@@ -311,6 +311,18 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
             ),
             id="request-slot-contract-fields",
         ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="blocker-family",
+                    outcome="The blocker is reported only when manual service is required.",
+                    antecedent_family="blocker",
+                    request_slot_id="b" * 64,
+                    pinability="shapeless_valid",
+                ),
+            ),
+            id="antecedent-family",
+        ),
     ],
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
@@ -472,6 +484,45 @@ def test_typed_criteria_list_round_trip_preserves_grading_metadata() -> None:
     assert criteria_from_json(raw) == (criterion,)
 
 
+def test_floor_rekeyed_association_round_trip_preserves_coherent_pair() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The blocker is reported.",
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path="output.blocker",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert raw[0]["requested_output_floor_rekeyed"] is True
+    assert raw[0]["floor_rekeyed_from_path"] == "output.blocker"
+    assert criteria_from_json(raw) == (criterion,)
+
+
+def test_floor_rekeyed_association_legacy_omission_defaults_false() -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done"}])
+
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+
+@pytest.mark.parametrize(
+    "stored_pair",
+    [
+        {"requested_output_floor_rekeyed": True},
+        {"floor_rekeyed_from_path": "output.blocker"},
+        {"requested_output_floor_rekeyed": False, "floor_rekeyed_from_path": "output.blocker"},
+        {"requested_output_floor_rekeyed": True, "floor_rekeyed_from_path": "blocker"},
+        {"requested_output_floor_rekeyed": "true", "floor_rekeyed_from_path": "output.blocker"},
+    ],
+)
+def test_floor_rekeyed_association_decode_fails_closed(stored_pair: dict[str, object]) -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", **stored_pair}])
+
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+
 def test_typed_boolean_validation_classification_round_trip_preserves_shape_and_evidence() -> None:
     """Typed boolean classifications persist goal_judgment_boolean / independent_run_evidence."""
     criterion = CompletionCriterion(
@@ -533,6 +584,55 @@ def test_typed_metadata_is_self_describing_without_a_storage_version() -> None:
             mint_disposition="degraded",
         ),
     )
+    assert "antecedent_family" not in criteria_to_json(criteria_from_json([legacy]))[0]
+
+
+def test_antecedent_family_is_reconciliation_identity() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(CompletionCriterion(id="s0", outcome="The blocker is reported.", antecedent_family="blocker"),),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [CompletionCriterion(id="f0", outcome="The blocker is reported.", antecedent_family="unconditional")],
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.reason == "not_subset"
+
+
+def test_floor_rekeyed_association_is_reconciliation_identity() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(
+            CompletionCriterion(
+                id="s0",
+                outcome="The blocker is reported.",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path="output.blocker",
+            ),
+        ),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [CompletionCriterion(id="f0", outcome="The blocker is reported.")],
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.reason == "not_subset"
+
+
+@pytest.mark.parametrize("invalid_family", ["conditional", [], {"family": "blocker"}])
+def test_criteria_from_json_ignores_invalid_antecedent_family(invalid_family: object) -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", "antecedent_family": invalid_family}])
+
+    assert criterion.antecedent_family is None
 
 
 def test_reconciliation_identity_ignores_pinability_and_derived_mint_state() -> None:

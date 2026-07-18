@@ -101,6 +101,104 @@ async def test_loader_adopts_current_bare_list_row_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_loader_adopts_current_bare_list_with_known_antecedent_family() -> None:
+    criteria = [{"id": "c0", "outcome": "done", "antecedent_family": "blocker"}]
+
+    loaded = await _load_latest(_make_row(criteria=criteria))
+
+    assert isinstance(loaded, WorkflowCopilotCompletionCriteriaSet)
+    assert loaded.criteria == criteria
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enveloped", [False, True], ids=["bare_list", "v1_envelope"])
+async def test_loader_adopts_coherent_floor_rekeyed_association(enveloped: bool) -> None:
+    criteria = [
+        {
+            "id": "c0",
+            "outcome": "done",
+            "requested_output_floor_rekeyed": True,
+            "floor_rekeyed_from_path": "output.blocker",
+        }
+    ]
+
+    stored: object = {"contract_version": 1, "criteria": criteria} if enveloped else criteria
+    loaded = await _load_latest(_make_row(criteria=stored))
+
+    assert isinstance(loaded, WorkflowCopilotCompletionCriteriaSet)
+    assert loaded.criteria == criteria
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enveloped", [False, True], ids=["bare_list", "v1_envelope"])
+@pytest.mark.parametrize(
+    "stored_pair",
+    [
+        {"requested_output_floor_rekeyed": False},
+        {"requested_output_floor_rekeyed": None},
+        {"requested_output_floor_rekeyed": True},
+        {"floor_rekeyed_from_path": None},
+        {"floor_rekeyed_from_path": "output.blocker"},
+        {"requested_output_floor_rekeyed": False, "floor_rekeyed_from_path": None},
+        {"requested_output_floor_rekeyed": False, "floor_rekeyed_from_path": "output.blocker"},
+        {"requested_output_floor_rekeyed": True, "floor_rekeyed_from_path": None},
+        {"requested_output_floor_rekeyed": True, "floor_rekeyed_from_path": "blocker"},
+    ],
+)
+async def test_loader_rejects_malformed_floor_rekeyed_association(
+    enveloped: bool,
+    stored_pair: dict[str, object],
+) -> None:
+    criteria = [{"id": "c0", "outcome": "done", **stored_pair}]
+
+    stored: object = {"contract_version": 1, "criteria": criteria} if enveloped else criteria
+    loaded = await _load_latest(_make_row(criteria=stored))
+
+    assert isinstance(loaded, NonAdoptableCriteriaSet)
+    assert loaded.reason == "undecodable_v1_criteria"
+
+
+@pytest.mark.asyncio
+async def test_loader_rejects_current_bare_list_with_unknown_antecedent_family() -> None:
+    criteria = [{"id": "c0", "outcome": "done", "antecedent_family": "speculative_future_family"}]
+
+    loaded = await _load_latest(_make_row(criteria=criteria))
+
+    assert isinstance(loaded, NonAdoptableCriteriaSet)
+    assert loaded.reason == "undecodable_v1_criteria"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enveloped", [False, True], ids=["bare_list", "v1_envelope"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("antecedent_family", None),
+        ("requested_output_evidence_source", "future_evidence_source"),
+        ("mint_disposition", "future_mint_disposition"),
+        ("terminal_action_verification_mode", "future_verification_mode"),
+    ],
+)
+async def test_loader_rejects_present_authority_field_that_decode_would_normalize(
+    enveloped: bool,
+    field: str,
+    value: object,
+) -> None:
+    criterion: dict[str, object] = {
+        "id": "c0",
+        "outcome": "done",
+        "kind": "terminal_action",
+        field: value,
+    }
+    criteria: object = {"contract_version": 1, "criteria": [criterion]} if enveloped else [criterion]
+
+    loaded = await _load_latest(_make_row(criteria=criteria))
+
+    assert isinstance(loaded, NonAdoptableCriteriaSet)
+    assert loaded.reason == "undecodable_v1_criteria"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "criteria_value",
     [
@@ -144,6 +242,7 @@ async def test_loader_rejects_v1_envelope_whose_criteria_do_not_fully_decode(inn
     [
         {"id": "c0", "outcome": "done", "kind": "speculative_future_kind"},
         {"id": "c0", "outcome": "done", "level": "epic"},
+        {"id": "c0", "outcome": "done", "antecedent_family": "speculative_future_family"},
     ],
 )
 async def test_loader_rejects_v1_envelope_whose_enum_value_was_coerced(criterion: dict[str, Any]) -> None:
@@ -151,6 +250,16 @@ async def test_loader_rejects_v1_envelope_whose_enum_value_was_coerced(criterion
 
     assert isinstance(loaded, NonAdoptableCriteriaSet)
     assert loaded.reason == "undecodable_v1_criteria"
+
+
+@pytest.mark.asyncio
+async def test_loader_adopts_v1_envelope_with_known_antecedent_family() -> None:
+    criterion = {"id": "c0", "outcome": "done", "antecedent_family": "blocker"}
+
+    loaded = await _load_latest(_make_row(criteria={"contract_version": 1, "criteria": [criterion]}))
+
+    assert isinstance(loaded, WorkflowCopilotCompletionCriteriaSet)
+    assert loaded.criteria == [criterion]
 
 
 @pytest.mark.asyncio

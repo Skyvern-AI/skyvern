@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_PROMPT_NAME
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -566,6 +567,8 @@ class TestMalformedCredentialIdExtraction:
 
 def _capture_handler(captured: dict[str, str]):
     async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return {"version": "1", "slots": []}
         captured["prompt"] = prompt
         return {"testing_intent": "unspecified", "credential_input_kind": "none"}
 
