@@ -853,19 +853,36 @@ class CdpProxyServer:
             )
             LOG.info("CDP proxy draining", drain_timeout_seconds=drain_timeout)
             server.close(close_connections=False)
+            # Re-arm the handlers: a second signal ends the drain early, so a
+            # dev Ctrl-C (or an operator's repeated stop) stays interruptible
+            # instead of sitting out the full drain budget.
+            force = asyncio.Event()
+            for sig in installed:
+                loop.remove_signal_handler(sig)
+                loop.add_signal_handler(sig, force.set)
+            drained = asyncio.create_task(server.wait_closed())
+            forced = asyncio.create_task(force.wait())
             try:
-                await asyncio.wait_for(server.wait_closed(), timeout=drain_timeout)
-            except asyncio.TimeoutError:
-                # Server.close() is idempotent — a second call cannot upgrade the
-                # drain to a force-close — so stragglers are closed directly. Each
-                # close() bounds its own handshake, so this always terminates.
-                # `handlers` is an undocumented websockets.asyncio Server attribute
-                # (its _close() iterates the same dict); the lifecycle tests here
-                # exercise it, so a websockets bump that renames it fails loudly.
-                LOG.warning("CDP proxy drain timeout expired, force-closing remaining connections")
-                stragglers = [asyncio.create_task(conn.close(1001)) for conn in list(server.handlers)]
-                if stragglers:
-                    await asyncio.wait(stragglers)
+                done, _ = await asyncio.wait(
+                    {drained, forced}, timeout=drain_timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if drained not in done:
+                    # Server.close() is idempotent — a second call cannot upgrade the
+                    # drain to a force-close — so stragglers are closed directly. Each
+                    # close() bounds its own handshake, so this always terminates.
+                    # `handlers` is an undocumented websockets.asyncio Server attribute
+                    # (its _close() iterates the same dict); the lifecycle tests here
+                    # exercise it, so a websockets bump that renames it fails loudly.
+                    reason = "second signal" if forced in done else "drain timeout expired"
+                    LOG.warning("CDP proxy force-closing remaining connections", reason=reason)
+                    stragglers = [asyncio.create_task(conn.close(1001)) for conn in list(server.handlers)]
+                    if stragglers:
+                        await asyncio.wait(stragglers)
+            finally:
+                for task in (drained, forced):
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
         finally:
             for sig in installed:
                 loop.remove_signal_handler(sig)
