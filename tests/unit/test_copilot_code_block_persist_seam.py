@@ -5173,6 +5173,117 @@ class TestCodeRepairProgressClassification:
         assert result["data"]["missing_extraction_schema_paths"] == ["output.record_id"]
         assert result["data"]["missing_code_return_paths"] == ["output.record_id"]
 
+    def _run_preflight_metadata_reject_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="validate_start",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id"],
+            required_extraction_schema_paths=["output.record_id"],
+            required_code_return_paths=["output.record_id"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        return ctx
+
+    _RUN_PREFLIGHT_CLICK_YAML = _yaml(
+        """
+        title: Provider lookup
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: validate_start
+            code: |
+              await page.locator("#start").click()
+        """
+    )
+
+    def test_run_preflight_metadata_reject_arms_directive_and_emits_once(self) -> None:
+        ctx = self._run_preflight_metadata_reject_ctx()
+        with capture_logs() as logs:
+            result = workflow_update_module._metadata_contract_run_preflight_reject(
+                ctx, self._RUN_PREFLIGHT_CLICK_YAML, []
+            )
+        assert result is not None and result["ok"] is False
+        directive = result["data"]["metadata_convergence_directive"]
+        assert directive["rung"] == 1
+        assert "declared_goal" in directive["missing_fields_by_label"]["validate_start"]
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+
+    def test_run_preflight_metadata_reject_repeat_does_not_reissue_emit(self) -> None:
+        ctx = self._run_preflight_metadata_reject_ctx()
+        with capture_logs() as first_logs:
+            first = workflow_update_module._metadata_contract_run_preflight_reject(
+                ctx, self._RUN_PREFLIGHT_CLICK_YAML, []
+            )
+        ctx.output_contract_bail_actuated_this_call = False
+        with capture_logs() as second_logs:
+            workflow_update_module._metadata_contract_run_preflight_reject(ctx, self._RUN_PREFLIGHT_CLICK_YAML, [])
+        assert first is not None and first["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert len([log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]) == 1
+        assert [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
+
+    def test_run_preflight_value_required_reject_arms_no_directive(self) -> None:
+        ctx = self._run_preflight_metadata_reject_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Provider lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: validate_start
+                code: |
+                  return {"output": {"summary": "ok"}}
+            """
+        )
+        metadata = [
+            {
+                "block_label": "validate_start",
+                "claimed_outcomes": [
+                    {
+                        "goal_value_paths": ["output"],
+                        "extraction_schema": '{"type":"object","properties":{"output":{"type":"object"}}}',
+                    }
+                ],
+                "terminal_verifier_expectations": [{"goal_value_paths": ["output"]}],
+            }
+        ]
+        with capture_logs() as logs:
+            result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
+        assert result is not None and result["ok"] is False
+        assert "metadata_convergence_directive" not in result["data"]
+        assert [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
+
+    def test_cross_seam_write_arm_then_metadata_less_preflight_escalates(self) -> None:
+        ctx = self._run_preflight_metadata_reject_ctx()
+        first = workflow_update_module._metadata_contract_run_preflight_reject(ctx, self._RUN_PREFLIGHT_CLICK_YAML, [])
+        assert first is not None and first["data"]["metadata_convergence_directive"]["rung"] == 1
+        ctx.output_contract_bail_actuated_this_call = False
+        directive = workflow_update_module._adjudicate_metadata_reject_ladder(
+            ctx,
+            workflow_yaml=self._RUN_PREFLIGHT_CLICK_YAML,
+            raw_metadata=[],
+            missing_labels=["validate_start"],
+            required_paths={"output.record_id"},
+        )
+        assert directive is not None
+        assert directive["rung"] == 2
+        assert "metadata_fill_in_skeleton" in directive
+
+    def test_metadata_less_preflight_never_grants_advisory_run(self) -> None:
+        ctx = self._run_preflight_metadata_reject_ctx()
+        directive = workflow_update_module._adjudicate_metadata_reject_ladder(
+            ctx,
+            workflow_yaml=self._RUN_PREFLIGHT_CLICK_YAML,
+            raw_metadata=[],
+            missing_labels=["validate_start"],
+            required_paths={"output.record_id"},
+        )
+        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths={"output.record_id"})
+        assert directive is not None and directive["rung"] == 1
+        assert workflow_update_module._output_contract_advisory_granted(ctx, signature) is False
+
     def test_metadata_contract_scaffold_uses_recorded_paths_before_request_policy(self) -> None:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
@@ -12179,6 +12290,224 @@ def _submitted_with_sibling_code(sibling_code: str) -> str:
 {indented}
         """
     )
+
+
+_METADATA_LESS_DIRECTIVE_EVENT = "copilot_output_contract_spine_structure_directive_emitted"
+
+_RECORDED_METADATA_REJECT_BLOCK_LABEL = "validate_public_start_service_path"
+
+
+def _recorded_metadata_reject_yaml() -> str:
+    return _yaml(
+        f"""
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {{parameter_type: output, key: workflow_output}}
+          blocks:
+          - block_type: code
+            label: {_RECORDED_METADATA_REJECT_BLOCK_LABEL}
+            code: |
+              await page.locator("#start").click()
+        """
+    )
+
+
+def _metadata_less_output_yaml(selector: str = "#search-submit") -> str:
+    return _yaml(
+        f"""
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {{parameter_type: output, key: workflow_output}}
+          blocks:
+          - block_type: code
+            label: extract_provider
+            code: |
+              await page.locator("{selector}").click()
+        """
+    )
+
+
+def _metadata_less_page_read_yaml() -> str:
+    return _yaml(
+        """
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {parameter_type: output, key: workflow_output}
+          blocks:
+          - block_type: code
+            label: extract_provider
+            code: |
+              await page.locator("#search-submit").click()
+              value = await page.locator("#npi").inner_text()
+              return {"npi": value}
+        """
+    )
+
+
+def _metadata_less_two_block_yaml() -> str:
+    return _yaml(
+        """
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {parameter_type: output, key: workflow_output}
+          blocks:
+          - block_type: code
+            label: first_block
+            description: extract the provider data
+            code: |
+              await page.locator("#a").click()
+          - block_type: code
+            label: second_block
+            description: extract the license data
+            code: |
+              await page.locator("#b").click()
+        """
+    )
+
+
+class TestMetadataLessRejectArming:
+    @pytest.mark.asyncio
+    async def test_metadata_less_reject_arms_rung_one_directive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": _metadata_less_output_yaml()}, ctx, allow_missing_credentials=True
+            )
+        assert result["ok"] is False
+        directive = result["data"]["metadata_convergence_directive"]
+        assert directive["rung"] == 1
+        assert directive["missing_fields_by_label"]["extract_provider"]
+        assert "declared_goal" in directive["missing_fields_by_label"]["extract_provider"]
+        assert [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len([log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]) == 1
+        assert not ctx.output_contract_spine_directive_blockers_by_attempt_key
+        assert not ctx.output_contract_spine_directive_stage_count_by_attempt_key
+        assert not ctx.output_contract_actuation_by_signature
+        assert not ctx.output_contract_declick_attempted_by_signature
+        assert not ctx.output_contract_actuation_count_by_signature
+
+    @pytest.mark.asyncio
+    async def test_identical_repeat_escalates_to_rung_two_skeleton(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        with capture_logs() as logs:
+            second = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        directive = second["data"]["metadata_convergence_directive"]
+        assert directive["rung"] == 2
+        skeleton = directive["metadata_fill_in_skeleton"]["extract_provider"]
+        assert skeleton["declared_goal"] == ""
+        assert skeleton["claimed_outcomes"] == []
+        assert "evidence_refs_or_observation_refs" not in skeleton
+        assert skeleton["evidence_refs"] == []
+        assert skeleton["observation_refs"] == []
+        rung_two_emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(rung_two_emits) == 1 and rung_two_emits[0]["rung"] == 2
+
+    @pytest.mark.asyncio
+    async def test_structural_progress_resets_to_rung_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        click_yaml = _metadata_less_output_yaml()
+        await _update_workflow({"workflow_yaml": click_yaml}, ctx, allow_missing_credentials=True)
+        repeat = await _update_workflow({"workflow_yaml": click_yaml}, ctx, allow_missing_credentials=True)
+        assert repeat["data"]["metadata_convergence_directive"]["rung"] == 2
+        progressed = await _update_workflow(
+            {"workflow_yaml": _metadata_less_page_read_yaml()}, ctx, allow_missing_credentials=True
+        )
+        assert progressed["ok"] is False
+        assert progressed["data"]["metadata_convergence_directive"]["rung"] == 1
+
+    @pytest.mark.asyncio
+    async def test_log_only_mode_leaves_seam_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(
+            workflow_update_module, "copilot_author_time_gate_log_only_enabled", lambda *_args, **_kwargs: True
+        )
+        ctx = _code_only_ctx()
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": _metadata_less_output_yaml()}, ctx, allow_missing_credentials=True
+            )
+        assert result["ok"] is False
+        assert "metadata_convergence_directive" not in result["data"]
+        assert not ctx.output_contract_armed_directive_fingerprint_by_signature
+        assert [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_missing_labels_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow(
+            {"workflow_yaml": _metadata_less_two_block_yaml()}, ctx, allow_missing_credentials=True
+        )
+        assert result["ok"] is False
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+        assert "metadata_convergence_directive" not in result["data"]
+
+    @pytest.mark.asyncio
+    async def test_churn_stash_fires_at_cap_with_arming_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+            result = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+            assert result["ok"] is False
+            assert result["data"]["metadata_convergence_directive"]["rung"] in (1, 2)
+            assert ctx.code_authoring_guardrail_reject_count == index + 1
+            assert ctx.blocker_signal is None
+        final = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        assert final["ok"] is False
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    @pytest.mark.asyncio
+    async def test_seam_replay_emits_once_then_escalates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        with capture_logs() as first_logs:
+            first = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        with capture_logs() as second_logs:
+            second = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        assert first["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert second["data"]["metadata_convergence_directive"]["rung"] == 2
+        assert len([log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]) == 1
+        second_emits = [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(second_emits) == 1 and second_emits[0]["rung"] == 2
+        assert not ctx.output_contract_spine_directive_blockers_by_attempt_key
+        assert not ctx.output_contract_actuation_by_signature
+
+    @pytest.mark.asyncio
+    async def test_recorded_reject_identity_arms_and_next_author_consumes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        yaml_text = _recorded_metadata_reject_yaml()
+        assert not ctx.output_contract_armed_directive_fingerprint_by_signature
+        with capture_logs() as first_logs:
+            first = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        assert first["ok"] is False
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+        directive = first["data"]["metadata_convergence_directive"]
+        assert directive["rung"] == 1
+        assert "declared_goal" in directive["missing_fields_by_label"][_RECORDED_METADATA_REJECT_BLOCK_LABEL]
+        assert len([log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]) == 1
+        assert ctx.output_contract_armed_directive_fingerprint_by_signature
+
+        second = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        escalated = second["data"]["metadata_convergence_directive"]
+        assert escalated["rung"] == 2
+        assert _RECORDED_METADATA_REJECT_BLOCK_LABEL in escalated["metadata_fill_in_skeleton"]
 
 
 class TestWholeTrajectoryImposition:

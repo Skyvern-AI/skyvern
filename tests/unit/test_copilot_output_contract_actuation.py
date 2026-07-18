@@ -1105,6 +1105,65 @@ def test_click_only_declick_flag_clears_when_source_becomes_observable() -> None
     assert signature not in ctx.output_contract_declick_attempted_by_signature
 
 
+def test_steer_only_downgrades_advisory_run_and_grants_nothing() -> None:
+    signature = "sig_steer_advisory"
+    baseline_ctx = _advisory_ctx()
+    baseline_ctx.output_contract_reject_count_by_signature[signature] = 1
+    baseline_ctx.output_contract_armed_directive_fingerprint_by_signature[signature] = _FINGERPRINT
+    baseline = wu._actuate_output_contract_bail(
+        baseline_ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_PAGE_READ_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint=_FINGERPRINT,
+    )
+    assert baseline.kind == OutputContractActuationKind.ADVISORY_RUN
+
+    ctx = _advisory_ctx()
+    ctx.output_contract_reject_count_by_signature[signature] = 1
+    ctx.output_contract_armed_directive_fingerprint_by_signature[signature] = _FINGERPRINT
+    steered = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_PAGE_READ_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint=_FINGERPRINT,
+        steer_only=True,
+    )
+    assert steered.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert ctx.output_contract_actuation_by_signature == {}
+    assert ctx.output_contract_actuation_count_by_signature == {}
+
+
+def test_steer_only_never_terminals_click_only_and_skips_declick() -> None:
+    signature = "sig_steer_click_only"
+    ctx = _advisory_ctx()
+    first = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_CLICK_ONLY_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint="fp_0",
+        steer_only=True,
+    )
+    assert first.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert signature not in ctx.output_contract_declick_attempted_by_signature
+    second = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_CLICK_ONLY_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint="fp_1",
+        steer_only=True,
+    )
+    assert second.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert second.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
+
+
 def test_observed_required_values_exact_and_lineage_match() -> None:
     ctx = SimpleNamespace(scouted_output_covered_paths={"output.order.id"}, composition_page_evidence=None)
     assert wu._observed_required_output_values(ctx, {"output.order.id"}) is True
@@ -1273,6 +1332,35 @@ def test_same_fresh_signature_emits_one_reject_before_typed_advisory(monkeypatch
     assert ctx.latest_recorded_build_test_outcome is None
     assert [entry["phase"] for entry in ctx.recorded_build_test_outcome_history] == ["author_time_reject"]
     assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
+
+
+def test_has_metadata_reject_attaches_no_metadata_convergence_directive(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ladder_ctx()
+    evaluation = _make_evaluation("sig_complete_metadata", block_label="collect")
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: None)
+    complete_metadata = [
+        {
+            "block_label": "collect",
+            "declared_goal": "Collect the provider summary",
+            "claimed_outcomes": ["summary extracted"],
+            "page_dependencies": ["provider page"],
+            "completion_criteria": ["summary non-empty"],
+            "terminal_verifier_expectations": ["summary rendered"],
+            "evidence_refs": ["scout:provider-page"],
+        }
+    ]
+
+    payload = wu._record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="Value-required deficiency on a metadata-complete block.",
+        authored_structural_fingerprint="fp_complete_metadata",
+        workflow_yaml=_PAGE_READ_YAML,
+        raw_metadata=complete_metadata,
+    )
+
+    assert payload["output_contract_actuation"] == OutputContractActuationKind.STRUCTURE_DIRECTIVE.value
+    assert "metadata_convergence_directive" not in payload
 
 
 def test_reject_seam_metadata_required_reaches_advisory_before_no_source_terminal() -> None:
