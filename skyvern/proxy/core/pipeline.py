@@ -106,12 +106,16 @@ class SynthesizedResponse:
     relay down instead of answering the client.
 
     `reason` is the audit tag for the decision trace — a label-safe identifier,
-    since it becomes a metric label.
+    since it becomes a metric label. `audit_method` names the method the decision
+    was actually about when that differs from the intercepted command's own — a
+    denied method tunneled inside Target.sendMessageToTarget (SKY-12538) — so the
+    audit trail records the blocked method, not the wrapper it arrived in.
     """
 
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     reason: str = "intercepted"
+    audit_method: str | None = None
 
     def __post_init__(self) -> None:
         if (self.result is None) == (self.error is None):
@@ -125,6 +129,12 @@ class SynthesizedResponse:
             raise ValueError(f"synthesized response is not CDP-encodable: {exc}") from exc
         if not isinstance(self.reason, str) or not _REASON_PATTERN.fullmatch(self.reason):
             raise ValueError("reason must be a short lowercase identifier ([a-z0-9_]{1,64})")
+        if self.audit_method is not None and (
+            not isinstance(self.audit_method, str)
+            or not self.audit_method
+            or any(c.isspace() for c in self.audit_method)
+        ):
+            raise ValueError("audit_method must be a non-empty method name")
 
     def to_response(self, command: CdpCommand) -> CdpResponse:
         """Stamp the synthesis with the intercepted command's own id and session

@@ -1361,6 +1361,20 @@ class CdpProxyServer:
                 self._event_policy.observe_command(processed, session)
                 _track_command(command_starts, upstream_command.id, processed.method)
                 processed = upstream_command
+            elif isinstance(processed, (CdpEvent, CdpResponse)):
+                # A CDP client only ever sends COMMANDS (method + id) to the browser;
+                # events and responses flow the other way. A method-bearing frame
+                # sent without an id decodes as an event (frames.py), so forwarding a
+                # client event raw would let a client smuggle a command past command
+                # interception — e.g. a denied Target.sendMessageToTarget stripped of
+                # its id would tunnel a denied inner method past the denylist. Dropped,
+                # never forwarded: closing the bypass here rather than trusting the
+                # browser to reject an id-less command.
+                self._metrics.increment(
+                    _METRIC_FRAMES_DROPPED,
+                    tags={**_org_tag(session), "direction": direction.value, "reason": "non_command_upstream"},
+                )
+                continue
             wire = encode_frame(processed)
             await connection.send(wire)
             self._record_relayed(session, direction, wire)
@@ -1404,14 +1418,20 @@ class CdpProxyServer:
             self._record_intercepted(session, command, INTERCEPTOR_FAILURE_REASON)
             return interceptor_failure_response(command)
         if isinstance(outcome, SynthesizedResponse):
-            self._record_intercepted(session, command, outcome.reason)
+            self._record_intercepted(session, command, outcome.reason, audit_method=outcome.audit_method)
             return outcome.to_response(command)
         return outcome
 
-    def _record_intercepted(self, session: ProxySession, command: CdpCommand, reason: str) -> None:
+    def _record_intercepted(
+        self, session: ProxySession, command: CdpCommand, reason: str, audit_method: str | None = None
+    ) -> None:
         """The audit trail for a command answered at the proxy (SKY-12538): a counter
-        under bounded labels plus one structured line naming the exact method."""
-        cdp_method, cdp_domain = _cdp_method_tags(command.method)
+        under bounded labels plus one structured line naming the exact method. The
+        synthesis's audit_method wins over the wrapper it arrived in, so a denial
+        tunneled through Target.sendMessageToTarget is recorded against the method
+        actually blocked."""
+        method = audit_method or command.method
+        cdp_method, cdp_domain = _cdp_method_tags(method)
         self._metrics.increment(
             _METRIC_COMMANDS_INTERCEPTED,
             tags={**_org_tag(session), "reason": reason, "cdp_method": cdp_method, "cdp_domain": cdp_domain},
@@ -1419,7 +1439,7 @@ class CdpProxyServer:
         LOG.info(
             "CDP command intercepted",
             session_id=session.session_id,
-            cdp_method=command.method,
+            cdp_method=method,
             reason=reason,
             **_org_tag(session),
         )
