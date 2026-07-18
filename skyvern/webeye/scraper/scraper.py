@@ -39,10 +39,14 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 
-async def build_scraping_failed_reason(browser_state: BrowserState, requested_url: str) -> str:
+async def build_scraping_failed_reason(
+    browser_state: BrowserState, requested_url: str, *, timed_out: bool = False
+) -> str:
     """Build the user-facing ScrapingFailed reason with the requested URL plus the landed URL when they differ.
 
     Query strings are stripped because OAuth/SSO URLs commonly carry secrets in query params.
+    ``timed_out`` keeps the word "timeout" in the reason so failure_classifier routes page-analysis
+    timeouts to PAGE_LOAD_TIMEOUT instead of lumping them into DATA_EXTRACTION_FAILURE.
     """
     safe_requested = strip_query_params(requested_url)
     safe_landed: str | None = None
@@ -55,10 +59,16 @@ async def build_scraping_failed_reason(browser_state: BrowserState, requested_ur
     except Exception:
         LOG.debug("Could not resolve landed URL for ScrapingFailed reason", exc_info=True)
 
-    base = (
-        "Skyvern failed to load the website. "
-        "The page may have navigated unexpectedly or become unresponsive during analysis."
-    )
+    if timed_out:
+        base = (
+            "Skyvern hit a page-analysis timeout while loading the website. "
+            "The page took too long to load or become responsive during analysis."
+        )
+    else:
+        base = (
+            "Skyvern failed to load the website. "
+            "The page may have navigated unexpectedly or become unresponsive during analysis."
+        )
     if safe_landed and safe_landed != safe_requested and safe_landed not in {"about:blank", ""}:
         return f"{base} Requested URL: {safe_requested}. Current URL: {safe_landed}."
     return f"{base} URL: {safe_requested}."
@@ -256,7 +266,9 @@ async def scrape_website(
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
-                raise ScrapingFailed(reason=await build_scraping_failed_reason(browser_state, url)) from e
+                raise ScrapingFailed(
+                    reason=await build_scraping_failed_reason(browser_state, url, timed_out=isinstance(e, TimeoutError))
+                ) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
         await asyncio.sleep(0.5)
         return await scrape_website(
@@ -594,7 +606,14 @@ async def filter_frames(
             filtered_frames.append(frame)
             continue
 
-        decision = await scrape_exclude(frame.page, frame)
+        try:
+            frame_page = frame.page
+        except AssertionError:
+            # Playwright's Frame.page asserts self._page; a frame can detach between
+            # the is_detached() check above and here, leaving _page unset.
+            continue
+
+        decision = await scrape_exclude(frame_page, frame)
         if decision.placeholder is not None and decision.placeholder not in placeholder_nodes:
             placeholder_nodes.append(decision.placeholder)
         if decision.exclude:

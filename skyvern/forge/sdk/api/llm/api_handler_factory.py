@@ -42,6 +42,7 @@ from skyvern.forge.sdk.api.llm.utils import (
     is_truncated_response,
     llm_messages_builder,
     llm_messages_builder_with_history,
+    loads_with_repair,
     parse_api_response,
 )
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
@@ -1841,7 +1842,7 @@ class LLMAPIHandlerFactory:
                 if context and len(context.hashed_href_map) > 0:
                     llm_content = json.dumps(parsed_response)
                     rendered_content = Template(llm_content).render(context.hashed_href_map)
-                    parsed_response = json.loads(rendered_content)
+                    parsed_response = loads_with_repair(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
                         if _should_bundle:
@@ -2397,7 +2398,7 @@ class LLMAPIHandlerFactory:
                 if context and len(context.hashed_href_map) > 0:
                     llm_content = json.dumps(parsed_response)
                     rendered_content = Template(llm_content).render(context.hashed_href_map)
-                    parsed_response = json.loads(rendered_content)
+                    parsed_response = loads_with_repair(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
                         if _should_bundle:
@@ -2998,7 +2999,7 @@ class LLMCaller:
             if context and len(context.hashed_href_map) > 0:
                 llm_content = json.dumps(parsed_response)
                 rendered_content = Template(llm_content).render(context.hashed_href_map)
-                parsed_response = json.loads(rendered_content)
+                parsed_response = loads_with_repair(rendered_content)
                 rendered_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:

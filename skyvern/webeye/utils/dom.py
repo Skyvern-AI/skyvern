@@ -1336,6 +1336,17 @@ class DomUtil:
                 num_elements = await locator.count()
                 if num_elements < 1:
                     raise MissingElement(selector=xpath, element_id=element_id)
+                # The tag-name xpath can resolve to many repeated nodes (rich text editors,
+                # repeated text). Reject it here so the next fill/read hits a classified
+                # MultipleElementsFound instead of a raw Playwright strict-mode violation.
+                if num_elements > 1:
+                    LOG.warning(
+                        "Multiple elements found with xpath fallback. Expected 1. Validation failed.",
+                        num_elements=num_elements,
+                        selector=xpath,
+                        element_id=element_id,
+                    )
+                    raise MultipleElementsFound(num=num_elements, selector=xpath, element_id=element_id)
 
         elif num_elements > 1:
             LOG.warning(
