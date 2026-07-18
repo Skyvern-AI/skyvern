@@ -71,6 +71,17 @@ configure_litellm_transport()
 
 LOG = structlog.get_logger()
 
+# Transient upstream faults litellm maps to these subclass openai.APIError, NOT
+# litellm.exceptions.APIError, so a bare `except litellm.exceptions.APIError` misses them.
+# Bound at import (real litellm) so the except clauses stay resilient to a monkeypatched
+# `litellm.exceptions` that only stubs APIError.
+_TRANSIENT_LLM_DEPENDENCY_ERRORS: tuple[type[Exception], ...] = (
+    litellm.exceptions.Timeout,
+    litellm.exceptions.APIConnectionError,
+    litellm.exceptions.ServiceUnavailableError,
+    litellm.exceptions.InternalServerError,
+)
+
 
 class _NoRedirectAsyncHTTPHandler(AsyncHTTPHandler):
     def create_client(self, *args: Any, **kwargs: Any) -> Any:
@@ -1667,7 +1678,7 @@ class LLMAPIHandlerFactory:
 
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
-                except litellm.exceptions.APIError as e:
+                except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
                     _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
@@ -2242,7 +2253,7 @@ class LLMAPIHandlerFactory:
                     llm_duration_seconds = time.perf_counter() - t_llm_request
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
-                except litellm.exceptions.APIError as e:
+                except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
                     _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
