@@ -118,6 +118,10 @@ class StateMachineInputText(StateMachine):
             sky_id=self.target.skyId,
             tag_name=self.target.tagName,
             texts=self.target.text,
+            selector=self.target.selector,
+            role=self.target.role,
+            accessible_name=self.target.accessibleName,
+            input_type=self.target.inputType,
         )
 
         action = ActionInputText(

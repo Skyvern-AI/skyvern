@@ -1278,6 +1278,21 @@ def _trajectory_prefix_at_anchor(
     return prefix, len(trajectory) - len(prefix)
 
 
+def synthesize_goto_code_block(url: str) -> SynthesizedCodeBlock | None:
+    """A goto-only block for a navigation with no captured interactions after it."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    line = (
+        f"{_INDENT}await page.goto("
+        f"{_py_str(_scrub_url_for_code_literal(url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+    )
+    return SynthesizedCodeBlock(
+        code=line + "\n",
+        steps=[{"description": f"Open {url}", "action_type": "goto_url", "line_start": 1, "line_end": 1}],
+    )
+
+
 def synthesize_code_block(
     trajectory: Sequence[Mapping[str, Any]],
     *,
@@ -1624,6 +1639,22 @@ def synthesize_code_block(
             emitted += 1
             continue
 
+        if tool_name == "wait":
+            try:
+                duration_ms = int(interaction.get("duration_ms") or 0)
+            except (TypeError, ValueError):
+                duration_ms = 0
+            if duration_ms <= 0:
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_duration"}
+                )
+                continue
+            line_start = len(lines) + 1
+            lines.append(f"{action_indent}await page.wait_for_timeout({duration_ms})")
+            append_step(f"Wait {max(duration_ms // 1000, 1)}s", "wait", line_start)
+            emitted += 1
+            continue
+
         locator = _locator_expr(
             interaction,
             notes,
@@ -1767,6 +1798,11 @@ def synthesize_code_block(
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
+        elif tool_name == "hover" and not strict_selectors:
+            # Non-strict only: recording trajectories carry deliberate hovers; the
+            # strict-imposition envelope keeps treating hover as unsupported.
+            lines.append(f"{action_indent}await {locator}.hover()")
+            append_step(f"Hover over {_step_target(interaction)}", "hover", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
             diagnostics.dropped_interactions.append(
