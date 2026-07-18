@@ -6,7 +6,7 @@ from typing import cast
 
 import structlog
 from sqlalchemy import case, desc, func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
@@ -419,6 +419,21 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_session)
             return PersistentBrowserSession.model_validate(browser_session)
 
+    @db_operation("get_persistent_browser_session_unscoped")
+    async def get_persistent_browser_session_unscoped(self, session_id: str) -> PersistentBrowserSession | None:
+        """Primary-key read without organization scoping, for trusted internal session
+        resolution (e.g. the CDP proxy) that learns the owning organization from the row."""
+        async with self.Session() as session:
+            query = (
+                select(PersistentBrowserSessionModel)
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(deleted_at=None)
+            )
+            persistent_browser_session = (await session.scalars(query)).first()
+            if persistent_browser_session:
+                return PersistentBrowserSession.model_validate(persistent_browser_session)
+            return None
+
     @db_operation("create_persistent_browser_session")
     async def create_persistent_browser_session(
         self,
@@ -535,8 +550,15 @@ class BrowserSessionsRepository(BaseRepository):
         ip_address: str | None,
         ecs_task_arn: str | None,
         organization_id: str | None = None,
+        upstream_cdp_url: str | None = None,
+        browser_vendor: str | None = None,
     ) -> None:
-        """Set the browser address for a persistent browser session."""
+        """Set the browser address for a persistent browser session.
+
+        browser_address is the client-facing (proxied) URL; upstream_cdp_url is the endpoint the
+        CDP proxy dials and must never be handed to a client or carry a credential — connect-time
+        credentials are injected from env at dial time.
+        """
         async with self.Session() as session:
             persistent_browser_session = (
                 await session.scalars(
@@ -555,7 +577,17 @@ class BrowserSessionsRepository(BaseRepository):
                     persistent_browser_session.ip_address = ip_address
                 if ecs_task_arn:
                     persistent_browser_session.ecs_task_arn = ecs_task_arn
-                await session.commit()
+                if upstream_cdp_url:
+                    persistent_browser_session.upstream_cdp_url = upstream_cdp_url
+                if browser_vendor:
+                    persistent_browser_session.browser_vendor = browser_vendor
+                try:
+                    await session.commit()
+                except StatementError as exc:
+                    # A failed statement renders its bound parameters — including upstream_cdp_url —
+                    # into the text that callers log. The type and statement still identify the fault.
+                    exc.hide_parameters = True
+                    raise
                 await session.refresh(persistent_browser_session)
             else:
                 raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
