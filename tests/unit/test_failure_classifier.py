@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
+from skyvern.exceptions import ScrapingFailed
 from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.webeye.scraper.scraper import build_scraping_failed_reason
 
 
 class NoProxyAvailable(Exception):
@@ -294,3 +298,26 @@ def test_inactivity_timeout_is_not_infrastructure() -> None:
 
     assert "INFRASTRUCTURE_ERROR" not in categories
     assert "PAGE_LOAD_TIMEOUT" in categories
+
+
+@pytest.mark.asyncio
+async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    timeout_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=True)
+    assert "timeout" in timeout_reason.lower()
+    # A page-analysis timeout is wrapped in ScrapingFailed; its reason must still rank
+    # PAGE_LOAD_TIMEOUT above DATA_EXTRACTION_FAILURE so it stays distinguishable.
+    categories = _categories_for(timeout_reason, ScrapingFailed(reason=timeout_reason))
+    assert categories[0] == "PAGE_LOAD_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_non_timeout_scraping_reason_stays_data_extraction() -> None:
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    generic_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=False)
+    assert "timeout" not in generic_reason.lower()
+    assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]
