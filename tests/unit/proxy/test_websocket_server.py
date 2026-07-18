@@ -471,3 +471,33 @@ async def test_serve_forever_force_closes_stragglers_after_drain_timeout(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+
+@pytest.mark.asyncio
+async def test_second_signal_during_drain_force_closes_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Drain budget is huge on purpose: only the second signal can end the wait,
+    # so a fast completion proves the fast-exit path rather than the timeout.
+    monkeypatch.setenv("CDP_PROXY_DRAIN_TIMEOUT_SECONDS", "3600")
+    port = _free_port()
+    task = asyncio.create_task(_lifecycle_server(port).serve_forever())
+    client = None
+    try:
+        await _wait_for_listener(port, up=True)
+        client = await websockets_client.connect(f"ws://127.0.0.1:{port}/s1")
+        os.kill(os.getpid(), signal.SIGTERM)
+        await _wait_for_listener(port, up=False)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+        await asyncio.wait_for(task, timeout=10)
+        with pytest.raises(websockets_exceptions.ConnectionClosed):
+            await asyncio.wait_for(client.recv(), timeout=5)
+        assert client.protocol.close_code == 1001
+    finally:
+        if client is not None:
+            await client.close()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
