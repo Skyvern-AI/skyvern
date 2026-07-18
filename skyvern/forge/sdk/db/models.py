@@ -1307,6 +1307,12 @@ class PersistentBrowserSessionModel(Base):
     timeout_minutes = Column(Integer, nullable=True)
     ip_address = Column(String, nullable=True)
     ecs_task_arn = Column(String, nullable=True)
+    # Server-side CDP routing. browser_address stays the client-facing proxy URL; these name the
+    # upstream the proxy dials and the adapter that dials it. Never a credential — connect-time
+    # credentials come from env — and never returned to clients (BrowserSessionResponse.
+    # from_browser_session allowlists the client-facing fields).
+    upstream_cdp_url = Column(String, nullable=True)
+    browser_vendor = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
