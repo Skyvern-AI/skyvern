@@ -8,7 +8,29 @@ import litellm
 import pytest
 
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.api.llm.utils import _fix_cutoff_json, _fix_unescaped_quotes_in_json, parse_api_response
+from skyvern.forge.sdk.api.llm.utils import (
+    _fix_cutoff_json,
+    _fix_unescaped_quotes_in_json,
+    loads_with_repair,
+    parse_api_response,
+)
+
+
+class TestLoadsWithRepair:
+    """Tests for loads_with_repair, used when rendering hashed-href values back into JSON."""
+
+    def test_valid_json_passes_through(self) -> None:
+        assert loads_with_repair('{"url": "https://example.com"}') == {"url": "https://example.com"}
+
+    def test_invalid_control_character_does_not_raise(self) -> None:
+        # A raw control character inside a string value is what strict json.loads rejects
+        # ("Invalid control character at ...") when hashed hrefs are rendered into the payload.
+        rendered = '{"path": "/a\x1fb"}'
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(rendered)
+        result = loads_with_repair(rendered)
+        assert isinstance(result, dict)
+        assert "path" in result
 
 
 class TestParseApiResponse:
