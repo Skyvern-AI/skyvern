@@ -8,7 +8,18 @@ from random import uniform
 from urllib.parse import urljoin, urlparse
 
 import structlog
-from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import (
+    ElementHandle,
+)
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import (
+    FloatRect,
+    Frame,
+    FrameLocator,
+    Locator,
+    Page,
+    TimeoutError,
+)
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
@@ -16,6 +27,7 @@ from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
     InteractWithDisabledElement,
+    InvalidElementForTextInput,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -34,6 +46,14 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
+
+
+def is_incompatible_text_input_error(exc: BaseException) -> bool:
+    # Playwright raises "Element is not an <input>, <textarea> or [contenteditable] element"
+    # from fill()/clear() when the resolved node can't accept text (button, link, span,
+    # dialog/container, iframe). The static tag_name can disagree with the live node after
+    # a re-render, so callers relying on the tag alone still reach these APIs.
+    return "is not an" in str(exc).lower()
 
 
 def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
@@ -939,11 +959,21 @@ class SkyvernElement:
         await self.input_sequentially(text=text, default_timeout=timeout)
 
     async def input_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.get_locator().fill(text, timeout=timeout)
+        try:
+            await self.get_locator().fill(text, timeout=timeout)
+        except PlaywrightError as exc:
+            if is_incompatible_text_input_error(exc):
+                raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
+            raise
 
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         locator = self.get_locator()
-        await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
+        try:
+            await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
+        except PlaywrightError as exc:
+            if is_incompatible_text_input_error(exc):
+                raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
+            raise
 
     async def check(
         self,
