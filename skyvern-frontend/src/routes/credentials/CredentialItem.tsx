@@ -8,6 +8,7 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { SelectionCheckbox } from "@/components/SelectionCheckbox";
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   CopyIcon,
   EyeNoneIcon,
@@ -435,6 +436,13 @@ function CredentialItem({
                 {getHostname(credential.tested_url) ?? credential.tested_url}
               </span>
             )}
+            <span className="text-muted-foreground">·</span>
+            <Link
+              to={`/browser-profiles/${credential.browser_profile_id}`}
+              className="text-blue-400 hover:text-blue-300"
+            >
+              Fix the saved login by hand
+            </Link>
           </div>
         )}
         {canResaveSession && !credential.browser_profile_id && !activeTest && (
