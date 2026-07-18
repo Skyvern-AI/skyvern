@@ -46,6 +46,12 @@ class RequestSlotPinability(StrEnum):
     UNPINNABLE = "unpinnable"
 
 
+class RequestSlotAntecedentFamily(StrEnum):
+    UNCONDITIONAL = "unconditional"
+    BLOCKER = "blocker"
+    UNDECIDABLE = "undecidable"
+
+
 class RequestSlotProducerFailureKind(StrEnum):
     MISSING_HANDLER = "missing_handler"
     PROMPT_RENDER_ERROR = "prompt_render_error"
@@ -97,6 +103,7 @@ class RequestSlotDeclarationV1(BaseModel):
     source_quote: str = Field(min_length=1, max_length=_MAX_SOURCE_QUOTE_CHARS)
     plane: RequestSlotPlane
     pinability: RequestSlotPinability
+    antecedent_family: RequestSlotAntecedentFamily
 
     @field_validator("source_quote")
     @classmethod
@@ -110,7 +117,7 @@ class RequestSlotEnvelopeV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal["1"]
-    slots: tuple[RequestSlotDeclarationV1, ...] = Field(min_length=1, max_length=64)
+    slots: tuple[RequestSlotDeclarationV1, ...] = Field(max_length=64)
 
 
 def _request_digest(version: str, sources: tuple[RequestSlotSourceV1, ...]) -> str:
@@ -148,6 +155,7 @@ class CanonicalRequestSlotV1(BaseModel):
     source_end: int = Field(ge=1, le=_MAX_REQUEST_PROMPT_CHARS)
     plane: RequestSlotPlane
     pinability: RequestSlotPinability
+    antecedent_family: RequestSlotAntecedentFamily
 
     @field_validator("path_segments")
     @classmethod
@@ -172,8 +180,8 @@ class RequestSlotContractV1(BaseModel):
 
     version: Literal["1"]
     request_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    slots: tuple[CanonicalRequestSlotV1, ...] = Field(min_length=1, max_length=64)
-    count: int = Field(ge=1, le=64)
+    slots: tuple[CanonicalRequestSlotV1, ...] = Field(max_length=64)
+    count: int = Field(ge=0, le=64)
 
     @model_validator(mode="after")
     def _validate_derived_membership(self) -> RequestSlotContractV1:
@@ -340,6 +348,7 @@ def canonicalize_request_slots(
                 source_end=end,
                 plane=declaration.plane,
                 pinability=declaration.pinability,
+                antecedent_family=declaration.antecedent_family,
             )
         )
     return RequestSlotContractV1(
@@ -389,6 +398,7 @@ def request_slot_contracts_agree(
         and first_slot.source_id == second_slot.source_id
         and first_slot.plane == second_slot.plane
         and first_slot.pinability == second_slot.pinability
+        and first_slot.antecedent_family == second_slot.antecedent_family
         and first_slot.source_start < second_slot.source_end
         and second_slot.source_start < first_slot.source_end
         for first_slot, second_slot in zip(first.slots, second.slots, strict=True)

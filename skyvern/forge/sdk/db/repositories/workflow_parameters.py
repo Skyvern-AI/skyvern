@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -8,7 +9,7 @@ import structlog
 from sqlalchemy import select
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json
+from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
 from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
@@ -76,35 +77,64 @@ from skyvern.webeye.actions.actions import Action
 LOG = structlog.get_logger()
 
 
+def _floor_rekeyed_association_is_coherent(item: Mapping[str, object]) -> bool:
+    marker_present = "requested_output_floor_rekeyed" in item
+    path_present = "floor_rekeyed_from_path" in item
+    if not marker_present and not path_present:
+        return True
+    return (
+        marker_present
+        and path_present
+        and item["requested_output_floor_rekeyed"] is True
+        and isinstance(item["floor_rekeyed_from_path"], str)
+    )
+
+
 def _decode_completion_criteria_set(
     row: WorkflowCopilotCompletionCriteriaSetModel,
 ) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet:
-    """A v1 dict-envelope row adopts only when every recorded criterion decodes."""
+    """A current or v1 row adopts only when every recorded criterion decodes without loss."""
     raw_criteria = row.criteria
     try:
         if isinstance(raw_criteria, list):
-            return WorkflowCopilotCompletionCriteriaSet.model_validate(row)
-        if (
+            current = WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+            inner = current.criteria
+            is_v1_envelope = False
+        elif (
             isinstance(raw_criteria, dict)
             and raw_criteria.get("contract_version") == 1
             and isinstance(raw_criteria.get("criteria"), list)
         ):
             inner = raw_criteria["criteria"]
-            decoded = criteria_from_json(inner)
-            if (
-                not inner
-                or len(decoded) != len(inner)
+            current = None
+            is_v1_envelope = True
+        else:
+            inner = None
+            current = None
+            is_v1_envelope = False
+
+        decoded = criteria_from_json(inner)
+        if inner is not None and (
+            (is_v1_envelope and not inner)
+            or len(decoded) != len(inner)
+            or any(
+                not _floor_rekeyed_association_is_coherent(item)
                 or any(
-                    (isinstance(item.get("kind"), str) and item["kind"] != criterion.kind)
-                    or (isinstance(item.get("level"), str) and item["level"] != criterion.level)
-                    for item, criterion in zip(inner, decoded)
+                    field in item and item[field] != canonical_value
+                    for field, canonical_value in criterion_authority_projection(criterion).items()
                 )
-            ):
-                return NonAdoptableCriteriaSet(
-                    reason="undecodable_v1_criteria",
-                    completion_criteria_set_id=row.completion_criteria_set_id,
-                    goal_epoch=row.goal_epoch,
-                )
+                or ("antecedent_family" in item and item["antecedent_family"] is None)
+                for item, criterion in zip(inner, decoded)
+            )
+        ):
+            return NonAdoptableCriteriaSet(
+                reason="undecodable_v1_criteria",
+                completion_criteria_set_id=row.completion_criteria_set_id,
+                goal_epoch=row.goal_epoch,
+            )
+        if current is not None:
+            return current
+        if is_v1_envelope:
             return WorkflowCopilotCompletionCriteriaSet(
                 completion_criteria_set_id=row.completion_criteria_set_id,
                 organization_id=row.organization_id,
