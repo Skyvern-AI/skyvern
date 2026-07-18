@@ -3712,6 +3712,7 @@ def _adjudicate_output_contract_ladder_after_reject(
     *,
     workflow_yaml: str,
     current_fingerprint: str,
+    steer_only: bool = False,
 ) -> OutputContractActuation | None:
     """Run the actuation ladder at the shared deficiency seam so a signature whose formation
     remains incomplete advances toward an advisory-consumed run or a typed terminal within the
@@ -3744,6 +3745,7 @@ def _adjudicate_output_contract_ladder_after_reject(
         current_fingerprint=current_fingerprint,
         advisory_run_grantable=blockers == [_OUTPUT_CONTRACT_REJECT_REASON_CODE],
         declaration_paths=evaluation.declaration_paths,
+        steer_only=steer_only,
     )
     if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
         _stash_output_source_unobservable_terminal(
@@ -3759,6 +3761,130 @@ def _adjudicate_output_contract_ladder_after_reject(
     return actuation
 
 
+_METADATA_CONVERGENCE_DIRECTIVE_BLOCKER = "missing_code_artifact_metadata"
+
+
+def _metadata_reject_directive_payload(
+    *,
+    missing_fields_by_label: dict[str, list[str]],
+    required_paths: set[str],
+    escalate: bool,
+) -> dict[str, Any]:
+    directive: dict[str, Any] = {
+        "rung": 2 if escalate else 1,
+        "missing_fields_by_label": {label: list(fields) for label, fields in missing_fields_by_label.items()},
+    }
+    if escalate:
+        # "evidence_refs_or_observation_refs" is a messaging label for the either-one requirement;
+        # the skeleton must only offer real CodeArtifactMetadata fields the model can set.
+        directive["metadata_fill_in_skeleton"] = {
+            label: {
+                field: "" if field == "declared_goal" else []
+                for raw_field in fields
+                for field in (
+                    ("evidence_refs", "observation_refs")
+                    if raw_field == "evidence_refs_or_observation_refs"
+                    else (raw_field,)
+                )
+            }
+            for label, fields in missing_fields_by_label.items()
+        }
+    if required_paths:
+        directive["required_output_paths"] = sorted(required_paths)
+        directive["extraction_schema_template"] = _schema_template_for_required_paths(required_paths)
+    return directive
+
+
+def _emit_metadata_convergence_directive(
+    *,
+    signature: str,
+    block_label: str,
+    missing_fields_by_label: dict[str, list[str]],
+    required_paths: set[str],
+    escalate: bool,
+) -> dict[str, Any]:
+    LOG.info(
+        "copilot_output_contract_spine_structure_directive_emitted",
+        block_label=block_label,
+        canonical_output_contract_signature=signature,
+        spine_split_blockers=[_METADATA_CONVERGENCE_DIRECTIVE_BLOCKER],
+        spine_stage_count=None,
+        rung=2 if escalate else 1,
+    )
+    return _metadata_reject_directive_payload(
+        missing_fields_by_label=missing_fields_by_label,
+        required_paths=required_paths,
+        escalate=escalate,
+    )
+
+
+def _metadata_reject_seam_fingerprint(
+    workflow_yaml: str, signature: str, missing_fields_by_label: dict[str, list[str]]
+) -> str:
+    return hashlib.sha256(
+        (
+            _output_contract_structural_fingerprint(workflow_yaml, signature)
+            + json.dumps(missing_fields_by_label, sort_keys=True)
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _adjudicate_metadata_reject_ladder(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    missing_labels: list[str],
+    required_paths: set[str],
+) -> dict[str, Any] | None:
+    """Route the metadata-less reject through the shared actuation ladder in steer-only mode so a
+    repeated identical structural key escalates the convergence directive instead of re-issuing the
+    same steer, never minting an advisory run or a terminal at this seam."""
+    if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
+        return None
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
+    block_label = missing_labels[0] if len(missing_labels) == 1 else ""
+    if not signature or not block_label:
+        return None
+    missing_fields_by_label = _metadata_missing_required_fields_by_label(
+        raw_metadata, labels=missing_labels, missing_labels=missing_labels
+    )
+    seam_fingerprint = _metadata_reject_seam_fingerprint(workflow_yaml, signature, missing_fields_by_label)
+    escalate = _prior_output_contract_directive_unconsumed(ctx, signature, seam_fingerprint)
+    evaluation = _OutputContractEvaluation(
+        block_label=block_label,
+        artifact_id="",
+        required_paths=required_paths,
+        observation_paths=required_paths,
+        declaration_paths=set(),
+        source="missing_code_artifact_metadata",
+        reason_code="metadata_reject",
+        missing_metadata_paths=[],
+        missing_schema_paths=[],
+        missing_return_paths=[],
+        shape_violations=[],
+        canonical_signature=signature,
+        payload={"reason_code": "metadata_reject"},
+        repair_context=None,
+    )
+    actuation = _adjudicate_output_contract_ladder_after_reject(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        current_fingerprint=seam_fingerprint,
+        steer_only=True,
+    )
+    if actuation is None or actuation.kind != OutputContractActuationKind.STRUCTURE_DIRECTIVE:
+        return None
+    return _emit_metadata_convergence_directive(
+        signature=signature,
+        block_label=block_label,
+        missing_fields_by_label=missing_fields_by_label,
+        required_paths=required_paths,
+        escalate=escalate,
+    )
+
+
 def _record_output_contract_reject(
     ctx: AgentContext,
     evaluation: _OutputContractEvaluation,
@@ -3766,6 +3892,7 @@ def _record_output_contract_reject(
     summary: str,
     authored_structural_fingerprint: str = "",
     workflow_yaml: str = "",
+    raw_metadata: object = None,
 ) -> dict[str, Any]:
     # A candidate so incomplete that no required child paths are derivable must still consume the
     # reject budget: an empty set would silently skip counting and degrade the turn to the generic
@@ -3781,14 +3908,39 @@ def _record_output_contract_reject(
     payload = dict(evaluation.payload)
     payload["output_contract_reject_count"] = count
     payload["output_contract_reject_budget"] = _MAX_OUTPUT_CONTRACT_REJECTS
+    missing_fields_by_label = (
+        _metadata_missing_required_fields_by_label(raw_metadata, labels=[evaluation.block_label], missing_labels=[])
+        if evaluation.block_label
+        else {}
+    )
+    directive_fingerprint = (
+        _metadata_reject_seam_fingerprint(workflow_yaml, evaluation.canonical_signature, missing_fields_by_label)
+        if missing_fields_by_label
+        else authored_structural_fingerprint
+    )
+    directive_escalate = _prior_output_contract_directive_unconsumed(
+        ctx, evaluation.canonical_signature, directive_fingerprint
+    )
     actuation = _adjudicate_output_contract_ladder_after_reject(
         ctx,
         evaluation,
         workflow_yaml=workflow_yaml,
-        current_fingerprint=authored_structural_fingerprint,
+        current_fingerprint=directive_fingerprint,
     )
     if actuation is not None:
         payload["output_contract_actuation"] = actuation.kind.value
+        if (
+            actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+            and evaluation.block_label
+            and missing_fields_by_label
+        ):
+            payload["metadata_convergence_directive"] = _emit_metadata_convergence_directive(
+                signature=evaluation.canonical_signature,
+                block_label=evaluation.block_label,
+                missing_fields_by_label=missing_fields_by_label,
+                required_paths=evaluation.required_paths,
+                escalate=directive_escalate,
+            )
         if actuation.kind != OutputContractActuationKind.STRUCTURE_DIRECTIVE:
             latest_outcome = ctx.latest_recorded_build_test_outcome
             if (
@@ -4915,6 +5067,7 @@ def _actuate_output_contract_bail(
     current_fingerprint: str,
     advisory_run_grantable: bool = False,
     declaration_paths: set[str] | None = None,
+    steer_only: bool = False,
 ) -> OutputContractActuation:
     click_only_spine = _output_contract_click_only_spine(target_code, declaration_paths)
     observed_required_values = _observed_required_output_values(ctx, required_paths)
@@ -4948,6 +5101,11 @@ def _actuate_output_contract_bail(
     )
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN and not _run_authority_permits_dispatch(ctx):
         actuation = OutputContractActuation(OutputContractActuationKind.STRUCTURE_DIRECTIVE, actuation.family)
+    if steer_only and actuation.kind in {
+        OutputContractActuationKind.ADVISORY_RUN,
+        OutputContractActuationKind.BLOCKED_TERMINAL,
+    }:
+        actuation = OutputContractActuation(OutputContractActuationKind.STRUCTURE_DIRECTIVE, actuation.family)
     payload: AuthorTimeGateAblationPayload = {
         "actuation_kind": actuation.kind.value,
         "family": actuation.family.value,
@@ -4979,10 +5137,16 @@ def _actuate_output_contract_bail(
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
         _grant_output_contract_advisory_run(ctx, signature)
         _arm_pending_run_evidence(ctx, signature, required_paths)
-    elif actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE and not evidence.prior_directive_unconsumed:
+    elif (
+        actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+        and not evidence.prior_directive_unconsumed
+        and not steer_only
+    ):
         _record_output_contract_actuation_progress(ctx, signature)
     if (
-        actuation.kind not in {OutputContractActuationKind.BLOCKED_TERMINAL, OutputContractActuationKind.ADVISORY_RUN}
+        not steer_only
+        and actuation.kind
+        not in {OutputContractActuationKind.BLOCKED_TERMINAL, OutputContractActuationKind.ADVISORY_RUN}
         and click_only_spine
         and not observed_required_values
     ):
@@ -5611,6 +5775,7 @@ def _metadata_contract_run_preflight_reject(
         summary="Submitted workflow does not satisfy the requested output contract before run.",
         authored_structural_fingerprint=authored_fingerprint,
         workflow_yaml=workflow_yaml,
+        raw_metadata=raw_code_artifact_metadata,
     )
     if (
         evaluation.can_attempt_run or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in evaluation.shape_violations
@@ -11564,6 +11729,7 @@ async def _update_workflow(
                 summary="Submitted workflow does not satisfy the requested output contract.",
                 authored_structural_fingerprint=authored_fingerprint,
                 workflow_yaml=workflow_yaml,
+                raw_metadata=params.get("code_artifact_metadata"),
             )
             if allow_static_output_uncertainty and _output_contract_advisory_granted(
                 ctx, output_contract_evaluation.canonical_signature
@@ -11675,14 +11841,24 @@ async def _update_workflow(
             _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
         elif missing_metadata_reject_count < 1 and not budget_terminal:
             _record_code_authoring_guardrail_reject(ctx)
+        metadata_convergence_directive = _adjudicate_metadata_reject_ladder(
+            ctx,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=params.get("code_artifact_metadata"),
+            missing_labels=missing_labels,
+            required_paths=required_child_output_paths,
+        )
+        metadata_reject_data = _code_repair_progress_data(
+            metadata_repair_context,
+            missing_requested_output_facts=missing_metadata_output_facts,
+            metadata_repair_contract=metadata_repair_contract,
+        )
+        if metadata_convergence_directive is not None:
+            metadata_reject_data["metadata_convergence_directive"] = metadata_convergence_directive
         return reject(
             error=missing_metadata_error,
             user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(
-                metadata_repair_context,
-                missing_requested_output_facts=missing_metadata_output_facts,
-                metadata_repair_contract=metadata_repair_contract,
-            ),
+            data=metadata_reject_data,
             repair_context=metadata_repair_context,
             record_repair_context_outcome=False,
         )
