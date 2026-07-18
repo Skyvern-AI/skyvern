@@ -25,8 +25,10 @@ proxy. Cloud live-view is VNC + Page.captureScreenshot and never touches this.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from skyvern.proxy.core.frames import CdpCommand, CdpEvent, CdpFrame
-from skyvern.proxy.core.pipeline import Direction, MiddlewarePipeline
+from skyvern.proxy.core.pipeline import CommandInterceptor, Direction, MiddlewarePipeline
 from skyvern.proxy.core.policy import EventPolicyConfig, RateRule
 from skyvern.proxy.core.session import ProxySession
 
@@ -176,7 +178,7 @@ async def bound_screencast_middleware(frame: CdpFrame, direction: Direction, ses
     return frame
 
 
-def screencast_pipeline() -> MiddlewarePipeline:
+def screencast_pipeline(interceptors: Iterable[CommandInterceptor] | None = None) -> MiddlewarePipeline:
     """The command half of the screencast policy.
 
     Param bounding is a command rewrite, and EventPolicyPort decides events only, so the
@@ -184,7 +186,7 @@ def screencast_pipeline() -> MiddlewarePipeline:
     turn both on together (see `skyvern.proxy.__main__`). Rewriting commands in general is
     the interception seam's job (SKY-12535); this is the one rule that cannot wait for it.
     """
-    return MiddlewarePipeline([bound_screencast_middleware])
+    return MiddlewarePipeline([bound_screencast_middleware], interceptors)
 
 
 __all__ = [

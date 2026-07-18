@@ -45,7 +45,14 @@ from skyvern.proxy.core.frames import (
     encode_frame,
     params_session_id,
 )
-from skyvern.proxy.core.pipeline import Direction, MiddlewarePipeline
+from skyvern.proxy.core.pipeline import (
+    INTERCEPTOR_FAILURE_REASON,
+    Direction,
+    InterceptContext,
+    MiddlewarePipeline,
+    SynthesizedResponse,
+    interceptor_failure_response,
+)
 from skyvern.proxy.core.policy import Drop, Rewrite
 from skyvern.proxy.core.policy_pack import POLICY_PACK_EVENT_METHODS
 from skyvern.proxy.core.screencast import (
@@ -326,6 +333,7 @@ _METRIC_COMMAND_LATENCY = "skyvern.cdp_proxy.command_latency_seconds"
 _METRIC_FRAMES_DROPPED = "skyvern.cdp_proxy.frames_dropped"
 _METRIC_FRAME_DECODE_ERRORS = "skyvern.cdp_proxy.frame_decode_errors"
 _METRIC_CLIENT_BACKPRESSURE_CLOSED = "skyvern.cdp_proxy.client_backpressure_closed"
+_METRIC_COMMANDS_INTERCEPTED = "skyvern.cdp_proxy.commands_intercepted"
 
 
 def _org_tag(session: ProxySession) -> dict[str, str]:
@@ -1284,6 +1292,23 @@ class CdpProxyServer:
         # shared is None only on the pinned single-client relay contract, where there
         # is no co-tenant to steer another client's session or race its autoAttach.
         direction = Direction.CLIENT_TO_UPSTREAM
+        context: InterceptContext | None = None
+        if self._pipeline.has_interceptors:
+
+            async def send_proxy_command(command: CdpCommand) -> None:
+                # The proxy's reserved id lane: the response is consumed by the
+                # upstream reader's PROXY_CLIENT_KEY branch, never sent to a client.
+                upstream_command = remapper.to_upstream_as_proxy(command)
+                try:
+                    await connection.send(encode_frame(upstream_command))
+                except BaseException:
+                    # ANY post-allocation failure (encode, send, cancellation) must
+                    # free the mapping: proxy-lane entries are never evictable by
+                    # clients, so a leaked one is a slot lost to co-tenants forever.
+                    remapper.discard(upstream_command.id)
+                    raise
+
+            context = InterceptContext(send_proxy_command=send_proxy_command)
         async for raw in ws:
             try:
                 frame = decode_frame(raw)
@@ -1304,6 +1329,16 @@ class CdpProxyServer:
                 if shared is not None and not _owns_addressed_sessions(shared, client_key, processed):
                     self._refuse_foreign_session(shared, session, client_key, processed)
                     continue
+                if context is not None:
+                    # After the ownership refusal (an interceptor never sees a
+                    # foreign-session command) and before remapping (a synthesized
+                    # response reuses the client's own id; only a forwarded command
+                    # ever allocates an upstream one).
+                    verdict = await self._intercept_command(processed, session, context)
+                    if isinstance(verdict, CdpResponse):
+                        await self._deliver_intercept_response(ws, shared, session, client_key, verdict)
+                        continue
+                    processed = verdict
                 try:
                     upstream_command = remapper.to_upstream(client_key, processed)
                 except RemapperFullError:
@@ -1353,6 +1388,60 @@ class CdpProxyServer:
             session_id=command.session_id,
         )
         self._deliver_to_channel(shared, channel, refusal, encode_frame(refusal))
+
+    async def _intercept_command(
+        self, command: CdpCommand, session: ProxySession, context: InterceptContext
+    ) -> CdpCommand | CdpResponse:
+        """Run the interceptor chain over a client command, fail-closed: a raising
+        interceptor (or a contract violation) answers the client with a deterministic
+        internal error and forwards nothing — a policy hook that fails must never
+        fail open into the browser."""
+        try:
+            outcome = await self._pipeline.intercept(command, session, context)
+        except Exception as exc:
+            # Type only — a frame's content must never reach logs.
+            LOG.warning("command interceptor failed", error_type=type(exc).__name__, cdp_method=command.method)
+            self._record_intercepted(session, command, INTERCEPTOR_FAILURE_REASON)
+            return interceptor_failure_response(command)
+        if isinstance(outcome, SynthesizedResponse):
+            self._record_intercepted(session, command, outcome.reason)
+            return outcome.to_response(command)
+        return outcome
+
+    def _record_intercepted(self, session: ProxySession, command: CdpCommand, reason: str) -> None:
+        """The audit trail for a command answered at the proxy (SKY-12538): a counter
+        under bounded labels plus one structured line naming the exact method."""
+        cdp_method, cdp_domain = _cdp_method_tags(command.method)
+        self._metrics.increment(
+            _METRIC_COMMANDS_INTERCEPTED,
+            tags={**_org_tag(session), "reason": reason, "cdp_method": cdp_method, "cdp_domain": cdp_domain},
+        )
+        LOG.info(
+            "CDP command intercepted",
+            session_id=session.session_id,
+            cdp_method=command.method,
+            reason=reason,
+            **_org_tag(session),
+        )
+
+    async def _deliver_intercept_response(
+        self,
+        ws: websockets.ServerConnection,
+        shared: _SharedUpstream | None,
+        session: ProxySession,
+        client_key: str,
+        response: CdpResponse,
+    ) -> None:
+        wire = encode_frame(response)
+        if shared is not None:
+            channel = shared.channels.get(client_key)
+            if channel is not None:
+                # A response is non-droppable in _deliver_to_channel: a client too
+                # slow to take it is closed rather than left hanging on the command.
+                self._deliver_to_channel(shared, channel, response, wire)
+            return
+        await ws.send(wire)
+        self._record_relayed(session, Direction.UPSTREAM_TO_CLIENT, wire)
 
     async def _pay_screencast_ack(
         self,
