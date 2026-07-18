@@ -93,6 +93,10 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
         default=None,
         description="Optional live interpretation drafts to commit instead of reprocessing the compressed recording.",
     )
+    code_first: bool = Field(
+        default=False,
+        description="When true, synthesize deterministic code blocks from the recording instead of agent blocks.",
+    )
 
 
 class ProcessBrowserSessionRecordingResponse(BaseModel):
