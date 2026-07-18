@@ -219,6 +219,26 @@ class MaskedInputReadbackMismatch(SkyvernException):
         )
 
 
+class InputTextCommitMismatch(SkyvernException):
+    def __init__(self, *, expected_length: int, actual_length: int):
+        self.expected_length = expected_length
+        self.actual_length = actual_length
+        super().__init__(
+            f"Input text commit mismatch: expected length {expected_length}, found actual length {actual_length}."
+        )
+
+
+class RepeatedActionFailure(SkyvernException):
+    def __init__(self, *, element_id: str, attempt_count: int, failure_description: str):
+        self.element_id = element_id
+        self.attempt_count = attempt_count
+        self.failure_description = failure_description
+        super().__init__(
+            f"Action on element {element_id} failed identically {attempt_count} consecutive times: "
+            f"{failure_description}."
+        )
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 

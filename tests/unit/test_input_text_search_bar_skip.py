@@ -122,6 +122,10 @@ async def _run_search_bar_input(stop_flag: bool, incremental: list[dict]) -> lis
             "skyvern.webeye.actions.handler.sequentially_select_from_dropdown",
             new=AsyncMock(return_value=select_result),
         ),
+        patch(
+            "skyvern.webeye.actions.handler._is_input_text_commit_verification_enabled",
+            new=AsyncMock(return_value=False),
+        ),
     ):
         return await handle_input_text_action(
             action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
