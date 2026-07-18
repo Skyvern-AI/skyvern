@@ -1689,7 +1689,6 @@ class TestStepEmission:
     def test_skipped_interactions_emit_no_step(self) -> None:
         trajectory = [
             _interaction("click", selector="#go", source_url="https://example.com/"),
-            _interaction("hover", selector="#menu"),
             _interaction("select_option", selector="#size"),
             _interaction("click"),
             _interaction("press_key", key=""),
@@ -1697,6 +1696,39 @@ class TestStepEmission:
         block = synthesize_code_block(trajectory)
         assert block is not None
         assert [s["action_type"] for s in block.steps] == ["goto_url", "click"]
+
+    def test_hover_emits_step_in_non_strict_mode(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com/"),
+            _interaction("hover", selector="#menu"),
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "click", "hover"]
+        assert 'await page.locator("#menu").hover()' in block.code
+
+    def test_hover_stays_unsupported_in_strict_mode(self) -> None:
+        block = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/"),
+                _interaction("hover", selector="#menu"),
+            ],
+            strict_selectors=True,
+        )
+        assert block is not None
+        assert {"trajectory_index": 1, "tool_name": "hover", "reason_code": "unsupported_tool"} in (
+            block.diagnostics.dropped_interactions
+        )
+
+    def test_wait_emits_timeout_step(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com/"),
+            {"tool_name": "wait", "duration_ms": 6000},
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "click", "wait"]
+        assert "await page.wait_for_timeout(6000)" in block.code
 
     def test_no_entry_url_means_no_goto_step(self) -> None:
         block = synthesize_code_block([_interaction("press_key", key="Enter")])
