@@ -39,3 +39,6 @@ export const ANALYTICS_GROUP_BY_LENS_FLAG = "ANALYTICS_GROUP_BY_LENS";
 // showing the editor to other orgs would promise a retry that never fires. Server-evaluated via
 // /customer (see FeatureFlagProvider), keyed on organization_id like the backend gate.
 export const CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY";
+
+// Opt-in preview (0% base): recordings synthesize code blocks instead of agent blocks.
+export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";
