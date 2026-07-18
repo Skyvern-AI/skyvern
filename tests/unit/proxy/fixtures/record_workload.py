@@ -40,6 +40,18 @@ import websockets
 
 SETTLE_SECONDS = 14.0
 
+# The recorded workload's definition, importable so a replay drives the same
+# stream: any drift between these constants and a replayer silently changes
+# what "the same workload" means.
+BROADBAND_CONDITIONS = {
+    "offline": False,
+    "latency": 40,
+    "downloadThroughput": 5_000_000 // 8,
+    "uploadThroughput": 1_000_000 // 8,
+}
+AUTO_ATTACH_PARAMS = {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True}
+WORKLOAD_DOMAINS = ("Runtime.enable", "Network.enable", "Page.enable", "Log.enable")
+
 
 def build_site(root: Path) -> None:
     """A page shaped like a real one: stylesheet, script, images, an xhr, console."""
@@ -116,7 +128,7 @@ async def main() -> None:
 
         # Chrome was launched on about:blank, so flat auto-attach picks up the existing
         # page target (Chrome rejects GET on /json/new).
-        await send("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
+        await send("Target.setAutoAttach", AUTO_ATTACH_PARAMS)
         await send("Target.setDiscoverTargets", {"discover": True})
         await asyncio.sleep(2.0)
 
@@ -129,19 +141,10 @@ async def main() -> None:
         if not session_id:
             raise SystemExit("no page session attached")
 
-        for method in ("Runtime.enable", "Network.enable", "Page.enable", "Log.enable"):
+        for method in WORKLOAD_DOMAINS:
             await send(method, None, session_id)
         if os.environ.get("THROTTLE"):
-            await send(
-                "Network.emulateNetworkConditions",
-                {
-                    "offline": False,
-                    "latency": 40,
-                    "downloadThroughput": 5_000_000 // 8,
-                    "uploadThroughput": 1_000_000 // 8,
-                },
-                session_id,
-            )
+            await send("Network.emulateNetworkConditions", BROADBAND_CONDITIONS, session_id)
         await asyncio.sleep(0.3)
         await send("Page.navigate", {"url": page_url}, session_id)
         await asyncio.sleep(SETTLE_SECONDS)
