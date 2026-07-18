@@ -120,6 +120,28 @@ class TestFilterFrames:
         assert frames == [keep]
         assert placeholders == []
 
+    @pytest.mark.asyncio
+    async def test_frame_detached_after_check_skips_instead_of_asserting(self) -> None:
+        # Playwright's Frame.page asserts self._page; a frame detached between the
+        # is_detached() check and the page access raises AssertionError mid-scrape.
+        class _DetachRacingFrame:
+            def is_detached(self) -> bool:
+                return False
+
+            @property
+            def page(self) -> object:
+                raise AssertionError
+
+        keep = _make_frame()
+        racing = _DetachRacingFrame()
+
+        async def _exclude(page: object, frame: object) -> ScrapeFrameDecision:
+            return ScrapeFrameDecision(exclude=False)
+
+        frames, placeholders = await filter_frames([keep, racing], _exclude)
+        assert frames == [keep]
+        assert placeholders == []
+
 
 @pytest.fixture(autouse=True)
 def _skyvern_ctx() -> Iterator[None]:
