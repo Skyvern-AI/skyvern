@@ -9159,6 +9159,18 @@ class TestCompiledAuthoringImposition:
         ]
         return ctx
 
+    @staticmethod
+    def _cafe_search_capture() -> dict[str, object]:
+        return {
+            "tool_name": "type_text",
+            "selector": "#café-search",
+            "source_url": "https://example.com/catalog",
+            "typed_length": 15,
+            "role": "textbox",
+            "accessible_name": "Catalog search",
+            "trajectory_index": 0,
+        }
+
     @pytest.mark.asyncio
     async def test_imposes_strict_scout_selector_and_lifts_singleton_literal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -9842,6 +9854,25 @@ class TestCompiledAuthoringImposition:
     async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "input[placeholder='Search']",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 13,
+                "role": "textbox",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "button.lookup",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Lookup",
+                "trajectory_index": 1,
+            },
+        ]
         ctx.workflow_yaml = _SUBMITTED_LITERAL_YAML
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
@@ -10742,6 +10773,7 @@ class TestCompiledAuthoringImposition:
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._typed_default_ctx()
+        ctx.scout_trajectory = [self._cafe_search_capture(), {**ctx.scout_trajectory[0], "trajectory_index": 1}]
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_TYPED_LITERAL_REWRITE_YAML}, ctx)
 
@@ -10777,6 +10809,7 @@ class TestCompiledAuthoringImposition:
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._typed_default_ctx()
+        ctx.scout_trajectory = [self._cafe_search_capture(), {**ctx.scout_trajectory[0], "trajectory_index": 1}]
         submitted_yaml = _SUBMITTED_TYPED_LITERAL_REWRITE_YAML.replace("example_sku_123", "other_sku_456")
 
         result = await _update_workflow({"workflow_yaml": submitted_yaml}, ctx)
@@ -15978,7 +16011,7 @@ class TestScoutedSpinePersistSeamCoverage:
         assert 'await page.locator("#stage-c").click()' in rejected["error"]
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
         assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
+        assert events[0]["site"] == "pre_persist"
 
         with capture_logs() as logs:
             nudge = enforcement_module._scouted_spine_turn_end_nudge(ctx)
@@ -16009,7 +16042,7 @@ class TestScoutedSpinePersistSeamCoverage:
         assert [log for log in logs if log["event"] == "copilot_imposition_skipped_after_update"]
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
         assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
+        assert events[0]["site"] == "pre_persist"
 
     @pytest.mark.asyncio
     async def test_second_persist_dropping_all_code_blocks_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -16039,7 +16072,7 @@ class TestScoutedSpinePersistSeamCoverage:
         assert ctx.code_authoring_guardrail_reject_count == 1
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
         assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
+        assert events[0]["site"] == "pre_persist"
 
     def test_separated_split_branch_under_coverage_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         diagnostics = _spine_emission_diagnostics()
@@ -16119,7 +16152,7 @@ class TestScoutedSpinePersistSeamCoverage:
         assert "Missing rung source to reuse verbatim" in rejected["error"]
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
         assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
+        assert events[0]["site"] == "pre_persist"
         assert events[0]["credential_scout_precondition_pending"] is True
 
         ctx.scout_trajectory.append(_submit_interaction(source_url="https://example.com/records"))
@@ -16166,6 +16199,19 @@ class TestScoutedSpinePersistSeamCoverage:
         assert "The persisted draft is missing scouted rung(s)." in result["error"]
         assert "Missing rung source to reuse verbatim" in result["error"]
         assert ".password" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_render_gate_preempts_pre_persist_spine_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _checkpoint_eligible_ctx()
+        draft = _records_block_yaml('await page.locator("#stage-a").click()\nnote = "{{ frobnicator }}"')
+
+        with capture_logs() as logs:
+            result = await _update_workflow({"workflow_yaml": draft}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "code_block_unrenderable"
+        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
 
 
 class TestScoutedSpineTurnEndCheckpoint:
@@ -17485,7 +17531,7 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         remaining = [block.get("label") for block in parsed["workflow_definition"]["blocks"]]
         assert "orphan_rung" not in remaining
 
-    def test_admitted_imposition_is_not_answered_by_the_persist_seam_guard(self) -> None:
+    def test_admitted_imposition_passes_the_pre_persist_gate(self) -> None:
         ctx = _quote_ctx()
         ctx.update_workflow_called = True
         ctx.synthesized_goal_complete_landed = True
@@ -17504,10 +17550,10 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert result.violations == []
         assert result.substitutions is not None
         assert ctx.spine_imposition_owned_attempt is True
-        assert workflow_update_module._persist_seam_spine_under_build_result(result.workflow_yaml, ctx) is None
+        assert workflow_update_module._pre_persist_scouted_spine_result(result.workflow_yaml, ctx) is None
         assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
 
-    def test_persist_seam_guard_still_fires_when_imposition_is_not_admitted(self) -> None:
+    def test_pre_persist_gate_still_fires_when_imposition_is_not_admitted(self) -> None:
         ctx = _records_spine_ctx()
         ctx.update_workflow_called = True
         under_built = _records_block_yaml('await page.locator("#stage-a").click()')
@@ -17518,12 +17564,12 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert imposition.substitutions is None
 
         with capture_logs() as logs:
-            guarded = workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx)
+            guarded = workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx)
 
         assert guarded is not None
         assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert events and events[0]["site"] == "persist_seam"
+        assert events and events[0]["site"] == "pre_persist"
 
     def test_ungrounded_sibling_mixing_ambiguous_and_concrete_calls_is_replaced_by_the_spine(self) -> None:
         ctx = _quote_ctx()
@@ -17705,7 +17751,7 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert ctx.spine_imposition_owned_attempt is True
         code = str(_single_code_block(parse_workflow_yaml(imposition.workflow_yaml))["code"])
         assert 'page.locator("#stage-b").click()' in code
-        assert workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx) is None
+        assert workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx) is None
 
 
 def _reaching_extraction_ctx() -> CopilotContext:
@@ -18087,7 +18133,7 @@ class TestSequencedDownloadTerminalCoverage:
         later.update_workflow_called = True
 
         with capture_logs() as logs:
-            guarded = workflow_update_module._persist_seam_spine_under_build_result(imposed.workflow_yaml, later)
+            guarded = workflow_update_module._pre_persist_scouted_spine_result(imposed.workflow_yaml, later)
 
         assert guarded is None
         assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
@@ -18110,7 +18156,7 @@ class TestSequencedDownloadTerminalCoverage:
         assert imposition.substitutions is None
         assert ctx.spine_imposition_owned_attempt is False
 
-        guarded = workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx)
+        guarded = workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx)
 
         assert guarded is not None
         assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
@@ -19339,6 +19385,145 @@ class TestFreehandSurfacePersistSeam:
         result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
         assert result is None
 
+    def test_fragment_scout_rejects_nameless_get_by_role(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.get_by_role("button").click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+
+    def test_fragment_scout_rejects_dynamic_role_get_by_role(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = "await page.get_by_role(role_var).click()"
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+
+    def test_fragment_scout_rejects_dynamic_name_get_by_role(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.get_by_role("button", name=btn_name).click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+
+    def test_fragment_scout_rejects_non_literal_kwarg_get_by_role(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.get_by_role("button", name="Continue", exact=flag).click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+
+    def test_fragment_scout_reject_names_get_by_role_site(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.get_by_role("button").click()'
+        with capture_logs() as logs:
+            result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        events = [log for log in logs if log["event"] == "copilot_browser_surface_rejection_provenance"]
+        assert events and events[0]["site"] == "fragment_scout"
+
+    def test_goal_reaching_rejects_unscouted_get_by_role(self) -> None:
+        code = 'await page.get_by_role("button", name="Unscouted", exact=True).click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code), _goal_reaching_freehand_ctx()
+        )
+        assert result is not None
+        assert "unscouted browser action(s)" in result.violations[0]
+
+    def test_fragment_scout_rejects_freehand_bare_locator_guess(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("#search").fill("x")\nawait page.locator("tr").click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert result.repair_context.block_label == "find_address"
+        assert "page.locator('tr')" in result.violations[0]
+        assert "never_captured" in result.violations[0]
+
+    def test_fragment_scout_rejects_freehand_attribute_selector_guess(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = "await page.locator('button[data-action=\"orderDocuments\"]').click()"
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert "orderDocuments" in result.violations[0]
+
+    def test_fragment_scout_rejects_aliased_locator_mutation(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'target = page.locator("#guessed")\nawait target.click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert "ambiguous browser action(s)" in result.violations[0]
+        assert "target.click()" in result.violations[0]
+
+    def test_fragment_scout_rejects_nth_wrapped_locator_guess(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("tr").nth(2).click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert "ambiguous browser action(s)" in result.violations[0]
+
+    def test_fragment_scout_rejects_has_text_refined_locator_guess(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("tr", has_text="Order").click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert "unscouted browser action(s)" in result.violations[0]
+        assert "never_captured" in result.violations[0]
+
+    def test_fragment_scout_rejects_first_wrapped_bare_locator_guess(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("tr").first.click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert "page.locator('tr')" in result.violations[0]
+
+    def test_fragment_scout_admits_first_wrapped_scouted_selector(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("#search").first.fill("x")'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is None
+
+    def test_fragment_scout_reject_carries_fragment_scout_site(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("tr").click()'
+        with capture_logs() as logs:
+            result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        events = [log for log in logs if log["event"] == "copilot_browser_surface_rejection_provenance"]
+        assert events and events[0]["site"] == "fragment_scout"
+
+    def test_fragment_scout_admits_input_prefixed_capture_replay(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        ctx.scout_trajectory[0]["selector"] = "input#search"
+        code = 'await page.locator("#search").fill("x")'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is None
+
+    def test_fragment_scout_skips_unchanged_block(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("tr").click()'
+        submitted = _freehand_block_yaml(code)
+        ctx.workflow_yaml = submitted
+        result = workflow_update_module._persist_seam_freehand_surface_result(submitted, ctx)
+        assert result is None
+
+    def test_goal_reaching_freehand_bare_locator_reject_unchanged(self) -> None:
+        code = 'await page.locator("#search").fill("x")\nawait page.locator("tr").click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code), _goal_reaching_freehand_ctx()
+        )
+        assert result is not None
+        assert "unscouted browser action(s)" in result.violations[0]
+
     def test_unguarded_credential_fill_routes_to_guarded_entry_rung(self) -> None:
         parameters = "  parameters:\n  - {parameter_type: credential, key: portal}\n"
         code = 'await page.locator("#password").fill(portal.password)'
@@ -19563,3 +19748,495 @@ class TestCodeBlockRenderPreflightSeam:
             and "parameters.business_name" in str(log.get("failing_expression"))
             for log in logs
         )
+
+
+def _under_scouted_order_status_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#confirmation",
+            "source_url": "https://portal.example.com/order-status",
+            "role": "textbox",
+            "accessible_name": "Confirmation number",
+            "typed_length": 8,
+            "trajectory_index": 0,
+        }
+    ]
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    return ctx
+
+
+class TestUnderScoutedOrderStatusReplay:
+    _LOOKUP_BLOCK_CODE = (
+        'await page.goto("https://portal.example.com/order-status")\n'
+        'await page.locator("#confirmation").fill("ABC123")\n'
+        "await page.locator('button[data-action=\"orderLookup\"]').click()\n"
+        "await page.locator('button[data-action=\"orderDocuments\"]').click()\n"
+        'rows = page.locator("tr")\n'
+        "row_count = await rows.count()\n"
+    )
+
+    def test_freehand_button_guesses_rejected_instead_of_admitted(self) -> None:
+        ctx = _under_scouted_order_status_ctx()
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(self._LOOKUP_BLOCK_CODE, label="lookup_order"), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert result.repair_context.block_label == "lookup_order"
+        assert "orderLookup" in result.violations[0]
+        assert "orderDocuments" in result.violations[0]
+
+    def test_scouted_confirmation_replay_admitted(self) -> None:
+        ctx = _under_scouted_order_status_ctx()
+        code = (
+            'await page.goto("https://portal.example.com/order-status")\n'
+            'await page.locator("#confirmation").fill("ABC123")\n'
+        )
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, label="lookup_order"), ctx
+        )
+        assert result is None
+
+
+def _pre_goal_wizard_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#username",
+            "source_url": "https://utility.example.com/login",
+            "credential_id": "cred_1",
+            "credential_name": "portal",
+            "credential_field": "username",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#password",
+            "source_url": "https://utility.example.com/login",
+            "credential_id": "cred_1",
+            "credential_name": "portal",
+            "credential_field": "password",
+            "trajectory_index": 1,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#sign-in",
+            "source_url": "https://utility.example.com/login",
+            "role": "button",
+            "accessible_name": "Sign In",
+            "trajectory_index": 2,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#business-toggle",
+            "source_url": "https://utility.example.com/start-service",
+            "role": "button",
+            "accessible_name": "Business",
+            "trajectory_index": 3,
+        },
+        {
+            "tool_name": "type_text",
+            "selector": "#service-address",
+            "source_url": "https://utility.example.com/start-service",
+            "role": "textbox",
+            "accessible_name": "Service address",
+            "typed_length": 20,
+            "trajectory_index": 4,
+        },
+    ]
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    return ctx
+
+
+def _wizard_block_yaml(*, include_business_block: bool) -> str:
+    sign_in_code = (
+        '          _scout_entry_target = page.locator("#username")\n'
+        "          if await _scout_entry_target.count() == 1:\n"
+        '              await page.locator("#username").fill(portal.username)\n'
+        '              await page.locator("#password").fill(portal.password)\n'
+        '              await page.locator("#sign-in").click()\n'
+    )
+    business_code = (
+        '          await page.locator("#business-toggle").click()\n'
+        '          await page.locator("#service-address").fill(str(service_address))\n'
+    )
+    yaml_text = (
+        "title: t\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "  - {parameter_type: credential, key: portal, credential_id: cred_1}\n"
+        "  - {parameter_type: workflow, workflow_parameter_type: string, key: service_address, default_value: addr}\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: sign_in_to_portal\n"
+        "    code: |\n"
+        f"{sign_in_code}"
+    )
+    if include_business_block:
+        yaml_text += "  - block_type: code\n    label: open_business_start_service\n    code: |\n" + business_code
+    return yaml_text
+
+
+class TestPreGoalWizardSpineReplay:
+    def test_sign_in_only_collapse_rejected_naming_dropped_rungs(self) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=False), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_under_build"
+        assert "#business-toggle" in result.violations[0]
+        assert "#service-address" in result.violations[0]
+
+    def test_multi_block_draft_covering_all_scouted_rungs_admitted(self) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=True), ctx
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_multi_block_covering_draft_persists_with_multiple_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+
+        async def _fake_process_from_yaml(**kwargs: object) -> SimpleNamespace:
+            parsed = yaml.safe_load(str(kwargs["workflow_yaml"]))
+            blocks = [SimpleNamespace(label=block.get("label")) for block in parsed["workflow_definition"]["blocks"]]
+            return SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks), proxy_location=None)
+
+        monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_process_from_yaml)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#business-toggle",
+                "source_url": "https://utility.example.com/start-service",
+                "role": "button",
+                "accessible_name": "Business",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": "https://utility.example.com/start-service",
+                "role": "textbox",
+                "accessible_name": "Service address",
+                "typed_length": 20,
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = (
+            "title: t\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - {parameter_type: workflow, workflow_parameter_type: string, key: service_address, default_value: a}\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: open_business_services\n"
+            "    code: |\n"
+            '      await page.locator("#business-toggle").click()\n'
+            "  - block_type: code\n"
+            "    label: fill_service_address\n"
+            "    code: |\n"
+            '      await page.locator("#service-address").fill(str(service_address))\n'
+        )
+        ctx.workflow_yaml = submitted
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert result["data"]["block_count"] == 2
+
+
+class TestPrePersistScoutedSpineGate:
+    def test_covering_draft_returns_none(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        code = 'await page.locator("#search-submit").click()'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_draft_dropping_scouted_rung_rejected_with_rung_provenance(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        code = 'print(await page.locator("body").inner_text())'
+        result = workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_under_build"
+        assert "#search-submit" in result.violations[0]
+
+    def test_gate_skipped_without_imposition(self) -> None:
+        ctx = _code_only_ctx()
+        code = 'print(await page.locator("body").inner_text())'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_gate_skipped_without_scout_trajectory(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = []
+        code = 'print(await page.locator("body").inner_text())'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_gate_reuses_imposition_synthesized_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.imposition_synthesized_block = code_block_synthesis_module.synthesize_code_block(
+            ctx.scout_trajectory, strict_selectors=True, reached_download_target=None
+        )
+        assert ctx.imposition_synthesized_block is not None
+
+        def _fail_resynthesis(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("pre-persist gate re-synthesized instead of reusing the imposition result")
+
+        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", _fail_resynthesis)
+        code = 'await page.locator("#search-submit").click()'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_gate_declines_synthesizer_side_partition_findings(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#stage-a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#stage-b", "trajectory_index": 2},
+        ]
+        synthesized = code_block_synthesis_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        covering_code = synthesized.interaction_code or synthesized.code
+        draft_calls = [
+            (mutation.method, mutation.receiver)
+            for mutation in workflow_update_module._browser_surface_for_code(covering_code)[0]
+        ]
+        findings = code_block_synthesis_module.spine_partition_findings(
+            synthesized.diagnostics, draft_calls, ctx.scout_trajectory
+        )
+        assert any(finding.kind == code_block_synthesis_module.UNFORGIVEN_DROP_FINDING for finding in findings)
+
+        result = workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(covering_code), ctx)
+
+        assert result is None
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_pre_persist_reject_leaves_canonical_definition_unwritten(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(workflow_update_module, "_workflow_requires_canonical_persist", lambda *_a, **_k: True)
+        canonical_writes: list[dict[str, object]] = []
+
+        async def _spy_update_workflow_definition(**kwargs: object) -> None:
+            canonical_writes.append(kwargs)
+
+        monkeypatch.setattr(
+            workflow_update_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=_spy_update_workflow_definition),
+        )
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        submitted = _freehand_block_yaml('print(await page.locator("body").inner_text())', label="report_only")
+        ctx.workflow_yaml = submitted
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "under-builds the scouted spine" in result["error"]
+        assert canonical_writes == []
+        assert ctx.has_staged_proposal is False
+        assert ctx.persisted_draft_browser_calls is None
+
+    @pytest.mark.asyncio
+    async def test_covering_draft_persists_through_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(workflow_update_module, "_workflow_requires_canonical_persist", lambda *_a, **_k: True)
+        canonical_writes: list[dict[str, object]] = []
+
+        async def _spy_update_workflow_definition(**kwargs: object) -> None:
+            canonical_writes.append(kwargs)
+
+        async def _fake_created_by_stamp(*_args: object, **_kwargs: object) -> str | None:
+            return "copilot"
+
+        async def _fake_canonical_workflow(**_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="submit_search")]),
+                title="t",
+                description=None,
+                proxy_location=None,
+                webhook_callback_url=None,
+                totp_verification_url=None,
+                totp_identifier=None,
+                persist_browser_session=False,
+                pin_saved_session_ip=False,
+                browser_profile_id=None,
+                browser_profile_key=None,
+                model=None,
+                max_screenshot_scrolls=None,
+                extra_http_headers=None,
+                cdp_connect_headers=None,
+                run_with=None,
+                ai_fallback=True,
+                cache_key=None,
+                adaptive_caching=None,
+                enable_self_healing=False,
+                code_version=None,
+                run_sequentially=False,
+                sequential_key=None,
+            )
+
+        monkeypatch.setattr(
+            workflow_update_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=_spy_update_workflow_definition),
+        )
+        monkeypatch.setattr(workflow_update_module, "resolve_copilot_created_by_stamp", _fake_created_by_stamp)
+        monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_canonical_workflow)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        submitted = _freehand_block_yaml('await page.locator("#search-submit").click()', label="submit_search")
+        ctx.workflow_yaml = submitted
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert len(canonical_writes) == 1
+        assert ctx.persisted_draft_browser_calls == [("click", "page.locator('#search-submit')")]
+
+
+_P6_UNDER_SCOUT_RECORDED_RUN_IDS = (
+    "wr_551756368310299524",
+    "wr_551757699750161408",
+    "wr_551759572355902654",
+)
+_P10_SPINE_COLLAPSE_RECORDED_RUN_ID = "wr_551770266824468500"
+
+# Selector shapes are transcribed verbatim from each recorded run's proposed workflow; only the mock
+# host is placeholder-normalized per this file's OSS-synced target convention.
+_P6_RECORDED_FREEHAND_BLOCKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "wr_551756368310299524": (
+        "lookup_order",
+        'await page.goto("https://example.com/order-status")\n'
+        'await page.locator("#confirmation").fill(str(enter_confirmation))\n'
+        "await page.locator('button[data-action=\"orderLookup\"]').click()\n"
+        'await page.locator(\'button[data-action="orderDocuments"]\').wait_for(state="visible", timeout=10000)\n'
+        "await page.locator('button[data-action=\"orderDocuments\"]').click()\n",
+        ("orderLookup", "orderDocuments"),
+    ),
+    "wr_551757699750161408": (
+        "lookup_order",
+        'await page.goto("https://example.com/order-status")\n'
+        'await page.locator("#confirmation").fill(str(enter_confirmation))\n'
+        "await page.locator('button[data-action=\"orderLookup\"]').click()\n",
+        ("orderLookup",),
+    ),
+    "wr_551759572355902654": (
+        "retrieve_resale_document",
+        "documents_button = page.locator('button[data-action=\"orderDocuments\"]')\n"
+        "await documents_button.click()\n"
+        'rows = page.locator("tr")\n',
+        ("documents_button",),
+    ),
+}
+
+
+class TestRecordedGauntletPacketReplay:
+    @pytest.mark.parametrize("run_id", _P6_UNDER_SCOUT_RECORDED_RUN_IDS)
+    def test_p6_recorded_freehand_block_rejected(self, run_id: str) -> None:
+        label, code, expected_tokens = _P6_RECORDED_FREEHAND_BLOCKS[run_id]
+        ctx = _under_scouted_order_status_ctx()
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, label=label), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert result.repair_context.block_label == label
+        for token in expected_tokens:
+            assert token in result.violations[0]
+
+    def test_p6_recorded_freehand_reject_carries_fragment_scout_site(self) -> None:
+        label, code, _ = _P6_RECORDED_FREEHAND_BLOCKS[_P6_UNDER_SCOUT_RECORDED_RUN_IDS[0]]
+        ctx = _under_scouted_order_status_ctx()
+        with capture_logs() as logs:
+            result = workflow_update_module._persist_seam_freehand_surface_result(
+                _freehand_block_yaml(code, label=label), ctx
+            )
+        assert result is not None
+        events = [log for log in logs if log["event"] == "copilot_browser_surface_rejection_provenance"]
+        assert events and events[0]["site"] == "fragment_scout"
+
+    def test_p6_recorded_scouted_confirmation_replay_admitted(self) -> None:
+        ctx = _under_scouted_order_status_ctx()
+        code = (
+            'await page.goto("https://example.com/order-status")\nawait page.locator("#confirmation").fill("ABC123")\n'
+        )
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, label="lookup_order"), ctx
+        )
+        assert result is None
+
+    def test_p6_cap_evicted_scouted_selector_still_admitted(self) -> None:
+        ctx = _under_scouted_order_status_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/order-status",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            }
+        ]
+        ctx.scouted_interactions = [
+            {
+                "tool_name": "type_text",
+                "selector": "#confirmation",
+                "source_url": "https://example.com/order-status",
+                "role": "textbox",
+                "accessible_name": "Confirmation number",
+                "typed_length": 8,
+                "trajectory_index": 0,
+            }
+        ]
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        code = 'await page.locator("#confirmation").fill("ABC123")'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, label="lookup_order"), ctx
+        )
+        assert result is None
+
+    @pytest.mark.parametrize("run_id", [_P10_SPINE_COLLAPSE_RECORDED_RUN_ID])
+    def test_p10_recorded_sign_in_only_collapse_rejected_naming_dropped_rungs(self, run_id: str) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=False), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_under_build"
+        assert "#business-toggle" in result.violations[0]
+        assert "#service-address" in result.violations[0]
+
+    @pytest.mark.parametrize("run_id", [_P10_SPINE_COLLAPSE_RECORDED_RUN_ID])
+    def test_p10_recorded_covering_multi_block_spine_admitted(self, run_id: str) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=True), ctx
+        )
+        assert result is None
