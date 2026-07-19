@@ -3887,6 +3887,32 @@ def _adjudicate_metadata_reject_ladder(
     )
 
 
+def _synthesized_metadata_reject_directive(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    label_candidates: list[str],
+    required_paths: set[str],
+) -> dict[str, Any] | None:
+    if len(label_candidates) != 1:
+        return None
+    label = label_candidates[0]
+    full_required_fields = {"declared_goal", *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS, "evidence_refs_or_observation_refs"}
+    missing_fields_by_label = _metadata_missing_required_fields_by_label(
+        raw_metadata, labels=[label], missing_labels=[]
+    )
+    if set(missing_fields_by_label.get(label) or []) != full_required_fields:
+        return None
+    return _adjudicate_metadata_reject_ladder(
+        ctx,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        missing_labels=[label],
+        required_paths=required_paths,
+    )
+
+
 def _record_output_contract_reject(
     ctx: AgentContext,
     evaluation: _OutputContractEvaluation,
@@ -12300,13 +12326,23 @@ async def _update_workflow(
             block_labels=output_empty_labels,
         )
         _record_code_authoring_guardrail_reject(ctx)
+        reject_data = _code_repair_progress_data()
+        metadata_convergence_directive = _synthesized_metadata_reject_directive(
+            ctx,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=ctx.code_artifact_metadata,
+            label_candidates=output_empty_labels,
+            required_paths=unresolved_recorded_output_paths,
+        )
+        if metadata_convergence_directive is not None:
+            reject_data["metadata_convergence_directive"] = metadata_convergence_directive
         return reject(
             error=(
                 "Submitted workflow does not return any keyed output after the last recorded test outcome. "
                 "Add structured output for the unsatisfied completion criteria before testing again."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
+            data=reject_data,
         )
 
     missing_output_paths = (
@@ -12356,6 +12392,16 @@ async def _update_workflow(
         )
         _record_code_authoring_guardrail_reject(ctx)
         missing_path_text = ", ".join(missing_output_paths[:8])
+        reject_data = _code_repair_progress_data()
+        metadata_convergence_directive = _synthesized_metadata_reject_directive(
+            ctx,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=ctx.code_artifact_metadata,
+            label_candidates=block_labels,
+            required_paths=set(missing_output_paths),
+        )
+        if metadata_convergence_directive is not None:
+            reject_data["metadata_convergence_directive"] = metadata_convergence_directive
         return reject(
             error=(
                 "Submitted workflow does not cover the missing requested output paths from the last recorded test "
@@ -12363,7 +12409,7 @@ async def _update_workflow(
                 "produce matching structured output before testing again; output_root is diagnostic only."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
+            data=reject_data,
         )
 
     select_option_mismatch_context = _select_option_text_click_repair_context(workflow_yaml, ctx)

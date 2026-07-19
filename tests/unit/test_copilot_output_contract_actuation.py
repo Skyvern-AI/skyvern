@@ -1364,6 +1364,49 @@ def test_has_metadata_reject_attaches_no_metadata_convergence_directive(monkeypa
     assert "metadata_convergence_directive" not in payload
 
 
+def test_synthesized_metadata_less_reject_arms_convergence_directive() -> None:
+    ctx = _ladder_ctx()
+    ctx.turn_id = "turn-synth-metadata-less"
+
+    with capture_logs() as logs:
+        directive = wu._synthesized_metadata_reject_directive(
+            ctx,
+            workflow_yaml=_PAGE_READ_YAML,
+            raw_metadata=[],
+            label_candidates=["collect"],
+            required_paths={"output.confirmation_number"},
+        )
+
+    assert directive is not None
+    assert any(entry["event"] == "copilot_output_contract_spine_structure_directive_emitted" for entry in logs)
+
+
+def test_synthesized_metadata_complete_reject_arms_no_directive() -> None:
+    ctx = _ladder_ctx()
+    ctx.turn_id = "turn-synth-metadata-complete"
+    complete_metadata = [
+        {
+            "block_label": "collect",
+            "declared_goal": "Collect the confirmation number",
+            "claimed_outcomes": ["confirmation captured"],
+            "page_dependencies": ["confirmation page"],
+            "completion_criteria": ["confirmation non-empty"],
+            "terminal_verifier_expectations": ["confirmation rendered"],
+            "evidence_refs": ["scout:confirmation"],
+        }
+    ]
+
+    directive = wu._synthesized_metadata_reject_directive(
+        ctx,
+        workflow_yaml=_PAGE_READ_YAML,
+        raw_metadata=complete_metadata,
+        label_candidates=["collect"],
+        required_paths={"output.confirmation_number"},
+    )
+
+    assert directive is None
+
+
 def test_reject_seam_metadata_required_reaches_advisory_before_no_source_terminal() -> None:
     ctx = _ladder_ctx()
     signature = "sig_metadata_required"
