@@ -78,6 +78,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _bare_drop_superseded_on_screen,
+    _bare_locator_call_selector,
     _credential_field_accesses,
     _get_by_role_expr_strict,
     _is_ignorable_entry_opener_drop,
@@ -94,6 +95,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
+    normalized_scout_selector,
     obligation_finding_reason_code,
     obligation_finding_selector,
     produce_covered_static_return_envelope,
@@ -7563,7 +7565,7 @@ class _BrowserMutationSignature(NamedTuple):
 
 _BrowserSurfaceProvenanceKind = Literal["never_captured", "shape_diverged", "ambiguous", "suffix_disallowed"]
 _BrowserSurfaceDivergenceSource = Literal["synthesized", "trajectory_dropped"]
-_BrowserSurfaceProvenanceSite = Literal["whole_trajectory", "extraction_suffix"]
+_BrowserSurfaceProvenanceSite = Literal["whole_trajectory", "extraction_suffix", "fragment_scout"]
 
 _BROWSER_SURFACE_PROVENANCE_EVENT = "copilot_browser_surface_rejection_provenance"
 
@@ -8270,6 +8272,7 @@ def _scouted_spine_under_build_result(
     draft_codes: list[str],
     block_label: str,
     site: str = "imposition",
+    draft_repairable_only: bool = False,
 ) -> _SynthesizedCodeImpositionResult | None:
     diagnostics = synthesized.diagnostics
     # Lane-flagged emissions (optional dismissals, readonly verifies, entry recovery) are conditional
@@ -8325,6 +8328,10 @@ def _scouted_spine_under_build_result(
                 selector=str(first_uncovered.get("selector") or "") or None,
             ),
         )
+    # Non-uncovered partition findings are synthesizer-side: no draft edit closes them, so a
+    # repair-convergence-only site routes them to the turn-end obligation halt instead of a churn loop.
+    if draft_repairable_only:
+        return None
     partition_findings = [
         finding
         for finding in spine_partition_findings(diagnostics, draft_calls, ctx.scout_trajectory or [])
@@ -8371,16 +8378,10 @@ def _scouted_spine_partition_under_build_result(
     )
 
 
-def _persist_seam_spine_under_build_result(
-    workflow_yaml: str, ctx: AgentContext
-) -> _SynthesizedCodeImpositionResult | None:
+def _pre_persist_scouted_spine_result(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult | None:
+    """Last author-time gate before a durable persist: whatever path produced the final yaml, a draft
+    whose browser calls leave the scouted spine partition open is rejected instead of persisted."""
     if not ctx.impose_synthesized_code_block:
-        return None
-    if ctx.spine_imposition_owned_attempt:
-        return None
-    # First-persist drafts stay imposition's concern; this seam guards later persists in a turn that
-    # already committed one, and the turn-end checkpoint owns coverage for everything else.
-    if not ctx.update_workflow_called and ctx.persisted_draft_browser_calls is None:
         return None
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
@@ -8392,14 +8393,18 @@ def _persist_seam_spine_under_build_result(
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return None
-    code_blocks = _workflow_code_blocks(parsed)
-    synthesized = synthesize_code_block(
-        scout_trajectory,
-        strict_selectors=True,
-        reached_download_target=ctx.reached_download_target,
-    )
+    synthesized = ctx.imposition_synthesized_block
+    if synthesized is None:
+        # Deliberate fallback: when no imposition pass synthesized this attempt, grade a fresh strict
+        # synthesis of the raw trajectory, without imposition's grounded-outcome reconciliation.
+        synthesized = synthesize_code_block(
+            scout_trajectory,
+            strict_selectors=True,
+            reached_download_target=ctx.reached_download_target,
+        )
     if synthesized is None:
         return None
+    code_blocks = _workflow_code_blocks(parsed)
     # A submission with zero code blocks still holds the open spine obligation: empty draft calls
     # leave every required rung uncovered rather than slipping the seam.
     return _scouted_spine_under_build_result(
@@ -8408,12 +8413,121 @@ def _persist_seam_spine_under_build_result(
         synthesized=synthesized,
         draft_codes=[str(block.get("code") or "") for block in code_blocks],
         block_label=", ".join(_code_block_label(block) for block in code_blocks) or _SYNTHESIZED_BLOCK_LABEL,
-        site="persist_seam",
+        site="pre_persist",
+        draft_repairable_only=True,
     )
 
 
 _FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE = "freehand_unresolvable_selector"
 _FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE = "freehand_unguarded_credential_fill"
+
+
+def _scouted_selector_forms(scout_trajectory: list[ScoutedInteraction]) -> set[str]:
+    return {
+        normalized_scout_selector(selector)
+        for interaction in scout_trajectory
+        if (selector := str(interaction.get("selector") or "").strip())
+    }
+
+
+def _receiver_is_self_validating_get_by_role(receiver: str) -> bool:
+    try:
+        node = ast.parse(receiver, mode="eval").body
+    except SyntaxError:
+        return False
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_by_role"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "page"
+    ):
+        return False
+    if len(node.args) != 1:
+        return False
+    role = node.args[0]
+    if not (isinstance(role, ast.Constant) and isinstance(role.value, str) and role.value):
+        return False
+    if any(keyword.arg is None or not isinstance(keyword.value, ast.Constant) for keyword in node.keywords):
+        return False
+    return any(
+        keyword.arg == "name"
+        and isinstance(keyword.value, ast.Constant)
+        and isinstance(keyword.value.value, str)
+        and keyword.value.value
+        for keyword in node.keywords
+    )
+
+
+def _fragment_scout_freehand_validation(
+    *,
+    code_blocks: list[dict[str, Any]],
+    exempt_block: dict[str, Any] | None,
+    prior_yaml: str | None,
+    scout_trajectory: list[ScoutedInteraction],
+    synthesized_code: str,
+    synthesized_diagnostics: SynthesisDiagnostics | None,
+) -> _BrowserSurfaceValidation:
+    """A fragment scout is no authoritative full-spine reference, but every durable mutation must still
+    resolve to a scout-captured form (captured selector or synthesized receiver) or be rejected; only
+    selectorless page navigation and self-validating literal role+name receivers are admitted unscouted."""
+    scouted_forms = _scouted_selector_forms(scout_trajectory)
+    scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
+    admitted_receivers = {
+        (mutation.method, normalized_locator_expr(mutation.receiver)) for mutation in scouted_mutations
+    }
+    violations: list[str] = []
+    provenance: list[_BrowserSurfaceRejectionProvenance] = []
+    for block in code_blocks:
+        if block is exempt_block:
+            continue
+        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
+            continue
+        label = _code_block_label(block)
+        block_mutations, _, block_ambiguous = _browser_surface_for_code(str(block.get("code") or ""))
+        freehand_mutations: list[_BrowserMutationSignature] = []
+        for mutation in block_mutations:
+            if mutation.receiver == "page":
+                continue
+            if (mutation.method, normalized_locator_expr(mutation.receiver)) in admitted_receivers:
+                continue
+            if _receiver_is_self_validating_get_by_role(mutation.receiver):
+                continue
+            selector = _bare_locator_call_selector(mutation.receiver)
+            if selector is not None and normalized_scout_selector(selector) in scouted_forms:
+                continue
+            freehand_mutations.append(mutation)
+        if freehand_mutations:
+            action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(freehand_mutations))
+            block_provenance = [
+                _classify_unscouted_mutation(
+                    mutation,
+                    scouted_mutations=scouted_mutations,
+                    diagnostics=synthesized_diagnostics,
+                    site="fragment_scout",
+                    block_label=label,
+                )
+                for mutation in sorted(freehand_mutations)
+            ]
+            provenance.extend(block_provenance)
+            violations.append(
+                f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): "
+                f"{action_text}.{_provenance_suffix_text(block_provenance)}"
+            )
+        if block_ambiguous:
+            ambiguous_provenance = [
+                _ambiguous_browser_action_provenance(action, site="fragment_scout", block_label=label)
+                for action in block_ambiguous
+            ]
+            provenance.extend(ambiguous_provenance)
+            violations.append(
+                f"Unable to impose synthesized code block: `{label}` contains ambiguous browser action(s): "
+                + ", ".join(block_ambiguous)
+                + "."
+                + _provenance_suffix_text(ambiguous_provenance)
+            )
+    _log_browser_surface_rejection_provenance(provenance)
+    return _BrowserSurfaceValidation(violations, provenance)
 
 
 def _workflow_credential_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
@@ -8588,6 +8702,18 @@ def _persist_seam_freehand_surface_result(
     # The full synthesized spine is an authoritative admissibility reference only when the scout captured a
     # durable entry through a commit; a fragment scout would false-reject legitimate multi-block authoring.
     if synthesized is None or not synthesized_trajectory_reaches_goal(ctx):
+        # scouted_interactions joins the admitted set because the trajectory is cap-evicted; both
+        # collections carry only scout-captured selectors.
+        fragment_validation = _fragment_scout_freehand_validation(
+            code_blocks=code_blocks,
+            exempt_block=exempt_block,
+            prior_yaml=prior_yaml,
+            scout_trajectory=[*scout_trajectory, *ctx.scouted_interactions],
+            synthesized_code=synthesized_code,
+            synthesized_diagnostics=synthesized_diagnostics,
+        )
+        if fragment_validation.violations:
+            return _freehand_surface_reject(workflow_yaml, code_blocks, fragment_validation)
         return None
     validation = _whole_trajectory_browser_surface_violations(
         code_blocks=code_blocks,
@@ -9863,6 +9989,7 @@ def _maybe_impose_synthesized_code_block(
     ctx.pending_requested_output_extraction_candidate = None
     ctx.spine_imposition_owned_attempt = False
     ctx.spine_imposition_carrier_label = None
+    ctx.imposition_synthesized_block = None
     if not getattr(ctx, "impose_synthesized_code_block", False):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
@@ -9957,6 +10084,7 @@ def _maybe_impose_synthesized_code_block(
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
         )
+    ctx.imposition_synthesized_block = synthesized
     if synthesized.diagnostics.grounded_submit_binding_fingerprints:
         LOG.info(
             "copilot recorded outcome binding consumed by synthesizer",
@@ -11517,17 +11645,6 @@ async def _update_workflow(
             )
     workflow_yaml = imposition.workflow_yaml
     if imposition.substitutions is None:
-        seam_under_build = _persist_seam_spine_under_build_result(workflow_yaml, ctx)
-        if seam_under_build is not None:
-            _set_code_authoring_repair_context(ctx, seam_under_build.repair_context)
-            _record_code_authoring_guardrail_reject(ctx)
-            return reject(
-                error="\n".join(seam_under_build.violations),
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data=_code_repair_progress_data(seam_under_build.repair_context),
-                repair_context=seam_under_build.repair_context,
-                record_repair_context_outcome=False,
-            )
         freehand_surface = _persist_seam_freehand_surface_result(workflow_yaml, ctx)
         if freehand_surface is not None:
             _set_code_authoring_repair_context(ctx, freehand_surface.repair_context)
@@ -12262,6 +12379,18 @@ async def _update_workflow(
             "user_facing_summary": _compiled_authoring_user_summary(),
             "data": _code_repair_progress_data(select_option_mismatch_context),
         }
+
+    pre_persist_spine = _pre_persist_scouted_spine_result(workflow_yaml, ctx)
+    if pre_persist_spine is not None:
+        _set_code_authoring_repair_context(ctx, pre_persist_spine.repair_context)
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(
+            error="\n".join(pre_persist_spine.violations),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(pre_persist_spine.repair_context),
+            repair_context=pre_persist_spine.repair_context,
+            record_repair_context_outcome=False,
+        )
 
     try:
         # A code block renders code-first (goal + plain step timeline) only when it

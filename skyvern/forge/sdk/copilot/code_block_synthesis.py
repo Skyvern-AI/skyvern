@@ -1929,6 +1929,15 @@ SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE = "scouted_spine_unrecorded_index"
 SCOUTED_SPINE_TRUNCATED_REASON_CODE = "scouted_spine_truncated"
 
 
+_LEADING_TAG_ID_SELECTOR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*#")
+
+
+def normalized_scout_selector(selector: str) -> str:
+    # Capture and persist-seam comparison share one normal form: a leading `tag#id` qualifier reduces
+    # to `#id` (ids are document-unique), so both sides name the same control.
+    return _LEADING_TAG_ID_SELECTOR_RE.sub("#", selector)
+
+
 def normalized_locator_expr(text: str) -> str:
     try:
         return ast.unparse(ast.parse(text, mode="eval"))
