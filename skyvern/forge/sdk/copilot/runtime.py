@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
     )
+    from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
@@ -494,9 +495,12 @@ class AgentContext:
     # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
     pending_goal_complete_landing: bool = False
     synthesized_goal_complete_landed: bool = False
-    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
-    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    # Imposition answered this persist attempt on a goal-complete trajectory; owned-carrier metadata
+    # scaffolding keys off it (workflow_update._scaffold_metadata_from_owned_carrier_produced_output).
     spine_imposition_owned_attempt: bool = False
+    # Synthesized block computed by this persist attempt's imposition pass; the pre-persist spine gate
+    # reuses it so both seams grade one synthesis. Reset at each imposition entry.
+    imposition_synthesized_block: SynthesizedCodeBlock | None = None
     # Label of the code block the imposition attempt owns this call (carrier), including on no-op early
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None
