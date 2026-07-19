@@ -1,0 +1,105 @@
+---
+title: "get_browser_profile_usage"
+slug: sdk-reference/browser-profiles/get-browser-profile-usage
+---
+
+List the workflows, credentials, and recent runs that depend on a browser profile. Use this before deleting a profile to see what would be affected.
+
+<CodeGroup>
+```python Python
+usage = await client.get_browser_profile_usage("bp_abc123")
+
+for workflow in usage.workflows:
+    print(f"{workflow.title} ({workflow.workflow_permanent_id}) via {workflow.via}")
+
+for credential in usage.credentials:
+    print(f"{credential.name} ({credential.credential_id})")
+
+print(f"Recent seeded runs: {usage.recent_seeded_run_count}")
+```
+
+```typescript TypeScript
+const usage = await skyvern.getBrowserProfileUsage("bp_abc123");
+
+for (const workflow of usage.workflows) {
+  console.log(`${workflow.title} (${workflow.workflow_permanent_id}) via ${workflow.via}`);
+}
+
+for (const credential of usage.credentials) {
+  console.log(`${credential.name} (${credential.credential_id})`);
+}
+
+console.log(`Recent seeded runs: ${usage.recent_seeded_run_count}`);
+```
+</CodeGroup>
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile_id` | `str` | Yes | The browser profile ID. |
+| `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+### Returns `BrowserProfileUsage`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `workflows` | `list[BrowserProfileUsageWorkflow]` | Workflows that reference the browser profile. |
+| `credentials` | `list[BrowserProfileUsageCredential]` | Credentials attached to the browser profile. |
+| `recent_seeded_run_count` | `int` | Number of recent runs that were seeded from this browser profile. |
+
+**`BrowserProfileUsageWorkflow`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `workflow_permanent_id` | `str` | Permanent ID of the workflow. |
+| `title` | `str` | Display title of the workflow. |
+| `via` | `str` | How the workflow is linked to the profile (for example, `browser_profile_id` or `credential`). |
+
+**`BrowserProfileUsageCredential`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `credential_id` | `str` | ID of the credential. |
+| `name` | `str` | Display name of the credential. |
+
+---
+
+### Request options
+
+
+Override timeout, retries, or headers for this call by passing `request_options` (Python) or a second options argument (TypeScript).
+
+<CodeGroup>
+```python Python
+from skyvern.client.core import RequestOptions
+
+request_options=RequestOptions(
+    timeout_in_seconds=120,
+    max_retries=3,
+    additional_headers={"x-custom-header": "value"},
+)
+```
+
+```typescript TypeScript
+// Pass as second argument to any method
+{
+  timeoutInSeconds: 120,
+  maxRetries: 3,
+  headers: { "x-custom-header": "value" },
+}
+```
+</CodeGroup>
+
+| Option (Python) | Option (TypeScript) | Type | Description |
+|-----------------|---------------------|------|-------------|
+| `timeout_in_seconds` | `timeoutInSeconds` | `int` / `number` | HTTP timeout in seconds. |
+| `max_retries` | `maxRetries` | `int` / `number` | Retry count. |
+| `additional_headers` | `headers` | `dict` / `Record<string, string>` | Extra headers. |
+| `additional_query_parameters` | - | `dict` | Extra query parameters. |
+| `additional_body_parameters` | - | `dict` | Extra body parameters. |
+| - | `abortSignal` | `AbortSignal` | Signal to cancel the request. |
+| - | `apiKey` | `string` | Override API key. |
+
+
+---

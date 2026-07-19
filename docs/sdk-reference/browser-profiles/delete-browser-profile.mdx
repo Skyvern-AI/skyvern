@@ -3,7 +3,7 @@ title: "delete_browser_profile"
 slug: sdk-reference/browser-profiles/delete-browser-profile
 ---
 
-Delete a browser profile.
+Soft-delete a browser profile. Any credentials attached to the profile are detached in the same transaction, so future logins for those credentials will not resolve to a deleted profile.
 
 <CodeGroup>
 ```python Python
@@ -21,6 +21,10 @@ await skyvern.deleteBrowserProfile("bp_abc123");
 |-----------|------|----------|-------------|
 | `profile_id` | `str` | Yes | The browser profile ID to delete. |
 | `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
+
+<Info>
+To see which workflows, credentials, and recent runs depend on a profile before deleting, call [`get_browser_profile_usage`](/sdk-reference/browser-profiles/get-browser-profile-usage).
+</Info>
 
 <Warning>
 `browser_profile_id` only works with `run_workflow`, not `run_task`. If you pass it to `run_task`, it will be silently ignored.

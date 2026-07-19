@@ -24,7 +24,11 @@ for (const p of profiles) {
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `include_deleted` | `bool` | No | `None` | Include soft-deleted profiles in the results. |
+| `page` | `int` | No | `1` | Page number to return (1-indexed). |
+| `page_size` | `int` | No | `10` | Number of profiles per page. |
+| `include_deleted` | `bool` | No | `False` | Include soft-deleted profiles in the results. |
+| `search_key` | `str` | No | `None` | Case-insensitive substring match against the profile name and description. A profile is returned if either field matches. |
+| `managed` | `bool` | No | `None` | Omit to return all profiles; `False` returns only user-created profiles; `True` returns only auto-managed profiles. |
 | `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
 
 ### Returns `list[BrowserProfile]`
