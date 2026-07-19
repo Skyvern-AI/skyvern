@@ -24,7 +24,10 @@ from types import ModuleType
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.forge_log import setup_logger
+
+_OTLP_EXPORTER_LOGGER = "opentelemetry.exporter.otlp.proto.grpc.exporter"
 
 _TOUCHED_LOGGERS = (
     "uvicorn.error",
@@ -35,6 +38,7 @@ _TOUCHED_LOGGERS = (
     "websockets.client",
     "websockets.legacy",
     "websockets.legacy.server",
+    _OTLP_EXPORTER_LOGGER,
 )
 
 
@@ -55,6 +59,37 @@ def test_setup_logger_silences_uvicorn_and_websockets(_restore_logger_levels: No
     assert logging.getLogger("websockets.client").level == logging.WARNING
     assert logging.getLogger("websockets.legacy").level == logging.WARNING
     assert logging.getLogger("websockets.legacy.server").level == logging.WARNING
+
+
+def test_setup_logger_defaults_otlp_exporter_logger_to_warning(_restore_logger_levels: None) -> None:
+    setup_logger()
+    assert logging.getLogger(_OTLP_EXPORTER_LOGGER).level == logging.WARNING
+
+
+def test_setup_logger_suppresses_otlp_exporter_logs_at_critical(
+    _restore_logger_levels: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "OTEL_EXPORTER_LOG_LEVEL", "CRITICAL")
+
+    setup_logger()
+
+    exporter_logger = logging.getLogger(_OTLP_EXPORTER_LOGGER)
+    assert exporter_logger.level == logging.CRITICAL
+    # The exporter emits its failure spam at WARNING ("Transient error ... retrying")
+    # and ERROR ("Failed to export ..."); both records must be dropped so they never
+    # reach stdout/log ingestion. A mere severity relabel would still emit them.
+    assert exporter_logger.isEnabledFor(logging.WARNING) is False
+    assert exporter_logger.isEnabledFor(logging.ERROR) is False
+
+
+def test_setup_logger_falls_back_to_warning_for_unknown_exporter_level(
+    _restore_logger_levels: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "OTEL_EXPORTER_LOG_LEVEL", "NOT_A_LEVEL")
+
+    setup_logger()
+
+    assert logging.getLogger(_OTLP_EXPORTER_LOGGER).level == logging.WARNING
 
 
 @pytest.mark.parametrize(
