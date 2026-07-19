@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
@@ -7,8 +9,14 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
+    _record_code_authoring_guardrail_reject,
+)
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
+    raise_if_turn_halt,
     retire_outranked_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
@@ -48,6 +56,23 @@ def _signal(
 
 def _churn_signal() -> CopilotToolBlockerSignal:
     return _signal("code_authoring_guardrail_churn")
+
+
+_REPLAY_STRUCTURAL_KEY = "b3d8aac91f1ae3a92d60ebd15ebee04216af45b03f18fe39d6deeefa77140e33"
+
+
+def _synthesized_force_signal() -> CopilotToolBlockerSignal:
+    return _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False)
+
+
+def _synthesized_replay_context() -> CopilotContext:
+    ctx = make_copilot_context()
+    ctx.impose_synthesized_code_block = True
+    ctx.recorded_build_test_outcome_history = [
+        {"structural_key": _REPLAY_STRUCTURAL_KEY, "phase": "build_test"},
+        {"structural_key": _REPLAY_STRUCTURAL_KEY, "phase": "build_test"},
+    ]
+    return ctx
 
 
 def _grant_ladder(ctx: CopilotContext) -> None:
@@ -416,3 +441,44 @@ def test_fresh_context_has_no_owner() -> None:
     ctx = make_copilot_context()
     assert current_turn_owner(ctx) is None
     assert ctx.gate_precedence_conflict_events == []
+
+
+def test_exhausted_churn_owns_over_held_synthesized_force_and_halts() -> None:
+    ctx = _synthesized_replay_context()
+    assert (
+        claim_and_stash_blocker_signal(
+            ctx, TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE, _synthesized_force_signal()
+        )
+        is not None
+    )
+
+    for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+        _record_code_authoring_guardrail_reject(ctx)
+
+    owner = current_turn_owner(ctx)
+    assert owner is not None
+    assert owner.claimant is TurnClaimant.CODE_AUTHORING_CHURN
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "code_authoring_guardrail_churn"
+    assert blocker_signal_render_allowed(ctx, ctx.blocker_signal) is True
+    assert "code_authoring_guardrail_churn>synthesized_block_persistence_force" in _conflict_fingerprints(ctx)
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+
+    stash_turn_halt_from_blocker_signal(ctx, ctx.blocker_signal, source="enforcement_backstop")
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx)
+
+
+def test_standard_path_churn_precedence_unchanged() -> None:
+    ctx = make_copilot_context()
+    assert (
+        claim_and_stash_blocker_signal(
+            ctx, TurnClaimant.CREDENTIAL_PRIORITY_CHURN, _signal("credential_priority_authoring_churn")
+        )
+        is not None
+    )
+    assert claim_turn(ctx, TurnClaimant.CODE_AUTHORING_CHURN) is ClaimOutcome.YIELDED
+
+    ctx2 = make_copilot_context()
+    assert claim_and_stash_blocker_signal(ctx2, TurnClaimant.CODE_AUTHORING_CHURN, _churn_signal()) is not None
+    assert claim_turn(ctx2, TurnClaimant.LOOP_DETECTED) is ClaimOutcome.YIELDED
