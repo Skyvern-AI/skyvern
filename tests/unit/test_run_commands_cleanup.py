@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import threading
 from unittest.mock import AsyncMock, MagicMock, call
@@ -15,14 +16,19 @@ def _reset_cleanup_state() -> None:
     run_commands._mcp_cleanup_done = False
     run_commands._mcp_cleanup_in_progress = False
     run_commands._mcp_eof_shutdown_requested = False
+    run_commands._mcp_main_task = None
+    run_commands._mcp_shutdown_exit_code = None
 
 
 @pytest.mark.asyncio
 async def test_cleanup_mcp_resources_closes_auth_db(monkeypatch: pytest.MonkeyPatch) -> None:
-    close_current_session = AsyncMock()
-    close_skyvern = AsyncMock()
-    close_auth_db = AsyncMock()
+    order: list[str] = []
+    shutdown_action_log_worker = AsyncMock(side_effect=lambda: order.append("action_log"))
+    close_current_session = AsyncMock(side_effect=lambda: order.append("session"))
+    close_skyvern = AsyncMock(side_effect=lambda: order.append("client"))
+    close_auth_db = AsyncMock(side_effect=lambda: order.append("auth"))
 
+    monkeypatch.setattr("skyvern.cli.core.action_log.shutdown_action_log_worker", shutdown_action_log_worker)
     monkeypatch.setattr("skyvern.cli.core.session_manager.close_current_session", close_current_session)
     monkeypatch.setattr("skyvern.cli.core.client.close_skyvern", close_skyvern)
     monkeypatch.setattr("skyvern.cli.core.mcp_http_auth.close_auth_db", close_auth_db)
@@ -32,6 +38,7 @@ async def test_cleanup_mcp_resources_closes_auth_db(monkeypatch: pytest.MonkeyPa
     close_current_session.assert_awaited_once()
     close_skyvern.assert_awaited_once()
     close_auth_db.assert_awaited_once()
+    assert order == ["action_log", "session", "client", "auth"]
 
 
 @pytest.mark.asyncio
@@ -247,72 +254,93 @@ def test_mcp_shutdown_signal_uses_source_specific_exit_code(
     eof_shutdown: bool,
     expected_exit_code: int,
 ) -> None:
-    cleanup, force_exit = MagicMock(), MagicMock()
     run_commands._mcp_eof_shutdown_requested = eof_shutdown
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup)
-    monkeypatch.setattr(run_commands.os, "_exit", force_exit)
 
-    run_commands._handle_mcp_shutdown_signal(getattr(run_commands.signal, signum), None)
+    with pytest.raises(SystemExit) as exc_info:
+        run_commands._handle_mcp_shutdown_signal(getattr(run_commands.signal, signum), None)
 
-    cleanup.assert_called_once_with()
-    force_exit.assert_called_once_with(expected_exit_code)
-
-
-def test_mcp_shutdown_signal_exits_even_when_cleanup_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    force_exit = MagicMock()
-    run_commands._mcp_eof_shutdown_requested = False
-    monkeypatch.setattr(
-        run_commands, "_cleanup_mcp_resources_blocking", MagicMock(side_effect=RuntimeError("cleanup blew up"))
-    )
-    monkeypatch.setattr(run_commands.os, "_exit", force_exit)
-
-    with pytest.raises(RuntimeError, match="cleanup blew up"):
-        run_commands._handle_mcp_shutdown_signal(run_commands.signal.SIGTERM, None)
-
-    force_exit.assert_called_once_with(143)
+    assert exc_info.value.code == expected_exit_code
+    assert run_commands._mcp_shutdown_exit_code == expected_exit_code
 
 
 def test_mcp_shutdown_signal_does_not_exit_during_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
-    cleanup, force_exit = MagicMock(), MagicMock()
     run_commands._mcp_cleanup_in_progress = True
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup)
-    monkeypatch.setattr(run_commands.os, "_exit", force_exit)
 
     run_commands._handle_mcp_shutdown_signal(run_commands.signal.SIGINT, None)
 
-    cleanup.assert_not_called()
-    force_exit.assert_not_called()
 
-
-def test_run_mcp_sigterm_calls_blocking_cleanup_in_finally(monkeypatch: pytest.MonkeyPatch) -> None:
-    cleanup_blocking, force_exit = MagicMock(), MagicMock(side_effect=KeyboardInterrupt)
+@pytest.mark.parametrize(
+    ("signum", "eof_shutdown", "expected_exit_code"),
+    [("SIGTERM", False, 143), ("SIGINT", True, 0)],
+)
+def test_run_mcp_signal_drains_before_sibling_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    signum: str,
+    eof_shutdown: bool,
+    expected_exit_code: int,
+) -> None:
+    cleanup_calls = 0
+    run_loop: asyncio.AbstractEventLoop | None = None
+    sibling: asyncio.Task[None] | None = None
     register = MagicMock()
-    signal_install = MagicMock(return_value=run_commands.signal.SIG_DFL)
-    run = MagicMock(side_effect=lambda **_kwargs: run_commands._handle_mcp_shutdown_signal(15, None))
+    run = AsyncMock()
     set_stateless = MagicMock()
     eof_event = MagicMock()
 
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup_blocking)
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    async def run_async(**_kwargs: object) -> None:
+        nonlocal run_loop, sibling
+        run_loop = asyncio.get_running_loop()
+        sibling = asyncio.create_task(wait_forever())
+        run_commands._mcp_eof_shutdown_requested = eof_shutdown
+        run_loop.call_later(0.01, run_commands.signal.raise_signal, getattr(run_commands.signal, signum))
+        await asyncio.Event().wait()
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        assert asyncio.get_running_loop() is run_loop
+        assert sibling is not None
+        assert sibling.cancelling() == 0
+        cleanup_calls += 1
+        sibling.cancel()
+        await asyncio.gather(sibling, return_exceptions=True)
+
+    run.side_effect = run_async
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (eof_event, eof_event))
-    monkeypatch.setattr(run_commands.os, "_exit", force_exit)
-    monkeypatch.setattr(run_commands.signal, "signal", signal_install)
     monkeypatch.setattr(run_commands.atexit, "register", register)
-    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run", run)
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run)
     monkeypatch.setattr("skyvern.cli.core.session_manager.set_stateless_http_mode", set_stateless)
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(SystemExit) as exc_info:
         run_commands.run_mcp()
 
+    assert exc_info.value.code == expected_exit_code
     register.assert_called_once_with(run_commands._cleanup_mcp_resources_sync)
-    assert call(run_commands.signal.SIGTERM, run_commands._handle_mcp_shutdown_signal) in signal_install.call_args_list
-    run.assert_called_once_with(transport="stdio")
+    run.assert_awaited_once_with(transport="stdio")
+    assert cleanup_calls == 1
+    assert run_commands._mcp_main_task is None
+    assert run_commands._mcp_shutdown_exit_code == expected_exit_code
     set_stateless.assert_has_calls([call(False), call(False)])
-    assert cleanup_blocking.call_count == 2 and force_exit.call_args == call(143)
+
+    run_commands._cleanup_mcp_resources_sync()
+    assert cleanup_calls == 1
 
 
 def test_run_mcp_restores_signal_handlers_after_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
+    run_loop: asyncio.AbstractEventLoop | None = None
     originals = {run_commands.signal.SIGINT: object(), run_commands.signal.SIGTERM: object()}
+
+    async def run_async(**_kwargs: object) -> None:
+        nonlocal run_loop
+        run_loop = asyncio.get_running_loop()
+
+    async def cleanup() -> None:
+        assert asyncio.get_running_loop() is run_loop
+        events.append("cleanup")
 
     def install_signal_handler(handled_signal: run_commands.signal.Signals, handler: object) -> object:
         if handler is run_commands._handle_mcp_shutdown_signal:
@@ -322,35 +350,35 @@ def test_run_mcp_restores_signal_handlers_after_cleanup(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(run_commands.signal, "signal", install_signal_handler)
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (MagicMock(), MagicMock()))
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", lambda: events.append("cleanup"))
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(run_commands.atexit, "register", MagicMock())
-    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run", MagicMock())
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run_async)
 
     run_commands.run_mcp()
 
-    assert events == ["cleanup", "restore", "restore"]
+    assert events[-3:] == ["cleanup", "restore", "restore"]
 
 
-def test_run_mcp_stdin_eof_invokes_blocking_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
-    cleanup_blocking = MagicMock()
+def test_run_mcp_stdin_eof_invokes_original_loop_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    cleanup = AsyncMock()
     request_shutdown, force_exit = MagicMock(), MagicMock()
     eof_detected = threading.Event()
     poller = MagicMock()
     poller.poll.side_effect = lambda _timeout: (eof_detected.set(), [(123, run_commands.select.POLLHUP)])[1]
 
-    def return_on_eof(**_kwargs: object) -> None:
-        assert eof_detected.wait(1)
+    async def return_on_eof(**_kwargs: object) -> None:
+        assert await asyncio.to_thread(eof_detected.wait, 1)
 
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup_blocking)
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(run_commands._thread, "interrupt_main", request_shutdown)
     monkeypatch.setattr(run_commands.os, "_exit", force_exit)
     monkeypatch.setattr(run_commands.select, "poll", lambda: poller)
     monkeypatch.setattr(run_commands.atexit, "register", MagicMock())
-    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run", return_on_eof)
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", return_on_eof)
 
     run_commands.run_mcp()
 
-    cleanup_blocking.assert_called_once_with()
+    cleanup.assert_awaited_once_with()
     request_shutdown.assert_not_called()
     force_exit.assert_not_called()
 
@@ -358,14 +386,14 @@ def test_run_mcp_stdin_eof_invokes_blocking_cleanup(monkeypatch: pytest.MonkeyPa
 def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
 
-    cleanup_blocking = MagicMock()
+    cleanup = AsyncMock()
     register = MagicMock()
-    run = MagicMock()
+    run = AsyncMock()
     set_stateless = MagicMock()
 
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", cleanup_blocking)
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(run_commands.atexit, "register", register)
-    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run", run)
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run)
     monkeypatch.setattr("skyvern.cli.core.session_manager.set_stateless_http_mode", set_stateless)
 
     run_commands.run_mcp(
@@ -377,7 +405,7 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     )
 
     register.assert_called_once_with(run_commands._cleanup_mcp_resources_sync)
-    run.assert_called_once()
+    run.assert_awaited_once()
     kwargs = run.call_args.kwargs
     assert kwargs["transport"] == "streamable-http"
     assert kwargs["host"] == "127.0.0.1"
@@ -389,7 +417,7 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     assert middleware[0].cls is run_commands._ServerCardMiddleware
     assert middleware[1].cls is MCPAPIKeyMiddleware
     set_stateless.assert_has_calls([call(True), call(False)])
-    cleanup_blocking.assert_called_once()
+    cleanup.assert_awaited_once()
 
 
 @pytest.mark.asyncio

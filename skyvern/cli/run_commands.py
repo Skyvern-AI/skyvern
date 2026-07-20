@@ -47,6 +47,8 @@ LOG = structlog.get_logger(__name__)
 _mcp_cleanup_done = False
 _mcp_cleanup_in_progress = False
 _mcp_eof_shutdown_requested = False
+_mcp_main_task: asyncio.Task[Any] | None = None
+_mcp_shutdown_exit_code: int | None = None
 _MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS = 5.0
 _MCP_NATIVE_EOF_GRACE_SECONDS = 0.25
 # The EOF watcher's os._exit(0) preempts cleanup unconditionally, so this must exceed
@@ -60,17 +62,21 @@ def _default_host() -> str:
 
 
 async def _cleanup_mcp_resources() -> None:
+    from skyvern.cli.core.action_log import shutdown_action_log_worker  # noqa: PLC0415
     from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
     from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
     from skyvern.cli.core.session_manager import close_current_session  # noqa: PLC0415
 
     try:
-        await close_current_session()
+        await shutdown_action_log_worker()
     finally:
         try:
-            await close_skyvern()
+            await close_current_session()
         finally:
-            await close_auth_db()
+            try:
+                await close_skyvern()
+            finally:
+                await close_auth_db()
 
 
 def _cleanup_mcp_resources_blocking() -> None:
@@ -209,14 +215,33 @@ def _start_stdin_eof_watcher() -> tuple[threading.Event, threading.Event]:
 
 
 def _handle_mcp_shutdown_signal(_signum: int, _frame: Any) -> None:
+    global _mcp_shutdown_exit_code
     if _mcp_cleanup_in_progress:
         return
+    # Exit 0 only for the EOF watcher's synthetic SIGINT; a real SIGTERM keeps 143.
+    eof_initiated = _mcp_eof_shutdown_requested and _signum == signal.SIGINT
+    _mcp_shutdown_exit_code = 0 if eof_initiated else 128 + _signum
+    if _mcp_main_task is None:
+        raise SystemExit(_mcp_shutdown_exit_code)
+    # Cancel only the wrapper so its finally drains sibling tasks before asyncio.run closes.
+    _mcp_main_task.cancel()
+
+
+async def _run_mcp_with_cleanup(run_async: Any, **kwargs: Any) -> None:
+    global _mcp_cleanup_done, _mcp_cleanup_in_progress, _mcp_main_task
+    current_task = asyncio.current_task()
+    _mcp_main_task = current_task
     try:
-        _cleanup_mcp_resources_blocking()
+        await run_async(**kwargs)
     finally:
-        # Exit 0 only for the EOF watcher's synthetic SIGINT; a real SIGTERM keeps 143.
-        eof_initiated = _mcp_eof_shutdown_requested and _signum == signal.SIGINT
-        os._exit(0 if eof_initiated else 128 + _signum)
+        _mcp_cleanup_in_progress = True
+        try:
+            await _cleanup_mcp_resources()
+        finally:
+            _mcp_cleanup_done = True
+            _mcp_cleanup_in_progress = False
+            if _mcp_main_task is current_task:
+                _mcp_main_task = None
 
 
 def get_pids_on_port(port: int) -> list[int]:
@@ -584,8 +609,9 @@ def run_mcp(
     ] = False,
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
-    global _mcp_eof_shutdown_requested
+    global _mcp_eof_shutdown_requested, _mcp_shutdown_exit_code
     _mcp_eof_shutdown_requested = False
+    _mcp_shutdown_exit_code = None
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
     try:
         from skyvern.library.local_browser_profile import (  # noqa: PLC0415
@@ -615,20 +641,28 @@ def run_mcp(
             original_signal_handlers[signal.SIGINT] = signal.signal(signal.SIGINT, _handle_mcp_shutdown_signal)
             original_signal_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, _handle_mcp_shutdown_signal)
             eof_watcher_stop, shutdown_complete = _start_stdin_eof_watcher()
-            mcp.run(transport="stdio")
+            try:
+                asyncio.run(_run_mcp_with_cleanup(mcp.run_async, transport="stdio"))
+            except asyncio.CancelledError:
+                if _mcp_shutdown_exit_code is None:
+                    raise
+                raise SystemExit(_mcp_shutdown_exit_code) from None
             return
 
         middleware = [
             Middleware(_ServerCardMiddleware, transport_type=transport, host=host, port=port, mcp_path=path),
             Middleware(MCPAPIKeyMiddleware),
         ]
-        mcp.run(
-            transport=transport,
-            host=host,
-            port=port,
-            path=path,
-            middleware=middleware,
-            stateless_http=stateless_http_enabled,
+        asyncio.run(
+            _run_mcp_with_cleanup(
+                mcp.run_async,
+                transport=transport,
+                host=host,
+                port=port,
+                path=path,
+                middleware=middleware,
+                stateless_http=stateless_http_enabled,
+            )
         )
     finally:
         if eof_watcher_stop is not None:
@@ -636,7 +670,6 @@ def run_mcp(
         try:
             set_stateless_http_mode(False)
             set_concise_responses(False)
-            _cleanup_mcp_resources_blocking()
         finally:
             for handled_signal, original_handler in original_signal_handlers.items():
                 signal.signal(handled_signal, original_handler)

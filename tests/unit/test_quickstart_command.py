@@ -70,6 +70,9 @@ def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_
             assert transport == "stdio"
             run_mcp_server()
 
+        async def run_async(self, *, transport: str, **_: object) -> None:
+            self.run(transport=transport)
+
     fake_mcp_tools.mcp = FakeMCP()
 
     monkeypatch.setattr(run_commands, "prepare_cli_runtime", lambda **_kwargs: events.append("prepare"))
@@ -78,7 +81,11 @@ def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_
     monkeypatch.setattr(run_commands, "set_concise_responses", lambda _: None)
     eof_event = types.SimpleNamespace(set=lambda: None)
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (eof_event, eof_event))
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", lambda: events.append("cleanup"))
+
+    async def _fake_cleanup_mcp_resources() -> None:
+        events.append("cleanup")
+
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", _fake_cleanup_mcp_resources)
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.mcp_http_auth", fake_auth)
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.session_manager", fake_session_manager)
     monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools", fake_mcp_tools)
@@ -314,6 +321,9 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
             assert os.environ["SKYVERN_BASE_URL"] == "http://project"
             events.append(f"run:{transport}")
 
+        async def run_async(self, *, transport: str, **_: object) -> None:
+            self.run(transport=transport)
+
     fake_mcp_tools.mcp = FakeMCP()
 
     monkeypatch.chdir(tmp_path)
@@ -324,7 +334,11 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
     monkeypatch.setattr(run_commands.atexit, "register", lambda _: None)
     eof_event = types.SimpleNamespace(set=lambda: None)
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (eof_event, eof_event))
-    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", lambda: events.append("cleanup"))
+
+    async def fake_cleanup_mcp_resources() -> None:
+        events.append("cleanup")
+
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", fake_cleanup_mcp_resources)
     monkeypatch.setitem(sys.modules, "skyvern.forge.sdk.forge_log", fake_forge_log)
     monkeypatch.setitem(sys.modules, "skyvern.library.local_browser_profile", fake_local_browser_profile)
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.mcp_http_auth", fake_auth)
@@ -340,8 +354,8 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
         "telemetry:local_cli:stdio",
         "stateless:False",
         "run:stdio",
-        "stateless:False",
         "cleanup",
+        "stateless:False",
     ]
 
 

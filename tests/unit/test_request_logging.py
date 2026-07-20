@@ -450,6 +450,10 @@ def _make_app() -> FastAPI:
             ),
         }
 
+    @app.post("/v1/browser_sessions/{browser_session_id}/action_logs")
+    async def create_action_logs(browser_session_id: str) -> dict:
+        return {"accepted": 1, "browser_session_id": browser_session_id}
+
     @app.get("/missing")
     async def missing() -> dict:
         raise HTTPException(status_code=404, detail="not found")
@@ -479,6 +483,21 @@ def log_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 class TestMiddlewareLogVolume:
+    def test_action_log_request_and_response_bodies_are_fully_redacted(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        secret = "sk-test-action-log-secret"
+
+        response = client.post(
+            "/v1/browser_sessions/pbs_test/action_logs",
+            json={"events": [{"selector": f'input[value="{secret}"]'}]},
+        )
+
+        assert response.status_code == 200
+        log_mock.info.assert_called_once()
+        assert log_mock.info.call_args.kwargs["body"] == _REDACTED
+        assert log_mock.info.call_args.kwargs["response_body"] == _REDACTED
+        assert secret not in str(log_mock.info.call_args)
+
     def test_successful_sensitive_get_keeps_redacted_audit_line(self, log_mock: MagicMock) -> None:
         """OTP/credential reads must leave an audit trail even though they are successful reads."""
         client = TestClient(_make_app())

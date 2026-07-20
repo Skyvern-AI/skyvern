@@ -1347,29 +1347,35 @@ def _tel_pattern_allows_bare_digits(pattern: str | None, bare_digits: str) -> bo
         return True
 
 
+def _tel_constraints_accept(value: str, *, pattern: str | None, maxlength: str | None) -> bool:
+    # Unlike the required bare-digit first attempt, optional +1 handling fails closed when the
+    # browser's pattern cannot be interpreted safely by Python. A declared-but-empty pattern
+    # matches only the empty string in HTML, so it must not be treated as absent.
+    if pattern is not None:
+        try:
+            if re.fullmatch(pattern, value) is None:
+                return False
+        except re.error:
+            return False
+    if maxlength:
+        try:
+            max_chars = int(maxlength)
+        except ValueError:
+            return False
+        if max_chars < 0 or len(value) > max_chars:
+            return False
+    return True
+
+
 def _nanp_e164_fallback(value: str, *, pattern: str | None, maxlength: str | None) -> str | None:
     """Return a canonical E.164 retry only with explicit +1 evidence and permissive field constraints."""
     national_digits = _nanp_national_digits(value)
     if national_digits is None or not _has_explicit_nanp_country_code(value):
         return None
     e164_value = f"+1{national_digits}"
-    if pattern:
-        try:
-            if re.fullmatch(pattern, e164_value) is None:
-                return None
-        except re.error:
-            # Unlike the required bare-digit first attempt, this optional +1 rewrite fails closed when
-            # the browser's pattern cannot be interpreted safely by Python.
-            return None
-
-    if maxlength:
-        try:
-            max_chars = int(maxlength)
-        except ValueError:
-            return None
-        if max_chars < 0 or len(e164_value) > max_chars:
-            return None
-    return e164_value
+    if _tel_constraints_accept(e164_value, pattern=pattern, maxlength=maxlength):
+        return e164_value
+    return None
 
 
 def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | None) -> tuple[str, bool, bool]:
@@ -1537,15 +1543,23 @@ async def verify_phone_input_digits(
     locator: Locator,
     expected_value: str,
     allow_nanp_country_prefix: bool = False,
+    pattern: str | None = None,
+    maxlength: str | None = None,
 ) -> None:
     # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator)
     expected_digits = _phone_digits(expected_value)
     actual_digits = _phone_digits(actual_value)
+    # A field rendering a literal "+1" over the typed digits asserts NANP for itself; trust it only
+    # when that rendered value also satisfies the field's declared constraints. Weaker markers
+    # (bare or trunk "1") stay fail-loud.
+    field_asserts_nanp = (actual_value or "").strip().startswith("+1") and _tel_constraints_accept(
+        actual_value or "", pattern=pattern, maxlength=maxlength
+    )
     if not _phone_readback_digits_match(
         expected_digits,
         actual_digits,
-        allow_nanp_country_prefix=allow_nanp_country_prefix,
+        allow_nanp_country_prefix=allow_nanp_country_prefix or field_asserts_nanp,
     ):
         raise PhoneNumberInputMismatch(
             expected_digit_count=len(expected_digits),
@@ -1564,12 +1578,16 @@ async def _verify_tel_input_after_fill(
     tag_name: str,
     expected_value: str,
     allow_nanp_country_prefix: bool,
+    pattern: str | None = None,
+    maxlength: str | None = None,
 ) -> None:
     await verify_phone_input_digits(
         tag_name=tag_name,
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
         allow_nanp_country_prefix=allow_nanp_country_prefix,
+        pattern=pattern,
+        maxlength=maxlength,
     )
 
 
@@ -1579,6 +1597,8 @@ async def _fill_nanp_tel_with_readback(
     tag_name: str,
     national_digits: str,
     e164_fallback: str | None,
+    pattern: str | None = None,
+    maxlength: str | None = None,
 ) -> PhoneNumberInputMismatch | None:
     """Fill affirmative NANP digits and verify every attempt.
     Retry atomically with national digits before constraint-safe E.164 for the least invasive recovery.
@@ -1600,6 +1620,8 @@ async def _fill_nanp_tel_with_readback(
                 tag_name=tag_name,
                 expected_value=national_digits,
                 allow_nanp_country_prefix=e164_fallback is not None,
+                pattern=pattern,
+                maxlength=maxlength,
             )
         except PhoneNumberInputMismatch as mismatch:
             if attempt_index == len(attempts) - 1:
@@ -4250,10 +4272,12 @@ async def handle_input_text_action(
     tel_pattern: str | None = None
     tel_maxlength: str | None = None
     tel_e164_fallback: str | None = None
+    tel_source_text: str | None = None
     if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
         # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
         # byte-for-byte. Affirmative-NANP tel is typed as bare national digits (skipping the format-check
         # LLM) unless the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
+        tel_source_text = text
         tel_pattern = await skyvern_element.get_attr("pattern")
         tel_maxlength = await skyvern_element.get_attr("maxlength")
         tel_e164_fallback = _nanp_e164_fallback(text, pattern=tel_pattern, maxlength=tel_maxlength)
@@ -4348,6 +4372,14 @@ async def handle_input_text_action(
                 skyvern_element = blocking_element
                 tag_name = blocking_tag_name
                 live_input_type = blocking_input_type
+                if used_bare_nanp:
+                    # The tel plan read constraints from the original element; re-derive them from
+                    # the element actually being filled.
+                    tel_pattern = await skyvern_element.get_attr("pattern")
+                    tel_maxlength = await skyvern_element.get_attr("maxlength")
+                    tel_e164_fallback = _nanp_e164_fallback(
+                        tel_source_text or "", pattern=tel_pattern, maxlength=tel_maxlength
+                    )
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -4516,6 +4548,8 @@ async def handle_input_text_action(
                     tag_name=tag_name,
                     national_digits=text,
                     e164_fallback=tel_e164_fallback,
+                    pattern=tel_pattern,
+                    maxlength=tel_maxlength,
                 )
                 if phone_mismatch is not None:
                     LOG.warning(

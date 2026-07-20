@@ -71,9 +71,56 @@ async def test_phone_readback_rejects_duplicated_country_code() -> None:
 
 
 @pytest.mark.asyncio
-async def test_phone_readback_rejects_country_code_without_source_evidence() -> None:
+async def test_phone_readback_accepts_explicit_widget_nanp_rewrite_without_source_evidence() -> None:
     locator = MagicMock()
     locator.input_value = AsyncMock(return_value="+1 (987) 555-0199")
+
+    await verify_phone_input_digits(tag_name="input", locator=locator, expected_value="9875550199")
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_rejects_bare_prepended_one_without_explicit_marker() -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(return_value="19875550199")
+
+    with pytest.raises(PhoneNumberInputMismatch):
+        await verify_phone_input_digits(tag_name="input", locator=locator, expected_value="9875550199")
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_rejects_widget_rewrite_violating_field_constraints() -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(return_value="+1 (987) 555-0199")
+
+    with pytest.raises(PhoneNumberInputMismatch):
+        await verify_phone_input_digits(
+            tag_name="input",
+            locator=locator,
+            expected_value="9875550199",
+            pattern="[0-9]{10}",
+        )
+
+    with pytest.raises(PhoneNumberInputMismatch):
+        await verify_phone_input_digits(
+            tag_name="input",
+            locator=locator,
+            expected_value="9875550199",
+            maxlength="10",
+        )
+
+    with pytest.raises(PhoneNumberInputMismatch):
+        await verify_phone_input_digits(
+            tag_name="input",
+            locator=locator,
+            expected_value="9875550199",
+            pattern="",
+        )
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_rejects_trunk_one_without_plus_marker() -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(return_value="1 (987) 555-0199")
 
     with pytest.raises(PhoneNumberInputMismatch):
         await verify_phone_input_digits(tag_name="input", locator=locator, expected_value="9875550199")
