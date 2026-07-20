@@ -15,18 +15,23 @@ real database -- all DB / LLM / agent surfaces are patched.
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime, timezone
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.context import DeliveredUnverifiedPublicOutputs
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SchemaIncompatibility,
     render_schema_incompatibility_user_reason,
@@ -40,6 +45,7 @@ from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
     _validate_copilot_audio_artifact_id,
+    convert_to_history_messages,
     workflow_copilot_chat_audio,
     workflow_copilot_chat_post,
 )
@@ -52,6 +58,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamResponseUpdate,
 )
 from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 def _make_chat_request(
@@ -68,6 +75,143 @@ def _make_chat_request(
         code_block=code_block,
         keep_pending_proposal=keep_pending_proposal,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finalizer", ["normal", "cancel"], ids=["normal-turn", "cancel-turn"])
+@pytest.mark.parametrize("destination", ["persistence", "sse", "history"])
+async def test_delivered_unverified_narrative_payload_survives_persistence_sse_and_history(
+    monkeypatch: pytest.MonkeyPatch,
+    finalizer: str,
+    destination: str,
+) -> None:
+    payload = {
+        "turnId": "turn-1",
+        "turnIndex": 0,
+        "mode": "build",
+        "designStarted": True,
+        "designEnded": True,
+        "draft": None,
+        "blocks": [],
+        "terminal": "response",
+        "terminalMessage": "done",
+        "narrativeSummary": None,
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": None,
+        "endedAt": None,
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    ctx = make_copilot_ctx()
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_workflow_run_id = "wr_route_source"
+    png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAE0lEQVR4nGP8z4APMOGVZRip0gBBLAETee26JgAAAABJRU5ErkJggg=="
+    image_secret_without_association = png_b64[20:30]
+    ctx.secret_scrub_values.extend(["registered-secret-value", image_secret_without_association])
+    deeply_nested: dict[str, object] = {"password": "deep-must-not-persist"}
+    for index in range(100):
+        deeply_nested = {f"level_{index}": deeply_nested}
+    ctx.delivered_unverified_observed_outputs = DeliveredUnverifiedPublicOutputs(
+        {
+            "result": {
+                "amount": 0,
+                "confirmed": False,
+                "code_output": "captured-code-output-" + "x" * 579,
+                "deep": deeply_nested,
+                "valid_image_with_unassociated_registered_value": png_b64,
+                "png_prefixed_registered_value": "iVBORw0KGgoAAAANSUhEUg" + "registered-secret-value",
+                "api_key=sk-raw-secret-key-1234567890": "safe-value",
+                7: "non-string-key-value",
+            }
+        }
+    )
+    agent_result = agent_module._make_agent_result(
+        ctx,
+        _delivered_unverified_snapshot=agent_module._delivered_unverified_observed_outputs(ctx),
+        user_response="done",
+        updated_workflow=None,
+        proposal_disposition="review_untested",
+        narrative_payload=payload,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    if finalizer == "normal":
+        await workflow_copilot_route._finalise_normal_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=original_workflow,
+            chat_request=_make_chat_request(),
+            agent_result=agent_result,
+        )
+    else:
+        await workflow_copilot_route._persist_cancel_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=original_workflow,
+            user_message="Please update it",
+            agent_result=agent_result,
+        )
+
+    assistant_write = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1]
+    persisted_payload = assistant_write.kwargs["narrative_payload"]
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    response_payload = response_frame.model_dump(mode="json")["narrative_payload"]
+
+    now = datetime.now(timezone.utc)
+    history = convert_to_history_messages(
+        [
+            WorkflowCopilotChatMessage(
+                workflow_copilot_chat_message_id="message-1",
+                workflow_copilot_chat_id="chat-1",
+                sender=WorkflowCopilotChatSender.AI,
+                content="done",
+                narrative_payload=persisted_payload,
+                created_at=now,
+                modified_at=now,
+            )
+        ]
+    )
+    assert history[0].narrative_payload is not None
+    destination_payload = {
+        "persistence": persisted_payload,
+        "sse": response_payload,
+        "history": history[0].narrative_payload,
+    }[destination]
+    observed_outputs = destination_payload["deliveredUnverifiedObservedOutputs"]
+    json.dumps(destination_payload)
+    assert observed_outputs["result"]["amount"] == 0
+    assert observed_outputs["result"]["confirmed"] is False
+    assert observed_outputs["result"]["code_output"] == "captured-code-output-" + "x" * 579
+    canonical_image = base64.b64decode(
+        observed_outputs["result"]["valid_image_with_unassociated_registered_value"], validate=True
+    )
+    with Image.open(BytesIO(canonical_image)) as image:
+        image.load()
+        assert image.format == "PNG"
+        assert image.info == {}
+    assert observed_outputs["result"]["png_prefixed_registered_value"] == {
+        "$skyvernOmitted": {"reason": "invalid image", "count": 1}
+    }
+    assert "wr_route_source" not in str(observed_outputs)
+    assert observed_outputs["$skyvernOutput"]["omitted"]["depth"] >= 1
+    assert "deep-must-not-persist" not in str(observed_outputs)
+    assert "sk-raw-secret-key-1234567890" not in str(observed_outputs)
+    assert "non-string-key-value" not in str(observed_outputs)
 
 
 @pytest.mark.asyncio
