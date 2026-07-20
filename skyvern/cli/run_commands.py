@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import _thread
 import asyncio
 import atexit
@@ -10,12 +12,15 @@ import signal
 import subprocess
 import sys
 import threading
-from typing import TYPE_CHECKING, Annotated, Any, List, Literal, Optional, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from skyvern.library.local_browser_profile import LocalBrowserProfile
+
 import psutil
+import structlog
 import typer
 import uvicorn
 from dotenv import set_key
@@ -38,11 +43,11 @@ from skyvern.utils.env_paths import (
 )
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
+LOG = structlog.get_logger(__name__)
 _mcp_cleanup_done = False
 _mcp_cleanup_in_progress = False
 _mcp_eof_shutdown_requested = False
 _MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS = 5.0
-_MCP_PROCESS_KILL_TIMEOUT_SECONDS = 2.0
 _MCP_NATIVE_EOF_GRACE_SECONDS = 0.25
 # The EOF watcher's os._exit(0) preempts cleanup unconditionally, so this must exceed
 # the cloud path's graceful join plus process-kill wait.
@@ -76,25 +81,18 @@ def _cleanup_mcp_resources_blocking() -> None:
     _mcp_cleanup_in_progress = True
 
     try:
-        logger = logging.getLogger(__name__)
         try:
             local_browser_identity = _current_local_browser_identity()
         except Exception:
-            logger.warning("Failed to identify the local MCP browser", exc_info=True)
+            LOG.warning("Failed to identify the local MCP browser", exc_info=True)
             local_browser_identity = None
         # In stdio, this main-thread read and a cleanup thread both resolve _global_session because
         # ContextVars are not inherited. The exclusive mode means local identity cannot hide a cloud close.
         if local_browser_identity is not None:
             try:
-                # Playwright objects belong to mcp.run's closed loop; a fresh-loop close hangs forever.
-                # The owned profile is an anonymous mkdtemp throwaway, so clean it up directly.
-                try:
-                    _kill_local_browser_process_tree(local_browser_identity[0], local_browser_identity[1])
-                finally:
-                    if local_browser_identity[2] and local_browser_identity[1]:
-                        shutil.rmtree(local_browser_identity[1], ignore_errors=True)
+                _cleanup_local_browser_from_identity(local_browser_identity, event_prefix="mcp_local_browser")
             except Exception:
-                logger.warning("MCP local browser cleanup failed", exc_info=True)
+                LOG.warning("MCP local browser cleanup failed", exc_info=True)
         else:
             cleanup_errors: list[BaseException] = []
 
@@ -108,10 +106,10 @@ def _cleanup_mcp_resources_blocking() -> None:
             cleanup_thread.start()
             cleanup_thread.join(_MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS)
             if cleanup_thread.is_alive():
-                logger.warning("MCP graceful cleanup timed out")
+                LOG.warning("MCP graceful cleanup timed out")
             elif cleanup_errors:
                 error = cleanup_errors[0]
-                logger.warning("MCP graceful cleanup failed", exc_info=(type(error), error, error.__traceback__))
+                LOG.warning("MCP graceful cleanup failed", exc_info=(type(error), error, error.__traceback__))
     finally:
         _mcp_cleanup_done = True
         _mcp_cleanup_in_progress = False
@@ -122,68 +120,32 @@ def _cleanup_mcp_resources_sync() -> None:
     _cleanup_mcp_resources_blocking()
 
 
-def _current_local_browser_identity() -> tuple[int | None, str | None, bool] | None:
+def _current_local_browser_identity() -> tuple[str | None, bool, LocalBrowserProfile | None] | None:
     from skyvern.cli.core.session_manager import get_current_session  # noqa: PLC0415
 
     current = get_current_session()
     if current.context is None or current.context.mode != "local" or current.browser is None:
         return None
     return (
-        current.browser.local_cdp_port,
         current.browser.local_user_data_dir,
         current.browser.local_user_data_dir_owned,
+        current.browser.local_browser_profile,
     )
 
 
-def _find_local_browser_processes(port: int | None, user_data_dir: str | None) -> list[psutil.Process]:
-    if user_data_dir is None:
-        return []
-
-    processes: dict[int, psutil.Process] = {}
-    user_data_arg = f"--user-data-dir={user_data_dir}"
-    try:
-        for process in psutil.process_iter(["pid", "cmdline"]):
-            try:
-                if user_data_arg in ((process.info or {}).get("cmdline") or []):
-                    processes[process.pid] = process
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-    except Exception:
-        logging.getLogger(__name__).warning("Failed to inspect local browser processes", exc_info=True)
-    return list(processes.values())
-
-
-def _local_browser_process_tree(port: int | None, user_data_dir: str | None) -> list[psutil.Process]:
-    processes: dict[int, psutil.Process] = {}
-    # The Playwright node driver is Chromium's parent, not its descendant; stdin EOF reaps that driver.
-    for root in _find_local_browser_processes(port, user_data_dir):
-        processes[root.pid] = root
-        try:
-            processes.update({process.pid: process for process in root.children(recursive=True)})
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
-    return list(processes.values())
-
-
-def _kill_local_browser_process_tree(
-    port: int | None,
-    user_data_dir: str | None,
+def _cleanup_local_browser_from_identity(
+    identity: tuple[str | None, bool, LocalBrowserProfile | None],
     *,
-    known_processes: list[psutil.Process] | None = None,
+    event_prefix: str,
 ) -> None:
-    if user_data_dir is None:
-        return
+    from skyvern.library import local_browser_profile  # noqa: PLC0415
 
-    processes = {process.pid: process for process in known_processes or []}
-    processes.update({process.pid: process for process in _local_browser_process_tree(port, user_data_dir)})
-
-    for process in processes.values():
-        try:
-            process.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
-    if processes:
-        psutil.wait_procs(list(processes.values()), timeout=_MCP_PROCESS_KILL_TIMEOUT_SECONDS)
+    user_data_dir, owned, profile = identity
+    if owned and user_data_dir:
+        if not local_browser_profile.cleanup_local_browser_profile(profile or user_data_dir):
+            LOG.warning(f"{event_prefix}_profile_cleanup_deferred", user_data_dir=user_data_dir)
+    elif user_data_dir and not local_browser_profile.terminate_local_browser_processes(user_data_dir):
+        LOG.warning(f"{event_prefix}_termination_incomplete", user_data_dir=user_data_dir)
 
 
 def _watch_stdin_eof(
@@ -207,13 +169,9 @@ def _watch_stdin_eof(
         try:
             local_browser_identity = _current_local_browser_identity()
             if local_browser_identity is not None:
-                try:
-                    _kill_local_browser_process_tree(local_browser_identity[0], local_browser_identity[1])
-                finally:
-                    if local_browser_identity[2] and local_browser_identity[1]:
-                        shutil.rmtree(local_browser_identity[1], ignore_errors=True)
+                _cleanup_local_browser_from_identity(local_browser_identity, event_prefix="mcp_eof_local_browser")
         except Exception:
-            logging.getLogger(__name__).warning("MCP EOF fallback cleanup failed", exc_info=True)
+            LOG.warning("MCP EOF fallback cleanup failed", exc_info=True)
         (force_exit or os._exit)(0)
 
     try:
@@ -236,7 +194,7 @@ def _watch_stdin_eof(
                 return
             stop.wait(0.05)
     except (AttributeError, OSError, ValueError):
-        logging.getLogger(__name__).warning("MCP stdin EOF watcher failed", exc_info=True)
+        LOG.warning("MCP stdin EOF watcher failed", exc_info=True)
 
 
 def _start_stdin_eof_watcher() -> tuple[threading.Event, threading.Event]:
@@ -261,7 +219,7 @@ def _handle_mcp_shutdown_signal(_signum: int, _frame: Any) -> None:
         os._exit(0 if eof_initiated else 128 + _signum)
 
 
-def get_pids_on_port(port: int) -> List[int]:
+def get_pids_on_port(port: int) -> list[int]:
     """Return a list of PIDs listening on the given port."""
     pids = []
     try:
@@ -273,7 +231,7 @@ def get_pids_on_port(port: int) -> List[int]:
     return list(set(pids))
 
 
-def kill_pids(pids: List[int]) -> None:
+def kill_pids(pids: list[int]) -> None:
     """Kill the given list of PIDs in a cross-platform way."""
     host_system = detect_os()
     for pid in pids:
@@ -569,7 +527,7 @@ def run_dev() -> None:
 class _ServerCardMiddleware:
     """Serve /.well-known/mcp/server-card.json for HTTP MCP transports."""
 
-    def __init__(self, app: "ASGIApp", transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
+    def __init__(self, app: ASGIApp, transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
         from skyvern.cli.core.server_card import build_server_card  # noqa: PLC0415
 
         self.app = app
@@ -579,7 +537,7 @@ class _ServerCardMiddleware:
         endpoint_url = os.environ.get("SKYVERN_MCP_PUBLIC_URL") or f"http://{host_part}:{port}{mcp_path}"
         self.card = build_server_card(self.transport_type, endpoint_url)
 
-    async def __call__(self, scope: "Scope", receive: "Receive", send: "Send") -> None:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope["path"] == "/.well-known/mcp/server-card.json":
             cors_headers = {
                 "Access-Control-Allow-Origin": "*",
@@ -629,6 +587,14 @@ def run_mcp(
     global _mcp_eof_shutdown_requested
     _mcp_eof_shutdown_requested = False
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
+    try:
+        from skyvern.library.local_browser_profile import (  # noqa: PLC0415
+            sweep_local_browser_profiles_with_budget,
+        )
+
+        sweep_local_browser_profiles_with_budget()
+    except Exception:
+        LOG.warning("local_browser_profile_startup_sweep_failed", exc_info=True)
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
     from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
@@ -693,10 +659,10 @@ def _normalize_mcp_path(path: str) -> str:
 )
 def run_code(
     script_path: str = typer.Argument(..., help="Path to the Python script to run"),
-    params: List[str] = typer.Option([], "-p", help="Parameters in format param=value (without leading dash)"),
+    params: list[str] = typer.Option([], "-p", help="Parameters in format param=value (without leading dash)"),
     params_json: str = typer.Option(None, "--params", help="JSON string of parameters"),
     params_file: str = typer.Option(None, "--params-file", help="Path to JSON file with parameters"),
-    ai: Optional[str] = typer.Option(
+    ai: str | None = typer.Option(
         "fallback", "--ai", help="AI mode to use for the script. Options: fallback, proactive or None"
     ),
 ) -> None:
