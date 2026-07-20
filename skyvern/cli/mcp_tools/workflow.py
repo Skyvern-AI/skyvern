@@ -20,7 +20,11 @@ import yaml
 from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
-from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    ParameterType,
+    WorkflowParameterType,
+    is_sensitive_workflow_parameter,
+)
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
@@ -730,6 +734,19 @@ async def _inject_workflow_update_top_level_settings(
 # Derived from the enum to stay in sync when new secret types are added.
 _AUTO_MANAGED_PARAMETER_TYPES = frozenset(pt.value for pt in ParameterType if pt.is_secret_or_credential())
 _PROTECTED_WORKFLOW_PARAMETER_TYPES = frozenset(pt.value for pt in WorkflowParameterType if pt.is_credential_type())
+# Intentional explicit allowlist (not enum-derived): a new WorkflowParameterType is auto-wired
+# only after it is added here, so a future sensitive type is never eligible by default. Add new
+# non-credential types when introduced.
+_AUTO_WIRE_WORKFLOW_PARAMETER_TYPES = frozenset(
+    {
+        WorkflowParameterType.STRING.value,
+        WorkflowParameterType.INTEGER.value,
+        WorkflowParameterType.FLOAT.value,
+        WorkflowParameterType.BOOLEAN.value,
+        WorkflowParameterType.JSON.value,
+        WorkflowParameterType.FILE_URL.value,
+    }
+)
 # Login-capable credential types — subset of protected params that carry username/password data.
 # Derived from the enum to stay in sync when new login-capable types are added.
 _LOGIN_CREDENTIAL_PARAMETER_TYPES = frozenset(pt.value for pt in ParameterType if pt.is_login_credential())
@@ -922,6 +939,55 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if isinstance(loop_blocks, list):
             result.extend(_iter_blocks_flat(loop_blocks))
     return result
+
+
+def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded_keys: set[str]) -> bool:
+    wf_def = raw_definition.get("workflow_definition")
+    if not isinstance(wf_def, dict):
+        return False
+
+    parameters = wf_def.get("parameters")
+    ordered_keys: list[str] = []
+    eligible_by_key: dict[str, bool] = {}
+    for parameter in parameters if isinstance(parameters, list) else []:
+        if not isinstance(parameter, dict):
+            continue
+        key = parameter.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        eligible = (
+            parameter.get("parameter_type") == ParameterType.WORKFLOW.value
+            and parameter.get("workflow_parameter_type") in _AUTO_WIRE_WORKFLOW_PARAMETER_TYPES
+            and not is_sensitive_workflow_parameter(parameter)
+            and key not in excluded_keys
+        )
+        if key not in eligible_by_key:
+            ordered_keys.append(key)
+            eligible_by_key[key] = eligible
+        else:
+            eligible_by_key[key] = eligible_by_key[key] and eligible
+
+    eligible_keys = [key for key in ordered_keys if eligible_by_key[key]]
+    blocks = wf_def.get("blocks")
+    changed = False
+    for block in _iter_blocks_flat(blocks if isinstance(blocks, list) else []):
+        if block.get("block_type") != BlockType.CODE:
+            continue
+        # Explicit [] is a caller opt-out ("this block uses no workflow parameters");
+        # only a missing/null parameter_keys triggers auto-wiring.
+        if block.get("parameter_keys") is None:
+            block["parameter_keys"] = list(eligible_keys)
+            changed = True
+    return changed
+
+
+def _auto_wire_definition_string(definition: str, fmt: str, excluded_keys: set[str]) -> str:
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+    if not _auto_wire_code_only_parameter_keys(raw, excluded_keys):
+        return definition
+    return _dump_definition_dict(raw, parsed_format)
 
 
 def _code_block_pointer(blocks: Any, *, hint: str) -> dict[str, Any] | None:
@@ -1615,8 +1681,13 @@ async def skyvern_workflow_create(
         if json_def is not None:
             if err := _validate_code_only_workflow_blocks(json_def, "skyvern_workflow_create"):
                 return err
+            # No exclusions on create: _auto_wire_code_only_parameter_keys already skips
+            # sensitive params, and there is no existing workflow to protect.
+            _auto_wire_code_only_parameter_keys(json_def, set())
         elif err := _validate_code_only_definition(definition, format, "skyvern_workflow_create"):
             return err
+        elif yaml_def is not None:
+            yaml_def = _auto_wire_definition_string(yaml_def, format, set())
 
     with Timer() as timer:
         try:
@@ -1705,6 +1776,18 @@ async def skyvern_workflow_update(
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, fetch_existing)
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
+        if code_only:
+            existing = await fetch_existing()
+            existing_wf_def = existing.get("workflow_definition")
+            existing_params = existing_wf_def.get("parameters", []) if isinstance(existing_wf_def, dict) else []
+            # Only the existing workflow's protected keys need excluding here; sensitive
+            # keys in the submitted definition are already skipped inside the auto-wire.
+            protected_existing = {
+                parameter["key"]
+                for parameter in (existing_params if isinstance(existing_params, list) else [])
+                if _is_protected_update_parameter(parameter)
+            }
+            definition = _auto_wire_definition_string(definition, format, protected_existing)
         definition, param_warnings = await _inject_workflow_update_parameters(definition, format, fetch_existing)
     except NotFoundError:
         return make_result(

@@ -13,6 +13,7 @@ import pytest
 
 from skyvern.cli.core import trajectory_store
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
+from skyvern.cli.mcp_tools import code_block as code_block_tools
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import trajectory as mcp_trajectory
 from skyvern.cli.mcp_tools.code_block import skyvern_code_block_synthesize
@@ -82,6 +83,7 @@ def _expected_synthesis_data(*, strict_selectors: bool) -> dict[str, Any]:
         "notes": synthesized.notes,
         "emitted_interaction_count": synthesized.diagnostics.emitted_interaction_count,
         "truncated": synthesized.diagnostics.truncated,
+        "parameter_wiring_hint": code_block_tools.PARAMETER_WIRING_HINT,
     }
 
 
@@ -101,6 +103,15 @@ async def test_legacy_two_positional_call_still_binds_strict_selectors() -> None
     positional = await skyvern_code_block_synthesize(json.dumps(_fixture_trajectory()), True)
 
     assert positional == _expected_result(ok=True, data=_expected_synthesis_data(strict_selectors=True))
+
+
+@pytest.mark.asyncio
+async def test_synthesize_returns_stable_parameter_wiring_hint() -> None:
+    result = await skyvern_code_block_synthesize(json.dumps(_fixture_trajectory()))
+
+    assert result["data"]["parameter_wiring_hint"] == code_block_tools.PARAMETER_WIRING_HINT
+    assert "\n" not in code_block_tools.PARAMETER_WIRING_HINT
+    assert "[] to opt out" in code_block_tools.PARAMETER_WIRING_HINT
 
 
 @pytest.mark.asyncio
