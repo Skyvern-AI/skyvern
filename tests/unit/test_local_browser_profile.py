@@ -583,6 +583,32 @@ def test_deletion_child_rejects_same_name_directory_replacement(tmp_path: Path) 
     assert sentinel.read_text() == "replacement data"
 
 
+def test_wait_for_process_reaps_child_after_forced_stop() -> None:
+    process = MagicMock(spec=subprocess.Popen)
+    process.pid = 43210
+    reaped = False
+
+    def wait_for_exit(timeout: float) -> int:
+        nonlocal reaped
+        if process.kill.called and timeout >= 0.04:
+            reaped = True
+            return -9
+        if not process.kill.called:
+            time.sleep(timeout)
+        raise subprocess.TimeoutExpired(cmd="profile-deleter", timeout=timeout)
+
+    process.wait.side_effect = wait_for_exit
+    process.poll.side_effect = lambda: -9 if reaped else None
+
+    local_browser_profile._wait_for_process_with_budget(
+        process,
+        started_at=time.monotonic(),
+        budget=0.1,
+    )
+
+    assert process.poll() == -9
+
+
 def test_timed_out_deletion_stops_before_cleanup_returns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -590,6 +616,7 @@ def test_timed_out_deletion_stops_before_cleanup_returns(
     profile_path = tmp_path / "profile"
     profile_path.mkdir()
     late_mutation = tmp_path / "late-mutation"
+    ready = tmp_path / "ready"
     children: list[subprocess.Popen[bytes]] = []
     real_popen = subprocess.Popen
 
@@ -601,15 +628,22 @@ def test_timed_out_deletion_stops_before_cleanup_returns(
                 (
                     "import pathlib, signal, sys, time; "
                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "pathlib.Path(sys.argv[2]).touch(); "
                     "time.sleep(0.5); pathlib.Path(sys.argv[1]).touch()"
                 ),
                 str(late_mutation),
+                str(ready),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         children.append(child)
+        ready_deadline = time.monotonic() + 1
+        while not ready.exists():
+            assert child.poll() is None
+            assert time.monotonic() < ready_deadline
+            time.sleep(0.001)
         return child
 
     monkeypatch.setattr(local_browser_profile, "PROFILE_DELETE_TIMEOUT_SECONDS", 0.1)
