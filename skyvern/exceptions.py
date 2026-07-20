@@ -1297,6 +1297,27 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class MissingOrganizationForBrowserSession(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Cannot acquire browser session {browser_session_id} without an organization identity.")
+
+
+class MissingBrowserStateForBrowserSession(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} has no reusable browser state (cold or evicted); "
+            "cannot acquire it for the script."
+        )
+
+
+class BrowserSessionSwitchNotAllowed(SkyvernException):
+    def __init__(self, script_id: str | None, bound_session_id: str | None, requested_session_id: str) -> None:
+        super().__init__(
+            f"Script {script_id} already bound a browser (session {bound_session_id}); cannot switch to "
+            f"browser session {requested_session_id} mid-run."
+        )
+
+
 class BrowserSessionStartupTimeout(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
