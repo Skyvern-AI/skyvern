@@ -17,6 +17,14 @@ from typing import Any
 
 import pytest
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingCandidate,
+    AuthoringParameterFieldBinding,
+    AuthoringParameterTerminalBinding,
+    authoring_parameter_binding_directive_consumed,
+    build_authoring_parameter_binding_directive,
+    build_authoring_parameter_binding_snapshot,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -199,6 +207,150 @@ def test_grounded_submit_rung_binding_fails_closed_on_invalid_bundle(mutation: s
         interaction["submit_rung_binding"]["fingerprint"] = "stale"
 
     assert synthesize_code_block(trajectory, strict_selectors=True) is None
+
+
+def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    assert result.code.count(fill) == 1
+    assert result.code.index(fill) < result.code.index('page.locator("#submit").click()')
+    assert result.parameters == [{"key": "search_location"}]
+    assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+def test_authoring_parameter_snapshot_recovers_missing_fill_before_enter() -> None:
+    trajectory = [
+        _interaction(
+            "press_key",
+            selector="#location",
+            key="Enter",
+            source_url="https://example.com/form",
+            trajectory_index=0,
+        )
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="press_key",
+            trajectory_index=0,
+            selector="#location",
+            key="Enter",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    press = 'page.locator("#location").press("Enter")'
+    assert result.code.count(fill) == 1
+    assert result.code.index(fill) < result.code.index(press)
+    assert result.parameters == [{"key": "search_location"}]
+
+
+def test_authoring_parameter_directive_consumption_requires_structural_and_final_code_evidence() -> None:
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=0,
+                match_basis="exact_authored_selector",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=1,
+            selector="#submit",
+        ),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[
+            AuthoringParameterBindingCandidate(
+                declared_key="search_location",
+                field_selector="#location",
+            )
+        ],
+    )
+    code = 'await page.locator("#location").fill(str(search_location))'
+
+    assert authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code=code,
+        parameter_keys=["search_location"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive.model_copy(update={"structural_key": "stale"}),
+        snapshot,
+        code=code,
+        parameter_keys=["search_location"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#other").fill(str(search_location))',
+        parameter_keys=["search_location"],
+    )
+
+
+def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_changes() -> None:
+    trajectory = [_interaction("press_key", selector="#location", key="Tab", source_url="https://example.com/form")]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="press_key",
+            trajectory_index=0,
+            selector="#location",
+            key="Enter",
+        ),
+    )
+
+    assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
