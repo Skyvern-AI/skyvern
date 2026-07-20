@@ -164,6 +164,8 @@ async def test_ten_digit_tel_phone_uses_tel_readback_not_card_readback() -> None
         tag_name="input",
         expected_value="2245550199",
         allow_nanp_country_prefix=False,
+        pattern=None,
+        maxlength=None,
     )
     card_readback.assert_not_awaited()
     phone_format.assert_not_awaited()
@@ -279,6 +281,29 @@ async def test_blocking_date_input_refreshes_type_before_routing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_blocking_tel_input_rechecks_constraints_before_readback() -> None:
+    original = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    blocking = _mock_input(
+        {"type": "tel", "autocomplete": None, "name": "phone", "pattern": "[0-9]{10}", "maxlength": "10"}
+    )
+    blocking.get_id.return_value = "BLOCKING"
+
+    results, _, tel_verify, _, _, _, _ = await _run_input_text(original, "+1 (224) 555-0199", blocker=blocking)
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    blocking.input_sequentially.assert_awaited_once_with(text="2245550199")
+    # The blocker's mask both rejects the E.164 retry and governs the read-back constraint check.
+    tel_verify.assert_awaited_once_with(
+        skyvern_element=blocking,
+        tag_name="input",
+        expected_value="2245550199",
+        allow_nanp_country_prefix=False,
+        pattern="[0-9]{10}",
+        maxlength="10",
+    )
+
+
+@pytest.mark.asyncio
 async def test_generic_text_input_skips_commit_verification_when_flag_disabled() -> None:
     el = _mock_input({"type": "text", "autocomplete": None, "name": "postal_code"})
 
@@ -357,6 +382,8 @@ async def test_secret_tel_value_uses_tel_verifier_not_secret_readback() -> None:
         tag_name="input",
         expected_value="2245550199",
         allow_nanp_country_prefix=False,
+        pattern=None,
+        maxlength=None,
     )
     secret_readback.assert_not_awaited()
     card_readback.assert_not_awaited()
