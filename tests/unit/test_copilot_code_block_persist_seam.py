@@ -1745,6 +1745,153 @@ class TestCodeRepairProgressClassification:
         assert directive.parameter_binding_directive is not None
 
     @pytest.mark.asyncio
+    async def test_keyless_draft_persists_but_run_blocks_is_rejected_when_criteria_dark(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(allow_run_blocks=True)
+        keyless_yaml = _yaml(
+            """
+            title: Download monthly statement
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: billing_start_date, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: billing_end_date, workflow_parameter_type: string}
+              blocks:
+              - block_type: text_prompt
+                label: normalize_invoice_inputs
+                prompt: "Return these inputs unchanged: account number 100245, dates 2026-05-01 to 2026-05-31."
+              - block_type: code
+                label: fetch_invoice_pdf
+                parameter_keys: []
+                code: |
+                  await page.locator("#current-statement-row").click()
+                  await page.locator('a[href="/statements/100245_2026-05.pdf"]').click()
+            """
+        )
+
+        persist_result = await _update_workflow(
+            {"workflow_yaml": keyless_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert persist_result["ok"] is True
+
+        dispatched: list[object] = []
+
+        async def _run(_params: object, _ctx: object, **_kwargs: object) -> dict[str, object]:
+            dispatched.append(_params)
+            return {"ok": True}
+
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _run)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        run_result = json.loads(
+            await tools_module.run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug"),
+                json.dumps({"block_labels": ["fetch_invoice_pdf"]}),
+            )
+        )
+
+        assert run_result["ok"] is False
+        assert run_result["data"]["reason_code"] == "definition_contract_unsatisfied"
+        assert run_result["data"]["unreferenced_parameter_keys"] == [
+            "account_number",
+            "billing_end_date",
+            "billing_start_date",
+        ]
+        assert dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_keyless_run_blocks_dispatches_in_log_only_shadow_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(allow_run_blocks=True)
+        keyless_yaml = _yaml(
+            """
+            title: Download monthly statement
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: fetch_invoice_pdf
+                parameter_keys: []
+                code: |
+                  await page.locator("#current-statement-row").click()
+            """
+        )
+        persist_result = await _update_workflow(
+            {"workflow_yaml": keyless_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert persist_result["ok"] is True
+
+        ctx.author_time_gate_log_only_ids = {workflow_update_module.DEFINITION_CONTRACT_UNSATISFIED_GATE_ID}
+        dispatched: list[object] = []
+
+        async def _run(_params: object, _ctx: object, **_kwargs: object) -> dict[str, object]:
+            dispatched.append(_params)
+            return {"ok": True}
+
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _run)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        await tools_module.run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug"),
+            json.dumps({"block_labels": ["fetch_invoice_pdf"]}),
+        )
+
+        assert dispatched != []
+        assert [event.gate_id for event in ctx.author_time_gate_ablation_events] == [
+            workflow_update_module.DEFINITION_CONTRACT_UNSATISFIED_GATE_ID
+        ]
+
+    @pytest.mark.asyncio
+    async def test_bound_draft_run_blocks_dispatches_when_criteria_dark(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(allow_run_blocks=True)
+        bound_yaml = _yaml(
+            """
+            title: Download monthly statement
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: fetch_invoice_pdf
+                parameter_keys: [account_number]
+                code: |
+                  await page.locator("#account").fill(str(account_number))
+                  await page.locator("#current-statement-row").click()
+            """
+        )
+
+        persist_result = await _update_workflow(
+            {"workflow_yaml": bound_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert persist_result["ok"] is True
+
+        dispatched: list[object] = []
+
+        async def _run(_params: object, _ctx: object, **_kwargs: object) -> dict[str, object]:
+            dispatched.append(_params)
+            return {"ok": True, "run_status": "completed"}
+
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _run)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        await tools_module.run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug"),
+            json.dumps({"block_labels": ["fetch_invoice_pdf"]}),
+        )
+
+        assert dispatched != []
+
+    @pytest.mark.asyncio
     async def test_recut_ambiguous_field_binding_returns_value_free_typed_directive(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
