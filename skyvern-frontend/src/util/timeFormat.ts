@@ -134,6 +134,19 @@ function formatExecutionTime(
   return `${seconds}s`;
 }
 
+function formatDurationSeconds(seconds: number | null | undefined): string {
+  if (seconds == null || seconds < 0 || !Number.isFinite(seconds)) {
+    return "—";
+  }
+
+  const total = Math.round(seconds);
+  if (total < 60) {
+    return `${total}s`;
+  }
+
+  return `${Math.floor(total / 60)}m ${total % 60}s`;
+}
+
 export {
   normalizeUtcTimestamp,
   basicLocalTimeFormat,
@@ -143,4 +156,5 @@ export {
   localTimeFormatWithShortDate,
   formatTimeRemaining,
   formatExecutionTime,
+  formatDurationSeconds,
 };

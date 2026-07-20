@@ -701,13 +701,58 @@ export interface EvalBrowserSession extends Eval {
   arm?: string | null;
   model?: string | null;
   task_id?: string | null;
+  task_title?: string | null;
   perfect?: boolean | null;
   rubric_avg?: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_s?: number | null;
 }
 
 export type EvalApiResponse = Array<
   EvalWorkflow | EvalTask | EvalBrowserSession
 >;
+
+export interface EvalModelSummary {
+  model: string | null;
+  total: number;
+  perfect_count: number;
+  graded_count: number;
+  pass_rate: number | null;
+  rubric_avg: number | null;
+  duration_avg_s: number | null;
+  last_started_at: string | null;
+}
+
+export interface EvalSummaryResponse {
+  models: EvalModelSummary[];
+  total_runs: number;
+}
+
+export interface RuntimeCostTierMetrics {
+  steps: number | null;
+  duration_min: number | null;
+  tokens: number | null;
+  cost: number | null;
+}
+
+export interface RuntimeCostModelSummary {
+  model: string;
+  runs: number;
+  steps: number | null;
+  duration_min: number | null;
+  tokens: number | null;
+  output_tokens: number | null;
+  cost: number | null;
+  token_coverage: number;
+  tiers: Partial<Record<"easy" | "medium" | "hard", RuntimeCostTierMetrics>>;
+}
+
+export interface RuntimeCostSummaryResponse {
+  task_set_size: number;
+  captured_at: string | null;
+  models: RuntimeCostModelSummary[];
+}
 
 export type DebugSessionApiResponse = {
   debug_session_id: string;
