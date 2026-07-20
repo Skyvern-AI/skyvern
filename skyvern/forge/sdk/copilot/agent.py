@@ -848,6 +848,13 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "list the exact key in the code block's parameter_keys, reference the exact key as a bare Python "
             "variable in code, do not hardcode the eval value, and rerun via update_and_run_blocks."
         )
+    if repair_context.parameter_binding_directive is not None:
+        lines.append("parameter_binding_pairs:")
+        for candidate in repair_context.parameter_binding_directive.candidates:
+            key = _clean_authoring_repair_prompt_atom(candidate.declared_key, max_chars=80)
+            selector = _clean_authoring_repair_prompt_atom(candidate.field_selector, max_chars=160)
+            if key and selector:
+                lines.append(f"- {key} -> {selector}")
     if repair_context.reason_code == "synthesized_parameter_binding_ambiguous":
         binding_action_lines = _render_unresolved_name_binding_actions(
             repair_context.unresolved_names, available_parameter_keys

@@ -24,6 +24,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingSnapshot,
+    authoring_parameter_binding_fingerprint,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     FrozenRequestedOutputExtractionCandidate,
@@ -347,6 +351,79 @@ def grounded_submit_rung_binding_fingerprint(
         ],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _binding_source_origin(source_url: str) -> str:
+    parsed = urlsplit(source_url)
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+
+
+def _captured_trajectory_index(interaction: Mapping[str, Any], position: int) -> int:
+    raw_index = interaction.get("trajectory_index")
+    return raw_index if isinstance(raw_index, int) and raw_index >= 0 else position
+
+
+def _validated_authoring_parameter_binding_snapshot(
+    snapshot: AuthoringParameterBindingSnapshot,
+    trajectory: Sequence[Mapping[str, Any]],
+) -> dict[int, tuple[str, str]] | None:
+    if not snapshot.field_bindings:
+        return None
+    terminal_matches = [
+        (position, interaction)
+        for position, interaction in enumerate(trajectory)
+        if _captured_trajectory_index(interaction, position) == snapshot.terminal.trajectory_index
+    ]
+    if len(terminal_matches) != 1:
+        return None
+    _terminal_position, terminal = terminal_matches[0]
+    if _binding_source_origin(str(terminal.get("source_url") or "")) != snapshot.source_origin:
+        return None
+    if str(terminal.get("tool_name") or "") != snapshot.terminal.tool_name:
+        return None
+    if str(terminal.get("selector") or "").strip() != snapshot.terminal.selector:
+        return None
+    if str(terminal.get("key") or "").strip() != snapshot.terminal.key:
+        return None
+    expected = authoring_parameter_binding_fingerprint(
+        structural_key=snapshot.structural_key,
+        source_origin=snapshot.source_origin,
+        field_bindings=snapshot.field_bindings,
+        terminal=snapshot.terminal,
+    )
+    if expected != snapshot.fingerprint:
+        return None
+    by_index: dict[int, tuple[str, str]] = {}
+    declared_keys: set[str] = set()
+    selectors: set[str] = set()
+    for binding in snapshot.field_bindings:
+        if (
+            not grounded_parameter_key_is_safe(binding.declared_key)
+            or not binding.field_selector
+            or binding.declared_key in declared_keys
+            or binding.field_selector in selectors
+        ):
+            return None
+        declared_keys.add(binding.declared_key)
+        selectors.add(binding.field_selector)
+        if binding.field_trajectory_index is None:
+            continue
+        field_matches = [
+            (position, interaction)
+            for position, interaction in enumerate(trajectory)
+            if _captured_trajectory_index(interaction, position) == binding.field_trajectory_index
+        ]
+        if len(field_matches) != 1:
+            return None
+        field_position, interaction = field_matches[0]
+        if _binding_source_origin(str(interaction.get("source_url") or "")) != snapshot.source_origin:
+            return None
+        if str(interaction.get("tool_name") or "") != "type_text":
+            return None
+        if str(interaction.get("selector") or "").strip() != binding.field_selector:
+            return None
+        by_index[field_position] = (binding.declared_key, binding.field_selector)
+    return by_index
 
 
 def _validated_submit_rung_binding(
@@ -1298,6 +1375,7 @@ def synthesize_code_block(
     *,
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
@@ -1313,8 +1391,21 @@ def synthesize_code_block(
     credential_param_keys: dict[str, str] = {}
     used_download_vars: set[str] = set()
     grounded_binding_count = sum(1 for interaction in trajectory if "submit_rung_binding" in interaction)
-    if grounded_binding_count > 1:
+    if grounded_binding_count > 1 or (grounded_binding_count and parameter_binding_snapshot is not None):
         return None
+    snapshot_bindings_by_index = (
+        _validated_authoring_parameter_binding_snapshot(parameter_binding_snapshot, trajectory)
+        if parameter_binding_snapshot is not None
+        else {}
+    )
+    if parameter_binding_snapshot is not None and snapshot_bindings_by_index is None:
+        return None
+    snapshot_bindings_by_index = snapshot_bindings_by_index or {}
+    snapshot_recovery_bindings = (
+        [binding for binding in parameter_binding_snapshot.field_bindings if binding.field_trajectory_index is None]
+        if parameter_binding_snapshot is not None
+        else []
+    )
     compile_download_target = (
         reached_download_target is not None
         and not reached_download_target.already_registered
@@ -1577,6 +1668,27 @@ def synthesize_code_block(
             return _INDENT * 2
         return _INDENT
 
+    snapshot_recovery_emitted = False
+
+    def emit_snapshot_recovery(trajectory_index: int, action_indent: str) -> None:
+        nonlocal snapshot_recovery_emitted
+        if (
+            snapshot_recovery_emitted
+            or parameter_binding_snapshot is None
+            or _captured_trajectory_index(trajectory[trajectory_index], trajectory_index)
+            != parameter_binding_snapshot.terminal.trajectory_index
+        ):
+            return
+        for binding in snapshot_recovery_bindings:
+            if binding.declared_key not in used_param_keys:
+                used_param_keys.add(binding.declared_key)
+                parameters.append({"key": binding.declared_key})
+            lines.append(
+                f"{action_indent}await page.locator({_py_str(binding.field_selector)}).fill(str({binding.declared_key}))"
+            )
+        diagnostics.grounded_submit_binding_fingerprints.append(parameter_binding_snapshot.fingerprint)
+        snapshot_recovery_emitted = True
+
     for trajectory_index, interaction in enumerate(trajectory):
         if emitted >= _MAX_STEPS:
             diagnostics.truncated = True
@@ -1600,6 +1712,7 @@ def synthesize_code_block(
         tool_name = str(interaction.get("tool_name") or "")
 
         if tool_name == "press_key":
+            emit_snapshot_recovery(trajectory_index, action_indent)
             key = str(interaction.get("key") or "").strip()
             if not key:
                 diagnostics.dropped_interactions.append(
@@ -1668,6 +1781,7 @@ def synthesize_code_block(
 
         line_start = len(lines) + 1
         if tool_name == "click":
+            emit_snapshot_recovery(trajectory_index, action_indent)
             captured_index = interaction.get("trajectory_index")
             submit_trajectory_index = (
                 captured_index if isinstance(captured_index, int) and captured_index >= 0 else trajectory_index
@@ -1715,16 +1829,22 @@ def synthesize_code_block(
                 record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
+            snapshot_binding = snapshot_bindings_by_index.get(trajectory_index)
             typed_identity = _typed_value_identity(interaction)
-            param_key = typed_param_keys.get(typed_identity) if typed_identity is not None else None
+            param_key = snapshot_binding[0] if snapshot_binding is not None else None
             if param_key is None:
-                param_key = _param_key(interaction, used_param_keys)
+                param_key = typed_param_keys.get(typed_identity) if typed_identity is not None else None
+            if param_key is None or param_key not in used_param_keys:
+                if param_key is None:
+                    param_key = _param_key(interaction, used_param_keys)
+                else:
+                    used_param_keys.add(param_key)
                 parameter = {"key": param_key}
                 typed_value = str(interaction.get("typed_value") or "").strip()
-                if typed_value:
+                if typed_value and snapshot_binding is None:
                     parameter["default_value"] = typed_value
                 typed_length = interaction.get("typed_length")
-                if strict_selectors and typed_length is not None:
+                if strict_selectors and typed_length is not None and snapshot_binding is None:
                     try:
                         typed_length_int = int(typed_length)
                     except (TypeError, ValueError):
@@ -1903,7 +2023,8 @@ def synthesize_code_block(
 
     if not lines:
         return None
-    if len(diagnostics.grounded_submit_binding_fingerprints) != grounded_binding_count:
+    expected_binding_fingerprint_count = grounded_binding_count + (1 if parameter_binding_snapshot is not None else 0)
+    if len(diagnostics.grounded_submit_binding_fingerprints) != expected_binding_fingerprint_count:
         return None
     emitted_code = "\n".join(lines)
     for scout_var in _INTERNAL_SCOUT_VARS:
@@ -2669,6 +2790,7 @@ def synthesize_code_block_with_extraction(
     *,
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> SynthesizedCodeBlock | None:
     if not _trajectory_contains_reveal(trajectory, extraction_plan):
         return None
@@ -2676,6 +2798,7 @@ def synthesize_code_block_with_extraction(
         trajectory,
         strict_selectors=strict_selectors,
         reached_download_target=reached_download_target,
+        parameter_binding_snapshot=parameter_binding_snapshot,
     )
     suffix = synthesize_extraction_suffix(extraction_plan)
     if interaction is None or suffix is None:
