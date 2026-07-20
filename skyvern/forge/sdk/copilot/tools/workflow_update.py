@@ -6228,6 +6228,49 @@ def _metadata_preflight_reject_yields_to_ladder(ctx: AgentContext) -> bool:
     )
 
 
+def _run_dispatch_definition_reject(ctx: AgentContext, workflow_yaml: str) -> dict[str, Any] | None:
+    # A keyless draft may persist (draft-first authoring), but a run must never dispatch
+    # while declared string keys are unreferenced — mirrors the update_and_run gate.
+    if not workflow_yaml:
+        return None
+    definition_reject = _definition_plane_preflight_reject(
+        ctx,
+        workflow_yaml,
+        enforce_untagged_declared_inputs=True,
+    )
+    if definition_reject is None:
+        return None
+    halted = _stash_unresolved_recorded_outcome_grounding_halt(
+        ctx,
+        definition_reject.unreferenced_parameter_keys,
+    )
+    if not halted:
+        if _record_definition_plane_ablation_event(
+            ctx,
+            workflow_yaml,
+            definition_reject,
+            code_artifact_metadata=ctx.code_artifact_metadata,
+        ):
+            return None
+        _record_definition_plane_reject(
+            ctx,
+            workflow_yaml,
+            definition_reject,
+            code_artifact_metadata=ctx.code_artifact_metadata,
+        )
+    return {
+        "ok": False,
+        "error": _definition_plane_reject_error(definition_reject),
+        "user_facing_summary": _compiled_authoring_user_summary(),
+        "data": {
+            "reason_code": "definition_contract_unsatisfied",
+            "definition_criterion_ids": list(definition_reject.criterion_ids),
+            "definition_reason_codes": list(definition_reject.reason_codes),
+            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+        },
+    }
+
+
 def _metadata_contract_run_preflight_reject(
     ctx: AgentContext,
     workflow_yaml: str,
