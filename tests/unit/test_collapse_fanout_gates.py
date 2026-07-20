@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import posthog
 import pytest
 
 from skyvern.forge.sdk.core import skyvern_context
@@ -57,6 +58,7 @@ def _task(*, organization_id: str | None = "o_123", workflow_run_id: str | None 
     return SimpleNamespace(
         organization_id=organization_id,
         workflow_run_id=workflow_run_id,
+        workflow_permanent_id="wpid_012",
         task_id="tsk_789",
     )
 
@@ -65,7 +67,9 @@ def _set_provider(monkeypatch: pytest.MonkeyPatch, provider: FakeExperimentation
     monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
 
 
-def _umbrella_calls(provider: FakeExperimentationProvider) -> list[tuple[str, str, str, dict[str, str]]]:
+def _umbrella_calls(
+    provider: FakeExperimentationProvider,
+) -> list[tuple[str, str, str, dict[str, str]]]:
     return [call for call in provider.calls if call[1] == UMBRELLA_FLAG]
 
 
@@ -102,13 +106,82 @@ async def test_resolve_collapse_gate_separates_control_family_off_and_gate_error
 
 
 @pytest.mark.asyncio
-async def test_collapse_family_off_skips_umbrella(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("task_wpid", "context_wpid", "expected_wpid"),
+    [
+        ("wpid_012", "wpid_ctx", "wpid_012"),
+        (None, "wpid_ctx", "wpid_ctx"),
+        (None, None, ""),
+    ],
+)
+async def test_collapse_family_flag_evaluation_includes_workflow_permanent_id(
+    monkeypatch: pytest.MonkeyPatch,
+    task_wpid: str | None,
+    context_wpid: str | None,
+    expected_wpid: str,
+) -> None:
     provider = FakeExperimentationProvider({handler.COLLAPSE_SELECT_FANOUT_FLAG: False})
     _set_provider(monkeypatch, provider)
+    task = _task()
+    task.workflow_permanent_id = task_wpid
 
-    assert await handler._is_collapse_select_fanout_enabled(_task()) is False
-    assert provider.calls == [("cached", handler.COLLAPSE_SELECT_FANOUT_FLAG, "o_123", {"organization_id": "o_123"})]
+    if context_wpid is not None:
+        with skyvern_context.scoped(SkyvernContext(workflow_permanent_id=context_wpid)):
+            assert await handler._is_collapse_select_fanout_enabled(task) is False
+    else:
+        assert await handler._is_collapse_select_fanout_enabled(task) is False
+
+    family_properties = next(
+        properties
+        for _, feature_name, _, properties in provider.calls
+        if feature_name == handler.COLLAPSE_SELECT_FANOUT_FLAG
+    )
+    assert family_properties == {
+        "organization_id": "o_123",
+        "workflow_permanent_id": expected_wpid,
+    }
     assert _umbrella_calls(provider) == []
+
+
+def test_posthog_local_wpid_exclusion_requires_a_present_property() -> None:
+    client = posthog.Posthog(api_key="local", sync_mode=True)
+    client.feature_flags = [
+        {
+            "id": 1,
+            "key": "test-wpid-exclusion",
+            "active": True,
+            "filters": {
+                "groups": [
+                    {
+                        "properties": [
+                            {
+                                "key": "workflow_permanent_id",
+                                "type": "person",
+                                "value": ["wpid_excluded"],
+                                "operator": "is_not",
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+    ]
+    client.group_type_mapping = {}
+    client.cohorts = {}
+
+    def enabled(properties: dict[str, str]) -> bool | None:
+        return client.feature_enabled(
+            "test-wpid-exclusion",
+            "o_123",
+            person_properties=properties,
+            only_evaluate_locally=True,
+            send_feature_flag_events=False,
+        )
+
+    assert enabled({}) is None
+    assert enabled({"workflow_permanent_id": ""}) is True
+    assert enabled({"workflow_permanent_id": "wpid_excluded"}) is False
+    assert enabled({"workflow_permanent_id": "wpid_other"}) is True
 
 
 @pytest.mark.asyncio
