@@ -1728,6 +1728,8 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
     for criterion in _active_completion_criteria(ctx):
         if isinstance(criterion, CompletionCriterion) and _is_judgment_boolean_criterion(criterion):
             continue
+        if isinstance(criterion, CompletionCriterion) and criterion.antecedent_family == "blocker":
+            continue
         if getattr(criterion, "level", None) == "definition":
             continue
         if getattr(criterion, "method_mandated", False):
@@ -1757,9 +1759,13 @@ def _contingent_antecedent_child_paths(ctx: AgentContext) -> set[str]:
             criterion.output_path and _is_judgment_boolean_criterion(criterion)
         ):
             continue
-        path = _canonical_requested_output_path(criterion.contingent_antecedent_output_path)
-        if path and _output_path_has_child(path):
-            paths.add(path)
+        raw_paths = [criterion.contingent_antecedent_output_path]
+        if criterion.antecedent_family == "blocker":
+            raw_paths.append(criterion.output_path)
+        for raw_path in raw_paths:
+            path = _canonical_requested_output_path(raw_path)
+            if path and _output_path_has_child(path):
+                paths.add(path)
     return paths
 
 
@@ -2573,6 +2579,9 @@ _METADATA_FAMILY_REJECT_FAMILIES = frozenset(
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
 _OUTPUT_CONTRACT_ABLATION_GATE_ID = "output_contract_actuation"
 _METADATA_PREFLIGHT_ABLATION_GATE_ID = "metadata_run_preflight_reject"
+_VALUE_BEARING_ROOT_GUIDANCE_PATH = "output"
+_VALUE_BEARING_PREARM_FINGERPRINT_PREFIX = "value-bearing:prearm:"
+_VALUE_BEARING_GUIDANCE_FINGERPRINT_PREFIX = "value-bearing:guidance:"
 
 
 @dataclass(frozen=True)
@@ -2798,6 +2807,77 @@ def _return_skeleton_for_required_paths(
         return f'return {{"{root}": {root}}}'
     pairs = ", ".join(f'"{root}": {root}' for root in roots if _return_scaffold_name_is_safe(root))
     return f"return {{{pairs}}}" if pairs else ""
+
+
+def _value_bearing_satisfying_templates(
+    *,
+    block_label: str,
+    required_paths: set[str],
+    declaration_paths: set[str],
+    source: str,
+    reason_code: str,
+) -> dict[str, Any]:
+    declaration = _metadata_contract_required_paths(declaration_paths)
+    declaration_children = sorted(
+        child
+        for path in declaration
+        if (child := _output_path_direct_child(path, _VALUE_BEARING_ROOT_GUIDANCE_PATH))
+        and _return_scaffold_name_is_safe(child)
+    )
+    root_declarations_are_direct = len(declaration_children) == len(declaration)
+    if required_paths != {_VALUE_BEARING_ROOT_GUIDANCE_PATH} or not root_declarations_are_direct:
+        return {
+            "code_artifact_metadata": (
+                _metadata_contract_template(
+                    block_label=block_label,
+                    required_paths=required_paths,
+                    source=source,
+                    reason_code=reason_code,
+                    declaration_paths=declaration_paths,
+                )
+                if block_label
+                else None
+            ),
+            "extraction_schema": _schema_template_for_required_paths(required_paths, declaration_paths),
+            "return_skeleton": _return_skeleton_for_required_paths(required_paths, declaration_paths),
+        }
+    schema = (
+        _schema_template_for_required_paths(declaration, declaration)
+        if declaration
+        else {
+            "type": "object",
+            "properties": {_VALUE_BEARING_ROOT_GUIDANCE_PATH: {}},
+            "required": [_VALUE_BEARING_ROOT_GUIDANCE_PATH],
+        }
+    )
+    metadata_template = (
+        _metadata_contract_template(
+            block_label=block_label,
+            required_paths=set(),
+            source=source,
+            reason_code=reason_code,
+            declaration_paths=declaration,
+        )
+        if block_label
+        else None
+    )
+    if metadata_template is not None:
+        schema_text = json.dumps(schema, sort_keys=True)
+        for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+            row = metadata_template[field_name][0]
+            row["goal_value_paths"] = [_VALUE_BEARING_ROOT_GUIDANCE_PATH]
+            row["extraction_schema"] = schema_text
+    declaration_defaults = ", ".join(f'"{child}": None' for child in declaration_children)
+    return_skeleton = (
+        'return {"' + _VALUE_BEARING_ROOT_GUIDANCE_PATH + '": {' + declaration_defaults + ", **output_value}}"
+        if declaration_defaults
+        else f'return {{"{_VALUE_BEARING_ROOT_GUIDANCE_PATH}": output_value}}'
+    )
+    return {
+        "code_artifact_metadata": metadata_template,
+        "extraction_schema": schema,
+        "return_skeleton": return_skeleton,
+    }
 
 
 def _metadata_item_for_block_label(raw_metadata: object, block_label: str) -> Mapping[str, Any] | None:
@@ -3173,6 +3253,16 @@ class _OutputContractRequiredPaths:
         return _OutputContractLiveness.ABSENT
 
 
+def _value_bearing_directive_paths(contract: _OutputContractRequiredPaths) -> set[str]:
+    if not contract.observation_paths and (
+        contract.declaration_paths or contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY
+    ):
+        return {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
+    if contract.union:
+        return set(contract.union)
+    return set()
+
+
 def _degraded_request_slot_diagnostics(ctx: AgentContext) -> tuple[_DegradedRequestSlotDiagnostic, ...]:
     diagnostics: list[_DegradedRequestSlotDiagnostic] = []
     request_policy = ctx.request_policy
@@ -3345,6 +3435,52 @@ def _resolve_static_expression(
     return _resolve_static_expression(assigned, assignments, uncertain_names, seen_names | {expression.id})
 
 
+_RootOutputEnvelopeState = Literal["proven", "absent", "unknown"]
+
+
+def _root_output_expression_state(
+    expression: ast.expr,
+    assignments: Mapping[str, ast.expr],
+    uncertain_names: set[str],
+) -> _RootOutputEnvelopeState:
+    resolved = _resolve_static_expression(expression, assignments, uncertain_names)
+    if resolved is None:
+        return "unknown"
+    if not isinstance(resolved, ast.Dict):
+        return "absent" if isinstance(resolved, (ast.Constant, ast.List, ast.Set, ast.Tuple)) else "unknown"
+    literal_keys: list[str] = []
+    for key in resolved.keys:
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            return "unknown"
+        literal_keys.append(key.value)
+    return "proven" if _VALUE_BEARING_ROOT_GUIDANCE_PATH in literal_keys else "absent"
+
+
+def _root_output_envelope_state(code: str) -> _RootOutputEnvelopeState:
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+        return_nodes = [node for node in _iter_top_level_scope(tree.body) if isinstance(node, ast.Return)]
+        if not return_nodes:
+            return "absent"
+        states: set[_RootOutputEnvelopeState] = set()
+        for node in return_nodes:
+            if node.value is None:
+                states.add("absent")
+                continue
+            prior_body = [
+                statement for statement in tree.body if (statement.end_lineno or statement.lineno) < node.lineno
+            ]
+            assignments, uncertain_names = _top_level_static_assignments(ast.Module(body=prior_body, type_ignores=[]))
+            states.add(_root_output_expression_state(node.value, assignments, uncertain_names))
+        if "absent" in states:
+            return "absent"
+        if "unknown" in states:
+            return "unknown"
+        return "proven"
+    except (RecursionError, SyntaxError, ValueError):
+        return "unknown"
+
+
 _StaticOutputPathState = Literal["value", "empty", "absent", "unknown"]
 
 
@@ -3478,7 +3614,7 @@ def _evaluate_output_contract_for_code_block(
         return None
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     contract = _output_contract_required_paths_source(ctx)
-    required_paths = contract.union
+    required_paths = _value_bearing_directive_paths(contract) if enforce_value_bearing_liveness else set(contract.union)
     observation_paths = contract.observation_paths
     declaration_paths = contract.declaration_paths
     source = contract.source
@@ -3512,11 +3648,25 @@ def _evaluate_output_contract_for_code_block(
     declaration_only_contract = bool(declaration_paths) and not observation_paths
     if enforce_value_bearing_liveness:
         if contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
-            shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
-        elif target_block is not None and _statically_lacks_value_bearing_observation_paths(
-            target_code, observation_paths
-        ):
-            shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
+            root_envelope_unproved = (
+                required_paths == {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
+                and _root_output_envelope_state(target_code) != "proven"
+            )
+            if (
+                target_block is None
+                or root_envelope_unproved
+                or _statically_lacks_value_bearing_observation_paths(target_code, required_paths)
+            ):
+                shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
+        elif target_block is not None:
+            root_envelope_unproved = (
+                observation_paths == {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
+                and _root_output_envelope_state(target_code) != "proven"
+            )
+            if root_envelope_unproved or _statically_lacks_value_bearing_observation_paths(
+                target_code, observation_paths
+            ):
+                shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
     if not block_label:
         shape_violations.append("ambiguous_output_owner" if owner_labels else "missing_output_owner")
     elif target_block is None:
@@ -3602,6 +3752,13 @@ def _evaluate_output_contract_for_code_block(
         | (required_paths if shape_violations else set())
     )
     value_bearing_output_required = _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in shape_violations
+    satisfying_templates = _value_bearing_satisfying_templates(
+        block_label=block_label,
+        required_paths=required_paths,
+        declaration_paths=declaration_paths,
+        source=source,
+        reason_code=reason_code,
+    )
     payload: dict[str, Any] = {
         "reason_code": (
             _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE
@@ -3637,21 +3794,7 @@ def _evaluate_output_contract_for_code_block(
         "runtime_output_repair_facts": runtime_contract.facts if runtime_contract is not None else [],
         "output_owner_labels": owner_labels,
         "metadata_repair_contract": metadata_repair_contract,
-        "satisfying_templates": {
-            "code_artifact_metadata": (
-                _metadata_contract_template(
-                    block_label=block_label,
-                    required_paths=required_paths,
-                    source=source,
-                    reason_code=reason_code,
-                    declaration_paths=declaration_paths,
-                )
-                if block_label
-                else None
-            ),
-            "extraction_schema": _schema_template_for_required_paths(required_paths, declaration_paths),
-            "return_skeleton": _return_skeleton_for_required_paths(required_paths, declaration_paths),
-        },
+        "satisfying_templates": satisfying_templates,
         "missing_requested_output_facts": _missing_requested_output_facts(
             missing_paths,
             reason_code=reason_code,
@@ -3715,6 +3858,7 @@ def _adjudicate_output_contract_ladder_after_reject(
     workflow_yaml: str,
     current_fingerprint: str,
     steer_only: bool = False,
+    structure_directive_paths: set[str] | None = None,
 ) -> OutputContractActuation | None:
     """Run the actuation ladder at the shared deficiency seam so a signature whose formation
     remains incomplete advances toward an advisory-consumed run or a typed terminal within the
@@ -3722,9 +3866,10 @@ def _adjudicate_output_contract_ladder_after_reject(
     owner-directive path, not granted an inert run."""
     if ctx.turn_halt is not None or ctx.output_contract_bail_actuated_this_call:
         return None
-    # A statically valueless contract cannot be adjudicated by dispatching a run, so a
-    # value-bearing reject never mints an advisory grant that would yield the preflight.
-    if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations:
+    # A statically valueless contract cannot be adjudicated by dispatching a run. The native
+    # reject seam may still ask the same ladder for steer-only structure guidance, but ordinary
+    # callers remain inert so they cannot mint an advisory grant that would yield the preflight.
+    if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations and not steer_only:
         return None
     signature = evaluation.canonical_signature
     block_label = evaluation.block_label
@@ -3742,7 +3887,11 @@ def _adjudicate_output_contract_ladder_after_reject(
         ctx,
         blockers=blockers,
         target_code=target_code,
-        required_paths=evaluation.observation_paths,
+        required_paths=(
+            structure_directive_paths
+            if steer_only and structure_directive_paths is not None
+            else evaluation.observation_paths
+        ),
         signature=signature,
         current_fingerprint=current_fingerprint,
         advisory_run_grantable=blockers == [_OUTPUT_CONTRACT_REJECT_REASON_CODE],
@@ -3829,6 +3978,168 @@ def _metadata_reject_seam_fingerprint(
             + json.dumps(missing_fields_by_label, sort_keys=True)
         ).encode("utf-8")
     ).hexdigest()
+
+
+@dataclass(frozen=True)
+class _ValueBearingEvaluationGuidance:
+    required_output_paths: tuple[str, ...]
+    shape_violations: tuple[str, ...]
+    satisfying_templates: dict[str, Any]
+
+    def fingerprint_payload(self) -> dict[str, Any]:
+        return {
+            "required_output_paths": list(self.required_output_paths),
+            "shape_violations": list(self.shape_violations),
+            "satisfying_templates": self.satisfying_templates,
+        }
+
+
+def _value_bearing_evaluation_guidance(
+    evaluation: _OutputContractEvaluation,
+) -> _ValueBearingEvaluationGuidance | None:
+    raw_paths = evaluation.payload.get("canonical_required_child_paths")
+    raw_shape_violations = evaluation.payload.get("shape_violations")
+    raw_satisfying_templates = evaluation.payload.get("satisfying_templates")
+    if (
+        not isinstance(raw_paths, list)
+        or not raw_paths
+        or any(not isinstance(path, str) or not path for path in raw_paths)
+        or not isinstance(raw_shape_violations, list)
+        or any(not isinstance(violation, str) or not violation for violation in raw_shape_violations)
+        or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in raw_shape_violations
+        or not isinstance(raw_satisfying_templates, dict)
+    ):
+        return None
+    paths = tuple(sorted(set(raw_paths)))
+    if any(
+        path != _canonical_requested_output_path(path) or _output_path_root(path) != _VALUE_BEARING_ROOT_GUIDANCE_PATH
+        for path in paths
+    ):
+        return None
+    return _ValueBearingEvaluationGuidance(
+        required_output_paths=paths,
+        shape_violations=tuple(raw_shape_violations),
+        satisfying_templates=dict(raw_satisfying_templates),
+    )
+
+
+def _value_bearing_reject_seam_fingerprint(
+    signature: str,
+    guidance: _ValueBearingEvaluationGuidance,
+) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "directive_family": _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+                "canonical_output_contract_signature": signature,
+                "guidance": guidance.fingerprint_payload(),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{_VALUE_BEARING_GUIDANCE_FINGERPRINT_PREFIX}{digest}"
+
+
+def _value_bearing_reject_directive_payload(
+    *,
+    guidance: _ValueBearingEvaluationGuidance,
+    escalate: bool,
+) -> dict[str, Any]:
+    return {
+        "rung": 2 if escalate else 1,
+        "required_output_paths": list(guidance.required_output_paths),
+        "shape_violations": list(guidance.shape_violations),
+        "satisfying_templates": guidance.satisfying_templates,
+    }
+
+
+def _emit_value_bearing_convergence_directive(
+    *,
+    signature: str,
+    block_label: str,
+    guidance: _ValueBearingEvaluationGuidance,
+    guidance_fingerprint: str,
+    candidate_fingerprint: str,
+    escalate: bool,
+) -> dict[str, Any]:
+    directive = _value_bearing_reject_directive_payload(
+        guidance=guidance,
+        escalate=escalate,
+    )
+    LOG.info(
+        "copilot_output_contract_spine_structure_directive_emitted",
+        directive_family=_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+        block_label=block_label,
+        canonical_output_contract_signature=signature,
+        canonical_required_child_paths=list(guidance.required_output_paths),
+        guidance_fingerprint=guidance_fingerprint,
+        candidate_fingerprint=candidate_fingerprint,
+        spine_split_blockers=list(guidance.shape_violations),
+        spine_stage_count=None,
+        rung=directive["rung"],
+    )
+    return directive
+
+
+def _value_bearing_definition_reject_corrective(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> dict[str, Any] | None:
+    if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
+        return None
+    evaluation = _evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        raw_metadata,
+        allow_static_return_advisory=True,
+        enforce_value_bearing_liveness=True,
+    )
+    if evaluation is None or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in evaluation.shape_violations:
+        return None
+    guidance = _value_bearing_evaluation_guidance(evaluation)
+    if guidance is None or not evaluation.canonical_signature or not evaluation.block_label:
+        return None
+    guidance_fingerprint = _value_bearing_reject_seam_fingerprint(
+        evaluation.canonical_signature,
+        guidance,
+    )
+    escalate = _prior_output_contract_directive_unconsumed(
+        ctx,
+        evaluation.canonical_signature,
+        guidance_fingerprint,
+    )
+    actuation = _adjudicate_output_contract_ladder_after_reject(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        current_fingerprint=guidance_fingerprint,
+        steer_only=True,
+        structure_directive_paths=set(guidance.required_output_paths),
+    )
+    if actuation is None or actuation.kind != OutputContractActuationKind.STRUCTURE_DIRECTIVE:
+        return None
+    candidate_fingerprint = _output_contract_structural_fingerprint(
+        workflow_yaml,
+        evaluation.canonical_signature,
+    )
+    directive = _emit_value_bearing_convergence_directive(
+        signature=evaluation.canonical_signature,
+        block_label=evaluation.block_label,
+        guidance=guidance,
+        guidance_fingerprint=guidance_fingerprint,
+        candidate_fingerprint=candidate_fingerprint,
+        escalate=escalate,
+    )
+    return {
+        "canonical_output_contract_signature": evaluation.canonical_signature,
+        "canonical_required_child_paths": list(guidance.required_output_paths),
+        "shape_violations": list(guidance.shape_violations),
+        "satisfying_templates": guidance.satisfying_templates,
+        "output_contract_actuation": actuation.kind.value,
+        "value_bearing_convergence_directive": directive,
+    }
 
 
 def _adjudicate_metadata_reject_ladder(
@@ -3925,7 +4236,14 @@ def _record_output_contract_reject(
     # A candidate so incomplete that no required child paths are derivable must still consume the
     # reject budget: an empty set would silently skip counting and degrade the turn to the generic
     # churn stop (loop_detected) instead of this ladder's typed terminal.
-    counted_paths = evaluation.required_paths or {_OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH}
+    value_bearing_reject = _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations
+    value_bearing_guidance = _value_bearing_evaluation_guidance(evaluation) if value_bearing_reject else None
+    value_bearing_directive_paths = (
+        set(value_bearing_guidance.required_output_paths) if value_bearing_guidance is not None else set()
+    )
+    counted_paths = (
+        value_bearing_directive_paths or evaluation.required_paths or {_OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH}
+    )
     count = _record_output_contract_family_reject(
         ctx,
         counted_paths,
@@ -3936,29 +4254,74 @@ def _record_output_contract_reject(
     payload = dict(evaluation.payload)
     payload["output_contract_reject_count"] = count
     payload["output_contract_reject_budget"] = _MAX_OUTPUT_CONTRACT_REJECTS
+    value_bearing_directive_eligible = bool(
+        value_bearing_reject
+        and evaluation.canonical_signature
+        and evaluation.block_label
+        and value_bearing_guidance is not None
+    )
     missing_fields_by_label = (
         _metadata_missing_required_fields_by_label(raw_metadata, labels=[evaluation.block_label], missing_labels=[])
         if evaluation.block_label
         else {}
     )
-    directive_fingerprint = (
-        _metadata_reject_seam_fingerprint(workflow_yaml, evaluation.canonical_signature, missing_fields_by_label)
-        if missing_fields_by_label
-        else authored_structural_fingerprint
-    )
+    if value_bearing_directive_eligible:
+        assert value_bearing_guidance is not None
+        directive_fingerprint = _value_bearing_reject_seam_fingerprint(
+            evaluation.canonical_signature,
+            value_bearing_guidance,
+        )
+    else:
+        directive_fingerprint = (
+            _metadata_reject_seam_fingerprint(workflow_yaml, evaluation.canonical_signature, missing_fields_by_label)
+            if missing_fields_by_label
+            else authored_structural_fingerprint
+        )
     directive_escalate = _prior_output_contract_directive_unconsumed(
         ctx, evaluation.canonical_signature, directive_fingerprint
     )
-    actuation = _adjudicate_output_contract_ladder_after_reject(
+    budget_terminal = value_bearing_directive_eligible and _adjudicate_output_contract_budget(
         ctx,
-        evaluation,
-        workflow_yaml=workflow_yaml,
-        current_fingerprint=directive_fingerprint,
+        counted_paths,
+        count=count,
+        block_label=evaluation.block_label,
     )
+    actuation = (
+        None
+        if budget_terminal
+        else _adjudicate_output_contract_ladder_after_reject(
+            ctx,
+            evaluation,
+            workflow_yaml=workflow_yaml,
+            current_fingerprint=directive_fingerprint,
+            steer_only=value_bearing_directive_eligible,
+            structure_directive_paths=value_bearing_directive_paths if value_bearing_directive_eligible else None,
+        )
+    )
+    value_bearing_directive_emitted = False
     if actuation is not None:
         payload["output_contract_actuation"] = actuation.kind.value
+        if actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE and value_bearing_directive_eligible:
+            assert value_bearing_guidance is not None
+            candidate_fingerprint = _output_contract_structural_fingerprint(
+                workflow_yaml, evaluation.canonical_signature
+            )
+            value_bearing_directive = _emit_value_bearing_convergence_directive(
+                signature=evaluation.canonical_signature,
+                block_label=evaluation.block_label,
+                guidance=value_bearing_guidance,
+                guidance_fingerprint=directive_fingerprint,
+                candidate_fingerprint=candidate_fingerprint,
+                escalate=directive_escalate,
+            )
+            payload["value_bearing_convergence_directive"] = value_bearing_directive
+            value_bearing_directive_emitted = True
+            latest_outcome = ctx.latest_recorded_build_test_outcome
+            if isinstance(latest_outcome, RecordedBuildTestOutcome) and latest_outcome.phase == "author_time_reject":
+                record_build_test_outcome(ctx, None)
         if (
             actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+            and not value_bearing_directive_eligible
             and evaluation.block_label
             and missing_fields_by_label
         ):
@@ -3979,10 +4342,19 @@ def _record_output_contract_reject(
                 # The typed adjudication now owns this same deficiency. Keep the historical reject for
                 # ceiling/liveness evidence, but do not render it again as a fresh rejection next turn.
                 record_build_test_outcome(ctx, None)
-    if _adjudicate_output_contract_budget(ctx, counted_paths, count=count, block_label=evaluation.block_label):
+    if not value_bearing_directive_eligible:
+        budget_terminal = _adjudicate_output_contract_budget(
+            ctx,
+            counted_paths,
+            count=count,
+            block_label=evaluation.block_label,
+        )
+    if budget_terminal:
         payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
         payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-    if actuation is None or actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE:
+    if (
+        actuation is None or actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    ) and not value_bearing_directive_emitted:
         structural_payload = _output_contract_author_time_structural_payload(
             ctx,
             evaluation.required_paths,
@@ -4687,9 +5059,13 @@ def _arm_output_contract_value_bearing_directive(
     workflow_yaml: str,
     liveness: _OutputContractLiveness,
 ) -> None:
-    fingerprint = _output_contract_structural_fingerprint(workflow_yaml, signature)
-    already_armed = ctx.output_contract_armed_directive_fingerprint_by_signature.get(signature) == fingerprint
-    _record_armed_directive_fingerprint(ctx, signature, fingerprint)
+    fingerprint = (
+        f"{_VALUE_BEARING_PREARM_FINGERPRINT_PREFIX}{_output_contract_structural_fingerprint(workflow_yaml, signature)}"
+    )
+    armed = ctx.output_contract_armed_directive_fingerprint_by_signature.get(signature)
+    already_armed = armed == fingerprint
+    if not (armed or "").startswith(_VALUE_BEARING_GUIDANCE_FINGERPRINT_PREFIX):
+        _record_armed_directive_fingerprint(ctx, signature, fingerprint)
     if already_armed:
         return
     LOG.info(
@@ -4794,6 +5170,8 @@ def _prior_output_contract_actuation(ctx: AgentContext, signature: str) -> bool:
 
 def _prior_output_contract_directive_unconsumed(ctx: AgentContext, signature: str, current_fingerprint: str) -> bool:
     armed = ctx.output_contract_armed_directive_fingerprint_by_signature.get(signature)
+    if (armed or "").startswith(_VALUE_BEARING_PREARM_FINGERPRINT_PREFIX):
+        return False
     return bool(armed) and armed == current_fingerprint
 
 
@@ -5423,15 +5801,16 @@ def _impose_output_contract_envelope_after_steering(
 ) -> tuple[str, object, bool]:
     ctx.output_contract_bail_actuated_this_call = False
     contract = _output_contract_required_paths_source(ctx)
-    required_paths = contract.union
+    required_paths = set(contract.union)
+    directive_paths = _value_bearing_directive_paths(contract)
     observation_paths = contract.observation_paths
     declaration_paths = contract.declaration_paths
     source = contract.source
     reason_code = contract.reason_code
-    if not required_paths:
-        return workflow_yaml, raw_code_artifact_metadata, False
-    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
     if contract.liveness is not _OutputContractLiveness.VALUE_REQUIRED:
+        if not directive_paths:
+            return workflow_yaml, raw_code_artifact_metadata, False
+        signature = _output_contract_signature(ctx=ctx, required_paths=directive_paths)
         _arm_output_contract_value_bearing_directive(
             ctx,
             signature=signature,
@@ -5439,6 +5818,9 @@ def _impose_output_contract_envelope_after_steering(
             liveness=contract.liveness,
         )
         return workflow_yaml, raw_code_artifact_metadata, False
+    if not required_paths:
+        return workflow_yaml, raw_code_artifact_metadata, False
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
     # The stamp precedes actuation and ignores advisory state so no
     # acceptance route can persist a block that omits the declaration paths.
     workflow_yaml, declaration_stamped = _stamp_declaration_contract_defaults(
@@ -5692,6 +6074,22 @@ def _metadata_contract_run_preflight_reject(
         and _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters) is not None
     )
     if definition_reject is not None and (enforce_untagged_declared_inputs or not grounded_binding_available):
+        definition_corrective = (
+            None
+            if copilot_author_time_gate_log_only_enabled(ctx, DEFINITION_CONTRACT_UNSATISFIED_GATE_ID)
+            else _value_bearing_definition_reject_corrective(
+                ctx,
+                workflow_yaml=workflow_yaml,
+                raw_metadata=raw_code_artifact_metadata,
+            )
+        )
+        definition_data = {
+            "reason_code": "definition_contract_unsatisfied",
+            "definition_criterion_ids": list(definition_reject.criterion_ids),
+            "definition_reason_codes": list(definition_reject.reason_codes),
+            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+            **(definition_corrective or {}),
+        }
         halted = _stash_unresolved_recorded_outcome_grounding_halt(
             ctx,
             definition_reject.unreferenced_parameter_keys,
@@ -5701,12 +6099,7 @@ def _metadata_contract_run_preflight_reject(
                 "ok": False,
                 "error": _definition_plane_reject_error(definition_reject),
                 "user_facing_summary": _compiled_authoring_user_summary(),
-                "data": {
-                    "reason_code": "definition_contract_unsatisfied",
-                    "definition_criterion_ids": list(definition_reject.criterion_ids),
-                    "definition_reason_codes": list(definition_reject.reason_codes),
-                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-                },
+                "data": definition_data,
             }
         if not _record_definition_plane_ablation_event(
             ctx,
@@ -5724,12 +6117,7 @@ def _metadata_contract_run_preflight_reject(
                 "ok": False,
                 "error": _definition_plane_reject_error(definition_reject),
                 "user_facing_summary": _compiled_authoring_user_summary(),
-                "data": {
-                    "reason_code": "definition_contract_unsatisfied",
-                    "definition_criterion_ids": list(definition_reject.criterion_ids),
-                    "definition_reason_codes": list(definition_reject.reason_codes),
-                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-                },
+                "data": definition_data,
             }
     convergence_reject = _recorded_outcome_convergence_reject(
         ctx,
@@ -5812,13 +6200,19 @@ def _metadata_contract_run_preflight_reject(
         return None
     if evaluation.repair_context is not None:
         ctx.last_code_authoring_repair_context = evaluation.repair_context
+    if _metadata_preflight_reject_yields_to_ladder(ctx):
+        return None
+    if "value_bearing_convergence_directive" in payload:
+        return _output_contract_reject_result(
+            evaluation,
+            payload=payload,
+            tool_name="update_and_run_blocks",
+        )
     payload = dict(payload)
     payload["output_contract_reason_code"] = payload.get("reason_code")
     payload["reason_code"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
     payload["reject_reason"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
     block_label = evaluation.block_label or "the target output block"
-    if _metadata_preflight_reject_yields_to_ladder(ctx):
-        return None
     return {
         "ok": False,
         "error": (
@@ -5835,13 +6229,23 @@ def output_contract_value_bearing_run_reject(
     code_by_label: Mapping[str, str],
 ) -> dict[str, Any] | None:
     """Refuses dispatch of a saved workflow whose author contract is statically provably
-    valueless (declaration-only, degraded-empty, or statically-all-empty); unknown stays fail-open."""
+    valueless. Observation paths stay fail-open when unknown; a root-only repair must prove its envelope."""
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     contract = _output_contract_required_paths_source(ctx)
     declaration_only_contract = bool(contract.declaration_paths) and not contract.observation_paths
-    statically_valueless = contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract
-    if not statically_valueless and contract.liveness is _OutputContractLiveness.VALUE_REQUIRED and code_by_label:
+    root_only_liveness_contract = (
+        contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract
+    )
+    if root_only_liveness_contract:
+        statically_valueless = not code_by_label or all(
+            _root_output_envelope_state(code) != "proven"
+            or _statically_lacks_value_bearing_observation_paths(code, {_VALUE_BEARING_ROOT_GUIDANCE_PATH})
+            for code in code_by_label.values()
+        )
+    else:
+        statically_valueless = False
+    if contract.liveness is _OutputContractLiveness.VALUE_REQUIRED and code_by_label:
         statically_valueless = all(
             _statically_lacks_value_bearing_observation_paths(code, contract.observation_paths)
             for code in code_by_label.values()
@@ -5872,9 +6276,8 @@ def output_contract_value_bearing_run_reject(
         )
     elif contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
         error = (
-            "Cannot run the saved workflow: every requested value-bearing output has degraded out of "
-            "the completion criteria, so no code revision can satisfy the contract. Re-establish at "
-            "least one requested value-bearing output before running."
+            "Cannot run the saved workflow: its code does not prove a non-empty top-level `output` "
+            "value. Revise the owning code block to return a real value under `output` before running."
         )
     else:
         error = (
@@ -11576,6 +11979,8 @@ async def _update_workflow(
     allow_static_output_uncertainty: bool = False,
     formation_prepared: bool = False,
 ) -> dict[str, Any]:
+    ctx.output_contract_bail_actuated_this_call = False
+
     def reject(
         *,
         error: str,
@@ -11712,6 +12117,22 @@ async def _update_workflow(
         )
     definition_reject = _definition_plane_preflight_reject(ctx, workflow_yaml)
     if definition_reject is not None:
+        definition_corrective = (
+            None
+            if copilot_author_time_gate_log_only_enabled(ctx, DEFINITION_CONTRACT_UNSATISFIED_GATE_ID)
+            else _value_bearing_definition_reject_corrective(
+                ctx,
+                workflow_yaml=workflow_yaml,
+                raw_metadata=ctx.raw_code_artifact_metadata,
+            )
+        )
+        definition_data = {
+            "reason_code": "definition_contract_unsatisfied",
+            "definition_criterion_ids": list(definition_reject.criterion_ids),
+            "definition_reason_codes": list(definition_reject.reason_codes),
+            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+            **(definition_corrective or {}),
+        }
         halted = _stash_unresolved_recorded_outcome_grounding_halt(
             ctx,
             definition_reject.unreferenced_parameter_keys,
@@ -11720,12 +12141,7 @@ async def _update_workflow(
             return reject(
                 error=_definition_plane_reject_error(definition_reject),
                 user_facing_summary=_compiled_authoring_user_summary(),
-                data={
-                    "reason_code": "definition_contract_unsatisfied",
-                    "definition_criterion_ids": list(definition_reject.criterion_ids),
-                    "definition_reason_codes": list(definition_reject.reason_codes),
-                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-                },
+                data=definition_data,
             )
         if not _record_definition_plane_ablation_event(
             ctx,
@@ -11742,12 +12158,7 @@ async def _update_workflow(
             return reject(
                 error=_definition_plane_reject_error(definition_reject),
                 user_facing_summary=_compiled_authoring_user_summary(),
-                data={
-                    "reason_code": "definition_contract_unsatisfied",
-                    "definition_criterion_ids": list(definition_reject.criterion_ids),
-                    "definition_reason_codes": list(definition_reject.reason_codes),
-                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-                },
+                data=definition_data,
             )
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         unrenderable = _code_block_render_reject(workflow_yaml, getattr(ctx, "workflow_yaml", None))
