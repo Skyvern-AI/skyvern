@@ -363,10 +363,15 @@ def _captured_trajectory_index(interaction: Mapping[str, Any], position: int) ->
     return raw_index if isinstance(raw_index, int) and raw_index >= 0 else position
 
 
+class _ValidatedSnapshotBindings(NamedTuple):
+    fill_by_index: dict[int, tuple[str, str]]
+    select_option_by_index: dict[int, str]
+
+
 def _validated_authoring_parameter_binding_snapshot(
     snapshot: AuthoringParameterBindingSnapshot,
     trajectory: Sequence[Mapping[str, Any]],
-) -> dict[int, tuple[str, str]] | None:
+) -> _ValidatedSnapshotBindings | None:
     if not snapshot.field_bindings:
         return None
     terminal_matches = [
@@ -393,7 +398,8 @@ def _validated_authoring_parameter_binding_snapshot(
     )
     if expected != snapshot.fingerprint:
         return None
-    by_index: dict[int, tuple[str, str]] = {}
+    fill_by_index: dict[int, tuple[str, str]] = {}
+    select_option_by_index: dict[int, str] = {}
     declared_keys: set[str] = set()
     selectors: set[str] = set()
     for binding in snapshot.field_bindings:
@@ -418,12 +424,27 @@ def _validated_authoring_parameter_binding_snapshot(
         field_position, interaction = field_matches[0]
         if _binding_source_origin(str(interaction.get("source_url") or "")) != snapshot.source_origin:
             return None
+        if binding.match_basis == "scouted_selection_value":
+            if str(interaction.get("tool_name") or "") != "click":
+                return None
+            if templated_selection_locator_binding(interaction) != (binding.declared_key, binding.field_selector):
+                return None
+            continue
+        if binding.match_basis == "scouted_option_value":
+            if str(interaction.get("tool_name") or "") != "select_option":
+                return None
+            if str(interaction.get("selector") or "").strip() != binding.field_selector:
+                return None
+            if not selection_option_value_admissible(str(interaction.get("value") or "").strip(), binding.declared_key):
+                return None
+            select_option_by_index[field_position] = binding.declared_key
+            continue
         if str(interaction.get("tool_name") or "") != "type_text":
             return None
         if str(interaction.get("selector") or "").strip() != binding.field_selector:
             return None
-        by_index[field_position] = (binding.declared_key, binding.field_selector)
-    return by_index
+        fill_by_index[field_position] = (binding.declared_key, binding.field_selector)
+    return _ValidatedSnapshotBindings(fill_by_index, select_option_by_index)
 
 
 def _validated_submit_rung_binding(
@@ -835,6 +856,38 @@ def build_input_templated_locator(
             return None
         return f'page.get_by_role({_py_str(role)}, name=f"{body}", exact=True)'
     return None
+
+
+def templated_selection_locator_binding(interaction: Mapping[str, Any]) -> tuple[str, str] | None:
+    """(declared_key, canonical templated-locator expression) for a click whose stamped
+    input_correspondences template exactly one declared-key hole. None when the click is untemplatable
+    or witnesses more than one hole. The canonical expression is the join key shared with the consumption
+    recognizer, so a re-authored templated click and this snapshot binding agree by construction."""
+    plan = _input_templating_plan(interaction)
+    if plan is None or len(plan.holes) != 1:
+        return None
+    key = str(plan.holes[0].get("input_key") or "")
+    if not key:
+        return None
+    expr = build_input_templated_locator(
+        surface=plan.surface, selector=plan.selector, role=plan.role, name=plan.name, holes=plan.holes
+    )
+    if expr is None:
+        return None
+    try:
+        canonical = ast.unparse(ast.parse(expr, mode="eval").body)
+    except SyntaxError:
+        return None
+    return key, canonical
+
+
+def selection_option_value_admissible(value: str, key: str) -> bool:
+    return (
+        value == value.strip()
+        and len(value) >= _WITNESS_MIN_VALUE_LEN
+        and bool(_WITNESS_SAFE_CHARSET_RE.fullmatch(value))
+        and _witness_key_is_safe(key)
+    )
 
 
 def _ordered_holes(raw: str, holes: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]] | None:
@@ -1393,14 +1446,17 @@ def synthesize_code_block(
     grounded_binding_count = sum(1 for interaction in trajectory if "submit_rung_binding" in interaction)
     if grounded_binding_count > 1 or (grounded_binding_count and parameter_binding_snapshot is not None):
         return None
-    snapshot_bindings_by_index = (
+    validated_snapshot_bindings = (
         _validated_authoring_parameter_binding_snapshot(parameter_binding_snapshot, trajectory)
         if parameter_binding_snapshot is not None
-        else {}
+        else _ValidatedSnapshotBindings({}, {})
     )
-    if parameter_binding_snapshot is not None and snapshot_bindings_by_index is None:
+    if parameter_binding_snapshot is not None and validated_snapshot_bindings is None:
         return None
-    snapshot_bindings_by_index = snapshot_bindings_by_index or {}
+    if validated_snapshot_bindings is None:
+        validated_snapshot_bindings = _ValidatedSnapshotBindings({}, {})
+    snapshot_bindings_by_index = validated_snapshot_bindings.fill_by_index
+    snapshot_select_option_by_index = validated_snapshot_bindings.select_option_by_index
     snapshot_recovery_bindings = (
         [binding for binding in parameter_binding_snapshot.field_bindings if binding.field_trajectory_index is None]
         if parameter_binding_snapshot is not None
@@ -1907,6 +1963,7 @@ def synthesize_code_block(
                 lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
             record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
         elif tool_name == "select_option":
+            emit_snapshot_recovery(trajectory_index, action_indent)
             value = str(interaction.get("value") or "").strip()
             if not value:
                 notes.append("dropped a select_option interaction with no recorded value")
@@ -1914,7 +1971,14 @@ def synthesize_code_block(
                     {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_value"}
                 )
                 continue
-            lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
+            bound_key = snapshot_select_option_by_index.get(trajectory_index)
+            if bound_key is not None:
+                if bound_key not in used_param_keys:
+                    used_param_keys.add(bound_key)
+                    parameters.append({"key": bound_key})
+                lines.append(f"{action_indent}await {locator}.select_option(str({bound_key}))")
+            else:
+                lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
