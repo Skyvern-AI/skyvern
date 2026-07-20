@@ -114,9 +114,11 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     produce_covered_static_return_envelope,
     render_missing_rung_call_sources,
     render_obligation_findings,
+    selection_option_value_admissible,
     spine_partition_findings,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
+    templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
     uncovered_rung_records,
 )
@@ -2343,6 +2345,111 @@ class _AuthoringParameterBindingResolution(NamedTuple):
     directive: AuthoringParameterBindingDirective | None
 
 
+class _SelectionBindingRecord(NamedTuple):
+    declared_key: str
+    match_basis: AuthoringParameterBindingMatchBasis
+    field_selector: str
+    trajectory_index: int
+    terminal_tool: AuthoringParameterBindingTerminalTool
+    terminal_selector: str
+
+
+def _selection_parameter_binding_resolution(
+    ctx: AgentContext,
+    *,
+    target_keys: Sequence[str],
+    ephemeral_values: Mapping[str, Any],
+    structural_key: str,
+    source_origin: str,
+) -> _AuthoringParameterBindingResolution:
+    trajectory = ctx.scout_trajectory
+    if not isinstance(trajectory, list) or not trajectory:
+        return _AuthoringParameterBindingResolution(None, None)
+    target = set(target_keys)
+    admitted: list[_SelectionBindingRecord] = []
+    for position, interaction in enumerate(trajectory):
+        if not isinstance(interaction, Mapping):
+            continue
+        if url_origin(str(interaction.get("source_url") or "").strip()) != source_origin:
+            continue
+        tool = str(interaction.get("tool_name") or "")
+        index = _scout_trajectory_index(interaction, position)
+        if tool == "click":
+            templated = templated_selection_locator_binding(interaction)
+            if templated is None:
+                continue
+            key, join_selector = templated
+            if key in target:
+                admitted.append(
+                    _SelectionBindingRecord(
+                        key,
+                        "scouted_selection_value",
+                        join_selector,
+                        index,
+                        "click",
+                        str(interaction.get("selector") or "").strip(),
+                    )
+                )
+        elif tool == "select_option":
+            value = str(interaction.get("value") or "").strip()
+            selector = _safe_selector_repair_atom(interaction.get("selector"))
+            if not value or not selector:
+                continue
+            for key in target_keys:
+                key_value = ephemeral_values.get(key)
+                if isinstance(key_value, str) and key_value == value and selection_option_value_admissible(value, key):
+                    admitted.append(
+                        _SelectionBindingRecord(key, "scouted_option_value", selector, index, "select_option", selector)
+                    )
+    if not admitted:
+        return _AuthoringParameterBindingResolution(None, None)
+    directive = build_authoring_parameter_binding_directive(
+        structural_key=structural_key,
+        source_origin=source_origin,
+        candidates=[
+            AuthoringParameterBindingCandidate(declared_key=record.declared_key, field_selector=record.field_selector)
+            for record in admitted
+        ],
+    )
+    resolved: list[AuthoringParameterFieldBinding] = []
+    for key in target_keys:
+        matches = [record for record in admitted if record.declared_key == key]
+        if len(matches) != 1:
+            return _AuthoringParameterBindingResolution(None, directive)
+        record = matches[0]
+        resolved.append(
+            AuthoringParameterFieldBinding(
+                declared_key=key,
+                field_selector=record.field_selector,
+                field_trajectory_index=record.trajectory_index,
+                match_basis=record.match_basis,
+            )
+        )
+    if len({binding.field_selector for binding in resolved}) != len(resolved):
+        return _AuthoringParameterBindingResolution(None, directive)
+    terminal_record = max(admitted, key=lambda record: record.trajectory_index)
+    terminal = AuthoringParameterTerminalBinding(
+        tool_name=terminal_record.terminal_tool,
+        trajectory_index=terminal_record.trajectory_index,
+        selector=terminal_record.terminal_selector,
+    )
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key=structural_key,
+        source_origin=source_origin,
+        field_bindings=resolved,
+        terminal=terminal,
+    )
+    LOG.info(
+        "copilot recorded outcome selection rung bound",
+        binding_fingerprint=snapshot.fingerprint,
+        parameter_keys=[binding.declared_key for binding in snapshot.field_bindings],
+        binding_count=len(snapshot.field_bindings),
+        terminal_tool=snapshot.terminal.tool_name,
+        terminal_trajectory_index=snapshot.terminal.trajectory_index,
+    )
+    return _AuthoringParameterBindingResolution(snapshot, directive)
+
+
 def _pending_authoring_parameter_binding_directive(
     ctx: AgentContext,
 ) -> tuple[CodeAuthoringRepairContext, AuthoringParameterBindingDirective] | None:
@@ -2423,6 +2530,7 @@ def _authoring_parameter_binding_resolution(
 
     snapshots: list[AuthoringParameterBindingSnapshot] = []
     candidate_pairs: list[AuthoringParameterBindingCandidate] = []
+    any_active_fields = False
     for form in forms:
         if not isinstance(form, Mapping):
             continue
@@ -2430,6 +2538,7 @@ def _authoring_parameter_binding_resolution(
         active_fields = [
             field for field in fields if field.get("disabled") is not True and str(field.get("selector") or "").strip()
         ]
+        any_active_fields = any_active_fields or bool(active_fields)
         field_selectors = {str(field.get("selector") or "").strip() for field in active_fields}
         submit_selectors = {
             str(control.get("selector") or "").strip()
@@ -2555,6 +2664,17 @@ def _authoring_parameter_binding_resolution(
         else None
     )
     if len(unique_snapshots) != 1:
+        if not any_active_fields:
+            selection = _selection_parameter_binding_resolution(
+                ctx,
+                target_keys=target_keys,
+                ephemeral_values=ephemeral_values,
+                structural_key=structural_key,
+                source_origin=source_origin,
+            )
+            if selection.snapshot is not None:
+                return selection
+            return _AuthoringParameterBindingResolution(None, directive or selection.directive)
         return _AuthoringParameterBindingResolution(None, directive)
     snapshot = next(iter(unique_snapshots.values()))
     LOG.info(
