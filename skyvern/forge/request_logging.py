@@ -47,6 +47,7 @@ _STREAMING_CONTENT_TYPE = "text/event-stream"
 _ARTIFACT_CONTENT_URL_QUERY_RE = re.compile(
     r"((?:[a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s\"'<>]+)?/v1/artifacts/[^/\s\"'<>]+/content/?)\?[^\s\"'<>]*"
 )
+_ACTION_LOG_ENDPOINT_RE = re.compile(r"^/v1/browser_sessions/[^/]+/action_logs/?$")
 
 # Exact field names that are always redacted.  Use a set for O(1) lookup
 # instead of regex substring matching to avoid false positives like
@@ -91,7 +92,9 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
 
 
 def _is_sensitive_endpoint(request: Request) -> bool:
-    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS
+    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS or (
+        request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None
+    )
 
 
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:

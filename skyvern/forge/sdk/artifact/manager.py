@@ -6,6 +6,7 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import structlog
@@ -27,6 +28,9 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+
+if TYPE_CHECKING:
+    from skyvern.schemas.action_log import ActionLogEvent
 
 LOG = structlog.get_logger(__name__)
 
@@ -516,11 +520,9 @@ class ArtifactManager:
         filename: str,
         data: bytes,
     ) -> str:
-        """Upload browser-session file data and record a deduplicated artifact row.
+        """Upload browser-session file data and record an artifact row.
 
-        Idempotent on ``(browser_session_id, uri, artifact_type)`` where ``uri`` derives from
-        ``filename``: re-ingesting the same filename overwrites the stored object but returns the
-        existing row unchanged, so its ``file_size``/``checksum`` reflect the first write.
+        Except for action logs, rows are idempotent on ``(browser_session_id, uri, artifact_type)``.
         """
         if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
             raise ValueError("filename must be a file name without path components")
@@ -552,6 +554,21 @@ class ArtifactManager:
             file_size=len(data),
         )
 
+    async def create_browser_session_action_log_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        event: "ActionLogEvent",
+    ) -> str:
+        return await self.create_browser_session_data_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            artifact_type=ArtifactType.BROWSER_SESSION_ACTION_LOG,
+            filename=f"v1-{event.event_id}.json",
+            data=event.model_dump_json().encode(),
+        )
+
     async def _create_browser_session_artifact(
         self,
         *,
@@ -563,15 +580,16 @@ class ArtifactManager:
         checksum: str | None = None,
         file_size: int | None = None,
     ) -> str:
-        """Shared idempotent insert keyed on ``(browser_session_id, uri, artifact_type)``."""
-        existing = await app.DATABASE.artifacts.find_artifact_for_browser_session(
-            organization_id=organization_id,
-            browser_session_id=browser_session_id,
-            uri=uri,
-            artifact_type=artifact_type,
-        )
-        if existing is not None:
-            return existing.artifact_id
+        """Insert a browser-session artifact, deduplicating every type except action logs."""
+        if artifact_type != ArtifactType.BROWSER_SESSION_ACTION_LOG:
+            existing = await app.DATABASE.artifacts.find_artifact_for_browser_session(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                uri=uri,
+                artifact_type=artifact_type,
+            )
+            if existing is not None:
+                return existing.artifact_id
 
         artifact_id = generate_artifact_id()
         await app.DATABASE.artifacts.create_artifact(
