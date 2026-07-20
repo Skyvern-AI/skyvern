@@ -235,10 +235,6 @@ class Settings(BaseSettings):
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
 
-    # Format: "http://<username>:<password>@host:port, http://<username>:<password>@host:port, ...."
-    HOSTED_PROXY_POOL: str = ""
-    ENABLE_PROXY: bool = False
-
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT

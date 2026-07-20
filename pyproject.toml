@@ -357,47 +357,5 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 [tool.mypy]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
-[tool.importlinter]
-root_packages = ["skyvern"]
-include_external_packages = true
-
-[[tool.importlinter.contracts]]
-name = "proxy core and ports import no framework or I/O libraries"
-type = "forbidden"
-source_modules = ["skyvern.proxy.core", "skyvern.proxy.ports"]
-forbidden_modules = [
-    "aiohttp",
-    "fastapi",
-    "httpx",
-    "playwright",
-    "redis",
-    "requests",
-    "sqlalchemy",
-    "starlette",
-    "structlog",
-    "uvicorn",
-    "websockets",
-]
-
-[[tool.importlinter.contracts]]
-name = "proxy adapters depend on ports and core, never the reverse"
-type = "layers"
-layers = ["skyvern.proxy.adapters", "skyvern.proxy.ports", "skyvern.proxy.core"]
-
-[[tool.importlinter.contracts]]
-name = "proxy never imports runner code or playwright"
-type = "forbidden"
-source_modules = ["skyvern.proxy"]
-forbidden_modules = [
-    "cloud",
-    "codeblock",
-    "playwright",
-    "skyvern.cli",
-    "skyvern.config",
-    "skyvern.forge",
-    "skyvern.webeye",
-    "workers",
-]
-
 [project.scripts]
 skyvern = "skyvern.__main__:main"

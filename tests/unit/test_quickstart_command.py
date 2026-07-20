@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 from typer.testing import CliRunner
 
 import skyvern.cli.quickstart as quickstart_module
@@ -22,10 +25,65 @@ from skyvern.utils.env_paths import (
     resolve_backend_env_path,
 )
 
+_BLOCKING_SWEEP_WITH_DESCENDANT = """
+import subprocess
+import sys
+import time
+
+descendant_code = (
+    "import pathlib, signal, sys, time; "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "pathlib.Path(sys.argv[1]).touch(); "
+    "time.sleep(0.5); pathlib.Path(sys.argv[2]).touch()"
+)
+subprocess.Popen(
+    [sys.executable, "-c", descendant_code, sys.argv[1], sys.argv[2]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+time.sleep(60)
+"""
+
 
 def _set_home(monkeypatch, home: Path) -> None:
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+
+
+def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_server) -> types.ModuleType:
+    from skyvern.cli import run_commands
+
+    fake_auth = types.ModuleType("skyvern.cli.core.mcp_http_auth")
+    fake_auth.MCPAPIKeyMiddleware = object
+
+    fake_session_manager = types.ModuleType("skyvern.cli.core.session_manager")
+    fake_session_manager.set_stateless_http_mode = lambda _enabled: None
+
+    fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
+    fake_telemetry.configure_mcp_telemetry_runtime = lambda **_kwargs: None
+
+    fake_mcp_tools = types.ModuleType("skyvern.cli.mcp_tools")
+
+    class FakeMCP:
+        def run(self, *, transport: str, **_: object) -> None:
+            assert transport == "stdio"
+            run_mcp_server()
+
+    fake_mcp_tools.mcp = FakeMCP()
+
+    monkeypatch.setattr(run_commands, "prepare_cli_runtime", lambda **_kwargs: events.append("prepare"))
+    monkeypatch.setattr(run_commands.atexit, "register", lambda _: None)
+    monkeypatch.setattr(run_commands.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(run_commands, "set_concise_responses", lambda _: None)
+    eof_event = types.SimpleNamespace(set=lambda: None)
+    monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (eof_event, eof_event))
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", lambda: events.append("cleanup"))
+    monkeypatch.setitem(sys.modules, "skyvern.cli.core.mcp_http_auth", fake_auth)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.core.session_manager", fake_session_manager)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools", fake_mcp_tools)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.telemetry", fake_telemetry)
+    return run_commands
 
 
 def test_backend_env_read_uses_intent_specific_precedence(tmp_path, monkeypatch) -> None:
@@ -245,6 +303,9 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
     fake_telemetry.configure_mcp_telemetry_runtime = fake_configure_mcp_telemetry_runtime
 
+    fake_local_browser_profile = types.ModuleType("skyvern.library.local_browser_profile")
+    fake_local_browser_profile.sweep_local_browser_profiles_with_budget = lambda: events.append("sweep")
+
     fake_mcp_tools = types.ModuleType("skyvern.cli.mcp_tools")
 
     class FakeMCP:
@@ -265,6 +326,7 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
     monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (eof_event, eof_event))
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", lambda: events.append("cleanup"))
     monkeypatch.setitem(sys.modules, "skyvern.forge.sdk.forge_log", fake_forge_log)
+    monkeypatch.setitem(sys.modules, "skyvern.library.local_browser_profile", fake_local_browser_profile)
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.mcp_http_auth", fake_auth)
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.session_manager", fake_session_manager)
     monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools", fake_mcp_tools)
@@ -274,12 +336,94 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
     assert events == [
         "setup_logger",
+        "sweep",
         "telemetry:local_cli:stdio",
         "stateless:False",
         "run:stdio",
         "stateless:False",
         "cleanup",
     ]
+
+
+@pytest.mark.parametrize("failure_stage", ["import", "call"])
+def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, failure_stage: str) -> None:
+    events: list[str] = []
+    run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, lambda: events.append("run"))
+
+    fake_local_browser_profile = types.ModuleType("skyvern.library.local_browser_profile")
+    if failure_stage == "import":
+
+        def missing_sweep(name: str) -> object:
+            if name == "sweep_local_browser_profiles_with_budget":
+                raise ImportError("sweep import failed")
+            raise AttributeError(name)
+
+        fake_local_browser_profile.__getattr__ = missing_sweep
+    else:
+
+        def failing_sweep() -> None:
+            raise RuntimeError("sweep call failed")
+
+        fake_local_browser_profile.sweep_local_browser_profiles_with_budget = failing_sweep
+    monkeypatch.setitem(sys.modules, "skyvern.library.local_browser_profile", fake_local_browser_profile)
+
+    with capture_logs() as logs:
+        run_commands.run_mcp()
+
+    assert events == ["prepare", "run", "cleanup"]
+    assert any(log.get("log_level") == "warning" for log in logs)
+
+
+def test_run_mcp_starts_within_sweep_budget_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
+    from skyvern.library import local_browser_profile
+
+    events: list[str] = []
+    children: list[subprocess.Popen[bytes]] = []
+    run_started_at: list[float] = []
+    real_popen = subprocess.Popen
+    budget_seconds = 0.3
+    descendant_ready = tmp_path / "descendant-ready"
+    late_mutation = tmp_path / "late-mutation"
+
+    def start_blocking_child(*_args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = real_popen(
+            [sys.executable, "-c", _BLOCKING_SWEEP_WITH_DESCENDANT, str(descendant_ready), str(late_mutation)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=kwargs["stderr"],
+            start_new_session=bool(kwargs.get("start_new_session", False)),
+        )
+        children.append(child)
+        deadline = time.monotonic() + 1
+        while not descendant_ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert descendant_ready.exists()
+        return child
+
+    def run_mcp_server() -> None:
+        run_started_at.append(time.monotonic())
+        assert children and children[0].poll() is not None
+        events.append("run")
+
+    run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, run_mcp_server)
+    monkeypatch.setattr(subprocess, "Popen", start_blocking_child)
+    monkeypatch.setattr(local_browser_profile, "PROFILE_SWEEP_STARTUP_BUDGET_SECONDS", budget_seconds)
+
+    started_at = time.monotonic()
+    try:
+        with capture_logs() as logs:
+            run_commands.run_mcp()
+    finally:
+        for child in children:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
+    assert run_started_at[0] - started_at <= budget_seconds + 0.075
+    assert events == ["prepare", "run", "cleanup"]
+    assert any(log.get("event") == "local_browser_profile_sweep_timed_out" for log in logs)
+    time.sleep(0.55)
+    assert not late_mutation.exists()
 
 
 @pytest.mark.parametrize(
