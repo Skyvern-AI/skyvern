@@ -1,0 +1,119 @@
+{
+  "provenance": {
+    "artifact_root_sha256": "841e1ac5e9f3f3f415e019ba434dba48ca234ac3fb5d761f1327efdd1b227692",
+    "backend_log_sha256": "be9f4880b3e8411fb3bfaab84e09ba15e2737a3c03d71143042dfa763e8b635c",
+    "proposed_workflow_sha256": "d89d27d9e809914f745c02430f9fdf7c264670b95bd8535e04e485c2166de8a8",
+    "result_sha256": "7c2794223e422eccdba84b2f800944f9d2ad584071ca47f113f0b4b96964c123",
+    "source_lines": [4, 560, 616, 782],
+    "workflow_run_id": "wr_551768603334229250"
+  },
+  "request_slot": {
+    "latest_request": "I need a reusable workflow that starts a commercial water service request in the mock Citrus County Utilities portal at http://localhost:8900/utility_services/citrus_water/. It should use the business name, contact email, service address, and desired start date as reusable inputs. For this eval run use Example Realty Labs Inc, utilities@example-realty.test, 1842 Harbor Vista Dr, Orlando, FL 32801, and 2026-06-22. The workflow should submit the request when the reviewable form is complete, then return a safe result with the confirmation number, account number, selected start date, deposit amount, and next owner. If the site only exposes an email/manual-service path instead of an online form, report that as the blocker rather than inventing values.",
+    "source_quotes": [
+      "confirmation number",
+      "account number",
+      "selected start date",
+      "deposit amount",
+      "next owner",
+      "If the site only exposes an email/manual-service path instead of an online form, report that as the blocker rather than inventing values."
+    ]
+  },
+  "criterion": {
+    "outcome": "the blocker is reported if the site only exposes an email/manual-service path instead of an online form",
+    "output_path": "output.blocker"
+  },
+  "accepted_artifact_metadata": {
+    "submit_commercial_water_request": {
+      "artifact_id": "code_artifact:submit_commercial_water_request",
+      "block_label": "submit_commercial_water_request",
+      "claimed_outcomes": [
+        {
+          "covered_criteria": ["online_submission_complete"],
+          "criteria_ids": ["online_submission_complete"],
+          "extraction_schema": "{\"type\":\"object\",\"properties\":{\"confirmation_number\":{\"type\":[\"string\",\"null\"]},\"account_number\":{\"type\":[\"string\",\"null\"]},\"selected_start_date\":{\"type\":[\"string\",\"null\"]},\"deposit_amount\":{\"type\":[\"string\",\"null\"]},\"next_owner\":{\"type\":[\"string\",\"null\"]},\"blocker\":{\"type\":[\"string\",\"null\"]},\"submitted\":{\"type\":\"boolean\"},\"evidence_text\":{\"type\":\"string\"}},\"required\":[\"confirmation_number\",\"account_number\",\"selected_start_date\",\"deposit_amount\",\"next_owner\",\"blocker\",\"submitted\",\"evidence_text\"]}",
+          "extraction_schema_provenance": "self_authored",
+          "goal_value_paths": [
+            "confirmation_number",
+            "account_number",
+            "selected_start_date",
+            "deposit_amount",
+            "next_owner",
+            "submitted"
+          ],
+          "id": "online_submission_result",
+          "scope": "terminal",
+          "status": "observed_not_verified",
+          "text": "For the tested online-form path, the request is submitted and all five requested page-grounded result values are returned with blocker null."
+        }
+      ],
+      "completion_criteria": [
+        {
+          "id": "online_submission_complete",
+          "level": "terminal",
+          "outcome": "Online request submitted with complete result",
+          "requested_output_evidence_source": "runtime_output",
+          "terminal": true,
+          "text": "On the tested online path, submitted is true; confirmation_number, account_number, selected_start_date, deposit_amount, and next_owner are non-empty and visibly supported; blocker is null."
+        }
+      ],
+      "declared_goal": "Submit the online commercial water request when available and safely classify the result.",
+      "terminal_verifier_expectations": [
+        {
+          "claimed_outcome_ids": ["online_submission_result"],
+          "criteria_ids": ["online_submission_complete"],
+          "extraction_schema": "{\"type\":\"object\",\"properties\":{\"confirmation_number\":{\"type\":[\"string\",\"null\"]},\"account_number\":{\"type\":[\"string\",\"null\"]},\"selected_start_date\":{\"type\":[\"string\",\"null\"]},\"deposit_amount\":{\"type\":[\"string\",\"null\"]},\"next_owner\":{\"type\":[\"string\",\"null\"]},\"blocker\":{\"type\":[\"string\",\"null\"]},\"submitted\":{\"type\":\"boolean\"},\"evidence_text\":{\"type\":\"string\"}},\"required\":[\"confirmation_number\",\"account_number\",\"selected_start_date\",\"deposit_amount\",\"next_owner\",\"blocker\",\"submitted\",\"evidence_text\"]}",
+          "extraction_schema_provenance": "self_authored",
+          "goal_value_paths": [
+            "confirmation_number",
+            "account_number",
+            "selected_start_date",
+            "deposit_amount",
+            "next_owner",
+            "submitted"
+          ],
+          "id": "verify_online_submission",
+          "text": "Confirm submitted is true and each requested result field appears verbatim in evidence_text; blocker must be null for this online-form run."
+        }
+      ]
+    }
+  },
+  "registered_output_row": {
+    "workflow_run_id": "wr_551768603334229250",
+    "output_parameter_id": "op_551768603334229240",
+    "output_parameter_key": "submit_commercial_water_request_output",
+    "block_label": "submit_commercial_water_request",
+    "block_type": "code",
+    "value": {
+      "confirmation_number": "WTR-1842-DEMO",
+      "account_number": "100245",
+      "selected_start_date": "2026-06-22",
+      "deposit_amount": "$41.00 plus initiation fee",
+      "next_owner": "Provider",
+      "blocker": null,
+      "submitted": true,
+      "evidence_text": "Contact Us | Support\nCC\nCitrus County Utilities\nWater Service\nOverview\nSupport Center\nStart/Stop/Move Service\nSubmitted confirmation page is visible.\nWater Service Request Submitted\nConfirmation Number\nWTR-1842-DEMO\nService Address\n1842 Harbor Vista Dr, Orlando, FL 32801\nSelected Start Date\n2026-06-22\nAccount Number\n100245\nDeposit Amount\n$41.00 plus initiation fee\nNext Owner\nProvider\nResidential Customers\nMy Account\nStart Service\nBusiness Customers\nTurn On Service\nService Requests\nHelp & Support\nContact Us\nPayment Locations\nCompany Information\nSafety\nRates\nTerms"
+    }
+  },
+  "recorded_criteria": [
+    {"id": "c303cb0527a5020e7c6c1df0973bd8706d7860af2f59c0bd4a6483870cb8df00", "outcome": "the confirmation number is returned", "output_path": "output.confirmation_number"},
+    {"id": "1005ea901a0dece2b2d7b1831d94084d1109d055737dda722d0eb6f462fb8994", "outcome": "the account number is returned", "output_path": "output.account_number"},
+    {"id": "68e587b4e594b09b28bc70e2dd43aad4c120e577ef245bdf90bfefca1bea2385", "outcome": "the selected start date is returned", "output_path": "output.selected_start_date"},
+    {"id": "fb6a01d4803a2a54403060d691f91bc8979d9df3427dfe547cda77e411f3e5c4", "outcome": "the deposit amount is returned", "output_path": "output.deposit_amount"},
+    {"id": "5e137f7b0e047880023c409114f147c0d8dda7ab04b47ebfc15192ff905e811f", "outcome": "the next owner is returned", "output_path": "output.next_owner"}
+  ],
+  "recorded_verdicts": [
+    {"criterion_id": "c303cb0527a5020e7c6c1df0973bd8706d7860af2f59c0bd4a6483870cb8df00", "satisfied": true, "reason_code": "evidence_confirms", "evidence_ref": "submit_commercial_water_request_output.confirmation_number"},
+    {"criterion_id": "1005ea901a0dece2b2d7b1831d94084d1109d055737dda722d0eb6f462fb8994", "satisfied": true, "reason_code": "evidence_confirms", "evidence_ref": "submit_commercial_water_request_output.account_number"},
+    {"criterion_id": "68e587b4e594b09b28bc70e2dd43aad4c120e577ef245bdf90bfefca1bea2385", "satisfied": true, "reason_code": "evidence_confirms", "evidence_ref": "submit_commercial_water_request_output.selected_start_date"},
+    {"criterion_id": "fb6a01d4803a2a54403060d691f91bc8979d9df3427dfe547cda77e411f3e5c4", "satisfied": true, "reason_code": "evidence_confirms", "evidence_ref": "submit_commercial_water_request_output.deposit_amount"},
+    {"criterion_id": "5e137f7b0e047880023c409114f147c0d8dda7ab04b47ebfc15192ff905e811f", "satisfied": true, "reason_code": "evidence_confirms", "evidence_ref": "submit_commercial_water_request_output.next_owner"}
+  ],
+  "recorded_failure": {
+    "criterion_id": "3362dc25307750ce8cfcc05e3459f621874ba48d0a4500fbdd67f95d84cace37",
+    "reason_code": "evidence_contradicts",
+    "evidence_ref": "submit_commercial_water_request_output.blocker",
+    "missing_evidence": "produced evidence contradicted this criterion",
+    "warrants_repair": true,
+    "turn_halt_kind": "repair_ceiling_reached"
+  }
+}

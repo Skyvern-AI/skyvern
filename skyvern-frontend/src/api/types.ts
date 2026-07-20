@@ -925,9 +925,28 @@ export type BrowserProfileApiResponse = {
   proxy_session_id?: string | null;
   is_managed?: boolean;
   workflow_permanent_id?: string | null;
+  // Batched by the list endpoint so rows show the credential-login role without a per-row usage fetch.
+  linked_credential_name?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+};
+
+export type BrowserProfileUsageWorkflow = {
+  workflow_permanent_id: string;
+  title: string;
+  via: "browser_profile_id" | "seed_browser_profile_id";
+};
+
+export type BrowserProfileUsageCredential = {
+  credential_id: string;
+  name: string;
+};
+
+export type BrowserProfileUsage = {
+  workflows: Array<BrowserProfileUsageWorkflow>;
+  credentials: Array<BrowserProfileUsageCredential>;
+  recent_seeded_run_count: number;
 };
 
 export type PasswordCredentialApiResponse = {

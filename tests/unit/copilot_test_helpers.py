@@ -169,6 +169,7 @@ def make_completion_criterion(
     output_path: str | None = None,
     contingent_on: str | None = None,
     contingent_antecedent_output_path: str | None = None,
+    antecedent_family: str | None = None,
     kind: str = "outcome",
     terminal_action_family: str | None = None,
     deliverable_kind: str | None = None,
@@ -192,6 +193,7 @@ def make_completion_criterion(
         output_path=output_path,
         contingent_on=contingent_on,
         contingent_antecedent_output_path=contingent_antecedent_output_path,
+        antecedent_family=antecedent_family,  # type: ignore[arg-type]
         kind=kind,  # type: ignore[arg-type]
         terminal_action_family=terminal_action_family,  # type: ignore[arg-type]
         deliverable_kind=deliverable_kind,  # type: ignore[arg-type]

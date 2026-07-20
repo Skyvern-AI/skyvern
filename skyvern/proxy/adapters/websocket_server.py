@@ -16,6 +16,7 @@ import email.utils
 import json
 import logging
 import os
+import signal
 import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -122,6 +123,15 @@ _OUTBOUND_DRAIN_TIMEOUT_SECONDS = 5.0
 # HTTP discovery targets a client GETs before the WS upgrade, longest suffix first
 # so /json/version and /json/list match before the bare /json alias.
 _DISCOVERY_SUFFIXES = ("/json/version", "/json/list", "/json")
+
+# Unauthenticated HTTP health target for orchestrator probes (httpGet, not
+# tcpSocket: a wedged event loop still accepts TCP via the listen backlog).
+_HEALTH_PATH = "/healthz"
+# After SIGTERM/SIGINT the listener closes and existing relays drain. Past this
+# budget remaining connections are force-closed (1001) so the process exits with
+# clean WS closes instead of the supervisor's SIGKILL cutting sockets mid-frame.
+_DEFAULT_DRAIN_TIMEOUT_SECONDS = 3600
+_MAX_DRAIN_TIMEOUT_SECONDS = 24 * 3600
 
 # Enqueued by the drain path so the writer flushes all real frames then stops.
 _DRAIN_SENTINEL = object()
@@ -814,15 +824,84 @@ class CdpProxyServer:
         self._shared_upstreams_lock = asyncio.Lock()
 
     async def serve_forever(self) -> None:
-        async with websockets.serve(
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        installed: list[signal.Signals] = []
+        # Handlers go in BEFORE the listener opens so no signal can land in a
+        # window where connections are being accepted but drain is not armed.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Platforms/embeddings without loop signal support (Windows,
+                # non-main threads) still serve; drain then relies on cancellation.
+                pass
+        server = await websockets.serve(
             self._handle_client, self._host, self._port, max_size=None, process_request=self._process_request
-        ):
-            LOG.info("CDP proxy listening", host=self._host, port=self._port)
-            await asyncio.Future()
+        )
+        LOG.info("CDP proxy listening", host=self._host, port=self._port)
+        try:
+            await stop.wait()
+            # Drain: close the listener so no new client lands here, keep every
+            # established relay running, and only force-close stragglers once the
+            # drain budget is spent. The orchestrator's grace period is the outer
+            # bound; this inner one exists so a healthy drain ends with clean
+            # 1001 closes rather than a SIGKILL.
+            drain_timeout = _positive_env_int(
+                "CDP_PROXY_DRAIN_TIMEOUT_SECONDS", _DEFAULT_DRAIN_TIMEOUT_SECONDS, _MAX_DRAIN_TIMEOUT_SECONDS
+            )
+            LOG.info("CDP proxy draining", drain_timeout_seconds=drain_timeout)
+            server.close(close_connections=False)
+            # Re-arm the handlers: a second signal ends the drain early, so a
+            # dev Ctrl-C (or an operator's repeated stop) stays interruptible
+            # instead of sitting out the full drain budget.
+            force = asyncio.Event()
+            for sig in installed:
+                loop.remove_signal_handler(sig)
+                loop.add_signal_handler(sig, force.set)
+            drained = asyncio.create_task(server.wait_closed())
+            forced = asyncio.create_task(force.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {drained, forced}, timeout=drain_timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if drained not in done:
+                    # Server.close() is idempotent — a second call cannot upgrade the
+                    # drain to a force-close — so stragglers are closed directly. Each
+                    # close() bounds its own handshake, so this always terminates.
+                    # `handlers` is an undocumented websockets.asyncio Server attribute
+                    # (its _close() iterates the same dict); the lifecycle tests here
+                    # exercise it, so a websockets bump that renames it fails loudly.
+                    reason = "second signal" if forced in done else "drain timeout expired"
+                    LOG.warning("CDP proxy force-closing remaining connections", reason=reason)
+                    stragglers = [asyncio.create_task(conn.close(1001)) for conn in list(server.handlers)]
+                    if stragglers:
+                        await asyncio.wait(stragglers)
+            finally:
+                for task in (drained, forced):
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        finally:
+            for sig in installed:
+                loop.remove_signal_handler(sig)
+            server.close(close_connections=True)
+            await server.wait_closed()
+            LOG.info("CDP proxy stopped")
 
     async def _process_request(self, connection: websockets.ServerConnection, request: Request) -> Response | None:
         """Serve the pre-upgrade CDP discovery GETs; return None to let a real WS
         upgrade proceed. Authenticated the same way as the WS connection."""
+        try:
+            is_health_probe = urlsplit(request.path).path == _HEALTH_PATH
+        except ValueError:
+            is_health_probe = False
+        if is_health_probe:
+            # Unauthenticated on purpose: probes carry no credentials, and the
+            # response reveals nothing but liveness. Draining needs no branch —
+            # the closed listener refuses the probe's connect outright.
+            return connection.respond(HTTPStatus.OK, "ok")
         try:
             split = _split_discovery_target(request.path)
             if split is None:
@@ -1361,6 +1440,20 @@ class CdpProxyServer:
                 self._event_policy.observe_command(processed, session)
                 _track_command(command_starts, upstream_command.id, processed.method)
                 processed = upstream_command
+            elif isinstance(processed, (CdpEvent, CdpResponse)):
+                # A CDP client only ever sends COMMANDS (method + id) to the browser;
+                # events and responses flow the other way. A method-bearing frame
+                # sent without an id decodes as an event (frames.py), so forwarding a
+                # client event raw would let a client smuggle a command past command
+                # interception — e.g. a denied Target.sendMessageToTarget stripped of
+                # its id would tunnel a denied inner method past the denylist. Dropped,
+                # never forwarded: closing the bypass here rather than trusting the
+                # browser to reject an id-less command.
+                self._metrics.increment(
+                    _METRIC_FRAMES_DROPPED,
+                    tags={**_org_tag(session), "direction": direction.value, "reason": "non_command_upstream"},
+                )
+                continue
             wire = encode_frame(processed)
             await connection.send(wire)
             self._record_relayed(session, direction, wire)
@@ -1404,14 +1497,20 @@ class CdpProxyServer:
             self._record_intercepted(session, command, INTERCEPTOR_FAILURE_REASON)
             return interceptor_failure_response(command)
         if isinstance(outcome, SynthesizedResponse):
-            self._record_intercepted(session, command, outcome.reason)
+            self._record_intercepted(session, command, outcome.reason, audit_method=outcome.audit_method)
             return outcome.to_response(command)
         return outcome
 
-    def _record_intercepted(self, session: ProxySession, command: CdpCommand, reason: str) -> None:
+    def _record_intercepted(
+        self, session: ProxySession, command: CdpCommand, reason: str, audit_method: str | None = None
+    ) -> None:
         """The audit trail for a command answered at the proxy (SKY-12538): a counter
-        under bounded labels plus one structured line naming the exact method."""
-        cdp_method, cdp_domain = _cdp_method_tags(command.method)
+        under bounded labels plus one structured line naming the exact method. The
+        synthesis's audit_method wins over the wrapper it arrived in, so a denial
+        tunneled through Target.sendMessageToTarget is recorded against the method
+        actually blocked."""
+        method = audit_method or command.method
+        cdp_method, cdp_domain = _cdp_method_tags(method)
         self._metrics.increment(
             _METRIC_COMMANDS_INTERCEPTED,
             tags={**_org_tag(session), "reason": reason, "cdp_method": cdp_method, "cdp_domain": cdp_domain},
@@ -1419,7 +1518,7 @@ class CdpProxyServer:
         LOG.info(
             "CDP command intercepted",
             session_id=session.session_id,
-            cdp_method=command.method,
+            cdp_method=method,
             reason=reason,
             **_org_tag(session),
         )

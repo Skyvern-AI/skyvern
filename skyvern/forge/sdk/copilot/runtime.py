@@ -45,12 +45,14 @@ from skyvern.webeye.browser_state import BrowserState
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
+    from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingSnapshot
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
     )
+    from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
@@ -209,17 +211,6 @@ class ScoutedInputCorrespondence(TypedDict):
     position: int
 
 
-class ScoutedFieldParameterBinding(TypedDict):
-    parameter_key: str
-    field_selector: str
-
-
-class ScoutedSubmitRungBinding(TypedDict):
-    repeated_structural_key: str
-    fingerprint: str
-    field_bindings: list[ScoutedFieldParameterBinding]
-
-
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
@@ -245,9 +236,6 @@ class ScoutedInteraction(TypedDict):
     # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
     # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
     ambiguous: NotRequired[bool]
-    # Value-free, current-page binding attached only to the exact captured submit rung on a derived trajectory.
-    # The source trajectory remains unchanged; synthesis consumes the fingerprint all-or-nothing.
-    submit_rung_binding: NotRequired[ScoutedSubmitRungBinding]
     # Credential fills carry references and metadata only — never secret values.
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
@@ -372,6 +360,7 @@ class AgentContext:
     recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
+    authoring_parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None
     consecutive_non_converging_repair_count: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
@@ -494,9 +483,12 @@ class AgentContext:
     # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
     pending_goal_complete_landing: bool = False
     synthesized_goal_complete_landed: bool = False
-    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
-    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    # Imposition answered this persist attempt on a goal-complete trajectory; owned-carrier metadata
+    # scaffolding keys off it (workflow_update._scaffold_metadata_from_owned_carrier_produced_output).
     spine_imposition_owned_attempt: bool = False
+    # Synthesized block computed by this persist attempt's imposition pass; the pre-persist spine gate
+    # reuses it so both seams grade one synthesis. Reset at each imposition entry.
+    imposition_synthesized_block: SynthesizedCodeBlock | None = None
     # Label of the code block the imposition attempt owns this call (carrier), including on no-op early
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None

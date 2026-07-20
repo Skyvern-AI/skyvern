@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 
 import structlog
-from playwright.async_api import async_playwright
 
+from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import FailedToNavigateToUrl, MissingBrowserState
 from skyvern.forge import app
@@ -16,6 +17,11 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import VideoArtifact
+from skyvern.webeye.browser_engine import (
+    BrowserEngineContext,
+    BrowserEngineSelection,
+    resolve_browser_engine,
+)
 from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
@@ -87,9 +93,49 @@ def _resolve_stream_key(*, workflow_run_id: str | None, task_id: str | None) -> 
     return None
 
 
+def canonical_run_key(
+    *,
+    workflow_run_id: str | None = None,
+    task_id: str | None = None,
+    script_id: str | None = None,
+) -> str | None:
+    """The one stable key a logical run's engine selection is pinned under. ``workflow_run_id`` wins
+    so a workflow-owned task and its workflow share a single selection owner (never two). Returns
+    None when the run has no durable identity (e.g. a standalone script with no id), in which case
+    the resource is ephemeral and its engine is not pinned/cached."""
+    return workflow_run_id or task_id or script_id
+
+
+class _EngineSelectionOwner:
+    """Per-run single-flight owner of the pinned engine selection.
+
+    The resolution runs inside a shared ``asyncio.Task``: concurrent first acquisitions for one run
+    await the same task and receive the same frozen selection. Waiters await it through
+    ``asyncio.shield`` (see ``get_or_resolve_engine_selection``); the shield is what keeps one waiter's
+    cancellation from aborting the shared resolution — awaiting a task WITHOUT shielding would propagate
+    the waiter's cancellation to it. The resolved value lives on THIS owner object, not a bare per-key
+    dict, so a resolver whose owner was already dropped by terminal cleanup cannot resurrect the run's
+    selection — its result is simply unreferenced. ``terminal`` is set by ``_drop_engine_owner`` before it
+    cancels the resolver: it marks the owner as being torn down so a same-key acquisition waits it out
+    instead of starting a second resolver, and so the done-callback evicts it whatever the outcome.
+    """
+
+    __slots__ = ("task", "terminal")
+
+    def __init__(self, task: asyncio.Task[BrowserEngineSelection]) -> None:
+        self.task = task
+        self.terminal = False
+
+
 class RealBrowserManager(BrowserManager):
     def __init__(self) -> None:
         self.pages: dict[str, BrowserState] = {}
+        # Engine pinned per logical run, keyed by run id (workflow_run_id / task_id / script_id) via a
+        # per-key single-flight owner. Resolved once at the first browser-resource creation for a run
+        # and reused for every later resource/recreation in that run, so recreation can never
+        # re-resolve to a different engine (e.g. after a flag change). Dropped — with its in-flight
+        # resolution cancelled — when the run's browser state is cleaned up.
+        self._engine_owners: dict[str, _EngineSelectionOwner] = {}
         # CDP frame publishers keyed by stream key (``{wr}.png`` / ``{task}.png``).
         self._frame_publishers: dict[str, CDPFramePublisher] = {}
         # Serializes the check/create/start/store/register sequence in
@@ -183,8 +229,97 @@ class RealBrowserManager(BrowserManager):
                 exc_info=True,
             )
 
-    @staticmethod
+    async def get_or_resolve_engine_selection(
+        self,
+        *,
+        run_key: str | None,
+        context: BrowserEngineContext,
+    ) -> BrowserEngineSelection:
+        """Single owner of a logical run's engine selection: resolve it once under ``run_key`` and
+        reuse it for EVERY browser resource in the run — this manager's states and the persistent
+        session attach alike — so all paths for one run share one pinned engine and recreation never
+        re-resolves to a different one (e.g. after a flag flip). Resolution per key is single-flighted
+        via a per-key owner task, so concurrent first acquisitions await one resolution and receive
+        the same frozen selection while different keys resolve concurrently. ``run_key`` None means an
+        ephemeral resource with no durable run identity: it is not pinned or cached (the resolver still
+        fails closed on capability). The source-capability check runs on every return, including cache
+        hits, so a capability-restricted run fails closed the moment it reaches an unsupported source.
+
+        Failure-bounded: if the shared resolution finishes exceptionally (resolver raised, or terminal
+        cleanup cancelled it) the owner is dropped so nothing is stored and a later acquisition
+        re-resolves cleanly — no orphan owner accumulates on failed run keys."""
+        if run_key is None:
+            return await resolve_browser_engine(context)
+        while True:
+            owner = self._engine_owners.get(run_key)
+            if owner is None:
+                # No await between the miss and the store, so concurrent first acquisitions for one key
+                # observe the same owner and share its single resolution task (single-flight).
+                owner = _EngineSelectionOwner(asyncio.ensure_future(resolve_browser_engine(context)))
+                self._engine_owners[run_key] = owner
+                # Reap the owner if its resolution ends with nothing selectable (failed/cancelled, or
+                # marked dropping) and no live waiter, so it neither lingers nor leaks an exception.
+                owner.task.add_done_callback(functools.partial(self._reap_failed_owner, run_key, owner))
+                break
+            if not owner.terminal:
+                break
+            # Terminal owner mid-teardown: wait it out, evict once it ends, then loop for a fresh owner.
+            try:
+                await asyncio.shield(owner.task)
+            except asyncio.CancelledError:
+                if (t := asyncio.current_task()) is not None and t.cancelling() > 0:
+                    raise  # this acquirer itself was cancelled — leave the still-running owner untouched
+            except Exception:
+                pass
+            if owner.task.done() and self._engine_owners.get(run_key) is owner:
+                del self._engine_owners[run_key]
+        # shield so cancelling THIS waiter cannot cancel the shared resolution task (asyncio otherwise
+        # propagates it); only terminal cleanup cancels the task. Evicting a failed/cancelled/terminal owner
+        # is the done-callback's job, so a waiter cancel never drops a healthy owner here (even after success).
+        selection = await asyncio.shield(owner.task)
+        selection.ensure_supports(context.browser_source)
+        return selection
+
+    def _reap_failed_owner(self, run_key: str, owner: _EngineSelectionOwner, task: asyncio.Task) -> None:
+        """Done-callback for an owner's resolution task. Consumes the outcome so a failed/cancelled
+        resolution never surfaces an unretrieved-exception warning, and evicts the owner when it should
+        no longer be selectable — finished exceptionally/cancelled OR marked terminal by cleanup —
+        provided it is still the current owner for ``run_key`` (``is owner`` guards a reused key). A
+        successful, non-terminal selection is kept."""
+        failed = task.cancelled() or task.exception() is not None
+        if (failed or owner.terminal) and self._engine_owners.get(run_key) is owner:
+            del self._engine_owners[run_key]
+
+    async def _drop_engine_owner(self, run_key: str | None) -> None:
+        """Terminally remove a run's pinned engine owner. Idempotent. Marks the owner terminal, cancels
+        the in-flight resolution, and AWAITS its termination (keeping the owner registered as it unwinds)
+        so no second same-key resolver starts until the first definitively ends — even one that
+        suppresses/delays cancellation. If THIS cleanup coroutine is itself cancelled while the resolver
+        still runs, the cancellation propagates and the terminal owner stays registered. Removes by id."""
+        if run_key is None:
+            return
+        owner = self._engine_owners.get(run_key)
+        if owner is None:
+            return
+        owner.terminal = True
+        if not owner.task.done():
+            owner.task.cancel()
+        try:
+            # shield keeps the resolver alive if this cleanup coroutine is cancelled mid-await. Propagate
+            # only OUR cancellation (via the current task's cancellation count) — never the resolver
+            # task's own cancellation surfacing through shield — so an external cancel is never swallowed
+            # (even if the resolver finishes in the same tick); the owner stays for its done-callback.
+            await asyncio.shield(owner.task)
+        except asyncio.CancelledError:
+            if (t := asyncio.current_task()) is not None and t.cancelling() > 0:
+                raise
+        except Exception:
+            pass
+        if self._engine_owners.get(run_key) is owner:
+            del self._engine_owners[run_key]
+
     async def _create_browser_state(
+        self,
         proxy_location: ProxyLocationInput = None,
         url: str | None = None,
         task_id: str | None = None,
@@ -196,8 +331,28 @@ class RealBrowserManager(BrowserManager):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        engine_run_key: str | None = None,
     ) -> BrowserState:
-        pw = await async_playwright().start()
+        engine_selection = await self.get_or_resolve_engine_selection(
+            run_key=engine_run_key
+            or canonical_run_key(workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id),
+            context=BrowserEngineContext(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                task_id=task_id,
+                script_id=script_id,
+                browser_source=settings.BROWSER_TYPE,
+            ),
+        )
+        LOG.info(
+            "Creating browser state",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            browser_source=settings.BROWSER_TYPE,
+            **engine_selection.attribution(),
+        )
+        pw = await engine_selection.start_driver()
         try:
             (
                 browser_context,
@@ -241,6 +396,7 @@ class RealBrowserManager(BrowserManager):
             browser_artifacts=browser_artifacts,
             browser_cleanup=browser_cleanup,
             release_driver_on_close=browser_address is not None,
+            engine_selection=engine_selection,
         )
 
     def evict_page(self, page_id: str) -> None:
@@ -309,6 +465,11 @@ class RealBrowserManager(BrowserManager):
                 proxy_location=proxy_location,
                 url=task.url,
                 task_id=task.task_id,
+                # Pin the engine under the workflow_run_id for a workflow-owned task so it shares one
+                # selection owner with the workflow path (not a second task_id owner). Passed only as
+                # the engine key — workflow_run_id is deliberately kept out of browser-context creation
+                # here to preserve the task path's existing download-dir / artifact behavior.
+                engine_run_key=canonical_run_key(workflow_run_id=task.workflow_run_id, task_id=task.task_id),
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
                 extra_http_headers=extra_http_headers,
@@ -651,6 +812,8 @@ class RealBrowserManager(BrowserManager):
         for browser_state in self.pages.values():
             await browser_state.close()
         self.pages = dict()
+        for run_key in list(self._engine_owners):
+            await self._drop_engine_owner(run_key)
         LOG.info("BrowserManger is closed")
 
     async def cleanup_for_task(
@@ -665,6 +828,7 @@ class RealBrowserManager(BrowserManager):
         If error occurs, log it and address the cleanup error.
         """
         LOG.info("Cleaning up for task")
+        await self._drop_engine_owner(task_id)
         browser_state_to_close = self.pages.pop(task_id, None)
         if browser_state_to_close:
             # Stop tracing before closing the browser if tracing is enabled
@@ -708,6 +872,11 @@ class RealBrowserManager(BrowserManager):
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run", sampling=True)
         browser_state_to_close = self.pages.get(workflow_run_id)
+
+        # Drop the run's pinned engine — the run is ending, so no further browser resource will be
+        # created for it. Covers the run, its inherited children, and its tasks.
+        for run_key in (workflow_run_id, *(child_workflow_run_ids or ()), *task_ids):
+            await self._drop_engine_owner(run_key)
 
         # Pop child workflow_run entries first — these are orphaned because child
         # workflows skip clean_up_workflow. Must happen before the shared check

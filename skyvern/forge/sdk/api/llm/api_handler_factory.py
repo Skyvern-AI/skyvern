@@ -42,6 +42,7 @@ from skyvern.forge.sdk.api.llm.utils import (
     is_truncated_response,
     llm_messages_builder,
     llm_messages_builder_with_history,
+    loads_with_repair,
     parse_api_response,
 )
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
@@ -69,6 +70,17 @@ from skyvern.utils.url_validators import validate_fetch_url
 configure_litellm_transport()
 
 LOG = structlog.get_logger()
+
+# Transient upstream faults litellm maps to these subclass openai.APIError, NOT
+# litellm.exceptions.APIError, so a bare `except litellm.exceptions.APIError` misses them.
+# Bound at import (real litellm) so the except clauses stay resilient to a monkeypatched
+# `litellm.exceptions` that only stubs APIError.
+_TRANSIENT_LLM_DEPENDENCY_ERRORS: tuple[type[Exception], ...] = (
+    litellm.exceptions.Timeout,
+    litellm.exceptions.APIConnectionError,
+    litellm.exceptions.ServiceUnavailableError,
+    litellm.exceptions.InternalServerError,
+)
 
 
 class _NoRedirectAsyncHTTPHandler(AsyncHTTPHandler):
@@ -1666,7 +1678,7 @@ class LLMAPIHandlerFactory:
 
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
-                except litellm.exceptions.APIError as e:
+                except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
                     _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
@@ -1841,7 +1853,7 @@ class LLMAPIHandlerFactory:
                 if context and len(context.hashed_href_map) > 0:
                     llm_content = json.dumps(parsed_response)
                     rendered_content = Template(llm_content).render(context.hashed_href_map)
-                    parsed_response = json.loads(rendered_content)
+                    parsed_response = loads_with_repair(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
                         if _should_bundle:
@@ -2241,7 +2253,7 @@ class LLMAPIHandlerFactory:
                     llm_duration_seconds = time.perf_counter() - t_llm_request
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
-                except litellm.exceptions.APIError as e:
+                except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
                     _llm_span.set_attribute("status", "error")
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
@@ -2397,7 +2409,7 @@ class LLMAPIHandlerFactory:
                 if context and len(context.hashed_href_map) > 0:
                     llm_content = json.dumps(parsed_response)
                     rendered_content = Template(llm_content).render(context.hashed_href_map)
-                    parsed_response = json.loads(rendered_content)
+                    parsed_response = loads_with_repair(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
                         if _should_bundle:
@@ -2998,7 +3010,7 @@ class LLMCaller:
             if context and len(context.hashed_href_map) > 0:
                 llm_content = json.dumps(parsed_response)
                 rendered_content = Template(llm_content).render(context.hashed_href_map)
-                parsed_response = json.loads(rendered_content)
+                parsed_response = loads_with_repair(rendered_content)
                 rendered_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:

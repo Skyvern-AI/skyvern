@@ -778,6 +778,10 @@ class Settings(BaseSettings):
     OTEL_METRICS_ENABLED: bool = True
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
+    # Log level for the OTLP gRPC exporter's own logger. Raise above WARNING (e.g.
+    # "CRITICAL") to drop its retry/failure records where the OTLP endpoint is
+    # intentionally unavailable; the default keeps export failures visible.
+    OTEL_EXPORTER_LOG_LEVEL: str = "WARNING"
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"

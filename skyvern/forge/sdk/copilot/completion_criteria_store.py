@@ -12,13 +12,18 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 
-from skyvern.forge.sdk.copilot.completion_output_grounding import split_requested_output_criteria
+from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    _normalize_output_path,
+    split_requested_output_criteria,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     run_plane_all_no_evidence,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    ANTECEDENT_FAMILY_VALUES,
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
+    AntecedentFamily,
     CompletionCriterion,
     CriterionKind,
     ExpectedOutputShape,
@@ -61,6 +66,15 @@ _TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
 _TERMINAL_ACTION_VERIFICATION_MODES = frozenset(get_args(TerminalActionVerificationMode))
 _MINT_DISPOSITIONS = frozenset(get_args(MintDisposition))
 _PINABILITIES = frozenset(get_args(Pinability))
+
+
+def _normalize_floor_rekeyed_association(marker: object, path: object) -> tuple[bool, str | None]:
+    if marker is not True or not isinstance(path, str) or not path.strip().startswith("output."):
+        return False, None
+    normalized_path = _normalize_output_path(path)
+    if normalized_path:
+        return True, f"output.{normalized_path}"
+    return False, None
 
 
 @dataclass(frozen=True)
@@ -164,8 +178,17 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             item["terminal_action_verification_mode"] = criterion.terminal_action_verification_mode
         if criterion.requested_output_corroborator:
             item["requested_output_corroborator"] = True
+        if criterion.antecedent_family is not None:
+            item["antecedent_family"] = criterion.antecedent_family
         if criterion.requested_output_path_mint_source is not None:
             item["requested_output_path_mint_source"] = criterion.requested_output_path_mint_source
+        floor_rekeyed, floor_rekeyed_from_path = _normalize_floor_rekeyed_association(
+            criterion.requested_output_floor_rekeyed,
+            criterion.floor_rekeyed_from_path,
+        )
+        if floor_rekeyed:
+            item["requested_output_floor_rekeyed"] = True
+            item["floor_rekeyed_from_path"] = floor_rekeyed_from_path
         if criterion.mint_degrade is not None:
             item["mint_degrade"] = criterion.mint_degrade
         if criterion.judgment_truth_condition is not None:
@@ -179,6 +202,41 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             item["mint_disposition"] = criterion.mint_disposition
         items.append(item)
     return items
+
+
+def criterion_authority_projection(criterion: CompletionCriterion) -> dict[str, Any]:
+    """Canonical values for persisted fields that can change grading authority.
+
+    Repository admission compares only fields present in a stored row, preserving
+    omitted legacy defaults while rejecting values the tolerant decoder normalized.
+    """
+    item = criteria_to_json([criterion])[0]
+    floor_rekeyed, floor_rekeyed_from_path = _normalize_floor_rekeyed_association(
+        criterion.requested_output_floor_rekeyed,
+        criterion.floor_rekeyed_from_path,
+    )
+    item.update(
+        {
+            "antecedent_family": criterion.antecedent_family,
+            "deliverable_confirmation_criterion_id": criterion.deliverable_confirmation_criterion_id,
+            "terminal_action_verification_mode": criterion.terminal_action_verification_mode,
+            "requested_output_corroborator": criterion.requested_output_corroborator,
+            "requested_output_path_mint_source": criterion.requested_output_path_mint_source,
+            "requested_output_floor_rekeyed": floor_rekeyed,
+            "floor_rekeyed_from_path": floor_rekeyed_from_path,
+            "mint_degrade": criterion.mint_degrade,
+            "judgment_predicate": (
+                criterion.judgment_truth_condition.predicate if criterion.judgment_truth_condition else None
+            ),
+            "judgment_polarity_when_holds": (
+                criterion.judgment_truth_condition.polarity_when_holds if criterion.judgment_truth_condition else None
+            ),
+            "request_slot_id": criterion.request_slot_id,
+            "pinability": criterion.pinability,
+            "mint_disposition": criterion.mint_disposition,
+        }
+    )
+    return item
 
 
 def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
@@ -207,6 +265,13 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         )
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
+        )
+        antecedent_family_raw = item.get("antecedent_family")
+        antecedent_family = cast(
+            AntecedentFamily | None,
+            antecedent_family_raw
+            if isinstance(antecedent_family_raw, str) and antecedent_family_raw in ANTECEDENT_FAMILY_VALUES
+            else None,
         )
         kind_raw = item.get("kind")
         kind = kind_raw if isinstance(kind_raw, str) and kind_raw in _CRITERION_KINDS else "outcome"
@@ -237,6 +302,10 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         pinability = pinability_raw if pinability_raw in _PINABILITIES else None
         mint_disposition_raw = item.get("mint_disposition")
         mint_disposition = mint_disposition_raw if mint_disposition_raw in _MINT_DISPOSITIONS else "decidable"
+        requested_output_floor_rekeyed, floor_rekeyed_from_path = _normalize_floor_rekeyed_association(
+            item.get("requested_output_floor_rekeyed"),
+            item.get("floor_rekeyed_from_path"),
+        )
         stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
         stored_expected_output_value = _coerce_expected_output_value(expected_output_value)
         stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
@@ -284,6 +353,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 outcome=outcome,
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
+                antecedent_family=antecedent_family,
                 deliverable_kind=stored_deliverable_kind,
                 deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
                 declared_deliverable_kind=_normalize_deliverable_kind(item.get("declared_deliverable_kind")),
@@ -303,6 +373,8 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
                 requested_output_corroborator=bool(item.get("requested_output_corroborator")),
+                requested_output_floor_rekeyed=requested_output_floor_rekeyed,
+                floor_rekeyed_from_path=floor_rekeyed_from_path,
                 mint_degrade=resolve_mint_degrade(
                     item.get("mint_degrade"), contingent_on, contingent_antecedent_output_path
                 ),
@@ -320,6 +392,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
+    antecedent_family_key = criterion.antecedent_family or ""
     deliverable_kind_key = (
         f"{criterion.deliverable_kind or ''}\x1fdeclared:{criterion.declared_deliverable_kind or ''}"
         f"\x1fconfirmation:{criterion.deliverable_confirmation_criterion_id or ''}"
@@ -335,9 +408,17 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     expected_classification_key = (
         str(criterion.expected_classification) if criterion.expected_classification is not None else ""
     )
+    floor_rekeyed, floor_rekeyed_from_path = _normalize_floor_rekeyed_association(
+        criterion.requested_output_floor_rekeyed,
+        criterion.floor_rekeyed_from_path,
+    )
+    floor_rekeyed_key = (
+        f"\x1ffloor_rekeyed:{str(floor_rekeyed).lower()}\x1ffloor_rekeyed_from_path:{floor_rekeyed_from_path or ''}"
+    )
     if criterion.output_path:
         return (
             f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1fantecedent_family:{antecedent_family_key}"
             f"\x1fdeliverable_kind:{deliverable_kind_key}"
             f"\x1foutput_path:{criterion.output_path}"
             f"\x1fexpected_output_value:{expected_output_value_key}"
@@ -347,21 +428,26 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
             f"\x1fterminal_action_verification_mode:{terminal_action_verification_mode_key}"
             f"\x1fclassification_output_key:{classification_output_key}"
             f"\x1fexpected_classification:{expected_classification_key}"
+            f"{floor_rekeyed_key}"
         )
     if criterion.kind == "validation_classification":
         return (
             f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+            f"\x1fantecedent_family:{antecedent_family_key}"
             f"\x1fdeliverable_kind:{deliverable_kind_key}"
             f"\x1fkind:{criterion.kind}"
             f"\x1fclassification_output_key:{classification_output_key}"
             f"\x1fexpected_classification:{expected_classification_key}"
+            f"{floor_rekeyed_key}"
         )
     return (
         f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
+        f"\x1fantecedent_family:{antecedent_family_key}"
         f"\x1fdeliverable_kind:{deliverable_kind_key}"
         f"\x1fkind:{criterion.kind}"
         f"\x1fterminal_action_verification_mode:{terminal_action_verification_mode_key}"
         f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+        f"{floor_rekeyed_key}"
     )
 
 

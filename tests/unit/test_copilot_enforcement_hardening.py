@@ -59,6 +59,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _strip_input_images,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
+    synthesized_trajectory_reaches_goal,
 )
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
@@ -829,3 +830,20 @@ def test_grant_plus_ceiling_reject_in_one_call_reaches_stalled_terminal_not_chur
     signal = ctx.blocker_signal
     assert isinstance(signal, CopilotToolBlockerSignal)
     assert signal.internal_reason_code == ADVISORY_DISPATCH_STALLED_REASON_CODE
+
+
+def test_single_captured_interaction_trajectory_never_reaches_goal() -> None:
+    ctx = _fresh_context()
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#confirmation",
+            "source_url": "https://portal.example.com/order-status",
+            "role": "textbox",
+            "accessible_name": "Confirmation number",
+            "typed_length": 8,
+            "trajectory_index": 0,
+        }
+    ]
+
+    assert synthesized_trajectory_reaches_goal(ctx) is False

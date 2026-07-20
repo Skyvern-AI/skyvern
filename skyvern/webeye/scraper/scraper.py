@@ -606,7 +606,14 @@ async def filter_frames(
             filtered_frames.append(frame)
             continue
 
-        decision = await scrape_exclude(frame.page, frame)
+        try:
+            frame_page = frame.page
+        except AssertionError:
+            # Playwright's Frame.page asserts self._page; a frame can detach between
+            # the is_detached() check above and here, leaving _page unset.
+            continue
+
+        decision = await scrape_exclude(frame_page, frame)
         if decision.placeholder is not None and decision.placeholder not in placeholder_nodes:
             placeholder_nodes.append(decision.placeholder)
         if decision.exclude:

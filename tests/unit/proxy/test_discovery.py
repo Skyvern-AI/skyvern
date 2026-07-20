@@ -235,3 +235,29 @@ async def test_discovery_never_resolves_or_leaks_the_upstream() -> None:
     assert sessions.resolve_calls == 0
     text = bytes(response.body).decode()
     assert SECRET not in text and "vendor.internal" not in text
+
+
+# ---- health endpoint --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_healthz_answers_without_credentials() -> None:
+    server = _server(StaticKeyAuth({VALID_KEY: Principal(principal_id="p")}))
+
+    response = await _discover(server, "/healthz")
+
+    assert response is not None
+    assert response.status_code == 200
+    assert response.body == b"ok"
+
+
+@pytest.mark.asyncio
+async def test_healthz_never_reaches_discovery_or_ws_upgrade() -> None:
+    # A probe target is answered directly: not None (which would hand the GET to
+    # the WS handshake) and not gated on the discovery auth path.
+    server = _server(StaticKeyAuth({VALID_KEY: Principal(principal_id="p")}))
+
+    response = await _discover(server, "/healthz?probe=1")
+
+    assert response is not None
+    assert response.status_code == 200

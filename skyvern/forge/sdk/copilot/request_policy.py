@@ -220,6 +220,7 @@ RequestedOutputEvidenceSource = Literal[
 JudgmentPredicate = Literal["login_gate_blocks_target"]
 MintDisposition = Literal["pending", "decidable", "degraded"]
 Pinability = Literal["pinned", "shapeless_valid", "unpinnable"]
+AntecedentFamily = Literal["unconditional", "blocker", "undecidable"]
 _JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
 MintDegrade = Literal[
     "turn_unsatisfiable_fallback",
@@ -227,6 +228,7 @@ MintDegrade = Literal[
     "undecidable_judgment",
 ]
 MINT_DEGRADE_VALUES: frozenset[str] = frozenset(get_args(MintDegrade))
+ANTECEDENT_FAMILY_VALUES: frozenset[str] = frozenset(get_args(AntecedentFamily))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
@@ -301,6 +303,7 @@ class CompletionCriterion:
     outcome: str
     contingent_on: str | None = None
     contingent_antecedent_output_path: str | None = None
+    antecedent_family: AntecedentFamily | None = None
     deliverable_kind: Literal["registered_download"] | None = None
     # Author-time seam signal only: unlike ``deliverable_kind`` it survives canonicalization onto
     # non-canonical output paths, so it is never rendered to the completion verifier.
@@ -433,6 +436,14 @@ class RequestPolicy:
         data["requested_output_criteria_count"] = len(requested_output_criteria)
         if self.request_slot_failure_kind is not None:
             data["request_slot_failure_kind"] = self.request_slot_failure_kind
+        family_criteria = [
+            criterion for criterion in self.graded_completion_criteria() if criterion.antecedent_family is not None
+        ]
+        data["antecedent_family_criterion_count"] = len(family_criteria)
+        for index, criterion in enumerate(family_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"antecedent_family_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_antecedent_family"] = criterion.antecedent_family
         for index, criterion in enumerate(requested_output_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
             prefix = f"requested_output_criterion_{index}"
             data[f"{prefix}_id"] = criterion.id
@@ -1087,6 +1098,7 @@ def _degrade_unbound_request_slot_criterion(criterion: CompletionCriterion) -> C
         expected_classification=None,
         judgment_truth_condition=None,
         kind="outcome",
+        antecedent_family="undecidable",
         mint_disposition="degraded",
         mint_degrade="undecidable_judgment",
         requested_output_floor_rekeyed=True,
@@ -1126,7 +1138,12 @@ def _bind_criterion_to_request_slot(
 ) -> CompletionCriterion:
     pinability = cast(Pinability, slot.pinability.value)
     has_exact_requirement = _request_slot_has_exact_requirement(criterion)
-    degraded = pinability == "unpinnable" or (pinability == "pinned" and not has_exact_requirement)
+    antecedent_family = cast(AntecedentFamily, slot.antecedent_family.value)
+    degraded = (
+        pinability == "unpinnable"
+        or (pinability == "pinned" and not has_exact_requirement)
+        or antecedent_family == "undecidable"
+    )
     rekeyed = degraded or pinability == "shapeless_valid"
 
     expected_output_value = criterion.expected_output_value
@@ -1168,6 +1185,7 @@ def _bind_criterion_to_request_slot(
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
         judgment_truth_condition=judgment_truth_condition,
+        antecedent_family=antecedent_family,
         request_slot_id=slot.slot_id,
         pinability=pinability,
         mint_disposition="degraded" if degraded else ("pending" if pending else "decidable"),
@@ -2946,20 +2964,10 @@ async def _classify_request(
                 "request-policy request-slot anchor correction failed",
                 failure_kind=correction_failure_kind,
             )
-    declared_request_slots = (
-        request_slot_failure_kind is None
-        and isinstance(raw_criteria, list)
-        and any(
-            isinstance(item, dict)
-            and _item_claims_request_slot(item)
-            and _request_slot_anchor_is_admissible(item, request_slot_request=request_slot_request)
-            for item in raw_criteria
-        )
-    )
-    if declared_request_slots:
-        # This validation hop is deliberately sequential: the request-policy
-        # classifier first declares which criteria are request-owned slots, then
-        # the independent producer types their identity, plane, and pinability.
+    if request_slot_failure_kind is None:
+        # The independent producer owns slot membership as well as type. Run it even
+        # when the primary classifier declares no slots so an omitted conditional
+        # fallback cannot disappear from the completion contract.
         request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
         if request_slot_result.status == "success":
             request_slot_contract = request_slot_result.contract

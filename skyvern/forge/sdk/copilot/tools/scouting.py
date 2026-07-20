@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import normalized_scout_selector
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
 )
@@ -527,8 +528,8 @@ def _page_evidence_with_inputs_as_fields(page_evidence: dict[str, Any]) -> dict[
             continue
         field = dict(item)
         selector = field.get("selector")
-        if isinstance(selector, str) and selector.startswith("input#"):
-            field["selector"] = f"#{selector.split('#', 1)[1]}"
+        if isinstance(selector, str):
+            field["selector"] = normalized_scout_selector(selector)
         fields.append(field)
     if not fields:
         return page_evidence

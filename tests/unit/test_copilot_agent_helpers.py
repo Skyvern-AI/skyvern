@@ -27,6 +27,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _synthesized_block_offer_prompt,
     _verified_workflow_or_none,
 )
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingCandidate,
+    build_authoring_parameter_binding_directive,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
@@ -82,6 +86,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -116,6 +121,17 @@ from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 
 _HISTORY_SENTINEL_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _with_empty_request_slots(handler):
+    """Keep request-policy test doubles explicit about the independent slot producer."""
+
+    async def wrapped(*, prompt: str, prompt_name: str):
+        if prompt_name == REQUEST_SLOTS_PROMPT_NAME:
+            return {"version": "1", "slots": []}
+        return await handler(prompt=prompt, prompt_name=prompt_name)
+
+    return wrapped
 
 
 def test_prompt_offer_compiles_plan_and_refreshes_when_observation_changes() -> None:
@@ -833,6 +849,16 @@ workflow_definition:
             parameter_keys=["enter_confirmation"],
             available_parameter_keys=["confirmation_number"],
             binding_candidates=["enter_confirmation", "confirmation_number"],
+            parameter_binding_directive=build_authoring_parameter_binding_directive(
+                structural_key="definition-reject",
+                source_origin="https://example.com",
+                candidates=[
+                    AuthoringParameterBindingCandidate(
+                        declared_key="confirmation_number",
+                        field_selector="#confirmation",
+                    )
+                ],
+            ),
         )
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -843,6 +869,8 @@ workflow_definition:
 
         assert "reason_code: synthesized_parameter_binding_ambiguous" in prompt
         assert "binding_candidates: enter_confirmation, confirmation_number" in prompt
+        assert "parameter_binding_pairs:" in prompt
+        assert "confirmation_number -> #confirmation" in prompt
         assert "declare and use the exact workflow input key" in prompt
         assert "include that exact key in the code block's parameter_keys" in prompt
         assert "reference it as a bare Python variable in code" in prompt
@@ -3844,11 +3872,13 @@ class TestRequestPolicyCredentialResolution:
             workflow_yaml="",
             chat_history=[],
             global_llm_context="",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         assert policy.classifier_status == "success"
-        assert observed_timeouts == [default_timeout]
+        # The primary policy classifier uses the configured budget. The independent
+        # request-slot producer then performs its two matching deterministic reads.
+        assert observed_timeouts == [default_timeout, 30.0, 30.0]
 
     @pytest.mark.asyncio
     async def test_request_policy_classifier_timeout_does_not_retry(self, monkeypatch) -> None:
@@ -3868,7 +3898,7 @@ class TestRequestPolicyCredentialResolution:
             workflow_yaml="",
             chat_history=[],
             global_llm_context="",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         assert calls == 1
@@ -3900,7 +3930,7 @@ class TestRequestPolicyCredentialResolution:
             workflow_yaml="",
             chat_history=[],
             global_llm_context="",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         assert calls == 1
@@ -3978,7 +4008,7 @@ class TestRequestPolicyCredentialResolution:
             workflow_yaml="",
             chat_history=[],
             global_llm_context="",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         assert calls == 2
@@ -4293,7 +4323,7 @@ workflow_definition:
             chat_history=[],
             global_llm_context="",
             organization_id="org-1",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         assert policy.raw_secret_detected is True
@@ -4390,7 +4420,7 @@ workflow_definition:
             chat_history=[],
             global_llm_context="",
             organization_id="org-1",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         assert policy.raw_secret_detected is True
@@ -6118,7 +6148,7 @@ class TestRequestPolicyPromptRendering:
                 ("ai", "Which saved credential should I use?"),
             ),
             global_llm_context="",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         prompt = captured["prompt"]
@@ -6144,7 +6174,7 @@ class TestRequestPolicyPromptRendering:
             workflow_yaml="",
             chat_history=[],
             global_llm_context="",
-            handler=handler,
+            handler=_with_empty_request_slots(handler),
         )
 
         prompt = captured["prompt"]
