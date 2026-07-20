@@ -4,7 +4,6 @@ import asyncio
 import os
 import pathlib
 import platform
-import random
 import re
 import shutil
 import socket
@@ -485,21 +484,6 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        # Custom per-request proxy URL takes precedence over the global proxy pool.
-        # Users may pass proxy_location={"url": "http://user:pass@host:port"} to
-        # route this specific task/session through their own proxy server.
-        if isinstance(proxy_location, dict) and "url" in proxy_location:
-            proxy_url = proxy_location["url"]
-            if _is_valid_proxy_url(proxy_url):
-                args["proxy"] = {"server": proxy_url}
-                LOG.info("Using custom per-request proxy URL", proxy_url=_redact_proxy_url(proxy_url))
-            else:
-                LOG.warning("Invalid custom proxy URL provided, ignoring", proxy_url=_redact_proxy_url(proxy_url))
-        elif settings.ENABLE_PROXY:
-            proxy_config = setup_proxy()
-            if proxy_config:
-                args["proxy"] = proxy_config
-
         if isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
@@ -560,79 +544,6 @@ class BrowserContextFactory:
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
-
-
-def setup_proxy() -> dict | None:
-    if not settings.HOSTED_PROXY_POOL or settings.HOSTED_PROXY_POOL.strip() == "":
-        LOG.warning("No proxy server value found. Continuing without using proxy...")
-        return None
-
-    proxy_servers = [server.strip() for server in settings.HOSTED_PROXY_POOL.split(",") if server.strip()]
-
-    if not proxy_servers:
-        LOG.warning("Proxy pool contains only empty values. Continuing without proxy...")
-        return None
-
-    valid_proxies = []
-    for proxy in proxy_servers:
-        if _is_valid_proxy_url(proxy):
-            valid_proxies.append(proxy)
-        else:
-            LOG.warning(f"Invalid proxy URL format: {proxy}")
-
-    if not valid_proxies:
-        LOG.warning("No valid proxy URLs found. Continuing without proxy...")
-        return None
-
-    try:
-        proxy_server = random.choice(valid_proxies)
-        proxy_creds = _get_proxy_server_creds(proxy_server)
-
-        LOG.info("Found proxy server creds, using them...")
-
-        return {
-            "server": proxy_server,
-            "username": proxy_creds.get("username", ""),
-            "password": proxy_creds.get("password", ""),
-        }
-    except Exception as e:
-        LOG.warning(f"Error setting up proxy: {e}. Continuing without proxy...")
-        return None
-
-
-def _redact_proxy_url(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-        if not parsed.hostname:
-            return "<redacted>"
-        host = parsed.hostname
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-        userinfo = ""
-        if parsed.username:
-            userinfo = f"{parsed.username}:***@" if parsed.password else f"{parsed.username}@"
-        return f"{parsed.scheme}://{userinfo}{host}"
-    except Exception:
-        return "<redacted>"
-
-
-def _is_valid_proxy_url(url: str) -> bool:
-    PROXY_PATTERN = re.compile(r"^(http|https|socks5):\/\/([^:@]+(:[^@]*)?@)?[^\s:\/]+(:\d+)?$")
-    try:
-        parsed = urlparse(url)
-        if not parsed.scheme or not parsed.netloc:
-            return False
-        return bool(PROXY_PATTERN.match(url))
-    except Exception:
-        return False
-
-
-def _get_proxy_server_creds(proxy: str) -> dict:
-    parsed_url = urlparse(proxy)
-    if parsed_url.username and parsed_url.password:
-        return {"username": parsed_url.username, "password": parsed_url.password}
-    LOG.warning("No credentials found in the proxy URL.")
-    return {}
 
 
 def _is_display_server_error(error: Exception) -> bool:
