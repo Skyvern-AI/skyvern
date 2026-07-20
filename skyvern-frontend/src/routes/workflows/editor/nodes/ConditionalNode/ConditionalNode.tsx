@@ -169,7 +169,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         className="opacity-0"
       />
       <div
-        className="rounded-xl border-2 border-dashed border-slate-600 p-2"
+        className="rounded-xl border-2 border-dashed border-border p-2 dark:border-slate-600"
         style={{
           width: conditionalNodeWidth,
           height: childrenHeightExtent,

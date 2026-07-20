@@ -12,8 +12,10 @@ export type DownloadedFileInfo = {
 export const ArtifactType = {
   Recording: "recording",
   SessionReplay: "session_replay",
+  Screenshot: "screenshot",
   ActionScreenshot: "screenshot_action",
   LLMScreenshot: "screenshot_llm",
+  EvalScore: "eval_score",
   LLMResponseRaw: "llm_response",
   LLMResponseParsed: "llm_response_parsed",
   VisibleElementsTree: "visible_elements_tree",
@@ -671,7 +673,7 @@ export type Action = {
   screenshotArtifactId?: string | null;
 };
 
-export type EvalKind = "workflow" | "task";
+export type EvalKind = "workflow" | "task" | "browser_session";
 
 export interface Eval {
   kind: EvalKind;
@@ -693,7 +695,19 @@ export interface EvalTask extends Eval {
   url: string | null;
 }
 
-export type EvalApiResponse = EvalWorkflow[] | EvalTask[];
+export interface EvalBrowserSession extends Eval {
+  kind: "browser_session";
+  session_id: string;
+  arm?: string | null;
+  model?: string | null;
+  task_id?: string | null;
+  perfect?: boolean | null;
+  rubric_avg?: number | null;
+}
+
+export type EvalApiResponse = Array<
+  EvalWorkflow | EvalTask | EvalBrowserSession
+>;
 
 export type DebugSessionApiResponse = {
   debug_session_id: string;
@@ -730,6 +744,7 @@ export type WorkflowRunApiResponse = {
   workflow_permanent_id: string;
   workflow_run_id: string;
   workflow_title: string | null;
+  retried_from_workflow_run_id?: string | null;
 };
 
 export const TaskRunType = {
@@ -796,6 +811,8 @@ export type WorkflowRunStatusApiResponse = {
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
+  retried_from_workflow_run_id?: string | null;
+  retried_by_workflow_run_id?: string | null;
 };
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -835,6 +852,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
+  retried_from_workflow_run_id?: string | null;
+  retried_by_workflow_run_id?: string | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -906,9 +925,28 @@ export type BrowserProfileApiResponse = {
   proxy_session_id?: string | null;
   is_managed?: boolean;
   workflow_permanent_id?: string | null;
+  // Batched by the list endpoint so rows show the credential-login role without a per-row usage fetch.
+  linked_credential_name?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+};
+
+export type BrowserProfileUsageWorkflow = {
+  workflow_permanent_id: string;
+  title: string;
+  via: "browser_profile_id" | "seed_browser_profile_id";
+};
+
+export type BrowserProfileUsageCredential = {
+  credential_id: string;
+  name: string;
+};
+
+export type BrowserProfileUsage = {
+  workflows: Array<BrowserProfileUsageWorkflow>;
+  credentials: Array<BrowserProfileUsageCredential>;
+  recent_seeded_run_count: number;
 };
 
 export type PasswordCredentialApiResponse = {

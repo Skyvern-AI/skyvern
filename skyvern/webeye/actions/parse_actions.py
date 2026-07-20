@@ -302,7 +302,7 @@ def parse_action(
         # LLM-generated navigation targets can be steered by page content, so block
         # private/loopback/link-local hosts the same way the task URL boundary does.
         host = urlparse(validated_url).hostname
-        if not host or is_blocked_host(host):
+        if not host or is_blocked_host(host, resolve_dns=False):
             LOG.warning("GOTO_URL action targets a blocked host, skipping action", url=validated_url)
             return NullAction(**base_action_dict)
         return GotoUrlAction(**base_action_dict, url=validated_url)
@@ -323,7 +323,7 @@ def parse_action(
             LOG.warning("NEW_TAB action returned with an invalid url, skipping action", url=url)
             return NullAction(**base_action_dict)
         host = urlparse(validated_url).hostname
-        if not host or is_blocked_host(host):
+        if not host or is_blocked_host(host, resolve_dns=False):
             LOG.warning("NEW_TAB action targets a blocked host, skipping action", url=validated_url)
             return NullAction(**base_action_dict)
         return NewTabAction(**base_action_dict, url=validated_url)

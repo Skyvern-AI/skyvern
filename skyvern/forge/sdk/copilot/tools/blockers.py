@@ -1548,8 +1548,12 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     output_contract_owns_turn = (
         tool_name in _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS and output_contract_ladder_unresolved(ctx)
     )
+    grounding_owns_mutation = (
+        tool_name in _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS
+        and recorded_outcome_grounding_requires_current_page(ctx)
+    )
 
-    if not output_contract_owns_turn:
+    if not output_contract_owns_turn and not grounding_owns_mutation:
         detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
         if detected is not None:
             return _emit_tool_blocker_signal(
@@ -1567,6 +1571,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         isinstance(tracker, list)
         and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
         and not output_contract_owns_turn
+        and not grounding_owns_mutation
     ):
         detected = detect_tool_loop(tracker, tool_name, arguments)
         if detected is not None:

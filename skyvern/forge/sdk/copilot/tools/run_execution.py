@@ -206,7 +206,7 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_page_inspected, _mark_post_run_page_observed
-from .workflow_update import record_output_contract_run_output_evidence
+from .workflow_update import output_contract_value_bearing_run_reject, record_output_contract_run_output_evidence
 
 LOG = structlog.get_logger()
 
@@ -1063,10 +1063,22 @@ def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) 
             block["extracted_data"] = {key: value}
 
 
+def _registered_output_identity_workflow(
+    *,
+    dispatch_to_worker: bool,
+    dispatch_workflow: Workflow | None,
+    runtime_workflow: Workflow,
+) -> Workflow | None:
+    if dispatch_to_worker:
+        return dispatch_workflow
+    return runtime_workflow
+
+
 async def _attach_registered_output_parameter_values(
     *,
     workflow_run_id: str,
     workflow: Workflow | None,
+    output_identity_workflow: Workflow | None = None,
     data: dict[str, Any],
     persisted_output_parameters: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -1086,7 +1098,8 @@ async def _attach_registered_output_parameter_values(
     if not registered_rows:
         return {}
 
-    index_by_id, index_by_key = _workflow_output_parameter_indexes(workflow)
+    exact_output_identity = output_identity_workflow is not None
+    index_by_id, index_by_key = _workflow_output_parameter_indexes(output_identity_workflow or workflow)
     persisted_key_by_id = {
         output_parameter_id: key
         for parameter in persisted_output_parameters or []
@@ -1100,8 +1113,15 @@ async def _attach_registered_output_parameter_values(
         if not isinstance(output_parameter_id, str) or not output_parameter_id:
             continue
         block_info = dict(index_by_id.get(output_parameter_id, {}))
+        if exact_output_identity and not block_info:
+            LOG.info(
+                "Skipped registered output with no exact run-definition identity",
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=output_parameter_id,
+            )
+            continue
         output_parameter_key = block_info.get("output_parameter_key")
-        if not isinstance(output_parameter_key, str) or not output_parameter_key:
+        if not exact_output_identity and (not isinstance(output_parameter_key, str) or not output_parameter_key):
             output_parameter_key = persisted_key_by_id.get(output_parameter_id)
             if isinstance(output_parameter_key, str):
                 block_info["output_parameter_key"] = output_parameter_key
@@ -1524,6 +1544,23 @@ async def _run_blocks_and_collect_debug(
     if runtime_security_failure is not None:
         ctx.last_executed_block_labels = []
         return runtime_security_failure
+
+    # The lane asserts a saved-workflow property, so its evidence set is every saved code
+    # block, never just the selected subset (security lanes above stay selection-scoped).
+    value_bearing_reject = output_contract_value_bearing_run_reject(
+        ctx,
+        {
+            code_input.label: code_input.code
+            for code_input in _selected_code_security_inputs(
+                _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+                selected_labels=set(),
+                include_descendants=True,
+            )
+        },
+    )
+    if value_bearing_reject is not None:
+        ctx.last_executed_block_labels = []
+        return value_bearing_reject
 
     credential_ids = list(
         dict.fromkeys(
@@ -2202,12 +2239,16 @@ async def _run_blocks_and_collect_debug(
     if not run_ok and run and getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
 
+    output_identity_workflow = _registered_output_identity_workflow(
+        dispatch_to_worker=dispatch_to_worker,
+        dispatch_workflow=dispatch_workflow,
+        runtime_workflow=runtime_workflow,
+    )
+
     registered_outputs_by_label = await _attach_registered_output_parameter_values(
         workflow_run_id=workflow_run.workflow_run_id,
-        # Dispatched runs: the worker wrote outputs keyed by the persisted dispatch version's
-        # regenerated output-parameter ids, so map against that version (not runtime_workflow,
-        # which is intentionally left with the source ids). Inline runs map against runtime_workflow.
-        workflow=dispatch_workflow if dispatch_workflow is not None else runtime_workflow,
+        workflow=runtime_workflow,
+        output_identity_workflow=output_identity_workflow,
         data=result_data,
         persisted_output_parameters=all_output_params,
     )
@@ -2707,7 +2748,9 @@ def _record_run_blocks_result(
     )
     copilot_ctx.completion_verification_result = completion_verification
     if prior_committed_outcome is None or _verification_fully_satisfied(completion_verification):
-        record_completion_verification(copilot_ctx, completion_verification)
+        record_completion_verification(
+            copilot_ctx, completion_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+        )
         _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
@@ -2843,7 +2886,9 @@ def _record_run_blocks_result(
         if blocked_verification is not completion_verification:
             completion_verification = blocked_verification
             copilot_ctx.completion_verification_result = blocked_verification
-            record_completion_verification(copilot_ctx, blocked_verification)
+            record_completion_verification(
+                copilot_ctx, blocked_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+            )
             _record_adjudication_on_turn_state(copilot_ctx, blocked_verification)
         _mark_page_inspected(copilot_ctx)
         result["ok"] = False

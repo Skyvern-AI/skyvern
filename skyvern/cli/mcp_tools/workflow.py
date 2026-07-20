@@ -8,10 +8,12 @@ browser session.
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import json
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal
 
 import structlog
 import yaml
@@ -20,6 +22,7 @@ from pydantic import Field
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -37,6 +40,7 @@ from ._workflow_http import (
     update_workflow_folder_raw,
     update_workflow_raw,
 )
+from .response import MCP_MAX_RESPONSE_CHARS, _response_size
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -44,6 +48,8 @@ _SUMMARY_SCALAR_PREVIEW_LIMIT = 3
 _SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
 _SUMMARY_STRING_PREVIEW_LIMIT = 120
 _SUMMARY_RECURSION_LIMIT = 10
+_POINTER_MAX_LABELS = 20
+_POINTER_LABEL_BUDGET_CHARS = 800
 _SCREENSHOT_LIST_KEYS = frozenset({"task_screenshots", "workflow_screenshots", "screenshot_urls"})
 _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workflow_screenshot_artifact_ids"})
 
@@ -491,7 +497,30 @@ _CODE_V2_DEFAULTS: dict[str, Any] = {
     "run_with": "agent",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
-_WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = ("run_sequentially", "sequential_key")
+_WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
+    "description",
+    "webhook_callback_url",
+    "totp_verification_url",
+    "totp_identifier",
+    "persist_browser_session",
+    "pin_saved_session_ip",
+    "browser_profile_id",
+    "browser_profile_key",
+    "model",
+    "is_saved_task",
+    "max_screenshot_scrolls",
+    "max_elapsed_time_minutes",
+    "extra_http_headers",
+    "cdp_connect_headers",
+    "status",
+    "run_with",
+    "ai_fallback",
+    "cache_key",
+    "adaptive_caching",
+    "generate_script_on_terminal",
+    "run_sequentially",
+    "sequential_key",
+)
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
@@ -653,19 +682,27 @@ def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
     return json.dumps(raw) if changed else definition
 
 
-async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workflow_id: str) -> str:
+async def _inject_workflow_update_proxy_default(
+    definition: str,
+    fmt: str,
+    fetch_existing: Callable[[], Awaitable[dict[str, Any]]],
+) -> str:
     """Preserve or default workflow proxy location when MCP update omits it."""
 
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None or "proxy_location" in raw:
         return definition
 
-    existing_workflow = await get_workflow_by_id(workflow_id)
+    existing_workflow = await fetch_existing()
     raw["proxy_location"] = existing_workflow.get("proxy_location") or _DEFAULT_MCP_PROXY_LOCATION
     return _dump_definition_dict(raw, parsed_format)
 
 
-async def _inject_workflow_update_top_level_settings(definition: str, fmt: str, workflow_id: str) -> str:
+async def _inject_workflow_update_top_level_settings(
+    definition: str,
+    fmt: str,
+    fetch_existing: Callable[[], Awaitable[dict[str, Any]]],
+) -> str:
     """Preserve workflow-level settings that schema defaults would otherwise clobber."""
 
     raw, parsed_format = _load_definition_dict(definition, fmt)
@@ -676,12 +713,12 @@ async def _inject_workflow_update_top_level_settings(definition: str, fmt: str, 
     if not missing_fields:
         return definition
 
-    existing_workflow = await get_workflow_by_id(workflow_id)
+    existing_workflow = await fetch_existing()
     changed = False
     for field in missing_fields:
-        existing_value = existing_workflow.get(field)
-        if existing_value is not None:
-            raw[field] = existing_value
+        # Key-presence check (not `is not None`): a stored explicit None must survive omission too.
+        if field in existing_workflow:
+            raw[field] = existing_workflow[field]
             changed = True
 
     return _dump_definition_dict(raw, parsed_format) if changed else definition
@@ -887,6 +924,47 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _code_block_pointer(blocks: Any, *, hint: str) -> dict[str, Any] | None:
+    """Summarize the workflow's reusable code blocks so a caller learns the code exists without being
+    told in a prompt. Returns None when nothing is reusable, so the key is omitted rather than
+    advertising an empty shell."""
+    if not isinstance(blocks, list):
+        return None
+    code_blocks = [
+        block
+        for block in _iter_blocks_flat(blocks)
+        if block.get("block_type") == BlockType.CODE and isinstance(block.get("code"), str) and block["code"].strip()
+    ]
+    if not code_blocks:
+        return None
+    # Labels are unbounded in the schema, so cap the preview by characters as well as by count: the
+    # oversize branch emits this pointer, and an unbounded preview could push that response back over
+    # the response cap and get the whole pointer stripped. code_block_count stays exact regardless.
+    labels: list[str] = []
+    budget = _POINTER_LABEL_BUDGET_CHARS
+    for block in code_blocks:
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        if len(labels) >= _POINTER_MAX_LABELS:
+            break
+        if len(label) > budget:
+            continue
+        labels.append(label)
+        budget -= len(label)
+    return {
+        "code_block_count": len(code_blocks),
+        "block_labels": labels,
+        "hint": hint,
+    }
+
+
+def _skills_pointer(workflow_system_prompt: Any, *, hint: str) -> dict[str, Any] | None:
+    if not isinstance(workflow_system_prompt, str) or not workflow_system_prompt.strip():
+        return None
+    return {"prompt_chars": len(workflow_system_prompt), "hint": hint}
+
+
 def _iter_positional_block_matches(
     existing_blocks: list[dict[str, Any]],
     update_blocks: list[dict[str, Any]],
@@ -934,7 +1012,11 @@ def _iter_positional_block_matches(
     return result
 
 
-async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> tuple[str, list[str]]:
+async def _inject_workflow_update_parameters(
+    definition: str,
+    fmt: str,
+    fetch_existing: Callable[[], Awaitable[dict[str, Any]]],
+) -> tuple[str, list[str]]:
     """Preserve protected credential/secret parameters during MCP workflow updates.
 
     Credential references should NEVER be modifiable via MCP — the existing workflow's
@@ -961,7 +1043,7 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
 
     update_params: list[dict[str, Any]] = wf_def.get("parameters", [])
 
-    existing_workflow = await get_workflow_by_id(workflow_id)
+    existing_workflow = await fetch_existing()
     existing_wf_def = existing_workflow.get("workflow_definition")
     if not isinstance(existing_wf_def, dict):
         return definition, warnings
@@ -1178,6 +1260,82 @@ def _parse_definition(definition: str, fmt: str) -> tuple[dict[str, Any] | None,
 # ---------------------------------------------------------------------------
 
 
+def guard_definition_size(
+    fn: Callable[..., Awaitable[dict[str, Any]]],
+) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """Return a structured CLI fallback when a workflow definition cannot fit in one MCP response."""
+
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        # Coupled to the wrapped tool's `version` parameter name; a rename silently drops --version from the hint.
+        version = signature.bind_partial(*args, **kwargs).arguments.get("version")
+        result = await fn(*args, **kwargs)
+        response_chars = _response_size(result)
+        if response_chars <= MCP_MAX_RESPONSE_CHARS:
+            return result
+
+        data = result.get("data")
+        if not result.get("ok") or not isinstance(data, dict):
+            return result
+        definition = data.get("workflow_definition")
+        if not isinstance(definition, dict):
+            return result
+
+        workflow_id = str(data.get("workflow_permanent_id") or "<wpid>")
+        version_arg = f" --version {version}" if version is not None else ""
+        blocks = definition.get("blocks")
+        parameters = definition.get("parameters")
+        code_block_pointer = _code_block_pointer(
+            blocks,
+            hint=(
+                "This workflow already carries persisted executable code. Run "
+                f"`skyvern workflow get --id {workflow_id}{version_arg} --definition-file wf.json`, then reuse "
+                "the code blocks from wf.json instead of re-authoring."
+            ),
+        )
+        skills_pointer = data.get("skills")
+        overflow_skills_pointer = None
+        if isinstance(skills_pointer, dict):
+            overflow_skills_pointer = {
+                **skills_pointer,
+                "hint": (
+                    f"This workflow carries {skills_pointer['prompt_chars']} persisted skill-instruction characters, "
+                    "but its definition was omitted from this oversized response. Run "
+                    f"`skyvern workflow get --id {workflow_id}{version_arg} --definition-file wf.json`, edit "
+                    "`workflow_definition.workflow_system_prompt` in wf.json, then run "
+                    f"`skyvern workflow update --id {workflow_id} --definition @wf.json`."
+                ),
+            }
+        return make_result(
+            "skyvern_workflow_get",
+            ok=False,
+            data={
+                "workflow_permanent_id": data.get("workflow_permanent_id"),
+                "title": data.get("title"),
+                "version": data.get("version"),
+                "block_count": len(_iter_blocks_flat(blocks)) if isinstance(blocks, list) else 0,
+                "parameter_count": len(parameters) if isinstance(parameters, list) else 0,
+                "definition_chars": _response_size(definition),
+                **({"code_block_pointer": code_block_pointer} if code_block_pointer is not None else {}),
+                **({"skills": overflow_skills_pointer} if overflow_skills_pointer is not None else {}),
+            },
+            timing_ms=result.get("timing_ms"),
+            error=make_error(
+                ErrorCode.ACTION_FAILED,
+                f"Workflow definition response is {response_chars} characters, exceeding the MCP response cap "
+                f"of {MCP_MAX_RESPONSE_CHARS} characters.",
+                f"Run `skyvern workflow get --id {workflow_id}{version_arg} --definition-file wf.json`, "
+                "edit wf.json, then run "
+                f"`skyvern workflow update --id {workflow_id} --definition @wf.json`.",
+                {"response_chars": response_chars, "max_chars": MCP_MAX_RESPONSE_CHARS},
+            ),
+        )
+
+    return wrapper
+
+
 async def skyvern_workflow_list(
     search: Annotated[str | None, "Search across workflow titles, folder names, and parameter metadata"] = None,
     query: Annotated[
@@ -1244,7 +1402,17 @@ async def skyvern_workflow_get(
 
     This fetches a single workflow by id only — it does NOT search, browse, or paginate, and rejects
     arguments like query/search/page/page_size/only_workflows. To find a workflow by name or see what
-    exists, call skyvern_workflow_list first, then pass the returned workflow_id here."""
+    exists, call skyvern_workflow_list first, then pass the returned workflow_id here.
+
+    For very large workflows, run
+    `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
+    `skyvern workflow update --id <wpid> --definition @wf.json`.
+    The update replaces the whole workflow definition.
+
+    Persisted skill instructions are at `data.workflow_definition.workflow_system_prompt`; `data.skills`
+    reports their raw character count. Preserve them with skyvern_workflow_get → edit →
+    skyvern_workflow_update because omitting the field clears it. JSON preserves skill content exactly;
+    YAML may rewrite Jinja-style references when block labels or parameter keys are sanitized."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_get"):
         return err
 
@@ -1279,11 +1447,31 @@ async def skyvern_workflow_get(
             "workflow_definition": _workflow_definition_to_authoring_shape(wf_data["workflow_definition"]),
         }
 
+    definition = wf_data.get("workflow_definition") if isinstance(wf_data, dict) else None
+    blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    code_block_pointer = _code_block_pointer(
+        blocks,
+        hint=(
+            "This workflow already carries persisted executable code. Read the code blocks' `code` fields in "
+            "workflow_definition and reuse them instead of re-authoring."
+        ),
+    )
+    workflow_system_prompt = definition.get("workflow_system_prompt") if isinstance(definition, dict) else None
+    skills_pointer = _skills_pointer(
+        workflow_system_prompt,
+        hint=(
+            "This workflow carries persisted skill instructions. Read them at "
+            "data.workflow_definition.workflow_system_prompt in this response; preserve them with "
+            "skyvern_workflow_get → edit → skyvern_workflow_update."
+        ),
+    )
     version_str = f", version={version}" if version is not None else ""
     return make_result(
         "skyvern_workflow_get",
         data={
             **wf_data,
+            **({"code_block_pointer": code_block_pointer} if code_block_pointer is not None else {}),
+            **({"skills": skills_pointer} if skills_pointer is not None else {}),
             "sdk_equivalent": f"# No SDK method yet — GET /api/v1/workflows/{workflow_id}{version_str}",
         },
         timing_ms=timer.timing_ms,
@@ -1392,6 +1580,9 @@ async def skyvern_workflow_create(
     max_steps_per_run, totp_identifier, complete_criterion, error_code_mapping,
     continue_on_failure, engine, model, etc.). The schema defaults are intentional; silently
     flipping them changes behavior the user did not request.
+
+    Skill instructions can be stored in `workflow_definition.workflow_system_prompt`; see
+    skyvern_workflow_get for the read/preserve flow and format caveats.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(
@@ -1475,7 +1666,15 @@ async def skyvern_workflow_update(
 
     The ENTIRE updated workflow — its title, blocks, and parameters — must be serialized INTO the
     `definition` string; do NOT pass title/blocks/parameters as separate top-level arguments (only
-    workflow_id/definition/format/code_only are accepted, any other top-level field is rejected)."""
+    workflow_id/definition/format/code_only are accepted, any other top-level field is rejected).
+
+    For very large workflows, run
+    `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
+    `skyvern workflow update --id <wpid> --definition @wf.json`.
+    This command replaces the whole workflow definition.
+
+    Preserve `workflow_definition.workflow_system_prompt` when updating — omitting it clears it; see
+    skyvern_workflow_get for the safe get → edit → update flow and format caveats."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
         return err
 
@@ -1494,11 +1693,19 @@ async def skyvern_workflow_update(
         if err := _validate_code_only_definition(definition, format, "skyvern_workflow_update"):
             return err
 
+    existing_workflow: dict[str, Any] | None = None
+
+    async def fetch_existing() -> dict[str, Any]:
+        nonlocal existing_workflow
+        if existing_workflow is None:
+            existing_workflow = await get_workflow_by_id(workflow_id)
+        return existing_workflow
+
     param_warnings: list[str] = []
     try:
-        definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
-        definition = await _inject_workflow_update_top_level_settings(definition, format, workflow_id)
-        definition, param_warnings = await _inject_workflow_update_parameters(definition, format, workflow_id)
+        definition = await _inject_workflow_update_proxy_default(definition, format, fetch_existing)
+        definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
+        definition, param_warnings = await _inject_workflow_update_parameters(definition, format, fetch_existing)
     except NotFoundError:
         return make_result(
             "skyvern_workflow_update",

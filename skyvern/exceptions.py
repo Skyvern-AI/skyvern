@@ -136,13 +136,22 @@ def _is_browser_connection_error(message: str) -> bool:
 
 
 # A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
-# ws/wss endpoint URL, which can carry the remote-browser vendor host, a session-bearing
-# path/query, or credentials embedded as user:pass@host. Redact it before it reaches a user.
-_CDP_WS_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+# endpoint URL, which can carry the remote-browser vendor host, a session-bearing path/query,
+# or credentials embedded as user:pass@host. The devtools socket is always ws/wss, so a ws/wss
+# URL in a browser error is unambiguously a CDP endpoint and safe to redact anywhere. The
+# /json/version discovery endpoint is http/https and carries the same host/token, but so does an
+# ordinary navigation/target/proxy URL — an http(s) URL is only known to be a CDP endpoint in a
+# CDP-connection context, so http(s) redaction is scoped to that context (see redact_cdp_endpoint_urls).
+_WS_ENDPOINT_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+_CDP_ENDPOINT_URL_RE = re.compile(r"(?:wss?|https?)://\S+", re.IGNORECASE)
 
 
-def _redact_cdp_endpoint_urls(message: str) -> str:
-    return _CDP_WS_URL_RE.sub("[remote browser endpoint]", message)
+def redact_ws_endpoint_urls(message: str) -> str:
+    return _WS_ENDPOINT_URL_RE.sub("[remote browser endpoint]", message)
+
+
+def redact_cdp_endpoint_urls(message: str) -> str:
+    return _CDP_ENDPOINT_URL_RE.sub("[remote browser endpoint]", message)
 
 
 def get_user_facing_exception_message(exception: Exception) -> str:
@@ -195,6 +204,38 @@ class CardNumberInputMismatch(SkyvernException):
         super().__init__(
             "Card number input read-back mismatch: "
             f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
+
+
+class MaskedInputReadbackMismatch(SkyvernException):
+    # A masked field (postal code, SSN, etc.) accepted the keystrokes but committed nothing usable —
+    # it reads back empty or still shows mask placeholders. Counts only; the raw value may be a secret.
+    def __init__(self, *, expected_char_count: int, committed_char_count: int):
+        self.expected_char_count = expected_char_count
+        self.committed_char_count = committed_char_count
+        super().__init__(
+            "Masked input read-back mismatch: "
+            f"expected {expected_char_count} characters, committed {committed_char_count}."
+        )
+
+
+class InputTextCommitMismatch(SkyvernException):
+    def __init__(self, *, expected_length: int, actual_length: int):
+        self.expected_length = expected_length
+        self.actual_length = actual_length
+        super().__init__(
+            f"Input text commit mismatch: expected length {expected_length}, found actual length {actual_length}."
+        )
+
+
+class RepeatedActionFailure(SkyvernException):
+    def __init__(self, *, element_id: str, attempt_count: int, failure_description: str):
+        self.element_id = element_id
+        self.attempt_count = attempt_count
+        self.failure_description = failure_description
+        super().__init__(
+            f"Action on element {element_id} failed identically {attempt_count} consecutive times: "
+            f"{failure_description}."
         )
 
 
@@ -506,7 +547,14 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
-        raw_message = _redact_cdp_endpoint_urls(str(exception).strip())
+        # BrowserFactory.create_browser_context wraps every creator/setup failure, so an http(s) URL
+        # here is only known to be a CDP discovery endpoint (rather than an ordinary proxy/public-IP
+        # probe URL the user needs) when the error carries a CDP-connection signal. Default to ws/wss
+        # redaction and escalate to http(s)+ws(s) redaction only for connect_over_cdp/WebSocket errors.
+        raw = str(exception).strip()
+        raw_message = (
+            redact_cdp_endpoint_urls(raw) if _is_browser_connection_error(raw) else redact_ws_endpoint_urls(raw)
+        )
         raw_lower = raw_message.lower()
 
         # Browser launch environment errors: worker cannot initialize the
@@ -1017,9 +1065,17 @@ class NoElementBoudingBox(SkyvernException):
         super().__init__(f"Element does not have a bounding box. element_id={element_id}")
 
 
-class NoIncrementalElementFoundForAutoCompletion(SkyvernException):
-    def __init__(self, element_id: str, text: str) -> None:
-        super().__init__(f"No auto completion shown up after fill in [{text}]. element_id={element_id}")
+class AutoCompletionCommitFailure(SkyvernException):
+    def __init__(self, stage: str, attempt_trail: list[str] | None = None) -> None:
+        trail = attempt_trail or [stage]
+        super().__init__(f"Autocomplete selection failed. stage={stage} attempt_trail={','.join(trail)}")
+        self.stage = stage
+        self.attempt_trail = trail
+
+
+# Deprecated: superseded by AutoCompletionCommitFailure, which carries the failing stage.
+# Kept for one release so downstream `except` clauses keep working.
+NoIncrementalElementFoundForAutoCompletion = AutoCompletionCommitFailure
 
 
 class NoSuitableAutoCompleteOption(SkyvernException):

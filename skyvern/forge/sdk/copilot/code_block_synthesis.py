@@ -24,6 +24,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingSnapshot,
+    authoring_parameter_binding_fingerprint,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     FrozenRequestedOutputExtractionCandidate,
@@ -33,6 +37,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     output_path_segments,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.runtime import ScoutedFieldParameterBinding, ScoutedInputCorrespondence
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -47,6 +52,7 @@ _ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
 _ENTRY_OPENER_VAR = "_scout_entry_opener"
 _OPTIONAL_DISMISSAL_VAR = "_scout_optional_dismissal"
 _READONLY_DEFERRED_VAR = "_scout_readonly_actual"
+_MONTH_HELPER_VAR = "_scout_month_to_iso"
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
@@ -56,6 +62,7 @@ _INTERNAL_SCOUT_VARS = (
     _ENTRY_OPENER_VAR,
     _OPTIONAL_DISMISSAL_VAR,
     _READONLY_DEFERRED_VAR,
+    _MONTH_HELPER_VAR,
 )
 
 # Base name for the download var bound by `async with page.expect_download() as <name>:`.
@@ -78,7 +85,15 @@ _CREDENTIAL_FIELD_ACCESS_RE = re.compile(
     r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
 )
 _CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
-_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
+
+
+def _is_submit_interaction(interaction: Mapping[str, Any]) -> bool:
+    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits, so
+    both the synthesis submit boundary and the persist-time credential-scout gate share one definition."""
+    tool_name = str(interaction.get("tool_name") or "").strip()
+    if tool_name == "click":
+        return True
+    return tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter"
 
 
 class CredentialFieldAccess(NamedTuple):
@@ -124,7 +139,7 @@ def first_matched_post_fill_submit_index(
     for index, interaction in enumerate(trajectory):
         if index <= latest_fill_index:
             continue
-        if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+        if not _is_submit_interaction(interaction):
             continue
         source_url = str(interaction.get("source_url") or "").strip()
         if matched_source_urls and source_url not in matched_source_urls:
@@ -217,6 +232,7 @@ _RESERVED_PARAM_NAMES = frozenset(
         "password",
         "totp",
         "totp_identifier",
+        "otp",
         "print",
         "len",
         "range",
@@ -247,6 +263,7 @@ _RESERVED_PARAM_NAMES = frozenset(
         _ENTRY_RESUME_AFTER_AUTH_VAR,
         _ENTRY_RESUME_TARGET_VAR,
         _ENTRY_OPENER_VAR,
+        _MONTH_HELPER_VAR,
         _DOWNLOAD_VAR_BASE,
         f"{_DOWNLOAD_VAR_BASE}_file",
         _DOWNLOAD_FILENAME_VAR_BASE,
@@ -280,10 +297,14 @@ class SynthesisDiagnostics:
     forgiven_interactions: list[dict[str, Any]] = field(default_factory=list)
     download_terminal_anchor: int | None = None
     download_terminal_dropped_trailing: int = 0
+    # Post-download-cut trajectory indices recorded before the emission loop, so the partition obligation
+    # can detect a truncation-break index that lands in no record lane instead of silently losing it.
+    retained_trajectory_indices: list[int] = field(default_factory=list)
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
     typed_param_bindings: list[tuple[int, str]] = field(default_factory=list)
+    grounded_submit_binding_fingerprints: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -297,6 +318,180 @@ class SynthesizedCodeBlock:
     extraction_code: str = ""
     extraction_fingerprint: str = ""
     extraction_plan_identity: str = ""
+
+
+def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
+    return (
+        parameter_key.isidentifier()
+        and not keyword.iskeyword(parameter_key)
+        and not parameter_key.startswith("__")
+        and parameter_key not in _RESERVED_PARAM_NAMES
+    )
+
+
+def grounded_submit_rung_binding_fingerprint(
+    *,
+    repeated_structural_key: str,
+    source_url: str,
+    submit_selector: str,
+    submit_trajectory_index: int,
+    field_bindings: Sequence[ScoutedFieldParameterBinding],
+) -> str:
+    payload = {
+        "repeated_structural_key": repeated_structural_key,
+        "source_url": source_url,
+        "submit_selector": submit_selector,
+        "submit_trajectory_index": submit_trajectory_index,
+        "field_bindings": [
+            {
+                "parameter_key": binding["parameter_key"],
+                "field_selector": binding["field_selector"],
+            }
+            for binding in field_bindings
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _binding_source_origin(source_url: str) -> str:
+    parsed = urlsplit(source_url)
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+
+
+def _captured_trajectory_index(interaction: Mapping[str, Any], position: int) -> int:
+    raw_index = interaction.get("trajectory_index")
+    return raw_index if isinstance(raw_index, int) and raw_index >= 0 else position
+
+
+class _ValidatedSnapshotBindings(NamedTuple):
+    fill_by_index: dict[int, tuple[str, str]]
+    select_option_by_index: dict[int, str]
+
+
+def _validated_authoring_parameter_binding_snapshot(
+    snapshot: AuthoringParameterBindingSnapshot,
+    trajectory: Sequence[Mapping[str, Any]],
+) -> _ValidatedSnapshotBindings | None:
+    if not snapshot.field_bindings:
+        return None
+    terminal_matches = [
+        (position, interaction)
+        for position, interaction in enumerate(trajectory)
+        if _captured_trajectory_index(interaction, position) == snapshot.terminal.trajectory_index
+    ]
+    if len(terminal_matches) != 1:
+        return None
+    _terminal_position, terminal = terminal_matches[0]
+    if _binding_source_origin(str(terminal.get("source_url") or "")) != snapshot.source_origin:
+        return None
+    if str(terminal.get("tool_name") or "") != snapshot.terminal.tool_name:
+        return None
+    if str(terminal.get("selector") or "").strip() != snapshot.terminal.selector:
+        return None
+    if str(terminal.get("key") or "").strip() != snapshot.terminal.key:
+        return None
+    expected = authoring_parameter_binding_fingerprint(
+        structural_key=snapshot.structural_key,
+        source_origin=snapshot.source_origin,
+        field_bindings=snapshot.field_bindings,
+        terminal=snapshot.terminal,
+    )
+    if expected != snapshot.fingerprint:
+        return None
+    fill_by_index: dict[int, tuple[str, str]] = {}
+    select_option_by_index: dict[int, str] = {}
+    declared_keys: set[str] = set()
+    selectors: set[str] = set()
+    for binding in snapshot.field_bindings:
+        if (
+            not grounded_parameter_key_is_safe(binding.declared_key)
+            or not binding.field_selector
+            or binding.declared_key in declared_keys
+            or binding.field_selector in selectors
+        ):
+            return None
+        declared_keys.add(binding.declared_key)
+        selectors.add(binding.field_selector)
+        if binding.field_trajectory_index is None:
+            continue
+        field_matches = [
+            (position, interaction)
+            for position, interaction in enumerate(trajectory)
+            if _captured_trajectory_index(interaction, position) == binding.field_trajectory_index
+        ]
+        if len(field_matches) != 1:
+            return None
+        field_position, interaction = field_matches[0]
+        if _binding_source_origin(str(interaction.get("source_url") or "")) != snapshot.source_origin:
+            return None
+        if binding.match_basis == "scouted_selection_value":
+            if str(interaction.get("tool_name") or "") != "click":
+                return None
+            if templated_selection_locator_binding(interaction) != (binding.declared_key, binding.field_selector):
+                return None
+            continue
+        if binding.match_basis == "scouted_option_value":
+            if str(interaction.get("tool_name") or "") != "select_option":
+                return None
+            if str(interaction.get("selector") or "").strip() != binding.field_selector:
+                return None
+            if not selection_option_value_admissible(str(interaction.get("value") or "").strip(), binding.declared_key):
+                return None
+            select_option_by_index[field_position] = binding.declared_key
+            continue
+        if str(interaction.get("tool_name") or "") != "type_text":
+            return None
+        if str(interaction.get("selector") or "").strip() != binding.field_selector:
+            return None
+        fill_by_index[field_position] = (binding.declared_key, binding.field_selector)
+    return _ValidatedSnapshotBindings(fill_by_index, select_option_by_index)
+
+
+def _validated_submit_rung_binding(
+    interaction: Mapping[str, Any], trajectory_index: int
+) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+    raw = interaction.get("submit_rung_binding")
+    if not isinstance(raw, Mapping) or str(interaction.get("tool_name") or "") != "click":
+        return None
+    repeated_structural_key = str(raw.get("repeated_structural_key") or "").strip()
+    fingerprint = str(raw.get("fingerprint") or "").strip()
+    raw_fields = raw.get("field_bindings")
+    if not repeated_structural_key or not fingerprint or not isinstance(raw_fields, list) or not raw_fields:
+        return None
+    fields: list[ScoutedFieldParameterBinding] = []
+    parameter_keys: set[str] = set()
+    field_selectors: set[str] = set()
+    for raw_field in raw_fields:
+        if not isinstance(raw_field, Mapping):
+            return None
+        parameter_key = str(raw_field.get("parameter_key") or "").strip()
+        field_selector = str(raw_field.get("field_selector") or "").strip()
+        if (
+            not grounded_parameter_key_is_safe(parameter_key)
+            or not field_selector
+            or parameter_key in parameter_keys
+            or field_selector in field_selectors
+        ):
+            return None
+        parameter_keys.add(parameter_key)
+        field_selectors.add(field_selector)
+        fields.append({"parameter_key": parameter_key, "field_selector": field_selector})
+    if [field["parameter_key"] for field in fields] != sorted(parameter_keys):
+        return None
+    submit_selector = str(interaction.get("selector") or "").strip()
+    source_url = str(interaction.get("source_url") or "").strip()
+    if not submit_selector or not source_url:
+        return None
+    expected = grounded_submit_rung_binding_fingerprint(
+        repeated_structural_key=repeated_structural_key,
+        source_url=source_url,
+        submit_selector=submit_selector,
+        submit_trajectory_index=trajectory_index,
+        field_bindings=fields,
+    )
+    if fingerprint != expected:
+        return None
+    return fingerprint, tuple((field["parameter_key"], field["field_selector"]) for field in fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +626,399 @@ def _get_by_role_expr_strict(role: str, name: str) -> str:
     return f"page.get_by_role({_py_str(role)}, name={_py_str(name)}, exact=True)"
 
 
+LOCATOR_WITNESS_PARAM_SOURCE = "locator_witness"
+INPUT_TEMPLATED_PROVENANCE_SOURCE = "input_templated"
+_SCOUT_MONTH_HELPER_NAME = _MONTH_HELPER_VAR
+_WITNESS_MIN_VALUE_LEN = 3
+_WITNESS_SAFE_CHARSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+_WITNESS_KEY_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_WITNESS_MONTH_TO_ISO = {
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "may": "05",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+}
+
+
+class _InputTemplatingPlan(NamedTuple):
+    surface: str
+    selector: str
+    role: str
+    name: str
+    holes: list[Mapping[str, Any]]
+
+
+def _witness_key_is_safe(key: str) -> bool:
+    if not _WITNESS_KEY_IDENT_RE.fullmatch(key):
+        return False
+    if keyword.iskeyword(key):
+        return False
+    if key.startswith("_scout"):
+        return False
+    return key not in _RESERVED_PARAM_NAMES
+
+
+def _month_name_to_iso(value: str) -> str | None:
+    parts = value.split()
+    if len(parts) != 2:
+        return None
+    month = _WITNESS_MONTH_TO_ISO.get(parts[0].lower())
+    year = parts[1]
+    if month is None or len(year) != 4 or not year.isdigit():
+        return None
+    return f"{year}-{month}"
+
+
+def _witness_observed_forms(value: str) -> list[tuple[str, str]]:
+    forms: list[tuple[str, str]] = [("identity", value)]
+    iso = _month_name_to_iso(value)
+    if iso is not None and iso != value:
+        forms.append(("month_name_to_iso", iso))
+    return forms
+
+
+def _quoted_content_spans(selector: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    quote = ""
+    start = -1
+    i = 0
+    length = len(selector)
+    while i < length:
+        ch = selector[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                spans.append((start, i))
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+            start = i + 1
+        i += 1
+    return spans
+
+
+def _boundary_delimited_positions(haystack: str, needle: str, allowed_spans: Sequence[tuple[int, int]]) -> list[int]:
+    positions: list[int] = []
+    if not needle:
+        return positions
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx < 0:
+            break
+        end = idx + len(needle)
+        left_ok = idx == 0 or not haystack[idx - 1].isalnum()
+        right_ok = end == len(haystack) or not haystack[end].isalnum()
+        inside = any(span_start <= idx and end <= span_end for span_start, span_end in allowed_spans)
+        if left_ok and right_ok and inside:
+            positions.append(idx)
+        start = idx + 1
+    return positions
+
+
+def _resolve_non_competing_correspondences(raw: list[dict[str, Any]]) -> list[ScoutedInputCorrespondence]:
+    result: list[ScoutedInputCorrespondence] = []
+    for surface in ("selector", "accessible_name"):
+        entries = sorted((entry for entry in raw if entry["surface"] == surface), key=lambda entry: entry["_position"])
+        key_counts: dict[str, int] = {}
+        for entry in entries:
+            key_counts[entry["input_key"]] = key_counts.get(entry["input_key"], 0) + 1
+        bad: set[int] = set()
+        for a_index, a_entry in enumerate(entries):
+            if key_counts[a_entry["input_key"]] > 1:
+                bad.add(a_index)
+            a_start = a_entry["_position"]
+            a_end = a_start + len(a_entry["matched_literal"])
+            for b_index in range(a_index + 1, len(entries)):
+                b_start = entries[b_index]["_position"]
+                b_end = b_start + len(entries[b_index]["matched_literal"])
+                if a_start < b_end and b_start < a_end:
+                    bad.add(a_index)
+                    bad.add(b_index)
+        for index, entry in enumerate(entries):
+            if index in bad:
+                continue
+            result.append(
+                {
+                    "input_key": entry["input_key"],
+                    "matched_literal": entry["matched_literal"],
+                    "parameter_value": entry["parameter_value"],
+                    "surface": entry["surface"],
+                    "transform": entry["transform"],
+                    "position": entry["_position"],
+                }
+            )
+    return result
+
+
+def input_correspondences_for_interaction(
+    interaction: Mapping[str, Any], declared_params: Mapping[str, str]
+) -> list[ScoutedInputCorrespondence]:
+    """Witness a declared parameter value observed verbatim (identity, or month-name -> ISO) inside a
+    quoted selector segment or the accessible name at click time — value containment, never label==header
+    matching. Empty unless the match is unique across both surfaces, boundary-delimited, safe-charset on
+    value and literal, whitespace-normalized, and name-safe."""
+    if str(interaction.get("tool_name") or "") != "click":
+        return []
+    selector = str(interaction.get("selector") or "").strip()
+    name = str(interaction.get("accessible_name") or "").strip()
+    selector_spans = _quoted_content_spans(selector)
+    name_spans = [(0, len(name))] if name else []
+    raw: list[dict[str, Any]] = []
+    for key in sorted(declared_params):
+        value = declared_params[key]
+        if not value or value != value.strip() or len(value) < _WITNESS_MIN_VALUE_LEN:
+            continue
+        if not _WITNESS_SAFE_CHARSET_RE.fullmatch(value):
+            continue
+        if not _witness_key_is_safe(key):
+            continue
+        for transform, observed in _witness_observed_forms(value):
+            if len(observed) < _WITNESS_MIN_VALUE_LEN or not _WITNESS_SAFE_CHARSET_RE.fullmatch(observed):
+                continue
+            selector_positions = _boundary_delimited_positions(selector, observed, selector_spans)
+            name_positions = _boundary_delimited_positions(name, observed, name_spans)
+            if len(selector_positions) + len(name_positions) != 1:
+                continue
+            if selector_positions:
+                surface, position = "selector", selector_positions[0]
+            else:
+                surface, position = "accessible_name", name_positions[0]
+            raw.append(
+                {
+                    "surface": surface,
+                    "input_key": key,
+                    "matched_literal": observed,
+                    "parameter_value": value,
+                    "transform": transform,
+                    "_position": position,
+                }
+            )
+    return _resolve_non_competing_correspondences(raw)
+
+
+def _escape_fstring_literal_segment(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+    escaped = "".join(f"\\x{ord(ch):02x}" if ch in _CONTROL_CODEPOINTS else ch for ch in escaped)
+    for separator in _EXTRA_LINE_SEPARATORS:
+        escaped = escaped.replace(separator, f"\\u{ord(separator):04x}")
+    return escaped.replace("{", "{{").replace("}", "}}")
+
+
+def _interpolate_holes(raw: str, holes: Sequence[Mapping[str, Any]]) -> str | None:
+    segments: list[str] = []
+    cursor = 0
+    for hole in holes:
+        matched_literal = str(hole.get("matched_literal") or "")
+        idx = hole.get("position")
+        # Interpolate at the boundary-validated span carried from the witness, not a naive substring
+        # scan: a value that also occurs earlier as a non-boundary substring would template the wrong span.
+        if not isinstance(idx, int) or idx < cursor or raw[idx : idx + len(matched_literal)] != matched_literal:
+            return None
+        segments.append(_escape_fstring_literal_segment(raw[cursor:idx]))
+        key = str(hole.get("input_key") or "")
+        if str(hole.get("transform") or "identity") == "month_name_to_iso":
+            segments.append("{" + _SCOUT_MONTH_HELPER_NAME + "(" + key + ")}")
+        else:
+            segments.append("{" + key + "}")
+        cursor = idx + len(matched_literal)
+    segments.append(_escape_fstring_literal_segment(raw[cursor:]))
+    return "".join(segments)
+
+
+def build_input_templated_locator(
+    *, surface: str, selector: str, role: str, name: str, holes: Sequence[Mapping[str, Any]]
+) -> str | None:
+    """Single source for the templated locator literal, used at emission AND re-derived byte-for-byte at
+    the admissibility seam so a tampered or reordered provenance record fails the recompute equality check."""
+    if not holes:
+        return None
+    if surface == "selector":
+        body = _interpolate_holes(selector, holes)
+        if body is None:
+            return None
+        return f'page.locator(f"{body}")'
+    if surface == "accessible_name":
+        if not role or not name:
+            return None
+        body = _interpolate_holes(name, holes)
+        if body is None:
+            return None
+        return f'page.get_by_role({_py_str(role)}, name=f"{body}", exact=True)'
+    return None
+
+
+def templated_selection_locator_binding(interaction: Mapping[str, Any]) -> tuple[str, str] | None:
+    """(declared_key, canonical templated-locator expression) for a click whose stamped
+    input_correspondences template exactly one declared-key hole. None when the click is untemplatable
+    or witnesses more than one hole. The canonical expression is the join key shared with the consumption
+    recognizer, so a re-authored templated click and this snapshot binding agree by construction."""
+    plan = _input_templating_plan(interaction)
+    if plan is None or len(plan.holes) != 1:
+        return None
+    key = str(plan.holes[0].get("input_key") or "")
+    if not key:
+        return None
+    expr = build_input_templated_locator(
+        surface=plan.surface, selector=plan.selector, role=plan.role, name=plan.name, holes=plan.holes
+    )
+    if expr is None:
+        return None
+    try:
+        canonical = ast.unparse(ast.parse(expr, mode="eval").body)
+    except SyntaxError:
+        return None
+    return key, canonical
+
+
+def selection_option_value_admissible(value: str, key: str) -> bool:
+    return (
+        value == value.strip()
+        and len(value) >= _WITNESS_MIN_VALUE_LEN
+        and bool(_WITNESS_SAFE_CHARSET_RE.fullmatch(value))
+        and _witness_key_is_safe(key)
+    )
+
+
+def _ordered_holes(raw: str, holes: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]] | None:
+    positioned: list[tuple[int, Mapping[str, Any]]] = []
+    for hole in holes:
+        matched_literal = str(hole.get("matched_literal") or "")
+        idx = hole.get("position")
+        if not isinstance(idx, int) or raw[idx : idx + len(matched_literal)] != matched_literal:
+            return None
+        positioned.append((idx, hole))
+    positioned.sort(key=lambda item: item[0])
+    return [hole for _, hole in positioned]
+
+
+def _input_templating_plan(interaction: Mapping[str, Any]) -> _InputTemplatingPlan | None:
+    correspondences = interaction.get("input_correspondences")
+    if not isinstance(correspondences, list) or not correspondences:
+        return None
+    selector = str(interaction.get("selector") or "").strip()
+    role = str(interaction.get("role") or "").strip()
+    name = str(interaction.get("accessible_name") or "").strip()
+    selector_holes = [c for c in correspondences if isinstance(c, Mapping) and c.get("surface") == "selector"]
+    name_holes = [c for c in correspondences if isinstance(c, Mapping) and c.get("surface") == "accessible_name"]
+    parsed = _parse_role_name(selector) if selector else None
+    if (
+        selector_holes
+        and selector
+        and parsed is None
+        and not _is_positional_selector(selector)
+        and not _is_bare_ambiguous_selector(selector)
+    ):
+        ordered = _ordered_holes(selector, selector_holes)
+        if ordered is not None:
+            return _InputTemplatingPlan(surface="selector", selector=selector, role="", name="", holes=ordered)
+    if name_holes and role and name:
+        ambiguous_role = parsed is not None and not parsed[1]
+        if not selector or _is_bare_ambiguous_selector(selector) or ambiguous_role:
+            ordered = _ordered_holes(name, name_holes)
+            if ordered is not None:
+                return _InputTemplatingPlan(surface="accessible_name", selector="", role=role, name=name, holes=ordered)
+    return None
+
+
+def _maybe_input_templated_locator(
+    interaction: Mapping[str, Any],
+    *,
+    diagnostics: SynthesisDiagnostics | None,
+    trajectory_index: int | None,
+) -> str | None:
+    plan = _input_templating_plan(interaction)
+    if plan is None:
+        return None
+    expr = build_input_templated_locator(
+        surface=plan.surface, selector=plan.selector, role=plan.role, name=plan.name, holes=plan.holes
+    )
+    if expr is None:
+        return None
+    if diagnostics is not None:
+        record: dict[str, Any] = {
+            "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+            "source": INPUT_TEMPLATED_PROVENANCE_SOURCE,
+            "surface": plan.surface,
+            "emitted_literal": expr,
+            "holes": [
+                {
+                    "input_key": str(hole.get("input_key") or ""),
+                    "matched_literal": str(hole.get("matched_literal") or ""),
+                    "parameter_value": str(hole.get("parameter_value") or ""),
+                    "transform": str(hole.get("transform") or "identity"),
+                    "position": hole.get("position"),
+                }
+                for hole in plan.holes
+            ],
+        }
+        if plan.surface == "selector":
+            record["selector"] = plan.selector
+        else:
+            record["role"] = plan.role
+            record["name"] = plan.name
+        diagnostics.locator_provenance.append(record)
+    return expr
+
+
+def _prescan_input_templating(trajectory: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
+    keys: list[str] = []
+    needs_month = False
+    for interaction in trajectory:
+        plan = _input_templating_plan(interaction)
+        if plan is None:
+            continue
+        for hole in plan.holes:
+            key = str(hole.get("input_key") or "")
+            if key and key not in keys:
+                keys.append(key)
+            if str(hole.get("transform") or "identity") == "month_name_to_iso":
+                needs_month = True
+    return keys, needs_month
+
+
+def _scout_month_helper_lines() -> list[str]:
+    month_map_literal = "{" + ", ".join(f'"{name}": "{code}"' for name, code in _WITNESS_MONTH_TO_ISO.items()) + "}"
+    return [
+        f"{_INDENT}def {_SCOUT_MONTH_HELPER_NAME}(_value):",
+        f"{_INDENT * 2}_months = {month_map_literal}",
+        f"{_INDENT * 2}_parts = str(_value).split()",
+        f"{_INDENT * 2}if len(_parts) != 2 or _parts[0].lower() not in _months or not (len(_parts[1]) == 4 "
+        f"and _parts[1].isdigit()):",
+        f'{_INDENT * 3}raise Exception("unrecognized month value for grounded parameter")',
+        f'{_INDENT * 2}return _parts[1] + "-" + _months[_parts[0].lower()]',
+    ]
+
+
+def _witness_charset_guard_lines(key: str) -> list[str]:
+    return [
+        f"{_INDENT}if not (isinstance({key}, str) and {key} == {key}.strip() and {key}[:1].isalnum() "
+        f'and all(_c.isalnum() or _c in " ._-" for _c in {key})):',
+        f"{_INDENT * 2}raise Exception({_py_str(f'invalid value for grounded parameter {key}')})",
+    ]
+
+
+def witness_prelude_lines(keys: Sequence[str], *, include_month_helper: bool) -> list[str]:
+    """Top-of-body guards (fail closed before any interpolation) plus the reserved month helper def.
+    Reinjected into every separated browser stage because each stage is an independent CodeBlock."""
+    lines: list[str] = []
+    if include_month_helper:
+        lines.extend(_scout_month_helper_lines())
+    for key in keys:
+        lines.extend(_witness_charset_guard_lines(key))
+    return lines
+
+
 def _locator_expr(
     interaction: Mapping[str, Any],
     notes: list[str],
@@ -450,6 +1038,11 @@ def _locator_expr(
     selector = str(interaction.get("selector") or "").strip()
     role = str(interaction.get("role") or "").strip()
     name = str(interaction.get("accessible_name") or "").strip()
+    scout_ambiguous = bool(interaction.get("ambiguous"))
+
+    templated = _maybe_input_templated_locator(interaction, diagnostics=diagnostics, trajectory_index=trajectory_index)
+    if templated is not None:
+        return templated
 
     if strict_selectors:
         if not selector:
@@ -465,7 +1058,7 @@ def _locator_expr(
             return ""
         parsed_strict = _parse_role_name(selector)
         ambiguous_role = parsed_strict is not None and not parsed_strict[1]
-        if ambiguous_role or _is_bare_ambiguous_selector(selector):
+        if ambiguous_role or scout_ambiguous or _is_bare_ambiguous_selector(selector):
             if role and name:
                 expr = _get_by_role_expr_strict(role, name)
                 if diagnostics is not None:
@@ -522,6 +1115,20 @@ def _locator_expr(
         if _is_positional_selector(selector):
             notes.append(f"low-confidence locator: positional selector {selector!r} with no role/name to anchor on")
             return f"page.locator({_py_str(selector)})"
+        if scout_ambiguous and role and name:
+            return _get_by_role_expr(role, name)
+        if scout_ambiguous:
+            notes.append(f"disambiguated a scout-ambiguous {selector!r} selector to .first from scout document order")
+            if diagnostics is not None:
+                diagnostics.locator_provenance.append(
+                    {
+                        "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                        "selector": selector,
+                        "emitted_literal": selector,
+                        "source": "first_fallback",
+                    }
+                )
+            return f"page.locator({_py_str(selector)}).first"
         if _is_bare_ambiguous_selector(selector):
             if role and name:
                 return _get_by_role_expr(role, name)
@@ -678,6 +1285,25 @@ def is_optional_dismissal_only_trajectory(trajectory: Sequence[Mapping[str, Any]
     )
 
 
+def _is_anonymous_structural_dismissal_click(interaction: Mapping[str, Any]) -> bool:
+    return _is_structural_dismissal_click(interaction) and not _is_optional_dismissal_click(interaction)
+
+
+def _last_action_interaction_index(trajectory: Sequence[Mapping[str, Any]]) -> int:
+    last = -1
+    for index, interaction in enumerate(trajectory):
+        tool_name = str(interaction.get("tool_name") or "")
+        if tool_name not in _ENTRY_TARGET_TOOLS:
+            continue
+        # An empty-key press_key is dropped as missing_key and emits nothing, so it must not claim the
+        # terminal index — otherwise a trailing empty keypress steals it from a real terminal dismissal
+        # click and defeats the reclassify-to-required guard.
+        if tool_name == "press_key" and not str(interaction.get("key") or "").strip():
+            continue
+        last = index
+    return last
+
+
 def _optional_dismissal_locator_expr(interaction: Mapping[str, Any], fallback_locator: str) -> str:
     selector = str(interaction.get("selector") or "").strip()
     if _NOT_DECLINE_BUTTON_SELECTOR_PATTERN.match(selector) or _is_cookie_accept_xpath_selector(selector):
@@ -746,7 +1372,7 @@ def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict
 
     submit_index = -1
     for index in range(last_credential_index + 1, len(trajectory)):
-        if str(trajectory[index].get("tool_name") or "") == "click":
+        if _is_submit_interaction(trajectory[index]):
             submit_index = index
             break
     if submit_index < 0:
@@ -782,11 +1408,27 @@ def _trajectory_prefix_at_anchor(
     return prefix, len(trajectory) - len(prefix)
 
 
+def synthesize_goto_code_block(url: str) -> SynthesizedCodeBlock | None:
+    """A goto-only block for a navigation with no captured interactions after it."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    line = (
+        f"{_INDENT}await page.goto("
+        f"{_py_str(_scrub_url_for_code_literal(url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+    )
+    return SynthesizedCodeBlock(
+        code=line + "\n",
+        steps=[{"description": f"Open {url}", "action_type": "goto_url", "line_start": 1, "line_end": 1}],
+    )
+
+
 def synthesize_code_block(
     trajectory: Sequence[Mapping[str, Any]],
     *,
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
@@ -801,6 +1443,25 @@ def synthesize_code_block(
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
     used_download_vars: set[str] = set()
+    grounded_binding_count = sum(1 for interaction in trajectory if "submit_rung_binding" in interaction)
+    if grounded_binding_count > 1 or (grounded_binding_count and parameter_binding_snapshot is not None):
+        return None
+    validated_snapshot_bindings = (
+        _validated_authoring_parameter_binding_snapshot(parameter_binding_snapshot, trajectory)
+        if parameter_binding_snapshot is not None
+        else _ValidatedSnapshotBindings({}, {})
+    )
+    if parameter_binding_snapshot is not None and validated_snapshot_bindings is None:
+        return None
+    if validated_snapshot_bindings is None:
+        validated_snapshot_bindings = _ValidatedSnapshotBindings({}, {})
+    snapshot_bindings_by_index = validated_snapshot_bindings.fill_by_index
+    snapshot_select_option_by_index = validated_snapshot_bindings.select_option_by_index
+    snapshot_recovery_bindings = (
+        [binding for binding in parameter_binding_snapshot.field_bindings if binding.field_trajectory_index is None]
+        if parameter_binding_snapshot is not None
+        else []
+    )
     compile_download_target = (
         reached_download_target is not None
         and not reached_download_target.already_registered
@@ -818,6 +1479,37 @@ def synthesize_code_block(
                 anchor=reached_download_target.trajectory_anchor,
                 dropped_trailing_count=dropped_trailing,
             )
+    if grounded_binding_count != sum(1 for interaction in trajectory if "submit_rung_binding" in interaction):
+        return None
+    diagnostics.retained_trajectory_indices = list(range(len(trajectory)))
+
+    input_templated_keys, input_templated_needs_month = _prescan_input_templating(trajectory)
+    minted_input_witness_keys: set[str] = set()
+    for interaction in trajectory:
+        plan = _input_templating_plan(interaction)
+        if plan is None:
+            continue
+        for hole in plan.holes:
+            key = str(hole.get("input_key") or "")
+            if not key or key in minted_input_witness_keys:
+                continue
+            minted_input_witness_keys.add(key)
+            parameters.append(
+                {
+                    "key": key,
+                    "default_value": str(hole.get("parameter_value") or ""),
+                    "source": LOCATOR_WITNESS_PARAM_SOURCE,
+                }
+            )
+    for key in input_templated_keys:
+        used_param_keys.add(key)
+    if input_templated_keys:
+        lines.extend(witness_prelude_lines(input_templated_keys, include_month_helper=input_templated_needs_month))
+        LOG.info(
+            "copilot_spine_input_templated_prelude",
+            witness_keys=input_templated_keys,
+            month_helper=input_templated_needs_month,
+        )
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
         steps.append(
@@ -850,6 +1542,7 @@ def synthesize_code_block(
     entry_replay_condition_active = False
     entry_replay_start_index = 0
     entry_post_auth_resume_index = 0
+    login_only_presence_guard_active = False
     for index, interaction in enumerate(trajectory):
         candidate = str(interaction.get("source_url") or "").strip()
         if candidate:
@@ -918,6 +1611,22 @@ def synthesize_code_block(
                     entry_recovery_clicks.append((recovery_index, recovery_locator))
             if entry_recovery_clicks:
                 notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
+        login_only_presence_guard_active = bool(
+            entry_target
+            and not entry_replay_condition_active
+            and not entry_post_auth_resume_index
+            and not entry_replay_start_index
+            and not entry_recovery_clicks
+            and any(
+                str(interaction.get("tool_name") or "") == CREDENTIAL_FILL_TOOL_NAME
+                and str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS
+                for interaction in entry_trajectory
+            )
+        )
+        if login_only_presence_guard_active:
+            notes.append(
+                "login rung fills only when the credential form is present, so an authenticated replay skips it"
+            )
         line_start = len(lines) + 1
         if entry_target:
             if entry_replay_condition_active:
@@ -981,7 +1690,7 @@ def synthesize_code_block(
                         lane="entry_recovery",
                     )
                 lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
-            else:
+            elif not login_only_presence_guard_active:
                 lines.append(f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
         else:
             lines.append(
@@ -996,9 +1705,12 @@ def synthesize_code_block(
         elif entry_post_auth_resume_index:
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
+        if login_only_presence_guard_active:
+            lines.append(f"{_INDENT}if await {_ENTRY_TARGET_VAR}.count() == 1:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
+    terminal_action_index = _last_action_interaction_index(trajectory)
     deferred_readonly_assertions: list[tuple[int, str, str, str]] = []
 
     def action_indent_for(trajectory_index: int) -> str:
@@ -1008,7 +1720,30 @@ def synthesize_code_block(
             return _INDENT * 2
         if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
             return _INDENT * 2
+        if login_only_presence_guard_active:
+            return _INDENT * 2
         return _INDENT
+
+    snapshot_recovery_emitted = False
+
+    def emit_snapshot_recovery(trajectory_index: int, action_indent: str) -> None:
+        nonlocal snapshot_recovery_emitted
+        if (
+            snapshot_recovery_emitted
+            or parameter_binding_snapshot is None
+            or _captured_trajectory_index(trajectory[trajectory_index], trajectory_index)
+            != parameter_binding_snapshot.terminal.trajectory_index
+        ):
+            return
+        for binding in snapshot_recovery_bindings:
+            if binding.declared_key not in used_param_keys:
+                used_param_keys.add(binding.declared_key)
+                parameters.append({"key": binding.declared_key})
+            lines.append(
+                f"{action_indent}await page.locator({_py_str(binding.field_selector)}).fill(str({binding.declared_key}))"
+            )
+        diagnostics.grounded_submit_binding_fingerprints.append(parameter_binding_snapshot.fingerprint)
+        snapshot_recovery_emitted = True
 
     for trajectory_index, interaction in enumerate(trajectory):
         if emitted >= _MAX_STEPS:
@@ -1033,6 +1768,7 @@ def synthesize_code_block(
         tool_name = str(interaction.get("tool_name") or "")
 
         if tool_name == "press_key":
+            emit_snapshot_recovery(trajectory_index, action_indent)
             key = str(interaction.get("key") or "").strip()
             if not key:
                 diagnostics.dropped_interactions.append(
@@ -1072,6 +1808,22 @@ def synthesize_code_block(
             emitted += 1
             continue
 
+        if tool_name == "wait":
+            try:
+                duration_ms = int(interaction.get("duration_ms") or 0)
+            except (TypeError, ValueError):
+                duration_ms = 0
+            if duration_ms <= 0:
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_duration"}
+                )
+                continue
+            line_start = len(lines) + 1
+            lines.append(f"{action_indent}await page.wait_for_timeout({duration_ms})")
+            append_step(f"Wait {max(duration_ms // 1000, 1)}s", "wait", line_start)
+            emitted += 1
+            continue
+
         locator = _locator_expr(
             interaction,
             notes,
@@ -1085,7 +1837,30 @@ def synthesize_code_block(
 
         line_start = len(lines) + 1
         if tool_name == "click":
-            if _is_optional_or_structural_dismissal_click(interaction):
+            emit_snapshot_recovery(trajectory_index, action_indent)
+            captured_index = interaction.get("trajectory_index")
+            submit_trajectory_index = (
+                captured_index if isinstance(captured_index, int) and captured_index >= 0 else trajectory_index
+            )
+            if "submit_rung_binding" in interaction:
+                grounded_binding = _validated_submit_rung_binding(interaction, submit_trajectory_index)
+                if grounded_binding is None:
+                    return None
+                binding_fingerprint, field_bindings = grounded_binding
+                for parameter_key, field_selector in field_bindings:
+                    if parameter_key not in used_param_keys:
+                        used_param_keys.add(parameter_key)
+                        parameters.append({"key": parameter_key})
+                    lines.append(
+                        f"{action_indent}await page.locator({_py_str(field_selector)}).fill(str({parameter_key}))"
+                    )
+                diagnostics.grounded_submit_binding_fingerprints.append(binding_fingerprint)
+            reclassify_terminal_required = (
+                trajectory_index == terminal_action_index
+                and _is_anonymous_structural_dismissal_click(interaction)
+                and any(not str(record.get("lane") or "") for record in diagnostics.emitted_interactions)
+            )
+            if _is_optional_or_structural_dismissal_click(interaction) and not reclassify_terminal_required:
                 optional_locator = _optional_dismissal_locator_expr(interaction, locator)
                 lines.append(f"{action_indent}{_OPTIONAL_DISMISSAL_VAR} = {optional_locator}")
                 lines.append(f"{action_indent}if await {_OPTIONAL_DISMISSAL_VAR}.count() > 0:")
@@ -1110,16 +1885,22 @@ def synthesize_code_block(
                 record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
+            snapshot_binding = snapshot_bindings_by_index.get(trajectory_index)
             typed_identity = _typed_value_identity(interaction)
-            param_key = typed_param_keys.get(typed_identity) if typed_identity is not None else None
+            param_key = snapshot_binding[0] if snapshot_binding is not None else None
             if param_key is None:
-                param_key = _param_key(interaction, used_param_keys)
+                param_key = typed_param_keys.get(typed_identity) if typed_identity is not None else None
+            if param_key is None or param_key not in used_param_keys:
+                if param_key is None:
+                    param_key = _param_key(interaction, used_param_keys)
+                else:
+                    used_param_keys.add(param_key)
                 parameter = {"key": param_key}
                 typed_value = str(interaction.get("typed_value") or "").strip()
-                if typed_value:
+                if typed_value and snapshot_binding is None:
                     parameter["default_value"] = typed_value
                 typed_length = interaction.get("typed_length")
-                if strict_selectors and typed_length is not None:
+                if strict_selectors and typed_length is not None and snapshot_binding is None:
                     try:
                         typed_length_int = int(typed_length)
                     except (TypeError, ValueError):
@@ -1182,6 +1963,7 @@ def synthesize_code_block(
                 lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
             record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
         elif tool_name == "select_option":
+            emit_snapshot_recovery(trajectory_index, action_indent)
             value = str(interaction.get("value") or "").strip()
             if not value:
                 notes.append("dropped a select_option interaction with no recorded value")
@@ -1189,10 +1971,22 @@ def synthesize_code_block(
                     {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_value"}
                 )
                 continue
-            lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
+            bound_key = snapshot_select_option_by_index.get(trajectory_index)
+            if bound_key is not None:
+                if bound_key not in used_param_keys:
+                    used_param_keys.add(bound_key)
+                    parameters.append({"key": bound_key})
+                lines.append(f"{action_indent}await {locator}.select_option(str({bound_key}))")
+            else:
+                lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
+        elif tool_name == "hover" and not strict_selectors:
+            # Non-strict only: recording trajectories carry deliberate hovers; the
+            # strict-imposition envelope keeps treating hover as unsupported.
+            lines.append(f"{action_indent}await {locator}.hover()")
+            append_step(f"Hover over {_step_target(interaction)}", "hover", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
             diagnostics.dropped_interactions.append(
@@ -1206,6 +2000,9 @@ def synthesize_code_block(
         and (emitted - len(deferred_readonly_assertions)) == 0
         and (not entry_post_auth_resume_index)
     ):
+        lines.append(f"{_INDENT * 2}pass")
+
+    if login_only_presence_guard_active and (emitted - len(deferred_readonly_assertions)) == 0:
         lines.append(f"{_INDENT * 2}pass")
 
     if deferred_readonly_assertions:
@@ -1290,6 +2087,9 @@ def synthesize_code_block(
 
     if not lines:
         return None
+    expected_binding_fingerprint_count = grounded_binding_count + (1 if parameter_binding_snapshot is not None else 0)
+    if len(diagnostics.grounded_submit_binding_fingerprints) != expected_binding_fingerprint_count:
+        return None
     emitted_code = "\n".join(lines)
     for scout_var in _INTERNAL_SCOUT_VARS:
         if not _code_uses_name(emitted_code, scout_var):
@@ -1309,6 +2109,18 @@ def synthesize_code_block(
 
 
 SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = "scouted_spine_under_build"
+SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE = "scouted_spine_dropped_unforgiven"
+SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE = "scouted_spine_unrecorded_index"
+SCOUTED_SPINE_TRUNCATED_REASON_CODE = "scouted_spine_truncated"
+
+
+_LEADING_TAG_ID_SELECTOR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*#")
+
+
+def normalized_scout_selector(selector: str) -> str:
+    # Capture and persist-seam comparison share one normal form: a leading `tag#id` qualifier reduces
+    # to `#id` (ids are document-unique), so both sides name the same control.
+    return _LEADING_TAG_ID_SELECTOR_RE.sub("#", selector)
 
 
 def normalized_locator_expr(text: str) -> str:
@@ -1381,6 +2193,267 @@ def uncovered_required_emitted_interactions(
         else:
             next_call_index = match_index + 1
     return uncovered
+
+
+_IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
+_FILTERING_PSEUDO_CLASSES = (
+    ":visible",
+    ":enabled",
+    ":disabled",
+    ":checked",
+    ":not(",
+    ":has(",
+    ":has-text(",
+    ":text(",
+    ":is(",
+)
+_EXACT_TEXT_XPATH_TAG_RE = re.compile(
+    r"""^(?:xpath=)?//(?P<tag>[a-zA-Z][a-zA-Z0-9-]*)\s*\[\s*normalize-space\(\s*(?:\.|text\(\))?\s*\)\s*=\s*(?P<quote>['"])[^'"]+(?P=quote)\s*\]\s*$"""
+)
+
+
+def _qualifier_narrows_to_identity(qualifier: str) -> bool:
+    if not qualifier or qualifier[0] not in _IDENTITY_QUALIFIER_BOUNDARY:
+        return False
+    if any(pseudo in qualifier for pseudo in _FILTERING_PSEUDO_CLASSES):
+        return False
+    bracket_depth = 0
+    quote: str | None = None
+    for char in qualifier:
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif bracket_depth == 0 and (char.isspace() or char in ">+~"):
+            return False
+    return True
+
+
+def _selector_refines(bare: str, candidate: str) -> bool:
+    bare = bare.strip()
+    candidate = candidate.strip()
+    if not bare or not candidate or bare == candidate:
+        return False
+
+    bare_role = _parse_role_name(bare)
+    candidate_role = _parse_role_name(candidate)
+    if bare_role is not None or candidate_role is not None:
+        if bare_role is None or candidate_role is None:
+            return False
+        bare_role_name, bare_name, bare_suffix = bare_role
+        candidate_role_name, candidate_name, candidate_suffix = candidate_role
+        return (
+            bare_role_name == candidate_role_name
+            and not bare_name
+            and not bare_suffix
+            and bool(candidate_name)
+            and not candidate_suffix
+        )
+    if not _BARE_TAG_RE.match(bare):
+        return False
+    if not candidate.startswith(bare) or _is_positional_selector(candidate):
+        return False
+    return _qualifier_narrows_to_identity(candidate[len(bare) :])
+
+
+def _stable_same_kind_bare_click_refiner(bare: str, candidate: str) -> bool:
+    bare = bare.strip()
+    candidate = candidate.strip()
+    if not bare or not candidate or bare == candidate or _is_positional_selector(candidate):
+        return False
+    if _selector_refines(bare, candidate):
+        return True
+    if bare != "button":
+        return False
+
+    candidate_role = _parse_role_name(candidate)
+    if candidate_role is not None:
+        role_name, accessible_name, suffix = candidate_role
+        return role_name == "button" and bool(accessible_name) and not suffix
+
+    xpath_match = _EXACT_TEXT_XPATH_TAG_RE.match(candidate)
+    return xpath_match is not None and xpath_match.group("tag").casefold() == "button"
+
+
+def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: SynthesisDiagnostics) -> bool:
+    return (
+        dropped.get("reason_code") == "ambiguous_bare_selector"
+        and dropped.get("tool_name") == "click"
+        and dropped.get("trajectory_index") == 0
+        and str(dropped.get("selector") or "").strip() in {"button", "role=button"}
+        and bool(diagnostics.locator_provenance)
+    )
+
+
+def _bare_drop_superseded_on_screen(
+    dropped: Mapping[str, Any],
+    scout_trajectory: Sequence[Mapping[str, Any]],
+    *,
+    claimed_refiner_indices: set[int],
+) -> tuple[bool, dict[str, Any] | None]:
+    if dropped.get("reason_code") != "ambiguous_bare_selector" or dropped.get("tool_name") != "click":
+        return False, None
+    dropped_selector = str(dropped.get("selector") or "").strip()
+    if not dropped_selector:
+        return False, None
+
+    dropped_index = dropped.get("trajectory_index")
+    if not isinstance(dropped_index, int) or dropped_index < 0 or dropped_index >= len(scout_trajectory):
+        return False, None
+    source_url = str(scout_trajectory[dropped_index].get("source_url") or "").strip()
+    if not source_url:
+        return False, None
+
+    for refiner_index in range(dropped_index + 1, len(scout_trajectory)):
+        if refiner_index in claimed_refiner_indices:
+            continue
+        later = scout_trajectory[refiner_index]
+        if later.get("tool_name") != "click":
+            continue
+        if str(later.get("source_url") or "").strip() != source_url:
+            continue
+        later_selector = str(later.get("selector") or "").strip()
+        if not _stable_same_kind_bare_click_refiner(dropped_selector, later_selector):
+            continue
+        claimed_refiner_indices.add(refiner_index)
+        return True, {
+            "dropped_index": dropped_index,
+            "dropped_selector": dropped_selector,
+            "refiner_index": refiner_index,
+            "refiner_selector": later_selector,
+            "source_url": source_url,
+        }
+    return False, None
+
+
+UNCOVERED_RUNG_FINDING = "uncovered_rung"
+UNFORGIVEN_DROP_FINDING = "unforgiven_drop"
+UNRECORDED_INDEX_FINDING = "unrecorded_index"
+TRUNCATED_FINDING = "truncated"
+
+
+@dataclass(frozen=True, slots=True)
+class ObligationFinding:
+    kind: str
+    record: Mapping[str, Any] | None = None
+    trajectory_index: int | None = None
+
+
+def forgiven_dropped_indices(
+    diagnostics: SynthesisDiagnostics, scout_trajectory: Sequence[Mapping[str, Any]]
+) -> set[int]:
+    """Trajectory indices whose drop the closed forgiveness allowlist absolves, re-derived from the
+    synthesized diagnostics and trajectory so no forgiveness record needs to be transported."""
+    forgiven: set[int] = set()
+    claimed_refiner_indices: set[int] = set()
+    for dropped in diagnostics.dropped_interactions:
+        index = dropped.get("trajectory_index")
+        if _is_ignorable_entry_opener_drop(dropped, diagnostics):
+            if isinstance(index, int):
+                forgiven.add(index)
+            continue
+        superseded, _ = _bare_drop_superseded_on_screen(
+            dropped, scout_trajectory, claimed_refiner_indices=claimed_refiner_indices
+        )
+        if superseded and isinstance(index, int):
+            forgiven.add(index)
+    return forgiven
+
+
+def _recorded_partition_indices(diagnostics: SynthesisDiagnostics) -> set[int]:
+    recorded: set[int] = set()
+    for group in (
+        diagnostics.emitted_interactions,
+        diagnostics.dropped_interactions,
+        diagnostics.forgiven_interactions,
+    ):
+        for record in group:
+            index = record.get("trajectory_index")
+            if isinstance(index, int):
+                recorded.add(index)
+    return recorded
+
+
+def spine_partition_findings(
+    diagnostics: SynthesisDiagnostics,
+    draft_calls: Sequence[tuple[str, str]],
+    scout_trajectory: Sequence[Mapping[str, Any]],
+) -> list[ObligationFinding]:
+    """Partition-exhaustiveness obligation over the full retained-index manifest: an uncovered required
+    rung, a dropped interaction the allowlist does not forgive, a retained index in no record lane, or a
+    truncation are each a typed under-build finding. Forgiveness names the reason; it never absolves."""
+    findings: list[ObligationFinding] = []
+    for record in uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls):
+        index = record.get("trajectory_index")
+        findings.append(
+            ObligationFinding(
+                kind=UNCOVERED_RUNG_FINDING,
+                record=record,
+                trajectory_index=index if isinstance(index, int) else None,
+            )
+        )
+    forgiven = forgiven_dropped_indices(diagnostics, scout_trajectory)
+    for dropped in diagnostics.dropped_interactions:
+        index = dropped.get("trajectory_index")
+        if isinstance(index, int) and index in forgiven:
+            continue
+        findings.append(
+            ObligationFinding(
+                kind=UNFORGIVEN_DROP_FINDING,
+                record=dropped,
+                trajectory_index=index if isinstance(index, int) else None,
+            )
+        )
+    recorded = _recorded_partition_indices(diagnostics)
+    for index in diagnostics.retained_trajectory_indices:
+        if index not in recorded:
+            findings.append(ObligationFinding(kind=UNRECORDED_INDEX_FINDING, trajectory_index=index))
+    if diagnostics.truncated:
+        findings.append(ObligationFinding(kind=TRUNCATED_FINDING))
+    return findings
+
+
+def uncovered_rung_records(findings: Sequence[ObligationFinding]) -> list[Mapping[str, Any]]:
+    return [finding.record for finding in findings if finding.kind == UNCOVERED_RUNG_FINDING and finding.record]
+
+
+def obligation_finding_reason_code(finding: ObligationFinding) -> str:
+    if finding.kind == UNCOVERED_RUNG_FINDING:
+        return SCOUTED_SPINE_UNDER_BUILD_REASON_CODE
+    if finding.kind == UNFORGIVEN_DROP_FINDING:
+        return SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+    if finding.kind == UNRECORDED_INDEX_FINDING:
+        return SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE
+    return SCOUTED_SPINE_TRUNCATED_REASON_CODE
+
+
+def obligation_finding_selector(finding: ObligationFinding) -> str | None:
+    if finding.record is None:
+        return None
+    return str(finding.record.get("selector") or "") or None
+
+
+def obligation_finding_text(finding: ObligationFinding) -> str:
+    if finding.kind == UNCOVERED_RUNG_FINDING:
+        return missing_rung_text([finding.record]) if finding.record else "an uncovered scouted rung"
+    if finding.kind == UNFORGIVEN_DROP_FINDING:
+        record = finding.record or {}
+        tool_name = str(record.get("tool_name") or "unknown")
+        reason = str(record.get("reason_code") or "unknown")
+        index = record.get("trajectory_index", "?")
+        return f"dropped scout interaction {index} from `{tool_name}` ({reason})"
+    if finding.kind == UNRECORDED_INDEX_FINDING:
+        return f"scout interaction {finding.trajectory_index} was retained but landed in no persisted or forgiven lane"
+    return "the scout trajectory was truncated before every captured interaction was compiled"
+
+
+def render_obligation_findings(findings: Sequence[ObligationFinding]) -> str:
+    return "; ".join(obligation_finding_text(finding) for finding in findings)
 
 
 def missing_rung_text(uncovered: Sequence[Mapping[str, Any]]) -> str:
@@ -1781,6 +2854,7 @@ def synthesize_code_block_with_extraction(
     *,
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> SynthesizedCodeBlock | None:
     if not _trajectory_contains_reveal(trajectory, extraction_plan):
         return None
@@ -1788,6 +2862,7 @@ def synthesize_code_block_with_extraction(
         trajectory,
         strict_selectors=strict_selectors,
         reached_download_target=reached_download_target,
+        parameter_binding_snapshot=parameter_binding_snapshot,
     )
     suffix = synthesize_extraction_suffix(extraction_plan)
     if interaction is None or suffix is None:

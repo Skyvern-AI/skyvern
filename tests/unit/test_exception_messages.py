@@ -91,6 +91,54 @@ def test_unknown_error_redacts_raw_cdp_endpoint_url() -> None:
     assert "[remote browser endpoint]" in message
 
 
+def test_unknown_error_redacts_http_cdp_discovery_url() -> None:
+    # The /json/version discovery endpoint is reached over http(s) and can carry the vendor host
+    # and a session-bearing token just like the ws socket, so it must be redacted too.
+    inner_exception = Exception(
+        "connect_over_cdp: fetching https://remote.example.internal/json/version?token=SEKRET failed"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "https://" not in message
+    assert "SEKRET" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
+def test_unknown_error_preserves_generic_http_url() -> None:
+    # A non-CDP setup failure (proxy/public-IP probe) can echo an ordinary http(s) URL the user
+    # needs to diagnose their own configuration; with no CDP signal present it must not be redacted.
+    inner_exception = Exception("Proxy health check failed: GET http://proxy.example.com:8080/status returned 503")
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "http://proxy.example.com:8080/status" in message
+    assert "[remote browser endpoint]" not in message
+    assert "returned 503" in message
+
+
+def test_unknown_error_redacts_generic_ws_url() -> None:
+    # Even without a CDP signal, a ws/wss URL is unambiguously a devtools socket that may carry the
+    # vendor host or embedded credentials, so ws/wss endpoints are always redacted.
+    inner_exception = Exception("Browser setup failed talking to wss://user:secret@vendor.internal/session/tok-42")
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "wss://" not in message
+    assert "tok-42" not in message
+    assert "vendor.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
+def test_unknown_error_preserves_useful_non_sensitive_prose() -> None:
+    # A generic setup failure carrying an ordinary http(s) URL should reach the user intact so the
+    # message stays actionable.
+    inner_exception = Exception("Failed to reach public IP service at https://api.ipify.org")
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "https://api.ipify.org" in message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "Failed to reach public IP service" in message
+    assert "[remote browser endpoint]" not in message
+
+
 def test_captcha_not_solved_in_time_is_captcha_solve_error() -> None:
     # The action handler catches CaptchaSolveError before its generic arm; this
     # subclass relationship is what routes captcha-solve failures to the handled

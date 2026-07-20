@@ -57,6 +57,7 @@ from skyvern.exceptions import (
     MissingExtractActionsResponse,
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
+    RepeatedActionFailure,
     ScrapingFailed,
     SkyvernException,
     StepTerminationError,
@@ -78,6 +79,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
     list_files_in_directory,
+    recover_download_extension,
     rename_file,
     resolve_run_download_id,
     wait_for_download_finished,
@@ -95,6 +97,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
@@ -166,7 +169,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_cua_actions,
     parse_ui_tars_actions,
 )
-from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
@@ -178,6 +181,103 @@ RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
+REPEATED_ACTION_FAILURE_LIMIT = 3
+REPEATED_ACTION_CIRCUIT_BREAKER_FLAG = "REPEATED_ACTION_CIRCUIT_BREAKER"
+_ACTION_REPEAT_PAYLOAD_FIELDS = (
+    "button",
+    "download",
+    "duration",
+    "file_name",
+    "file_url",
+    "hold",
+    "hold_seconds",
+    "is_checked",
+    "is_magic_link",
+    "keys",
+    "option",
+    "path",
+    "repeat",
+    "start_x",
+    "start_y",
+    "text",
+    "url",
+    "verification_code",
+    "x",
+    "y",
+)
+_PERSISTED_ACTION_REPEAT_PAYLOAD_FIELDS = tuple(
+    field for field in _ACTION_REPEAT_PAYLOAD_FIELDS if field in Action.model_fields
+)
+
+
+def _repeated_action_identity(action: Action) -> tuple[ActionType, str, str] | None:
+    if not action.action_type.is_web_action() or not action.element_id:
+        return None
+    payload = {field: getattr(action, field) for field in _PERSISTED_ACTION_REPEAT_PAYLOAD_FIELDS}
+    payload_digest = hashlib.sha256(
+        json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return action.action_type, action.element_id, payload_digest
+
+
+def _get_repeated_action_failure(
+    attempts: list[tuple[Action, list[ActionResult]]],
+) -> RepeatedActionFailure | None:
+    recent_attempts = attempts[-REPEATED_ACTION_FAILURE_LIMIT:]
+    if len(recent_attempts) < REPEATED_ACTION_FAILURE_LIMIT:
+        return None
+    identities = [_repeated_action_identity(action) for action, _ in recent_attempts]
+    if identities[0] is None or any(identity != identities[0] for identity in identities[1:]):
+        return None
+    if any(not results or any(result.success for result in results) for _, results in recent_attempts):
+        return None
+    _, element_id, _ = identities[0]
+    final_result = recent_attempts[-1][1][-1]
+    failure_description = final_result.exception_type or "UnknownFailure"
+    return RepeatedActionFailure(
+        element_id=element_id,
+        attempt_count=REPEATED_ACTION_FAILURE_LIMIT,
+        failure_description=failure_description,
+    )
+
+
+async def _is_repeated_action_breaker_enabled(task: Task) -> bool:
+    try:
+        distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+        return bool(
+            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                REPEATED_ACTION_CIRCUIT_BREAKER_FLAG,
+                distinct_id,
+                properties={"organization_id": task.organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate repeated-action circuit breaker flag; defaulting to disabled",
+            task_id=task.task_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _get_previous_action_attempts(task: Task, current_step_id: str) -> list[tuple[Action, list[ActionResult]]]:
+    try:
+        steps = await app.DATABASE.tasks.get_task_steps(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+        )
+    except Exception:
+        LOG.warning("Failed to load action history for repeated-action detection", task_id=task.task_id, exc_info=True)
+        return []
+    if not isinstance(steps, list):
+        return []
+    attempts: list[tuple[Action, list[ActionResult]]] = []
+    for previous_step in sorted(steps, key=lambda item: (item.order, item.retry_index)):
+        if previous_step.step_id == current_step_id:
+            continue
+        if previous_step.output and previous_step.output.actions_and_results:
+            attempts.extend(previous_step.output.actions_and_results)
+    return attempts
 
 
 async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
@@ -537,6 +637,19 @@ class ForgeAgent:
                 )
                 continue
 
+            if not file_extension:
+                file_extension = recover_download_extension(
+                    os.path.join(workflow_download_directory, local_file_name), download_suffix
+                )
+                if file_extension:
+                    LOG.info(
+                        "Recovered missing download file extension from file content",
+                        file=local_file_name,
+                        extension=file_extension,
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
+
             if download_suffix:
                 # local_file_name is a bare basename for session (s3/gs) files but an absolute path for
                 # run-dir files; compare on basenames so a file already named by download_suffix is not
@@ -548,6 +661,21 @@ class ForgeAgent:
                     if Path(f).name != local_basename
                 }
                 desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                # finalize_* keys avoid the forge_log processor, which overwrites bare task_id/
+                # workflow_run_id with the ambient context's values; under a stale/shared context those
+                # would otherwise mask the task actually being finalized (the divergence to diagnose).
+                LOG.info(
+                    "download_suffix_finalize_rename",
+                    execution_path="agent_finalize",
+                    finalize_task_id=task.task_id,
+                    finalize_workflow_run_id=task.workflow_run_id,
+                    context_task_id=context.task_id if context else None,
+                    pre_rename_filename_fp=diagnostic_fingerprint(local_basename),
+                    passed_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+                    context_download_suffix_fp=diagnostic_fingerprint(context.download_suffix if context else None),
+                    desired_name_fp=diagnostic_fingerprint(desired_name),
+                    will_rename=local_basename != desired_name,
+                )
                 if local_basename != desired_name:
                     rename_file(os.path.join(workflow_download_directory, local_file_name), desired_name)
                 continue
@@ -1625,124 +1753,17 @@ class ForgeAgent:
             )
             if early_return is not None:
                 return early_return
-            assert detailed_agent_step_output.actions_and_results is not None
-
-            LOG.info(
-                "Actions executed successfully, marking step as completed",
-                sampling=True,
-                step_order=step.order,
-                step_retry=step.retry_index,
-                action_results=detailed_agent_step_output.action_results,
-            )
-
-            # Clean up TOTP cache after multi-field TOTP sequence completion
-            if self._is_multi_field_totp_sequence(actions):
-                context = skyvern_context.ensure_context()
-                cache_key = f"{task.task_id}_totp_cache"
-                removed_totp_cache = False
-                for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
-                    if key in context.totp_codes:
-                        context.totp_codes.pop(key)
-                        removed_totp_cache = True
-
-                if removed_totp_cache:
-                    LOG.debug(
-                        "Cleaned up TOTP cache after multi-field sequence completion",
-                        task_id=task.task_id,
-                    )
-
-                secret_key = f"{task.task_id}_secret"
-                if secret_key in context.totp_codes:
-                    context.totp_codes.pop(secret_key)
-
-            # Update Navigator caller with actual action results so the next
-            # step's tool responses include real execution data.
-            if (
-                engine == RunEngine.yutori_navigator
-                and detailed_agent_step_output
-                and detailed_agent_step_output.actions_and_results
-            ):
-                nav_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if isinstance(nav_caller, YutoriNavigatorLLMCaller):
-                    for action, results in detailed_agent_step_output.actions_and_results:
-                        if not results or not action.tool_call_id:
-                            continue
-                        r = results[-1]
-                        result_str: str | None
-                        if isinstance(action, WaitAction):
-                            # Skyvern's handle_wait_action always returns ActionFailure by
-                            # design (to discourage v1/v2 engines from leaning on wait), but
-                            # Navigator emits wait as a deliberate cooperative pause —
-                            # surface a positive tool result so the model sees WaitAction success.
-                            result_str = f"Waited {action.seconds}s"
-                        elif r.success:
-                            # Use actual data when available (JS output, etc.)
-                            result_str = str(r.data) if r.data is not None else None
-                        else:
-                            # Provide error details so the model can recover
-                            result_str = f"ERROR: {r.exception_message or 'Action failed'}"
-                        nav_caller.update_pending_result(action.tool_call_id, result_str)
-
-            # Check if Skyvern already returned a complete action, if so, don't run user goal check
-            has_decisive_action = False
-            if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
-                for action, results in detailed_agent_step_output.actions_and_results:
-                    if isinstance(action, DecisiveAction):
-                        has_decisive_action = True
-                        break
-
-            task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
-            enable_parallel_verification = False
-            if (
-                not has_decisive_action
-                and not task_completes_on_download
-                and not isinstance(task_block, ActionBlock)
-                and complete_verification
-                and (task.navigation_goal or task.complete_criterion)
-            ):
-                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "DISABLE_USER_GOAL_CHECK",
-                    task.task_id,
-                    properties={"task_url": task.url, "organization_id": task.organization_id},
-                )
-
-                # Parallel verification is always enabled (user goal check deferred to handle_completed_step)
-                enable_parallel_verification = not disable_user_goal_check
-
-            # if the last action is complete and is successful, check if there's a data extraction goal
-            # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
-            # skip when the step already ran a successful planner-emitted EXTRACT action — re-extracting would be a duplicate
-            step_has_successful_extract = any(
-                executed_action.action_type == ActionType.EXTRACT and any(result.success for result in results)
-                for executed_action, results in detailed_agent_step_output.actions_and_results
-            )
-            if (
-                task.navigation_goal
-                and task.data_extraction_goal
-                and not step_has_successful_extract
-                and self.step_has_completed_goal(detailed_agent_step_output)
-            ):
-                working_page = await browser_state.must_get_working_page()
-                # refresh task in case the extracted information is updated previously
-                refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
-                assert refreshed_task is not None
-                task = refreshed_task
-                extract_action = await self.create_extract_action(task, step, scraped_page)
-                extract_results = await ActionHandler.handle_action(
-                    scraped_page, task, step, working_page, extract_action
-                )
-                await app.AGENT_FUNCTION.post_action_execution(extract_action)
-                detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
-
-            # If no action errors return the agent state and output
-            completed_step = await self.update_step(
+            return await self._finalize_step_execution(
+                task=task,
                 step=step,
-                status=StepStatus.completed,
-                output=detailed_agent_step_output.to_agent_step_output(),
+                browser_state=browser_state,
+                engine=engine,
+                scraped_page=scraped_page,
+                complete_verification=complete_verification,
+                task_block=task_block,
+                actions=actions,
+                detailed_agent_step_output=detailed_agent_step_output,
             )
-            if enable_parallel_verification:
-                completed_step.speculative_original_status = StepStatus.completed
-            return completed_step, detailed_agent_step_output.get_clean_detailed_output()
         except CancelledError:
             # A cancellation here is a deliberate stop (elapsed-time timeout / user cancel). Persist
             # the step as failed (shielded, so the write survives the cancel) for observability, then
@@ -1854,6 +1875,7 @@ class ForgeAgent:
             element_id_to_action_index[action.element_id] = action_idx
 
         element_id_to_last_action: dict[str, int] = dict()
+        previous_step_attempts: list[tuple[Action, list[ActionResult]]] | None = None
         try:
             wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
             base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
@@ -1968,6 +1990,42 @@ class ForgeAgent:
                 action,
                 results,
             )
+            if (
+                results
+                and not any(result.success for result in results)
+                and await _is_repeated_action_breaker_enabled(task)
+            ):
+                current_step_attempts = detailed_agent_step_output.actions_and_results[: action_idx + 1]
+                repeated_failure = _get_repeated_action_failure(current_step_attempts)
+                current_identity = _repeated_action_identity(action)
+                current_attempts_can_follow_history = current_identity is not None and all(
+                    _repeated_action_identity(attempt_action) == current_identity
+                    and attempt_results
+                    and not any(result.success for result in attempt_results)
+                    for attempt_action, attempt_results in current_step_attempts
+                )
+                if (
+                    repeated_failure is None
+                    and len(current_step_attempts) < REPEATED_ACTION_FAILURE_LIMIT
+                    and current_attempts_can_follow_history
+                ):
+                    if previous_step_attempts is None:
+                        previous_step_attempts = await _get_previous_action_attempts(task, step.step_id)
+                    repeated_failure = _get_repeated_action_failure(previous_step_attempts + current_step_attempts)
+                if repeated_failure is not None:
+                    final_result = results[-1]
+                    repeated_result = ActionFailure(
+                        repeated_failure,
+                        stop_execution_on_failure=final_result.stop_execution_on_failure,
+                        download_triggered=final_result.download_triggered,
+                        interacted_with_sibling=bool(final_result.interacted_with_sibling),
+                        interacted_with_parent=bool(final_result.interacted_with_parent),
+                    )
+                    repeated_result.skip_remaining_actions = final_result.skip_remaining_actions
+                    repeated_result.needs_followup = final_result.needs_followup
+                    repeated_result.followup_message = final_result.followup_message
+                    results = [repeated_result]
+                    detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
 
             # Determine wait time between actions
             wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
@@ -2095,6 +2153,136 @@ class ForgeAgent:
 
         await artifact_tracker.drain()
         return actions, None
+
+    async def _finalize_step_execution(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+        scraped_page: ScrapedPage,
+        complete_verification: bool,
+        task_block: BaseTaskBlock | None,
+        actions: list[Action],
+        detailed_agent_step_output: DetailedAgentStepOutput,
+    ) -> tuple[Step, DetailedAgentStepOutput]:
+        assert detailed_agent_step_output.actions_and_results is not None
+
+        LOG.info(
+            "Actions executed successfully, marking step as completed",
+            sampling=True,
+            step_order=step.order,
+            step_retry=step.retry_index,
+            action_results=detailed_agent_step_output.action_results,
+        )
+
+        # Clean up TOTP cache after multi-field TOTP sequence completion
+        if self._is_multi_field_totp_sequence(actions):
+            context = skyvern_context.ensure_context()
+            cache_key = f"{task.task_id}_totp_cache"
+            removed_totp_cache = False
+            for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
+                if key in context.totp_codes:
+                    context.totp_codes.pop(key)
+                    removed_totp_cache = True
+
+            if removed_totp_cache:
+                LOG.debug(
+                    "Cleaned up TOTP cache after multi-field sequence completion",
+                    task_id=task.task_id,
+                )
+
+            secret_key = f"{task.task_id}_secret"
+            if secret_key in context.totp_codes:
+                context.totp_codes.pop(secret_key)
+
+        # Update Navigator caller with actual action results so the next
+        # step's tool responses include real execution data.
+        if (
+            engine == RunEngine.yutori_navigator
+            and detailed_agent_step_output
+            and detailed_agent_step_output.actions_and_results
+        ):
+            nav_caller = LLMCallerManager.get_llm_caller(task.task_id)
+            if isinstance(nav_caller, YutoriNavigatorLLMCaller):
+                for action, results in detailed_agent_step_output.actions_and_results:
+                    if not results or not action.tool_call_id:
+                        continue
+                    r = results[-1]
+                    result_str: str | None
+                    if isinstance(action, WaitAction):
+                        # Skyvern's handle_wait_action always returns ActionFailure by
+                        # design (to discourage v1/v2 engines from leaning on wait), but
+                        # Navigator emits wait as a deliberate cooperative pause —
+                        # surface a positive tool result so the model sees WaitAction success.
+                        result_str = f"Waited {action.seconds}s"
+                    elif r.success:
+                        # Use actual data when available (JS output, etc.)
+                        result_str = str(r.data) if r.data is not None else None
+                    else:
+                        # Provide error details so the model can recover
+                        result_str = f"ERROR: {r.exception_message or 'Action failed'}"
+                    nav_caller.update_pending_result(action.tool_call_id, result_str)
+
+        # Check if Skyvern already returned a complete action, if so, don't run user goal check
+        has_decisive_action = False
+        if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
+            for action, results in detailed_agent_step_output.actions_and_results:
+                if isinstance(action, DecisiveAction):
+                    has_decisive_action = True
+                    break
+
+        task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
+        enable_parallel_verification = False
+        if (
+            not has_decisive_action
+            and not task_completes_on_download
+            and not isinstance(task_block, ActionBlock)
+            and complete_verification
+            and (task.navigation_goal or task.complete_criterion)
+        ):
+            disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_USER_GOAL_CHECK",
+                task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
+
+            # Parallel verification is always enabled (user goal check deferred to handle_completed_step)
+            enable_parallel_verification = not disable_user_goal_check
+
+        # if the last action is complete and is successful, check if there's a data extraction goal
+        # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
+        # skip when the step already ran a successful planner-emitted EXTRACT action — re-extracting would be a duplicate
+        step_has_successful_extract = any(
+            executed_action.action_type == ActionType.EXTRACT and any(result.success for result in results)
+            for executed_action, results in detailed_agent_step_output.actions_and_results
+        )
+        if (
+            task.navigation_goal
+            and task.data_extraction_goal
+            and not step_has_successful_extract
+            and self.step_has_completed_goal(detailed_agent_step_output)
+        ):
+            working_page = await browser_state.must_get_working_page()
+            # refresh task in case the extracted information is updated previously
+            refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
+            assert refreshed_task is not None
+            task = refreshed_task
+            extract_action = await self.create_extract_action(task, step, scraped_page)
+            extract_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, extract_action)
+            await app.AGENT_FUNCTION.post_action_execution(extract_action)
+            detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
+
+        # If no action errors return the agent state and output
+        completed_step = await self.update_step(
+            step=step,
+            status=StepStatus.completed,
+            output=detailed_agent_step_output.to_agent_step_output(),
+        )
+        if enable_parallel_verification:
+            completed_step.speculative_original_status = StepStatus.completed
+        return completed_step, detailed_agent_step_output.get_clean_detailed_output()
 
     async def _generate_step_actions(
         self,

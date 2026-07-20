@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 import structlog
 import yaml
 
-from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
@@ -26,7 +25,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_structured
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS, _elapsed_run_seconds
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
 from skyvern.forge.sdk.copilot.task_output_envelope import (
     _TASK_ENVELOPE_BLOCK_TYPES,
     _TASK_OUTPUT_PAYLOAD_FIELDS,
@@ -454,10 +453,7 @@ async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None
     if not session_id:
         return "", ""
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
             return "", ""
         page = await browser_state.get_or_create_page()

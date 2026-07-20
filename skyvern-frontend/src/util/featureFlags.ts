@@ -33,3 +33,12 @@ export const COPILOT_UX_V1_FLAG = "copilot_ux_v1";
 // (run metadata / workflow tag). Off ⇒ the dashboard renders as today with no
 // group-by control. See cloud_docs/analytics/GROUP_BY_LENS_DESIGN.md.
 export const ANALYTICS_GROUP_BY_LENS_FLAG = "ANALYTICS_GROUP_BY_LENS";
+
+// Gates the login-block fallback-credential editor. Off ⇒ the fallback config is hidden, because
+// automatic retries only run for orgs in the CREDENTIAL_FALLBACK_RETRY rollout (backend gate), so
+// showing the editor to other orgs would promise a retry that never fires. Server-evaluated via
+// /customer (see FeatureFlagProvider), keyed on organization_id like the backend gate.
+export const CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY";
+
+// Opt-in preview (0% base): recordings synthesize code blocks instead of agent blocks.
+export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";

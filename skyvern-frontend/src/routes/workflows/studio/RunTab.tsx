@@ -1,5 +1,8 @@
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
+import { statusIsFinalized } from "@/routes/tasks/types";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
+import { getRerunNavigationState } from "../utils";
 import { RunView } from "./runview/RunView";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
@@ -16,12 +19,28 @@ export function RunTab() {
   const { workflowPermanentId } = useParams();
   const { openPane } = useStudioPanes();
   const { runId, pending } = useStudioInspectedRun();
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    runId ? { workflowRunId: runId } : undefined,
+  );
   // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
   // source agent, so the CTAs go too (the run stays viewable).
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
   // so suppress that CTA for block runs (the block is rerun from the editor).
   const isBlockRun = searchParams.has("bl");
+  const retryRun = () => {
+    const path = `/agents/${workflowPermanentId}/run`;
+    if (
+      workflowRun &&
+      workflowRun.workflow_run_id === runId &&
+      statusIsFinalized(workflowRun) &&
+      workflowRun.task_v2 === null
+    ) {
+      navigate(path, { state: getRerunNavigationState(workflowRun) });
+      return;
+    }
+    navigate(path);
+  };
 
   return (
     <RunView
@@ -40,13 +59,7 @@ export function RunTab() {
               });
             }
       }
-      onRetry={
-        isBlockRun || workflowDeleted
-          ? undefined
-          : // The post-start navigate resets the layout to the run mapping,
-            // so the form round-trip carries nothing.
-            () => navigate(`/agents/${workflowPermanentId}/run`)
-      }
+      onRetry={isBlockRun || workflowDeleted ? undefined : retryRun}
     />
   );
 }

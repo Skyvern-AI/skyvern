@@ -22,11 +22,13 @@ import {
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   commitYamlDraft,
+  subscribeToYamlDraftChanges,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   DndContext,
@@ -140,6 +142,8 @@ import {
   upgradeWorkflowDefinitionToVersionTwo,
   getWorkflowErrors,
 } from "./workflowEditorUtils";
+import { summarizeWorkflowChanges } from "./workflowChangesSummary";
+import { WorkflowChangesList } from "./WorkflowChangesList";
 import {
   createDimensionConvergenceState,
   processDimensionChanges,
@@ -198,6 +202,13 @@ import { duplicateBlockBelow } from "./workflowDuplicate";
 // protected by beginInternalUpdate/endInternalUpdate guards, so this timeout
 // only needs to cover synchronous mount-time effects.
 const INITIAL_LOAD_SETTLE_MS = 500;
+
+// Max gap between a user gesture and the draft change it caused for that change
+// to count as a user edit (vs. post-load materialization like login autofill).
+// Biased large so a real edit is never misread as materialization; the cost is
+// that an autofill landing within this window of a gesture can still read as a
+// phantom (the broad autofill-on-mount case is tracked as a follow-up).
+const USER_EDIT_GESTURE_WINDOW_MS = 250;
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -743,6 +754,25 @@ function FlowRenderer({
   const blockerRef = useRef(blocker);
   blockerRef.current = blocker;
 
+  // Studio-only: list what changed inside the leave/run unsaved-changes modal.
+  // Memoized on the blocked state so it runs once when the modal opens (the
+  // canvas is behind the modal and can't be edited). Legacy /edit keeps the
+  // modal unchanged (embedded gate).
+  const isNavBlocked = blocker.state === "blocked";
+  const unsavedChangeSummary = useMemo(() => {
+    if (!embedded || !isNavBlocked) {
+      return [];
+    }
+    try {
+      const saveData = useWorkflowHasChangesStore.getState().getSaveData();
+      const snapshot = useWorkflowSnapshotStore.getState().snapshot;
+      return saveData ? summarizeWorkflowChanges(saveData, snapshot) : [];
+    } catch (error) {
+      console.error("Failed to summarize workflow changes", error);
+      return [];
+    }
+  }, [embedded, isNavBlocked]);
+
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
       const layoutedElements = layout(nodes, edges, targettedBlockLabel);
@@ -972,6 +1002,102 @@ function FlowRenderer({
       workflow,
     };
   }, [nodes, edges, parameters, title, workflow]);
+
+  // Studio unsaved-changes baseline: freeze a clean snapshot at the
+  // first user interaction after a load/save, so post-load canvas
+  // materialization (e.g. a login-block credential autofill, which flips
+  // hasChanges without a user gesture) is absorbed into the baseline instead of
+  // reading as a user edit. Clear it when the workflow returns to clean, and
+  // keep the dot's contentDirty flag in sync with the draft. Studio-only.
+  const hasChangesFlag = workflowChangesStore.hasChanges;
+  useEffect(() => {
+    if (!embedded || readOnly || hasChangesFlag) {
+      return;
+    }
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+  }, [embedded, readOnly, hasChangesFlag]);
+
+  // Timestamp of the last discrete user gesture. The dirtiness effect below uses
+  // it to tell a user edit (change lands within a gesture window) from post-load
+  // materialization (a change with no preceding gesture), so autofill after an
+  // early interaction is absorbed into the baseline rather than shown as an edit.
+  const lastUserGestureAtRef = useRef(0);
+  // A held pointer means a drag may be in progress: the graph re-serializes per
+  // frame but its content can't change until the drop, so the dirtiness effect
+  // skips the per-frame diff while this is set (it settles at pointerup).
+  const pointerDownRef = useRef(false);
+  useEffect(() => {
+    if (!embedded || readOnly) {
+      return;
+    }
+    const captureBaseline = () => {
+      if (useWorkflowSnapshotStore.getState().snapshot === null) {
+        useWorkflowSnapshotStore.getState().captureSnapshot();
+      }
+    };
+    const markGesture = () => {
+      lastUserGestureAtRef.current = Date.now();
+    };
+    const onPointerDown = () => {
+      pointerDownRef.current = true;
+      markGesture();
+      captureBaseline();
+    };
+    const onPointerUp = () => {
+      pointerDownRef.current = false;
+      markGesture();
+    };
+    const onKeyDown = () => {
+      markGesture();
+      captureBaseline();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("pointerup", onPointerUp, true);
+    document.addEventListener("pointercancel", onPointerUp, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("pointerup", onPointerUp, true);
+      document.removeEventListener("pointercancel", onPointerUp, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [embedded, readOnly]);
+
+  // Debounced for user edits: constructSaveData changes per-frame during a node
+  // drag, and recomputing dirtiness serializes the whole graph — coalesce to
+  // once the draft settles (the dot updating a moment late is imperceptible).
+  const scheduleUserDirtyRefresh = useDebouncedCallback(() => {
+    useWorkflowSnapshotStore.getState().noteDraftChange(true);
+  }, 200);
+  useEffect(() => {
+    if (!embedded || readOnly) {
+      return;
+    }
+    const userDriven =
+      Date.now() - lastUserGestureAtRef.current <= USER_EDIT_GESTURE_WINDOW_MS;
+    if (userDriven) {
+      scheduleUserDirtyRefresh();
+    } else if (!pointerDownRef.current) {
+      // Post-load materialization (e.g. login autofill) is a one-off — resolve
+      // it promptly so the baseline absorbs it before the dot or the summary can
+      // flash a phantom edit. Skipped while a pointer is held so a long node
+      // drag doesn't re-serialize the whole graph every frame; a drag settles at
+      // pointerup, where the drop's constructSaveData change re-runs this.
+      useWorkflowSnapshotStore.getState().noteDraftChange(false);
+    }
+  }, [embedded, readOnly, constructSaveData, scheduleUserDirtyRefresh]);
+  // A Code-editor edit changes only the YAML draft, so constructSaveData is
+  // unchanged and the effect above never fires for it. The editor's keystrokes
+  // also don't reach the canvas gesture window that effect classifies on, and
+  // the draft only ever changes via user typing — so refresh as a user edit
+  // directly. Routing through that classification would read the edit as
+  // materialization and absorb it into the baseline, leaving the dot dark.
+  useEffect(() => {
+    if (!embedded || readOnly) {
+      return;
+    }
+    return subscribeToYamlDraftChanges(scheduleUserDirtyRefresh);
+  }, [embedded, readOnly, scheduleUserDirtyRefresh]);
 
   useEffect(() => {
     if (readOnly) {
@@ -2029,7 +2155,7 @@ function FlowRenderer({
         onMouseDownCapture={() => onMouseDownCapture?.()}
       >
         {layoutPhase === "pre-layout" && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950">
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-background">
             <div className="animate-pulse">
               <LogoMinimized />
             </div>
@@ -2054,6 +2180,7 @@ function FlowRenderer({
                 before leaving?
               </DialogDescription>
             </DialogHeader>
+            <WorkflowChangesList changes={unsavedChangeSummary} />
             <DialogFooter>
               <Button
                 variant="secondary"
@@ -2349,7 +2476,7 @@ function FlowRenderer({
                     : null;
                 if (!activeDragLabel) return null;
                 return (
-                  <div className="rounded border border-slate-500 bg-slate-elevation3 px-3 py-2 text-sm text-slate-100 opacity-90 shadow-lg">
+                  <div className="rounded border border-border bg-slate-elevation3 px-3 py-2 text-sm text-foreground opacity-90 shadow-lg dark:border-slate-500">
                     {activeDragLabel}
                   </div>
                 );

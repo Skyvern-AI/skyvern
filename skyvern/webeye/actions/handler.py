@@ -9,8 +9,9 @@ import urllib.parse
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, TypedDict
+from typing import Any, Awaitable, Callable, List, NamedTuple, TypedDict
 
 import structlog
 from cachetools import TTLCache
@@ -32,6 +33,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    AutoCompletionCommitFailure,
     CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
@@ -46,11 +48,13 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
+    InputTextCommitMismatch,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
+    MaskedInputReadbackMismatch,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -59,7 +63,6 @@ from skyvern.exceptions import (
     NoAutoCompleteOptionMeetCondition,
     NoAvailableOptionFoundForCustomSelection,
     NoElementMatchedForTargetOption,
-    NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
     NoTOTPSecretFound,
@@ -84,9 +87,13 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
-from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
+from skyvern.forge.sdk.experimentation.llm_prompt_config import (
+    resolve_check_user_goal_handler,
+    resolve_prompt_type_handler_with_override,
+)
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
 from skyvern.forge.sdk.models import Step
@@ -112,6 +119,7 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements_tracked,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -158,6 +166,7 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -167,6 +176,10 @@ LOG = structlog.get_logger()
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
+VERIFY_EMERGING_SELECT_PICK_FLAG = "VERIFY_EMERGING_SELECT_PICK"
+FIX_MASKED_INPUT_READBACK_FLAG = "FIX_MASKED_INPUT_READBACK"
+SURFACE_BLOCKED_FORM_ADVANCE_FLAG = "SURFACE_BLOCKED_FORM_ADVANCE"
+VERIFY_INPUT_TEXT_COMMIT_FLAG = "VERIFY_INPUT_TEXT_COMMIT"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
@@ -175,10 +188,60 @@ COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Cross-process re-resolution is deterministic under stable flag config.
 _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, ttl=86_400)
 
+
+class _CollapseGateResult(NamedTuple):
+    family_enabled: bool
+    assigned: bool | None
+    gate_error: bool
+
+
+class CustomSelectFamilyOutcome(StrEnum):
+    llm_fallback_gate_error = "llm_fallback_gate_error"
+    llm_fallback_eval_error = "llm_fallback_eval_error"
+    llm_fallback_family_off = "llm_fallback_family_off"
+    llm_fallback_control = "llm_fallback_control"
+    llm_fallback_no_match = "llm_fallback_no_match"
+    llm_fallback_match_unactionable = "llm_fallback_match_unactionable"
+    llm_fallback_pre_click_error = "llm_fallback_pre_click_error"
+    llm_fallback_reset_verified = "llm_fallback_reset_verified"
+    llm_fallback_post_click_unverified = "llm_fallback_post_click_unverified"
+    success_precommit = "success_precommit"
+    success_verified = "success_verified"
+    terminal_post_click_exception = "terminal_post_click_exception"
+    terminal_unverified_reset = "terminal_unverified_reset"
+    terminal_unverified_click = "terminal_unverified_click"
+    terminal_unverified_toggle = "terminal_unverified_toggle"
+
+
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
 SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
 SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
+AUTOCOMPLETE_COMMIT_REQUIRED_FLAG = "AUTOCOMPLETE_COMMIT_REQUIRED"
+AUTOCOMPLETE_COMMIT_WORD_RE = re.compile(r"[^\W_]+")
+AUTOCOMPLETE_POLL_INTERVAL_SECONDS = 0.5
+AUTOCOMPLETE_POLL_MAX_ATTEMPTS = 16
+AUTOCOMPLETE_POLL_DEFAULT_BUDGET_SECONDS = 4.0
+AUTOCOMPLETE_TOTAL_DEADLINE_SECONDS = 8.0
+AUTOCOMPLETE_READBACK_TIMEOUT_SECONDS = 2.0
+AUTOCOMPLETE_TEARDOWN_ERROR_MARKERS = (
+    "context was destroyed",
+    "navigation",
+    "target closed",
+    "has been closed",
+    "frame was detached",
+)
+AUTOCOMPLETE_DETACHED_ERROR_MARKERS = (
+    "not attached",
+    "detached",
+)
+AUTOCOMPLETE_RERESOLVE_FAILURE_MARKERS = (
+    "timeout",
+    "timed out",
+    "not found",
+    "no element",
+    "failed to find",
+)
 
 
 def _select_shadow_match_enabled() -> bool:
@@ -405,6 +468,16 @@ def _resolve_autocomplete_candidate(
     return matched_index, candidates[matched_index]
 
 
+def _autocomplete_candidate_for_element_id(
+    elements: list[dict], element_id: str
+) -> tuple[int, dict[str, str | None]] | None:
+    candidates = _autocomplete_candidates_from_elements(elements)
+    for index, candidate in enumerate(candidates):
+        if candidate.get("element_id") == element_id:
+            return index, candidate
+    return None
+
+
 async def _read_autocomplete_option_identity(
     *,
     skyvern_frame: SkyvernFrame,
@@ -441,39 +514,202 @@ async def _verify_autocomplete_option_identity(
             LOG.info(
                 "Autocomplete option index differed from deterministic candidate; accepting label match",
                 expected_index=matched_index,
-                expected_label=matched_label,
+                expected_label_length=len(matched_label),
                 actual_index=actual_index,
-                actual_label=actual_label,
+                actual_label_length=len(str(actual_label or "")),
             )
         return True
 
     LOG.info(
         "Autocomplete option identity did not match deterministic candidate",
         expected_index=matched_index,
-        expected_label=matched_label,
+        expected_label_length=len(matched_label),
         actual_index=actual_index,
-        actual_label=actual_label,
+        actual_label_length=len(str(actual_label or "")),
     )
     return False
+
+
+class AutocompleteCommitOutcome(BaseModel):
+    committed: bool = False
+    side_effects_observed: bool = False
+
+
+def _autocomplete_commit_tokens(value: str | None) -> list[str]:
+    return AUTOCOMPLETE_COMMIT_WORD_RE.findall(str(value or "").casefold())
+
+
+async def _read_autocomplete_committed_value(skyvern_element: SkyvernElement) -> tuple[str | None, bool]:
+    detached_error_observed = False
+    for attempt in range(2):
+        try:
+            async with asyncio.timeout(AUTOCOMPLETE_READBACK_TIMEOUT_SECONDS):
+                value = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
+            return str(value or ""), False
+        except Exception as exc:
+            message = str(exc).casefold()
+            if any(marker in message for marker in AUTOCOMPLETE_TEARDOWN_ERROR_MARKERS):
+                return None, True
+            detached_error = any(marker in message for marker in AUTOCOMPLETE_DETACHED_ERROR_MARKERS)
+            if attempt == 0 and detached_error:
+                detached_error_observed = True
+                continue
+            reresolution_failed = (
+                detached_error
+                or isinstance(exc, TimeoutError)
+                or any(marker in message for marker in AUTOCOMPLETE_RERESOLVE_FAILURE_MARKERS)
+            )
+            if detached_error_observed and reresolution_failed:
+                LOG.info(
+                    "Autocomplete read-back element stayed unreachable after detach, treating as implicit commit",
+                    element_id=skyvern_element.get_id(),
+                    error=type(exc).__name__,
+                )
+                return None, True
+            LOG.info(
+                "Autocomplete read-back could not read the input value",
+                element_id=skyvern_element.get_id(),
+                error=type(exc).__name__,
+            )
+            return None, False
+    return None, False
+
+
+async def _autocomplete_suggestions_closed(locator: Locator | None) -> bool | None:
+    if locator is None:
+        return None
+    try:
+        async with asyncio.timeout(AUTOCOMPLETE_READBACK_TIMEOUT_SECONDS):
+            if await locator.count() == 0:
+                return True
+            return not await locator.is_visible()
+    except Exception:
+        return None
+
+
+async def _autocomplete_selection_state(locator: Locator | None) -> bool | None:
+    if locator is None:
+        return None
+    try:
+        async with asyncio.timeout(AUTOCOMPLETE_READBACK_TIMEOUT_SECONDS):
+            aria_selected = await locator.get_attribute("aria-selected")
+    except Exception:
+        return None
+    if aria_selected is None:
+        return None
+    return str(aria_selected).casefold() == "true"
+
+
+async def _autocomplete_input_reports_closed(skyvern_element: SkyvernElement) -> bool | None:
+    try:
+        async with asyncio.timeout(AUTOCOMPLETE_READBACK_TIMEOUT_SECONDS):
+            # Must be a live read: get_attr defaults to static-first, and an input scraped before the
+            # dropdown opened carries a cached aria-expanded="false" that would read as commit evidence
+            # no matter what the keypress actually did.
+            aria_expanded = await skyvern_element.get_attr("aria-expanded", mode="dynamic")
+    except Exception:
+        return None
+    if aria_expanded is None:
+        return None
+    normalized = str(aria_expanded).casefold()
+    if normalized not in ("true", "false"):
+        return None
+    return normalized == "false"
 
 
 async def _verify_autocomplete_input_readback(
     *,
     skyvern_element: SkyvernElement,
-    matched_index: int,
     matched_label: str,
-) -> bool:
-    actual_value = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
-    if _normalize_select_shadow_text(actual_value) == _normalize_select_shadow_text(matched_label):
-        return True
+    typed_prefix: str,
+    pre_action_value: str | None = None,
+    suggestions_closed: bool | None = None,
+    selection_state_present: bool | None = None,
+    allow_unchanged_value: bool = False,
+    commit_required: bool = False,
+) -> AutocompleteCommitOutcome:
+    actual_value, teardown_observed = await _read_autocomplete_committed_value(skyvern_element)
+    if teardown_observed:
+        return AutocompleteCommitOutcome(committed=True, side_effects_observed=True)
+    if actual_value is None:
+        return AutocompleteCommitOutcome(committed=False, side_effects_observed=bool(suggestions_closed))
 
-    LOG.info(
-        "Autocomplete read-back did not match deterministic option",
-        expected_index=matched_index,
-        expected_label=matched_label,
-        actual_value=actual_value,
-    )
-    return False
+    actual_tokens = _autocomplete_commit_tokens(actual_value)
+    matched_tokens = _autocomplete_commit_tokens(matched_label)
+    baseline = typed_prefix if pre_action_value is None else pre_action_value
+    baseline_tokens = _autocomplete_commit_tokens(baseline)
+    actual_normalized = " ".join(actual_tokens)
+    matched_normalized = " ".join(matched_tokens)
+    baseline_normalized = " ".join(baseline_tokens)
+    prefix_normalized = " ".join(_autocomplete_commit_tokens(typed_prefix))
+
+    value_changed = actual_normalized != baseline_normalized
+    side_effects_observed = value_changed or bool(suggestions_closed)
+    actual_set = set(actual_tokens)
+    matched_set = set(matched_tokens)
+    # Field shows the whole label (plus any prefix like "Selected:"), or a shorter read-back that still
+    # covers at least half the label - a lone token of a multi-word label does not identify the selection.
+    token_superset = matched_set <= actual_set
+    token_subset = actual_set <= matched_set and len(actual_set) * 2 >= len(matched_set)
+    token_match = bool(actual_tokens) and bool(matched_tokens) and (token_superset or token_subset)
+
+    committed = False
+    if allow_unchanged_value:
+        committed = token_match or (bool(actual_tokens) and actual_normalized == prefix_normalized)
+    elif not actual_tokens:
+        # Chip/token widgets clear the input after committing, so cleared + closed listbox is a commit.
+        # Under commit-required a dismissal click that clears the field looks identical, so an
+        # affirmative selection signal is needed on top of the closed listbox.
+        committed = bool(suggestions_closed) and (not commit_required or bool(selection_state_present))
+    elif token_match:
+        label_distinguishable = matched_normalized != baseline_normalized
+        if label_distinguishable:
+            committed = value_changed
+        else:
+            committed = value_changed or bool(suggestions_closed) or bool(selection_state_present)
+
+    if not committed:
+        LOG.info(
+            "Autocomplete read-back did not confirm selected suggestion",
+            element_id=skyvern_element.get_id(),
+            expected_length=len(matched_normalized),
+            actual_length=len(actual_normalized),
+            value_changed=value_changed,
+            suggestions_closed=suggestions_closed,
+        )
+    return AutocompleteCommitOutcome(committed=committed, side_effects_observed=side_effects_observed)
+
+
+async def _poll_autocomplete_incremental_elements(
+    *,
+    incremental_scraped: IncrementalScrapePage,
+    cleanup_factory: CleanupElementTreeFunc,
+    deadline: float | None = None,
+) -> list[dict]:
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + AUTOCOMPLETE_POLL_DEFAULT_BUDGET_SECONDS
+    extracted_elements: list[dict] = []
+    for _ in range(AUTOCOMPLETE_POLL_MAX_ATTEMPTS):
+        try:
+            async with asyncio.timeout(AUTOCOMPLETE_POLL_INTERVAL_SECONDS):
+                probe_count = int(await incremental_scraped.get_incremental_elements_num())
+        except Exception:
+            probe_count = 0
+        # Re-extract on every positive probe rather than only on a count change: a listbox can swap a
+        # loading placeholder for an option in place, leaving the incremental count constant. We return
+        # as soon as an option candidate renders, so the common case still extracts at most once.
+        if probe_count > 0:
+            incremental_elements = await incremental_scraped.get_incremental_element_tree(cleanup_factory)
+            if incremental_elements:
+                extracted_elements = incremental_elements
+                if _autocomplete_candidates_from_elements(incremental_elements):
+                    return extracted_elements
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(AUTOCOMPLETE_POLL_INTERVAL_SECONDS, remaining))
+    return extracted_elements
 
 
 async def _reset_autocomplete_for_llm_fallback(
@@ -487,6 +723,7 @@ async def _reset_autocomplete_for_llm_fallback(
     text: str,
     task: Task,
     step: Step,
+    poll_deadline: float | None = None,
 ) -> tuple[IncrementalScrapePage, list[dict], list[dict], str, list[str]]:
     await current_incremental_scraped.stop_listen_dom_increment()
     await skyvern_element.input_clear()
@@ -494,13 +731,14 @@ async def _reset_autocomplete_for_llm_fallback(
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
     await skyvern_element.press_fill(text)
-    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fallback_refill")
-    incremental_element = await incremental_scraped.get_incremental_element_tree(
-        clean_and_remove_element_tree_factory(
+    incremental_element = await _poll_autocomplete_incremental_elements(
+        incremental_scraped=incremental_scraped,
+        cleanup_factory=clean_and_remove_element_tree_factory(
             task=task,
             step=step,
             check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
         ),
+        deadline=poll_deadline,
     )
 
     if len(incremental_element) > 0:
@@ -518,7 +756,7 @@ async def _reset_autocomplete_for_llm_fallback(
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
     ]
     if len(new_interactable_element_ids) == 0:
-        raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+        raise AutoCompletionCommitFailure(stage="suggestions_never_rendered")
 
     LOG.info(
         "New elements detected after resetting autocomplete fallback input",
@@ -642,7 +880,15 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
         # Name the file by the block-configured download_suffix so the watcher syncs the
         # request-based name instead of the site's suggested name.
         existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
-        return download_dir / download_filename_from_suffix(download_suffix, suffix, existing)
+        target_name = download_filename_from_suffix(download_suffix, suffix, existing)
+        LOG.info(
+            "download_suffix_target_named",
+            context_task_id=context.task_id if context else None,
+            context_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+            suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
+            desired_name_fp=diagnostic_fingerprint(target_name),
+        )
+        return download_dir / target_name
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
@@ -1046,23 +1292,21 @@ def _phone_digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
 
 
-def _nanp_readback_national_digits(digits: str) -> str | None:
-    if len(digits) == 10:
-        return digits
-    if len(digits) in {11, 12} and digits[:-10] == "1" * (len(digits) - 10):
-        return digits[-10:]
-    return None
-
-
-def _phone_readback_digits_match(expected_digits: str, actual_digits: str) -> bool:
+def _phone_readback_digits_match(
+    expected_digits: str,
+    actual_digits: str,
+    *,
+    allow_nanp_country_prefix: bool = False,
+) -> bool:
     if actual_digits == expected_digits:
         return True
-    if len(expected_digits) == 10 and actual_digits == f"1{expected_digits}":
-        return True
+    if not allow_nanp_country_prefix:
+        return False
+    return len(expected_digits) == 10 and actual_digits == f"1{expected_digits}"
 
-    expected_nanp_digits = _nanp_readback_national_digits(expected_digits)
-    actual_nanp_digits = _nanp_readback_national_digits(actual_digits)
-    return expected_nanp_digits is not None and expected_nanp_digits == actual_nanp_digits
+
+def _has_explicit_nanp_country_code(value: str | None) -> bool:
+    return re.match(r"\+1|1[ \-.(]", (value or "").strip()) is not None
 
 
 def _nanp_national_digits(value: str | None) -> str | None:
@@ -1073,7 +1317,7 @@ def _nanp_national_digits(value: str | None) -> str | None:
     digits = _phone_digits(text)
     # A leading 1 counts as a country code only when written as one (+1, or 1 set off by a
     # separator); bare 11-digit strings can be non-NANP numbers whose first digit is 1.
-    if re.fullmatch(r"1[0-9]{10}", digits) and re.match(r"\+1|1[ \-.(]", text):
+    if re.fullmatch(r"1[0-9]{10}", digits) and _has_explicit_nanp_country_code(text):
         national_digits = digits[-10:]
     elif re.fullmatch(
         r"\([0-9]{3}\) [0-9]{3}-[0-9]{4}|[0-9]{3}-[0-9]{3}-[0-9]{4}|"
@@ -1102,6 +1346,31 @@ def _tel_pattern_allows_bare_digits(pattern: str | None, bare_digits: str) -> bo
         return True
 
 
+def _nanp_e164_fallback(value: str, *, pattern: str | None, maxlength: str | None) -> str | None:
+    """Return a canonical E.164 retry only with explicit +1 evidence and permissive field constraints."""
+    national_digits = _nanp_national_digits(value)
+    if national_digits is None or not _has_explicit_nanp_country_code(value):
+        return None
+    e164_value = f"+1{national_digits}"
+    if pattern:
+        try:
+            if re.fullmatch(pattern, e164_value) is None:
+                return None
+        except re.error:
+            # Unlike the required bare-digit first attempt, this optional +1 rewrite fails closed when
+            # the browser's pattern cannot be interpreted safely by Python.
+            return None
+
+    if maxlength:
+        try:
+            max_chars = int(maxlength)
+        except ValueError:
+            return None
+        if max_chars < 0 or len(e164_value) > max_chars:
+            return None
+    return e164_value
+
+
 def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | None) -> tuple[str, bool, bool]:
     # Decide how to fill a tel field. Returns (text_to_type, used_bare_nanp, run_format_check).
     # Bare national digits avoid the fill()-split behavior that can drop a digit in self-formatting fields.
@@ -1112,7 +1381,7 @@ def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | 
     return value, False, is_tel and not is_secret
 
 
-async def _is_tel_digit_fix_enabled(task: Task) -> bool:
+async def _is_org_flag_enabled(task: Task, flag: str, log_label: str) -> bool:
     organization_id = task.organization_id
     if not organization_id:
         return False
@@ -1123,18 +1392,42 @@ async def _is_tel_digit_fix_enabled(task: Task) -> bool:
         # Bucket by org (not per-run) for a stable, monitorable ramp and clean rollback.
         return bool(
             await experimentation_provider.is_feature_enabled_cached(
-                FIX_TEL_INPUT_DIGIT_DROP_FLAG,
+                flag,
                 organization_id,
                 properties={"organization_id": organization_id},
             )
         )
     except Exception:
         LOG.warning(
-            "Failed to evaluate tel-digit-fix flag; defaulting to disabled",
+            f"Failed to evaluate {log_label} flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
         return False
+
+
+async def _is_tel_digit_fix_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, FIX_TEL_INPUT_DIGIT_DROP_FLAG, "tel-digit-fix")
+
+
+async def _is_verify_emerging_select_pick_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, VERIFY_EMERGING_SELECT_PICK_FLAG, "verify-emerging-select-pick")
+
+
+async def _is_masked_input_readback_fix_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, FIX_MASKED_INPUT_READBACK_FLAG, "masked-input-readback")
+
+
+async def _is_surface_blocked_form_advance_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, SURFACE_BLOCKED_FORM_ADVANCE_FLAG, "surface-blocked-form-advance")
+
+
+async def _is_autocomplete_commit_required_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, AUTOCOMPLETE_COMMIT_REQUIRED_FLAG, "autocomplete-commit-required")
+
+
+async def _is_input_text_commit_verification_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, VERIFY_INPUT_TEXT_COMMIT_FLAG, "input-text-commit")
 
 
 async def _resolve_collapse_xp_assignment(
@@ -1182,31 +1475,39 @@ async def _resolve_collapse_xp_assignment(
     return assignment
 
 
-async def _is_collapse_fanout_enabled(task: Task, family_flag: str, log_label: str) -> bool:
+async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -> _CollapseGateResult:
     organization_id = task.organization_id
     if not organization_id:
-        return False
+        return _CollapseGateResult(False, None, False)
     experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
     if not experimentation_provider:
-        return False
+        return _CollapseGateResult(False, None, False)
     try:
-        family_enabled = await experimentation_provider.is_feature_enabled_cached(
-            family_flag,
-            organization_id,
-            properties={"organization_id": organization_id},
+        family_enabled = bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                family_flag,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
         )
         if not family_enabled:
-            return False
+            return _CollapseGateResult(False, None, False)
         # PostHog hashes per flag key, so this umbrella is the only randomization source.
         # Family flags are kill switches and must never use percentage rollouts.
-        return await _resolve_collapse_xp_assignment(experimentation_provider, task, organization_id)
+        assigned = await _resolve_collapse_xp_assignment(experimentation_provider, task, organization_id)
+        return _CollapseGateResult(True, assigned, False)
     except Exception:
         LOG.warning(
             f"Failed to evaluate {log_label} flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
-        return False
+        return _CollapseGateResult(False, None, True)
+
+
+async def _is_collapse_fanout_enabled(task: Task, family_flag: str, log_label: str) -> bool:
+    gate = await _resolve_collapse_gate(task, family_flag, log_label)
+    return gate.family_enabled and bool(gate.assigned)
 
 
 async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
@@ -1229,12 +1530,22 @@ async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
     )
 
 
-async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
+async def verify_phone_input_digits(
+    *,
+    tag_name: str,
+    locator: Locator,
+    expected_value: str,
+    allow_nanp_country_prefix: bool = False,
+) -> None:
     # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator)
     expected_digits = _phone_digits(expected_value)
     actual_digits = _phone_digits(actual_value)
-    if not _phone_readback_digits_match(expected_digits, actual_digits):
+    if not _phone_readback_digits_match(
+        expected_digits,
+        actual_digits,
+        allow_nanp_country_prefix=allow_nanp_country_prefix,
+    ):
         raise PhoneNumberInputMismatch(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
@@ -1246,12 +1557,331 @@ async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected
     )
 
 
-async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_name: str, expected_value: str) -> None:
+async def _verify_tel_input_after_fill(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    expected_value: str,
+    allow_nanp_country_prefix: bool,
+) -> None:
     await verify_phone_input_digits(
         tag_name=tag_name,
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
+        allow_nanp_country_prefix=allow_nanp_country_prefix,
     )
+
+
+async def _fill_nanp_tel_with_readback(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    national_digits: str,
+    e164_fallback: str | None,
+) -> PhoneNumberInputMismatch | None:
+    """Fill affirmative NANP digits and verify every attempt.
+    Retry atomically with national digits before constraint-safe E.164 for the least invasive recovery.
+    """
+    attempts = [("sequential_national", national_digits), ("atomic_national", national_digits)]
+    if e164_fallback is not None:
+        attempts.append(("atomic_e164", e164_fallback))
+
+    for attempt_index, (strategy, value) in enumerate(attempts):
+        if strategy == "sequential_national":
+            await skyvern_element.input_sequentially(text=value)
+        else:
+            await skyvern_element.input_clear()
+            await skyvern_element.input_fill(text=value)
+
+        try:
+            await _verify_tel_input_after_fill(
+                skyvern_element=skyvern_element,
+                tag_name=tag_name,
+                expected_value=national_digits,
+                allow_nanp_country_prefix=e164_fallback is not None,
+            )
+        except PhoneNumberInputMismatch as mismatch:
+            if attempt_index == len(attempts) - 1:
+                return mismatch
+            LOG.info(
+                "Phone input read-back mismatch; trying next fill strategy",
+                element_id=skyvern_element.get_id(),
+                failed_strategy=strategy,
+                next_strategy=attempts[attempt_index + 1][0],
+                expected_digit_count=mismatch.expected_digit_count,
+                actual_digit_count=mismatch.actual_digit_count,
+            )
+        else:
+            return None
+    return None
+
+
+_INPUT_TEXT_MASK_FORMAT_RE = re.compile(r"[\s\-_().]")
+_NON_TEXT_INPUT_TYPES = {
+    "button",
+    "checkbox",
+    "color",
+    "date",
+    "datetime-local",
+    "file",
+    "hidden",
+    "image",
+    "month",
+    "password",
+    "radio",
+    "range",
+    "reset",
+    "submit",
+    "tel",
+    "time",
+    "week",
+}
+_INPUT_COMMIT_NAVIGATION_ERRORS = (
+    "execution context was destroyed",
+    "navigation",
+    "target closed",
+)
+_INPUT_COMMIT_DETACHED_ERRORS = ("detached", "not attached")
+_MASK_NORMALIZED_INPUT_TYPES = {"search", "text", "textarea"}
+_SET_NATIVE_INPUT_VALUE_JS = """
+(element, value) => {
+    const prototype = element instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value").set;
+    setter.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    element.blur();
+}
+"""
+
+
+def _normalize_input_text_value(value: str | None) -> str:
+    return _INPUT_TEXT_MASK_FORMAT_RE.sub("", value or "")
+
+
+def input_text_values_match(expected_value: str, actual_value: str | None, *, input_type: str) -> bool:
+    """Decide whether a field committed what was typed.
+
+    A field has committed when its value derives from the typed text. That covers an exact match, a
+    reformat that only rearranges separators ("1234567890" -> "(123) 456-7890"), and an enrichment
+    that extends the typed value ("12345" -> "12345-6789"). Only three things are failures: an empty
+    field, a field still showing unfilled mask placeholders, and a genuinely different value.
+
+    Deriving is read as a prefix rather than a substring: extending what was typed is a commit, but a
+    value that merely happens to contain it is not.
+    """
+    expected_trimmed = expected_value.strip()
+    actual_trimmed = (actual_value or "").strip()
+    if not expected_trimmed:
+        return True
+    if not actual_trimmed:
+        return False
+    if expected_trimmed == actual_trimmed:
+        return True
+    if input_type not in _MASK_NORMALIZED_INPUT_TYPES:
+        return False
+    expected_normalized = _normalize_input_text_value(expected_trimmed).casefold()
+    actual_normalized = _normalize_input_text_value(actual_trimmed).casefold()
+    if not expected_normalized:
+        # Nothing but separators was typed, so only separators may come back - anything else is a
+        # different value, not a reformat of this one.
+        return not actual_normalized
+    # An all-placeholder commit ("_____") normalizes away to nothing: the mask took the keystrokes
+    # and kept none of them.
+    if not actual_normalized:
+        return False
+    return actual_normalized.startswith(expected_normalized)
+
+
+def _is_input_commit_navigation_error(exc: PlaywrightError) -> bool:
+    return any(message in str(exc).lower() for message in _INPUT_COMMIT_NAVIGATION_ERRORS)
+
+
+def _is_input_commit_detached_error(exc: PlaywrightError) -> bool:
+    return any(message in str(exc).lower() for message in _INPUT_COMMIT_DETACHED_ERRORS)
+
+
+def _is_plausible_autocomplete_rewrite(expected_value: str, actual_value: str | None) -> bool:
+    # A suggestion rewrite contains or extends the typed text; the reverse containment
+    # (actual is a prefix/fragment of expected) is a dropped-input failure, not a rewrite.
+    expected_trimmed = expected_value.strip().casefold()
+    actual_trimmed = (actual_value or "").strip().casefold()
+    return bool(expected_trimmed and actual_trimmed) and expected_trimmed in actual_trimmed
+
+
+_OPTION_UI_ROLES = {"listbox", "option"}
+
+
+def _incremental_elements_contain_option_ui(elements: list[dict]) -> bool:
+    stack: list[dict] = [element for element in elements if isinstance(element, dict)]
+    while stack:
+        element = stack.pop()
+        if str(element.get("tagName") or "").lower() == "li":
+            return True
+        attributes = element.get("attributes")
+        if isinstance(attributes, dict) and str(attributes.get("role") or "").lower() in _OPTION_UI_ROLES:
+            return True
+        children = element.get("children")
+        if isinstance(children, list):
+            stack.extend(child for child in children if isinstance(child, dict))
+    return False
+
+
+async def _read_generic_input_commit(
+    *,
+    skyvern_element: SkyvernElement,
+    dom: DomUtil,
+    tag_name: str,
+    input_type: str,
+    expected_value: str,
+    allow_autocomplete_rewrite: bool,
+    allow_reresolve: bool,
+) -> tuple[bool, str | None, SkyvernElement]:
+    try:
+        actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    except PlaywrightError as exc:
+        if _is_input_commit_navigation_error(exc):
+            return True, None, skyvern_element
+        if not allow_reresolve or not _is_input_commit_detached_error(exc):
+            raise
+        skyvern_element = await dom.get_skyvern_element_by_id(skyvern_element.get_id())
+        actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    committed = input_text_values_match(expected_value, actual_value, input_type=input_type)
+    if not committed and allow_autocomplete_rewrite:
+        committed = _is_plausible_autocomplete_rewrite(expected_value, actual_value)
+    return committed, actual_value, skyvern_element
+
+
+async def _verify_generic_input_commit_with_escalation(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    dom: DomUtil,
+    tag_name: str,
+    input_type: str,
+    expected_value: str,
+    allow_autocomplete_rewrite: bool,
+) -> ActionFailure | None:
+    # React-style inputs re-render nodes on every value change, so each escalation stage
+    # gets its own re-resolve allowance instead of one shared across the ladder.
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    # A masked or debounced field can land its value a beat after the keystrokes settle. Let it
+    # before escalating, or the clear+retype below destroys a value that was about to commit.
+    await skyvern_frame.safe_wait_for_animation_end(caller="input_text.commit_readback")
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    await skyvern_element.input_clear()
+    await skyvern_element.input_sequentially(text=expected_value)
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    await skyvern_element.input_fill(text=expected_value)
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    await skyvern_element.get_locator().evaluate(_SET_NATIVE_INPUT_VALUE_JS, expected_value)
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    expected_length = len(_normalize_input_text_value(expected_value))
+    actual_length = len(_normalize_input_text_value(actual_value))
+    LOG.warning(
+        "Input text commit mismatch after fallback ladder",
+        element_id=skyvern_element.get_id(),
+        expected_length=expected_length,
+        actual_length=actual_length,
+    )
+    return ActionFailure(InputTextCommitMismatch(expected_length=expected_length, actual_length=actual_length))
+
+
+async def _verify_generic_input_commit(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    dom: DomUtil,
+    tag_name: str,
+    input_type: str,
+    expected_value: str,
+    allow_autocomplete_rewrite: bool = False,
+) -> ActionFailure | None:
+    try:
+        return await _verify_generic_input_commit_with_escalation(
+            skyvern_element=skyvern_element,
+            skyvern_frame=skyvern_frame,
+            dom=dom,
+            tag_name=tag_name,
+            input_type=input_type,
+            expected_value=expected_value,
+            allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        )
+    except PlaywrightError as exc:
+        if _is_input_commit_navigation_error(exc):
+            return None
+        if _is_input_commit_detached_error(exc):
+            LOG.info(
+                "Element detached during input commit verification; skipping verification",
+                element_id=skyvern_element.get_id(),
+            )
+            return None
+        raise
+
+
+def _is_generic_input_commit_candidate(*, tag_name: str, live_input_type: str) -> str | None:
+    if tag_name == "textarea":
+        return "textarea"
+    if tag_name != InteractiveElement.INPUT:
+        return None
+    return live_input_type if live_input_type not in _NON_TEXT_INPUT_TYPES else None
 
 
 async def _log_tel_fallback_fill_digit_counts(
@@ -1394,6 +2024,66 @@ async def _fill_card_number_with_readback(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
         )
+    )
+
+
+# Character an input-mask library leaves in unfilled slots (jQuery Inputmask, Cleave, and component-library
+# masked inputs generally).
+_MASK_PLACEHOLDER_CHAR = "_"
+
+
+def _alnum(value: str | None) -> str:
+    return "".join(ch for ch in (value or "") if ch.isalnum())
+
+
+def _has_input_mask_evidence(*, pattern: str | None, placeholder: str | None) -> bool:
+    # Only treat a field as masked when it advertises a constraint: an HTML `pattern`, or a placeholder
+    # rendered from mask slots (e.g. "_____", "___-__-____"). Keeps unrelated inputs untouched.
+    if pattern:
+        return True
+    return placeholder is not None and _MASK_PLACEHOLDER_CHAR in placeholder
+
+
+def _committed_value_is_masked_incomplete(expected_value: str, committed_value: str | None) -> bool:
+    # The mask accepted keystrokes but did not commit them: reads back empty (only separators), or still
+    # shows unfilled placeholder slots while holding fewer characters than were typed. Compares character
+    # counts only — never the raw value, which may be a secret. A placeholder char inside an otherwise
+    # complete value (e.g. "foo_bar") is not treated as incomplete.
+    expected_alnum = _alnum(expected_value)
+    if not expected_alnum:
+        return False
+    committed_alnum = _alnum(committed_value)
+    if not committed_alnum:
+        return True
+    return (
+        committed_value is not None
+        and _MASK_PLACEHOLDER_CHAR in committed_value
+        and len(committed_alnum) < len(expected_alnum)
+    )
+
+
+async def _verify_masked_input_after_fill(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    tag_name: str,
+    expected_value: str,
+    known_masked: bool,
+) -> None:
+    committed_value = await get_input_value(tag_name, skyvern_element.get_locator())
+    triggered = known_masked or (committed_value is not None and _MASK_PLACEHOLDER_CHAR in committed_value)
+    if not triggered or not _committed_value_is_masked_incomplete(expected_value, committed_value):
+        return
+
+    # A masked value can land a beat after the keystrokes settle; let the field commit before verdict.
+    await skyvern_frame.safe_wait_for_animation_end(caller="input_text.masked_readback")
+    committed_value = await get_input_value(tag_name, skyvern_element.get_locator())
+    if not _committed_value_is_masked_incomplete(expected_value, committed_value):
+        return
+
+    raise MaskedInputReadbackMismatch(
+        expected_char_count=len(_alnum(expected_value)),
+        committed_char_count=len(_alnum(committed_value)),
     )
 
 
@@ -1558,13 +2248,21 @@ async def _select_deterministic_normal_option(
     return action_result
 
 
-async def _verify_normal_select_option(
+async def _normal_select_readback_contradicts(
     *,
     locator: Locator,
     matched_index: int,
     matched_label: str | None,
     matched_value: str | None,
 ) -> bool:
+    """True only when a readable read-back disagrees with the deterministic selection.
+
+    An unreadable read-back is not a contradiction. select_option has already reported the value
+    committed, and a select's own change event can rerender or navigate the page away, detaching the
+    element; re-running the LLM fallback against that stale locator only fails again by value, label,
+    and index. Same reasoning as `is_post_dispatch_click_timeout`: the side effect landed, so a
+    timed-out post-action read must not trigger a duplicating fallback chain.
+    """
     try:
         selection = await locator.evaluate(
             r"""
@@ -1580,11 +2278,12 @@ async def _verify_normal_select_option(
                     value: option ? normalize(option.value) : normalize(select.value),
                 };
             }
-            """
+            """,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception:
         LOG.info(
-            "Failed to read normal select option after deterministic selection",
+            "Failed to read normal select option after deterministic selection; keeping select_option success",
             expected_index=matched_index,
             expected_label=matched_label,
             expected_value=matched_value,
@@ -1594,7 +2293,7 @@ async def _verify_normal_select_option(
 
     if not isinstance(selection, dict):
         LOG.info(
-            "Normal select read-back returned unexpected payload",
+            "Normal select read-back returned unexpected payload; keeping select_option success",
             expected_index=matched_index,
             expected_label=matched_label,
             expected_value=matched_value,
@@ -1602,26 +2301,32 @@ async def _verify_normal_select_option(
         )
         return False
 
+    # The read-back JS trims, but scraped option text does not: domUtils.removeMultipleSpaces()
+    # collapses whitespace runs without trimming, and returns early when there is no double
+    # space/tab/newline, so a single edge space survives verbatim into matched_label/matched_value.
+    expected_label = " ".join(matched_label.split()) if matched_label is not None else None
+    expected_value = " ".join(matched_value.split()) if matched_value is not None else None
+
     actual_index = selection.get("index")
     actual_value = selection.get("value")
     actual_label = selection.get("label") or actual_value
     if (
         actual_index == matched_index
-        and actual_label == matched_label
-        and (matched_value is None or actual_value == matched_value)
+        and actual_label == expected_label
+        and (expected_value is None or actual_value == expected_value)
     ):
-        return True
+        return False
 
     LOG.info(
         "Normal select read-back did not match deterministic option",
         expected_index=matched_index,
-        expected_label=matched_label,
-        expected_value=matched_value,
+        expected_label=expected_label,
+        expected_value=expected_value,
         actual_index=actual_index,
         actual_label=actual_label,
         actual_value=actual_value,
     )
-    return False
+    return True
 
 
 async def check_date_format(
@@ -1664,7 +2369,12 @@ async def check_date_format(
 class AutoCompletionResult(BaseModel):
     auto_completion_attempt: bool = False
     incremental_elements: list[dict] = []
-    action_result: ActionResult = ActionSuccess()
+    action_result: ActionResult | None = None
+    stage_outcome: str | None = None
+    # A click landed and mutated the field but the commit could not be verified. Once this is
+    # set the field is already dirty, so the caller must stop trying further selections instead
+    # of clicking more options on top of it.
+    committed_side_effects: bool = False
 
 
 class ScopedXhrDownloadCapture:
@@ -2452,6 +3162,91 @@ async def _retarget_disabled_element_for_click(
     return child_element
 
 
+_SUBMIT_LIKE_TEXT = re.compile(
+    r"\b(next|submit|continue|proceed|confirm|finish|save|apply|update|complete|register|sign\s?up|log\s?in)\b",
+    re.IGNORECASE,
+)
+
+_BLOCKED_FORM_ADVANCE_MESSAGE = (
+    "Clicked '{label}' but the page did not advance and no new elements appeared. The form is likely "
+    "blocked by a validation error — inspect the visible fields for invalid or required inputs and any "
+    "error messages, resolve them, and only then click to advance again instead of repeating this click."
+)
+
+
+def _submit_like_label(element_dict: dict) -> str:
+    attributes = element_dict.get("attributes") or {}
+    for candidate in (
+        element_dict.get("text"),
+        attributes.get("value"),
+        attributes.get("aria-label"),
+        attributes.get("title"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return "the button"
+
+
+def _click_is_submit_like(element_dict: dict) -> bool:
+    attributes = element_dict.get("attributes") or {}
+    tag = str(element_dict.get("tagName") or "").lower()
+    input_type = str(attributes.get("type") or "").lower()
+    if tag == "input" and input_type in {"submit", "image"}:
+        return True
+    role = str(attributes.get("role") or attributes.get("aria-role") or "").lower()
+    # A bare <a> is a navigation link (a real one changes the URL and is excluded by the
+    # caller's URL-change check); only an <a role="button"> counts as a submit control.
+    is_button_like = tag == "button" or role == "button" or (tag == "input" and input_type == "button")
+    if not is_button_like:
+        return False
+    label = " ".join(
+        str(part)
+        for part in (
+            element_dict.get("text"),
+            attributes.get("value"),
+            attributes.get("aria-label"),
+            attributes.get("title"),
+        )
+        if part
+    )
+    return bool(_SUBMIT_LIKE_TEXT.search(label))
+
+
+async def _maybe_flag_blocked_form_advance(
+    *,
+    results: list[ActionResult],
+    skyvern_element: SkyvernElement,
+    page: Page,
+    original_url: str,
+    incremental_scraped: IncrementalScrapePage,
+    task: Task,
+) -> None:
+    """Surface a diagnostic when a submit-like click neither navigated nor revealed new elements.
+
+    The signal flows to the next step's planner through ActionResult.followup_message (see
+    get_action_history), directing the agent to resolve the blocking validation instead of
+    re-clicking a button that is not advancing the form.
+    """
+    if not results or not isinstance(results[-1], ActionSuccess):
+        return
+    element_dict = skyvern_element.get_element_dict()
+    if not _click_is_submit_like(element_dict):
+        return
+    if page.url != original_url:
+        return
+    if not await _is_surface_blocked_form_advance_enabled(task):
+        return
+    if await incremental_scraped.get_incremental_elements_num() > 0:
+        return
+    results[-1].needs_followup = True
+    results[-1].followup_message = _BLOCKED_FORM_ADVANCE_MESSAGE.format(label=_submit_like_label(element_dict))
+    LOG.info(
+        "Surfacing blocked-form-advance diagnostic after a non-advancing submit-like click",
+        element_id=skyvern_element.get_id(),
+    )
+
+
 @traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
@@ -2609,6 +3404,17 @@ async def handle_click_action(
                 ):
                     results.append(sequential_click_result)
                     return results
+
+                # No navigation and no dropdown surfaced: flag a non-advancing submit-like click so the
+                # next step's planner resolves the blocking validation instead of re-clicking.
+                await _maybe_flag_blocked_form_advance(
+                    results=results,
+                    skyvern_element=skyvern_element,
+                    page=page,
+                    original_url=original_url,
+                    incremental_scraped=incremental_scraped,
+                    task=task,
+                )
 
             except Exception:
                 LOG.warning(
@@ -2786,6 +3592,7 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
+        entry_action_type="click",
         scraped_page_after_open=scraped_page_after_open,
         new_interactable_element_ids=new_interactable_element_ids,
     )
@@ -3002,6 +3809,40 @@ def _incremental_tree_contains_target_value(elements: list[dict], target_value: 
     return False
 
 
+def _incremental_tree_contains_option_with_target_value(elements: list[dict], target_value: str) -> bool:
+    # Match the target only against real option candidates (what the selector would click), unlike the
+    # broad search-bar helper above, so a "No results for <target>" banner cannot admit a selection.
+    normalized_target = _normalize_dropdown_match_text(target_value)
+    if not normalized_target:
+        return False
+    for candidate in _custom_select_candidates_from_elements(elements):
+        label = candidate.get("label")
+        if isinstance(label, str) and normalized_target in _normalize_dropdown_match_text(label):
+            return True
+    return False
+
+
+def _attr_indicates_aria_invalid(raw: object) -> bool:
+    # Compare as a normalized string so a literal False (bool or "false") reads as valid, not truthy;
+    # aria-invalid is "true"/"grammar"/"spelling" when rejected, "false"/absent when accepted.
+    if raw is None:
+        return False
+    return str(raw).strip().casefold() not in ("", "false")
+
+
+async def _is_commit_required_combobox(skyvern_element: SkyvernElement) -> bool:
+    role = await skyvern_element.get_attr("role")
+    aria_autocomplete = await skyvern_element.get_attr("aria-autocomplete")
+    is_combobox = str(role or "").strip().casefold() == "combobox" or str(
+        aria_autocomplete or ""
+    ).strip().casefold() in ("list", "both")
+    if not is_combobox:
+        return False
+    # aria-invalid is read live (dynamic) because it reflects post-input state, not the pre-input scrape.
+    aria_invalid = await skyvern_element.get_attr("aria-invalid", mode="dynamic")
+    return _attr_indicates_aria_invalid(aria_invalid)
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -3102,7 +3943,14 @@ async def handle_input_text_action(
             action=action,
         )
         action.set_has_mini_agent()
-        return await handle_select_option_action(select_action, page, scraped_page, task, step)
+        return await handle_select_option_action(
+            select_action,
+            page,
+            scraped_page,
+            task,
+            step,
+            entry_action_type="input_text_converted",
+        )
 
     select_action = SelectOptionAction(
         reasoning=action.reasoning,
@@ -3114,6 +3962,7 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+    autocomplete_option_signal: bool = False
 
     input_or_select_context = await _get_input_or_select_context(
         action=action,
@@ -3211,6 +4060,7 @@ async def handle_input_text_action(
                     step=step,
                     task=task,
                     target_value=text,
+                    entry_action_type="input_text",
                 )
 
                 if select_result is not None:
@@ -3280,7 +4130,8 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
-    is_tel = await skyvern_element.get_attr("type") == "tel"
+    live_input_type = ((await skyvern_element.get_attr("type")) or "text").lower()
+    is_tel = live_input_type == "tel"
     candidate_card_digits = _card_number_digits(text)
     is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
         skyvern_element
@@ -3288,11 +4139,16 @@ async def handle_input_text_action(
     used_bare_nanp = False
     run_phone_format_check = False
     log_tel_fallback_readback = False
+    tel_pattern: str | None = None
+    tel_maxlength: str | None = None
+    tel_e164_fallback: str | None = None
     if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
         # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
         # byte-for-byte. Affirmative-NANP tel is typed as bare national digits (skipping the format-check
         # LLM) unless the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
         tel_pattern = await skyvern_element.get_attr("pattern")
+        tel_maxlength = await skyvern_element.get_attr("maxlength")
+        tel_e164_fallback = _nanp_e164_fallback(text, pattern=tel_pattern, maxlength=tel_maxlength)
         text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
             is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
         )
@@ -3379,8 +4235,11 @@ async def handle_input_text_action(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
             if await blocking_element.is_editable():
+                blocking_tag_name = blocking_element.get_tag_name()
+                blocking_input_type = ((await blocking_element.get_attr("type")) or "text").lower()
                 skyvern_element = blocking_element
-                tag_name = blocking_element.get_tag_name()
+                tag_name = blocking_tag_name
+                live_input_type = blocking_input_type
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -3431,7 +4290,7 @@ async def handle_input_text_action(
         if len(text) == 0:
             return [ActionSuccess()]
 
-        if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
+        if tag_name == InteractiveElement.INPUT and live_input_type == "date":
             try:
                 action.set_has_mini_agent()
                 text = await check_date_format(
@@ -3473,7 +4332,8 @@ async def handle_input_text_action(
                     auto_complete_hacky_flag = False
                     return [result]
 
-        # Only the bare-digit NANP fill is read back to verify; other tel shapes are left unverified.
+        # Only the bare-digit NANP path uses the verified fallback ladder; other tel shapes remain
+        # observational to preserve flag-off behavior.
         verify_tel_input_after_fill = used_bare_nanp
 
         # SKY-11720: an auto-formatting card-number field (a space every 4 digits) restores its caret
@@ -3485,7 +4345,25 @@ async def handle_input_text_action(
         if is_card_number_input:
             card_expected_digits = candidate_card_digits
 
+        # Masked inputs (postal code, SSN) can report a successful fill while the mask committed nothing.
+        # Read the value back for masked fields and, on an empty/placeholder commit, retype once.
+        verify_masked_input_after_fill = False
+        mask_attr_evidence = False
+        if not is_tel and await _is_masked_input_readback_fix_enabled(task):
+            mask_attr_evidence = _has_input_mask_evidence(
+                pattern=await skyvern_element.get_attr("pattern"),
+                placeholder=await skyvern_element.get_attr("placeholder"),
+            )
+            verify_masked_input_after_fill = True
+
+        generic_commit_input_type = None
+        if not is_tel and not card_expected_digits and await _is_input_text_commit_verification_enabled(task):
+            generic_commit_input_type = _is_generic_input_commit_candidate(
+                tag_name=tag_name,
+                live_input_type=live_input_type,
+            )
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+        input_context_destroyed = False
 
         try:
             if card_expected_digits:
@@ -3497,36 +4375,59 @@ async def handle_input_text_action(
                 )
                 if card_failure is not None:
                     return [card_failure]
-            else:
+            elif verify_tel_input_after_fill:
+                phone_mismatch = await _fill_nanp_tel_with_readback(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    national_digits=text,
+                    e164_fallback=tel_e164_fallback,
+                )
+                if phone_mismatch is not None:
+                    LOG.warning(
+                        "Phone input read-back mismatch after retry",
+                        element_id=skyvern_element.get_id(),
+                        expected_digit_count=phone_mismatch.expected_digit_count,
+                        actual_digit_count=phone_mismatch.actual_digit_count,
+                    )
+                    return [ActionFailure(phone_mismatch)]
+            elif verify_masked_input_after_fill:
                 await skyvern_element.input_sequentially(text=text)
-                if verify_tel_input_after_fill:
-                    # Read the typed digits back; on mismatch, clear and retype once. A second mismatch
-                    # fails the action here rather than letting it surface as a silent wrong fill.
+                # Read the committed value back; on an empty/placeholder commit, refocus, clear and retype
+                # once. A second failure fails the action with a diagnostic rather than a silent empty fill.
+                try:
+                    await _verify_masked_input_after_fill(
+                        skyvern_element=skyvern_element,
+                        skyvern_frame=skyvern_frame,
+                        tag_name=tag_name,
+                        expected_value=text,
+                        known_masked=mask_attr_evidence,
+                    )
+                except MaskedInputReadbackMismatch:
+                    await skyvern_element.get_locator().focus(timeout=timeout)
+                    await skyvern_element.input_clear()
+                    await skyvern_element.input_sequentially(text=text)
                     try:
-                        await _verify_tel_input_after_fill(
+                        # Attempt 1 only raises once the field is proven masked, so the retry keeps that
+                        # verdict: a mask that swallows the retype reads back clean of placeholder chars.
+                        await _verify_masked_input_after_fill(
                             skyvern_element=skyvern_element,
+                            skyvern_frame=skyvern_frame,
                             tag_name=tag_name,
                             expected_value=text,
+                            known_masked=True,
                         )
-                    except PhoneNumberInputMismatch:
-                        await skyvern_element.input_clear()
-                        await skyvern_element.input_sequentially(text=text)
-                        try:
-                            await _verify_tel_input_after_fill(
-                                skyvern_element=skyvern_element,
-                                tag_name=tag_name,
-                                expected_value=text,
-                            )
-                        except PhoneNumberInputMismatch as mismatch:
-                            LOG.warning(
-                                "Phone input read-back mismatch after retry",
-                                action=action,
-                                element_id=skyvern_element.get_id(),
-                                expected_digit_count=mismatch.expected_digit_count,
-                                actual_digit_count=mismatch.actual_digit_count,
-                            )
-                            return [ActionFailure(mismatch)]
-                elif log_tel_fallback_readback:
+                    except MaskedInputReadbackMismatch as mismatch:
+                        LOG.warning(
+                            "Masked input read-back mismatch after retry",
+                            action=action,
+                            element_id=skyvern_element.get_id(),
+                            expected_char_count=mismatch.expected_char_count,
+                            committed_char_count=mismatch.committed_char_count,
+                        )
+                        return [ActionFailure(mismatch)]
+            else:
+                await skyvern_element.input_sequentially(text=text)
+                if log_tel_fallback_readback:
                     await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
@@ -3544,6 +4445,7 @@ async def handle_input_text_action(
             )
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
+                autocomplete_option_signal = _incremental_elements_contain_option_ui(incremental_element)
                 if (
                     input_or_select_context
                     and input_or_select_context.is_search_bar
@@ -3551,6 +4453,44 @@ async def handle_input_text_action(
                 ):
                     LOG.info(
                         "Detected target-matching dropdown after search-bar input; attempting custom selection",
+                        element_id=skyvern_element.get_id(),
+                    )
+                    action.set_has_mini_agent()
+                    select_result = await sequentially_select_from_dropdown(
+                        action=select_action,
+                        input_or_select_context=input_or_select_context,
+                        page=page,
+                        dom=dom,
+                        skyvern_element=skyvern_element,
+                        skyvern_frame=skyvern_frame,
+                        incremental_scraped=incremental_scraped,
+                        step=step,
+                        task=task,
+                        force_select=True,
+                        target_value=text,
+                        entry_action_type="input_text",
+                    )
+                    if select_result and select_result.action_result and select_result.action_result.success:
+                        auto_complete_hacky_flag = False
+                        # A matching option was committed during this INPUT_TEXT. Stop the batch only when
+                        # the next queued action would clobber it (a trailing Enter/Return); next step re-scrapes.
+                        if action.stop_batch_after_dropdown_select:
+                            select_result.action_result.skip_remaining_actions = True
+                        return [select_result.action_result]
+                elif (
+                    input_or_select_context is not None
+                    and not input_or_select_context.is_search_bar
+                    and not input_or_select_context.is_location_input
+                    and not is_secret_value
+                    and _incremental_tree_contains_option_with_target_value(incremental_element, text)
+                    and await _is_commit_required_combobox(skyvern_element)
+                ):
+                    # A role=combobox / aria-autocomplete field that is still aria-invalid after typing
+                    # only commits by picking a rendered option; the Tab hack below won't do that. Force one
+                    # deterministic selection against the surfaced option. This does not touch
+                    # is_auto_completion_input() or the speculative pre-input fanout.
+                    LOG.info(
+                        "Detected target-matching option after typing into an invalid combobox; committing selection",
                         element_id=skyvern_element.get_id(),
                         target_value=text,
                     )
@@ -3567,11 +4507,10 @@ async def handle_input_text_action(
                         task=task,
                         force_select=True,
                         target_value=text,
+                        entry_action_type="input_text",
                     )
                     if select_result and select_result.action_result and select_result.action_result.success:
                         auto_complete_hacky_flag = False
-                        # A matching option was committed during this INPUT_TEXT. Stop the batch only when
-                        # the next queued action would clobber it (a trailing Enter/Return); next step re-scrapes.
                         if action.stop_batch_after_dropdown_select:
                             select_result.action_result.skip_remaining_actions = True
                         return [select_result.action_result]
@@ -3584,6 +4523,7 @@ async def handle_input_text_action(
                 or "navigation" in error_message
                 or "target closed" in error_message
             ):
+                input_context_destroyed = True
                 # These are expected during page navigation/auto-submit, silently continue
                 LOG.debug(
                     "Playwright error during incremental element processing (likely page navigation)",
@@ -3607,6 +4547,19 @@ async def handle_input_text_action(
         finally:
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
+
+        if generic_commit_input_type is not None and not input_context_destroyed:
+            commit_failure = await _verify_generic_input_commit(
+                skyvern_element=skyvern_element,
+                skyvern_frame=skyvern_frame,
+                dom=dom,
+                tag_name=tag_name,
+                input_type=generic_commit_input_type,
+                expected_value=text,
+                allow_autocomplete_rewrite=autocomplete_option_signal,
+            )
+            if commit_failure is not None:
+                return [commit_failure]
 
         return [ActionSuccess()]
     except Exception as e:
@@ -3868,6 +4821,7 @@ async def handle_select_option_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    entry_action_type: str = "select_option",
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
@@ -4114,6 +5068,7 @@ async def handle_select_option_action(
                     scraped_page=scraped_page,
                     task=task,
                     step=step,
+                    entry_action_type=entry_action_type,
                 )
             )
             return results
@@ -4132,6 +5087,7 @@ async def handle_select_option_action(
             task=task,
             force_select=True,
             target_value=action.option.label or action.option.value or "",
+            entry_action_type=entry_action_type,
         )
         # force_select won't return None result
         assert result is not None
@@ -4614,7 +5570,8 @@ async def handle_goto_url_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.goto(action.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
+    await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -4700,9 +5657,10 @@ async def handle_new_tab_action(
     browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
     if browser_state is None:
         return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
+    validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
     new_page = await browser_state.new_page()
     try:
-        await browser_state.navigate_to_url(page=new_page, url=action.url)
+        await browser_state.navigate_to_url(page=new_page, url=validated_url)
     except Exception as e:
         # Don't leave a blank/failed tab as the newest page — the next scrape would fail it.
         try:
@@ -4882,82 +5840,15 @@ def generate_totp_value_with_task(task: Task, parameter: str) -> str:
 
 async def _did_page_respond(
     incremental_scraped: IncrementalScrapePage,
-    frame: Page | Frame,
-    original_url: str,
     skyvern_frame: SkyvernFrame | None = None,
 ) -> bool:
     try:
         if skyvern_frame:
             await skyvern_frame.safe_wait_for_animation_end(caller="page_respond")
-        return frame.url != original_url or (await incremental_scraped.get_incremental_elements_num()) > 0
+        return (await incremental_scraped.get_incremental_elements_num()) > 0
     except Exception:
         LOG.debug("Failed to check incremental elements after click", exc_info=True)
         return True
-
-
-async def _click_in_javascript_and_verify(
-    action: ClickAction | UploadFileAction,
-    page: Page,
-    skyvern_element: SkyvernElement,
-    incremental_scraped: IncrementalScrapePage,
-    skyvern_frame: SkyvernFrame | None,
-    *,
-    anchor: str,
-    no_response_msg: str,
-) -> ActionResult:
-    try:
-        frame = skyvern_frame.get_frame() if skyvern_frame else page
-        original_url = frame.url
-        await skyvern_element.click_in_javascript()
-        if await _did_page_respond(incremental_scraped, frame, original_url, skyvern_frame):
-            return ActionSuccess()
-        LOG.info(
-            "Chain click: JS click did not trigger a page response",
-            action=action,
-            element=str(skyvern_element),
-        )
-        return ActionFailure(FailToClick(action.element_id, anchor=anchor, msg=no_response_msg))
-    except Exception as e:
-        return ActionFailure(FailToClick(action.element_id, anchor=anchor, msg=str(e)))
-
-
-async def _is_likely_sibling_control(element: SkyvernElement, timeout: int) -> bool:
-    try:
-        metrics = await element.get_locator().evaluate(
-            """(element) => {
-                const rect = element.getBoundingClientRect();
-                const root = document.documentElement;
-                return {
-                    width: rect.width,
-                    height: rect.height,
-                    viewport_width: window.innerWidth || root.clientWidth || 0,
-                    viewport_height: window.innerHeight || root.clientHeight || 0,
-                    inside_modal: Boolean(element.closest(
-                        'dialog,[role="dialog" i],[role="alertdialog" i],[aria-modal="true" i]'
-                    )),
-                };
-            }""",
-            timeout=timeout,
-        )
-    except Exception:
-        LOG.debug("Failed to classify blocking sibling", exc_info=True, element_id=element.get_id())
-        return False
-
-    if not isinstance(metrics, dict) or metrics.get("inside_modal") is not False:
-        return False
-    width = metrics.get("width")
-    height = metrics.get("height")
-    viewport_width = metrics.get("viewport_width")
-    viewport_height = metrics.get("viewport_height")
-    dimensions = (width, height, viewport_width, viewport_height)
-    numeric_dimensions: list[float] = []
-    for value in dimensions:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            return False
-        numeric_dimensions.append(float(value))
-    numeric_width, numeric_height, numeric_viewport_width, numeric_viewport_height = numeric_dimensions
-    # ponytail: non-modal overlays are size-gated; add style/z-index signals if smaller overlays surface.
-    return numeric_width < numeric_viewport_width / 2 and numeric_height < numeric_viewport_height / 2
 
 
 def _get_click_count(action: ClickAction | UploadFileAction) -> int:
@@ -5176,46 +6067,6 @@ async def chain_click(
                         )
                         action_results.append(ActionSuccess())
                         return action_results
-
-                # A non-anchor click (e.g. a primary form submit) blocked by an
-                # untracked overlay (a consent / opt-out / FCRA modal over the
-                # control): a coordinate click would land on whatever pixel is on
-                # top — the overlay's own button — so dispatch on the intended
-                # element instead (element.click() fires on the target node,
-                # bypassing hit-testing and never touching the overlay). This
-                # needs the observer to confirm the click landed; without one we
-                # fail cleanly rather than guess, like the blocker path below.
-                if (
-                    isinstance(action, ClickAction)
-                    and not action.file_url
-                    and not action.download
-                    and action.x is None
-                    and action.y is None
-                    and click_count == 1
-                    and incremental_scraped is not None
-                    and skyvern_element.get_tag_name() != InteractiveElement.A
-                ):
-                    LOG.info(
-                        "Chain click: click blocked by an untracked overlay; dispatching on the intended element "
-                        "instead of coordinate-clicking into the overlay",
-                        action=action,
-                        element=str(skyvern_element),
-                        locator=locator,
-                    )
-                    action_results.append(
-                        await _click_in_javascript_and_verify(
-                            action,
-                            page,
-                            skyvern_element,
-                            incremental_scraped,
-                            skyvern_frame,
-                            anchor="overlay_blocked",
-                            no_response_msg=(
-                                "click blocked by overlay; no page response after intended-element dispatch"
-                            ),
-                        )
-                    )
-                    return action_results
             else:
                 # Element is visible and elementFromPoint returns the target itself,
                 # but Playwright's click still failed (e.g. element transiently
@@ -5229,13 +6080,45 @@ async def chain_click(
                     locator=locator,
                 )
 
+            # Only for a single click does "state unchanged" reliably mean "the
+            # click was a no-op": any repeated click toggles the checkbox more
+            # than once, so its final state is not a dependable no-op signal.
+            # Gate the checkbox verification on a single click and fold it into
+            # the shared coordinate -> JS ladder below instead of a parallel one.
+            verify_checkbox_toggle = click_count == 1 and await skyvern_element.is_checkbox()
+            checked_before = await skyvern_element.is_checked(timeout=timeout) if verify_checkbox_toggle else None
+
+            coordinate_error: Exception | None = None
             try:
                 await skyvern_element.coordinate_click(page=page, click_count=click_count)
+            except Exception as e:
+                coordinate_error = e
+
+            if verify_checkbox_toggle:
+                checked_after = await skyvern_element.is_checked(timeout=timeout)
+                state_known = checked_before is not None and checked_after is not None
+                if state_known and checked_after != checked_before:
+                    action_results.append(ActionSuccess())
+                    return action_results
+                if not state_known:
+                    # Unknown post-click state (detached/navigated): a second
+                    # click risks a double toggle, so never fall through to JS.
+                    if coordinate_error is None:
+                        action_results.append(ActionSuccess())
+                    else:
+                        action_results.append(
+                            ActionFailure(
+                                FailToClick(action.element_id, anchor="coordinate_click", msg=str(coordinate_error))
+                            )
+                        )
+                    return action_results
+                # State known and unchanged: a provable no-op, safe to JS-click.
+            elif coordinate_error is None:
                 action_results.append(ActionSuccess())
                 return action_results
-            except Exception as e:
+            else:
                 action_results.append(
-                    ActionFailure(FailToClick(action.element_id, anchor="coordinate_click", msg=str(e)))
+                    ActionFailure(FailToClick(action.element_id, anchor="coordinate_click", msg=str(coordinate_error)))
                 )
 
             LOG.info(
@@ -5246,11 +6129,26 @@ async def chain_click(
             )
             try:
                 await skyvern_element.click_in_javascript()
-                action_results.append(ActionSuccess())
-                return action_results
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
                 return action_results
+
+            if verify_checkbox_toggle:
+                checked_after_js = await skyvern_element.is_checked(timeout=timeout)
+                if checked_after_js is None or checked_after_js == checked_before:
+                    action_results.append(
+                        ActionFailure(
+                            FailToClick(
+                                action.element_id,
+                                anchor="self_js",
+                                msg="checkbox state unchanged after coordinate and JS click",
+                            )
+                        )
+                    )
+                    return action_results
+
+            action_results.append(ActionSuccess())
+            return action_results
 
         try:
             LOG.debug(
@@ -5259,11 +6157,9 @@ async def chain_click(
                 element=str(blocking_element),
                 locator=locator,
             )
-            target_handler = await skyvern_element.get_element_handler()
-            if await blocking_element.is_parent_of(target_handler) or (
-                await blocking_element.is_sibling_of(target_handler)
-                and (incremental_scraped is None or await _is_likely_sibling_control(blocking_element, timeout))
-            ):
+            if await blocking_element.is_parent_of(
+                await skyvern_element.get_element_handler()
+            ) or await blocking_element.is_sibling_of(await skyvern_element.get_element_handler()):
                 LOG.info(
                     "Chain click: element is blocked by other elements, going to click on the blocking element",
                     action=action,
@@ -5285,23 +6181,28 @@ async def chain_click(
 
         # JS click dispatches directly on the DOM node, bypassing hit-testing.
         LOG.info(
-            "Chain click: blocker is not a safe retarget, trying JS click on original element",
+            "Chain click: blocker is not parent/sibling, trying JS click on original element",
             action=action,
             element=str(skyvern_element),
             locator=locator,
         )
-        action_results.append(
-            await _click_in_javascript_and_verify(
-                action,
-                page,
-                skyvern_element,
-                incremental_scraped,
-                skyvern_frame,
-                anchor="self_js",
-                no_response_msg="no page response after click",
+        try:
+            await skyvern_element.click_in_javascript()
+            if await _did_page_respond(incremental_scraped, skyvern_frame):
+                action_results.append(ActionSuccess())
+                return action_results
+            LOG.info(
+                "Chain click: JS click did not trigger a page response",
+                action=action,
+                element=str(skyvern_element),
             )
-        )
-        return action_results
+            action_results.append(
+                ActionFailure(FailToClick(action.element_id, anchor="self_js", msg="no page response after click"))
+            )
+            return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
+            return action_results
 
     finally:
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
@@ -5376,8 +6277,11 @@ async def choose_auto_completion_dropdown(
     preserved_elements: list[dict] | None = None,
     relevance_threshold: float = 0.8,
     is_location_input: bool = False,
+    commit_required: bool = False,
+    verify_commit: bool = True,
     collapse_autocomplete_fanout_enabled: bool = False,
     action: InputTextAction | None = None,
+    poll_deadline: float | None = None,
 ) -> AutoCompletionResult:
     preserved_elements = preserved_elements or []
     clear_input = True
@@ -5390,12 +6294,12 @@ async def choose_auto_completion_dropdown(
 
     try:
         await skyvern_element.press_fill(text)
-        # wait for new elemnts to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fill")
-        incremental_element = await incremental_scraped.get_incremental_element_tree(
-            clean_and_remove_element_tree_factory(
+        incremental_element = await _poll_autocomplete_incremental_elements(
+            incremental_scraped=incremental_scraped,
+            cleanup_factory=clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
             ),
+            deadline=poll_deadline,
         )
 
         # check if elements in preserve list are still on the page
@@ -5457,7 +6361,7 @@ async def choose_auto_completion_dropdown(
                                 "Autocomplete deterministic option identity failed, resetting input before LLM fallback",
                                 element_id=matched_element_id,
                                 matched_index=matched_index,
-                                matched_label=matched_label,
+                                matched_label_length=len(matched_label),
                             )
                             (
                                 incremental_scraped,
@@ -5475,6 +6379,7 @@ async def choose_auto_completion_dropdown(
                                 text=text,
                                 task=task,
                                 step=step,
+                                poll_deadline=poll_deadline,
                             )
                             result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                             cleaned_incremental_element = shadow_candidate_elements
@@ -5482,32 +6387,45 @@ async def choose_auto_completion_dropdown(
                             LOG.info(
                                 "Autocomplete deterministic fast path: exact/stem option found, skipping LLM",
                                 element_id=matched_element_id,
-                                input_value=text,
+                                input_length=len(text),
                                 matched_index=matched_index,
-                                matched_label=matched_label,
+                                matched_label_length=len(matched_label),
                             )
                             try:
                                 await matched_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-                                if await _verify_autocomplete_input_readback(
+                                # This deterministic read-back predates the commit-verification feature
+                                # (it is the one verify site that exists on main), so it stays on
+                                # regardless of verify_commit - gating it would reintroduce the silent
+                                # deterministic-click success this whole change exists to stop.
+                                commit_outcome = await _verify_autocomplete_input_readback(
                                     skyvern_element=skyvern_element,
-                                    matched_index=matched_index,
                                     matched_label=matched_label,
-                                ):
+                                    typed_prefix=text,
+                                    pre_action_value=text,
+                                    suggestions_closed=await _autocomplete_suggestions_closed(matched_locator),
+                                    selection_state_present=await _autocomplete_selection_state(matched_locator),
+                                    commit_required=commit_required,
+                                )
+                                if commit_outcome.committed:
                                     clear_input = False
                                     result.action_result = ActionSuccess()
                                     return result
+                                result.stage_outcome = "clicked_but_not_committed"
+                                if commit_outcome.side_effects_observed:
+                                    result.committed_side_effects = True
+                                    raise AutoCompletionCommitFailure(stage="clicked_but_not_committed")
                                 LOG.info(
                                     "Autocomplete deterministic read-back failed, resetting input before LLM fallback",
                                     element_id=matched_element_id,
                                     matched_index=matched_index,
-                                    matched_label=matched_label,
                                 )
+                            except AutoCompletionCommitFailure:
+                                raise
                             except Exception:
                                 LOG.info(
                                     "Autocomplete deterministic fast-path click/read-back failed, falling through to LLM",
                                     element_id=matched_element_id,
                                     matched_index=matched_index,
-                                    matched_label=matched_label,
                                     exc_info=True,
                                 )
                             (
@@ -5526,6 +6444,7 @@ async def choose_auto_completion_dropdown(
                                 text=text,
                                 task=task,
                                 step=step,
+                                poll_deadline=poll_deadline,
                             )
                             result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                             cleaned_incremental_element = shadow_candidate_elements
@@ -5537,7 +6456,7 @@ async def choose_auto_completion_dropdown(
                             "Autocomplete deterministic option detached before click, resetting input before LLM fallback",
                             element_id=matched_element_id,
                             matched_index=matched_index,
-                            matched_label=matched_label,
+                            matched_label_length=len(matched_label),
                         )
                         (
                             incremental_scraped,
@@ -5555,6 +6474,7 @@ async def choose_auto_completion_dropdown(
                             text=text,
                             task=task,
                             step=step,
+                            poll_deadline=poll_deadline,
                         )
                         result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                         cleaned_incremental_element = shadow_candidate_elements
@@ -5574,18 +6494,62 @@ async def choose_auto_completion_dropdown(
                         LOG.info(
                             "Location auto-completion fast path: single option found, skipping LLM",
                             element_id=fast_path_element_id,
-                            input_value=text,
+                            input_length=len(text),
                         )
                         try:
                             await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-                            clear_input = False
-                            result.action_result = ActionSuccess()
-                            return result
+                            if verify_commit:
+                                commit_outcome = await _verify_autocomplete_input_readback(
+                                    skyvern_element=skyvern_element,
+                                    matched_label=only_element.get("text") or "",
+                                    typed_prefix=text,
+                                    pre_action_value=text,
+                                    suggestions_closed=await _autocomplete_suggestions_closed(fast_path_locator),
+                                    selection_state_present=await _autocomplete_selection_state(fast_path_locator),
+                                    commit_required=commit_required,
+                                )
+                            else:
+                                commit_outcome = AutocompleteCommitOutcome(committed=True)
+                            if commit_outcome.committed:
+                                clear_input = False
+                                result.action_result = ActionSuccess()
+                                return result
+                            result.stage_outcome = "clicked_but_not_committed"
+                            if commit_outcome.side_effects_observed:
+                                result.committed_side_effects = True
+                                raise AutoCompletionCommitFailure(stage="clicked_but_not_committed")
+                            LOG.info(
+                                "Location fast-path read-back failed, resetting input before LLM fallback",
+                                element_id=fast_path_element_id,
+                            )
+                        except AutoCompletionCommitFailure:
+                            raise
                         except Exception:
                             LOG.info(
                                 "Location fast-path click failed, falling through to LLM",
                                 element_id=fast_path_element_id,
+                                exc_info=True,
                             )
+                        (
+                            incremental_scraped,
+                            fallback_incremental_elements,
+                            shadow_candidate_elements,
+                            html,
+                            new_interactable_element_ids,
+                        ) = await _reset_autocomplete_for_llm_fallback(
+                            current_incremental_scraped=incremental_scraped,
+                            skyvern_frame=skyvern_frame,
+                            skyvern_element=skyvern_element,
+                            page=page,
+                            scraped_page=scraped_page,
+                            dom=dom,
+                            text=text,
+                            task=task,
+                            step=step,
+                            poll_deadline=poll_deadline,
+                        )
+                        result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
+                        cleaned_incremental_element = shadow_candidate_elements
 
             if not html:
                 html = incremental_scraped.build_html_tree(cleaned_incremental_element)
@@ -5602,7 +6566,7 @@ async def choose_auto_completion_dropdown(
                 if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
             ]
             if len(new_interactable_element_ids) == 0:
-                raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+                raise AutoCompletionCommitFailure(stage="suggestions_never_rendered")
             LOG.info(
                 "New elements detected after the input",
                 new_elements_ids=new_interactable_element_ids,
@@ -5649,11 +6613,31 @@ async def choose_auto_completion_dropdown(
         if json_response.get("direct_searching", False):
             LOG.info(
                 "Decided to directly search with the current value",
-                value=text,
+                element_id=skyvern_element.get_id(),
+                input_length=len(text),
             )
             await skyvern_element.press_key("Enter")
-            clear_input = False
-            return result
+            matched_label = str(json_response.get("value") or "")
+            # Searching with the typed text leaves the value unchanged by design, so an unchanged
+            # read-back is a commit here - but not on a field that must commit a real suggestion,
+            # where it is indistinguishable from Enter doing nothing at all.
+            if verify_commit:
+                commit_outcome = await _verify_autocomplete_input_readback(
+                    skyvern_element=skyvern_element,
+                    matched_label=matched_label or text,
+                    typed_prefix=text,
+                    pre_action_value=text,
+                    allow_unchanged_value=not commit_required,
+                    commit_required=commit_required,
+                )
+            else:
+                commit_outcome = AutocompleteCommitOutcome(committed=True)
+            if commit_outcome.committed:
+                clear_input = False
+                result.action_result = ActionSuccess()
+                return result
+            result.committed_side_effects = commit_outcome.side_effects_observed
+            raise AutoCompletionCommitFailure(stage="clicked_but_not_committed")
 
         if not element_id:
             reasoning = json_response.get("reasoning")
@@ -5682,6 +6666,15 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
+        candidate_match = _autocomplete_candidate_for_element_id(shadow_candidate_elements, element_id)
+        if candidate_match is None:
+            raise NoSuitableAutoCompleteOption(
+                reasoning="Selected element was not a rendered suggestion",
+                target_value=text,
+            )
+        _matched_index, candidate = candidate_match
+        matched_label = candidate.get("label") or ""
+
         # Use SkyvernElement.click() so we get the full fallback chain
         # (Playwright click → coordinate click → JavaScript click).  Plain
         # locator.click() can fail when the item or one of its ancestors has
@@ -5693,16 +6686,36 @@ async def choose_auto_completion_dropdown(
         )
         await selected_element.scroll_into_view()
         await selected_element.click(page=page)
-        clear_input = False
-        return result
+        if verify_commit:
+            commit_outcome = await _verify_autocomplete_input_readback(
+                skyvern_element=skyvern_element,
+                matched_label=matched_label,
+                typed_prefix=text,
+                pre_action_value=text,
+                suggestions_closed=await _autocomplete_suggestions_closed(locator),
+                selection_state_present=await _autocomplete_selection_state(locator),
+                commit_required=commit_required,
+            )
+        else:
+            commit_outcome = AutocompleteCommitOutcome(committed=True)
+        if commit_outcome.committed:
+            clear_input = False
+            result.action_result = ActionSuccess()
+            return result
+        result.committed_side_effects = commit_outcome.side_effects_observed
+        raise AutoCompletionCommitFailure(stage="clicked_but_not_committed")
 
     except Exception as e:
+        stage = e.stage if isinstance(e, AutoCompletionCommitFailure) else "suggestion_not_matched"
         LOG.info(
             "Failed to choose the auto completion dropdown",
             sampling=True,
+            element_id=skyvern_element.get_id(),
+            input_length=len(text),
+            stage=stage,
             exc_info=True,
-            input_value=text,
         )
+        result.stage_outcome = stage
         result.action_result = ActionFailure(exception=e)
         return result
     finally:
@@ -5721,6 +6734,21 @@ def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
         cache_map.add(key)
         new_elements.append(element)
     return new_elements
+
+
+def _autocomplete_side_effect_terminal(
+    *, commit_required: bool, attempt_trail: list[str], element_id: str
+) -> ActionResult | None:
+    LOG.info(
+        "Autocomplete click mutated the field without a verified commit; stopping to avoid clicking further options on a dirty field",
+        element_id=element_id,
+        attempt_trail=attempt_trail,
+    )
+    if commit_required:
+        return ActionFailure(
+            AutoCompletionCommitFailure(stage="clicked_but_not_committed", attempt_trail=attempt_trail)
+        )
+    return None
 
 
 async def input_or_auto_complete_input(
@@ -5750,6 +6778,16 @@ async def input_or_auto_complete_input(
     current_attemp = 0
     current_value = text
     result = AutoCompletionResult()
+    attempt_trail: list[str] = []
+    is_location = input_or_select_context.is_location_input or False
+    # Commit verification (and everything downstream of a failed read-back) only runs behind the
+    # flag, so flag-off orgs keep the pre-verification behavior: a selection click is assumed
+    # committed, with no read-back cost and no extra LLM fall-through.
+    verify_commit = await _is_autocomplete_commit_required_enabled(task)
+    # A location-search widget can be both. Search bars keep their documented fall-through, so they
+    # never enter strict commit mode - otherwise the search-bar branch below returns a hard failure.
+    commit_required = is_location and not input_or_select_context.is_search_bar and verify_commit
+    poll_deadline = asyncio.get_running_loop().time() + AUTOCOMPLETE_TOTAL_DEADLINE_SECONDS
 
     while current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
         current_attemp += 1
@@ -5759,9 +6797,9 @@ async def input_or_auto_complete_input(
         LOG.info(
             "Try the potential value for auto completion",
             sampling=True,
-            input_value=current_value,
+            attempt=current_attemp,
+            input_length=len(current_value),
         )
-        is_location = input_or_select_context.is_location_input or False
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
@@ -5773,18 +6811,29 @@ async def input_or_auto_complete_input(
             step=step,
             task=task,
             is_location_input=is_location,
+            commit_required=commit_required,
+            verify_commit=verify_commit,
             collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
             action=action,
+            poll_deadline=poll_deadline,
         )
         if isinstance(result.action_result, ActionSuccess):
             return ActionSuccess()
+        attempt_trail.append(f"attempt_{len(attempt_trail) + 1}:{result.stage_outcome or 'suggestion_not_matched'}")
 
         if input_or_select_context.is_search_bar:
+            # commit_required is derived with `and not is_search_bar`, so it is always False here;
+            # search bars keep their documented fall-through.
             LOG.info(
                 "Stop generating potential values for the auto-completion since it's a search bar",
                 context=input_or_select_context,
             )
             return None
+
+        if result.committed_side_effects:
+            return _autocomplete_side_effect_terminal(
+                commit_required=commit_required, attempt_trail=attempt_trail, element_id=skyvern_element.get_id()
+            )
 
         tried_values.append(current_value)
         whole_new_elements.extend(result.incremental_elements)
@@ -5807,7 +6856,7 @@ async def input_or_auto_complete_input(
 
         LOG.info(
             "Ask LLM to give potential values based on the current value",
-            current_value=current_value,
+            input_length=len(current_value),
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
         )
         if collapse_autocomplete_fanout_enabled and action is not None:
@@ -5822,13 +6871,14 @@ async def input_or_auto_complete_input(
             if not value:
                 LOG.info(
                     "Empty potential value, skip this attempt",
-                    value=each_value,
+                    attempt=current_attemp,
                 )
                 continue
             LOG.info(
                 "Try the potential value for auto completion",
                 sampling=True,
-                input_value=value,
+                attempt=current_attemp,
+                input_length=len(value),
             )
             result = await choose_auto_completion_dropdown(
                 context=input_or_select_context,
@@ -5841,11 +6891,20 @@ async def input_or_auto_complete_input(
                 step=step,
                 task=task,
                 is_location_input=is_location,
+                commit_required=commit_required,
+                verify_commit=verify_commit,
                 collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
                 action=action,
+                poll_deadline=poll_deadline,
             )
             if isinstance(result.action_result, ActionSuccess):
                 return ActionSuccess()
+            attempt_trail.append(f"attempt_{len(attempt_trail) + 1}:{result.stage_outcome or 'suggestion_not_matched'}")
+
+            if result.committed_side_effects:
+                return _autocomplete_side_effect_terminal(
+                    commit_required=commit_required, attempt_trail=attempt_trail, element_id=skyvern_element.get_id()
+                )
 
             tried_values.append(value)
             whole_new_elements.extend(result.incremental_elements)
@@ -5854,8 +6913,8 @@ async def input_or_auto_complete_input(
         if current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
             LOG.info(
                 "Ask LLM to tweak the current value based on tried input values",
-                current_value=current_value,
                 current_attemp=current_attemp,
+                input_length=len(current_value),
             )
             cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
             prompt = prompt_engine.load_prompt(
@@ -5874,12 +6933,15 @@ async def input_or_auto_complete_input(
             context_reasoning = json_respone.get("reasoning")
             new_current_value = json_respone.get("tweaked_value", "")
             if not new_current_value:
+                if commit_required:
+                    stage = result.stage_outcome or "suggestion_not_matched"
+                    return ActionFailure(AutoCompletionCommitFailure(stage=stage, attempt_trail=attempt_trail))
                 return ActionFailure(ErrEmptyTweakValue(reasoning=context_reasoning, current_value=current_value))
             LOG.info(
                 "Ask LLM tweaked the current value with a new value",
                 field_information=input_or_select_context.field,
-                current_value=current_value,
-                new_value=new_current_value,
+                previous_length=len(current_value),
+                new_length=len(new_current_value),
             )
             current_value = new_current_value
 
@@ -5888,26 +6950,38 @@ async def input_or_auto_complete_input(
             LOG.info(
                 "Auto completion attempts exhausted, trying discover-all-options fallback",
                 element_id=skyvern_element.get_id(),
-                original_text=text,
+                input_length=len(text),
             )
-            fallback_result = await discover_and_select_from_full_dropdown(
-                context=input_or_select_context,
-                page=page,
-                scraped_page=scraped_page,
-                dom=dom,
-                original_text=text,
-                skyvern_element=skyvern_element,
-                step=step,
-                task=task,
-            )
-            if fallback_result is not None:
-                return fallback_result
+            try:
+                fallback_result = await discover_and_select_from_full_dropdown(
+                    context=input_or_select_context,
+                    page=page,
+                    scraped_page=scraped_page,
+                    dom=dom,
+                    original_text=text,
+                    skyvern_element=skyvern_element,
+                    step=step,
+                    task=task,
+                    commit_required=commit_required,
+                    verify_commit=verify_commit,
+                )
+            except AutoCompletionCommitFailure as fallback_failure:
+                fallback_stage = fallback_failure.stage
+            else:
+                if isinstance(fallback_result, ActionSuccess):
+                    return fallback_result
+                fallback_stage = "suggestion_not_matched"
+            attempt_trail.append(f"attempt_{len(attempt_trail) + 1}:{fallback_stage}")
 
         LOG.info(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
             context=input_or_select_context,
+            attempt_trail=attempt_trail,
         )
+        if commit_required:
+            final_stage = attempt_trail[-1].split(":", 1)[1] if attempt_trail else "suggestion_not_matched"
+            return ActionFailure(AutoCompletionCommitFailure(stage=final_stage, attempt_trail=attempt_trail))
         return None
 
 
@@ -5922,6 +6996,8 @@ async def discover_and_select_from_full_dropdown(
     step: Step,
     task: Task,
     relevance_threshold: float = 0.6,
+    commit_required: bool = False,
+    verify_commit: bool = True,
 ) -> ActionResult | None:
     """Fallback for auto-completion: clear input, click/ArrowDown to reveal all options,
     then ask LLM to pick the best semantic match from actual dropdown values."""
@@ -6030,7 +7106,7 @@ async def discover_and_select_from_full_dropdown(
         LOG.info(
             "Discover fallback: asking LLM to pick from actual options",
             element_id=skyvern_element.get_id(),
-            original_text=original_text,
+            input_length=len(original_text),
         )
         json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
             prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
@@ -6053,7 +7129,7 @@ async def discover_and_select_from_full_dropdown(
             "Discover fallback: found suitable option, typing discovered value to trigger auto-completion",
             element_id=element_id,
             relevance_float=relevance_float,
-            discovered_value=discovered_value,
+            discovered_value_length=len(discovered_value),
         )
 
         if not discovered_value:
@@ -6074,24 +7150,48 @@ async def discover_and_select_from_full_dropdown(
         try:
             await skyvern_element.press_key("ArrowDown")
             await skyvern_element.press_key("Enter")
-            LOG.info(
-                "Discover fallback: selected option via keyboard",
-                discovered_value=discovered_value,
-            )
-            return ActionSuccess()
+            # This path fills the field with the option text itself, so a widget that commits that text
+            # verbatim reads back identical to the fill and the value alone proves nothing. aria-expanded
+            # is the tiebreak: closed means Enter took, open means it did not. A widget that exposes no
+            # expanded state at all - the shadow-DOM case this fallback exists for - leaves the verbatim
+            # read-back as the only evidence there is, so accept it rather than fail a committed field.
+            if verify_commit:
+                suggestions_closed = await _autocomplete_input_reports_closed(skyvern_element)
+                commit_outcome = await _verify_autocomplete_input_readback(
+                    skyvern_element=skyvern_element,
+                    matched_label=discovered_value,
+                    typed_prefix=discovered_value,
+                    pre_action_value=discovered_value,
+                    suggestions_closed=suggestions_closed,
+                    allow_unchanged_value=suggestions_closed is None,
+                    commit_required=commit_required,
+                )
+            else:
+                commit_outcome = AutocompleteCommitOutcome(committed=True)
+            if commit_outcome.committed:
+                LOG.info(
+                    "Discover fallback: selected option via keyboard",
+                    element_id=skyvern_element.get_id(),
+                )
+                return ActionSuccess()
+            raise AutoCompletionCommitFailure(stage="clicked_but_not_committed")
+        except AutoCompletionCommitFailure:
+            raise
         except Exception:
             LOG.info(
                 "Discover fallback: keyboard selection failed",
+                discovered_value_length=len(discovered_value),
                 exc_info=True,
-                discovered_value=discovered_value,
             )
             return None
 
+    except AutoCompletionCommitFailure:
+        raise
     except Exception:
         LOG.warning(
             "Discover fallback failed",
+            input_length=len(original_text),
             exc_info=True,
-            original_text=original_text,
         )
         return None
     finally:
@@ -6113,6 +7213,7 @@ async def sequentially_select_from_dropdown(
     force_select: bool = False,
     target_value: str = "",
     continue_until_close: bool = False,
+    entry_action_type: str = "select_option",
 ) -> CustomSingleSelectResult | None:
     """
     TODO: support to return all values retrieved from the sequentially select
@@ -6132,6 +7233,7 @@ async def sequentially_select_from_dropdown(
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
     single_select_result: CustomSingleSelectResult | None = None
+    selection_group_id = str(uuid.uuid4())
 
     check_filter_funcs: list[CheckFilterOutElementIDFunc] = [check_existed_but_not_option_element_in_dom_factory(dom)]
     for i in range(max_depth):
@@ -6148,6 +7250,8 @@ async def sequentially_select_from_dropdown(
             select_history=select_history,
             force_select=force_select,
             target_value=target_value,
+            entry_action_type=entry_action_type,
+            selection_group_id=selection_group_id,
         )
         assert single_select_result is not None
         select_history.append(single_select_result)
@@ -6220,7 +7324,13 @@ async def sequentially_select_from_dropdown(
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
         )
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
+        llm_api_handler = await resolve_prompt_type_handler_with_override(
+            "confirm-multi-selection-finish",
+            task.llm_key,
+            task.workflow_run_id if task.workflow_run_id else task.task_id,
+            task.organization_id,
+            LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER),
+        )
         json_response = await llm_api_handler(
             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
         )
@@ -6784,31 +7894,95 @@ async def _select_deterministic_custom_option(
     get_skyvern_element: Callable[[str], Awaitable[SkyvernElement]],
     get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None = None,
     task: Task,
+    step: Step | None = None,
+    entry_action_type: str = "select_option",
+    selection_group_id: str | None = None,
+    select_depth: int = 0,
 ) -> tuple[ActionResult, str | None] | None:
+    started_at = time.monotonic()
+    selection_group_id = selection_group_id or str(uuid.uuid4())
+    option_count: int | None = None
+    eligible = False
+    match_tier: str | None = None
+    attempted = False
+    click_attempted = False
+
+    def emit(outcome: CustomSelectFamilyOutcome) -> None:
+        try:
+            LOG.info(
+                "custom_select_family_outcome",
+                family="custom_select",
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                step_id=getattr(step, "step_id", None),
+                entry_action_type=entry_action_type,
+                selection_group_id=selection_group_id,
+                select_depth=select_depth,
+                family_gate_enabled=gate.family_enabled,
+                assigned=gate.assigned,
+                gate_error=gate.gate_error,
+                encountered=True,
+                eligible=eligible,
+                match_tier=match_tier,
+                option_count=option_count,
+                attempted=attempted,
+                click_attempted=click_attempted,
+                verified_success=outcome
+                in {CustomSelectFamilyOutcome.success_precommit, CustomSelectFamilyOutcome.success_verified},
+                outcome=outcome.value,
+                llm_fallback_requested=outcome.value.startswith("llm_fallback_"),
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+        except Exception:
+            LOG.debug("custom_select_family_outcome failed", exc_info=True)
+
     if not target_value:
         return None
     if isinstance(field_context, dict) and field_context.get("is_date_related") is True:
         return None
-    if not await _is_collapse_custom_select_fanout_enabled(task):
-        return None
 
-    option_candidates = get_option_candidates()
-    if not option_candidates:
-        return None
-
-    option_labels = [str(candidate.get("label") or "") for candidate in option_candidates]
-    option_values = [candidate.get("value") for candidate in option_candidates]
-    resolution = await app.AGENT_FUNCTION.resolve_field_option(
-        target_value=target_value,
-        option_labels=option_labels,
-        option_values=option_values,
-        field_context=field_context,
-        url=task.url,
-        organization_id=task.organization_id,
+    gate = await _resolve_collapse_gate(
+        task,
+        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
+        "collapse-custom-select-fanout",
     )
+    if gate.gate_error:
+        emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)
+        return None
+
+    try:
+        option_candidates = get_option_candidates()
+        if not option_candidates:
+            return None
+        option_labels = [str(candidate.get("label") or "") for candidate in option_candidates]
+        option_values = [candidate.get("value") for candidate in option_candidates]
+        resolution = await app.AGENT_FUNCTION.resolve_field_option(
+            target_value=target_value,
+            option_labels=option_labels,
+            option_values=option_values,
+            field_context=field_context,
+            url=task.url,
+            organization_id=task.organization_id,
+        )
+    except Exception:
+        emit(CustomSelectFamilyOutcome.llm_fallback_eval_error)
+        return None
+
+    option_count = len(option_candidates)
+    eligible = not resolution.fallback_to_llm and resolution.matched_index is not None
+    match_tier = getattr(resolution, "matched_tier", None)
+    if not gate.family_enabled:
+        emit(CustomSelectFamilyOutcome.llm_fallback_family_off)
+        return None
+    if gate.assigned is False:
+        emit(CustomSelectFamilyOutcome.llm_fallback_control)
+        return None
     if resolution.fallback_to_llm or resolution.matched_index is None:
+        emit(CustomSelectFamilyOutcome.llm_fallback_no_match)
         return None
     if resolution.matched_index >= len(option_candidates):
+        emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
         return None
 
     matched_candidate = option_candidates[resolution.matched_index]
@@ -6818,6 +7992,7 @@ async def _select_deterministic_custom_option(
     # that are not necessarily present on the resolved element itself.
     matched_option_is_choice_input = matched_candidate["is_choice_input"]
     if not element_id:
+        emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
         return None
 
     readback_scope_element: SkyvernElement | None = None
@@ -6825,8 +8000,10 @@ async def _select_deterministic_custom_option(
     try:
         selected_element = await get_skyvern_element(element_id)
         if await selected_element.get_attr("role") == "listbox":
+            emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
             return None
 
+        attempted = True
         matched_state = await _read_custom_select_matched_state(selected_element)
         live_role = str((matched_state or {}).get("role") or "").lower()
         live_toggle_shaped = (
@@ -6847,6 +8024,7 @@ async def _select_deterministic_custom_option(
         expected_label = _normalize_select_shadow_text(matched_label)
         if expected_label:
             if _custom_select_matched_state_confirms_pre_click(matched_state, expected_label):
+                emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
             if await _custom_select_scope_confirms_committed(
                 readback_scope_element=readback_scope_element,
@@ -6856,9 +8034,11 @@ async def _select_deterministic_custom_option(
                 expected_label=expected_label,
                 allow_aria_selected_option_tokens=False,
             ):
+                emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
 
         await selected_element.scroll_into_view()
+        click_attempted = True
         await selected_element.click(page=page)
         verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
@@ -6868,6 +8048,7 @@ async def _select_deterministic_custom_option(
             matched_label=matched_label,
         )
         if verified:
+            emit(CustomSelectFamilyOutcome.success_verified)
             return ActionSuccess(), matched_label
     except Exception:
         LOG.info(
@@ -6877,17 +8058,27 @@ async def _select_deterministic_custom_option(
             matched_label=matched_label,
             exc_info=True,
         )
+        emit(
+            CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
+            if click_attempted
+            else CustomSelectFamilyOutcome.llm_fallback_pre_click_error
+        )
         return None
 
     if anchor_is_combobox_input:
         # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
         # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
-        await _reset_custom_select_combobox_input(readback_scope_element, page)
+        reset_verified = await _reset_custom_select_combobox_input(readback_scope_element, page)
         LOG.info(
             "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
+        )
+        emit(
+            CustomSelectFamilyOutcome.llm_fallback_reset_verified
+            if reset_verified
+            else CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
         )
         return None
 
@@ -6900,6 +8091,7 @@ async def _select_deterministic_custom_option(
             matched_element_id=element_id,
             matched_label=matched_label,
         )
+        emit(CustomSelectFamilyOutcome.llm_fallback_post_click_unverified)
         return None
 
     LOG.info(
@@ -6915,21 +8107,24 @@ async def _select_deterministic_custom_option(
         )
     )
     action_failure.skip_remaining_actions = True
+    emit(CustomSelectFamilyOutcome.terminal_unverified_toggle)
     return action_failure, matched_label
 
 
-async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> None:
+async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> bool:
     if element is None:
-        return
+        return False
     try:
         locator = element.get_locator()
         await locator.fill("")
         await element.click(page=page)
+        return await get_input_value(element.get_tag_name(), locator) == ""
     except Exception:
         LOG.info(
             "Failed to reset custom-select combobox input before LLM fallback",
             exc_info=True,
         )
+        return False
 
 
 def _no_match_exception_for_dropdown(
@@ -6974,6 +8169,74 @@ def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> Non
         _collect_new_roots(child, new_ids, out)
 
 
+def _custom_select_fallback_subtrees(elements: list[dict], current_element_id: str) -> list[dict]:
+    anchor: dict | None = None
+    anchor_is_open = False
+    listboxes: list[dict] = []
+    anchor_descendant_listboxes: list[dict] = []
+    all_nodes: list[dict] = []
+
+    queue: deque[tuple[dict, bool, bool]] = deque((element, False, False) for element in elements)
+    while queue:
+        node, in_anchor, in_expanded_combobox = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes") or {}
+        all_nodes.append(node)
+        role = str(attrs.get("role") or "").lower()
+        is_anchor = node.get("id") == current_element_id
+        child_in_anchor = in_anchor or is_anchor
+        expanded = str(attrs.get("aria-expanded") or "").lower() == "true"
+        child_in_expanded_combobox = in_expanded_combobox or (role == "combobox" and expanded)
+
+        if is_anchor:
+            anchor = node
+            anchor_is_open = expanded or in_expanded_combobox
+        if role == "listbox":
+            listboxes.append(node)
+            if child_in_anchor:
+                anchor_descendant_listboxes.append(node)
+
+        for child in node.get("children") or []:
+            queue.append((child, child_in_anchor, child_in_expanded_combobox))
+
+    if anchor is None:
+        return []
+
+    anchor_attrs = anchor.get("attributes") or {}
+    controlled_dom_ids = {
+        reference
+        for attribute_name in ("aria-controls", "aria-owns")
+        for reference in str(anchor_attrs.get(attribute_name) or "").split()
+        if reference
+    }
+    anchor_dom_id = str(anchor_attrs.get("id") or "")
+    controlled_subtrees = [
+        node
+        for node in all_nodes
+        if str((node.get("attributes") or {}).get("id") or "") in controlled_dom_ids
+        and _custom_select_candidates_from_elements([node])
+    ]
+    if controlled_subtrees:
+        return controlled_subtrees
+
+    linked_listboxes = []
+    for listbox in listboxes:
+        attrs = listbox.get("attributes") or {}
+        listbox_dom_id = str(attrs.get("id") or "")
+        labelled_by = set(str(attrs.get("aria-labelledby") or "").split())
+        if listbox_dom_id in controlled_dom_ids or (anchor_dom_id and anchor_dom_id in labelled_by):
+            linked_listboxes.append(listbox)
+
+    if linked_listboxes:
+        return linked_listboxes
+    if anchor_descendant_listboxes:
+        return anchor_descendant_listboxes
+    if len(listboxes) == 1 and anchor_is_open:
+        return listboxes
+    return []
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -6982,6 +8245,7 @@ async def select_from_emerging_elements(
     scraped_page: ScrapedPage,
     step: Step,
     task: Task,
+    entry_action_type: str = "select_option",
     scraped_page_after_open: ScrapedPage | None = None,
     new_interactable_element_ids: list[str] | None = None,
 ) -> ActionResult:
@@ -6990,6 +8254,7 @@ async def select_from_emerging_elements(
     Currently mainly used for the dropdown menu selection.
     """
 
+    selection_group_id = str(uuid.uuid4())
     # TODO: support to handle the case when options are loaded by scroll
     scraped_page_after_open = scraped_page_after_open or await scraped_page.generate_scraped_page_without_screenshots()
     new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
@@ -7001,12 +8266,44 @@ async def select_from_emerging_elements(
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
     ]
 
+    fallback_element_subtrees: list[dict] = []
+    if len(new_interactable_element_ids) == 0:
+        # Resolve ownership from the untrimmed tree: trim_element_tree drops aria-controls /
+        # aria-owns / aria-labelledby / the DOM id, which are exactly the linkage attributes this
+        # fallback keys off, so resolving against the trimmed tree leaves it inert. Re-trim the
+        # small resolved subtree set below so the prompt stays trimmed (no page-wide token cost).
+        fallback_element_subtrees = _custom_select_fallback_subtrees(
+            scraped_page_after_open.element_tree,
+            current_element_id,
+        )
+        fallback_element_subtrees = trim_element_tree(copy.deepcopy(fallback_element_subtrees))
+        fallback_candidates = _custom_select_candidates_from_elements(fallback_element_subtrees)
+        fallback_candidate_ids: list[str] = []
+        for candidate in fallback_candidates:
+            fallback_id = candidate.get("element_id")
+            if fallback_id is not None:
+                fallback_candidate_ids.append(fallback_id)
+        new_interactable_element_ids = [
+            element_id
+            for element_id in fallback_candidate_ids
+            if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+        ]
+        if new_interactable_element_ids:
+            LOG.info(
+                "Found current-page custom-select options after incremental detection returned no elements",
+                current_element_id=current_element_id,
+                fallback_option_count=len(new_interactable_element_ids),
+            )
+
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+    interactable_element_ids = set(new_interactable_element_ids)
 
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
-    new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    new_element_subtrees = fallback_element_subtrees or _extract_new_subtrees(
+        scraped_page_after_open.element_tree_trimmed, new_element_ids
+    )
     shadow_candidate_elements: list[dict] = []
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
@@ -7049,14 +8346,29 @@ async def select_from_emerging_elements(
     async def get_readback_scope_element() -> SkyvernElement | None:
         return await dom_after_open.get_skyvern_element_by_id(current_element_id)
 
+    verify_pick_enabled = await _is_verify_emerging_select_pick_enabled(task)
+    deterministic_candidates = _custom_select_candidates_from_elements(shadow_candidate_elements)
+    if verify_pick_enabled:
+        # Restrict deterministic matching to the elements the dropdown actually surfaced. Gated:
+        # custom-widget option nodes are often not flagged interactable, so flag off keeps main's
+        # behavior (all candidates) and this ramps with the off-list rejection below.
+        deterministic_candidates = [
+            candidate
+            for candidate in deterministic_candidates
+            if candidate.get("element_id") in interactable_element_ids
+        ]
     deterministic_result = await _select_deterministic_custom_option(
         target_value=options.target_value,
-        get_option_candidates=lambda: _custom_select_candidates_from_elements(shadow_candidate_elements),
+        get_option_candidates=lambda: deterministic_candidates,
         field_context=options.model_dump(),
         page=page,
         get_skyvern_element=dom_after_open.get_skyvern_element_by_id,
         get_readback_scope_element=get_readback_scope_element,
         task=task,
+        step=step,
+        entry_action_type=entry_action_type,
+        selection_group_id=selection_group_id,
+        select_depth=0,
     )
     if deterministic_result is not None:
         action_result, _matched_label = deterministic_result
@@ -7076,8 +8388,7 @@ async def select_from_emerging_elements(
     )
     LOG.info("Calling LLM to find the match element", sampling=True)
 
-    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
-    json_response = await llm_api_handler(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     LOG.info(
         "LLM response for the matched element",
@@ -7101,7 +8412,20 @@ async def select_from_emerging_elements(
             llm_value=value,
         ),
     )
-    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+    anchor_input_pick = raw_action_type == ActionType.INPUT_TEXT.value and element_id == current_element_id
+    # A pick outside the elements the dropdown actually surfaced is a wrong-field click that used to
+    # proceed on a warning. Rejecting it turns those silent successes into loud failures, so it ramps
+    # behind a flag rather than shipping to every org at once.
+    off_list = element_id not in interactable_element_ids and not anchor_input_pick
+    if off_list and not verify_pick_enabled:
+        # Keep the pre-flag warning so the reject rate is measurable before ramping the flag on.
+        LOG.warning(
+            "Emerging-select pick is outside the surfaced interactable elements; proceeding because the verify flag is off",
+            element_id=element_id,
+            current_element_id=current_element_id,
+        )
+    off_list_pick = off_list and verify_pick_enabled
+    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value) or off_list_pick:
         raise _no_match_exception_for_dropdown(
             reasoning=json_response.get("reasoning"),
             target_value=options.target_value,
@@ -7109,14 +8433,6 @@ async def select_from_emerging_elements(
             transient_fallback_element_id=None,
         )
     action_type = ActionType(raw_action_type)
-
-    new_ids_set = set(new_interactable_element_ids)
-    if element_id not in new_ids_set:
-        LOG.warning(
-            "custom-select returned element outside new_interactable_element_ids",
-            selected_element_id=element_id,
-            new_interactable_count=len(new_ids_set),
-        )
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
@@ -7165,6 +8481,8 @@ async def select_from_dropdown(
     select_history: list[CustomSingleSelectResult] | None = None,
     force_select: bool = False,
     target_value: str = "",
+    entry_action_type: str = "select_option",
+    selection_group_id: str | None = None,
 ) -> CustomSingleSelectResult:
     """
     force_select: is used to choose an element to click even there's no dropdown menu;
@@ -7222,6 +8540,10 @@ async def select_from_dropdown(
         get_skyvern_element=lambda element_id: SkyvernElement.create_from_incremental(incremental_scraped, element_id),
         get_readback_scope_element=_readback_scope_element_provider(skyvern_element),
         task=task,
+        step=step,
+        entry_action_type=entry_action_type,
+        selection_group_id=selection_group_id or str(uuid.uuid4()),
+        select_depth=len(select_history),
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
@@ -7743,7 +9065,7 @@ async def normal_select(
                 matched_value=resolution.matched_value,
                 matched_index=resolution.matched_index,
             )
-            if _normal_select_successful(deterministic_result) and await _verify_normal_select_option(
+            if _normal_select_successful(deterministic_result) and not await _normal_select_readback_contradicts(
                 locator=locator,
                 matched_index=resolution.matched_index,
                 matched_label=resolution.matched_label,
@@ -8400,11 +9722,21 @@ async def click_listbox_option(
 
 
 async def get_input_value(tag_name: str, locator: Locator) -> str | None:
-    if tag_name in COMMON_INPUT_TAGS:
-        return await locator.input_value()
-    # for span, div, p or other tags:
-    # we need to trim the unicode space for these tags
-    return (await locator.inner_text()).replace("\xa0", " ").strip()
+    # input_value() rejects non-<input>/<textarea>/<select> nodes and inner_text() rejects
+    # non-HTMLElement nodes; the live node can disagree with the scraped tag_name after a
+    # re-render. Treat an incompatible read as "value unknown" so the caller's own
+    # element-type classification runs instead of a raw Playwright exception escaping here.
+    try:
+        if tag_name in COMMON_INPUT_TAGS:
+            return await locator.input_value()
+        # for span, div, p or other tags:
+        # we need to trim the unicode space for these tags
+        return (await locator.inner_text()).replace("\xa0", " ").strip()
+    except PlaywrightError as exc:
+        if is_incompatible_text_input_error(exc):
+            LOG.info("Skipping value read on an incompatible element", tag_name=tag_name, error=str(exc))
+            return None
+        raise
 
 
 class AbstractActionForContextParse(BaseModel):

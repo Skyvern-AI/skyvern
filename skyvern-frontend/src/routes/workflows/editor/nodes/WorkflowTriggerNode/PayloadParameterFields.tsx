@@ -131,13 +131,19 @@ function PayloadParameterFields({
   );
 
   if (parameters.length === 0 && staleKeys.length === 0) {
-    return <p className="text-xs text-slate-500">This agent has no inputs.</p>;
+    return (
+      <p className="text-xs text-muted-foreground dark:text-slate-500">
+        This agent has no inputs.
+      </p>
+    );
   }
 
   return (
     <div className="space-y-3">
       {parameters.length === 0 && (
-        <p className="text-xs text-slate-500">This agent has no inputs.</p>
+        <p className="text-xs text-muted-foreground dark:text-slate-500">
+          This agent has no inputs.
+        </p>
       )}
       {parameters.map((param) => {
         const isCredential = isCredentialParam(param);
@@ -147,15 +153,17 @@ function PayloadParameterFields({
           <div key={param.key} className="space-y-1.5">
             <div className="flex items-center justify-between">
               <div className="flex items-baseline gap-2">
-                <Label className="text-xs text-slate-300">{param.key}</Label>
-                <span className="text-[10px] text-slate-500">
+                <Label className="text-xs text-tertiary-foreground">
+                  {param.key}
+                </Label>
+                <span className="text-[10px] text-muted-foreground dark:text-slate-500">
                   {param.workflow_parameter_type}
                 </span>
               </div>
               {isCredential && (
                 <button
                   type="button"
-                  className="text-xs text-blue-400 hover:underline"
+                  className="text-xs text-blue-700 hover:underline dark:text-blue-400"
                   onClick={() => toggleDynamicCredential(param.key)}
                 >
                   {isDynamic ? "Use selector" : "Use dynamic value"}
@@ -163,7 +171,9 @@ function PayloadParameterFields({
               )}
             </div>
             {param.description && (
-              <p className="text-[10px] text-slate-500">{param.description}</p>
+              <p className="text-[10px] text-muted-foreground dark:text-slate-500">
+                {param.description}
+              </p>
             )}
             {isCredential && !isDynamic ? (
               <CredentialSelector
@@ -188,7 +198,7 @@ function PayloadParameterFields({
                 {isCredential &&
                   !payloadValues[param.key] &&
                   param.default_value != null && (
-                    <p className="text-[10px] text-slate-500">
+                    <p className="text-[10px] text-muted-foreground dark:text-slate-500">
                       Default:{" "}
                       {credentialNameById.get(String(param.default_value)) ??
                         String(param.default_value)}
@@ -201,20 +211,20 @@ function PayloadParameterFields({
       })}
 
       {staleKeys.length > 0 && (
-        <div className="space-y-1.5 rounded border border-amber-700/40 bg-amber-950/20 p-2">
-          <p className="text-[10px] font-medium uppercase text-amber-400">
+        <div className="space-y-1.5 rounded border border-amber-300 bg-amber-100 p-2 dark:border-amber-700/40 dark:bg-amber-950/20">
+          <p className="text-[10px] font-medium uppercase text-amber-700 dark:text-amber-400">
             Dormant payload entries
           </p>
-          <p className="text-[10px] text-slate-400">
+          <p className="text-[10px] text-muted-foreground">
             The target agent no longer declares these parameters. They are saved
             but never consumed at runtime, and any malformed Jinja2 here will
             still fail the trigger at execute time. Delete or align the target.
           </p>
           {staleKeys.map((key) => (
             <div key={key} className="flex items-center gap-2">
-              <Label className="text-xs text-slate-300">{key}</Label>
+              <Label className="text-xs text-tertiary-foreground">{key}</Label>
               <code
-                className="min-w-0 grow truncate text-[10px] text-slate-400"
+                className="min-w-0 grow truncate text-[10px] text-muted-foreground"
                 title={payloadValues[key]}
               >
                 {payloadValues[key]}
@@ -222,7 +232,7 @@ function PayloadParameterFields({
               <button
                 type="button"
                 aria-label={`delete ${key}`}
-                className="text-xs text-red-400 hover:underline"
+                className="text-xs text-red-700 hover:underline dark:text-red-400"
                 onClick={() => handleFieldChange(key, "")}
               >
                 delete

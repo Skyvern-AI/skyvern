@@ -33,6 +33,11 @@ from pydantic import BaseModel, model_validator
 
 ARTIFACT_URL_EXPIRY_SECONDS = 12 * 60 * 60  # 12 hours — global default when no per-org override.
 
+# TTL for URLs minted at the point of use via GET /artifacts/{id}/signed-url.
+# Short on purpose: the consumer asks for a fresh URL right before dereferencing
+# it, so the window only needs to cover one fetch (or one video-buffering burst).
+ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS = 5 * 60
+
 # Bounds for the per-org override. 1 hour minimum keeps URLs useful for webhook
 # consumers that retry across short outages; 7 days maximum follows the AWS S3
 # presigned-URL cap so customers used to S3 don't get surprised. The route
@@ -127,9 +132,8 @@ def sign_artifact_url(
 
     The signature is URL-safe base64 (no padding), 43 characters for SHA-256.
 
-    ``artifact_name`` and ``artifact_type`` are appended as informational query
-    params for client use only — they are not part of the canonical string or
-    signature.
+    ``artifact_name`` and ``artifact_type`` are accepted for call-site
+    compatibility but intentionally omitted from the capability URL.
     """
     kid = keyring.current_kid
     secret_bytes = keyring.get_secret_bytes(kid)
@@ -141,12 +145,7 @@ def sign_artifact_url(
     path = _ARTIFACT_CONTENT_PATH_TEMPLATE.format(artifact_id=artifact_id)
     canonical = _canonical_string("GET", path, expiry, kid)
     sig = _hmac_b64(secret_bytes, canonical)
-    sig_params: dict[str, str | int] = {"expiry": expiry, "kid": kid, "sig": sig}
-    if artifact_name is not None:
-        sig_params["artifact_name"] = artifact_name
-    if artifact_type is not None:
-        sig_params["artifact_type"] = artifact_type
-    params = urlencode(sig_params)
+    params = urlencode({"expiry": expiry, "kid": kid, "sig": sig})
     return f"{base_url.rstrip('/')}{path}?{params}"
 
 

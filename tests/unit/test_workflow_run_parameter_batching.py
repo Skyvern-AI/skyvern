@@ -49,6 +49,8 @@ def _make_service_with_mocks(
     batch_side_effect: Exception | None = None,
     single_side_effect: Exception | None = None,
     persist_browser_session: bool = False,
+    browser_profile_id: str | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
     service = WorkflowService()
@@ -59,8 +61,8 @@ def _make_service_with_mocks(
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
-        cdp_connect_headers=None,
-        browser_profile_id=None,
+        cdp_connect_headers=cdp_connect_headers,
+        browser_profile_id=browser_profile_id,
         persist_browser_session=persist_browser_session,
         browser_profile_key=None,
         title="Workflow",
@@ -834,3 +836,57 @@ async def test_setup_workflow_run_rolls_back_outer_session_on_batch_failure() ->
     assert rollback_index[0] < fallback_call_index[0], (
         f"rollback must precede fallback insert; got rollback at {rollback_index} fallback at {fallback_call_index}"
     )
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_skips_browser_inheritance_for_fallback_retry() -> None:
+    # A credential-fallback retry (retried_from_workflow_run_id set) clears the browser handles; it
+    # must NOT re-inherit the workflow's configured profile/cdp headers, or the retry reconnects to
+    # the failed account's persistent-browser-session profile.
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[],
+        browser_profile_id="bp_workflow",
+        cdp_connect_headers={"authorization": "Bearer workflow"},
+    )
+    request = WorkflowRequestBody(data={}, browser_profile_id=None, browser_session_id=None, cdp_connect_headers=None)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            retried_from_workflow_run_id="wr_original",
+        )
+
+    assert request.browser_profile_id is None
+    assert request.cdp_connect_headers is None
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_inherits_browser_profile_for_normal_run() -> None:
+    # The fallback-retry gate is conditional: a normal run (no retried_from) still inherits the
+    # workflow's configured browser profile / cdp headers.
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[],
+        browser_profile_id="bp_workflow",
+        cdp_connect_headers={"authorization": "Bearer workflow"},
+    )
+    request = WorkflowRequestBody(data={}, browser_profile_id=None, browser_session_id=None, cdp_connect_headers=None)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert request.browser_profile_id == "bp_workflow"
+    assert request.cdp_connect_headers == {"authorization": "Bearer workflow"}

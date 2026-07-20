@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Awaitable
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
@@ -15,15 +20,17 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     criteria_to_json,
     reconcile_completion_criteria,
 )
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionCriterion,
     JudgmentTruthCondition,
     RequestPolicy,
+    _apply_classifier_typed_requested_output_corroborators,
     _apply_requested_output_completion_criteria,
     _apply_validation_classification_completion_criteria,
     _classifier_fallback_policy,
-    _classify_request,
     _criterion_grounding_mode,
     _degrade_pathless_contingent_criteria,
     _parse_completion_criteria,
@@ -32,7 +39,78 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
 )
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
+
+_TERMINAL_ACTION_CREATE_OUTCOMES = (
+    "A new service request is submitted.",
+    "The requested service setup is created.",
+    "The account's start-service request is created.",
+)
+_TERMINAL_ACTION_ABSTAIN = {"version": "1", "criterion_id": None, "terminal_action_family": None}
+
+
+def _terminal_action_packet(*outcomes: str) -> dict[str, object]:
+    return {
+        "testing_intent": "require_test",
+        "credential_input_kind": "credential_name",
+        "credential_refs": ["Portal Login"],
+        "requires_user_clarification": False,
+        "completion_criteria": [
+            {
+                "outcome": outcome,
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+            }
+            for outcome in outcomes
+        ],
+    }
+
+
+async def _classify_with_terminal_action_reconciliation(
+    user_message: str,
+    packet: dict[str, object],
+    reconciliation: dict[str, object],
+) -> tuple[RequestPolicy, list[str]]:
+    prompts: list[str] = []
+
+    async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        assert prompt_name == request_policy_module.PROMPT_NAME
+        prompts.append(prompt)
+        if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
+            return reconciliation
+        return packet
+
+    policy = await request_policy_module._classify_request(user_message, "", [], "", handler)
+    return policy, prompts
+
+
+def _terminal_action_enforcement_ctx(criteria: tuple[CompletionCriterion, ...]) -> CopilotContext:
+    ctx = make_copilot_context()
+    ctx.turn_intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+    )
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=criteria))
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "credential_id": "credential_ref",
+            "credential_field": "username",
+            "trajectory_index": 0,
+        },
+        {"tool_name": "click", "accessible_name": "Sign in", "trajectory_index": 1},
+    ]
+    ctx.synthesized_block_offered = True
+    ctx.synthesized_block_offered_trajectory_len = len(ctx.scout_trajectory)
+    ctx.synthesized_block_offered_goal_complete = enforcement_module.synthesized_trajectory_is_goal_complete(ctx)
+    return ctx
 
 
 async def _policy_for_message(
@@ -41,22 +119,31 @@ async def _policy_for_message(
     *,
     config: CopilotConfig | None = None,
 ) -> RequestPolicy:
-    async def _handler(**_: Any) -> dict[str, Any]:
-        return {
-            "testing_intent": "require_test",
-            "credential_input_kind": "none",
-            "requires_user_clarification": False,
-            "completion_criteria": criteria,
-        }
+    """Exercise the retained deterministic fallback canonicalizers directly.
 
-    return await _classify_request(
-        user_message,
-        workflow_yaml="",
-        chat_history=[],
-        global_llm_context="",
-        handler=_handler,
-        config=config,
+    Fresh classifier responses use typed request-slot binding instead; those integration
+    semantics are covered by test_copilot_request_policy_pinability_consumer.py.
+    """
+    policy = RequestPolicy(
+        testing_intent="require_test",
+        classifier_status="success",
+        classifier_failure_kind="none",
+        completion_criteria=_parse_completion_criteria(criteria),
     )
+    aliases = config.requested_output_path_aliases if config is not None else {}
+    _apply_requested_output_completion_criteria(policy, user_message, aliases)
+    _apply_validation_classification_completion_criteria(policy)
+    _apply_classifier_typed_requested_output_corroborators(policy)
+    _degrade_pathless_contingent_criteria(policy)
+    policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
+        {
+            criterion.requested_output_evidence_source
+            for criterion in policy.completion_criteria
+            if criterion.output_path is not None and criterion.requested_output_evidence_source != "runtime_output"
+        }
+    )
+    policy.completion_contract_status = "present" if policy.graded_completion_criteria() else "absent"
+    return policy
 
 
 def _stored(*criteria: CompletionCriterion) -> StoredCriteriaSet:
@@ -74,6 +161,172 @@ def _criteria_for_path(policy: RequestPolicy, output_path: str) -> list[Completi
 def _criteria_fingerprint(criteria: list[CompletionCriterion]) -> str:
     payload = json.dumps(criteria_to_json(criteria), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("outcome", _TERMINAL_ACTION_CREATE_OUTCOMES)
+@pytest.mark.asyncio
+async def test_credentialed_create_omission_is_reconciled_before_custody_and_foreclosure(outcome: str) -> None:
+    policy, prompts = await _classify_with_terminal_action_reconciliation(
+        "Sign in with the saved credential and create the requested service setup.",
+        _terminal_action_packet(outcome),
+        {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"},
+    )
+
+    assert len(prompts) == 2
+    assert '"id":"c0"' in prompts[1] and '"kind":"outcome"' in prompts[1]
+    stored = criteria_from_json(criteria_to_json(policy.completion_criteria))
+    assert [
+        (
+            item.id,
+            item.outcome,
+            item.kind,
+            item.terminal_action_family,
+            item.terminal_action_verification_mode,
+        )
+        for item in stored
+    ] == [("c0", outcome, "terminal_action", "request", "semantic_outcome_v1")]
+    assert stored[0].method_mandated is False
+    ctx = _terminal_action_enforcement_ctx(stored)
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+    assert enforcement_module._should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
+
+    ctx.update_workflow_called = True
+    with capture_logs() as logs:
+        workflow_update_module._log_imposition_skipped_after_update(ctx)
+    (event,) = (entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update")
+    assert (event["reaches_goal"], event["goal_complete"]) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("user_message", "outcome"),
+    [
+        ("Sign in with the saved credential named Portal Login.", "The user is authenticated."),
+        ("Sign in with the saved credential and complete MFA.", "Authentication including MFA completes."),
+    ],
+)
+@pytest.mark.asyncio
+async def test_login_only_reconciliation_abstains_and_keeps_generic_goal_floor(user_message: str, outcome: str) -> None:
+    with capture_logs() as logs:
+        policy, prompts = await _classify_with_terminal_action_reconciliation(
+            user_message, _terminal_action_packet(outcome), _TERMINAL_ACTION_ABSTAIN
+        )
+
+    assert len(prompts) == 2
+    assert [(item.id, item.outcome, item.kind) for item in policy.completion_criteria] == [("c0", outcome, "outcome")]
+    assert [
+        entry["reason"] for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted"
+    ] == ["model_abstained"]
+    ctx = _terminal_action_enforcement_ctx(tuple(policy.completion_criteria))
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+    assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_terminal_action_reconciliation_abstains_without_rekeying() -> None:
+    malformed = {"version": "1", "criterion_id": ["c0", "c1"], "terminal_action_family": "request"}
+    with capture_logs() as logs:
+        policy, _ = await _classify_with_terminal_action_reconciliation(
+            "Sign in and create a service request.",
+            _terminal_action_packet("A service request is created.", "The created request is visible."),
+            malformed,
+        )
+
+    assert [(item.id, item.kind) for item in policy.completion_criteria] == [("c0", "outcome"), ("c1", "outcome")]
+    assert [
+        entry["reason"] for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted"
+    ] == ["malformed_response"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_action_reconciliation_gets_its_own_classifier_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[float] = []
+    # The initial classification may be followed by request-slot correction and
+    # production work that legitimately outlives its budget. Reconciliation is
+    # a distinct classifier stage and must not inherit that expired deadline.
+    monotonic_values = iter((100.0, 101.0, 112.0, 113.0))
+
+    async def bounded_wait_for(awaitable: Awaitable[object], *, timeout: float) -> object:
+        timeouts.append(timeout)
+        return await awaitable
+
+    timeout_error = request_policy_module.asyncio.TimeoutError
+    monkeypatch.setattr(request_policy_module.settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(request_policy_module, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
+    monkeypatch.setattr(
+        request_policy_module,
+        "asyncio",
+        SimpleNamespace(wait_for=bounded_wait_for, TimeoutError=timeout_error),
+    )
+
+    policy, prompts = await _classify_with_terminal_action_reconciliation(
+        "Sign in with the saved credential and create the requested service setup.",
+        _terminal_action_packet("The requested service setup is created."),
+        {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"},
+    )
+
+    assert len(prompts) == 2
+    assert [(criterion.id, criterion.kind) for criterion in policy.completion_criteria] == [("c0", "terminal_action")]
+    assert timeouts == [9.0, 9.0]
+
+
+def test_p9_exact_value_unpinnable_output_mint_degrades() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="The visible page path label is returned.",
+                output_path="output.visible_page_path_label",
+                expected_output_value="Public start-service path",
+                expected_output_shape="status_label",
+                pinability="unpinnable",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return visible_page_path_label.")
+
+    criterion = _criteria_for_path(policy, "output.visible_page_path_label")[0]
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+def test_p9_classifier_drift_normalizes_to_one_contract_shape() -> None:
+    prompt = "Return public_form_exists, visible_page_path_label, and recommended_next_action."
+    classifier_shapes = [
+        [
+            CompletionCriterion(id="c0", outcome="a public form exists for starting service"),
+            CompletionCriterion(id="c1", outcome="the visible page path label is returned"),
+        ],
+        [
+            CompletionCriterion(
+                id="c0",
+                outcome="a public form exists for starting service",
+                output_path="output.public_form_exists",
+            ),
+            CompletionCriterion(id="c1", outcome="the recommended next action is returned"),
+        ],
+        [
+            CompletionCriterion(id="c0", outcome="a public form exists for starting service"),
+            CompletionCriterion(id="c1", outcome="the visible page path label is returned"),
+            CompletionCriterion(
+                id="c2",
+                outcome="the public form result is returned",
+                output_path="output.public_form_exists",
+            ),
+            CompletionCriterion(id="c3", outcome="the recommended next action is returned"),
+        ],
+    ]
+    policies = [RequestPolicy(completion_criteria=criteria) for criteria in classifier_shapes]
+
+    for policy in policies:
+        _apply_requested_output_completion_criteria(policy, prompt)
+
+    serialized = [criteria_to_json(policy.completion_criteria) for policy in policies]
+    assert [len(policy.completion_criteria) for policy in policies] == [3, 3, 3]
+    assert serialized == [serialized[0], serialized[0], serialized[0]]
 
 
 def _requested_output_subset(policy: RequestPolicy, requested_output_paths: set[str]) -> list[CompletionCriterion]:
@@ -654,7 +907,7 @@ def test_requested_output_corroborator_respects_completion_criteria_cap() -> Non
     }
 
 
-def test_requested_output_corroborator_survives_when_requested_outputs_exceed_cap() -> None:
+def test_requested_output_canonicalization_drops_redundant_corroborator_when_outputs_exceed_cap() -> None:
     policy = RequestPolicy(
         completion_criteria=[
             CompletionCriterion(
@@ -686,9 +939,7 @@ def test_requested_output_corroborator_survives_when_requested_outputs_exceed_ca
     assert {
         criterion.output_path for criterion in _requested_output_subset(policy, requested_output_paths)
     } == requested_output_paths
-    assert len(corroborators) == 1
-    assert corroborators[0].id == "name_source"
-    assert corroborators[0].requested_output_corroborator is True
+    assert corroborators == []
 
 
 @pytest.mark.asyncio
@@ -868,7 +1119,8 @@ def test_parse_completion_criteria_preserves_validation_classification_contract(
     assert len(parsed) == 2
     assert parsed[0].kind == "validation_classification"
     assert parsed[0].classification_output_key == "login_gated"
-    assert parsed[0].expected_classification is True
+    assert parsed[0].expected_classification is None
+    assert parsed[0].mint_disposition == "pending"
     assert parsed[1].kind == "outcome"
 
 
@@ -1416,6 +1668,64 @@ async def test_date_qualified_download_preserves_classifier_typed_value_and_shap
 
 
 @pytest.mark.parametrize(
+    ("raw_criteria", "expected_count"),
+    [
+        pytest.param(
+            [
+                {
+                    "outcome": "The returned record includes the requested bill.",
+                    "output_path": "output.downloaded_file_artifact_ids",
+                    "expected_output_value": "May 2026",
+                    "expected_output_shape": "date",
+                    "deliverable_kind": "registered_download",
+                }
+            ],
+            1,
+            id="typed_value_single_download_stays_pathed",
+        ),
+        pytest.param(
+            [
+                {"outcome": "The first requested download is returned.", "deliverable_kind": "registered_download"},
+                {"outcome": "The second requested download is returned.", "deliverable_kind": "registered_download"},
+            ],
+            0,
+            id="multi_file_download_stays_pathless",
+        ),
+        pytest.param(
+            [{"outcome": "The task completes successfully."}],
+            0,
+            id="incidental_no_ask_earns_no_requested_output",
+        ),
+        pytest.param(
+            [{"outcome": "The requested download is returned.", "deliverable_kind": "registered_download"}],
+            1,
+            id="lone_presence_only_download_mints_requested_output",
+        ),
+    ],
+)
+def test_registered_download_shape_matrix_stays_fail_closed(
+    raw_criteria: list[dict[str, Any]], expected_count: int
+) -> None:
+    policy = RequestPolicy(completion_criteria=_parse_completion_criteria(raw_criteria))
+
+    trace = policy.to_trace_data()
+
+    assert trace["requested_output_criteria_count"] == expected_count
+    if expected_count == 0:
+        assert all(criterion.output_path is None for criterion in policy.completion_criteria)
+
+
+def test_lone_presence_only_download_defaults_downloaded_files_path() -> None:
+    criteria = _parse_completion_criteria(
+        [{"outcome": "The requested download is returned.", "deliverable_kind": "registered_download"}]
+    )
+
+    assert len(criteria) == 1
+    assert criteria[0].output_path == "output.downloaded_files"
+    assert criteria[0].expected_output_value is None
+
+
+@pytest.mark.parametrize(
     ("criterion_kwargs", "expected"),
     [
         pytest.param(
@@ -1608,6 +1918,203 @@ def test_criteria_json_rehydrates_validation_classification_without_requested_ou
     assert restored[0].output_path is None
     assert restored[0].expected_output_value is None
     assert restored[0].expected_output_shape is None
+
+
+def _minted_download_criterion() -> CompletionCriterion:
+    return _criterion(
+        "c0",
+        "The finished workflow produces the downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+    )
+
+
+def test_store_round_trip_preserves_requested_output_path_mint_source() -> None:
+    criteria = (_minted_download_criterion(),)
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored[0].requested_output_path_mint_source == "classifier_default"
+    assert restored == criteria
+
+
+def test_criteria_from_json_without_mint_source_key_loads_none() -> None:
+    restored = criteria_from_json(
+        [
+            {
+                "id": "c0",
+                "outcome": "The finished workflow produces the downloaded file.",
+                "output_path": "output.downloaded_files",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+
+    assert len(restored) == 1
+    assert restored[0].requested_output_path_mint_source is None
+
+
+def test_requested_output_path_mint_source_excluded_from_reconcile_key() -> None:
+    minted = _minted_download_criterion()
+    persisted_twin = replace(minted, requested_output_path_mint_source=None)
+
+    assert _criterion_reconcile_key(minted) == _criterion_reconcile_key(persisted_twin)
+
+
+def test_classifier_declared_registered_download_path_mints_declared_source() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested statement download is returned.",
+                "output_path": "output.downloaded_file_artifact_ids",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].output_path == "output.downloaded_file_artifact_ids"
+    assert parsed[0].requested_output_path_mint_source == "classifier_declared"
+
+
+def test_classifier_declared_non_registered_download_path_mints_no_source() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes the statement id.",
+                "output_path": "output.statement_id",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].output_path == "output.statement_id"
+    assert parsed[0].requested_output_path_mint_source is None
+
+
+def test_store_round_trip_preserves_classifier_declared_mint_source() -> None:
+    criteria = (replace(_minted_download_criterion(), requested_output_path_mint_source="classifier_declared"),)
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored[0].requested_output_path_mint_source == "classifier_declared"
+    assert restored == criteria
+
+
+def test_exact_value_download_ask_does_not_mint_classifier_declared_source() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested statement download is returned.",
+                "output_path": "output.downloaded_files",
+                "deliverable_kind": "registered_download",
+                "expected_output_value": "statement-2026-05.pdf",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].expected_output_value == "statement-2026-05.pdf"
+    assert parsed[0].requested_output_path_mint_source is None
+
+
+def test_plain_outcome_keeps_canonical_deliverable_confirmation_association() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested document is selected and downloaded.",
+                "deliverable_confirmation_criterion_id": REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].deliverable_confirmation_criterion_id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+
+
+def test_non_canonical_deliverable_confirmation_association_is_cleared() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested document is selected and downloaded.",
+                "deliverable_confirmation_criterion_id": "c1",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].deliverable_confirmation_criterion_id is None
+
+
+@pytest.mark.parametrize(
+    "ineligible_fields",
+    [
+        {"level": "definition"},
+        {"kind": "terminal_action", "terminal_action_family": "request"},
+        {"output_path": "output.downloaded_files", "deliverable_kind": "registered_download"},
+        {"method_mandated": True},
+    ],
+)
+def test_ineligible_criteria_cannot_carry_deliverable_confirmation_association(
+    ineligible_fields: dict[str, Any],
+) -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested document is selected and downloaded.",
+                "deliverable_confirmation_criterion_id": REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+                **ineligible_fields,
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].deliverable_confirmation_criterion_id is None
+
+
+def test_store_round_trip_preserves_deliverable_confirmation_association() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The requested document is selected and downloaded.",
+            deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+    assert restored[0].deliverable_confirmation_criterion_id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+
+
+def test_store_load_clears_association_on_ineligible_row() -> None:
+    row = criteria_to_json(
+        (
+            _criterion(
+                "c0",
+                "The requested document is selected and downloaded.",
+                deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            ),
+        )
+    )
+    row[0]["method_mandated"] = True
+
+    restored = criteria_from_json(row)
+
+    assert restored[0].deliverable_confirmation_criterion_id is None
+
+
+def test_deliverable_confirmation_association_changes_reconcile_identity() -> None:
+    associated = _criterion(
+        "c0",
+        "The requested document is selected and downloaded.",
+        deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+    )
+    unassociated = replace(associated, deliverable_confirmation_criterion_id=None)
+
+    assert _criterion_reconcile_key(associated) != _criterion_reconcile_key(unassociated)
 
 
 def test_request_policy_trace_exposes_requested_output_grounding_contract_without_values() -> None:
@@ -2060,7 +2567,8 @@ def test_scope_boundary_boolean_on_login_only_rekinds_and_drops_judgment_invaria
     assert promoted.kind == "validation_classification"
     assert promoted.classification_output_key == "login_only"
     assert promoted.expected_output_value is None
-    assert promoted.requested_output_evidence_source == "runtime_output"
+    assert promoted.requested_output_evidence_source == "independent_run_evidence"
+    assert promoted.mint_disposition == "pending"
 
 
 def test_scope_boundary_boolean_on_non_enumerated_path_keeps_judgment_invariant() -> None:

@@ -32,11 +32,16 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     has_actionable_steer_content,
     has_bounded_page_schema,
+    has_witnessed_value_content,
     merge_visual_composition_evidence,
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
     parse_composition_structured,
+)
+from skyvern.forge.sdk.copilot.result_evidence import (
+    loaded_result_composition_evidence_from_page,
+    loaded_result_composition_target_summary,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
@@ -2256,6 +2261,7 @@ def test_structured_preserves_live_key_and_table_binding_shape() -> None:
         "key_value_relations": [
             {
                 "key_text": "Record Identifier",
+                "value_text": "record-abc",
                 "container_selector": ".kv",
                 "container_match_count": 1,
                 "container_position": 0,
@@ -2290,7 +2296,53 @@ def test_structured_preserves_live_key_and_table_binding_shape() -> None:
     assert parsed["result_containers"][0]["rows"][1]["cells"][1] == {
         "column_index": 1,
         "visible": True,
+        "has_text": False,
+        "text": "",
     }
+
+
+def test_structured_result_containers_pass_through_cell_has_text() -> None:
+    payload = {
+        "page_title": "Records",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#records",
+                "selector_match_count": 1,
+                "visible": True,
+                "span_free": True,
+                "nested_table_free": True,
+                "row_selector": "#records > tbody > tr",
+                "headers": [{"text": "Status", "column_index": 0}],
+                "row_count": 1,
+                "rows_truncated": False,
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [{"column_index": 0, "visible": True, "has_text": True}],
+                    }
+                ],
+                "sample_rows": ["Active"],
+            }
+        ],
+        "result_containers_truncated": False,
+        "key_value_relations": [],
+        "key_value_relations_truncated": False,
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Records",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url="u", current_url="u")
+
+    assert parsed is not None
+    assert parsed["result_containers"][0]["rows"][0]["cells"][0]["has_text"] is True
 
 
 def test_html_packet_excludes_hidden_bindings_and_preserves_revealed_structure() -> None:
@@ -2332,11 +2384,214 @@ def test_html_packet_excludes_hidden_bindings_and_preserves_revealed_structure()
             "visible": True,
             "has_row_header": False,
             "cells": [
-                {"column_index": 0, "visible": True},
-                {"column_index": 1, "visible": True},
+                {"column_index": 0, "visible": True, "has_text": True, "text": "Record One"},
+                {"column_index": 1, "visible": True, "has_text": True, "text": "Ready"},
             ],
         }
     ]
+
+
+def test_html_parse_marks_empty_cell_without_text() -> None:
+    details = """
+    <table id="records">
+      <thead><tr><th>Address</th><th>Status</th></tr></thead>
+      <tbody><tr><td>Record One</td><td></td></tr></tbody>
+    </table>
+    """
+    parsed = parse_composition_html(
+        details, inspected_url="https://example.com/records", current_url="https://example.com/records"
+    )
+
+    cells = parsed["result_containers"][0]["rows"][0]["cells"]
+    assert cells[0]["has_text"] is True
+    assert cells[1]["has_text"] is False
+
+
+_REVEAL_URL = "https://portal.example.com/statement"
+_REVEAL_HTML = """
+<body>
+  <header><h1>Business Billing</h1><p>Account 880314</p></header>
+  <section class="results" id="result" STYLE>
+    <h3 id="result-title">March 2026 statement</h3>
+    <div class="amount" id="result-amount">Amount due: $3,927.75</div>
+    <p class="muted" id="result-period">Billing period: Mar 1 - Mar 31, 2026</p>
+  </section>
+</body>
+"""
+
+
+def test_html_reveal_shape_container_emits_value_relations() -> None:
+    hidden = parse_composition_html(
+        _REVEAL_HTML.replace("STYLE", 'style="display:none"'),
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    revealed = parse_composition_html(
+        _REVEAL_HTML.replace("STYLE", ""), inspected_url=_REVEAL_URL, current_url=_REVEAL_URL
+    )
+
+    hidden_values = [relation["value_text"] for relation in hidden["key_value_relations"]]
+    assert "Amount due: $3,927.75" not in hidden_values
+
+    reveal_relations = [
+        relation for relation in revealed["key_value_relations"] if relation["container_selector"] == "#result"
+    ]
+    assert [
+        (relation["key_text"], relation["value_text"], relation["value_child_index"]) for relation in reveal_relations
+    ] == [
+        ("", "Amount due: $3,927.75", 1),
+        ("", "Billing period: Mar 1 - Mar 31, 2026", 2),
+    ]
+    assert all(relation["direct_child_count"] == 3 for relation in reveal_relations)
+    assert revealed["key_value_relations_truncated"] is False
+    assert has_witnessed_value_content(revealed) is True
+
+
+def test_html_reveal_shape_single_value_leaf_keys_by_heading() -> None:
+    parsed = parse_composition_html(
+        '<body><section id="result"><h3>Statement total</h3><div>Amount due: $3,927.75</div><p></p></section></body>',
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    reveal = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 3]
+    assert [(r["key_text"], r["value_text"], r["value_child_index"]) for r in reveal] == [
+        ("Statement total", "Amount due: $3,927.75", 1)
+    ]
+
+
+def test_html_reveal_shape_multi_value_leaves_carry_empty_key() -> None:
+    parsed = parse_composition_html(
+        '<body><section id="result"><h3>Statement</h3>'
+        "<div>Amount due: $3,927.75</div><p>Billing period</p><span>Due date</span></section></body>",
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    reveal = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 4]
+    assert len(reveal) == 3
+    assert all(r["key_text"] == "" for r in reveal)
+
+
+def test_html_reveal_shape_rejects_structural_and_token_negatives() -> None:
+    def reveal_relations(inner: str, container: str = 'id="result"') -> list[dict[str, Any]]:
+        parsed = parse_composition_html(
+            f"<body><section {container}>{inner}</section></body>",
+            inspected_url=_REVEAL_URL,
+            current_url=_REVEAL_URL,
+        )
+        return [r for r in parsed["key_value_relations"] if r["direct_child_count"] >= 3]
+
+    three_leaf = "<h3>Heading</h3><div>A</div><p>B</p>"
+    assert reveal_relations(three_leaf, 'id="arrow-box"') == []
+    assert reveal_relations(three_leaf, 'class="browser-card"') == []
+    assert reveal_relations(three_leaf, 'id="panel"') == []
+    assert reveal_relations("<div>Heading</div><div>A</div><p>B</p>") == []
+    assert reveal_relations("<h3>Heading</h3><div><span>A</span></div><p>B</p>") == []
+    over_cap = "<h3>Heading</h3>" + "".join(f"<div>v{i}</div>" for i in range(6))
+    assert reveal_relations(over_cap) == []
+    long_heading = "x" * 121
+    assert reveal_relations(f"<h3>{long_heading}</h3><div>A</div><p>B</p>") == []
+
+
+def test_html_reveal_shape_six_child_boundary_included() -> None:
+    inner = "<h3>Heading</h3>" + "".join(f"<div>v{i}</div>" for i in range(5))
+    parsed = parse_composition_html(
+        f'<body><section id="result">{inner}</section></body>',
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    reveal = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 6]
+    assert len(reveal) == 5
+
+
+def test_html_reveal_shape_two_child_container_emits_single_relation() -> None:
+    parsed = parse_composition_html(
+        '<body><section id="result"><h3>Key</h3><div>Value</div></section></body>',
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    assert [(r["key_text"], r["value_text"], r["direct_child_count"]) for r in parsed["key_value_relations"]] == [
+        ("Key", "Value", 2)
+    ]
+
+
+def test_html_reveal_shape_page_cap_emits_truncation_signal() -> None:
+    inner = "<h3>Heading</h3>" + "".join(f"<div>v{i}</div>" for i in range(5))
+    containers = "".join(f'<section id="result-{index}">{inner}</section>' for index in range(5))
+    parsed = parse_composition_html(
+        f"<body><header><h1>Title</h1><p>Sub</p></header>{containers}</body>",
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    relations = parsed["key_value_relations"]
+    reveal = [r for r in relations if r["direct_child_count"] == 6]
+    header = [r for r in relations if r["direct_child_count"] == 2]
+    assert len(reveal) == 8
+    assert [(r["key_text"], r["value_text"]) for r in header] == [("Title", "Sub")]
+    assert parsed["key_value_relations_truncated"] is False
+    assert parsed["inspection_warnings"] == ["reveal_relations_truncated"]
+
+
+def test_html_reveal_shape_non_truncating_multi_reveal_emits_no_warning() -> None:
+    inner = "<h3>Heading</h3><div>A</div><p>B</p>"
+    containers = "".join(f'<section id="result-{index}">{inner}</section>' for index in range(3))
+    parsed = parse_composition_html(
+        f"<body><header><h1>Title</h1><p>Sub</p></header>{containers}</body>",
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    reveal = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 3]
+    header = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 2]
+    assert len(reveal) == 6
+    assert [(r["key_text"], r["value_text"]) for r in header] == [("Title", "Sub")]
+    assert parsed["key_value_relations_truncated"] is False
+    assert parsed["inspection_warnings"] == []
+
+
+def test_html_reveal_truncation_signal_gated_off_when_pass_one_truncated() -> None:
+    kv_pairs = "".join(f'<div id="kv{i}"><span>k{i}</span><span>val{i}</span></div>' for i in range(26))
+    inner = "<h3>Heading</h3>" + "".join(f"<div>v{i}</div>" for i in range(5))
+    containers = "".join(f'<section id="result-{index}">{inner}</section>' for index in range(5))
+    parsed = parse_composition_html(
+        f"<body>{kv_pairs}{containers}</body>",
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    assert parsed["key_value_relations_truncated"] is True
+    assert parsed["inspection_warnings"] == []
+
+
+def test_structured_rebinds_reveal_shape_relation_round_trip() -> None:
+    payload = {
+        "page_title": "Statement",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "result_containers_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "March 2026 statement",
+                "value_text": "Amount due: $3,927.75",
+                "container_selector": "#result",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 2,
+                "direct_child_count": 3,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "key_value_relations_truncated": False,
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Amount due: $3,927.75",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_REVEAL_URL, current_url=_REVEAL_URL)
+
+    assert parsed is not None
+    assert parsed["key_value_relations"] == payload["key_value_relations"]
 
 
 def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
@@ -2792,6 +3047,126 @@ async def test_structured_extractor_matches_html_parser_on_standalone_controls_d
     assert 'div[data-action="selectAddress"]' in surfaced
 
 
+_REVEAL_LIVE_URL = "https://portal.example.com/reveal"
+_REVEAL_LIVE_HTML = """<!DOCTYPE html><html><head><title>Statement</title></head><body>
+<header><h1>Business Billing</h1><p>Account 880314</p></header>
+<section class="results" id="result" style="display:block">
+  <h3 id="result-title">March 2026 statement</h3>
+  <div class="amount" id="result-amount">Amount due: $3,927.75</div>
+  <p class="muted" id="result-period">Billing period: Mar 1 - Mar 31, 2026</p>
+</section>
+<section class="results" id="result-hidden" style="display:none">
+  <h3>Prior statement</h3><div>Amount due: $9,999.99</div><p>Old</p>
+</section>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_emits_reveal_shape_relation_on_live_dom() -> None:
+    raw, content = await _capture_live_dom(_REVEAL_LIVE_URL, _REVEAL_LIVE_HTML, "#result-amount")
+
+    structured = parse_composition_structured(
+        json.loads(raw), inspected_url=_REVEAL_LIVE_URL, current_url=_REVEAL_LIVE_URL
+    )
+    html_parsed = parse_composition_html(content, inspected_url=_REVEAL_LIVE_URL, current_url=_REVEAL_LIVE_URL)
+
+    assert structured is not None
+    reveal = [
+        (relation["key_text"], relation["value_text"], relation["value_child_index"])
+        for relation in structured["key_value_relations"]
+        if relation["container_selector"] == "#result"
+    ]
+    assert reveal == [
+        ("", "Amount due: $3,927.75", 1),
+        ("", "Billing period: Mar 1 - Mar 31, 2026", 2),
+    ]
+    assert all(relation["value_text"] != "Amount due: $9,999.99" for relation in structured["key_value_relations"])
+    assert structured["key_value_relations"] == html_parsed["key_value_relations"]
+    assert has_witnessed_value_content(structured) is True
+
+
+_REVEAL_HIDDEN_LEAF_URL = "https://portal.example.com/hidden-leaf"
+_REVEAL_HIDDEN_LEAF_HTML = """<!DOCTYPE html><html><head><title>Statement</title></head><body>
+<section class="results" id="result" style="display:block">
+  <h3>Statement total</h3>
+  <div id="visible-value">Amount due: $3,927.75</div>
+  <p style="display:none">Hidden note leaf</p>
+</section>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_excludes_hidden_reveal_value_leaf_on_live_dom() -> None:
+    raw, _ = await _capture_live_dom(_REVEAL_HIDDEN_LEAF_URL, _REVEAL_HIDDEN_LEAF_HTML, "#visible-value")
+
+    structured = parse_composition_structured(
+        json.loads(raw), inspected_url=_REVEAL_HIDDEN_LEAF_URL, current_url=_REVEAL_HIDDEN_LEAF_URL
+    )
+
+    assert structured is not None
+    reveal = [
+        (relation["key_text"], relation["value_text"])
+        for relation in structured["key_value_relations"]
+        if relation["container_selector"] == "#result"
+    ]
+    assert reveal == [("Statement total", "Amount due: $3,927.75")]
+    assert all("Hidden note leaf" not in relation["value_text"] for relation in structured["key_value_relations"])
+
+
+_REVEAL_HIDDEN_HEADING_URL = "https://portal.example.com/hidden-heading"
+_REVEAL_HIDDEN_HEADING_HTML = """<!DOCTYPE html><html><head><title>Statement</title></head><body>
+<section class="results" id="result" style="display:block">
+  <h3 style="display:none">Statement total</h3>
+  <div id="visible-value">Amount due: $3,927.75</div>
+  <p>Billing period: Mar 1 - Mar 31, 2026</p>
+</section>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_rejects_reveal_container_with_hidden_heading_on_live_dom() -> None:
+    raw, _ = await _capture_live_dom(_REVEAL_HIDDEN_HEADING_URL, _REVEAL_HIDDEN_HEADING_HTML, "#visible-value")
+
+    structured = parse_composition_structured(
+        json.loads(raw), inspected_url=_REVEAL_HIDDEN_HEADING_URL, current_url=_REVEAL_HIDDEN_HEADING_URL
+    )
+
+    assert structured is not None
+    assert [r for r in structured["key_value_relations"] if r["container_selector"] == "#result"] == []
+
+
+_REVEAL_CAP_LIVE_URL = "https://portal.example.com/reveal-cap"
+_REVEAL_CAP_LIVE_HTML = (
+    "<!DOCTYPE html><html><head><title>Statement</title></head><body>"
+    + "".join(
+        f'<section class="results" id="result-{index}"><h3>Heading {index}</h3>'
+        + "".join(f"<div>value {index}-{leaf}</div>" for leaf in range(5))
+        + "</section>"
+        for index in range(5)
+    )
+    + "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_emits_reveal_truncation_signal_on_live_dom() -> None:
+    raw, _ = await _capture_live_dom(_REVEAL_CAP_LIVE_URL, _REVEAL_CAP_LIVE_HTML, "#result-0")
+    data = json.loads(raw)
+
+    assert data["reveal_relations_truncated"] is True
+
+    structured = parse_composition_structured(
+        data, inspected_url=_REVEAL_CAP_LIVE_URL, current_url=_REVEAL_CAP_LIVE_URL
+    )
+    assert structured is not None
+    assert structured["key_value_relations_truncated"] is False
+    assert structured["inspection_warnings"] == ["reveal_relations_truncated"]
+
+
 # Tools-layer invariant: cheap path skips get_html; failure falls back
 
 
@@ -3013,3 +3388,189 @@ class TestSemanticChallengeSplit:
         assert state["requires_human_verification"] is True
         assert state["gates_submit_controls"] is True
         assert {"text": "Search", "disabled": True} in state["gated_submit_controls"]
+
+
+def test_html_key_value_relation_captures_bounded_value_text() -> None:
+    long_value = "Z" * 400
+    details = f'<div class="kv"><div>Reference</div><div>{long_value}</div></div>'
+    parsed = parse_composition_html(details, inspected_url="https://example.com/p", current_url="https://example.com/p")
+
+    relation = parsed["key_value_relations"][0]
+    assert relation["key_text"] == "Reference"
+    assert relation["value_text"].startswith("Z")
+    assert len(relation["value_text"]) <= 240
+
+
+def test_html_table_cell_captures_bounded_text() -> None:
+    long_cell = "Y" * 400
+    details = f"""
+    <table id="records">
+      <thead><tr><th>Address</th></tr></thead>
+      <tbody><tr><td>{long_cell}</td></tr></tbody>
+    </table>
+    """
+    parsed = parse_composition_html(details, inspected_url="https://example.com/r", current_url="https://example.com/r")
+
+    cell = parsed["result_containers"][0]["rows"][0]["cells"][0]
+    assert cell["has_text"] is True
+    assert cell["text"].startswith("Y")
+    assert len(cell["text"]) <= 120
+
+
+def test_structured_passes_value_text_and_cell_text_with_caps() -> None:
+    payload = {
+        "page_title": "Records",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#records",
+                "selector_match_count": 1,
+                "visible": True,
+                "span_free": True,
+                "nested_table_free": True,
+                "row_selector": "#records > tbody > tr",
+                "headers": [{"text": "Address", "column_index": 0}],
+                "row_count": 1,
+                "rows_truncated": False,
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [{"column_index": 0, "visible": True, "has_text": True, "text": "C" * 400}],
+                    }
+                ],
+                "sample_rows": ["C" * 400],
+            }
+        ],
+        "result_containers_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "Reference",
+                "value_text": "V" * 400,
+                "container_selector": ".kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "key_value_relations_truncated": False,
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Records",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url="u", current_url="u")
+
+    assert parsed is not None
+    assert len(parsed["key_value_relations"][0]["value_text"]) <= 240
+    assert len(parsed["result_containers"][0]["rows"][0]["cells"][0]["text"]) <= 120
+
+
+def test_captured_value_and_cell_text_stay_out_of_loaded_result_summary() -> None:
+    details = """
+    <div class="kv"><div>Reference</div><div>secret-ref-value</div></div>
+    <table id="records">
+      <thead><tr><th>Address</th></tr></thead>
+      <tbody><tr><td>secret-cell-value</td></tr></tbody>
+    </table>
+    """
+    parsed = parse_composition_html(details, inspected_url="https://example.com/r", current_url="https://example.com/r")
+    evidence = loaded_result_composition_evidence_from_page(parsed, source_tool="evaluate", source_url="u")
+    assert evidence is not None
+    serialized = json.dumps(loaded_result_composition_target_summary(evidence))
+    assert '"value_text"' not in serialized
+    assert '"cells"' not in serialized
+
+
+def _kv_value_content_packet() -> dict[str, Any]:
+    return {
+        "key_value_relations": [
+            {
+                "key_text": "Ref Code",
+                "value_text": "AB-2931",
+                "container_selector": ".kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "key_value_relations_truncated": False,
+        "result_containers": [],
+        "result_containers_truncated": False,
+        "inspection_warnings": [],
+    }
+
+
+def _table_cell_content_packet() -> dict[str, Any]:
+    return {
+        "key_value_relations": [],
+        "key_value_relations_truncated": False,
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#rows",
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "cells": [{"column_index": 0, "has_text": True, "text": "value"}],
+                    }
+                ],
+            }
+        ],
+        "result_containers_truncated": False,
+        "inspection_warnings": [],
+    }
+
+
+def test_has_witnessed_value_content_true_on_kv_value_text() -> None:
+    packet = _kv_value_content_packet()
+    assert has_witnessed_value_content(packet) is True
+    assert has_bounded_page_schema(packet) is False
+    assert has_actionable_steer_content(packet) is False
+
+
+def test_has_witnessed_value_content_true_on_table_cell_text() -> None:
+    packet = _table_cell_content_packet()
+    assert has_witnessed_value_content(packet) is True
+    assert has_bounded_page_schema(packet) is True
+
+
+def test_has_witnessed_value_content_false_on_truncated_kv() -> None:
+    packet = _kv_value_content_packet()
+    packet["key_value_relations_truncated"] = True
+    assert has_witnessed_value_content(packet) is False
+
+
+def test_has_witnessed_value_content_false_on_inspection_warnings() -> None:
+    packet = _kv_value_content_packet()
+    packet["inspection_warnings"] = ["capture_incomplete"]
+    assert has_witnessed_value_content(packet) is False
+
+
+def test_has_witnessed_value_content_false_on_empty_capture() -> None:
+    packet = {
+        "key_value_relations": [],
+        "key_value_relations_truncated": False,
+        "result_containers": [],
+        "result_containers_truncated": False,
+        "inspection_warnings": [],
+    }
+    assert has_witnessed_value_content(packet) is False
+    assert has_bounded_page_schema(packet) is False
+
+
+def test_has_witnessed_value_content_false_on_blank_value_text() -> None:
+    packet = _kv_value_content_packet()
+    packet["key_value_relations"][0]["value_text"] = "   "
+    assert has_witnessed_value_content(packet) is False

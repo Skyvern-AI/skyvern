@@ -5,6 +5,7 @@ import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import libcst as cst
@@ -17,7 +18,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import FileUploadBlock
+from skyvern.forge.sdk.workflow.models.block import FileUploadBlock, UnsupportedStorageTypeError
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.workflows import BlockStatus, FileStorageType, FileUploadBlockYAML
@@ -81,10 +82,15 @@ async def _execute_file_upload(
     llm_error: Exception | None = None,
     formatted_prompt: str | None = None,
     format_error: Exception | None = None,
+    secret_values: dict[str, str] | None = None,
 ) -> SimpleNamespace:
     workflow_run_context = MagicMock()
     workflow_run_context.organization_id = "organization-id"
-    workflow_run_context.get_original_secret_value_or_none.return_value = None
+    if secret_values is None:
+        secret_values = (
+            {block.aws_secret_access_key: block.aws_secret_access_key} if block.aws_secret_access_key else {}
+        )
+    workflow_run_context.get_original_secret_value_or_none.side_effect = secret_values.get
     record_output = AsyncMock()
     build_result = AsyncMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
 
@@ -143,6 +149,21 @@ async def _execute_file_upload(
 
 
 @pytest.mark.asyncio
+async def test_unsupported_storage_type_returns_failed_result(tmp_path: Path) -> None:
+    block = _file_upload_block(None)
+    block.storage_type = cast(FileStorageType, "unsupported")
+
+    with pytest.raises(UnsupportedStorageTypeError):
+        block._validate_destination_fields(block.storage_type)
+
+    execution = await _execute_file_upload(block, tmp_path / "downloads")
+
+    assert execution.result.success is False
+    assert execution.result.failure_reason == "Unsupported storage type: unsupported"
+    assert execution.result.status == BlockStatus.failed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prompt", [None, "  \n\t"], ids=["none", "whitespace"])
 async def test_empty_prompt_uploads_all_files_without_llm(tmp_path: Path, prompt: str | None) -> None:
     download_dir = tmp_path / "downloads"
@@ -159,6 +180,37 @@ async def test_empty_prompt_uploads_all_files_without_llm(tmp_path: Path, prompt
     }
     execution.handler_factory.assert_not_called()
     execution.handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_literal_aws_secret_access_key_dispatches_unchanged_when_encryption_is_disabled(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_candidates(download_dir, names=("invoice.pdf",))
+    block = _file_upload_block(None)
+
+    execution = await _execute_file_upload(block, download_dir, secret_values={})
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.aws_secret_access_key == block.aws_secret_access_key
+
+
+@pytest.mark.asyncio
+async def test_referenced_aws_secret_access_key_dispatches_resolved_value(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_candidates(download_dir, names=("invoice.pdf",))
+    block = _file_upload_block(None)
+    block.aws_secret_access_key = "{{aws_secret}}"
+
+    execution = await _execute_file_upload(
+        block,
+        download_dir,
+        secret_values={"{{aws_secret}}": "resolved-aws-secret-access-key"},
+    )
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.aws_secret_access_key == "resolved-aws-secret-access-key"
 
 
 @pytest.mark.asyncio

@@ -81,7 +81,7 @@ function NodeTabs({ blockLabel }: Props) {
                   className={cn(
                     "flex h-[2.5rem] w-[2.5rem] min-w-[2.5rem] rotate-[-90deg] items-center justify-center gap-2 rounded-[50%] bg-slate-elevation3 p-2",
                     {
-                      "opacity-100 outline outline-2 outline-slate-300":
+                      "opacity-100 outline outline-2 outline-ring":
                         thisBlockIsTargetted,
                     },
                     {

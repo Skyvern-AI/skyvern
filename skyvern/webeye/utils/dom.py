@@ -8,7 +8,18 @@ from random import uniform
 from urllib.parse import urljoin, urlparse
 
 import structlog
-from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import (
+    ElementHandle,
+)
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import (
+    FloatRect,
+    Frame,
+    FrameLocator,
+    Locator,
+    Page,
+    TimeoutError,
+)
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
@@ -16,6 +27,7 @@ from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
     InteractWithDisabledElement,
+    InvalidElementForTextInput,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -34,6 +46,14 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
+
+
+def is_incompatible_text_input_error(exc: BaseException) -> bool:
+    # Playwright raises "Element is not an <input>, <textarea> or [contenteditable] element"
+    # from fill()/clear() when the resolved node can't accept text (button, link, span,
+    # dialog/container, iframe). The static tag_name can disagree with the live node after
+    # a re-render, so callers relying on the tag alone still reach these APIs.
+    return "is not an" in str(exc).lower()
 
 
 def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
@@ -205,6 +225,14 @@ class SkyvernElement:
 
         button_type = await self.get_attr("type")
         return button_type == "radio"
+
+    async def is_checked(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool | None:
+        # Live checked state via the DOM property; None when it can't be read
+        # (e.g. the element detached after navigation). Never raises.
+        try:
+            return await self.get_locator().is_checked(timeout=timeout)
+        except Exception:
+            return None
 
     async def is_btn_input(self) -> bool:
         tag_name = self.get_tag_name()
@@ -774,6 +802,16 @@ class SkyvernElement:
 
         return await dom.get_skyvern_element_by_id(unique_id)
 
+    @staticmethod
+    async def _label_click_forwards_to_descendant(label_locator: Locator) -> bool:
+        # HTML forwards a <label> click to its control only when the pointer does not
+        # land on interactive content nested inside; an <a href>/<button> descendant
+        # handles the click itself (navigating) instead of toggling the control.
+        try:
+            return await label_locator.locator("a[href], button").count() > 0
+        except Exception:
+            return False
+
     async def find_bound_label_by_attr_id(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> Locator | None:
         if self.get_tag_name() == "label":
             return None
@@ -785,6 +823,8 @@ class SkyvernElement:
         locator = self.get_frame().locator(f"label[for='{element_id}']")
         cnt = await locator.count()
         if cnt == 1:
+            if await self._label_click_forwards_to_descendant(locator):
+                return None
             return locator
 
         return None
@@ -807,6 +847,9 @@ class SkyvernElement:
                 return None
 
             if tag_name.lower() != "label":
+                return None
+
+            if await self._label_click_forwards_to_descendant(parent_locator):
                 return None
 
             return parent_locator
@@ -916,11 +959,21 @@ class SkyvernElement:
         await self.input_sequentially(text=text, default_timeout=timeout)
 
     async def input_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.get_locator().fill(text, timeout=timeout)
+        try:
+            await self.get_locator().fill(text, timeout=timeout)
+        except PlaywrightError as exc:
+            if is_incompatible_text_input_error(exc):
+                raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
+            raise
 
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         locator = self.get_locator()
-        await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
+        try:
+            await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
+        except PlaywrightError as exc:
+            if is_incompatible_text_input_error(exc):
+                raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
+            raise
 
     async def check(
         self,
@@ -1313,6 +1366,17 @@ class DomUtil:
                 num_elements = await locator.count()
                 if num_elements < 1:
                     raise MissingElement(selector=xpath, element_id=element_id)
+                # The tag-name xpath can resolve to many repeated nodes (rich text editors,
+                # repeated text). Reject it here so the next fill/read hits a classified
+                # MultipleElementsFound instead of a raw Playwright strict-mode violation.
+                if num_elements > 1:
+                    LOG.warning(
+                        "Multiple elements found with xpath fallback. Expected 1. Validation failed.",
+                        num_elements=num_elements,
+                        selector=xpath,
+                        element_id=element_id,
+                    )
+                    raise MultipleElementsFound(num=num_elements, selector=xpath, element_id=element_id)
 
         elif num_elements > 1:
             LOG.warning(

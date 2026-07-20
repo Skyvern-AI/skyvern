@@ -15,11 +15,13 @@ from skyvern.forge.sdk.copilot.tools import (
     _resolve_discovery_entry_url,
     discovery,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
     def __init__(self, server: object) -> None:
+        self.turn_origin = TurnOrigin.interactive
         self.discovery_mcp_server = server
         self.discovery_started_monotonic = None
         self.discovery_step_count = 0

@@ -19,17 +19,12 @@ import type {
   Parameter,
 } from "@/routes/workflows/types/workflowTypes";
 import {
-  CRON_PRESETS,
-  cronToHumanReadable,
-  formatNextRun,
   getLocalTimezone,
-  getNextRuns,
-  getTimezones,
   isValidCron,
   meetsMinCronInterval,
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
-import { cn } from "@/util/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConfigFields";
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
 import { buildScheduleParametersPayload } from "@/routes/workflows/components/scheduleParameters";
 import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
@@ -51,12 +46,9 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
     useState<WorkflowApiResponse | null>(null);
   const [cronExpression, setCronExpression] = useState("0 9 * * *");
   const [timezone, setTimezone] = useState(getLocalTimezone);
-  const [timezoneFilter, setTimezoneFilter] = useState<string | null>(null);
 
   const [scheduleName, setScheduleName] = useState("");
   const [scheduleDescription, setScheduleDescription] = useState("");
-
-  const allTimezones = useMemo(() => getTimezones(), []);
 
   const { data: workflows = [] } = useQuery<Array<WorkflowApiResponse>>({
     queryKey: ["workflows", "scheduleDialogPicker", workflowSearch],
@@ -127,18 +119,8 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
     }
   }, [selectedWorkflowId, workflowParameters, resetParameters]);
 
-  const filteredTimezones = useMemo(() => {
-    if (timezoneFilter === null) return allTimezones;
-    if (!timezoneFilter) return allTimezones;
-    const lower = timezoneFilter.toLowerCase();
-    return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
-  }, [timezoneFilter, allTimezones]);
-
   const valid = isValidCron(cronExpression);
-  const intervalTooShort = valid && !meetsMinCronInterval(cronExpression);
-  const cronAccepted = valid && !intervalTooShort;
-  const humanReadable = valid ? cronToHumanReadable(cronExpression) : null;
-  const nextRuns = valid ? getNextRuns(cronExpression, timezone, 5) : [];
+  const cronAccepted = valid && meetsMinCronInterval(cronExpression);
 
   function resetForm() {
     setWorkflowSearch("");
@@ -146,7 +128,6 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
     setSelectedWorkflow(null);
     setCronExpression("0 9 * * *");
     setTimezone(getLocalTimezone());
-    setTimezoneFilter(null);
     setScheduleName("");
     setScheduleDescription("");
     clearParameters();
@@ -275,116 +256,13 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
             disabled={createMutation.isPending}
           />
 
-          {/* Cron Presets */}
-          <div className="space-y-2">
-            <Label>Quick Presets</Label>
-            <div className="flex flex-wrap gap-2">
-              {CRON_PRESETS.map((preset) => (
-                <Button
-                  key={preset.label}
-                  variant={
-                    cronExpression === preset.expression
-                      ? "default"
-                      : "secondary"
-                  }
-                  size="sm"
-                  onClick={() => setCronExpression(preset.expression)}
-                >
-                  {preset.label}
-                </Button>
-              ))}
-            </div>
-          </div>
-
-          {/* Custom Cron Input */}
-          <div className="space-y-2">
-            <Label>Cron Expression</Label>
-            <Input
-              value={cronExpression}
-              onChange={(e) => setCronExpression(e.target.value)}
-              placeholder="* * * * *"
-              className={cn(
-                cronExpression && !cronAccepted && "border-destructive",
-              )}
-            />
-            {humanReadable && (
-              <p className="text-sm text-slate-400">{humanReadable}</p>
-            )}
-            {!valid && cronExpression && (
-              <p className="text-sm text-destructive">
-                Invalid cron expression
-              </p>
-            )}
-            {intervalTooShort && (
-              <p className="text-sm text-destructive">
-                Schedule runs must be at least 5 minutes apart.
-              </p>
-            )}
-          </div>
-
-          {/* Timezone Selector */}
-          <div className="space-y-2">
-            <Label>Timezone</Label>
-            <Input
-              value={timezoneFilter ?? timezone}
-              onChange={(e) => setTimezoneFilter(e.target.value)}
-              onFocus={(e) => e.currentTarget.select()}
-              onBlur={() => {
-                if (
-                  filteredTimezones.length === 1 &&
-                  filteredTimezones[0] !== undefined
-                ) {
-                  setTimezone(filteredTimezones[0]);
-                }
-                setTimezoneFilter(null);
-              }}
-              placeholder="Search timezones..."
-            />
-            {timezoneFilter !== null && (
-              <div className="max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
-                {filteredTimezones.slice(0, 20).map((tz) => (
-                  <button
-                    key={tz}
-                    type="button"
-                    className={cn(
-                      "w-full px-3 py-1.5 text-left text-sm hover:bg-slate-700",
-                      tz === timezone && "bg-slate-700 text-slate-50",
-                    )}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      setTimezone(tz);
-                      setTimezoneFilter(null);
-                    }}
-                  >
-                    {tz}
-                  </button>
-                ))}
-                {filteredTimezones.length === 0 && (
-                  <div className="px-3 py-2 text-sm text-slate-500">
-                    No timezones found
-                  </div>
-                )}
-              </div>
-            )}
-            <p className="text-xs text-slate-500">Current: {timezone}</p>
-          </div>
-
-          {/* Next Runs Preview */}
-          {nextRuns.length > 0 && (
-            <div className="space-y-2">
-              <Label>Next Scheduled Runs</Label>
-              <div className="space-y-1 rounded-md border border-slate-700 bg-slate-elevation3 p-3">
-                {nextRuns.map((run) => (
-                  <div
-                    key={run.toISOString()}
-                    className="text-xs text-slate-400"
-                  >
-                    {formatNextRun(run, timezone)}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          <ScheduleConfigFields
+            cronExpression={cronExpression}
+            timezone={timezone}
+            onCronChange={setCronExpression}
+            onTimezoneChange={setTimezone}
+            disabled={createMutation.isPending}
+          />
         </div>
 
         <DialogFooter>

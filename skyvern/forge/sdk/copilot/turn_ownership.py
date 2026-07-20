@@ -79,10 +79,12 @@ _PRECEDENCE_ORDER: tuple[TurnClaimant, ...] = (
     # Grounding-over-persistence nested exception: a live grounding requirement is emitted instead
     # of the persistence force when both hold.
     TurnClaimant.RECORDED_OUTCOME_GROUNDING,
-    # Cascade position after the rescout steer and below the grounding exception.
-    TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
-    # The churn convergence floor fires before the no-progress floor in the enforcement backstop.
+    # A budget-exhausted churn halt is the loop exit and outranks the persistence force, whose
+    # accepted-save channel has already failed by then; the pair only co-occurs on synthesized turns.
     TurnClaimant.CODE_AUTHORING_CHURN,
+    # Cascade position after the rescout steer and below the grounding exception; defers to the
+    # exhausted churn halt above.
+    TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
     # Loop detectors defer to every steering gate above them.
     TurnClaimant.LOOP_DETECTED,
 )

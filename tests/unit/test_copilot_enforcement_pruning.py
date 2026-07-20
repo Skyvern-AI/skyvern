@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agents import RunConfig
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_html
 from skyvern.forge.sdk.copilot.config import (
     SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
     BlockAuthoringPolicy,
@@ -44,6 +46,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _maybe_synthesized_block_offer_msg,
     _needs_suspicious_success_nudge,
     _prune_input_list,
+    _requested_output_paths_for_ctx,
     _should_block_mutating_tool_after_synthesized_offer,
     _should_force_advisory_run_dispatch,
     _should_force_synthesized_block_persistence,
@@ -51,6 +54,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _uncovered_output_reject_admits_evaluate,
     arm_credential_scout_reopen,
     consume_uncovered_output_reopen_event,
+    mint_scout_observation_contract_for_ctx,
     record_scouted_output_coverage,
     run_with_enforcement,
     synthesized_block_persistence_signal,
@@ -71,6 +75,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
     OutputContractAdvisoryState,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
@@ -140,6 +145,8 @@ class _Ctx:
         self.synthesized_goal_complete_landed = False
         self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
+        self.scout_observed_terminal_criterion_ids: set[str] = set()
+        self.scout_observation_contract: object | None = None
         self.flow_evidence: list[dict[str, object]] = []
         self.copilot_config: CopilotConfig | None = None
         self.uncovered_output_rescout_context_key = None
@@ -148,6 +155,7 @@ class _Ctx:
         self.last_run_blocks_workflow_run_id = None
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
+        self.author_time_gate_log_only_ids: frozenset[str] = frozenset()
         self.author_time_gate_ablation_events = []
         self.request_policy = None
         self.blocker_signal = None
@@ -2272,6 +2280,55 @@ class TestGoalLikelyNeedsMoreBlocks:
         assert self._check(123, 1) is False  # type: ignore[arg-type]
 
 
+LISTING_DETAIL_URL = "http://localhost:8901/record/1457803926"
+
+# Generic multi-field detail DOM: exercises the contract's label/header binding vs the
+# coverage-token channel. No specific vertical or PII (see CLAUDE.md OSS-sync rules).
+LISTING_DETAIL_HTML = """
+<html><head><title>Regional Records Directory</title></head><body>
+<div class="layout">
+  <div class="panel">
+    <h1>Search Results</h1>
+    <p class="muted">Showing 1 result in <strong>Example Region</strong>.</p>
+    <div class="result-card" id="recordCard">
+      <div>
+        <div class="rc-name">Northgate Unit 7</div>
+        <div class="muted">Facility</div>
+        <div>Northgate Holdings, LLC</div>
+        <div class="muted">general listing</div>
+        <div class="small">100 Example Ave # 200, Example City, EX 00001</div>
+        <div class="small muted">12.34 units away &middot; <a class="link">1-800-555-0102</a></div>
+        <div id="recordDetails">
+          <div class="kv"><div class="k">Reference Number</div><div>1457803926</div></div>
+          <div class="kv"><div class="k">Region</div><div>North</div></div>
+          <div class="kv"><div class="k">Category</div><div>Standard</div></div>
+          <div class="kv"><div class="k">Tier</div><div>Two</div></div>
+          <div class="kv"><div class="k">Effective date</div><div>01/01/2024</div></div>
+          <h3>Locations</h3>
+          <p class="muted small">Approval status per location for Northgate Holdings, LLC.</p>
+          <table>
+            <thead><tr><th>Site</th><th>Address</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>Northgate Holdings, LLC</td><td>100 Example Ave # 200, Example City, EX 00001</td><td><span class="status-ok">Approved</span></td></tr>
+              <tr><td>Northgate Holdings, LLC</td><td>240 Sample Blvd, Example City, EX 00002</td><td><span class="status-ok">Approved</span></td></tr>
+              <tr><td>Southgate Group</td><td>512 Test St, Other City, EX 00003</td><td><span class="status-no">Not Approved</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="rc-flags"></div>
+    </div>
+  </div>
+  <div class="panel filter-side">
+    <h2>Filter Options</h2>
+    <div class="fld"><label for="refInput">Search by Name, Group, or Reference Number</label><input id="refInput" type="text"/></div>
+    <div class="fld"><label>Reference Number</label><input type="text" value="1457803926"/></div>
+  </div>
+</div>
+</body></html>
+"""
+
+
 def _criterion(output_path: str, outcome: str) -> CompletionCriterion:
     return CompletionCriterion(id=output_path, outcome=outcome, output_path=output_path)
 
@@ -2406,6 +2463,118 @@ class TestScoutOutputCoverageGate:
         assert uncovered_requested_output_paths(ctx) == set()
         assert synthesized_trajectory_is_goal_complete(ctx) is True
 
+    def test_independent_run_evidence_is_exempt_while_runtime_output_stays_gated(self) -> None:
+        independent = CompletionCriterion(
+            id="output.login_gate_present",
+            outcome="whether a login gate blocked the target is recorded",
+            output_path="output.login_gate_present",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_independent_run_evidence_is_exempt_from_repair_context(self) -> None:
+        independent = CompletionCriterion(
+            id="output.login_gate_blocks_target",
+            outcome="the login-gate judgment is independently observed after the run",
+            output_path="output.login_gate_blocks_target",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["login_gate_blocks_target", "document_name"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    @pytest.mark.parametrize(
+        "evidence_source",
+        ["registered_output_parameter", "registered_artifact_content"],
+    )
+    def test_registered_post_run_evidence_remains_uncovered_from_repair_context(
+        self,
+        evidence_source: str,
+    ) -> None:
+        registered = CompletionCriterion(
+            id="output.confirmation_number",
+            outcome="the confirmation number is registered after the run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source=evidence_source,
+        )
+        ctx = self._authoring_ctx(registered)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["confirmation_number"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.confirmation_number"}
+
+    @pytest.mark.parametrize(
+        "evidence_source",
+        ["registered_output_parameter", "registered_artifact_content"],
+    )
+    def test_registered_post_run_evidence_stays_gated_when_independent_evidence_uses_same_repair_path(
+        self,
+        evidence_source: str,
+    ) -> None:
+        independent = CompletionCriterion(
+            id="independent_confirmation_number",
+            outcome="the confirmation number is confirmed by an independent run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        registered = CompletionCriterion(
+            id="registered_confirmation_number",
+            outcome="the confirmation number is registered after the run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source=evidence_source,
+        )
+        ctx = self._authoring_ctx(independent, registered)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["confirmation_number"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.confirmation_number"}
+
+    def test_runtime_output_stays_gated_when_independent_evidence_uses_same_path(self) -> None:
+        independent = CompletionCriterion(
+            id="independent_document_name",
+            outcome="the document name is confirmed by an independent run",
+            output_path="output.document_name",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_pathless_post_run_criterion_does_not_erase_repair_output_field(self) -> None:
+        independent = CompletionCriterion(
+            id="c_independent",
+            outcome="the judgment is independently observed after the run",
+            output_path=None,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        ctx = self._authoring_ctx(independent)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["field"],
+        )
+
+        assert _requested_output_paths_for_ctx(ctx) == {"output.field"}
+
     def test_runtime_output_stays_gated_alongside_exempt_source(self) -> None:
         registered = CompletionCriterion(
             id="output.confirmation_number",
@@ -2447,6 +2616,276 @@ class TestScoutOutputCoverageGate:
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
         assert synthesized_trajectory_is_goal_complete(ctx) is False
         assert _should_force_synthesized_block_persistence(ctx) is False
+
+    @staticmethod
+    def _kv_page(*, key_text: str, url: str, value_prose: str) -> dict[str, object]:
+        return {
+            "current_url": url,
+            "inspection_warnings": [],
+            "result_containers_truncated": False,
+            "key_value_relations_truncated": False,
+            "key_value_relations": [
+                {
+                    "key_text": key_text,
+                    "container_selector": ".kv",
+                    "container_match_count": 1,
+                    "container_position": 0,
+                    "value_child_index": 1,
+                    "direct_child_count": 2,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "result_containers": [{"selector": "#detail", "text_excerpt": value_prose}],
+        }
+
+    def test_contract_credits_output_path_without_lexical_overlap(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.overall_credentialing_result", "Overall Credentialing Result"))
+        page = self._kv_page(
+            key_text="Overall Credentialing Result",
+            url="https://example.com/provider",
+            value_prose="Status: Credentialed",
+        )
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            page,
+            url="https://example.com/provider",
+        )
+        assert contract is not None
+
+        record_scouted_output_coverage(ctx, page)
+        assert ctx.scouted_output_covered_paths == set()
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page, contract=contract)
+        assert ctx.scouted_output_covered_paths == {"output.overall_credentialing_result"}
+        assert uncovered_requested_output_paths(ctx) == set()
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert credited["value_grounded_paths"] == ["output.overall_credentialing_result"]
+
+    @staticmethod
+    def _shape_registry_config() -> CopilotConfig:
+        return CopilotConfig(
+            requested_output_shape_expectations={
+                "widget_id": ShapeExpectation(ValueShape.NUMERIC_ID, ValueCardinality.SCALAR, id_digit_length=8),
+                "depot": ShapeExpectation(ValueShape.POSTAL_ADDRESS, ValueCardinality.COLUMN),
+                "phase": ShapeExpectation(ValueShape.CATEGORICAL_TOKEN, ValueCardinality.COLUMN),
+            }
+        )
+
+    @staticmethod
+    def _shape_scout_page() -> dict[str, object]:
+        def _row(row_index: int, depot: str, phase: str) -> dict[str, object]:
+            return {
+                "row_index": row_index,
+                "visible": True,
+                "has_row_header": False,
+                "cells": [
+                    {"column_index": 0, "visible": True, "has_text": True, "text": depot},
+                    {"column_index": 1, "visible": True, "has_text": True, "text": phase},
+                ],
+            }
+
+        return {
+            "current_url": "https://example.com/sites",
+            "source_tool": "scout_interaction",
+            "interaction_selector": "#reveal",
+            "inspection_warnings": [],
+            "result_containers_truncated": False,
+            "key_value_relations_truncated": False,
+            "key_value_relations": [
+                {
+                    "key_text": "Ref Code",
+                    "value_text": "12345678",
+                    "container_selector": ".kv",
+                    "container_match_count": 1,
+                    "container_position": 0,
+                    "value_child_index": 1,
+                    "direct_child_count": 2,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": "#sites",
+                    "selector_match_count": 1,
+                    "visible": True,
+                    "span_free": True,
+                    "nested_table_free": True,
+                    "headers": [
+                        {"text": "Loc", "column_index": 0},
+                        {"text": "Stage", "column_index": 1},
+                    ],
+                    "row_selector": "#sites tbody tr",
+                    "row_count": 3,
+                    "rows_truncated": False,
+                    "sample_rows": ["r0", "r1", "r2"],
+                    "rows": [
+                        _row(0, "12 Peak Way Reno NV 89501", "Complete"),
+                        _row(1, "8 Oak Loop Boston MA", "Complete"),
+                        _row(2, "40 Fir Trail Fremont CA", "Pending"),
+                    ],
+                }
+            ],
+        }
+
+    def test_shape_channel_credits_value_grounded_and_drains_derived_parent(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        ctx.copilot_config = self._shape_registry_config()
+        page = self._shape_scout_page()
+
+        no_registry_ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        assert mint_scout_observation_contract_for_ctx(no_registry_ctx, page, url=page["current_url"]) is None
+
+        contract = mint_scout_observation_contract_for_ctx(ctx, page, url=page["current_url"])
+        assert contract is not None
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page, contract=contract)
+        assert ctx.scouted_output_covered_paths == {
+            "output.widget_id",
+            "output.sites",
+            "output.sites[].depot",
+            "output.sites[].phase",
+        }
+        assert uncovered_requested_output_paths(ctx) == set()
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert any(path == "output.sites" for path in credited["value_grounded_paths"])
+
+    def test_inspect_sourced_packet_shape_grounds_value_regardless_of_interaction(self) -> None:
+        page = self._shape_scout_page()
+        page["source_tool"] = "inspect_page_for_composition"
+        page.pop("interaction_selector", None)
+
+        # First-load capture (no prior interaction) grounds value by shape via witnessed content.
+        landing_ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        landing_ctx.copilot_config = self._shape_registry_config()
+        landing_ctx.scout_trajectory = []
+        landing_contract = mint_scout_observation_contract_for_ctx(landing_ctx, page, url=page["current_url"])
+        assert landing_contract is not None
+        with capture_logs() as landing_logs:
+            record_scouted_output_coverage(landing_ctx, page, contract=landing_contract)
+        landing_credited = next(
+            entry for entry in landing_logs if entry["event"] == "copilot_scouted_output_coverage_credited"
+        )
+        assert landing_credited["provenance"] == "value_grounded"
+
+        ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        ctx.copilot_config = self._shape_registry_config()
+        contract = mint_scout_observation_contract_for_ctx(ctx, page, url=page["current_url"])
+        assert contract is not None
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page, contract=contract)
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert any(path == "output.sites" for path in credited["value_grounded_paths"])
+
+    def test_two_partial_contracts_accumulate_coverage(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.overall_credentialing_result", "Overall Credentialing Result"),
+            _criterion("output.npi", "NPI"),
+        )
+        first = self._kv_page(
+            key_text="Overall Credentialing Result", url="https://example.com/p1", value_prose="Credentialed"
+        )
+        second = self._kv_page(key_text="NPI", url="https://example.com/p2", value_prose="1234567890")
+
+        first_contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            first,
+            url="https://example.com/p1",
+        )
+        record_scouted_output_coverage(ctx, first, contract=first_contract)
+        assert ctx.scouted_output_covered_paths == {"output.overall_credentialing_result"}
+
+        second_contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            second,
+            url="https://example.com/p2",
+        )
+        record_scouted_output_coverage(ctx, second, contract=second_contract)
+        assert ctx.scouted_output_covered_paths == {"output.overall_credentialing_result", "output.npi"}
+        assert uncovered_requested_output_paths(ctx) == set()
+
+    def test_realistic_multifield_dom_contract_binds_and_credits_value_grounded(self) -> None:
+        page_evidence = parse_composition_html(
+            LISTING_DETAIL_HTML,
+            inspected_url=LISTING_DETAIL_URL,
+            current_url=LISTING_DETAIL_URL,
+        )
+        ref_relations = [
+            relation for relation in page_evidence["key_value_relations"] if relation["key_text"] == "Reference Number"
+        ]
+        assert len(ref_relations) == 1
+
+        criteria = (
+            _criterion("output.reference_number", "Reference Number"),
+            _criterion("output.row_statuses", "Status"),
+        )
+
+        ctx = self._authoring_ctx(*criteria)
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            page_evidence,
+            url=LISTING_DETAIL_URL,
+        )
+        assert contract is not None
+        bindings_by_path = {binding.output_path: binding for binding in contract.bindings}
+        # The contract binds the reference-number KV and the status column by label/header match,
+        # crediting them as value_grounded from the realistic multi-field capture.
+        assert set(bindings_by_path) == {"output.reference_number", "output.row_statuses"}
+        assert bindings_by_path["output.reference_number"].kind == "key_value"
+        assert bindings_by_path["output.row_statuses"].kind == "table_column"
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page_evidence, contract=contract)
+        assert {"output.reference_number", "output.row_statuses"} <= ctx.scouted_output_covered_paths
+        assert uncovered_requested_output_paths(ctx) == set()
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert set(credited["value_grounded_paths"]) >= {"output.reference_number", "output.row_statuses"}
+
+    def test_include_lexical_false_credits_contract_only(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "Document Name"))
+        page = self._kv_page(
+            key_text="Document Name", url="https://example.com/doc", value_prose="Document Name Resale Certificate"
+        )
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            page,
+            url="https://example.com/doc",
+        )
+        assert contract is not None
+
+        record_scouted_output_coverage(ctx, page, include_lexical=False)
+        assert ctx.scouted_output_covered_paths == set()
+
+        record_scouted_output_coverage(ctx, page, contract=contract, include_lexical=False)
+        assert ctx.scouted_output_covered_paths == {"output.document_name"}
 
     def test_empty_shell_selector_tokens_do_not_credit(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
@@ -2735,6 +3174,15 @@ class TestScoutOutputCoverageGate:
         _restore_post_hook_context(ctx, snapshot)
         assert ctx.scouted_output_covered_paths == {"output.document_name"}
         assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+    def test_post_hook_failure_rolls_back_scout_observation_contract(self) -> None:
+        assert "scout_observation_contract" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        ctx = _Ctx()
+        ctx.scout_observation_contract = None
+        snapshot = _snapshot_post_hook_context(ctx)
+        ctx.scout_observation_contract = object()
+        _restore_post_hook_context(ctx, snapshot)
+        assert ctx.scout_observation_contract is None
 
 
 class TestAdvisoryRunDispatchForceLane:

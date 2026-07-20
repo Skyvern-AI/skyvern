@@ -15,6 +15,7 @@ import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import {
   Accordion,
   AccordionContent,
@@ -50,6 +51,8 @@ import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isActivationRun } from "@/util/onboarding/rolloutGating";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
@@ -59,6 +62,7 @@ import { parseHeaderJson } from "@/util/secretHeaders";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import {
+  CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
   WorkflowBlock,
@@ -74,7 +78,10 @@ import {
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
-import { getLoginCredentialInputs } from "./runWorkflowCredentials";
+import {
+  getLoginCredentialInputs,
+  getRotatingCredentialIds,
+} from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
 import { visitWorkflowBlocks } from "./workflowBlockUtils";
 
@@ -354,6 +361,47 @@ function getLoginCredentialDisplayText(
   };
 }
 
+function FallbackCredentialList({
+  fallbackCredentialIds,
+  fallbackTrigger,
+  credentialNamesById,
+}: {
+  fallbackCredentialIds: Array<string>;
+  fallbackTrigger: CredentialFallbackTrigger | null;
+  credentialNamesById: Map<string, string>;
+}) {
+  if (fallbackCredentialIds.length === 0) {
+    return null;
+  }
+
+  const triggerText =
+    fallbackTrigger === "any_failure"
+      ? "for any reason"
+      : "on credential failures";
+
+  return (
+    <div className="space-y-2">
+      <ol className="space-y-1">
+        {fallbackCredentialIds.map((credentialId, index) => (
+          <li
+            key={credentialId}
+            className="flex min-w-0 items-center gap-2 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200"
+          >
+            <span className="shrink-0 text-slate-400">{index + 1}.</span>
+            <span className="truncate">
+              {credentialNamesById.get(credentialId) ?? credentialId}
+            </span>
+          </li>
+        ))}
+      </ol>
+      <p className="text-xs text-slate-400">
+        If the run fails {triggerText}, Skyvern retries it automatically with
+        the next fallback.
+      </p>
+    </div>
+  );
+}
+
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
@@ -415,6 +463,8 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
   const onboarding = useOnboardingStateOptional();
+  const credentialFallbackRetryEnabled =
+    useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
   const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const onboardingLoading = onboarding != null && onboarding.isLoading;
   // Gate on the rollout arm so a 0% rollout / rollback restores the
@@ -674,7 +724,7 @@ function RunWorkflowForm({
             <h1 className="text-3xl">
               Inputs{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
-            <h2 className="text-lg text-slate-400">
+            <h2 className="text-lg text-muted-foreground">
               Fill the placeholder values that you have linked throughout your
               agent.
             </h2>
@@ -764,11 +814,25 @@ function RunWorkflowForm({
             <header>
               <h1 className="text-lg">Login credentials</h1>
             </header>
-            {loginCredentialInputs.map(({ parameter, loginBlockLabels }) => {
+            {loginCredentialInputs.map((input) => {
+              const {
+                parameter,
+                loginBlockLabels,
+                fallbackCredentialIds,
+                fallbackTrigger,
+              } = input;
               const { title, description } = getLoginCredentialDisplayText(
                 parameter,
                 loginBlockLabels,
               );
+              // Only surface fallbacks (and the "retries automatically" promise) for orgs in the
+              // rollout; the backend retry gate is keyed on the same flag.
+              const hasFallbacks =
+                credentialFallbackRetryEnabled &&
+                fallbackCredentialIds.length > 0;
+              const displayedFallbackCredentialIds = hasFallbacks
+                ? fallbackCredentialIds
+                : [];
 
               if (
                 parameter.parameter_type === WorkflowParameterTypes.Workflow
@@ -792,15 +856,15 @@ function RunWorkflowForm({
                     render={({ field }) => (
                       <FormItem>
                         <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
+                          <FormLabel className="!text-foreground">
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
                                 {title}
-                                <span className="text-sm text-slate-400">
+                                <span className="text-sm text-muted-foreground">
                                   credential
                                 </span>
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 {description}
                               </h2>
                             </div>
@@ -829,6 +893,47 @@ function RunWorkflowForm({
                 );
               }
 
+              const credentialIds = getRotatingCredentialIds(parameter);
+
+              if (credentialIds.length <= 1) {
+                const primaryCredentialId =
+                  credentialIds[0] ?? parameter.credential_id;
+                return (
+                  <div key={parameter.key} className="flex gap-16">
+                    <div className="w-72 shrink-0 text-slate-50">
+                      <div className="flex items-center gap-2 text-lg">
+                        {title}
+                        <span className="text-sm text-slate-400">
+                          credential
+                        </span>
+                      </div>
+                      <h2 className="text-sm text-slate-400">{description}</h2>
+                    </div>
+                    <div className="w-full space-y-2">
+                      <div className="flex min-w-0 items-center gap-2 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200">
+                        <span className="min-w-0 truncate">
+                          {credentialNamesById.get(primaryCredentialId) ??
+                            primaryCredentialId}
+                        </span>
+                        {hasFallbacks && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-xs font-normal"
+                          >
+                            Primary
+                          </Badge>
+                        )}
+                      </div>
+                      <FallbackCredentialList
+                        fallbackCredentialIds={displayedFallbackCredentialIds}
+                        fallbackTrigger={fallbackTrigger}
+                        credentialNamesById={credentialNamesById}
+                      />
+                    </div>
+                  </div>
+                );
+              }
+
               return (
                 <FormField
                   key={parameter.key}
@@ -845,6 +950,14 @@ function RunWorkflowForm({
                       credentialNamesById={credentialNamesById}
                       title={title}
                       description={description}
+                      showPrimaryBadge={hasFallbacks}
+                      fallbackContent={
+                        <FallbackCredentialList
+                          fallbackCredentialIds={displayedFallbackCredentialIds}
+                          fallbackTrigger={fallbackTrigger}
+                          credentialNamesById={credentialNamesById}
+                        />
+                      }
                     />
                   )}
                 />
@@ -928,17 +1041,17 @@ function RunWorkflowForm({
                     return (
                       <FormItem>
                         <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
+                          <FormLabel className="!text-foreground">
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
                                 {parameter.key}
-                                <span className="text-sm text-slate-400">
+                                <span className="text-sm text-muted-foreground">
                                   {getLabelForWorkflowParameterType(
                                     parameter.workflow_parameter_type,
                                   )}
                                 </span>
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 {parameter.description}
                               </h2>
                             </div>
@@ -1019,7 +1132,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Webhook Callback URL
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           The URL of a webhook endpoint to send the details of
                           the agent result.
                         </h2>
@@ -1079,7 +1192,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Proxy Location
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           Route Skyvern through one of our available proxies.
                         </h2>
                       </div>
@@ -1129,7 +1242,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Run With
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           {descriptions[field.value] ?? descriptions.agent}
                         </h2>
                       </div>
@@ -1170,7 +1283,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           AI Fallback (cached scripts)
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           If the run fails when running with code, keep this on
                           to have AI attempt to fix the issue and regenerate the
                           code.
@@ -1216,7 +1329,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Session ID
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Use a persistent browser session to maintain
                                   state and enable browser interaction.
                                 </h2>
@@ -1253,7 +1366,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Profile
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Load a saved browser profile to reuse cookies,
                                   storage, and signed-in state for this run.
                                 </h2>
@@ -1286,7 +1399,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Address
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   The address of the Browser server to use for
                                   the agent run.
                                 </h2>
@@ -1324,7 +1437,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Extra HTTP Headers
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Specify some self defined HTTP requests
                                   headers in Dict format
                                 </h2>
@@ -1358,7 +1471,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   CDP Connect Headers
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Headers attached only to the CDP WebSocket
                                   handshake when connecting to a remote browser
                                   (e.g. auth for the CDP endpoint). Not
@@ -1394,7 +1507,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Max Screenshot Scrolls
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                                 </h2>
                               </div>

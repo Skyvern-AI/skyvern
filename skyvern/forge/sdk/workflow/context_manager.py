@@ -722,7 +722,7 @@ class WorkflowRunContext:
         LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         credential_id = None
-        if parameter.credential_ids:
+        if parameter.credential_ids or parameter.fallback_credential_ids:
             credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
         elif parameter.credential_id:
             if self.has_parameter(parameter.credential_id) and self.has_value(parameter.credential_id):
@@ -745,8 +745,18 @@ class WorkflowRunContext:
         if cached:
             return cached
         if not parameter.credential_ids:
-            self.resolved_credential_parameter_ids[parameter.key] = parameter.credential_id
-            return parameter.credential_id
+            credential_id = parameter.credential_id
+            if parameter.fallback_credential_ids:
+                selected = await app.DATABASE.workflow_run_credential_selections.get_selection(
+                    workflow_run_id=self.workflow_run_id,
+                    parameter_key=parameter.key,
+                )
+                if selected:
+                    credential_id = selected
+                elif self.has_parameter(credential_id) and self.has_value(credential_id):
+                    credential_id = self.values[credential_id]
+            self.resolved_credential_parameter_ids[parameter.key] = credential_id
+            return credential_id
         credential_id = await select_credential_for_run(
             workflow_run_id=self.workflow_run_id,
             organization_id=organization_id,

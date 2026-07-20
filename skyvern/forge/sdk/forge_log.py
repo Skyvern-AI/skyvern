@@ -518,6 +518,13 @@ def setup_logger() -> None:
     logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
 
+    # The OTLP gRPC exporter logs a WARNING per retry and an ERROR per dropped batch when its
+    # endpoint is unreachable; raise its threshold via OTEL_EXPORTER_LOG_LEVEL (default WARNING) to
+    # drop that spam where the endpoint is intentionally unavailable, keeping it visible elsewhere.
+    logging.getLogger("opentelemetry.exporter.otlp.proto.grpc.exporter").setLevel(
+        LOGGING_LEVEL_MAP.get(settings.OTEL_EXPORTER_LOG_LEVEL.upper(), logging.WARNING)
+    )
+
     # Drop asyncio's orphaned-future noise from torn-down Playwright driver pipes (logged at
     # ERROR but non-actionable). setup_logger may run more than once (uvicorn reload), so keep
     # exactly one instance instead of stacking duplicates.

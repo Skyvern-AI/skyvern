@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_PROMPT_NAME
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -41,6 +42,16 @@ def _render(**overrides: str) -> str:
         global_llm_context=overrides.get("global_llm_context", ""),
         raw_secret_present=overrides.get("raw_secret_present", "false"),
         active_completion_criteria=active_completion_criteria,
+    )
+
+
+def _render_terminal_action_reconciliation() -> str:
+    return prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        terminal_action_reconciliation=True,
+        user_message="Sign in with a saved credential and create a service request.",
+        reconciliation_credential_input_kind="credential_name",
+        reconciliation_criteria='[{"id":"c0","outcome":"A service request is created.","kind":"outcome"}]',
     )
 
 
@@ -90,10 +101,16 @@ class TestRequestPolicyPromptStructure:
         rendered = _render()
         assert (
             "{outcome, contingent_on, contingent_antecedent_output_path, "
-            "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
+            "deliverable_kind, deliverable_confirmation_criterion_id, implicit, method_mandated, level, output_path, "
+            "expected_output_value, "
             "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
             "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
         ) in rendered
+        assert "deliverable_confirmation_criterion_id: null unless this is a plain run-plane outcome" in rendered
+        assert "__copilot_registered_download__downloaded_files_non_empty" in rendered
+        assert "Never set it merely because another outcome downloads a file" in rendered
+        assert "typed request-slot producer owns its final identity, path, plane, and pinability" in rendered
+        assert "Do not infer or emit pinability here" in rendered
         assert "never hide it in outcome prose" in rendered
         assert (
             "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, "
@@ -108,6 +125,24 @@ class TestRequestPolicyPromptStructure:
         ) in rendered
         assert "classification_output_key=login_only and expected_classification=true" in rendered
         assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_terminal_action_guidance_distinguishes_order_from_login_prefix(self) -> None:
+        rendered = _render()
+
+        assert "place an order" in rendered
+        assert "replace that post-login end state" in rendered
+        assert "successful authentication" in rendered
+        assert "whose only requested end state is authentication" in rendered
+
+    def test_terminal_action_reconciliation_mode_is_bounded_to_existing_criteria(self) -> None:
+        rendered = _render_terminal_action_reconciliation()
+
+        assert "TERMINAL ACTION RECONCILIATION MODE" in rendered
+        assert '"criterion_id":"c0"' in rendered
+        assert "select exactly one existing criterion ID" in rendered
+        assert "do not invent, remove, duplicate, paraphrase, or re-order criteria" in rendered
+        assert "successful authentication itself, including MFA" in rendered
+        assert "placing an order" in rendered
 
     def test_completion_criteria_schema_exposes_judgment_truth_condition_fields(self) -> None:
         rendered = _render()
@@ -268,6 +303,75 @@ class TestRawSecretBackstop:
         assert "FakePass123" not in redacted
         assert "AnotherFakePass456" not in redacted
         assert redacted.count("[REDACTED_SECRET]") == 2
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "access_token=abc123DEF",
+            "client_secret=xyz789",
+            "refresh_token=r_1.2.3",
+            "id_token=eyJabc.def.ghi",
+        ],
+    )
+    def test_oauth_style_underscore_prefixed_keyword_assignments_are_redacted(self, message: str) -> None:
+        redacted = redact_raw_secrets_for_prompt(message)
+        secret_value = message.split("=", 1)[1]
+
+        assert secret_value not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "token=abc",
+            "password: hunter2",
+            "api_key = k3y",
+            "authorization: Bearer zzz",
+        ],
+    )
+    def test_existing_keyword_assignment_cases_still_redact(self, message: str) -> None:
+        redacted = redact_raw_secrets_for_prompt(message)
+        secret_value = message.split(":", 1)[1] if ":" in message else message.split("=", 1)[1]
+
+        assert secret_value.strip() not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "tokenizer = Tokenizer()",
+            "password_reset_flow()",
+            "the secretary emailed me",
+            "secretariat won",
+        ],
+    )
+    def test_non_secret_text_is_not_over_redacted(self, message: str) -> None:
+        assert redact_raw_secrets_for_prompt(message) == message
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "next_token=abc123",
+            "continuation_token=xyz789",
+            "page_token=p_1",
+            "next_page_token=np_2",
+        ],
+    )
+    def test_pagination_cursor_tokens_are_not_over_redacted(self, message: str) -> None:
+        assert redact_raw_secrets_for_prompt(message) == message
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "authorization: Bearer zzz_opaque_value",
+            "Authorization: Basic dXNlcjpwYXNzd29yZA",
+        ],
+    )
+    def test_scheme_prefixed_authorization_values_are_redacted(self, message: str) -> None:
+        redacted = redact_raw_secrets_for_prompt(message)
+        opaque_value = message.split()[-1]
+        assert opaque_value not in redacted
+        assert "[REDACTED_SECRET]" in redacted
 
 
 class TestRawSecretRefusalSentinelConsistency:
@@ -463,6 +567,8 @@ class TestMalformedCredentialIdExtraction:
 
 def _capture_handler(captured: dict[str, str]):
     async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return {"version": "1", "slots": []}
         captured["prompt"] = prompt
         return {"testing_intent": "unspecified", "credential_input_kind": "none"}
 

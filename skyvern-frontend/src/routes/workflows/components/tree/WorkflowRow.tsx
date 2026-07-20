@@ -25,6 +25,7 @@ import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
+import { WorkflowReliabilityBadge } from "../../WorkflowReliabilityBadge";
 import { WorkflowRowContextMenu } from "../WorkflowRowContextMenu";
 import { useWorkflowsListContext } from "./WorkflowsListContext";
 import { useNavigate } from "react-router-dom";
@@ -57,6 +58,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     selectedCount,
     foldersMap,
     workflowTagsMap,
+    workflowReliabilityMap,
     tagDescriptions,
     tagColors,
     tagKeys,
@@ -101,7 +103,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         {showCheckbox && <TableCell />}
         <TableCell colSpan={2} style={firstCellStyle}>
           <div className="flex min-w-0 items-center gap-2">
-            <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
+            <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-700 dark:text-blue-400" />
             <span className="truncate" title={workflow.title}>
               {workflow.title}
             </span>
@@ -193,6 +195,11 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     </Tooltip>
                   </TooltipProvider>
                 )}
+                <WorkflowReliabilityBadge
+                  reliability={
+                    workflowReliabilityMap[workflow.workflow_permanent_id]
+                  }
+                />
               </div>
               {taggingEnabled && workflowTags && workflowTags.length > 0 ? (
                 <TagChipList
@@ -210,7 +217,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
           >
             {workflow.folder_id ? (
               <div className="flex min-w-0 items-center gap-1.5">
-                <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+                <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
                 <span
                   className="truncate text-sm"
                   title={

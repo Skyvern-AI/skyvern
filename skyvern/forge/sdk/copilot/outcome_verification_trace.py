@@ -19,6 +19,8 @@ LOG = structlog.get_logger()
 
 _SNAPSHOT_ATTR = "outcome_verification_trace_snapshot"
 _COMPLETION_PREFIX = "completion_verification_"
+_ABSTENTION_PREFIX = "plain_outcome_no_evidence_abstention_"
+_ABSTENTION_LOG_EVENT = "copilot.completion.plain_outcome_no_evidence_abstention"
 _CODE_ARTIFACT_VIOLATIONS_KEY = "copilot.code_artifact_violations"
 _CODE_ARTIFACT_VIOLATION_LABELS_KEY = "copilot.code_artifact_violation_block_labels"
 _CODE_ARTIFACT_VIOLATION_COUNT_KEY = "copilot.code_artifact_violation_count"
@@ -76,20 +78,32 @@ def record_code_artifact_violations(ctx: Any, violations: list[str], offending_l
         LOG.warning("failed to record copilot code artifact violation telemetry", exc_info=True)
 
 
-def record_completion_verification(ctx: Any, result: Any | None) -> None:
+def record_completion_verification(ctx: Any, result: Any | None, workflow_run_id: str | None = None) -> None:
     """Refresh the snapshot's completion-verification block for the latest run.
 
     Called on every recorded run, evaluated or not, so the snapshot describes the
     turn's most recent run and never preserves a stale verdict from an earlier one.
     """
     try:
+        trace_data: dict[str, Any] | None = None
+        if result is not None and getattr(result, "status", None) == "evaluated":
+            trace_data = result.to_trace_data()
+            # Span attributes are refreshed by later runs in the same turn, so the
+            # abstention fingerprint is also emitted as a durable log line.
+            if trace_data.get(f"{_ABSTENTION_PREFIX}engaged") is True:
+                LOG.info(
+                    _ABSTENTION_LOG_EVENT,
+                    workflow_run_id=workflow_run_id,
+                    fully_satisfied=trace_data.get("fully_satisfied"),
+                    **{key: value for key, value in trace_data.items() if key.startswith(_ABSTENTION_PREFIX)},
+                )
         snapshot = _snapshot(ctx)
         if snapshot is None:
             return
         for key in [key for key in snapshot if key.startswith(_COMPLETION_PREFIX)]:
             del snapshot[key]
-        if result is not None and getattr(result, "status", None) == "evaluated":
-            snapshot.update({f"{_COMPLETION_PREFIX}{key}": value for key, value in result.to_trace_data().items()})
+        if trace_data is not None:
+            snapshot.update({f"{_COMPLETION_PREFIX}{key}": value for key, value in trace_data.items()})
             snapshot[f"{_COMPLETION_PREFIX}evaluated_on_final_run"] = True
         else:
             snapshot[f"{_COMPLETION_PREFIX}status"] = getattr(result, "status", None) or "not_run"

@@ -12,6 +12,7 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
@@ -32,6 +33,7 @@ import {
 } from "../runProjections";
 import { toReadableSearch } from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
+import { collectBlockPrompts } from "./blockPrompts";
 import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
@@ -42,6 +44,7 @@ import {
 } from "./RunOutputsSection";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunSummaryStrip } from "./RunSummaryStrip";
+import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -285,6 +288,9 @@ export function RunView({
   const runInputs = useMemo(() => {
     const definitionParameters =
       workflowRun?.workflow?.workflow_definition?.parameters;
+    const blockPrompts = collectBlockPrompts(
+      workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+    );
     const runParameters =
       (workflowRun?.parameters as Record<string, unknown> | undefined) ?? {};
     const parameters = getOrderedRunParameters(
@@ -307,7 +313,7 @@ export function RunView({
     pushMeta("Browser session", workflowRun?.browser_session_id);
     pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
-    return { parameters, meta };
+    return { parameters, blockPrompts, meta };
   }, [workflowRun]);
 
   // Task 2.0 runs carry their output (and any webhook failure) on task_v2,
@@ -319,7 +325,9 @@ export function RunView({
     null;
 
   const hasInputs =
-    runInputs.parameters.length > 0 || runInputs.meta.length > 0;
+    runInputs.parameters.length > 0 ||
+    runInputs.blockPrompts.length > 0 ||
+    runInputs.meta.length > 0;
   const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
@@ -337,7 +345,6 @@ export function RunView({
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
         />
-
         {provisioning ? (
           <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-slate-elevation2 px-3 py-1.5 text-xs text-muted-foreground">
             <ClockIcon className="h-3.5 w-3.5 shrink-0" />
@@ -399,6 +406,7 @@ export function RunView({
                   <WorkflowRunTimeline
                     workflowRunId={workflowRunId}
                     hideLiveBadge
+                    enableSearch
                     activeItem={activeItem}
                     activeIteration={activeIteration}
                     onActionItemSelected={(item) => {
@@ -406,6 +414,19 @@ export function RunView({
                     }}
                     onBlockItemSelected={(block) => {
                       pinFrame(block.workflow_run_block_id);
+                      const handle =
+                        useWorkflowBlockSearchStore.getState().handle;
+                      if (!handle) {
+                        return;
+                      }
+                      const nodeId = resolveTimelineBlockJumpNodeId({
+                        editorOpen: studioPanes.includes("editor"),
+                        targets: handle.getTargets(),
+                        label: block.label,
+                      });
+                      if (nodeId) {
+                        handle.focusBlock(nodeId);
+                      }
                     }}
                     onThoughtItemSelected={(thought) => {
                       pinFrame(thought.thought_id);
@@ -439,6 +460,7 @@ export function RunView({
             {hasInputs ? (
               <RunInputsSection
                 parameters={runInputs.parameters}
+                blockPrompts={runInputs.blockPrompts}
                 meta={runInputs.meta}
               />
             ) : (
@@ -453,6 +475,7 @@ export function RunView({
               <RunOutputsSection
                 workflowRunId={workflowRun.workflow_run_id}
                 workflowTitle={workflowRun.workflow?.title}
+                outputs={workflowRun.outputs}
                 extractedInformation={extractedInformation}
                 files={downloadedFiles}
                 errors={runErrors}

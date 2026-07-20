@@ -9,16 +9,20 @@ and non-clobbering follow-ups (Tab/Escape/Arrow, different-element actions) are 
 
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
+from skyvern.exceptions import AutoCompletionCommitFailure
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction, KeypressAction
-from skyvern.webeye.actions.handler import handle_input_text_action
+from skyvern.webeye.actions.handler import AUTOCOMPLETE_COMMIT_REQUIRED_FLAG, handle_input_text_action
 from skyvern.webeye.actions.handler_utils import keys_include_enter, should_stop_batch_after_dropdown_select
-from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
+from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
 
 _NOW = datetime.now(UTC)
@@ -80,36 +84,8 @@ def test_flag_is_transient_not_serialized() -> None:
 # --------------------------------------------------------------------------- #
 # handle_input_text_action — gated batch-stop behavior
 # --------------------------------------------------------------------------- #
-def _mock_search_input() -> MagicMock:
-    el = MagicMock()
-    el.get_id.return_value = "AADC"
-    el.get_tag_name.return_value = "input"
-    el.get_frame.return_value = MagicMock()
-    locator = MagicMock()
-    locator.focus = AsyncMock()
-    el.get_locator.return_value = locator
-    el.is_disabled = AsyncMock(return_value=False)
-    el.get_selectable = AsyncMock(return_value=False)
-    el.has_hidden_attr = AsyncMock(return_value=False)
-    el.is_readonly = AsyncMock(return_value=False)
-    el.get_attr = AsyncMock(return_value=None)
-    el.is_spinbtn_input = AsyncMock(return_value=False)
-    el.is_editable = AsyncMock(return_value=True)
-    el.supports_text_input = AsyncMock(return_value=True)
-    el.is_visible = AsyncMock(return_value=True)
-    el.is_raw_input = AsyncMock(return_value=False)
-    el.is_auto_completion_input = AsyncMock(return_value=False)
-    el.find_blocking_element = AsyncMock(return_value=(None, False))
-    el.get_element_handler = AsyncMock(return_value=MagicMock())
-    el.input_sequentially = AsyncMock()
-    el.input_clear = AsyncMock()
-    el.scroll_into_view = AsyncMock()
-    el.press_key = AsyncMock()
-    return el
-
-
 async def _run_search_bar_input(stop_flag: bool, incremental: list[dict]) -> list:
-    skyvern_el = _mock_search_input()
+    skyvern_el = make_input_element_mock(element_id="AADC")
     dom_instance = MagicMock()
     dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
 
@@ -146,10 +122,92 @@ async def _run_search_bar_input(stop_flag: bool, incremental: list[dict]) -> lis
             "skyvern.webeye.actions.handler.sequentially_select_from_dropdown",
             new=AsyncMock(return_value=select_result),
         ),
+        patch(
+            "skyvern.webeye.actions.handler._is_input_text_commit_verification_enabled",
+            new=AsyncMock(return_value=False),
+        ),
     ):
         return await handle_input_text_action(
             action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
         )
+
+
+def _fake_experimentation_provider(enabled_flags: set[str]) -> MagicMock:
+    provider = MagicMock()
+
+    async def _is_enabled(flag: str, distinct_id: str, properties: dict | None = None) -> bool:
+        return flag in enabled_flags
+
+    provider.is_feature_enabled_cached = AsyncMock(side_effect=_is_enabled)
+    provider.resolve_feature_enabled_unrecorded = AsyncMock(return_value=False)
+    return provider
+
+
+async def _run_autocomplete_input_without_suggestions(
+    *,
+    is_search_bar: bool,
+    is_location_input: bool,
+    commit_flag_enabled: bool,
+) -> tuple[list, MagicMock]:
+    """Drive handle_input_text_action through the REAL autocomplete chain with a widget
+    that never renders suggestions."""
+    skyvern_el = make_input_element_mock(element_id="AADC")
+    skyvern_el.is_auto_completion_input = AsyncMock(return_value=True)
+    skyvern_el.press_fill = AsyncMock()
+    skyvern_el.has_attr = AsyncMock(return_value=False)
+    skyvern_el.get_locator.return_value.click = AsyncMock()
+
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_elements_num = AsyncMock(return_value=0)
+    inc.get_incremental_element_tree = AsyncMock(return_value=[])
+    inc.build_html_tree.return_value = "<div></div>"
+    inc.id_to_element_dict = {}
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"AADC": {"tagName": "input"}}
+    scraped_page.id_to_css_dict = {"AADC": "#aadc"}
+    scraped_after = MagicMock()
+    scraped_after.id_to_css_dict = {"AADC": "#aadc"}
+    scraped_page.generate_scraped_page_without_screenshots = AsyncMock(return_value=scraped_after)
+
+    context = InputOrSelectContext(field="Account", is_search_bar=is_search_bar, is_location_input=is_location_input)
+    enabled_flags = {AUTOCOMPLETE_COMMIT_REQUIRED_FLAG} if commit_flag_enabled else set()
+
+    action = _input()
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
+            return_value="123456",
+        ),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler.asyncio.sleep", new=AsyncMock()),
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER = _fake_experimentation_provider(enabled_flags)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value={})
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+        results = await handle_input_text_action(
+            action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+    return results, skyvern_el
 
 
 @pytest.mark.asyncio
@@ -174,3 +232,128 @@ async def test_plain_search_input_does_not_stop_batch() -> None:
     results = await _run_search_bar_input(stop_flag=True, incremental=[])
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     assert not results[0].skip_remaining_actions
+
+
+@pytest.mark.asyncio
+async def test_search_bar_without_suggestions_falls_through_to_plain_typing() -> None:
+    """A search bar whose autocomplete never renders suggestions must still be typed into (flag off)."""
+    results, skyvern_el = await _run_autocomplete_input_without_suggestions(
+        is_search_bar=True,
+        is_location_input=False,
+        commit_flag_enabled=False,
+    )
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    skyvern_el.input_sequentially.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_location_field_without_suggestions_falls_through_when_flag_off() -> None:
+    results, skyvern_el = await _run_autocomplete_input_without_suggestions(
+        is_search_bar=False,
+        is_location_input=True,
+        commit_flag_enabled=False,
+    )
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    skyvern_el.input_sequentially.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_bar_direct_search_enter_navigation_is_implicit_commit() -> None:
+    """direct_searching presses Enter, the page navigates, and every post-Enter read-back hits a stale
+    element; the action must succeed as an implicit commit without falling through to plain typing."""
+    skyvern_el = make_input_element_mock(element_id="AADC")
+    skyvern_el.is_auto_completion_input = AsyncMock(return_value=True)
+    skyvern_el.press_fill = AsyncMock()
+    skyvern_el.has_attr = AsyncMock(return_value=False)
+
+    enter_pressed = False
+
+    async def _press_key(key: str, **_: object) -> None:
+        nonlocal enter_pressed
+        if key == "Enter":
+            enter_pressed = True
+
+    skyvern_el.press_key = AsyncMock(side_effect=_press_key)
+
+    async def _read_input_value(tag_name: str, locator: object) -> str:
+        if enter_pressed:
+            raise PlaywrightError("Element is not attached to the DOM")
+        return ""
+
+    suggestions = [
+        {"id": "OPT1", "tagName": "li", "attributes": {"role": "option"}, "text": "Target 123456"},
+        {"id": "OPT2", "tagName": "li", "attributes": {"role": "option"}, "text": "Target 654321"},
+    ]
+
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_elements_num = AsyncMock(return_value=len(suggestions))
+    inc.get_incremental_element_tree = AsyncMock(return_value=copy.deepcopy(suggestions))
+    inc.build_html_tree.return_value = "<div>options</div>"
+    inc.id_to_element_dict = {}
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"AADC": {"tagName": "input"}}
+    scraped_page.id_to_css_dict = {"AADC": "#aadc"}
+
+    context = InputOrSelectContext(field="Search", is_search_bar=True, is_location_input=False)
+    llm_response = {
+        "auto_completion_attempt": False,
+        "relevance_float": 0.0,
+        "id": "",
+        "direct_searching": True,
+        "value": "123456",
+        "reasoning": "Search directly",
+    }
+
+    action = _input()
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(side_effect=_read_input_value)),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
+            return_value="123456",
+        ),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler.asyncio.sleep", new=AsyncMock()),
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER = _fake_experimentation_provider(set())
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+        results = await handle_input_text_action(
+            action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    skyvern_el.press_key.assert_awaited_once_with("Enter")
+    skyvern_el.input_sequentially.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_location_field_without_commit_fails_when_flag_on() -> None:
+    """With the commit-required flag on, a location field never falls through to plain typing."""
+    results, skyvern_el = await _run_autocomplete_input_without_suggestions(
+        is_search_bar=False,
+        is_location_input=True,
+        commit_flag_enabled=True,
+    )
+    assert len(results) == 1 and isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == AutoCompletionCommitFailure.__name__
+    assert "suggestions_never_rendered" in (results[0].exception_message or "")
+    skyvern_el.input_sequentially.assert_not_awaited()

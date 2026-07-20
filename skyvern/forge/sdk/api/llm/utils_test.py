@@ -3,25 +3,50 @@ Tests for methods in utils.py that use commentjson.loads
 """
 
 import json
-from unittest.mock import Mock
 
 import litellm
 import pytest
 
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.api.llm.utils import _fix_cutoff_json, _fix_unescaped_quotes_in_json, parse_api_response
+from skyvern.forge.sdk.api.llm.utils import (
+    _fix_cutoff_json,
+    _fix_unescaped_quotes_in_json,
+    loads_with_repair,
+    parse_api_response,
+)
+
+
+class TestLoadsWithRepair:
+    """Tests for loads_with_repair, used when rendering hashed-href values back into JSON."""
+
+    def test_valid_json_passes_through(self) -> None:
+        assert loads_with_repair('{"url": "https://example.com"}') == {"url": "https://example.com"}
+
+    def test_invalid_control_character_does_not_raise(self) -> None:
+        # A raw control character inside a string value is what strict json.loads rejects
+        # ("Invalid control character at ...") when hashed hrefs are rendered into the payload.
+        rendered = '{"path": "/a\x1fb"}'
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(rendered)
+        result = loads_with_repair(rendered)
+        assert isinstance(result, dict)
+        assert "path" in result
 
 
 class TestParseApiResponse:
     """Tests for parse_api_response function"""
 
-    def _create_mock_response(self, content: str | None) -> Mock:
-        """Helper method to create a mock LiteLLM response with the given content"""
-        response = Mock(spec=litellm.ModelResponse)
-        response.choices = [Mock()]
-        response.choices[0].message = Mock()
-        response.choices[0].message.content = content
-        return response
+    def _create_mock_response(self, content: str | None) -> litellm.ModelResponse:
+        """Helper method to create a LiteLLM response with the given content.
+
+        Uses a real ModelResponse rather than a Mock so that structlog's
+        exc_info rendering (which iterates the response on parse failures)
+        does not choke on a Mock during the error-path tests.
+        """
+        return litellm.ModelResponse(
+            choices=[litellm.Choices(message=litellm.Message(content=content, role="assistant"))],
+            model="gpt-4o",
+        )
 
     def test_parse_api_response_valid_json(self) -> None:
         """Test parsing a valid JSON response"""

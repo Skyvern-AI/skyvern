@@ -12,11 +12,14 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import normalized_scout_selector
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    role_name_match_count_expression as _role_name_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
@@ -28,11 +31,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
+    has_witnessed_value_content,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    mint_scout_observation_contract_for_ctx,
+    record_reached_terminal_action_observation,
     record_scouted_output_coverage,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
@@ -53,6 +59,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
     ScoutedInteraction,
+    resolve_browser_state_for_context,
 )
 
 from ._shared import (
@@ -121,10 +128,7 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
     if not ctx.browser_session_id:
         return None
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=ctx.browser_session_id)
         if not browser_state:
             return None
         page = await browser_state.get_or_create_page()
@@ -249,6 +253,35 @@ async def _selector_live_match_count(
     return value
 
 
+async def _role_name_match_count(
+    ctx: AgentContext, role: str, name: str, *, timeout_seconds: float = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+) -> int | None:
+    """Live count of elements whose computed ARIA role and accessible name exactly match, or None when
+    the page read is unavailable; lets the ambiguity guard tell a uniquely-resolvable re-anchor apart from
+    a name-degenerate one before trusting get_by_role(role, name, exact=True)."""
+    if not role or not name:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None or timeout_seconds <= 0:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _role_name_match_count_expression(role, name)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
     """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
 
@@ -283,6 +316,43 @@ def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selecto
     if stashed_selector != _selector_text(selector):
         return "", ""
     return role, name
+
+
+async def _capture_scout_ambiguity(ctx: AgentContext, selector: str | None) -> None:
+    """Stash whether a click/select selector is ambiguous (>1 match) on its source page, read before the
+    action dispatches so the count reflects the source rather than a post-navigation landing; a captured
+    (role, name) re-anchor is kept only when get_by_role(role, name, exact=True) resolves uniquely, so a
+    name-degenerate selector fails closed to the scout-the-step drop instead of a strict-mode failure."""
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    count = await _selector_live_match_count(ctx, selector)
+    if count is None or count <= 1:
+        return
+    ctx.pending_scout_ambiguous = (selector, True)
+    captured = await _capture_accessible_role_name(
+        ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+    )
+    if captured is None:
+        return
+    role, name = captured
+    if not role or not name:
+        return
+    if await _role_name_match_count(ctx, role, name) == 1:
+        ctx.pending_scout_reanchor = (selector, role, name)
+
+
+def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: str) -> bool:
+    """Return the stashed ambiguity verdict only when the recorded selector matches the probed one, so a
+    navigating click's verdict is never applied to a different element."""
+    if pending is None:
+        return False
+    stashed_selector, ambiguous = pending
+    if stashed_selector != _selector_text(selector):
+        return False
+    return ambiguous
 
 
 async def _resolve_scout_role_name(
@@ -360,6 +430,7 @@ def _record_scouted_interaction(
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
+    ambiguous: bool = False,
 ) -> None:
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -404,6 +475,8 @@ def _record_scouted_interaction(
         artifact["credential_field"] = credential_field
     if credential_name:
         artifact["credential_name"] = credential_name
+    if ambiguous:
+        artifact["ambiguous"] = True
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -432,6 +505,7 @@ def _record_scouted_interaction(
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
+    record_reached_terminal_action_observation(ctx)
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:
@@ -454,8 +528,8 @@ def _page_evidence_with_inputs_as_fields(page_evidence: dict[str, Any]) -> dict[
             continue
         field = dict(item)
         selector = field.get("selector")
-        if isinstance(selector, str) and selector.startswith("input#"):
-            field["selector"] = f"#{selector.split('#', 1)[1]}"
+        if isinstance(selector, str):
+            field["selector"] = normalized_scout_selector(selector)
         fields.append(field)
     if not fields:
         return page_evidence
@@ -615,6 +689,13 @@ def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: flo
     return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
 
 
+def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
+    if not isinstance(packet, dict):
+        return 0
+    value = packet.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
 def _mint_current_loaded_result_source(
     ctx: AgentContext,
     page_evidence: dict[str, Any] | None,
@@ -663,6 +744,12 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
             else:
                 ctx.last_scout_act_observe_recapture_attempted = True
+                # A card that renders asynchronously after the click is absent from the first
+                # capture; settle briefly so the single recapture can witness it before crediting.
+                settle_seconds = min(settings.COPILOT_CLICK_SETTLE_DELAY_SECONDS, remaining_seconds)
+                if settle_seconds > 0:
+                    await asyncio.sleep(settle_seconds)
+                    remaining_seconds = timeout_seconds - (time.monotonic() - started)
                 try:
                     recaptured = await _composition_get_structured_evidence(
                         ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
@@ -694,6 +781,8 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
         url=url,
+        result_container_count=_evidence_list_len(parsed, "result_containers"),
+        key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
     )
@@ -721,11 +810,18 @@ async def _register_scout_interaction_observation(
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
         parsed = await _scout_act_observe_page_evidence(ctx, url=url)
-        if parsed is not None and has_bounded_page_schema(parsed):
+        # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
+        # that rendered witnessed value content is bindable even when it exposes no actionable schema.
+        if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
             # Identity keys overwrite the parsed packet so the entry stays a
             # scout_interaction observation, with the schema merged before append.
             evidence = {**parsed, **evidence}
             page_evidence = evidence
+            contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+            ctx.scout_observation_contract = contract
+            record_scouted_output_coverage(
+                ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
+            )
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
@@ -1275,10 +1371,16 @@ async def _maybe_steer_evaluate_to_action(
             if isinstance(page_evidence, _UnsetEvidence)
             else page_evidence
         )
-        if parsed is None or not has_actionable_steer_content(parsed):
+        if parsed is None:
             _reset_evaluate_tracker(ctx)
             return False
-        record_scouted_output_coverage(ctx, parsed)
+        contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+        ctx.scout_observation_contract = contract
+        if not has_actionable_steer_content(parsed):
+            record_scouted_output_coverage(ctx, parsed, contract=contract, include_lexical=False)
+            _reset_evaluate_tracker(ctx)
+            return False
+        record_scouted_output_coverage(ctx, parsed, contract=contract)
         _record_scout_page_observation(ctx, parsed)
         loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:

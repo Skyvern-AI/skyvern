@@ -22,7 +22,10 @@ skyvern_click(selector="#submit") or skyvern_type(selector="#email", text="user@
 skyvern_act(prompt="Click the Sign In button")
 ```
 
-## Multi-step (simple, PREFERRED for forms)
+## Multi-step (simple)
+
+On stdio transports, refs persist across calls until the next observe, navigation, or page/document context change. Follow this pattern:
+
 1. `skyvern_observe()` returns element refs (`e0`, `e1`, ...)
 2. Your LLM decides which refs to interact with
 3. Run `skyvern_execute(...)` with those refs, for example:
@@ -35,6 +38,8 @@ skyvern_execute(
     ]
 )
 ```
+
+On hosted stateless HTTP, prefer `selector` or `intent` params because refs from prior calls do not resolve. A single `skyvern_execute` batch may use refs only when predictable before the call; refs returned by an inline observe cannot be selected adaptively later in that batch.
 
 ## Throwaway autonomous trial
 ```

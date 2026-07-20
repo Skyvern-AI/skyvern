@@ -26,6 +26,10 @@ export interface CredentialResponse {
     save_browser_session_intent?: boolean;
     /** ID of the credential folder this credential belongs to, if any */
     folder_id?: string;
+    /** Optional proxy location used for the credential's pinned proxy identity. */
+    proxy_location?: CredentialResponse.ProxyLocation;
+    /** Opaque Skyvern-managed proxy sticky-session id. */
+    proxy_session_id?: string;
 }
 
 export namespace CredentialResponse {
@@ -36,4 +40,8 @@ export namespace CredentialResponse {
         | Skyvern.PasswordCredentialResponse
         | Skyvern.CreditCardCredentialResponse
         | Skyvern.SecretCredentialResponse;
+    /**
+     * Optional proxy location used for the credential's pinned proxy identity.
+     */
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
 }

@@ -22,6 +22,9 @@ class BrowserProfile(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+    # Populated by the list endpoint (batched) so the UI can show the credential-login role + freshness on
+    # rows without a per-row usage fetch. None on single-get and for profiles no credential links.
+    linked_credential_name: str | None = None
 
     @field_validator("proxy_location", mode="before")
     @classmethod
@@ -32,6 +35,23 @@ class BrowserProfile(BaseModel):
     @classmethod
     def validate_proxy_session_id_field(cls, value: str | None) -> str | None:
         return validate_proxy_session_id(value)
+
+
+class BrowserProfileUsageWorkflow(BaseModel):
+    workflow_permanent_id: str
+    title: str
+    via: str
+
+
+class BrowserProfileUsageCredential(BaseModel):
+    credential_id: str
+    name: str
+
+
+class BrowserProfileUsage(BaseModel):
+    workflows: list[BrowserProfileUsageWorkflow] = []
+    credentials: list[BrowserProfileUsageCredential] = []
+    recent_seeded_run_count: int = 0
 
 
 class CreateBrowserProfileRequest(BaseModel):

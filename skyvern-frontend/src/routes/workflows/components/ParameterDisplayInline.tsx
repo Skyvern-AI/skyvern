@@ -45,7 +45,7 @@ function ParameterDisplayInline({
 }: ParameterDisplayInlineProps) {
   if (!parameters || parameters.length === 0) {
     return (
-      <div className={cn("ml-8 py-4 text-sm text-slate-400", className)}>
+      <div className={cn("ml-8 py-4 text-sm text-muted-foreground", className)}>
         {emptyMessage}
       </div>
     );
@@ -76,20 +76,22 @@ function ParameterDisplayInline({
               </div>
               <div className="truncate">
                 {displayValue === "-" ? (
-                  <span className="text-slate-400">-</span>
+                  <span className="text-muted-foreground">-</span>
                 ) : (
                   <HighlightText text={displayValue} query={searchQuery} />
                 )}
               </div>
               {showDescription ? (
-                <div className="text-slate-500">
+                <div className="text-muted-foreground dark:text-slate-500">
                   {parameter.description ? (
                     <HighlightText
                       text={parameter.description}
                       query={searchQuery}
                     />
                   ) : (
-                    <span className="text-slate-400">No description</span>
+                    <span className="text-muted-foreground">
+                      No description
+                    </span>
                   )}
                 </div>
               ) : null}

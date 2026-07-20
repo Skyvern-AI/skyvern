@@ -66,7 +66,9 @@ function BitwardenItemSelector({
       </SelectTrigger>
       <SelectContent>
         {message && (
-          <div className="px-2 py-1.5 text-xs text-slate-400">{message}</div>
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
+            {message}
+          </div>
         )}
         {items.map((item) => (
           <CustomSelectItem key={item.item_id} value={item.item_id}>
@@ -76,7 +78,7 @@ function BitwardenItemSelector({
                 <SelectItemText>{item.title}</SelectItemText>
               </span>
               {item.collection_id && (
-                <span className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
+                <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                   {item.collection_id}
                 </span>
               )}

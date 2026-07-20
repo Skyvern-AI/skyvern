@@ -14,9 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
+from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -24,7 +26,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import BlockResult, BlockStatus, BlockType, CodeBlock, CodeBlockStep
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.self_heal import HealSkipReason
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.webeye.actions.actions import Action
 
 SECRET_VALUE = "hunter2-super-secret"
@@ -123,6 +125,7 @@ def _install_db_fakes(
         "recovery_block_kwargs": None,
         "recovery_block_updates": [],
         "workflow_run_block_updates": [],
+        "heal_episodes": [],
     }
 
     async def _create_task(**kwargs: object) -> _FakeTask:
@@ -189,6 +192,12 @@ def _install_db_fakes(
     monkeypatch.setattr(
         app.DATABASE.workflow_runs, "create_or_update_workflow_run_output_parameter", AsyncMock(return_value=None)
     )
+
+    async def _create_heal_episode(**kwargs: object) -> None:
+        state["heal_episodes"].append(kwargs)
+        return None
+
+    monkeypatch.setattr(app.DATABASE.self_heal, "create_heal_episode", AsyncMock(side_effect=_create_heal_episode))
     return state
 
 
@@ -1741,3 +1750,619 @@ async def test_secure_infra_failure_without_metadata_finalizes_failed_and_record
     assert record_output_mock.await_count == 0
     assert BlockStatus.completed not in block_statuses
     heal_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_cap_denied_records_skipped_episode_and_falls_back_to_floor_after_preconditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    floor_result = await block.build_block_result(
+        success=True,
+        failure_reason=None,
+        output_parameter_value={"ok": True},
+        status=BlockStatus.completed,
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+    heal_mock = AsyncMock(return_value=floor_result)
+    call_order: list[str] = []
+    monkeypatch.setattr(block, "_attempt_self_heal", heal_mock)
+
+    async def _resolve_api_key(_organization_id: str) -> str:
+        call_order.append("api_key")
+        return "sk-live"
+
+    async def _check_cap(**kwargs: object) -> None:
+        del kwargs
+        call_order.append("cap")
+        return None
+
+    def _attachable(_context: object) -> bool:
+        call_order.append("browser_attachable")
+        return True
+
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(side_effect=_check_cap),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(side_effect=_resolve_api_key))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", _attachable)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+
+    async def _build_failure() -> BlockResult:
+        raise AssertionError("should not use failure result when floor succeeds")
+
+    result = await block._resolve_failure_with_heal(
+        exception=exception,
+        failing_line=2,
+        build_failure_result=_build_failure,
+        classification=HealClassification(healable=True, skip_reason=None),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    assert result.success is True
+    assert call_order == ["api_key", "browser_attachable", "cap"]
+    assert len(state["heal_episodes"]) == 2
+    harness_episode = state["heal_episodes"][0]
+    floor_episode = state["heal_episodes"][1]
+    assert harness_episode["engine"] == "harness"
+    assert harness_episode["status"] == "skipped"
+    assert harness_episode["skip_reason"] == HealSkipReason.capped
+    assert floor_episode["engine"] == "floor"
+    assert floor_episode["status"] == "fired_completed"
+    heal_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_missing_api_key_records_skip_and_falls_back_to_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    floor_result = await block.build_block_result(
+        success=True,
+        failure_reason=None,
+        output_parameter_value={"ok": True},
+        status=BlockStatus.completed,
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=floor_result))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=object()))
+
+    async def _build_failure() -> BlockResult:
+        raise AssertionError("should not use failure result when floor succeeds")
+
+    result = await block._resolve_failure_with_heal(
+        exception=exception,
+        failing_line=2,
+        build_failure_result=_build_failure,
+        classification=HealClassification(healable=True, skip_reason=None),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    assert result.success is True
+    assert len(state["heal_episodes"]) == 2
+    harness_episode = state["heal_episodes"][0]
+    floor_episode = state["heal_episodes"][1]
+    assert harness_episode["engine"] == "harness"
+    assert harness_episode["status"] == "skipped"
+    assert harness_episode["skip_reason"] == HealSkipReason.credential_unavailable
+    assert floor_episode["engine"] == "floor"
+    assert floor_episode["status"] == "fired_completed"
+    assert floor_episode["output_obligation"] == OutputObligation.observed.value
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_harness_failure_records_fired_failed_and_falls_back_to_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value="sk-live"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", lambda _ctx: True)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.run_self_heal_recovery",
+        AsyncMock(
+            return_value=SelfHealRecoveryResult(
+                success=False,
+                action_count=3,
+                wall_clock_ms=1200,
+                scout_trajectory=[],
+                failure_note="no_action_progress",
+            )
+        ),
+    )
+    monkeypatch.setattr(block, "_self_heal_mutation_guard_snapshot", AsyncMock(return_value=(1, "abc")))
+
+    async def _build_failure() -> BlockResult:
+        return await block.build_block_result(
+            success=False,
+            failure_reason="fallback failed",
+            output_parameter_value=None,
+            status=BlockStatus.failed,
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    result = await block._resolve_failure_with_heal(
+        exception=exception,
+        failing_line=2,
+        build_failure_result=_build_failure,
+        classification=HealClassification(healable=True, skip_reason=None),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    assert result.success is False
+    assert len(state["heal_episodes"]) == 2
+    harness_episode = state["heal_episodes"][0]
+    floor_episode = state["heal_episodes"][1]
+    assert harness_episode["engine"] == "harness"
+    assert harness_episode["status"] == "fired_failed"
+    assert floor_episode["engine"] == "floor"
+    assert floor_episode["status"] == "fired_failed"
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_harness_failure_with_mutation_suppresses_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value="sk-live"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", lambda _ctx: True)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.run_self_heal_recovery",
+        AsyncMock(
+            return_value=SelfHealRecoveryResult(
+                success=False,
+                performed_mutation=True,
+                action_count=2,
+                wall_clock_ms=900,
+                scout_trajectory=[],
+                failure_note="max_actions_exhausted",
+            )
+        ),
+    )
+    monkeypatch.setattr(block, "_self_heal_mutation_guard_snapshot", AsyncMock(return_value=(1, "abc")))
+
+    async def _build_failure() -> BlockResult:
+        return await block.build_block_result(
+            success=False,
+            failure_reason="fallback suppressed",
+            output_parameter_value=None,
+            status=BlockStatus.failed,
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    with capture_logs() as logs:
+        result = await block._resolve_failure_with_heal(
+            exception=exception,
+            failing_line=2,
+            build_failure_result=_build_failure,
+            classification=HealClassification(healable=True, skip_reason=None),
+            recorder=recorder,
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+        )
+
+    assert result.success is False
+    assert len(state["heal_episodes"]) == 1
+    harness_episode = state["heal_episodes"][0]
+    assert harness_episode["engine"] == "harness"
+    assert harness_episode["status"] == "fired_failed"
+    block._attempt_self_heal.assert_not_awaited()
+    assert any(
+        log.get("event") == "Runtime self-heal failed after mutating actions; suppressing floor fallback"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_harness_unverified_records_fired_unverified_and_falls_back_to_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    floor_result = await block.build_block_result(
+        success=True,
+        failure_reason=None,
+        output_parameter_value={"ok": True},
+        status=BlockStatus.completed,
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=floor_result))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value="sk-live"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", lambda _ctx: True)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.run_self_heal_recovery",
+        AsyncMock(
+            return_value=SelfHealRecoveryResult(
+                success=True,
+                verified=False,
+                performed_mutation=False,
+                action_count=2,
+                wall_clock_ms=800,
+                scout_trajectory=[],
+                failure_note="goal_unverified",
+            )
+        ),
+    )
+    monkeypatch.setattr(block, "_self_heal_mutation_guard_snapshot", AsyncMock(return_value=(1, "abc")))
+
+    async def _build_failure() -> BlockResult:
+        raise AssertionError("should not use failure result when floor succeeds")
+
+    result = await block._resolve_failure_with_heal(
+        exception=exception,
+        failing_line=2,
+        build_failure_result=_build_failure,
+        classification=HealClassification(healable=True, skip_reason=None),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    assert result.success is True
+    assert len(state["heal_episodes"]) == 2
+    harness_episode = state["heal_episodes"][0]
+    floor_episode = state["heal_episodes"][1]
+    assert harness_episode["engine"] == "harness"
+    assert harness_episode["status"] == "fired_unverified"
+    assert harness_episode["output_obligation"] == OutputObligation.vestigial.value
+    assert floor_episode["engine"] == "floor"
+    assert floor_episode["status"] == "fired_completed"
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_harness_unverified_with_mutation_fails_closed_without_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value="sk-live"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", lambda _ctx: True)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.run_self_heal_recovery",
+        AsyncMock(
+            return_value=SelfHealRecoveryResult(
+                success=True,
+                verified=False,
+                performed_mutation=True,
+                action_count=2,
+                wall_clock_ms=800,
+                scout_trajectory=[],
+                failure_note="goal_unverified",
+            )
+        ),
+    )
+    monkeypatch.setattr(block, "_self_heal_mutation_guard_snapshot", AsyncMock(return_value=(1, "abc")))
+
+    async def _build_failure() -> BlockResult:
+        return await block.build_block_result(
+            success=False,
+            failure_reason="fallback suppressed",
+            output_parameter_value=None,
+            status=BlockStatus.failed,
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    with capture_logs() as logs:
+        result = await block._resolve_failure_with_heal(
+            exception=exception,
+            failing_line=2,
+            build_failure_result=_build_failure,
+            classification=HealClassification(healable=True, skip_reason=None),
+            recorder=recorder,
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+        )
+
+    assert result.success is False
+    assert len(state["heal_episodes"]) == 1
+    harness_episode = state["heal_episodes"][0]
+    assert harness_episode["engine"] == "harness"
+    assert harness_episode["status"] == "fired_unverified"
+    assert harness_episode["output_obligation"] == OutputObligation.vestigial.value
+    block._attempt_self_heal.assert_not_awaited()
+    assert any(
+        log.get("event") == "Runtime self-heal unverified after mutating actions; suppressing floor fallback"
+        for log in logs
+    )
+    # The block row must never be left completed when the heal fails closed.
+    assert all(update.get("status") != BlockStatus.completed for update in state["workflow_run_block_updates"])
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_mutation_guard_mismatch_fails_harness_and_falls_back_to_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value="sk-live"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", lambda _ctx: True)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.run_self_heal_recovery",
+        AsyncMock(
+            return_value=SelfHealRecoveryResult(
+                success=True,
+                action_count=2,
+                wall_clock_ms=900,
+                scout_trajectory=[],
+                failure_note=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        block,
+        "_self_heal_mutation_guard_snapshot",
+        AsyncMock(side_effect=[(1, "hash_a"), (2, "hash_b")]),
+    )
+
+    async def _build_failure() -> BlockResult:
+        return await block.build_block_result(
+            success=False,
+            failure_reason="fallback failed",
+            output_parameter_value=None,
+            status=BlockStatus.failed,
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    result = await block._resolve_failure_with_heal(
+        exception=exception,
+        failing_line=2,
+        build_failure_result=_build_failure,
+        classification=HealClassification(healable=True, skip_reason=None),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    assert result.success is False
+    assert len(state["heal_episodes"]) == 2
+    assert state["heal_episodes"][0]["engine"] == "harness"
+    assert state["heal_episodes"][0]["status"] == "fired_failed"
+    assert state["heal_episodes"][1]["engine"] == "floor"
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_mutation_guard_mismatch_with_mutation_suppresses_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value="sk-live"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block._browser_context_is_attachable", lambda _ctx: True)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "get_for_workflow_run",
+        MagicMock(return_value=SimpleNamespace(browser_context=object())),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.run_self_heal_recovery",
+        AsyncMock(
+            return_value=SelfHealRecoveryResult(
+                success=True,
+                performed_mutation=True,
+                action_count=2,
+                wall_clock_ms=900,
+                scout_trajectory=[],
+                failure_note=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        block,
+        "_self_heal_mutation_guard_snapshot",
+        AsyncMock(side_effect=[(1, "hash_a"), (2, "hash_b")]),
+    )
+
+    async def _build_failure() -> BlockResult:
+        return await block.build_block_result(
+            success=False,
+            failure_reason="fallback suppressed",
+            output_parameter_value=None,
+            status=BlockStatus.failed,
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    with capture_logs() as logs:
+        result = await block._resolve_failure_with_heal(
+            exception=exception,
+            failing_line=2,
+            build_failure_result=_build_failure,
+            classification=HealClassification(healable=True, skip_reason=None),
+            recorder=recorder,
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+        )
+
+    assert result.success is False
+    assert len(state["heal_episodes"]) == 1
+    assert state["heal_episodes"][0]["engine"] == "harness"
+    assert state["heal_episodes"][0]["status"] == "fired_failed"
+    block._attempt_self_heal.assert_not_awaited()
+    assert any(
+        log.get("event") == "Runtime self-heal errored after mutating actions; suppressing floor fallback"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_heal_episode_persistence_failure_does_not_change_heal_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    monkeypatch.setattr(app.DATABASE.self_heal, "create_heal_episode", AsyncMock(side_effect=RuntimeError("missing")))
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    exception = RuntimeError("boom")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+    floor_result = await block.build_block_result(
+        success=True,
+        failure_reason=None,
+        output_parameter_value={"ok": True},
+        status=BlockStatus.completed,
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=floor_result))
+    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=object()))
+
+    async def _build_failure() -> BlockResult:
+        raise AssertionError("should not use failure result when floor succeeds")
+
+    with capture_logs() as logs:
+        result = await block._resolve_failure_with_heal(
+            exception=exception,
+            failing_line=2,
+            build_failure_result=_build_failure,
+            classification=HealClassification(healable=True, skip_reason=None),
+            recorder=recorder,
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+        )
+
+    assert result.success is True
+    assert any(entry.get("event") == "self-heal episode persistence failed; continuing" for entry in logs)

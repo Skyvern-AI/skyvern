@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { AxiosError } from "axios";
 import {
   CalendarIcon,
@@ -27,17 +27,25 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { statusIsFinalized } from "@/routes/tasks/types";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 
 import { EditableNodeTitle } from "../editor/nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "../editor/header/EditorOverflowMenu";
 import { MakeACopyButton } from "../editor/MakeACopyButton";
+import { WorkflowChangesList } from "../editor/WorkflowChangesList";
+import {
+  isDraftDirty,
+  summarizeWorkflowChanges,
+} from "../editor/workflowChangesSummary";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
+import { getRerunNavigationState } from "../utils";
 import { runOutcomeFromStatus } from "./runProjections";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
@@ -66,27 +74,114 @@ function TitleSection({ editable = true }: { editable?: boolean }) {
   );
 }
 
-function SaveButton() {
+export function SaveButton() {
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
+  const getSaveData = useWorkflowHasChangesStore((s) => s.getSaveData);
+  // contentDirty reflects real user edits vs the clean baseline snapshot, so
+  // post-load canvas materialization (login autofill) doesn't light the dot.
+  // It's debounced, so the click handler recomputes dirtiness synchronously
+  // instead of gating on it (see onClick).
+  const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
+  const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
   const isRecording = useRecordingStore((s) => s.isRecording);
   const onSave = useSaveWorkflow();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  // Compute once when the confirm dialog opens; the canvas is behind the modal
+  // and can't be edited while it's up, so the summary stays valid.
+  const changes = useMemo(() => {
+    if (!confirmOpen) {
+      return [];
+    }
+    try {
+      const saveData = getSaveData();
+      return saveData ? summarizeWorkflowChanges(saveData, snapshot) : [];
+    } catch (error) {
+      console.error("Failed to summarize workflow changes", error);
+      return [];
+    }
+  }, [confirmOpen, getSaveData, snapshot]);
+
   return (
-    <ControlTooltip content="Save workflow" blocked={isRecording}>
-      <Button
-        variant="outline"
-        size="icon"
-        className="h-8 w-8 border-border bg-transparent shadow-none"
-        disabled={isRecording}
-        onClick={() => void onSave()}
-        aria-label="Save workflow"
-      >
-        {saving ? (
-          <ReloadIcon className="size-4 animate-spin" />
-        ) : (
-          <SaveIcon className="size-4" />
-        )}
-      </Button>
-    </ControlTooltip>
+    <>
+      <ControlTooltip content="Save workflow" blocked={isRecording}>
+        <Button
+          variant="outline"
+          size="icon"
+          className="relative h-8 w-8 border-border bg-transparent shadow-none"
+          disabled={isRecording}
+          onClick={() => {
+            // Recompute dirtiness synchronously from the same source as the
+            // summary (incl. the YAML draft). contentDirty is debounced and
+            // canvas-only, so gating the confirmation on it would skip it for a
+            // YAML edit or an edit-then-save inside the debounce window.
+            let dirty = false;
+            try {
+              const saveData = getSaveData();
+              dirty = saveData ? isDraftDirty(saveData, snapshot) : false;
+            } catch (error) {
+              console.error("Failed to check workflow changes", error);
+            }
+            // onSave rejects on a failed save (already toasted by its onError);
+            // swallow so it isn't an unhandled rejection.
+            if (dirty) {
+              setConfirmOpen(true);
+            } else {
+              void onSave().catch(() => {});
+            }
+          }}
+          aria-label={
+            contentDirty ? "Save workflow (unsaved changes)" : "Save workflow"
+          }
+        >
+          {saving ? (
+            <ReloadIcon className="size-4 animate-spin" />
+          ) : (
+            <SaveIcon className="size-4" />
+          )}
+          {contentDirty && !saving && (
+            <span
+              aria-hidden
+              className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-primary"
+            />
+          )}
+        </Button>
+      </ControlTooltip>
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Saving Changes</DialogTitle>
+            <DialogDescription>
+              The changes below are going to be saved:
+            </DialogDescription>
+          </DialogHeader>
+          <WorkflowChangesList changes={changes} />
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button
+              disabled={saving}
+              onClick={() => {
+                // Close only on success; a failed save (already toasted by
+                // onSave's onError) keeps the list open for retry, so swallow
+                // the rejection rather than leaving it unhandled.
+                void onSave()
+                  .then(() => {
+                    if (!useWorkflowHasChangesStore.getState().hasChanges) {
+                      setConfirmOpen(false);
+                    }
+                  })
+                  .catch(() => {});
+              }}
+            >
+              {saving && <ReloadIcon className="mr-2 size-4 animate-spin" />}
+              Save changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
@@ -151,6 +246,16 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
+  const rerunEligible = Boolean(
+    workflowRun &&
+    // keepPreviousData can surface a prior run after the focused run clears/changes;
+    // only treat it as the focused run when its id matches the URL.
+    workflowRun.workflow_run_id === runId &&
+    statusIsFinalized(workflowRun) &&
+    workflowRun.task_v2 === null &&
+    !isBlockRun &&
+    !workflowRun.workflow?.deleted_at,
+  );
 
   const cancelRun = useMutation({
     mutationFn: async () => {
@@ -182,12 +287,14 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
 
   // ?panes= rides through the run form so the post-start navigate restores
   // this exact layout (plus the run surfaces appended) instead of remapping.
-  const startFullRun = () =>
-    navigate(
-      // The post-start navigate resets the layout to the run mapping, so the
-      // form round-trip carries nothing.
-      `/agents/${workflowPermanentId}/run`,
-    );
+  const startFullRun = () => {
+    const path = `/agents/${workflowPermanentId}/run`;
+    if (rerunEligible && workflowRun) {
+      navigate(path, { state: getRerunNavigationState(workflowRun) });
+      return;
+    }
+    navigate(path);
+  };
 
   if (running && activeRunId) {
     const stopDialog = (
@@ -276,7 +383,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
       disabled={isRecording}
       onClick={startFullRun}
     >
-      <PlayIcon className="mr-2 size-4" /> Run agent
+      <PlayIcon className="mr-2 size-4" />
+      {rerunEligible ? "Re-run agent" : "Run agent"}
     </Button>
   );
 }

@@ -10,7 +10,11 @@ import {
   CredentialParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
-import { ParametersState, SkyvernCredential } from "./types";
+import {
+  ParametersState,
+  parameterIsSkyvernCredential,
+  SkyvernCredential,
+} from "./types";
 
 /**
  * A single credential serializes to an editable workflow `credential_id`
@@ -21,7 +25,9 @@ function skyvernCredentialToParameterYAML(
   parameter: SkyvernCredential,
 ): WorkflowParameterYAML | CredentialParameterYAML {
   const hasCredentialRotation = (parameter.credentialIds?.length ?? 0) >= 2;
-  if (!hasCredentialRotation) {
+  const hasFallbackCredentials =
+    (parameter.fallbackCredentialIds?.length ?? 0) > 0;
+  if (!hasCredentialRotation && !hasFallbackCredentials) {
     return {
       parameter_type: WorkflowParameterTypes.Workflow,
       workflow_parameter_type: WorkflowParameterValueType.CredentialId,
@@ -35,8 +41,64 @@ function skyvernCredentialToParameterYAML(
     credential_id: parameter.credentialId,
     credential_ids: parameter.credentialIds ?? null,
     selection_strategy: parameter.selectionStrategy ?? null,
+    fallback_credential_ids: parameter.fallbackCredentialIds ?? null,
+    fallback_trigger: parameter.fallbackTrigger ?? null,
     key: parameter.key,
     description: parameter.description || null,
+  };
+}
+
+/**
+ * The parameter edit panel only exposes key/credential/description, so an edit
+ * must carry over the rotation pool and fallback config it can't see — a plain
+ * rebuild silently wipes them. When the primary credential changes it is
+ * removed from the fallback list (a credential may not be its own fallback)
+ * and swapped into the head of the rotation pool.
+ */
+function applySkyvernCredentialEdit(
+  previous: ParametersState[number] | null | undefined,
+  edit: { key: string; credentialId: string; description?: string | null },
+): SkyvernCredential {
+  const base: SkyvernCredential = {
+    key: edit.key,
+    parameterType: "credential",
+    credentialId: edit.credentialId,
+    description: edit.description ?? null,
+  };
+  if (
+    !previous ||
+    previous.parameterType !== "credential" ||
+    !parameterIsSkyvernCredential(previous)
+  ) {
+    return base;
+  }
+
+  const previousPool = previous.credentialIds ?? [];
+  const rotationPool =
+    previousPool.length >= 2
+      ? [
+          edit.credentialId,
+          ...previousPool.filter(
+            (id) => id !== previous.credentialId && id !== edit.credentialId,
+          ),
+        ]
+      : [];
+  const credentialIds = rotationPool.length >= 2 ? rotationPool : null;
+
+  const fallbackCredentialIds = (previous.fallbackCredentialIds ?? []).filter(
+    (id) => id !== edit.credentialId,
+  );
+  const hasFallback = fallbackCredentialIds.length > 0;
+
+  return {
+    ...base,
+    credentialIds,
+    selectionStrategy: credentialIds
+      ? (previous.selectionStrategy ?? null)
+      : null,
+    fallbackCredentialIds: hasFallback ? fallbackCredentialIds : null,
+    fallbackTrigger: hasFallback ? (previous.fallbackTrigger ?? null) : null,
+    dataType: previous.dataType,
   };
 }
 
@@ -103,6 +165,8 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           credentialId: parameter.credential_id,
           credentialIds: parameter.credential_ids ?? null,
           selectionStrategy: parameter.selection_strategy ?? null,
+          fallbackCredentialIds: parameter.fallback_credential_ids ?? null,
+          fallbackTrigger: parameter.fallback_trigger ?? null,
           description: parameter.description,
         };
       } else if (
@@ -202,6 +266,7 @@ const constructCacheKeyValueFromParameters = (opts: {
 };
 
 export {
+  applySkyvernCredentialEdit,
   constructCacheKeyValue,
   constructCacheKeyValueFromParameters,
   getInitialParameters,

@@ -65,6 +65,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         status=None,
         search_key="abc",
         run_type=["workflow_run", "task_v1"],
+        run_tags=None,
     )
     assert orjson.loads(response.body) == [
         {
@@ -147,6 +148,7 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         exclude_child_runs=expected_exclude_child_runs,
         created_at_start=None,
         created_at_end=None,
+        run_tags=None,
     )
 
 
@@ -165,6 +167,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         browser_session_id="pbs_123",
         browser_profile_id="bprof_123",
         max_screenshot_scrolls=3,
+        max_elapsed_time_minutes=None,
         extra_http_headers={"X-Test": "1"},
         cdp_connect_headers={"X-CDP-Auth": "secret"},
         browser_address="http://127.0.0.1:9222",
@@ -355,6 +358,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         browser_session_id=None,
         browser_profile_id=None,
         max_screenshot_scrolls=None,
+        max_elapsed_time_minutes=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_address=None,

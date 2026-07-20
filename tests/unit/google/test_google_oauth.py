@@ -1,7 +1,8 @@
+import asyncio
 import datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -10,6 +11,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
@@ -21,6 +23,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     UpdateGoogleOAuthCredentialRequest,
 )
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 
 
 def _unwrap_bind(value: Any) -> Any:
@@ -149,6 +152,75 @@ async def test_google_drive_uploads_multipart(
 
 
 @pytest.mark.asyncio
+async def test_google_drive_uploads_zero_byte_file_as_multipart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "empty"
+    source.write_bytes(b"")
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.params["uploadType"])
+        assert request.method == "POST"
+        assert await request.aread()
+        return httpx.Response(200, json={"id": "file_empty"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_empty"
+    assert requests == ["multipart"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_size", "expected_mode"),
+    [
+        (google_drive_service.DRIVE_MULTIPART_FILE_MAX_BYTES, "multipart"),
+        (google_drive_service.DRIVE_MULTIPART_FILE_MAX_BYTES + 1, "resumable"),
+        (google_drive_service.DRIVE_MULTIPART_UPLOAD_MAX_BYTES, "resumable"),
+    ],
+)
+async def test_google_drive_upload_boundary_selects_expected_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    file_size: int,
+    expected_mode: str,
+) -> None:
+    source = tmp_path / "boundary.bin"
+    source.write_bytes(b"x" * file_size)
+    session_uri = "https://www.googleapis.com/upload/session"
+    requests: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        upload_type = request.url.params.get("uploadType", "session")
+        requests.append((request.method, upload_type))
+        if upload_type == "resumable":
+            return httpx.Response(200, headers={"Location": session_uri})
+        return httpx.Response(200, json={"id": "file_boundary"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_boundary"
+    if expected_mode == "multipart":
+        assert requests == [("POST", "multipart")]
+    else:
+        assert requests == [("POST", "resumable"), ("PUT", "session")]
+
+
+@pytest.mark.asyncio
 async def test_google_drive_upload_does_not_retry_retryable_create_response(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -244,10 +316,228 @@ async def test_google_drive_upload_does_not_retry_ambiguous_transport_failure(
     sleep_mock.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_google_drive_upload_rejects_multipart_files_over_google_limit(tmp_path) -> None:
+def test_google_drive_multipart_builder_rejects_files_over_google_limit(tmp_path) -> None:
     source = tmp_path / "large.bin"
     source.write_bytes(b"x" * (google_drive_service.DRIVE_MULTIPART_UPLOAD_MAX_BYTES + 1))
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        google_drive_service.build_multipart_upload_request(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 413
+    assert exc_info.value.code == "file_too_large"
+
+
+def test_google_drive_should_use_resumable_upload(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 4)
+    threshold_file = tmp_path / "threshold.bin"
+    threshold_file.write_bytes(b"1234")
+    large_file = tmp_path / "large.bin"
+    large_file.write_bytes(b"12345")
+
+    assert google_drive_service.should_use_resumable_upload(str(threshold_file)) is False
+    assert google_drive_service.should_use_resumable_upload(str(large_file)) is True
+
+
+def test_google_drive_file_near_multipart_cap_uses_resumable(tmp_path) -> None:
+    boundary_file = tmp_path / "boundary.bin"
+    boundary_file.write_bytes(b"x" * google_drive_service.DRIVE_MULTIPART_UPLOAD_MAX_BYTES)
+    small_file = tmp_path / "small.bin"
+    small_file.write_bytes(b"hello-drive")
+
+    assert google_drive_service.should_use_resumable_upload(str(boundary_file)) is True
+    assert google_drive_service.should_use_resumable_upload(str(small_file)) is False
+
+
+@pytest.mark.parametrize(
+    ("range_header", "expected"),
+    [
+        ("bytes=0-262143", 262144),
+        (None, 0),
+        ("", 0),
+        ("malformed", 0),
+    ],
+)
+def test_google_drive_parse_resumable_range_offset(range_header: str | None, expected: int) -> None:
+    assert google_drive_service.parse_resumable_range_offset(range_header) == expected
+
+
+def test_google_drive_is_retryable_resumable_status() -> None:
+    for status_code in (429, 500, 502, 503, 504):
+        assert google_drive_service.is_retryable_resumable_status(status_code) is True
+    for status_code in (200, 308, 400, 403, 404):
+        assert google_drive_service.is_retryable_resumable_status(status_code) is False
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body_text", "expected"),
+    [
+        (429, None, True),
+        (503, None, True),
+        (403, '{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}', True),
+        (403, '{"error":{"errors":[{"reason":"insufficientPermissions"}]}}', False),
+        (403, None, False),
+        (200, None, False),
+    ],
+)
+def test_google_drive_is_retryable_resumable_response(
+    status_code: int,
+    body_text: str | None,
+    expected: bool,
+) -> None:
+    assert google_drive_service.is_retryable_resumable_response(status_code, body_text) is expected
+
+
+def test_google_drive_builds_resumable_chunk_headers() -> None:
+    assert google_drive_service.build_resumable_chunk_headers(
+        content_type="application/octet-stream",
+        start=262144,
+        end=524287,
+        total=700000,
+        chunk_len=262144,
+    ) == {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": "262144",
+        "Content-Range": "bytes 262144-524287/700000",
+    }
+
+
+def test_google_drive_builds_resumable_status_query_headers() -> None:
+    assert google_drive_service.build_resumable_status_query_headers(total=700000) == {
+        "Content-Range": "bytes */700000",
+        "Content-Length": "0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_google_drive_uploads_resumable_for_large_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 4)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "report.txt"
+    file_bytes = b"hello-drive"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"
+    requests: list[tuple[str, str]] = []
+    chunks: list[bytes] = []
+    content_ranges: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requests.append((request.method, url))
+        if request.method == "POST":
+            assert "uploadType=resumable" in url
+            assert request.url.params["fields"] == "id,name,webViewLink"
+            assert request.url.params["supportsAllDrives"] == "true"
+            assert request.headers["Authorization"] == "Bearer at-1"
+            assert request.headers["Content-Type"] == "application/json; charset=UTF-8"
+            assert request.headers["X-Upload-Content-Type"] == "text/plain"
+            assert request.headers["X-Upload-Content-Length"] == str(len(file_bytes))
+            assert await request.aread() == b'{"name":"report.txt","parents":["folder_123"]}'
+            return httpx.Response(200, headers={"Location": session_uri})
+
+        assert request.method == "PUT"
+        assert url == session_uri
+        assert request.headers["Content-Type"] == "text/plain"
+        assert "Transfer-Encoding" not in request.headers
+        assert "Authorization" not in request.headers
+        chunk = await request.aread()
+        content_range = request.headers["Content-Range"]
+        chunks.append(chunk)
+        content_ranges.append(content_range)
+        assert request.headers["Content-Length"] == str(len(chunk))
+        if content_range != f"bytes 8-10/{len(file_bytes)}":
+            end = int(content_range.split("-", 1)[1].split("/", 1)[0])
+            return httpx.Response(308, headers={"Range": f"bytes=0-{end}"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_789",
+                "name": "report.txt",
+                "webViewLink": "https://drive.google.com/file/d/file_789/view",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_789"
+    assert [method for method, _url in requests] == ["POST", "PUT", "PUT", "PUT"]
+    assert requests[1][1] == session_uri
+    assert b"".join(chunks) == file_bytes
+    assert content_ranges == [
+        f"bytes 0-3/{len(file_bytes)}",
+        f"bytes 4-7/{len(file_bytes)}",
+        f"bytes 8-10/{len(file_bytes)}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_initiation_accepts_201_and_uploads_multiple_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 3)
+    source = tmp_path / "payload"
+    file_bytes = b"0123456789"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunks: list[bytes] = []
+    content_ranges: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.headers["X-Upload-Content-Type"] == "application/octet-stream"
+            return httpx.Response(201, headers={"Location": session_uri})
+        assert request.headers["Content-Type"] == "application/octet-stream"
+        chunk = await request.aread()
+        content_range = request.headers["Content-Range"]
+        chunks.append(chunk)
+        content_ranges.append(content_range)
+        if content_range != f"bytes 9-9/{len(file_bytes)}":
+            end = int(content_range.split("-", 1)[1].split("/", 1)[0])
+            return httpx.Response(308, headers={"Range": f"bytes=0-{end}"})
+        return httpx.Response(200, json={"id": "file_chunked"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_chunked"
+    assert b"".join(chunks) == file_bytes
+    assert content_ranges == ["bytes 0-2/10", "bytes 3-5/10", "bytes 6-8/10", "bytes 9-9/10"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_204_without_location_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"large")
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(204)
+
+    _install_google_drive_transport(monkeypatch, handler)
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -256,8 +546,784 @@ async def test_google_drive_upload_rejects_multipart_files_over_google_limit(tmp
             folder_id="folder_123",
         )
 
-    assert exc_info.value.status == 413
-    assert exc_info.value.code == "file_too_large"
+    assert exc_info.value.code == "missing_resumable_session"
+    assert requests == ["POST"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_initiation_rejects_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"large")
+    session_uri = "https://www.googleapis.com/upload/session"
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(302, headers={"Location": session_uri})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 302
+    assert requests == ["POST"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_final_response_missing_id_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"large")
+    session_uri = "https://www.googleapis.com/upload/session"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        return httpx.Response(200, json={"name": "payload.bin"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.code == "malformed_response"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_missing_web_view_link_uses_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"large")
+    session_uri = "https://www.googleapis.com/upload/session"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        return httpx.Response(200, json={"id": "file_without_link"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    destination = FileUploadDestination(
+        storage_type=FileStorageType.GOOGLE_DRIVE,
+        customer_uri="https://drive.google.com/drive/folders/folder_123",
+        sdk_uri="https://drive.google.com/drive/folders/folder_123",
+        google_access_token="at-1",
+        google_drive_folder_id="folder_123",
+    )
+
+    result = await AgentFunction().upload_file_to_customer_storage(
+        file_path=str(source),
+        destination=destination,
+    )
+
+    assert result == "https://drive.google.com/file/d/file_without_link/view"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_initiation_retries_connect_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"large")
+    session_uri = "https://www.googleapis.com/upload/session"
+    post_calls = 0
+    put_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls, put_calls
+        if request.method == "POST":
+            post_calls += 1
+            if post_calls == 1:
+                raise httpx.ConnectError("connect failed", request=request)
+            return httpx.Response(200, headers={"Location": session_uri})
+        put_calls += 1
+        return httpx.Response(200, json={"id": "file_retry"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_retry"
+    assert post_calls == 2
+    assert put_calls == 1
+    sleep_mock.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_initiation_does_not_retry_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"large")
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.code == "ambiguous_upload_status"
+    assert calls == 1
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_resumes_after_put_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefghijkl"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    post_calls = 0
+    content_ranges: list[str] = []
+    query_calls = 0
+    failed_once = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_once, post_calls, query_calls
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        content_ranges.append(content_range)
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            assert request.headers["Content-Length"] == "0"
+            assert await request.aread() == b""
+            return httpx.Response(308, headers={"Range": "bytes=0-7"})
+
+        chunk = await request.aread()
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            assert chunk == file_bytes[0:4]
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+        if content_range == f"bytes 4-7/{len(file_bytes)}" and not failed_once:
+            failed_once = True
+            assert chunk == file_bytes[4:8]
+            raise httpx.ReadTimeout("read timed out", request=request)
+        assert content_range == f"bytes 8-11/{len(file_bytes)}"
+        assert chunk == file_bytes[8:12]
+        return httpx.Response(200, json={"id": "file_resumed"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_resumed"
+    assert post_calls == 1
+    assert query_calls == 1
+    assert content_ranges == ["bytes 0-3/12", "bytes 4-7/12", "bytes */12", "bytes 8-11/12"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_requeries_offset_after_double_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    content_ranges: list[str] = []
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        content_ranges.append(content_range)
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            if query_calls == 1:
+                raise httpx.ReadTimeout("status query timed out", request=request)
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            raise httpx.ReadTimeout("chunk response timed out", request=request)
+        assert content_range == f"bytes 4-7/{len(file_bytes)}"
+        return httpx.Response(200, json={"id": "file_requeried"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_requeried"
+    assert content_ranges == ["bytes 0-3/8", "bytes */8", "bytes */8", "bytes 4-7/8"]
+    sleep_mock.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_resumes_after_chunk_5xx(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_ranges: list[str] = []
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+
+        chunk_ranges.append(content_range)
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            return httpx.Response(503, text="temporarily unavailable")
+        assert content_range == f"bytes 4-7/{len(file_bytes)}"
+        return httpx.Response(200, json={"id": "file_resumed_after_503"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_resumed_after_503"
+    assert query_calls == 1
+    assert chunk_ranges == ["bytes 0-3/8", "bytes 4-7/8"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_resumes_after_chunk_429(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_ranges: list[str] = []
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+
+        chunk_ranges.append(content_range)
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            return httpx.Response(429, text="rate limited")
+        assert content_range == f"bytes 4-7/{len(file_bytes)}"
+        return httpx.Response(200, json={"id": "file_resumed_after_429"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_resumed_after_429"
+    assert query_calls == 1
+    assert chunk_ranges == ["bytes 0-3/8", "bytes 4-7/8"]
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_resumes_after_chunk_rate_limit_403(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    content_ranges: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        content_ranges.append(content_range)
+        if content_range == f"bytes */{len(file_bytes)}":
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            return httpx.Response(
+                403,
+                json={"error": {"errors": [{"reason": "userRateLimitExceeded"}], "message": "rate limited"}},
+            )
+        assert content_range == f"bytes 4-7/{len(file_bytes)}"
+        return httpx.Response(200, json={"id": "file_resumed_after_403"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_resumed_after_403"
+    assert content_ranges == ["bytes 0-3/8", "bytes */8", "bytes 4-7/8"]
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_non_rate_limit_403_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"abcdefgh")
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_ranges: list[str] = []
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        if content_range == "bytes */8":
+            query_calls += 1
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+
+        chunk_ranges.append(content_range)
+        return httpx.Response(
+            403,
+            json={"error": {"message": "forbidden", "errors": [{"reason": "insufficientPermissions"}]}},
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 403
+    assert query_calls == 0
+    assert chunk_ranges == ["bytes 0-3/8"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_commit_but_response_lost_does_not_exhaust(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 2)
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 3)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    committed_offset = 0
+    chunk_calls = 0
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chunk_calls, committed_offset, query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            if committed_offset == len(file_bytes):
+                return httpx.Response(200, json={"id": "file_committed"})
+            return httpx.Response(308, headers={"Range": f"bytes=0-{committed_offset - 1}"})
+
+        chunk_calls += 1
+        start_text, remainder = content_range.removeprefix("bytes ").split("-", 1)
+        end_text = remainder.split("/", 1)[0]
+        assert int(start_text) == committed_offset
+        committed_offset = int(end_text) + 1
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_committed"
+    assert chunk_calls == 4
+    assert query_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_final_chunk_completion_reconciled_after_lost_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 1)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_ranges: list[str] = []
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            return httpx.Response(200, json={"id": "file_completed"})
+
+        chunk_ranges.append(content_range)
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+        assert content_range == f"bytes 4-7/{len(file_bytes)}"
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_completed"
+    assert query_calls == 1
+    assert chunk_ranges == ["bytes 0-3/8", "bytes 4-7/8"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_non_advancing_308_bails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 2)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"abcdefgh")
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chunk_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        chunk_calls += 1
+        return httpx.Response(308, headers={"Range": "bytes=0-3"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await asyncio.wait_for(
+            google_drive_service.upload_file(
+                access_token="at-1",
+                file_path=str(source),
+                folder_id="folder_123",
+            ),
+            timeout=1,
+        )
+
+    assert exc_info.value.status == 503
+    assert exc_info.value.code == "resumable_upload_failed"
+    assert chunk_calls == 3
+    sleep_mock.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_malformed_range_after_progress_does_not_rewind(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 2)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"abcdefgh")
+    session_uri = "https://www.googleapis.com/upload/session"
+    content_ranges: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_ranges.append(request.headers["Content-Range"])
+        if len(content_ranges) == 1:
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+        return httpx.Response(308)
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.code == "resumable_upload_failed"
+    assert content_ranges == ["bytes 0-3/8", "bytes 4-7/8", "bytes 4-7/8"]
+    sleep_mock.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_query_reports_already_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    source = tmp_path / "payload.bin"
+    file_bytes = b"abcdefgh"
+    source.write_bytes(file_bytes)
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_ranges: list[str] = []
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        content_range = request.headers["Content-Range"]
+        if content_range == f"bytes */{len(file_bytes)}":
+            query_calls += 1
+            return httpx.Response(200, json={"id": "file_already_complete"})
+
+        chunk_ranges.append(content_range)
+        if content_range == f"bytes 0-3/{len(file_bytes)}":
+            return httpx.Response(308, headers={"Range": "bytes=0-3"})
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_already_complete"
+    assert query_calls == 1
+    assert chunk_ranges == ["bytes 0-3/8", "bytes 4-7/8"]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_exhausts_attempts_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 1)
+    monkeypatch.setattr(google_drive_service, "DRIVE_RESUMABLE_CHUNK_BYTES", 4)
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 3)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"abcdefgh")
+    session_uri = "https://www.googleapis.com/upload/session"
+    chunk_calls = 0
+    query_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chunk_calls, query_calls
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        if request.headers["Content-Range"] == "bytes */8":
+            query_calls += 1
+            raise httpx.ReadTimeout("status query timed out", request=request)
+        chunk_calls += 1
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 503
+    assert exc_info.value.code == "resumable_upload_failed"
+    assert chunk_calls == 1
+    assert query_calls == 3
+    sleep_mock.assert_has_awaits([call(1.0), call(2.0)])
+    assert sleep_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_missing_location_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 4)
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        return httpx.Response(200)
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 502
+    assert exc_info.value.code == "missing_resumable_session"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_resumable_malformed_final_response_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(google_drive_service, "DRIVE_MULTIPART_FILE_MAX_BYTES", 4)
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    session_uri = "https://www.googleapis.com/upload/session"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": session_uri})
+        assert request.method == "PUT"
+        return httpx.Response(200, content=b"not json")
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.code == "malformed_response"
+
+
+def test_google_drive_extracts_resumable_session_uri_case_insensitively() -> None:
+    assert (
+        google_drive_service.extract_resumable_session_uri({"location": "https://www.googleapis.com/upload/session"})
+        == "https://www.googleapis.com/upload/session"
+    )
+
+
+def test_google_drive_resumable_session_uri_accepts_googleapis_subdomain() -> None:
+    session_uri = "https://storage.googleapis.com/upload/session"
+
+    assert google_drive_service.extract_resumable_session_uri({"Location": session_uri}) == session_uri
+
+
+@pytest.mark.parametrize(
+    "session_uri",
+    [
+        "https://googleapis.com.evil.com/upload",
+        "https://user@evil.com/upload",
+        "https://user@www.googleapis.com/upload",
+        "https://www.googleapis.com:444/upload",
+    ],
+)
+def test_google_drive_resumable_session_uri_rejects_ssrf_variants(session_uri: str) -> None:
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        google_drive_service.extract_resumable_session_uri({"Location": session_uri})
+
+    assert exc_info.value.code == "invalid_resumable_session"
+
+
+def test_google_drive_resumable_session_uri_rejects_non_google_host() -> None:
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        google_drive_service.extract_resumable_session_uri({"location": "https://evil.example.com/upload"})
+
+    assert exc_info.value.code == "invalid_resumable_session"
+
+
+def test_google_drive_resumable_session_uri_rejects_http() -> None:
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        google_drive_service.extract_resumable_session_uri({"location": "http://www.googleapis.com/upload"})
+
+    assert exc_info.value.code == "invalid_resumable_session"
 
 
 def test_google_drive_maps_insufficient_scope_to_reconnect() -> None:

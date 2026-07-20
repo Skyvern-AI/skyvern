@@ -164,7 +164,11 @@ function chatUi(props: ChatProps) {
 async function renderChat(props: ChatProps = {}) {
   const view = render(chatUi(props));
   await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
+    expect(
+      screen.getByPlaceholderText(
+        /Message Skyvern Copilot|Ask Copilot to build/,
+      ),
+    ).toBeTruthy(),
   );
   return view;
 }

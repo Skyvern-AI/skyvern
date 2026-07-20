@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -29,7 +30,7 @@ class WorkflowCopilotCompletionCriteriaSet(BaseModel):
     workflow_copilot_chat_id: str
     goal_epoch: int
     status: str
-    criteria: list[dict]
+    criteria: list[dict[str, Any]]
     source_turn_id: str | None = None
     source_goal_text: str | None = None
     consecutive_all_no_evidence: int = 0
@@ -40,6 +41,19 @@ class WorkflowCopilotCompletionCriteriaSet(BaseModel):
     supersede_reason: str | None = None
     created_at: datetime
     modified_at: datetime
+
+
+CriteriaSetNonAdoptableReason = Literal["unknown_shape", "undecodable_v1_criteria"]
+
+
+@dataclass(frozen=True)
+class NonAdoptableCriteriaSet:
+    """A persisted criteria-set row whose shape cannot be decoded into the current
+    model; callers must treat the row as absent/superseded, never as an empty contract."""
+
+    reason: CriteriaSetNonAdoptableReason
+    completion_criteria_set_id: str
+    goal_epoch: int
 
 
 class WorkflowCopilotChatSender(StrEnum):

@@ -14,6 +14,7 @@ import {
   forgetDiscoverCopilotPrompt,
   readDiscoverCopilotPrompt,
   rememberDiscoverCopilotPrompt,
+  shouldOpenCopilotPaneForHandoff,
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "./discoverCopilotHandoff";
@@ -190,6 +191,48 @@ describe("discoverCopilotHandoff", () => {
     );
     expect(second.result.current.storedInitialCopilotMessage).toBeNull();
     second.unmount();
+  });
+});
+
+describe("shouldOpenCopilotPaneForHandoff", () => {
+  it("opens the Copilot pane for a studio handoff with a seeded prompt", () => {
+    expect(
+      shouldOpenCopilotPaneForHandoff({
+        embedded: true,
+        hasInitialCopilotMessage: true,
+        copilotPaneOpen: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not open outside the studio shell (non-embedded editor)", () => {
+    expect(
+      shouldOpenCopilotPaneForHandoff({
+        embedded: false,
+        hasInitialCopilotMessage: true,
+        copilotPaneOpen: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not open when there is no seeded prompt", () => {
+    expect(
+      shouldOpenCopilotPaneForHandoff({
+        embedded: true,
+        hasInitialCopilotMessage: false,
+        copilotPaneOpen: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("is a no-op when the Copilot pane is already open", () => {
+    expect(
+      shouldOpenCopilotPaneForHandoff({
+        embedded: true,
+        hasInitialCopilotMessage: true,
+        copilotPaneOpen: true,
+      }),
+    ).toBe(false);
   });
 });
 
