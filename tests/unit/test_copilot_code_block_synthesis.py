@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import hashlib
 import json
 import keyword
 import sys
@@ -18,9 +17,12 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
     AuthoringParameterFieldBinding,
     AuthoringParameterTerminalBinding,
+    authored_selection_parameter_bindings,
+    authored_selector_parameter_bindings,
     authoring_parameter_binding_directive_consumed,
     build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
@@ -53,7 +55,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     credential_scout_gap,
-    grounded_submit_rung_binding_fingerprint,
     input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
     obligation_finding_reason_code,
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_code_block,
     synthesize_code_block_with_extraction,
     synthesize_extraction_suffix,
+    templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
     witness_prelude_lines,
 )
@@ -103,110 +105,6 @@ def real_mypy() -> None:
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
     return {"tool_name": tool_name, **fields}
-
-
-def _submit_rung_binding(
-    interaction: dict[str, Any],
-    *,
-    trajectory_index: int,
-    fields: list[dict[str, str]],
-) -> dict[str, Any]:
-    repeated_structural_key = "recorded-p5-key"
-    return {
-        "repeated_structural_key": repeated_structural_key,
-        "field_bindings": fields,
-        "fingerprint": grounded_submit_rung_binding_fingerprint(
-            repeated_structural_key=repeated_structural_key,
-            source_url=str(interaction["source_url"]),
-            submit_selector=str(interaction["selector"]),
-            submit_trajectory_index=trajectory_index,
-            field_bindings=fields,
-        ),
-    }
-
-
-def test_grounded_submit_rung_binding_changes_candidate_and_preserves_trajectory() -> None:
-    trajectory = [
-        _interaction("click", selector="#open", source_url="https://example.com/form", trajectory_index=0),
-        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=1),
-    ]
-    plain = synthesize_code_block(trajectory, strict_selectors=True)
-    fields = [
-        {"parameter_key": "company_name", "field_selector": "#company"},
-        {"parameter_key": "contact_email", "field_selector": "#email"},
-    ]
-    trajectory[1]["submit_rung_binding"] = _submit_rung_binding(trajectory[1], trajectory_index=1, fields=fields)
-    original = [dict(interaction) for interaction in trajectory]
-
-    result = synthesize_code_block(trajectory, strict_selectors=True)
-
-    assert plain is not None
-    assert result is not None
-    assert trajectory == original
-    assert hashlib.sha256(plain.code.encode()).hexdigest() == (
-        "9703bf1b2b7a0a9a2e8145f89055e20c312a3cf2d6b0dc9a34d4d325bba6361f"
-    )
-    assert result.code != plain.code
-    assert result.code.index('page.locator("#company").fill(str(company_name))') < result.code.index(
-        'page.locator("#submit").click()'
-    )
-    assert result.code.index('page.locator("#email").fill(str(contact_email))') < result.code.index(
-        'page.locator("#submit").click()'
-    )
-    assert {parameter["key"] for parameter in result.parameters} == {"company_name", "contact_email"}
-    assert result.diagnostics.grounded_submit_binding_fingerprints == [
-        trajectory[1]["submit_rung_binding"]["fingerprint"]
-    ]
-    assert [record["trajectory_index"] for record in result.diagnostics.emitted_interactions] == [0, 1]
-
-
-def test_grounded_submit_rung_binding_targets_exact_submit_trajectory_index() -> None:
-    trajectory = [
-        _interaction("click", selector="#submit", source_url="https://example.com/landing", trajectory_index=0),
-        _interaction("click", selector="#open", source_url="https://example.com/form", trajectory_index=1),
-        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=2),
-    ]
-    fields = [{"parameter_key": "company_name", "field_selector": "#company"}]
-    trajectory[2]["submit_rung_binding"] = _submit_rung_binding(trajectory[2], trajectory_index=2, fields=fields)
-
-    result = synthesize_code_block(trajectory, strict_selectors=True)
-
-    assert result is not None
-    first_submit = result.code.index('page.locator("#submit").click()')
-    fill = result.code.index('page.locator("#company").fill(str(company_name))')
-    second_submit = result.code.rindex('page.locator("#submit").click()')
-    assert first_submit < fill < second_submit
-
-
-@pytest.mark.parametrize("mutation", ["incomplete", "leftover", "fingerprint"])
-def test_grounded_submit_rung_binding_fails_closed_on_invalid_bundle(mutation: str) -> None:
-    interaction = _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=0)
-    fields = [{"parameter_key": "company_name", "field_selector": "#company"}]
-    interaction["submit_rung_binding"] = _submit_rung_binding(interaction, trajectory_index=0, fields=fields)
-    trajectory = [interaction]
-    if mutation == "incomplete":
-        interaction["submit_rung_binding"]["field_bindings"] = []
-    elif mutation == "leftover":
-        trajectory.append(
-            _interaction(
-                "click",
-                selector="#second-submit",
-                source_url="https://example.com/form",
-                trajectory_index=1,
-                submit_rung_binding=_submit_rung_binding(
-                    {
-                        "selector": "#second-submit",
-                        "source_url": "https://example.com/form",
-                    },
-                    trajectory_index=1,
-                    fields=[{"parameter_key": "contact_email", "field_selector": "#email"}],
-                ),
-            )
-        )
-    else:
-        interaction["submit_rung_binding"]["fingerprint"] = "stale"
-
-    assert synthesize_code_block(trajectory, strict_selectors=True) is None
 
 
 def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() -> None:
@@ -351,6 +249,172 @@ def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_change
     )
 
     assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
+
+
+def _templated_selection_click(selector: str, key: str, value: str, index: int) -> dict[str, Any]:
+    interaction = _interaction(
+        "click", selector=selector, source_url="https://example.com/list", trajectory_index=index
+    )
+    interaction["input_correspondences"] = input_correspondences_for_interaction(interaction, {key: value})
+    return interaction
+
+
+def test_authored_selection_bindings_recognizes_templated_click_and_select_option() -> None:
+    code = (
+        'await page.locator(f"[data-account=\\"{account_number}\\"]").click()\n'
+        'await page.locator("#plan").select_option(str(plan_tier))\n'
+    )
+    bindings = authored_selection_parameter_bindings(code, {"account_number", "plan_tier"})
+    assert bindings is not None
+    assert bindings.get("#plan") == {"plan_tier"}
+    assert {key for keys in bindings.values() for key in keys} == {"account_number", "plan_tier"}
+    assert authored_selector_parameter_bindings(code, {"account_number", "plan_tier"}) == {}
+
+
+def test_authored_selection_bindings_ignores_literal_only_click() -> None:
+    code = 'await page.locator("#row-account-AC12345").click()\n'
+    assert authored_selection_parameter_bindings(code, {"account_number"}) == {}
+
+
+def test_authoring_parameter_directive_consumed_via_templated_click() -> None:
+    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
+    key, join = templated_selection_locator_binding(click)
+    assert key == "account_number"
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="account_number",
+                field_selector=join,
+                field_trajectory_index=0,
+                match_basis="scouted_selection_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
+        ),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[AuthoringParameterBindingCandidate(declared_key="account_number", field_selector=join)],
+    )
+    consumed_code = 'await page.locator(f"[data-account=\\"{account_number}\\"]").click()'
+    assert authoring_parameter_binding_directive_consumed(
+        directive, snapshot, code=consumed_code, parameter_keys=["account_number"]
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#row-account-AC12345").click()',
+        parameter_keys=["account_number"],
+    )
+
+
+def test_authoring_parameter_directive_consumed_via_select_option_value_argument() -> None:
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="plan_tier",
+                field_selector="#plan",
+                field_trajectory_index=0,
+                match_basis="scouted_option_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[AuthoringParameterBindingCandidate(declared_key="plan_tier", field_selector="#plan")],
+    )
+    assert authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#plan").select_option(str(plan_tier))',
+        parameter_keys=["plan_tier"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#plan").select_option("premium")',
+        parameter_keys=["plan_tier"],
+    )
+
+
+def test_selection_snapshot_click_binding_references_declared_key() -> None:
+    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
+    _key, join = templated_selection_locator_binding(click)
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="account_number",
+                field_selector=join,
+                field_trajectory_index=0,
+                match_basis="scouted_selection_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
+        ),
+    )
+    result = synthesize_code_block([click], strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert 'page.locator(f"[data-account=\\"{account_number}\\"]").click()' in result.code
+    assert ".fill(" not in result.code
+
+
+def test_selection_snapshot_select_option_binds_value_argument() -> None:
+    select = _interaction(
+        "select_option", selector="#plan", value="premium", source_url="https://example.com/list", trajectory_index=0
+    )
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="plan_tier",
+                field_selector="#plan",
+                field_trajectory_index=0,
+                match_basis="scouted_option_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
+    )
+    result = synthesize_code_block([select], strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert 'page.locator("#plan").select_option(str(plan_tier))' in result.code
+    assert '"premium"' not in result.code
+    assert result.parameters == [{"key": "plan_tier"}]
+
+
+def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="click", trajectory_index=9, selector="#submit"),
+    )
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert ".select_option(" not in result.code
+    assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
