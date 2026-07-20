@@ -44,6 +44,10 @@ MAX_UPLOAD_FILE_COUNT = 50
 AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT = 50
 CUSTOMER_STORAGE_UPLOAD_MAX_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB per file (FileUploadBlock)
 DEFAULT_MAX_SCREENSHOT_SCROLLS = 3
+# Sanity ceiling for a user-supplied scroll count. Bounds the value well below the
+# INTEGER column limit (a larger value overflowed workflow_runs on insert) while
+# staying far above any real screenshot need.
+MAX_SCREENSHOT_SCROLLS = 1000
 
 # Default navigation_goal for LoginBlocks. Instructs the LLM how to find the login
 # page, fill credentials, and handle multi-step flows / 2FA.

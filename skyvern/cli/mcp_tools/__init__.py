@@ -184,6 +184,17 @@ def _add_telemetry_middleware() -> None:
     mcp.add_middleware(MCPTelemetryMiddleware())
 
 
+def _add_argument_validation_middleware() -> None:
+    if _FASTMCP_IMPORT_ERROR is not None:
+        return
+    from .argument_validation import MCPArgumentValidationMiddleware  # noqa: PLC0415
+
+    # Registered after telemetry so telemetry stays the outermost wrapper and
+    # still records the call; this one is innermost and rejects malformed
+    # arguments before dispatch runs (and logs a raw pydantic error).
+    mcp.add_middleware(MCPArgumentValidationMiddleware())
+
+
 # -- Tool annotation factories --
 # Every tool registered with FastMCP must carry a human-readable `title`
 # (required by the Claude Connectors Directory). We build per-tool
@@ -366,6 +377,7 @@ Use skyvern_click's resolved_selector response to get xpaths for production scri
 """,
 )
 _add_telemetry_middleware()
+_add_argument_validation_middleware()
 
 # -- Browser session management --
 mcp.tool(tags={"session"}, annotations=_mut("Create Browser Session"))(skyvern_browser_session_create)
