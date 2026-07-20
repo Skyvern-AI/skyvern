@@ -1,6 +1,8 @@
 # ruff: noqa: E402
-import shutil
+import asyncio
 from typing import TYPE_CHECKING, Any
+
+import structlog
 
 from skyvern.exceptions import require_local_extra_modules
 
@@ -8,7 +10,10 @@ require_local_extra_modules("skyvern.library.skyvern_browser")
 
 from playwright.async_api import BrowserContext, Page
 
+from skyvern.library import local_browser_profile
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+
+LOG = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern import Skyvern
@@ -51,6 +56,7 @@ class SkyvernBrowser(BrowserContext):
         local_cdp_port: int | None = None,
         local_user_data_dir: str | None = None,
         local_user_data_dir_owned: bool = False,
+        local_browser_profile: local_browser_profile.LocalBrowserProfile | None = None,
     ):
         super().__init__(browser_context)
         self._skyvern = skyvern
@@ -61,6 +67,9 @@ class SkyvernBrowser(BrowserContext):
         self._local_cdp_port = local_cdp_port
         self._local_user_data_dir = local_user_data_dir
         self._local_user_data_dir_owned = local_user_data_dir_owned
+        self._local_browser_profile = local_browser_profile
+        self._close_task: asyncio.Task[None] | None = None
+        self._closed = False
 
         self.workflow_run_id: None | str = None
 
@@ -95,6 +104,10 @@ class SkyvernBrowser(BrowserContext):
     @property
     def local_user_data_dir_owned(self) -> bool:
         return self._local_user_data_dir_owned
+
+    @property
+    def local_browser_profile(self) -> local_browser_profile.LocalBrowserProfile | None:
+        return self._local_browser_profile
 
     @property
     def app_url(self) -> str | None:
@@ -160,9 +173,38 @@ class SkyvernBrowser(BrowserContext):
             await browser.close()  # Closes both browser and cloud session
             ```
         """
-        await self._browser_context.close(**kwargs)
-        if self._local_user_data_dir_owned and self._local_user_data_dir:
-            shutil.rmtree(self._local_user_data_dir, ignore_errors=True)
+        if self._closed:
+            return
+        close_task = self._close_task
+        if close_task is None:
 
-        if self._browser_session_id:
-            await self._skyvern.close_browser_session(self._browser_session_id)
+            async def close_sequence() -> None:
+                try:
+                    await self._browser_context.close(**kwargs)
+                finally:
+                    if self._local_user_data_dir_owned and self._local_user_data_dir:
+                        deleted = await asyncio.to_thread(
+                            local_browser_profile.cleanup_local_browser_profile,
+                            self._local_browser_profile or self._local_user_data_dir,
+                        )
+                        if not deleted:
+                            LOG.warning(
+                                "local_browser_profile_cleanup_deferred",
+                                user_data_dir=self._local_user_data_dir,
+                            )
+
+                if self._browser_session_id:
+                    await self._skyvern.close_browser_session(self._browser_session_id)
+
+            close_task = asyncio.create_task(close_sequence())
+            self._close_task = close_task
+
+            def _finish(task: asyncio.Task[None]) -> None:
+                if not task.cancelled() and task.exception() is None:
+                    self._closed = True
+                self._close_task = None
+
+            close_task.add_done_callback(_finish)
+
+        # Shield: a cancelled waiter must not cancel the shared close for every other caller.
+        await asyncio.shield(close_task)

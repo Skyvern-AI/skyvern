@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
-import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 
@@ -505,13 +504,20 @@ class Skyvern(AsyncSkyvern):
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
 
+        from skyvern.library import local_browser_profile  # noqa: PLC0415
         from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
 
         playwright = await self._get_playwright()
 
         use_instance_defaults = user_data_dir is None and port is None
+        managed_profile: local_browser_profile.LocalBrowserProfile | None = None
         if use_instance_defaults:
-            user_data_path = pathlib.Path(tempfile.mkdtemp(prefix="skyvern-browser-"))
+            managed_profile = local_browser_profile.create_local_browser_profile()
+            user_data_path = (
+                managed_profile.path
+                if managed_profile is not None
+                else pathlib.Path(tempfile.mkdtemp(prefix="skyvern-browser-"))
+            )
             launch_port = 0
         elif user_data_dir:
             user_data_path = pathlib.Path(user_data_dir)
@@ -526,6 +532,12 @@ class Skyvern(AsyncSkyvern):
         if args:
             launch_args.extend(args)
 
+        if managed_profile is not None and not managed_profile.revalidate():
+            deleted = await asyncio.to_thread(local_browser_profile.cleanup_local_browser_profile, managed_profile)
+            if not deleted:
+                LOG.warning("local_browser_profile_cleanup_deferred", user_data_dir=str(user_data_path))
+            raise RuntimeError("Local browser profile identity changed before Chromium launch")
+
         browser_context = None
         try:
             browser_context = await playwright.chromium.launch_persistent_context(
@@ -534,23 +546,29 @@ class Skyvern(AsyncSkyvern):
                 args=launch_args,
             )
             resolved_port = await _read_devtools_active_port(user_data_path) if use_instance_defaults else launch_port
-        except Exception:
-            try:
-                if browser_context is not None:
+            browser_address = f"http://localhost:{resolved_port}"
+            return SkyvernBrowser(
+                self,
+                browser_context,
+                browser_address=browser_address,
+                local_cdp_port=resolved_port,
+                local_user_data_dir=str(user_data_path),
+                local_user_data_dir_owned=use_instance_defaults,
+                local_browser_profile=managed_profile,
+            )
+        except BaseException:
+            if browser_context is not None:
+                try:
                     await browser_context.close()
-            finally:
-                if use_instance_defaults:
-                    shutil.rmtree(user_data_path, ignore_errors=True)
+                except BaseException:
+                    LOG.warning("local_browser_context_close_rollback_failed", exc_info=True)
+            if use_instance_defaults:
+                deleted = await asyncio.to_thread(
+                    local_browser_profile.cleanup_local_browser_profile, managed_profile or user_data_path
+                )
+                if not deleted:
+                    LOG.warning("local_browser_profile_cleanup_deferred", user_data_dir=str(user_data_path))
             raise
-        browser_address = f"http://localhost:{resolved_port}"
-        return SkyvernBrowser(
-            self,
-            browser_context,
-            browser_address=browser_address,
-            local_cdp_port=resolved_port,
-            local_user_data_dir=str(user_data_path),
-            local_user_data_dir_owned=use_instance_defaults,
-        )
 
     async def connect_to_browser_over_cdp(self, cdp_url: str) -> SkyvernBrowser:
         """Connect to an existing browser instance via Chrome DevTools Protocol (CDP).
