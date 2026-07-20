@@ -2253,3 +2253,150 @@ async def test_selector_click_prep_opt_out_keeps_escape_retry_for_interception(m
         ("click", None),
         ("click", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_forwards_script_id_to_manager(monkeypatch):
+    # MUST_FIX 1: the production script caller must forward the active run's script_id so the
+    # standalone-script browser is pinned under a real id (and, in cloud, used as the flag distinct id)
+    # instead of the id being discarded and the run forced into default-only behavior.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1"))
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state()
+    finally:
+        skyvern_context.reset()
+
+    manager.get_or_create_for_script.assert_awaited_once()
+    assert manager.get_or_create_for_script.await_args.kwargs["script_id"] == "scr_1"
+    # MF2: the real organization_id is forwarded so acquisition uses the same (session, org) key as release.
+    assert manager.get_or_create_for_script.await_args.kwargs["organization_id"] == "org_1"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_sources_session_id_from_context(monkeypatch):
+    # The acquire must key browser_session_id off the run context (like organization_id/script_id), so it
+    # matches what run_script's cleanup releases. Otherwise a standalone run carrying a session id builds a
+    # non-persistent browser here but is treated as a persistent session at cleanup and leaked.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    skyvern_context.set(
+        skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1", browser_session_id="session_1")
+    )
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state()  # generated caller passes no browser_session_id
+    finally:
+        skyvern_context.reset()
+
+    assert manager.get_or_create_for_script.await_args.kwargs["browser_session_id"] == "session_1"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_records_effective_session_on_context(monkeypatch):
+    # An explicit session passed to acquire (e.g. setup(browser_session_id=...)) must be recorded on the run
+    # context, so run_script's terminal cleanup releases the same session it attached even when run_script
+    # itself was invoked without one. Otherwise cleanup closes the reusable browser and skips release.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=None)  # fresh acquisition (no cached state yet)
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1")  # no session initially
+    skyvern_context.set(ctx)
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_explicit")
+    finally:
+        skyvern_context.reset()
+
+    assert manager.get_or_create_for_script.await_args.kwargs["browser_session_id"] == "pbs_explicit"
+    assert ctx.browser_session_id == "pbs_explicit"  # recorded so terminal cleanup releases the same session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_session", [None, "pbs_A"])
+async def test_get_or_create_browser_state_fails_closed_on_mid_run_session_switch(monkeypatch, bound_session):
+    # A script's browser is pinned under script_id at first acquire; get_or_create_for_script's cache hit
+    # would return that existing state and ignore a later, different requested session. Recording the new
+    # session on context would then make cleanup release an unattached session and leak the cached browser.
+    # Fail closed BEFORE mutating context, covering cached-local (None) and cached-session-A bindings; the
+    # bound identity on context must be preserved for terminal cleanup.
+    from skyvern.exceptions import BrowserSessionSwitchNotAllowed
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=MagicMock())  # a browser is already cached for scr_1
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1", browser_session_id=bound_session)
+    skyvern_context.set(ctx)
+    try:
+        with pytest.raises(BrowserSessionSwitchNotAllowed):
+            await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_B")
+    finally:
+        skyvern_context.reset()
+
+    assert ctx.browser_session_id == bound_session  # rejected request never overwrote the bound identity
+    manager.get_or_create_for_script.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_allows_same_session_cache_reuse(monkeypatch):
+    # Re-acquiring the SAME session (or none) against a cached state is legitimate reuse — not a switch.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=MagicMock())  # cached state exists
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1", browser_session_id="pbs_A")
+    skyvern_context.set(ctx)
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_A")
+    finally:
+        skyvern_context.reset()
+
+    manager.get_or_create_for_script.assert_awaited_once()
+    assert ctx.browser_session_id == "pbs_A"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_does_not_record_session_on_acquire_failure(monkeypatch):
+    # A cold/evicted requested session makes get_or_create_for_script fail closed. The requested session must
+    # NOT be written to context, or run_script's terminal cleanup would release a session the script never
+    # acquired (and clear its runnable_id, detaching another run's session). The prior binding must stand.
+    from skyvern.exceptions import MissingBrowserStateForBrowserSession
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=None)  # fresh acquisition
+    manager.get_or_create_for_script = AsyncMock(side_effect=MissingBrowserStateForBrowserSession("pbs_cold"))
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1")  # no prior session bound
+    skyvern_context.set(ctx)
+    try:
+        with pytest.raises(MissingBrowserStateForBrowserSession):
+            await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_cold")
+    finally:
+        skyvern_context.reset()
+
+    assert ctx.browser_session_id is None  # requested session not recorded because the attach failed
