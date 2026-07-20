@@ -156,6 +156,38 @@ async def test_mcp_tool_call_marks_error_results_as_not_ok() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_tool_call_reads_ok_from_structured_content() -> None:
+    """A ToolResult reporting failure via structured_content (no `data`) is recorded ok=False.
+
+    The argument-validation middleware short-circuits with exactly this shape.
+    """
+    events: list[tuple[str, dict | None, str | None, str | None, str | None]] = []
+
+    def fake_capture(
+        event: str,
+        data: dict | None = None,
+        distinct_id: str | None = None,
+        api_key: str | None = None,
+        host: str | None = None,
+    ) -> None:
+        events.append((event, data, distinct_id, api_key, host))
+
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_get_errors"), fastmcp_context=None)
+    response = SimpleNamespace(structured_content={"ok": False, "error": {"code": "INVALID_INPUT"}}, content=[])
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        return response
+
+    with patch.object(analytics, "capture", side_effect=fake_capture):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    assert len(events) == 1
+    _, payload, _, _, _ = events[0]
+    assert payload is not None
+    assert payload["ok"] is False
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_call_exception_omits_error_message() -> None:
     events: list[tuple[str, dict | None, str | None, str | None, str | None]] = []
 

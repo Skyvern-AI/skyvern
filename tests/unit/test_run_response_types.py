@@ -2,7 +2,21 @@ from datetime import UTC, datetime
 
 from pydantic import TypeAdapter
 
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunResponse, RunStatus, RunType, TaskRunResponse, WorkflowRunResponse
+
+
+def test_every_workflow_run_status_maps_to_run_status() -> None:
+    # A workflow run's status is projected onto the public RunStatus via
+    # RunStatus(workflow_run.status); a WorkflowRunStatus value with no RunStatus
+    # member raises ValueError on that projection (paused did, in production).
+    for status in WorkflowRunStatus:
+        assert RunStatus(status.value).value == status.value
+
+
+def test_paused_run_status_is_non_final() -> None:
+    assert RunStatus("paused") is RunStatus.paused
+    assert RunStatus.paused.is_final() is False
 
 
 def test_task_run_response_preserves_run_type_enum() -> None:
