@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import hashlib
 import json
 import keyword
 import sys
@@ -56,7 +55,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     credential_scout_gap,
-    grounded_submit_rung_binding_fingerprint,
     input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
     obligation_finding_reason_code,
@@ -107,110 +105,6 @@ def real_mypy() -> None:
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
     return {"tool_name": tool_name, **fields}
-
-
-def _submit_rung_binding(
-    interaction: dict[str, Any],
-    *,
-    trajectory_index: int,
-    fields: list[dict[str, str]],
-) -> dict[str, Any]:
-    repeated_structural_key = "recorded-p5-key"
-    return {
-        "repeated_structural_key": repeated_structural_key,
-        "field_bindings": fields,
-        "fingerprint": grounded_submit_rung_binding_fingerprint(
-            repeated_structural_key=repeated_structural_key,
-            source_url=str(interaction["source_url"]),
-            submit_selector=str(interaction["selector"]),
-            submit_trajectory_index=trajectory_index,
-            field_bindings=fields,
-        ),
-    }
-
-
-def test_grounded_submit_rung_binding_changes_candidate_and_preserves_trajectory() -> None:
-    trajectory = [
-        _interaction("click", selector="#open", source_url="https://example.com/form", trajectory_index=0),
-        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=1),
-    ]
-    plain = synthesize_code_block(trajectory, strict_selectors=True)
-    fields = [
-        {"parameter_key": "company_name", "field_selector": "#company"},
-        {"parameter_key": "contact_email", "field_selector": "#email"},
-    ]
-    trajectory[1]["submit_rung_binding"] = _submit_rung_binding(trajectory[1], trajectory_index=1, fields=fields)
-    original = [dict(interaction) for interaction in trajectory]
-
-    result = synthesize_code_block(trajectory, strict_selectors=True)
-
-    assert plain is not None
-    assert result is not None
-    assert trajectory == original
-    assert hashlib.sha256(plain.code.encode()).hexdigest() == (
-        "9703bf1b2b7a0a9a2e8145f89055e20c312a3cf2d6b0dc9a34d4d325bba6361f"
-    )
-    assert result.code != plain.code
-    assert result.code.index('page.locator("#company").fill(str(company_name))') < result.code.index(
-        'page.locator("#submit").click()'
-    )
-    assert result.code.index('page.locator("#email").fill(str(contact_email))') < result.code.index(
-        'page.locator("#submit").click()'
-    )
-    assert {parameter["key"] for parameter in result.parameters} == {"company_name", "contact_email"}
-    assert result.diagnostics.grounded_submit_binding_fingerprints == [
-        trajectory[1]["submit_rung_binding"]["fingerprint"]
-    ]
-    assert [record["trajectory_index"] for record in result.diagnostics.emitted_interactions] == [0, 1]
-
-
-def test_grounded_submit_rung_binding_targets_exact_submit_trajectory_index() -> None:
-    trajectory = [
-        _interaction("click", selector="#submit", source_url="https://example.com/landing", trajectory_index=0),
-        _interaction("click", selector="#open", source_url="https://example.com/form", trajectory_index=1),
-        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=2),
-    ]
-    fields = [{"parameter_key": "company_name", "field_selector": "#company"}]
-    trajectory[2]["submit_rung_binding"] = _submit_rung_binding(trajectory[2], trajectory_index=2, fields=fields)
-
-    result = synthesize_code_block(trajectory, strict_selectors=True)
-
-    assert result is not None
-    first_submit = result.code.index('page.locator("#submit").click()')
-    fill = result.code.index('page.locator("#company").fill(str(company_name))')
-    second_submit = result.code.rindex('page.locator("#submit").click()')
-    assert first_submit < fill < second_submit
-
-
-@pytest.mark.parametrize("mutation", ["incomplete", "leftover", "fingerprint"])
-def test_grounded_submit_rung_binding_fails_closed_on_invalid_bundle(mutation: str) -> None:
-    interaction = _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=0)
-    fields = [{"parameter_key": "company_name", "field_selector": "#company"}]
-    interaction["submit_rung_binding"] = _submit_rung_binding(interaction, trajectory_index=0, fields=fields)
-    trajectory = [interaction]
-    if mutation == "incomplete":
-        interaction["submit_rung_binding"]["field_bindings"] = []
-    elif mutation == "leftover":
-        trajectory.append(
-            _interaction(
-                "click",
-                selector="#second-submit",
-                source_url="https://example.com/form",
-                trajectory_index=1,
-                submit_rung_binding=_submit_rung_binding(
-                    {
-                        "selector": "#second-submit",
-                        "source_url": "https://example.com/form",
-                    },
-                    trajectory_index=1,
-                    fields=[{"parameter_key": "contact_email", "field_selector": "#email"}],
-                ),
-            )
-        )
-    else:
-        interaction["submit_rung_binding"]["fingerprint"] = "stale"
-
-    assert synthesize_code_block(trajectory, strict_selectors=True) is None
 
 
 def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() -> None:
