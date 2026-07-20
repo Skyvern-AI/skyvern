@@ -68,7 +68,7 @@ def test_completion_criteria_set_keeps_list_storage_shape() -> None:
 
 def test_v1_fixture_criteria_payload_matches_custody_md5() -> None:
     data = _load_v1_row_data()
-    payload_md5 = hashlib.md5(json.dumps(data["criteria"]).encode()).hexdigest()
+    payload_md5 = hashlib.md5(json.dumps(data["criteria"]).encode(), usedforsecurity=False).hexdigest()
     assert payload_md5 == _V1_CRITERIA_PAYLOAD_MD5
 
 
