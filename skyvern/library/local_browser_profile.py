@@ -349,7 +349,9 @@ def _wait_for_process_with_budget(
 
     if process.poll() is None:
         try:
-            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            # SIGKILL is asynchronous. Keep the work deadline bounded, but allow the
+            # configured stop reserve to reap the child before returning to the caller.
+            process.wait(timeout=max(stop_reserve, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             return None
     return None
