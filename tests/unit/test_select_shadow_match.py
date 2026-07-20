@@ -21,7 +21,9 @@ _SHADOW_OPTION = {
 
 
 def _shadow_task() -> SimpleNamespace:
-    return SimpleNamespace(navigation_goal="goal", navigation_payload={}, llm_key=None, organization_id=None)
+    return SimpleNamespace(
+        navigation_goal="goal", navigation_payload={}, llm_key=None, organization_id=None, workflow_permanent_id=None
+    )
 
 
 class _FakeSelectLocator:
@@ -79,7 +81,9 @@ async def _run_normal_select_with_shadow_log(
             results = await handler.normal_select(
                 action=action,
                 skyvern_element=_FakeSelectElement(options),
-                task=SimpleNamespace(navigation_goal="goal", navigation_payload={}, organization_id=None),
+                task=SimpleNamespace(
+                    navigation_goal="goal", navigation_payload={}, organization_id=None, workflow_permanent_id=None
+                ),
                 step=SimpleNamespace(step_id="step-1"),
                 builder=SimpleNamespace(),
             )
@@ -1000,7 +1004,12 @@ async def test_emerging_select_allows_input_text_on_anchor_element(
         ],
     )
     task = SimpleNamespace(
-        navigation_goal="goal", navigation_payload={}, llm_key=None, workflow_run_id=None, organization_id=None
+        navigation_goal="goal",
+        navigation_payload={},
+        llm_key=None,
+        workflow_run_id=None,
+        organization_id=None,
+        workflow_permanent_id=None,
     )
     with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
         result = await handler.select_from_emerging_elements(
@@ -1187,6 +1196,7 @@ _OUTCOME_TASK = SimpleNamespace(
     navigation_goal="goal",
     navigation_payload={},
     llm_key=None,
+    workflow_permanent_id=None,
 )
 
 
