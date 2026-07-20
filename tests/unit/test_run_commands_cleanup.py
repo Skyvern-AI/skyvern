@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import shutil
 import threading
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
 from skyvern.cli import run_commands
+from skyvern.library import local_browser_profile
 
 
 @pytest.fixture(autouse=True)
@@ -52,29 +53,35 @@ async def test_cleanup_mcp_resources_closes_auth_db_on_skyvern_close_error(monke
     close_auth_db.assert_awaited_once()
 
 
-def test_cleanup_mcp_resources_sync_skips_threaded_cleanup_for_local_browser(
+@pytest.mark.parametrize("deleted", [True, False], ids=["deleted", "deferred"])
+def test_cleanup_mcp_resources_sync_routes_owned_profile_through_shared_cleanup(
     monkeypatch: pytest.MonkeyPatch,
+    deleted: bool,
 ) -> None:
     cleanup = AsyncMock()
-    fallback = MagicMock()
-    rmtree = MagicMock()
+    profile = MagicMock(name="profile")
+    profile_cleanup = MagicMock(return_value=deleted)
+    terminate = MagicMock()
+    rmtree = MagicMock(side_effect=AssertionError("run_commands must not delete profiles directly"))
     thread = MagicMock()
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(
         run_commands,
         "_current_local_browser_identity",
-        lambda: (40101, "/tmp/skyvern-browser-owned", True),
+        lambda: ("/tmp/skyvern-browser-owned", True, profile),
     )
-    monkeypatch.setattr(run_commands, "_kill_local_browser_process_tree", fallback)
-    monkeypatch.setattr(run_commands.shutil, "rmtree", rmtree)
+    monkeypatch.setattr(local_browser_profile, "cleanup_local_browser_profile", profile_cleanup)
+    monkeypatch.setattr(local_browser_profile, "terminate_local_browser_processes", terminate)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
     monkeypatch.setattr(run_commands.threading, "Thread", thread)
 
     run_commands._cleanup_mcp_resources_sync()
 
     cleanup.assert_not_awaited()
     thread.assert_not_called()
-    fallback.assert_called_once_with(40101, "/tmp/skyvern-browser-owned")
-    rmtree.assert_called_once_with("/tmp/skyvern-browser-owned", ignore_errors=True)
+    profile_cleanup.assert_called_once_with(profile)
+    terminate.assert_not_called()
+    rmtree.assert_not_called()
     assert run_commands._mcp_cleanup_done is True
 
 
@@ -129,23 +136,30 @@ def test_cleanup_mcp_resources_blocking_ignores_reentrant_call(monkeypatch: pyte
     cleanup.assert_awaited_once_with()
 
 
-def test_cleanup_mcp_resources_sync_preserves_explicit_user_data_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("terminated", [True, False], ids=["terminated", "termination_deferred"])
+def test_cleanup_mcp_resources_sync_preserves_explicit_user_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    terminated: bool,
+) -> None:
     cleanup = AsyncMock()
-    fallback = MagicMock()
-    rmtree = MagicMock()
+    profile_cleanup = MagicMock()
+    terminate = MagicMock(return_value=terminated)
+    rmtree = MagicMock(side_effect=AssertionError("explicit user data must not be deleted"))
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(
         run_commands,
         "_current_local_browser_identity",
-        lambda: (40101, "/tmp/skyvern-browser-explicit", False),
+        lambda: ("/tmp/skyvern-browser-explicit", False, None),
     )
-    monkeypatch.setattr(run_commands, "_kill_local_browser_process_tree", fallback)
-    monkeypatch.setattr(run_commands.shutil, "rmtree", rmtree)
+    monkeypatch.setattr(local_browser_profile, "cleanup_local_browser_profile", profile_cleanup)
+    monkeypatch.setattr(local_browser_profile, "terminate_local_browser_processes", terminate)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
 
     run_commands._cleanup_mcp_resources_sync()
 
     cleanup.assert_not_awaited()
-    fallback.assert_called_once_with(40101, "/tmp/skyvern-browser-explicit")
+    profile_cleanup.assert_not_called()
+    terminate.assert_called_once_with("/tmp/skyvern-browser-explicit")
     rmtree.assert_not_called()
 
 
@@ -168,15 +182,28 @@ def test_stdin_eof_watcher_allows_native_clean_return(monkeypatch: pytest.Monkey
     force_exit.assert_not_called()
 
 
-def test_stdin_eof_watcher_force_exits_after_bounded_local_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("deleted", [True, False], ids=["deleted", "deferred"])
+def test_stdin_eof_watcher_force_exits_after_shared_profile_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    deleted: bool,
+) -> None:
+    events: list[str] = []
     poller = MagicMock()
     poller.poll.return_value = [(123, run_commands.select.POLLHUP)]
+    profile = MagicMock(name="profile")
+    profile_cleanup = MagicMock(side_effect=lambda _profile: events.append("cleanup") or deleted)
+    terminate = MagicMock()
+    rmtree = MagicMock(side_effect=AssertionError("run_commands must not delete profiles directly"))
+    force_exit = MagicMock(side_effect=lambda _code: events.append("exit"))
     monkeypatch.setattr(run_commands.select, "poll", lambda: poller)
-    monkeypatch.setattr(run_commands, "_current_local_browser_identity", lambda: (40101, "/tmp/owned", True))
-    fallback, force_exit = MagicMock(), MagicMock()
-    rmtree = MagicMock()
-    monkeypatch.setattr(run_commands, "_kill_local_browser_process_tree", fallback)
-    monkeypatch.setattr(run_commands.shutil, "rmtree", rmtree)
+    monkeypatch.setattr(
+        run_commands,
+        "_current_local_browser_identity",
+        lambda: ("/tmp/owned", True, profile),
+    )
+    monkeypatch.setattr(local_browser_profile, "cleanup_local_browser_profile", profile_cleanup)
+    monkeypatch.setattr(local_browser_profile, "terminate_local_browser_processes", terminate)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
 
     run_commands._watch_stdin_eof(
         threading.Event(),
@@ -188,49 +215,21 @@ def test_stdin_eof_watcher_force_exits_after_bounded_local_fallback(monkeypatch:
         shutdown_timeout=0,
     )
 
-    fallback.assert_called_once_with(40101, "/tmp/owned")
-    rmtree.assert_called_once_with("/tmp/owned", ignore_errors=True)
+    profile_cleanup.assert_called_once_with(profile)
+    terminate.assert_not_called()
+    rmtree.assert_not_called()
     force_exit.assert_called_once_with(0)
+    assert events == ["cleanup", "exit"]
     assert run_commands._mcp_eof_shutdown_requested is True
-
-
-def test_local_browser_process_matching_is_scoped_to_instance(monkeypatch: pytest.MonkeyPatch) -> None:
-    unreadable = SimpleNamespace(pid=10, info=None)
-    matching_dir = SimpleNamespace(pid=11, info={"cmdline": ["chrome", "--user-data-dir=/tmp/owned"]})
-    unrelated = SimpleNamespace(pid=12, info={"cmdline": ["chrome", "--user-data-dir=/tmp/other"]})
-    get_pids_on_port = MagicMock(side_effect=AssertionError("port-only matching is unsafe"))
-    monkeypatch.setattr(run_commands, "get_pids_on_port", get_pids_on_port)
-    monkeypatch.setattr(run_commands.psutil, "process_iter", lambda _attrs: [unreadable, matching_dir, unrelated])
-
-    assert {process.pid for process in run_commands._find_local_browser_processes(40101, "/tmp/owned")} == {11}
-    assert run_commands._find_local_browser_processes(40101, None) == []
-    get_pids_on_port.assert_not_called()
 
 
 def test_mcp_eof_shutdown_ceiling_exceeds_worst_case_cleanup() -> None:
     # The EOF watcher's os._exit(0) preempts cleanup unconditionally, so this must cover the cloud path.
     assert run_commands._MCP_EOF_SHUTDOWN_TIMEOUT_SECONDS > (
-        run_commands._MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS + run_commands._MCP_PROCESS_KILL_TIMEOUT_SECONDS
+        run_commands._MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS
+        + local_browser_profile.PROCESS_KILL_TIMEOUT_SECONDS
+        + local_browser_profile.PROFILE_DELETE_TIMEOUT_SECONDS
     )
-
-
-def test_local_browser_fallback_kills_only_matching_process_tree(monkeypatch: pytest.MonkeyPatch) -> None:
-    child = MagicMock(pid=20)
-    root = MagicMock(pid=10)
-    captured_before_graceful_close = MagicMock(pid=30)
-    root.children.return_value = [child]
-    monkeypatch.setattr(run_commands, "_find_local_browser_processes", lambda _port, _dir: [root])
-    wait_procs = MagicMock(return_value=([], []))
-    monkeypatch.setattr(run_commands.psutil, "wait_procs", wait_procs)
-
-    run_commands._kill_local_browser_process_tree(
-        40101, "/tmp/skyvern-browser-owned", known_processes=[captured_before_graceful_close]
-    )
-
-    root.kill.assert_called_once_with()
-    child.kill.assert_called_once_with()
-    captured_before_graceful_close.kill.assert_called_once_with()
-    wait_procs.assert_called_once()
 
 
 @pytest.mark.parametrize(
