@@ -103,7 +103,10 @@ class ScriptSkyvernPage(SkyvernPage):
             else:
                 raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
         else:
-            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script(browser_session_id=browser_session_id)
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script(
+                script_id=context.script_id if context else None,
+                browser_session_id=browser_session_id,
+            )
         return browser_state
 
     @classmethod
@@ -139,7 +142,6 @@ class ScriptSkyvernPage(SkyvernPage):
         url: str | None = None,
     ) -> ScrapedPage:
         # initialize browser state
-        # TODO: add workflow_run_id or eventually script_id/script_run_id
         browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id, url=url)
         return await browser_state.scrape_website(
             url="",

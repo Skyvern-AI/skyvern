@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
 from pathlib import Path
+from typing import cast
 
 import structlog
 from playwright._impl._errors import TargetClosedError
@@ -409,7 +410,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             launch_proxy_location = session.proxy_location if session.proxy_location is not None else proxy_location
             extra_http_headers = app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(session.proxy_session_id)
 
-            browser_state = await RealBrowserManager._create_browser_state(
+            browser_state = await cast(RealBrowserManager, app.BROWSER_MANAGER)._create_browser_state(
                 proxy_location=launch_proxy_location,
                 url=url,
                 organization_id=organization_id,
