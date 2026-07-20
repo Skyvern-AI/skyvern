@@ -1490,11 +1490,19 @@ async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -
     if not experimentation_provider:
         return _CollapseGateResult(False, None, False)
     try:
+        # task.workflow_permanent_id is None on most fetch paths; fall back to context (SKY-8992).
+        context = skyvern_context.current()
+        workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
+        # PostHog local evaluation cannot match exclusions when the property is absent.
+        properties = {
+            "organization_id": organization_id,
+            "workflow_permanent_id": workflow_permanent_id or "",
+        }
         family_enabled = bool(
             await experimentation_provider.is_feature_enabled_cached(
                 family_flag,
                 organization_id,
-                properties={"organization_id": organization_id},
+                properties=properties,
             )
         )
         if not family_enabled:
