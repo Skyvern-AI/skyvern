@@ -211,17 +211,6 @@ class ScoutedInputCorrespondence(TypedDict):
     position: int
 
 
-class ScoutedFieldParameterBinding(TypedDict):
-    parameter_key: str
-    field_selector: str
-
-
-class ScoutedSubmitRungBinding(TypedDict):
-    repeated_structural_key: str
-    fingerprint: str
-    field_bindings: list[ScoutedFieldParameterBinding]
-
-
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
@@ -247,9 +236,6 @@ class ScoutedInteraction(TypedDict):
     # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
     # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
     ambiguous: NotRequired[bool]
-    # Value-free, current-page binding attached only to the exact captured submit rung on a derived trajectory.
-    # The source trajectory remains unchanged; synthesis consumes the fingerprint all-or-nothing.
-    submit_rung_binding: NotRequired[ScoutedSubmitRungBinding]
     # Credential fills carry references and metadata only — never secret values.
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
