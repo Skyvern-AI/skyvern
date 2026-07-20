@@ -13,10 +13,11 @@ browsers shared across parent/child runs) must NOT have their driver stopped.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
+from skyvern.exceptions import MissingBrowserStateForBrowserSession, MissingOrganizationForBrowserSession
 from skyvern.webeye import browser_engine
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_engine import (
@@ -264,8 +265,8 @@ async def test_cleanup_for_workflow_run_keeps_driver_while_shared() -> None:
 
     # Both the workflow-run-level close and the task-level close observe the
     # parent's surviving reference and must not release the shared driver.
-    for call in state.close.await_args_list:
-        assert call.kwargs["release_driver"] is False
+    for close_call in state.close.await_args_list:
+        assert close_call.kwargs["release_driver"] is False
     assert "wr_parent" in manager.pages
 
 
@@ -897,6 +898,417 @@ async def test_acquirer_cancelled_while_waiting_out_terminal_owner(_restore_reso
             *[t for t in (first, drop, acquirer, owner1_task) if t is not None], return_exceptions=True
         )
     assert "wr_1" not in manager._engine_owners  # owner1 reaped once its resolver finished
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_reclaims_page_and_owner_to_baseline(_restore_resolver: None) -> None:
+    # MUST_FIX 2: many distinct script ids populate pages + engine owners; terminal cleanup of each
+    # must return both maps to baseline. Cleanup is idempotent (a second call is a harmless no-op).
+    manager = RealBrowserManager()
+    script_ids = [f"scr_{i}" for i in range(25)]
+    for sid in script_ids:
+        await _seed_engine_owner(manager, sid, "engine-1")
+        manager.pages[sid] = _fake_browser_state()
+    assert len(manager._engine_owners) == len(script_ids)
+    assert len(manager.pages) == len(script_ids)
+
+    for sid in script_ids:
+        await manager.cleanup_for_script(sid, close_browser_on_completion=False)
+    assert await manager.cleanup_for_script(script_ids[0], close_browser_on_completion=False) is None
+
+    assert manager._engine_owners == {}
+    assert manager.pages == {}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_releases_persistent_session_without_closing_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["scr_1"] = state
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    # Production default close_browser_on_completion=True: a persistent session is still only released.
+    await manager.cleanup_for_script(
+        "scr_1", close_browser_on_completion=True, browser_session_id="session_1", organization_id="org_1"
+    )
+
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    assert "scr_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_stops_tracing_before_browser_close(tmp_path) -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    state.browser_context = MagicMock()
+    state.browser_context.tracing.stop = AsyncMock()
+    state.browser_artifacts = BrowserArtifacts(traces_dir=str(tmp_path))
+    manager.pages["scr_1"] = state
+    calls = MagicMock()
+    calls.attach_mock(state.browser_context.tracing.stop, "stop_tracing")
+    calls.attach_mock(state.close, "close")
+
+    await manager.cleanup_for_script("scr_1")
+
+    state.browser_context.tracing.stop.assert_awaited_once_with(path=f"{tmp_path}/scr_1.zip")
+    state.close.assert_awaited_once()
+    assert calls.method_calls == [
+        call.stop_tracing(path=f"{tmp_path}/scr_1.zip"),
+        call.close(close_browser_on_completion=True, release_driver=None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_tracing_failure_does_not_skip_close_or_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    state.browser_context = MagicMock()
+    state.browser_context.tracing.stop = AsyncMock(side_effect=RuntimeError("trace boom"))
+    state.browser_artifacts = BrowserArtifacts(traces_dir=str(tmp_path))
+    manager.pages["scr_1"] = state
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    await manager.cleanup_for_script("scr_1", browser_session_id="session_1", organization_id="org_1")
+
+    # Persistent session: close is forced reusable (False) even though the default is True.
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_warns_when_session_has_no_organization(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RealBrowserManager()
+    log = MagicMock()
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.LOG", log)
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    await manager.cleanup_for_script("scr_1", browser_session_id="session_1")
+
+    log.warning.assert_called_once_with(
+        "Organization ID not specified, cannot release browser session", script_id="scr_1"
+    )
+    sessions.release_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_swallows_persistent_session_release_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # MF3: cleanup is best-effort ("errors are logged, not raised"). A persistent-session release
+    # failure must be caught and logged so it cannot escape run_script's finally and mask the script's
+    # own exception. Cleanup still reclaims the page.
+    manager = RealBrowserManager()
+    manager.pages["scr_1"] = _fake_browser_state()
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(side_effect=RuntimeError("release boom"))
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    result = await manager.cleanup_for_script(
+        "scr_1", close_browser_on_completion=False, browser_session_id="session_1", organization_id="org_1"
+    )
+
+    sessions.release_browser_session.assert_awaited_once()
+    assert "scr_1" not in manager.pages
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_for_script_uses_real_org_for_persistent_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    # MF2: acquisition looks the session up under the REAL organization_id (the symmetric key release uses),
+    # never script_id (a definition id) which would generally miss the org-scoped lookup.
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    state.get_working_page = AsyncMock(return_value=MagicMock())
+    state.get_or_create_page = AsyncMock()
+    sessions = MagicMock()
+    sessions.get_browser_state = AsyncMock(return_value=state)
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+    result = await manager.get_or_create_for_script("scr_1", "session_1", "org_1")
+    sessions.get_browser_state.assert_awaited_once_with("session_1", organization_id="org_1")
+    assert result is state and manager.pages["scr_1"] is state
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_for_script_fails_closed_without_org(monkeypatch: pytest.MonkeyPatch) -> None:
+    # MF2: a session requested without an org identity fails closed — never look up under script_id nor
+    # silently create an unrelated non-persistent browser.
+    manager = RealBrowserManager()
+    sessions = MagicMock()
+    sessions.get_browser_state = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+    created = AsyncMock()
+    monkeypatch.setattr(manager, "_create_browser_state", created)
+    with pytest.raises(MissingOrganizationForBrowserSession):
+        await manager.get_or_create_for_script(script_id="scr_1", browser_session_id="session_1")
+    sessions.get_browser_state.assert_not_awaited()
+    created.assert_not_awaited()
+    assert "scr_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_for_script_fails_closed_on_cold_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A requested browser session whose persistent state is cold/evicted (get_browser_state -> None) must
+    # fail closed, NOT silently fall back to an unregistered local browser: cleanup would misclassify that
+    # fallback as a reusable persistent session (browser_session_id truthy) and leak its context/driver.
+    manager = RealBrowserManager()
+    sessions = MagicMock()
+    sessions.get_browser_state = AsyncMock(return_value=None)
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+    fallback = _fake_browser_state()
+    fallback.get_or_create_page = AsyncMock()
+    created = AsyncMock(return_value=fallback)
+    monkeypatch.setattr(manager, "_create_browser_state", created)
+
+    with pytest.raises(MissingBrowserStateForBrowserSession):
+        await manager.get_or_create_for_script(
+            script_id="scr_1", browser_session_id="session_1", organization_id="org_1"
+        )
+
+    sessions.get_browser_state.assert_awaited_once_with("session_1", organization_id="org_1")
+    created.assert_not_awaited()  # no orphan local browser created
+    assert "scr_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_contains_drop_engine_owner_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # MF3: an ordinary _drop_engine_owner failure is contained so page pop/close cleanup is still attempted.
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["scr_1"] = state
+    monkeypatch.setattr(manager, "_drop_engine_owner", AsyncMock(side_effect=RuntimeError("owner boom")))
+    result = await manager.cleanup_for_script("scr_1")  # must not raise
+    state.close.assert_awaited_once()
+    assert "scr_1" not in manager.pages and result is state
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_reclaims_page_when_cancelled_mid_drop(_restore_resolver: None) -> None:
+    # A terminal run cancelled while cleanup awaits the in-flight engine owner must STILL reclaim the page
+    # (pop + close) before the cancellation surfaces — a cancelled terminal run cannot leak the browser it
+    # was reclaiming — and the caller's own cancellation must stay native (re-raised, not swallowed).
+    started = asyncio.Event()
+    release = asyncio.Event()
+    suppressed = asyncio.Event()
+
+    async def gated_suppressing_resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            suppressed.set()  # absorbed _drop_engine_owner's cancel; stay alive so cleanup parks on shield
+            await release.wait()
+        return _fake_selection("engine-1")
+
+    browser_engine.set_browser_engine_resolver(gated_suppressing_resolver)
+    manager = RealBrowserManager()
+    ctx = BrowserEngineContext(workflow_run_id="scr_1", browser_source="local-browser")
+    state = _fake_browser_state()
+
+    first: asyncio.Future | None = None
+    cleanup: asyncio.Future | None = None
+    owner_task: asyncio.Task | None = None
+    try:
+        first = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="scr_1", context=ctx))
+        await started.wait()  # resolver #1 is running (the in-flight owner)
+        owner_task = manager._engine_owners["scr_1"].task
+        manager.pages["scr_1"] = state
+
+        cleanup = asyncio.ensure_future(manager.cleanup_for_script("scr_1", close_browser_on_completion=False))
+        await asyncio.wait_for(suppressed.wait(), timeout=5.0)  # cleanup is parked inside _drop_engine_owner
+
+        cleanup.cancel()  # externally cancel the terminal cleanup itself
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup  # our own cancellation propagates, not swallowed into a successful cleanup
+
+        assert "scr_1" not in manager.pages  # page reclaimed despite the cancel
+        state.close.assert_awaited_once()  # browser closed, not leaked
+    finally:
+        release.set()
+        for task in (first, cleanup, owner_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in (first, cleanup, owner_task) if t is not None], return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_completes_release_when_cancelled_during_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A caller cancellation (shutdown/timeout) arriving while the browser close is in-flight must not skip
+    # the persistent-session release: the whole page/trace/close/release reclamation is shielded so it runs
+    # to completion, then the cancellation re-raises natively.
+    manager = RealBrowserManager()
+    in_close = asyncio.Event()
+    finish_close = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def slow_close(**_kwargs: object) -> None:
+        in_close.set()
+        await finish_close.wait()
+        closed.set()
+
+    state = _fake_browser_state()
+    state.close = AsyncMock(side_effect=slow_close)
+    manager.pages["scr_1"] = state
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    cleanup = asyncio.ensure_future(
+        manager.cleanup_for_script("scr_1", browser_session_id="session_1", organization_id="org_1")
+    )
+    await in_close.wait()  # reclamation is parked inside close()
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    finish_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup  # cancellation stays native
+
+    assert closed.is_set()  # close ran to completion despite the cancel
+    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")  # release too
+    assert "scr_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_completes_when_cancelled_during_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cancellation arriving during the final persistent-session release must still let that release finish;
+    # the shielded reclamation completes before the native cancellation propagates.
+    manager = RealBrowserManager()
+    in_release = asyncio.Event()
+    finish_release = asyncio.Event()
+    released = asyncio.Event()
+
+    async def slow_release(*_a: object, **_k: object) -> None:
+        in_release.set()
+        await finish_release.wait()
+        released.set()
+
+    state = _fake_browser_state()
+    manager.pages["scr_1"] = state
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(side_effect=slow_release)
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    cleanup = asyncio.ensure_future(
+        manager.cleanup_for_script("scr_1", browser_session_id="session_1", organization_id="org_1")
+    )
+    await in_release.wait()
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    finish_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+
+    assert released.is_set()  # release ran to completion despite the cancel
+    state.close.assert_awaited_once()  # close happened before the release
+    assert "scr_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Repeated caller cancellation (e.g. a shutdown that re-cancels) must not cancel the shielded
+    # reclamation while it is being drained: close and release still complete, the task is not leaked, and
+    # the FIRST native cancellation is preserved for re-raise.
+    manager = RealBrowserManager()
+    in_close = asyncio.Event()
+    finish_close = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def slow_close(**_kwargs: object) -> None:
+        in_close.set()
+        await finish_close.wait()
+        closed.set()
+
+    state = _fake_browser_state()
+    state.close = AsyncMock(side_effect=slow_close)
+    manager.pages["scr_1"] = state
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
+
+    cleanup = asyncio.ensure_future(
+        manager.cleanup_for_script("scr_1", browser_session_id="session_1", organization_id="org_1")
+    )
+    await in_close.wait()
+    cleanup.cancel("first cancellation")  # outer shield raises; cleanup enters the drain
+    await asyncio.sleep(0)
+    cleanup.cancel("second cancellation")  # must NOT cancel the shielded reclamation
+    await asyncio.sleep(0)
+    finish_close.set()
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await cleanup
+
+    assert exc_info.value.args == ("first cancellation",)
+    assert closed.is_set()  # close ran to completion despite two cancels
+    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    assert "scr_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_with_waiters_ends_deterministically(_restore_resolver: None) -> None:
+    # Cleanup while several waiters are blocked on the shared resolution must end deterministically:
+    # every waiter is cancelled and no owner/task is left behind.
+    gate = asyncio.Event()
+
+    async def gated_resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        await gate.wait()
+        return _fake_selection("engine-1")
+
+    browser_engine.set_browser_engine_resolver(gated_resolver)
+    manager = RealBrowserManager()
+    ctx = BrowserEngineContext(workflow_run_id="wr_1", browser_source="local-browser")
+
+    waiters = [
+        asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx)) for _ in range(3)
+    ]
+    await asyncio.sleep(0)  # all waiters attach to the shared owner task
+    await manager._drop_engine_owner("wr_1")  # terminal cleanup with waiters still blocked
+    results = await asyncio.gather(*waiters, return_exceptions=True)
+    assert all(isinstance(r, asyncio.CancelledError) for r in results)
+    assert manager._engine_owners == {}
+    gate.set()
+
+
+@pytest.mark.asyncio
+async def test_different_keys_resolve_concurrently(_restore_resolver: None) -> None:
+    # Prove overlapping in-flight resolution: both keys enter the resolver before either is released.
+    started = {"a": asyncio.Event(), "b": asyncio.Event()}
+    release = asyncio.Event()
+
+    async def resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        key = ctx.workflow_run_id or ""
+        started[key].set()
+        await release.wait()
+        return _fake_selection(f"engine-{key}")
+
+    browser_engine.set_browser_engine_resolver(resolver)
+    manager = RealBrowserManager()
+    a = asyncio.ensure_future(
+        manager.get_or_resolve_engine_selection(
+            run_key="a", context=BrowserEngineContext(workflow_run_id="a", browser_source="local-browser")
+        )
+    )
+    b = asyncio.ensure_future(
+        manager.get_or_resolve_engine_selection(
+            run_key="b", context=BrowserEngineContext(workflow_run_id="b", browser_source="local-browser")
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(started["a"].wait(), started["b"].wait()), timeout=1)
+    release.set()
+    ra, rb = await asyncio.gather(a, b)
+    assert ra.name == "engine-a"
+    assert rb.name == "engine-b"
 
 
 def _coro(value: BrowserEngineSelection):
