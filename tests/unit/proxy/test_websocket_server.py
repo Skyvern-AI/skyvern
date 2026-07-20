@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
+import signal
+import socket
 from types import SimpleNamespace
 from typing import Mapping
 
 import pytest
+from websockets import exceptions as websockets_exceptions
+from websockets.asyncio import client as websockets_client
 from websockets.datastructures import Headers
 
 from skyvern.proxy.adapters.memory import (
@@ -365,3 +372,132 @@ async def test_session_is_resolved_once_per_connection_not_per_message() -> None
     await make_server(upstream, counting)._handle_client(ws)  # type: ignore[arg-type]
 
     assert counting.resolve_calls == 1
+
+
+# ---- serve_forever lifecycle: health endpoint + signal drain ----------------
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def _wait_for_listener(port: int, *, up: bool, attempts: int = 500) -> None:
+    for _ in range(attempts):
+        try:
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            if not up:
+                return
+        else:
+            writer.close()
+            if up:
+                return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"listener on port {port} never became {'reachable' if up else 'refused'}")
+
+
+async def _http_get(port: int, path: str) -> tuple[int, bytes]:
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode())
+    await writer.drain()
+    raw = await reader.read(-1)
+    writer.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), body
+
+
+def _lifecycle_server(port: int) -> CdpProxyServer:
+    sessions = InMemorySessionRegistry()
+    sessions.put(make_resolved_session())
+    return CdpProxyServer(
+        upstream=RecordingUpstreamBrowser(),
+        sessions=sessions,
+        auth=AllowAllAuth(),
+        metrics=NoOpMetrics(),
+        event_policy=ForwardAllEventPolicy(),
+        host="127.0.0.1",
+        port=port,
+    )
+
+
+@pytest.mark.asyncio
+async def test_serve_forever_healthz_and_sigterm_drain() -> None:
+    port = _free_port()
+    task = asyncio.create_task(_lifecycle_server(port).serve_forever())
+    try:
+        await _wait_for_listener(port, up=True)
+        status, body = await _http_get(port, "/healthz")
+        assert (status, body) == (200, b"ok")
+
+        async with websockets_client.connect(f"ws://127.0.0.1:{port}/s1") as client:
+            await client.ping()
+            os.kill(os.getpid(), signal.SIGTERM)
+            # Drain: the listener refuses new work while the live relay survives.
+            await _wait_for_listener(port, up=False)
+            await client.ping()
+        await asyncio.wait_for(task, timeout=10)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_serve_forever_force_closes_stragglers_after_drain_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CDP_PROXY_DRAIN_TIMEOUT_SECONDS", "1")
+    port = _free_port()
+    task = asyncio.create_task(_lifecycle_server(port).serve_forever())
+    client = None
+    try:
+        await _wait_for_listener(port, up=True)
+        client = await websockets_client.connect(f"ws://127.0.0.1:{port}/s1")
+        os.kill(os.getpid(), signal.SIGTERM)
+
+        # The straggler never closes; the drain budget expires and the server
+        # exits anyway, closing the client with a clean 1001 instead of a RST.
+        await asyncio.wait_for(task, timeout=10)
+        with pytest.raises(websockets_exceptions.ConnectionClosed):
+            await asyncio.wait_for(client.recv(), timeout=5)
+        assert client.protocol.close_code == 1001
+    finally:
+        if client is not None:
+            await client.close()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_second_signal_during_drain_force_closes_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Drain budget is huge on purpose: only the second signal can end the wait,
+    # so a fast completion proves the fast-exit path rather than the timeout.
+    monkeypatch.setenv("CDP_PROXY_DRAIN_TIMEOUT_SECONDS", "3600")
+    port = _free_port()
+    task = asyncio.create_task(_lifecycle_server(port).serve_forever())
+    client = None
+    try:
+        await _wait_for_listener(port, up=True)
+        client = await websockets_client.connect(f"ws://127.0.0.1:{port}/s1")
+        os.kill(os.getpid(), signal.SIGTERM)
+        await _wait_for_listener(port, up=False)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+        await asyncio.wait_for(task, timeout=10)
+        with pytest.raises(websockets_exceptions.ConnectionClosed):
+            await asyncio.wait_for(client.recv(), timeout=5)
+        assert client.protocol.close_code == 1001
+    finally:
+        if client is not None:
+            await client.close()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

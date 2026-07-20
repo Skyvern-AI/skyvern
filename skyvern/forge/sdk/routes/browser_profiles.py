@@ -31,6 +31,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
+    BrowserProfileUsage,
     CreateBrowserProfileRequest,
     UpdateBrowserProfileRequest,
 )
@@ -310,6 +311,57 @@ async def get_browser_profile(
     return profile
 
 
+@base_router.get(
+    "/browser_profiles/{profile_id}/usage",
+    response_model=BrowserProfileUsage,
+    tags=["Browser Profiles"],
+    summary="Get browser profile usage",
+    description="List the workflows, credentials, and recent runs that depend on a browser profile.",
+    responses={
+        200: {"description": "Successfully retrieved browser profile usage"},
+        404: {"description": "Browser profile not found"},
+    },
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_browser_profile_usage",
+    },
+)
+@base_router.get(
+    "/browser_profiles/{profile_id}/usage/",
+    response_model=BrowserProfileUsage,
+    include_in_schema=False,
+)
+async def get_browser_profile_usage(
+    profile_id: str = Path(
+        ...,
+        description="The ID of the browser profile. browser_profile_id starts with `bp_`",
+        examples=["bp_123456"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserProfileUsage:
+    """List the workflows, credentials, and recent runs that depend on a browser profile."""
+    organization_id = current_org.organization_id
+    profile = await app.DATABASE.browser_sessions.get_browser_profile(
+        profile_id=profile_id,
+        organization_id=organization_id,
+    )
+    if not profile:
+        raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+
+    usage = await app.DATABASE.browser_sessions.get_browser_profile_usage(
+        profile_id=profile_id,
+        organization_id=organization_id,
+    )
+    LOG.info(
+        "Retrieved browser profile usage",
+        organization_id=organization_id,
+        browser_profile_id=profile_id,
+        workflow_count=len(usage.workflows),
+        credential_count=len(usage.credentials),
+        recent_seeded_run_count=usage.recent_seeded_run_count,
+    )
+    return usage
+
+
 @base_router.patch(
     "/browser_profiles/{profile_id}",
     response_model=BrowserProfile,
@@ -439,7 +491,9 @@ async def delete_browser_profile(
     )
 
     try:
-        await app.DATABASE.browser_sessions.delete_browser_profile(
+        # Soft-delete and credential-detach happen in one transaction (see the repo method), so a dangling
+        # bp id can't survive a mid-failure and 404 the credential's next login.
+        cleared_credential_ids = await app.DATABASE.browser_sessions.delete_browser_profile(
             profile_id=profile_id,
             organization_id=organization_id,
         )
@@ -450,6 +504,14 @@ async def delete_browser_profile(
             browser_profile_id=profile_id,
         )
         raise
+
+    if cleared_credential_ids:
+        LOG.info(
+            "Detached credentials from deleted browser profile",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+            credential_ids=cleared_credential_ids,
+        )
 
     # Reap the stored blob so soft-deleted profiles don't leave orphaned S3 objects behind.
     # Best-effort: the soft-delete already succeeded, so a reap failure must not fail the request.

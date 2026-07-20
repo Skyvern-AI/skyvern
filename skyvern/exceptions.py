@@ -239,6 +239,12 @@ class RepeatedActionFailure(SkyvernException):
         )
 
 
+class SecretInputMismatch(SkyvernException):
+    def __init__(self) -> None:
+        # No secret material in the message: not the value, its length, or its character classes.
+        super().__init__("Secret input read-back mismatch after atomic re-entry.")
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 

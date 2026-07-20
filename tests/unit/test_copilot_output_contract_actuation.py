@@ -43,6 +43,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
+    RequestSlotAntecedentFamily,
     RequestSlotPinability,
     RequestSlotPlane,
 )
@@ -1164,6 +1165,44 @@ def test_steer_only_never_terminals_click_only_and_skips_declick() -> None:
     assert second.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 
 
+def test_value_bearing_reject_uses_steer_only_structure_directive() -> None:
+    signature = "sig_value_bearing_steer"
+    evaluation = _make_evaluation(
+        signature,
+        block_label="collect",
+        shape_violations=["value_bearing_output_required"],
+    )
+    non_steer_ctx = _ladder_ctx()
+
+    inert = wu._adjudicate_output_contract_ladder_after_reject(
+        non_steer_ctx,
+        evaluation,
+        workflow_yaml=_PAGE_READ_YAML,
+        current_fingerprint="value-bearing:fp",
+    )
+
+    assert inert is None
+    assert non_steer_ctx.output_contract_armed_directive_fingerprint_by_signature == {}
+
+    ctx = _ladder_ctx()
+    actuation = wu._adjudicate_output_contract_ladder_after_reject(
+        ctx,
+        evaluation,
+        workflow_yaml=_PAGE_READ_YAML,
+        current_fingerprint="value-bearing:fp",
+        steer_only=True,
+    )
+
+    assert actuation is not None
+    assert actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert ctx.output_contract_armed_directive_fingerprint_by_signature[signature] == "value-bearing:fp"
+    assert ctx.output_contract_actuation_by_signature == {}
+    assert ctx.output_contract_pending_run_evidence == {}
+    assert ctx.output_contract_actuation_count_by_signature == {}
+    assert ctx.output_contract_declick_attempted_by_signature == {}
+    assert ctx.turn_halt is None
+
+
 def test_observed_required_values_exact_and_lineage_match() -> None:
     ctx = SimpleNamespace(scouted_output_covered_paths={"output.order.id"}, composition_page_evidence=None)
     assert wu._observed_required_output_values(ctx, {"output.order.id"}) is True
@@ -1361,6 +1400,49 @@ def test_has_metadata_reject_attaches_no_metadata_convergence_directive(monkeypa
 
     assert payload["output_contract_actuation"] == OutputContractActuationKind.STRUCTURE_DIRECTIVE.value
     assert "metadata_convergence_directive" not in payload
+
+
+def test_synthesized_metadata_less_reject_arms_convergence_directive() -> None:
+    ctx = _ladder_ctx()
+    ctx.turn_id = "turn-synth-metadata-less"
+
+    with capture_logs() as logs:
+        directive = wu._synthesized_metadata_reject_directive(
+            ctx,
+            workflow_yaml=_PAGE_READ_YAML,
+            raw_metadata=[],
+            label_candidates=["collect"],
+            required_paths={"output.confirmation_number"},
+        )
+
+    assert directive is not None
+    assert any(entry["event"] == "copilot_output_contract_spine_structure_directive_emitted" for entry in logs)
+
+
+def test_synthesized_metadata_complete_reject_arms_no_directive() -> None:
+    ctx = _ladder_ctx()
+    ctx.turn_id = "turn-synth-metadata-complete"
+    complete_metadata = [
+        {
+            "block_label": "collect",
+            "declared_goal": "Collect the confirmation number",
+            "claimed_outcomes": ["confirmation captured"],
+            "page_dependencies": ["confirmation page"],
+            "completion_criteria": ["confirmation non-empty"],
+            "terminal_verifier_expectations": ["confirmation rendered"],
+            "evidence_refs": ["scout:confirmation"],
+        }
+    ]
+
+    directive = wu._synthesized_metadata_reject_directive(
+        ctx,
+        workflow_yaml=_PAGE_READ_YAML,
+        raw_metadata=complete_metadata,
+        label_candidates=["collect"],
+        required_paths={"output.confirmation_number"},
+    )
+
+    assert directive is None
 
 
 def test_reject_seam_metadata_required_reaches_advisory_before_no_source_terminal() -> None:
@@ -1739,6 +1821,25 @@ def test_contingent_antecedent_alone_forms_declaration_only_contract() -> None:
     assert contract.union == {"output.blocker"}
 
 
+def test_blocker_family_path_is_declaration_only_for_authoring() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_blocker",
+            outcome="A blocker is reported when the site blocks submission.",
+            output_path="output.blocker",
+            antecedent_family="blocker",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == set()
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.union == {"output.blocker"}
+    assert contract.liveness is wu._OutputContractLiveness.ABSENT
+    assert wu._value_bearing_directive_paths(contract) == {"output"}
+
+
 def test_antecedent_overlapping_requested_output_stays_observation() -> None:
     ctx = _antecedent_ctx(
         CompletionCriterion(
@@ -2026,7 +2127,9 @@ def test_mint_degraded_output_path_leaves_observation_lane() -> None:
     )
 
     assert wu._requested_output_child_paths(ctx) == set()
-    assert wu._output_contract_required_paths_source(ctx).union == set()
+    contract = wu._output_contract_required_paths_source(ctx)
+    assert contract.union == set()
+    assert contract.degraded_request_slots == ()
 
 
 def test_face_c_degraded_mint_preserves_satisfiable_value_bearing_authoring_path() -> None:
@@ -2071,6 +2174,7 @@ def test_canonically_bound_shapeless_valid_criterion_stays_dispatchable() -> Non
         source_end=10,
         plane=RequestSlotPlane.RUN,
         pinability=RequestSlotPinability.SHAPELESS_VALID,
+        antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
     )
     bound = _bind_criterion_to_request_slot(
         CompletionCriterion(

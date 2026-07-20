@@ -254,6 +254,7 @@ class BrowserEngineContext:
     workflow_run_id: str | None = None
     workflow_permanent_id: str | None = None
     task_id: str | None = None
+    script_id: str | None = None
     browser_source: str | None = None
 
 

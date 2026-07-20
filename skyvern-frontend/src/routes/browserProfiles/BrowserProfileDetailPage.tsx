@@ -16,6 +16,7 @@ import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 
 import { DeleteBrowserProfileButton } from "./DeleteBrowserProfileButton";
+import { RefreshBrowserProfileButton } from "./RefreshBrowserProfileButton";
 import { RenameBrowserProfileDialog } from "./RenameBrowserProfileDialog";
 import { useBrowserProfileQuery } from "./hooks/useBrowserProfileQuery";
 import { useUpdateBrowserProfileMutation } from "./hooks/useBrowserProfileMutations";
@@ -115,6 +116,12 @@ function BrowserProfileDetailPage() {
               )}
             </div>
             <div className="flex gap-2">
+              {!profile.deleted_at && (
+                <RefreshBrowserProfileButton
+                  profile={profile}
+                  label="Refresh"
+                />
+              )}
               <Button
                 variant="secondary"
                 onClick={() => setRenameOpen(true)}

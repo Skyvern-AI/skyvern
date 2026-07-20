@@ -10,6 +10,7 @@ from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidL
 from skyvern.forge.sdk.copilot import request_slots as request_slots_module
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
+    RequestSlotAntecedentFamily,
     RequestSlotContractV1,
     RequestSlotDeclarationV1,
     RequestSlotEnvelopeV1,
@@ -60,6 +61,7 @@ def _response(
                 "source_quote": quote,
                 "plane": plane,
                 "pinability": pinability,
+                "antecedent_family": "unconditional",
             }
             for quote, plane, pinability in slots
         ],
@@ -73,9 +75,16 @@ def _envelope(
     return RequestSlotEnvelopeV1.model_validate_json(json.dumps(_response(request, *slots)))
 
 
-def _identity(contract: RequestSlotContractV1) -> tuple[tuple[str, str, str, str], ...]:
+def _identity(contract: RequestSlotContractV1) -> tuple[tuple[str, str, str, str, str], ...]:
     return tuple(
-        (slot.slot_id, slot.canonical_path, slot.plane.value, slot.pinability.value) for slot in contract.slots
+        (
+            slot.slot_id,
+            slot.canonical_path,
+            slot.plane.value,
+            slot.pinability.value,
+            slot.antecedent_family.value,
+        )
+        for slot in contract.slots
     )
 
 
@@ -91,6 +100,7 @@ def test_request_slot_models_are_strict_bounded_and_model_cannot_name_paths() ->
         "source_quote": "public form",
         "plane": "run",
         "pinability": "shapeless_valid",
+        "antecedent_family": "unconditional",
     }
 
     with pytest.raises(ValidationError):
@@ -104,6 +114,10 @@ def test_request_slot_models_are_strict_bounded_and_model_cannot_name_paths() ->
             {key: value for key, value in valid_declaration.items() if key != "pinability"}
         )
     with pytest.raises(ValidationError):
+        RequestSlotDeclarationV1.model_validate(
+            {key: value for key, value in valid_declaration.items() if key != "antecedent_family"}
+        )
+    with pytest.raises(ValidationError):
         RequestSlotDeclarationV1.model_validate({**valid_declaration, "source_id": "latest_request"})
     with pytest.raises(ValidationError):
         RequestSlotDeclarationV1.model_validate({**valid_declaration, "source_quote": ""})
@@ -112,9 +126,11 @@ def test_request_slot_models_are_strict_bounded_and_model_cannot_name_paths() ->
     with pytest.raises(ValidationError):
         RequestSlotDeclarationV1.model_validate({**valid_declaration, "pinability": "maybe"})
     with pytest.raises(ValidationError):
-        RequestSlotSourceV1.model_validate({"source_id": "u1", "order": 0, "text": "Return status."})
+        RequestSlotDeclarationV1.model_validate({**valid_declaration, "antecedent_family": "conditional"})
     with pytest.raises(ValidationError):
-        RequestSlotEnvelopeV1.model_validate({"version": "1", "slots": []})
+        RequestSlotSourceV1.model_validate({"source_id": "u1", "order": 0, "text": "Return status."})
+    empty = RequestSlotEnvelopeV1.model_validate_json('{"version":"1","slots":[]}')
+    assert empty.slots == ()
     with pytest.raises(ValidationError):
         RequestSlotProducerResult.model_validate({"status": "success", "attempts": 1})
 
@@ -219,6 +235,7 @@ def test_canonicalization_derives_server_owned_paths_ids_count_and_source_spans(
         RequestSlotPinability.PINNED,
         RequestSlotPinability.SHAPELESS_VALID,
     ]
+    assert all(slot.antecedent_family == RequestSlotAntecedentFamily.UNCONDITIONAL for slot in contract.slots)
     assert _anchor_texts(request, contract) == ["public form status", "recommended next action"]
     assert contract == RequestSlotContractV1.model_validate(contract.model_dump())
 
@@ -248,6 +265,7 @@ def test_canonicalization_rejects_missing_ambiguous_and_overlapping_anchors(
                         "source_quote": quote,
                         "plane": "run",
                         "pinability": "shapeless_valid",
+                        "antecedent_family": "unconditional",
                     }
                     for quote in quotes
                 ],
@@ -272,6 +290,7 @@ def test_canonicalization_rejects_unknown_source_and_context_only_anchor() -> No
                             "source_quote": source_quote,
                             "plane": "run",
                             "pinability": "shapeless_valid",
+                            "antecedent_family": "unconditional",
                         }
                     ],
                 }
@@ -337,6 +356,43 @@ def test_contract_agreement_detects_membership_that_opaque_identity_does_not_enc
 
     assert _identity(alpha) == _identity(beta)
     assert not request_slot_contracts_agree(alpha, beta)
+
+
+def test_contract_agreement_requires_antecedent_family_consensus() -> None:
+    request = _input(latest_request="Report the blocker if online submission is unavailable.")
+    unconditional_envelope = _envelope(request, ("blocker", "run", "shapeless_valid"))
+    blocker_envelope = unconditional_envelope.model_copy(
+        update={
+            "slots": (
+                unconditional_envelope.slots[0].model_copy(
+                    update={"antecedent_family": RequestSlotAntecedentFamily.BLOCKER}
+                ),
+            )
+        }
+    )
+    unconditional = canonicalize_request_slots(request=request, envelope=unconditional_envelope)
+    blocker = canonicalize_request_slots(request=request, envelope=blocker_envelope)
+
+    assert unconditional.slots[0].slot_id == blocker.slots[0].slot_id
+    assert not request_slot_contracts_agree(unconditional, blocker)
+
+
+@pytest.mark.asyncio
+async def test_producer_accepts_two_agreeing_empty_contracts() -> None:
+    calls = 0
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"version": "1", "slots": []}
+
+    result = await produce_request_slots(request=_input(latest_request="Submit the form."), handler=handler)
+
+    assert result.status == "success"
+    assert result.attempts == 2
+    assert result.contract is not None
+    assert result.contract.count == 0
+    assert calls == 2
 
 
 def test_pinability_is_not_identity_but_plane_is() -> None:

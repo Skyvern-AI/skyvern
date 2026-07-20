@@ -1,5 +1,8 @@
 import { TSON } from "@/util/tson";
 import { getInvalidJsonMessage } from "@/util/jsonParseError";
+import { isTemplateExpression } from "@/util/googleSheetsUrl";
+
+const HTTP_SCHEME_REQUIRED_MESSAGE = "URL must use HTTP or HTTPS protocol";
 
 // URL Validation Helper
 export function validateUrl(url: string): { valid: boolean; message: string } {
@@ -8,10 +11,26 @@ export function validateUrl(url: string): { valid: boolean; message: string } {
     return { valid: false, message: "URL is required" };
   }
 
+  const schemeProbe = trimmed.replace(/\s/g, "");
+  const explicitScheme = schemeProbe
+    .match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/)?.[1]
+    ?.toLowerCase();
+  if (explicitScheme && !["http", "https"].includes(explicitScheme)) {
+    return { valid: false, message: HTTP_SCHEME_REQUIRED_MESSAGE };
+  }
+
+  if (schemeProbe.startsWith("//")) {
+    return { valid: false, message: "Invalid URL format" };
+  }
+
+  if (isTemplateExpression(trimmed)) {
+    return { valid: true, message: "Valid URL" };
+  }
+
   try {
     const parsed = new URL(trimmed);
     if (!["http:", "https:"].includes(parsed.protocol)) {
-      return { valid: false, message: "URL must use HTTP or HTTPS protocol" };
+      return { valid: false, message: HTTP_SCHEME_REQUIRED_MESSAGE };
     }
     return { valid: true, message: "Valid URL" };
   } catch {

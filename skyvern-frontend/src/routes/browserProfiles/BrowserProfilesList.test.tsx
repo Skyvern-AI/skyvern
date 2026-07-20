@@ -115,4 +115,15 @@ describe("BrowserProfilesList paginated row selection", () => {
     // table renders, so the highlighted rows are exactly the rendered range.
     expect(selectionState()).toEqual(["true", "true", "true", "true"]);
   });
+
+  it("bulk-delete dialog warns credentials unlink and pinned workflows need repointing", () => {
+    renderList(makeProfiles(2));
+
+    fireEvent.click(screen.getByLabelText("select-Profile 0"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(
+      screen.getByText(/Linked credentials are unlinked automatically/),
+    ).toBeTruthy();
+  });
 });
