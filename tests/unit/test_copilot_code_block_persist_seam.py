@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from types import EllipsisType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -1311,6 +1312,49 @@ class TestCodeSafetySeam:
             {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"}
         ]
         assert ctx.last_code_authoring_repair_context != _stale_unresolved_repair_context()
+
+
+def _live_root_value_bearing_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.turn_id = "t-live-root-value-bearing-directive"
+    ctx.scout_trajectory = []
+    ctx.request_policy = RequestPolicy(
+        request_slot_failure_kind="invalid_anchor_correction",
+        completion_criteria=[
+            CompletionCriterion(
+                id="3362dc25307750ce8cfcc05e3459f621874ba48d0a4500fbdd67f95d84cace37",
+                outcome="A visible manual-service path is returned as a blocker.",
+                output_path="output.blocker",
+                contingent_on="the site exposes only a manual-service path",
+                contingent_antecedent_output_path="output.blocker",
+                antecedent_family="blocker",
+            ),
+            *[
+                CompletionCriterion(
+                    id=f"slot_{index}",
+                    outcome=f"The returned record includes slot {index}.",
+                    output_path="output",
+                    antecedent_family="undecidable",
+                    request_slot_id=f"slot_{index}",
+                    pinability="unpinnable",
+                    mint_disposition="degraded",
+                    mint_degrade="undecidable_judgment",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=path,
+                )
+                for index, path in enumerate(
+                    (
+                        "output.confirmation_number",
+                        "output.account_number",
+                        "output.selected_start_date",
+                        "output.deposit_amount",
+                        "output.next_owner",
+                    )
+                )
+            ],
+        ],
+    )
+    return ctx
 
 
 class TestCodeRepairProgressClassification:
@@ -4932,8 +4976,9 @@ class TestCodeRepairProgressClassification:
 
         assert result is not None
         assert result["ok"] is False
-        assert result["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert result["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in result["data"]
+        assert result["data"]["value_bearing_convergence_directive"]["rung"] == 1
         assert result["data"]["block_label"] == "extract_entry_output"
         assert result["data"]["canonical_required_child_paths"] == ["output.flags", "output.record_id"]
         assert result["data"]["missing_goal_value_paths"] == ["output.flags", "output.record_id"]
@@ -5077,15 +5122,20 @@ class TestCodeRepairProgressClassification:
 
         assert results[0] is not None
         assert results[0]["ok"] is False
-        assert results[0]["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert results[0]["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert results[0]["data"]["reason_code"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in results[0]["data"]
+        assert results[0]["data"]["value_bearing_convergence_directive"]["rung"] == 1
         assert results[0]["data"]["output_contract_reject_count"] == 1
         assert results[-1] is not None
         assert results[-1]["data"]["output_contract_reject_count"] == 4
+        assert results[-1]["data"]["reason_code"] == "metadata_contract_required_before_run"
+        assert results[-1]["data"]["output_contract_reason_code"] == "value_bearing_output_required"
         assert all(
             result is None or result["data"]["reason_code"] != "output_contract_reject_budget_exhausted"
             for result in results
         )
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
 
     def test_metadata_contract_run_preflight_accepts_complete_submitted_metadata(self) -> None:
         ctx = _code_only_ctx()
@@ -5224,36 +5274,58 @@ class TestCodeRepairProgressClassification:
         assert len([log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]) == 1
         assert [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
 
-    def test_run_preflight_value_required_reject_arms_no_directive(self) -> None:
-        ctx = self._run_preflight_metadata_reject_ctx()
-        workflow_yaml = _yaml(
-            """
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: validate_start
-                code: |
-                  return {"output": {"summary": "ok"}}
-            """
+    def test_run_preflight_root_only_value_required_emits_without_payload_rewrite(self) -> None:
+        ctx = _live_root_value_bearing_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            [],
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
         )
-        metadata = [
-            {
-                "block_label": "validate_start",
-                "claimed_outcomes": [
-                    {
-                        "goal_value_paths": ["output"],
-                        "extraction_schema": '{"type":"object","properties":{"output":{"type":"object"}}}',
-                    }
-                ],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output"]}],
-            }
-        ]
+
+        assert evaluation is not None
+        assert evaluation.required_paths == {"output"}
+        assert evaluation.payload["canonical_required_child_paths"] == ["output"]
+        assert evaluation.payload["declaration_only_child_paths"] == ["output.blocker"]
+        assert evaluation.payload["shape_violations"] == ["value_bearing_output_required"]
+        assert evaluation.payload["satisfying_templates"]
+        assert evaluation.payload["satisfying_templates"]["return_skeleton"] == (
+            'return {"output": {"blocker": None, **output_value}}'
+        )
+        assert evaluation.payload["satisfying_templates"]["extraction_schema"] == {
+            "type": "object",
+            "properties": {
+                "output": {
+                    "type": "object",
+                    "properties": {"blocker": {"type": ["string", "null"]}},
+                    "required": ["blocker"],
+                }
+            },
+            "required": ["output"],
+        }
+        metadata_template = evaluation.payload["satisfying_templates"]["code_artifact_metadata"]
+        assert metadata_template["claimed_outcomes"][0]["goal_value_paths"] == ["output"]
+        assert metadata_template["terminal_verifier_expectations"][0]["goal_value_paths"] == ["output"]
+        assert evaluation.canonical_signature == workflow_update_module._output_contract_signature(
+            ctx=ctx, required_paths={"output"}
+        )
         with capture_logs() as logs:
-            result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
+            result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
         assert result is not None and result["ok"] is False
         assert "metadata_convergence_directive" not in result["data"]
-        assert [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
+        assert result["data"]["value_bearing_convergence_directive"] == {
+            "rung": 1,
+            "required_output_paths": ["output"],
+            "shape_violations": ["value_bearing_output_required"],
+            "satisfying_templates": result["data"]["satisfying_templates"],
+        }
+        assert result["data"]["canonical_output_contract_signature"] == evaluation.canonical_signature
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+        assert emits[0]["directive_family"] == "value_bearing_output_required"
+        assert emits[0]["canonical_required_child_paths"] == ["output"]
 
     def test_cross_seam_write_arm_then_metadata_less_preflight_escalates(self) -> None:
         ctx = self._run_preflight_metadata_reject_ctx()
@@ -14542,7 +14614,8 @@ class TestDeclarationContractStamp:
         assert evaluation.payload["reason_code"] == "value_bearing_output_required"
         assert evaluation.can_attempt_run is False
         assert preflight is not None
-        assert preflight["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert preflight["data"]["reason_code"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in preflight["data"]
         assert (
             workflow_update_module._output_contract_advisory_state(ctx, evaluation.canonical_signature)
             == OutputContractAdvisoryState.UNUSED
@@ -14568,12 +14641,14 @@ class TestDeclarationContractStamp:
         assert formed_yaml == workflow_yaml
         assert evaluation is not None
         signature = evaluation.canonical_signature
-        assert ctx.output_contract_armed_directive_fingerprint_by_signature.get(
-            signature
-        ) == workflow_update_module._output_contract_structural_fingerprint(workflow_yaml, signature)
+        assert ctx.output_contract_armed_directive_fingerprint_by_signature.get(signature) == (
+            workflow_update_module._VALUE_BEARING_PREARM_FINGERPRINT_PREFIX
+            + workflow_update_module._output_contract_structural_fingerprint(workflow_yaml, signature)
+        )
         assert evaluation.payload["contract_liveness"] == "degraded_empty"
         assert evaluation.payload["reason_code"] == "value_bearing_output_required"
         assert evaluation.can_attempt_run is False
+        assert "canonical_evaluation_paths" not in evaluation.payload
         assert [row["request_slot_id"] for row in evaluation.payload["degraded_request_slots"]] == [
             "slot_0",
             "slot_1",
@@ -14649,6 +14724,7 @@ class TestDeclarationContractStamp:
         assert evaluation.payload["contract_liveness"] == "degraded_empty"
         assert evaluation.payload["reason_code"] == "value_bearing_output_required"
         assert evaluation.can_attempt_run is False
+        assert "canonical_evaluation_paths" not in evaluation.payload
         assert [row["floor_rekeyed_from_path"] for row in evaluation.payload["degraded_request_slots"]] == sorted(
             requested_paths
         )
@@ -14656,7 +14732,8 @@ class TestDeclarationContractStamp:
             "invalid_output"
         }
         assert preflight is not None
-        assert preflight["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert preflight["data"]["reason_code"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in preflight["data"]
 
     @pytest.mark.asyncio
     async def test_degraded_declaration_only_contract_never_persists_or_dispatches(
@@ -14688,8 +14765,8 @@ class TestDeclarationContractStamp:
 
         parsed = json.loads(result)
         assert parsed["ok"] is False
-        assert parsed["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert parsed["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert parsed["data"]["reason_code"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in parsed["data"]
         assert parsed["data"]["contract_liveness"] == "degraded_empty"
         assert persisted is False
         assert dispatched is False
@@ -14919,6 +14996,34 @@ def test_value_bearing_lattice_deep_alias_chain_is_fail_open() -> None:
     assert workflow_update_module._statically_valueless_return_envelope(code) is False
 
 
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ('runtime_value = await collect()\nreturn {"output": runtime_value}', "proven"),
+        (
+            'runtime_value = await collect()\npayload = {"output": runtime_value}\nalias = payload\nreturn alias',
+            "proven",
+        ),
+        ("runtime_value = await collect()\nreturn runtime_value", "unknown"),
+        ('runtime_value = await collect()\nreturn {"request_id": runtime_value}', "absent"),
+        ('runtime_value = await collect()\nreturn {"output.request_id": runtime_value}', "absent"),
+        ('runtime_value = await collect()\noutput_key = "output"\nreturn {output_key: runtime_value}', "unknown"),
+        (
+            'runtime_value = await collect()\nextra = await collect_extra()\nreturn {"output": runtime_value, **extra}',
+            "unknown",
+        ),
+        (
+            'if should_return_output:\n    return {"output": runtime_value}\nreturn {"request_id": runtime_value}',
+            "absent",
+        ),
+        ('return payload\npayload = {"output": runtime_value}', "unknown"),
+        ("await page.click('#submit')", "absent"),
+    ],
+)
+def test_root_output_envelope_state_requires_literal_root_on_every_return(code: str, expected: str) -> None:
+    assert workflow_update_module._root_output_envelope_state(code) == expected
+
+
 def test_canonical_output_contract_signature_is_single_keyed_under_degraded_slots() -> None:
     ctx = _degraded_declaration_stamp_ctx()
     workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
@@ -14931,24 +15036,1190 @@ def test_canonical_output_contract_signature_is_single_keyed_under_degraded_slot
     )
     assert evaluation is not None
     contract = workflow_update_module._output_contract_required_paths_source(ctx)
-    signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=contract.union)
+    directive_paths = workflow_update_module._value_bearing_directive_paths(contract)
+    signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=directive_paths)
 
+    assert directive_paths == {"output"}
     assert evaluation.canonical_signature == signature
     assert evaluation.payload["canonical_output_contract_signature"] == signature
-    assert workflow_update_module._output_contract_pin_key(ctx, workflow_yaml, contract.union) == signature
-    structural = workflow_update_module._output_contract_author_time_structural_payload(ctx, contract.union)
+    assert workflow_update_module._output_contract_pin_key(ctx, workflow_yaml, directive_paths) == signature
+    structural = workflow_update_module._output_contract_author_time_structural_payload(ctx, directive_paths)
     assert structural is not None
     assert structural["canonical_output_contract_signature"] == signature
     workflow_update_module._record_output_contract_family_reject(
-        ctx, contract.union, reject_family="value_bearing_output_required"
+        ctx, directive_paths, reject_family="value_bearing_output_required"
     )
     assert ctx.output_contract_reject_count_by_signature == {signature: 1}
-    workflow_update_module._record_output_contract_deferral(ctx, contract.union)
+    workflow_update_module._record_output_contract_deferral(ctx, directive_paths)
     assert ctx.output_contract_deferral_count_by_signature == {signature: 1}
     identity_free = workflow_update_module._stable_output_contract_key(
-        workflow_update_module._output_contract_scope_key(ctx), contract.union
+        workflow_update_module._output_contract_scope_key(ctx), directive_paths
     )
     assert signature != identity_free
+
+
+class TestValueBearingDefinitionRejectComposition:
+    @staticmethod
+    def _ctx() -> CopilotContext:
+        ctx = _live_root_value_bearing_ctx()
+        ctx.request_policy.completion_criteria.append(
+            CompletionCriterion(
+                id="reusable_inputs",
+                outcome="The workflow uses the service address as a reusable input.",
+                level="definition",
+                output_path="workflow.parameters",
+            )
+        )
+        return ctx
+
+    @staticmethod
+    def _workflow_yaml() -> str:
+        return _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: extract_record
+                parameter_keys: []
+                code: |
+                  return {"output": None}
+            """
+        )
+
+    @staticmethod
+    def _assert_composed_reject(result: dict[str, object], *, rung: int) -> None:
+        data = result["data"]
+        assert isinstance(data, dict)
+        assert data["reason_code"] == "definition_contract_unsatisfied"
+        assert data["unreferenced_parameter_keys"] == ["service_address"]
+        assert data["canonical_required_child_paths"] == ["output"]
+        assert data["shape_violations"] == ["value_bearing_output_required"]
+        assert data["satisfying_templates"]
+        assert data["output_contract_actuation"] == "structure_directive"
+        assert data["value_bearing_convergence_directive"] == {
+            "rung": rung,
+            "required_output_paths": ["output"],
+            "shape_violations": ["value_bearing_output_required"],
+            "satisfying_templates": data["satisfying_templates"],
+        }
+
+    def test_live_request_policy_definition_reject_composes_root_directive_and_escalates(self) -> None:
+        ctx = self._ctx()
+        workflow_yaml = self._workflow_yaml()
+
+        with capture_logs() as first_logs:
+            first = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+        ctx.output_contract_bail_actuated_this_call = False
+        with capture_logs() as second_logs:
+            second = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+
+        assert first is not None
+        assert second is not None
+        self._assert_composed_reject(first, rung=1)
+        self._assert_composed_reject(second, rung=2)
+        first_emits = [log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        second_emits = [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(first_emits) == 1
+        assert len(second_emits) == 1
+        assert first_emits[0]["canonical_required_child_paths"] == ["output"]
+        assert second_emits[0]["canonical_required_child_paths"] == ["output"]
+        assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "definition_contract_unsatisfied"
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_public_p5_tool_replay_emits_rungs_then_preserves_definition_route(self) -> None:
+        ctx = self._ctx()
+        workflow_yaml = self._workflow_yaml()
+        metadata: list[dict[str, object]] = []
+        submitted_metadata = json.dumps(metadata, sort_keys=True)
+        tool_ctx = SimpleNamespace(context=ctx, tool_name="update_and_run_blocks")
+        arguments = json.dumps(
+            {
+                "workflow_yaml": workflow_yaml,
+                "block_labels": ["extract_record"],
+                "code_artifact_metadata": metadata,
+            }
+        )
+
+        with capture_logs() as logs:
+            first = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+            second = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+
+        self._assert_composed_reject(first, rung=1)
+        self._assert_composed_reject(second, rung=2)
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert [event["rung"] for event in emits] == [1, 2]
+        assert all(event["canonical_required_child_paths"] == ["output"] for event in emits)
+        assert emits[0]["guidance_fingerprint"] == emits[1]["guidance_fingerprint"]
+        assert json.dumps(metadata, sort_keys=True) == submitted_metadata
+        assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "definition_contract_unsatisfied"
+        requirement = ctx.recorded_outcome_grounding_requirement
+        assert requirement is not None
+        assert requirement.phase == "author_time_reject"
+        assert requirement.reason_code == "definition_contract_unsatisfied"
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.workflow_yaml == ""
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_definition_reject_returns_same_composed_root_directive(self) -> None:
+        ctx = self._ctx()
+
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": self._workflow_yaml(), "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+            )
+
+        self._assert_composed_reject(result, rung=1)
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+        assert emits[0]["canonical_required_child_paths"] == ["output"]
+        assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "definition_contract_unsatisfied"
+        assert ctx.workflow_yaml == ""
+
+
+class TestValueBearingConvergenceDirective:
+    @staticmethod
+    def _directive(
+        data: dict[str, object],
+        *,
+        paths: list[str],
+        rung: int,
+    ) -> dict[str, object]:
+        return {
+            "rung": rung,
+            "required_output_paths": paths,
+            "shape_violations": ["value_bearing_output_required"],
+            "satisfying_templates": data["satisfying_templates"],
+        }
+
+    @staticmethod
+    def _ctx() -> CopilotContext:
+        ctx = _declaration_stamp_ctx()
+        ctx.request_policy.completion_criteria.append(
+            CompletionCriterion(
+                id="c_account",
+                outcome="The returned record includes account number.",
+                output_path="output.account_number",
+            )
+        )
+        return ctx
+
+    @staticmethod
+    def _workflow_and_metadata() -> tuple[str, list[dict[str, object]]]:
+        workflow_yaml = _collapsed_spine_yaml(
+            'return {"output": {"record_id": None, "account_number": None, "blocker": None}}'
+        )
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id", "output.account_number"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+        return workflow_yaml, metadata
+
+    @staticmethod
+    def _degraded_ctx(*floor_paths: str) -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.turn_id = "t-degraded-value-bearing-directive"
+        ctx.scout_trajectory = []
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id=f"slot_{index}",
+                    outcome=f"The returned record includes slot {index}.",
+                    output_path="output",
+                    request_slot_id=f"slot_{index}",
+                    pinability="unpinnable",
+                    mint_disposition="degraded",
+                    mint_degrade="undecidable_judgment",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=path,
+                )
+                for index, path in enumerate(floor_paths)
+            ]
+        )
+        return ctx
+
+    @staticmethod
+    def _declaration_only_ctx() -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.turn_id = "t-declaration-only-value-bearing-directive"
+        ctx.scout_trajectory = []
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="c_blocker",
+                    outcome="A blocker is returned when submission is unavailable.",
+                    output_path="output.blocker",
+                    contingent_on="submission is unavailable",
+                    contingent_antecedent_output_path="output.blocker",
+                    antecedent_family="blocker",
+                )
+            ]
+        )
+        return ctx
+
+    @staticmethod
+    def _live_root_request_policy_ctx() -> CopilotContext:
+        return _live_root_value_bearing_ctx()
+
+    @staticmethod
+    def _live_root_evaluation(
+        ctx: CopilotContext,
+        workflow_yaml: str,
+        metadata: list[dict[str, object]],
+    ) -> workflow_update_module._OutputContractEvaluation:
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            enforce_value_bearing_liveness=True,
+        )
+        assert evaluation is not None
+        assert evaluation.required_paths == {"output"}
+        assert evaluation.payload["canonical_required_child_paths"] == ["output"]
+        assert evaluation.canonical_signature == workflow_update_module._output_contract_signature(
+            ctx=ctx, required_paths={"output"}
+        )
+        return evaluation
+
+    def test_declaration_only_run_preflight_returns_root_family_guidance_and_accepts_exact_reauthor(self) -> None:
+        ctx = self._declaration_only_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+
+        first = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+
+        assert first is not None and first["ok"] is False
+        assert first["data"]["contract_liveness"] == "absent"
+        assert first["data"]["canonical_required_child_paths"] == ["output"]
+        assert first["data"]["declaration_only_child_paths"] == ["output.blocker"]
+        assert first["data"]["reason_code"] == "value_bearing_output_required"
+        assert first["data"]["reject_reason"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in first["data"]
+        assert first["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"], paths=["output"], rung=1
+        )
+        assert first["data"]["satisfying_templates"]["return_skeleton"] == (
+            'return {"output": {"blocker": None, **output_value}}'
+        )
+        assert first["data"]["satisfying_templates"]["extraction_schema"]["properties"]["output"]["properties"][
+            "blocker"
+        ] == {"type": ["string", "null"]}
+        assert "code_artifact_metadata" in first["error"]
+        assert "return skeleton" in first["error"]
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+
+        templates = first["data"]["satisfying_templates"]
+        reauthored_code = (
+            'output_value = {"status": await page.locator("#status").text_content()}\n' + templates["return_skeleton"]
+        )
+        reauthored_yaml = _collapsed_spine_yaml(reauthored_code)
+        ctx.output_contract_bail_actuated_this_call = False
+
+        assert (
+            workflow_update_module._metadata_contract_run_preflight_reject(
+                ctx,
+                reauthored_yaml,
+                [templates["code_artifact_metadata"]],
+            )
+            is None
+        )
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+        assert (
+            workflow_update_module.output_contract_value_bearing_run_reject(
+                ctx,
+                {"extract_record": reauthored_code},
+            )
+            is None
+        )
+
+    def test_degraded_empty_run_preflight_returns_root_family_guidance(self) -> None:
+        ctx = self._degraded_ctx("output.confirmation_number", "output.account_number")
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+
+        assert result is not None and result["ok"] is False
+        assert result["data"]["contract_liveness"] == "degraded_empty"
+        assert result["data"]["canonical_required_child_paths"] == ["output"]
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert result["data"]["reject_reason"] == "value_bearing_output_required"
+        assert "output_contract_reason_code" not in result["data"]
+        assert result["data"]["value_bearing_convergence_directive"] == self._directive(
+            result["data"], paths=["output"], rung=1
+        )
+        assert "code_artifact_metadata" in result["error"]
+        assert "return skeleton" in result["error"]
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'runtime_value = await collect()\nreturn {"output": runtime_value}',
+            'runtime_value = await collect()\npayload = {"output": runtime_value}\nalias = payload\nreturn alias',
+        ],
+    )
+    def test_root_only_runtime_envelopes_exit_value_bearing_liveness(self, code: str) -> None:
+        ctx = self._degraded_ctx("output.confirmation_number")
+        workflow_yaml = _collapsed_spine_yaml(code)
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths=set(),
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            enforce_value_bearing_liveness=True,
+        )
+
+        assert evaluation is not None
+        assert "value_bearing_output_required" not in evaluation.shape_violations
+        assert evaluation.payload["reason_code"] == "output_contract_required"
+        assert workflow_update_module.output_contract_value_bearing_run_reject(ctx, {"extract_record": code}) is None
+
+    @pytest.mark.asyncio
+    async def test_native_reject_emits_full_sorted_guidance_on_both_rungs(self) -> None:
+        ctx = self._ctx()
+        workflow_yaml, metadata = self._workflow_and_metadata()
+
+        with capture_logs() as first_logs:
+            first = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+        with capture_logs() as second_logs:
+            second = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+
+        assert first["ok"] is False
+        assert first["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"],
+            paths=["output.account_number", "output.blocker", "output.record_id"],
+            rung=1,
+        )
+        assert "metadata_convergence_directive" not in first["data"]
+        assert second["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"],
+            paths=["output.account_number", "output.blocker", "output.record_id"],
+            rung=2,
+        )
+        first_emits = [log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        second_emits = [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(first_emits) == 1
+        assert first_emits[0]["directive_family"] == "value_bearing_output_required"
+        assert first_emits[0]["block_label"] == "extract_record"
+        assert first_emits[0]["canonical_output_contract_signature"]
+        assert first_emits[0]["rung"] == 1
+        assert len(second_emits) == 1
+        assert second_emits[0]["directive_family"] == "value_bearing_output_required"
+        assert second_emits[0]["rung"] == 2
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.output_contract_actuation_count_by_signature == {}
+        assert ctx.output_contract_declick_attempted_by_signature == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_identical_guidance_escalates_across_candidate_changes_and_logs_both_fingerprints(self) -> None:
+        ctx = self._ctx()
+        first_workflow, metadata = self._workflow_and_metadata()
+        second_workflow = _collapsed_spine_yaml(
+            'return {"output": {"record_id": None, "account_number": None, "unused": None, "blocker": None}}'
+        )
+
+        with capture_logs() as first_logs:
+            first = await _update_workflow(
+                {"workflow_yaml": first_workflow, "code_artifact_metadata": metadata},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+        with capture_logs() as second_logs:
+            second = await _update_workflow(
+                {"workflow_yaml": second_workflow, "code_artifact_metadata": metadata},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+
+        first_directive = first["data"]["value_bearing_convergence_directive"]
+        second_directive = second["data"]["value_bearing_convergence_directive"]
+        assert first_directive == self._directive(
+            first["data"], paths=["output.account_number", "output.blocker", "output.record_id"], rung=1
+        )
+        assert second_directive == self._directive(
+            second["data"], paths=["output.account_number", "output.blocker", "output.record_id"], rung=2
+        )
+        first_emit = next(log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT)
+        second_emit = next(log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT)
+        assert first_emit["guidance_fingerprint"] == second_emit["guidance_fingerprint"]
+        assert first_emit["candidate_fingerprint"] != second_emit["candidate_fingerprint"]
+
+    @pytest.mark.asyncio
+    async def test_emitted_directive_clears_stale_author_time_rendering_but_preserves_history(self) -> None:
+        ctx = self._ctx()
+        workflow_yaml, metadata = self._workflow_and_metadata()
+        record_build_test_outcome(ctx, _author_time_reject_outcome("definition_contract_unsatisfied"))
+        history = list(ctx.recorded_build_test_outcome_history)
+
+        result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
+            ctx,
+            allow_missing_credentials=True,
+            formation_prepared=True,
+        )
+
+        assert result["data"]["value_bearing_convergence_directive"] == self._directive(
+            result["data"], paths=["output.account_number", "output.blocker", "output.record_id"], rung=1
+        )
+        assert ctx.latest_recorded_build_test_outcome is None
+        assert ctx.recorded_build_test_outcome_history == history
+
+    @pytest.mark.asyncio
+    async def test_degraded_request_slots_emit_only_canonical_root_guidance(self) -> None:
+        ctx = self._degraded_ctx("output.confirmation_number", "output.account_number")
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+
+        with capture_logs() as first_logs:
+            first = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+        with capture_logs() as second_logs:
+            second = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+
+        assert first["ok"] is False
+        assert first["data"]["canonical_required_child_paths"] == ["output"]
+        assert "canonical_evaluation_paths" not in first["data"]
+        assert [row["floor_rekeyed_from_path"] for row in first["data"]["degraded_request_slots"]] == [
+            "output.confirmation_number",
+            "output.account_number",
+        ]
+        assert first["data"]["contract_liveness"] == "degraded_empty"
+        assert first["data"]["output_contract_reject_count"] == 1
+        assert first["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"], paths=["output"], rung=1
+        )
+        assert first["data"]["output_contract_actuation"] == "structure_directive"
+        assert second["data"]["output_contract_reject_count"] == 2
+        assert second["data"]["value_bearing_convergence_directive"] == self._directive(
+            second["data"], paths=["output"], rung=2
+        )
+        assert second["data"]["output_contract_actuation"] == "structure_directive"
+        first_emits = [log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        second_emits = [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(first_emits) == 1
+        assert len(second_emits) == 1
+        assert first_emits[0]["canonical_required_child_paths"] == ["output"]
+        assert second_emits[0]["canonical_required_child_paths"] == ["output"]
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.output_contract_actuation_count_by_signature == {}
+        assert ctx.output_contract_declick_attempted_by_signature == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_root_only_directives_reach_existing_budget_terminal(self) -> None:
+        ctx = self._degraded_ctx("output.confirmation_number", "output.account_number")
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+        assert contract.union == set()
+        sentinel_signature = workflow_update_module._output_contract_signature(
+            ctx=ctx, required_paths={workflow_update_module._OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH}
+        )
+        ctx.output_contract_reject_count_by_signature[sentinel_signature] = (
+            workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS - 1
+        )
+        ctx.output_contract_deferral_count_by_signature[sentinel_signature] = (
+            workflow_update_module._MAX_OUTPUT_CONTRACT_DEFERRALS - 1
+        )
+
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+
+        assert result["data"]["reason_code"] == "output_contract_reject_budget_exhausted"
+        assert result["data"]["reject_reason"] == "output_contract_reject_budget_exhausted"
+        assert "value_bearing_convergence_directive" not in result["data"]
+        assert "output_contract_actuation" not in result["data"]
+        assert [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
+        assert ctx.turn_halt is not None
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "output_contract_reject_budget_exhausted"
+        assert (
+            ctx.output_contract_reject_count_by_signature[sentinel_signature]
+            == workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS
+        )
+
+    def test_live_blocker_budget_routes_to_root_guidance(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        evaluation = self._live_root_evaluation(ctx, workflow_yaml, [])
+        blocker_signature = workflow_update_module._output_contract_signature(
+            ctx=ctx, required_paths={"output.blocker"}
+        )
+        ctx.output_contract_reject_count_by_signature[blocker_signature] = (
+            workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS
+        )
+        ctx.output_contract_deferral_count_by_signature[blocker_signature] = (
+            workflow_update_module._MAX_OUTPUT_CONTRACT_DEFERRALS
+        )
+
+        payload = workflow_update_module._record_output_contract_reject(
+            ctx,
+            evaluation,
+            summary="Value-bearing output is still required.",
+            workflow_yaml=workflow_yaml,
+            raw_metadata=[],
+        )
+
+        root_signature = evaluation.canonical_signature
+        assert root_signature != blocker_signature
+        assert payload["canonical_required_child_paths"] == ["output"]
+        assert payload["declaration_only_child_paths"] == ["output.blocker"]
+        assert payload["value_bearing_convergence_directive"] == self._directive(payload, paths=["output"], rung=1)
+        assert payload["output_contract_reject_count"] == 1
+        assert payload["reason_code"] == "value_bearing_output_required"
+        assert ctx.output_contract_reject_count_by_signature[blocker_signature] == (
+            workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS
+        )
+        assert ctx.output_contract_reject_count_by_signature[root_signature] == 1
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    def test_emitted_directive_does_not_arm_recorded_outcome_grounding(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        evaluation = self._live_root_evaluation(ctx, workflow_yaml, [])
+
+        first = workflow_update_module._record_output_contract_reject(
+            ctx,
+            evaluation,
+            summary="Value-bearing output is still required.",
+            workflow_yaml=workflow_yaml,
+            raw_metadata=[],
+        )
+
+        assert first["value_bearing_convergence_directive"] == self._directive(first, paths=["output"], rung=1)
+        assert ctx.latest_recorded_build_test_outcome is None
+
+        ctx.output_contract_bail_actuated_this_call = False
+        second = workflow_update_module._record_output_contract_reject(
+            ctx,
+            evaluation,
+            summary="Value-bearing output is still required.",
+            workflow_yaml=workflow_yaml,
+            raw_metadata=[],
+        )
+
+        assert second["value_bearing_convergence_directive"] == self._directive(first, paths=["output"], rung=2)
+        assert second["reason_code"] == "value_bearing_output_required"
+        assert ctx.latest_recorded_build_test_outcome is None
+
+    @pytest.mark.asyncio
+    async def test_mixed_degraded_diagnostics_do_not_invent_child_guidance(self) -> None:
+        ctx = self._degraded_ctx("output.account_number", "output")
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+
+        result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": []},
+            ctx,
+            allow_missing_credentials=True,
+            formation_prepared=True,
+        )
+
+        assert result["data"]["value_bearing_convergence_directive"] == self._directive(
+            result["data"], paths=["output"], rung=1
+        )
+        assert "output.account_number" not in result["data"]["canonical_required_child_paths"]
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_observation_paths_take_precedence_over_incomplete_degraded_diagnostics(self) -> None:
+        ctx = self._ctx()
+        ctx.request_policy.completion_criteria.append(
+            CompletionCriterion(
+                id="slot_incomplete",
+                outcome="The returned record includes an additional slot.",
+                output_path="output",
+                request_slot_id="slot_incomplete",
+                pinability="unpinnable",
+                mint_disposition="degraded",
+                mint_degrade="undecidable_judgment",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path="output",
+            )
+        )
+        workflow_yaml, metadata = self._workflow_and_metadata()
+
+        result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
+            ctx,
+            allow_missing_credentials=True,
+            formation_prepared=True,
+        )
+
+        assert result["data"]["value_bearing_convergence_directive"] == self._directive(
+            result["data"],
+            paths=["output.account_number", "output.blocker", "output.record_id"],
+            rung=1,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_path", ["", "output"])
+    async def test_degraded_diagnostics_are_not_directive_path_authority(self, invalid_path: str) -> None:
+        ctx = self._degraded_ctx("output.account_number", invalid_path)
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+                formation_prepared=True,
+            )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert result["data"]["output_contract_reject_count"] == 1
+        assert result["data"]["value_bearing_convergence_directive"] == self._directive(
+            result["data"], paths=["output"], rung=1
+        )
+        assert result["data"]["output_contract_actuation"] == "structure_directive"
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+        assert emits[0]["canonical_required_child_paths"] == ["output"]
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_live_request_policy_evaluation_emits_root_guidance_without_invented_children(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        evaluation = self._live_root_evaluation(ctx, workflow_yaml, [])
+
+        with capture_logs() as logs:
+            result = workflow_update_module._record_output_contract_reject(
+                ctx,
+                evaluation,
+                summary="Value-bearing output is still required.",
+                workflow_yaml=workflow_yaml,
+                raw_metadata=[],
+            )
+
+        assert result["canonical_required_child_paths"] == ["output"]
+        assert "canonical_evaluation_paths" not in result
+        assert result["reason_code"] == "value_bearing_output_required"
+        assert result["value_bearing_convergence_directive"] == self._directive(result, paths=["output"], rung=1)
+        assert result["output_contract_actuation"] == "structure_directive"
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+        assert emits[0]["canonical_required_child_paths"] == ["output"]
+        assert ctx.output_contract_actuation_by_signature == {}
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_live_request_policy_native_preflight_emits_evaluator_root_guidance(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        submitted_metadata = [
+            {
+                "artifact_id": "code_artifact:extract_record",
+                "block_label": "extract_record",
+                "claimed_outcomes": [
+                    {
+                        "goal_value_paths": [
+                            "confirmation_number",
+                            "account_number",
+                            "selected_start_date",
+                            "deposit_amount",
+                            "next_owner",
+                        ],
+                        "extraction_schema": json.dumps(
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "confirmation_number": {"type": "string"},
+                                    "account_number": {"type": "string"},
+                                },
+                            }
+                        ),
+                    }
+                ],
+            }
+        ]
+
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": workflow_yaml, "code_artifact_metadata": submitted_metadata},
+                ctx,
+                allow_missing_credentials=True,
+            )
+
+        assert result["data"]["canonical_required_child_paths"] == ["output"]
+        assert result["data"]["value_bearing_convergence_directive"] == self._directive(
+            result["data"], paths=["output"], rung=1
+        )
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+        assert emits[0]["canonical_required_child_paths"] == ["output"]
+        assert emits[0]["rung"] == 1
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    def test_p8_bare_dynamic_return_emits_evaluator_root_guidance_on_both_rungs(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        workflow_yaml = _collapsed_spine_yaml(
+            'rows = await page.locator("[data-testid=quickconnect-row]").all_text_contents()\nreturn rows'
+        )
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.confirmation_number"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths=set(),
+            )
+        ]
+        submitted_bytes = json.dumps(metadata, sort_keys=True)
+
+        with capture_logs() as first_logs:
+            first = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
+        ctx.output_contract_bail_actuated_this_call = False
+        with capture_logs() as second_logs:
+            second = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
+
+        assert first is not None
+        assert second is not None
+        assert first["data"]["reason_code"] == "value_bearing_output_required"
+        assert second["data"]["reason_code"] == "value_bearing_output_required"
+        assert first["data"]["canonical_required_child_paths"] == ["output"]
+        assert first["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"], paths=["output"], rung=1
+        )
+        assert second["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"], paths=["output"], rung=2
+        )
+        first_prearms = [
+            log for log in first_logs if log["event"] == "copilot_output_contract_value_bearing_directive_emitted"
+        ]
+        second_prearms = [
+            log for log in second_logs if log["event"] == "copilot_output_contract_value_bearing_directive_emitted"
+        ]
+        first_emits = [log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        second_emits = [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert first_prearms == []
+        assert second_prearms == []
+        assert len(first_emits) == 1
+        assert len(second_emits) == 1
+        assert first_emits[0]["rung"] == 1
+        assert second_emits[0]["rung"] == 2
+        assert json.dumps(metadata, sort_keys=True) == submitted_bytes
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_p8_value_bearing_directive_preserves_recorded_outcome_grounding_route(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        ctx.request_policy.completion_criteria.append(
+            CompletionCriterion(
+                id="p8_reusable_inputs",
+                outcome=(
+                    "The workflow uses business name, contact email, service address, and desired start date "
+                    "as reusable inputs."
+                ),
+                level="definition",
+                output_path="workflow.parameters",
+            )
+        )
+        parameters_yaml = """
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+        """
+        directive_workflow = _yaml(
+            f"""
+            title: QuickConnect lookup
+            workflow_definition:
+{parameters_yaml}
+              blocks:
+              - block_type: code
+                label: extract_record
+                parameter_keys: [business_name, contact_email, service_address, desired_start_date]
+                code: |
+                  rows = await page.locator("[data-testid=quickconnect-row]").all_text_contents()
+                  reusable_inputs = (business_name, contact_email, service_address, desired_start_date)
+                  return rows if all(reusable_inputs) else rows
+            """
+        )
+        definition_reject_workflow = _yaml(
+            f"""
+            title: QuickConnect lookup
+            workflow_definition:
+{parameters_yaml}
+              blocks:
+              - block_type: code
+                label: extract_record
+                parameter_keys: []
+                code: |
+                  return {{"output": {{"confirmation_number": "QC-1042"}}}}
+            """
+        )
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.confirmation_number"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths=set(),
+            )
+        ]
+        tool_ctx = SimpleNamespace(context=ctx, tool_name="update_and_run_blocks")
+
+        def arguments(workflow_yaml: str) -> str:
+            return json.dumps(
+                {
+                    "workflow_yaml": workflow_yaml,
+                    "block_labels": ["extract_record"],
+                    "code_artifact_metadata": metadata,
+                }
+            )
+
+        with capture_logs() as logs:
+            first = json.loads(
+                await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments(directive_workflow))
+            )
+            second = json.loads(
+                await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments(directive_workflow))
+            )
+
+            assert first["data"]["value_bearing_convergence_directive"] == self._directive(
+                first["data"], paths=["output"], rung=1
+            )
+            assert second["data"]["value_bearing_convergence_directive"] == self._directive(
+                second["data"], paths=["output"], rung=2
+            )
+            assert ctx.latest_recorded_build_test_outcome is None
+
+            for _ in range(2):
+                definition_reject = json.loads(
+                    await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                        tool_ctx,
+                        arguments(definition_reject_workflow),
+                    )
+                )
+                assert definition_reject["data"]["reason_code"] == "definition_contract_unsatisfied"
+                assert "value_bearing_convergence_directive" not in definition_reject["data"]
+
+            assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+            assert ctx.latest_recorded_build_test_outcome.reason_code == "definition_contract_unsatisfied"
+            requirement = ctx.recorded_outcome_grounding_requirement
+            assert requirement is not None
+            assert requirement.phase == "author_time_reject"
+            assert requirement.reason_code == "definition_contract_unsatisfied"
+
+            grounding = json.loads(
+                await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                    tool_ctx,
+                    arguments(definition_reject_workflow),
+                )
+            )
+
+        assert grounding["ok"] is False
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "recorded_outcome_grounding_required"
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert [event["rung"] for event in emits] == [1, 2]
+        assert all(event["canonical_required_child_paths"] == ["output"] for event in emits)
+
+    def test_value_bearing_guidance_rejects_non_output_root(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": None}')
+        evaluation = self._live_root_evaluation(ctx, workflow_yaml, [])
+        payload = dict(evaluation.payload)
+        payload["canonical_required_child_paths"] = ["record_id"]
+
+        assert workflow_update_module._value_bearing_evaluation_guidance(replace(evaluation, payload=payload)) is None
+
+    def test_live_root_native_candidate_churn_preserves_metadata_bytes_and_escalates(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        first_workflow = _collapsed_spine_yaml('return {"output": None}')
+        second_workflow = _collapsed_spine_yaml('return {"output": None, "unused": None}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.confirmation_number"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths=set(),
+            )
+        ]
+        submitted_bytes = json.dumps(metadata, sort_keys=True)
+        first_evaluation = self._live_root_evaluation(ctx, first_workflow, metadata)
+        second_evaluation = self._live_root_evaluation(ctx, second_workflow, metadata)
+
+        with capture_logs() as logs:
+            first = workflow_update_module._record_output_contract_reject(
+                ctx,
+                first_evaluation,
+                summary="Value-bearing output is still required.",
+                workflow_yaml=first_workflow,
+                raw_metadata=metadata,
+            )
+        ctx.output_contract_bail_actuated_this_call = False
+        with capture_logs() as second_logs:
+            second = workflow_update_module._record_output_contract_reject(
+                ctx,
+                second_evaluation,
+                summary="Value-bearing output is still required.",
+                workflow_yaml=second_workflow,
+                raw_metadata=metadata,
+            )
+
+        assert first["reason_code"] == "value_bearing_output_required"
+        assert second["reason_code"] == "value_bearing_output_required"
+        assert first["canonical_required_child_paths"] == ["output"]
+        assert first["value_bearing_convergence_directive"] == self._directive(first, paths=["output"], rung=1)
+        assert second["value_bearing_convergence_directive"] == self._directive(first, paths=["output"], rung=2)
+        assert "metadata_convergence_directive" not in first
+        assert "metadata_convergence_directive" not in second
+        assert json.dumps(metadata, sort_keys=True) == submitted_bytes
+        emits = [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        second_emits = [log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT]
+        assert len(emits) == 1
+        assert len(second_emits) == 1
+        assert emits[0]["canonical_required_child_paths"] == ["output"]
+        assert emits[0]["guidance_fingerprint"] == second_emits[0]["guidance_fingerprint"]
+        assert emits[0]["candidate_fingerprint"] != second_emits[0]["candidate_fingerprint"]
+
+    @pytest.mark.asyncio
+    async def test_full_native_prearm_preserves_rung_across_candidate_churn(self) -> None:
+        ctx = self._live_root_request_policy_ctx()
+        first_workflow = _collapsed_spine_yaml('return {"output": None}')
+        second_workflow = _collapsed_spine_yaml('return {"output": None, "unused": None}')
+
+        with capture_logs() as first_logs:
+            first = await _update_workflow(
+                {"workflow_yaml": first_workflow, "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+            )
+        with capture_logs() as second_logs:
+            second = await _update_workflow(
+                {"workflow_yaml": second_workflow, "code_artifact_metadata": []},
+                ctx,
+                allow_missing_credentials=True,
+            )
+
+        assert first["data"]["value_bearing_convergence_directive"] == self._directive(
+            first["data"], paths=["output"], rung=1
+        )
+        assert second["data"]["value_bearing_convergence_directive"] == self._directive(
+            second["data"], paths=["output"], rung=2
+        )
+        first_prearms = [
+            log for log in first_logs if log["event"] == "copilot_output_contract_value_bearing_directive_emitted"
+        ]
+        second_prearms = [
+            log for log in second_logs if log["event"] == "copilot_output_contract_value_bearing_directive_emitted"
+        ]
+        first_emit = next(log for log in first_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT)
+        second_emit = next(log for log in second_logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT)
+        assert len(first_prearms) == 1
+        assert len(second_prearms) == 1
+        assert first_emit["guidance_fingerprint"] == second_emit["guidance_fingerprint"]
+        assert first_emit["candidate_fingerprint"] != second_emit["candidate_fingerprint"]
+        assert ctx.output_contract_armed_directive_fingerprint_by_signature == {
+            first["data"]["canonical_output_contract_signature"]: second_emit["guidance_fingerprint"]
+        }
+        assert ctx.output_contract_pending_run_evidence == {}
+        assert ctx.turn_halt is None
+        assert ctx.blocker_signal is None
+
+    def test_changed_evaluation_guidance_resets_to_rung_one(self) -> None:
+        ctx = self._ctx()
+        workflow_yaml, metadata = self._workflow_and_metadata()
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            enforce_value_bearing_liveness=True,
+        )
+        assert evaluation is not None
+
+        first = workflow_update_module._record_output_contract_reject(
+            ctx,
+            evaluation,
+            summary="Value-bearing output is still required.",
+            workflow_yaml=workflow_yaml,
+            raw_metadata=metadata,
+        )
+        changed_templates = dict(evaluation.payload["satisfying_templates"])
+        changed_templates["return_skeleton"] = 'return {"output": {"record_id": refreshed_record_id}}'
+        changed_payload = dict(evaluation.payload)
+        changed_payload["satisfying_templates"] = changed_templates
+        ctx.output_contract_bail_actuated_this_call = False
+
+        changed = workflow_update_module._record_output_contract_reject(
+            ctx,
+            replace(evaluation, payload=changed_payload),
+            summary="Value-bearing output is still required.",
+            workflow_yaml=workflow_yaml,
+            raw_metadata=metadata,
+        )
+
+        assert first["value_bearing_convergence_directive"]["rung"] == 1
+        assert changed["value_bearing_convergence_directive"] == self._directive(
+            changed_payload,
+            paths=["output.account_number", "output.blocker", "output.record_id"],
+            rung=1,
+        )
+
+    def test_value_bearing_prearm_and_metadata_family_state_do_not_escalate_first_rung(self) -> None:
+        workflow_yaml, metadata = self._workflow_and_metadata()
+        ctx = self._ctx()
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            enforce_value_bearing_liveness=True,
+        )
+        assert evaluation is not None
+        signature = evaluation.canonical_signature
+        workflow_update_module._arm_output_contract_value_bearing_directive(
+            ctx,
+            signature=signature,
+            workflow_yaml=workflow_yaml,
+            liveness=workflow_update_module._OutputContractLiveness.DEGRADED_EMPTY,
+        )
+        ctx.output_contract_bail_actuated_this_call = False
+
+        payload = workflow_update_module._record_output_contract_reject(
+            ctx,
+            evaluation,
+            summary="Value-bearing output is still required.",
+            authored_structural_fingerprint=workflow_update_module._output_contract_structural_fingerprint(
+                workflow_yaml, signature
+            ),
+            workflow_yaml=workflow_yaml,
+            raw_metadata=None,
+        )
+
+        assert payload["value_bearing_convergence_directive"]["rung"] == 1
+        assert "metadata_convergence_directive" not in payload
+
+        baseline_ctx = _code_only_ctx()
+        baseline = workflow_update_module._adjudicate_metadata_reject_ladder(
+            baseline_ctx,
+            workflow_yaml=_metadata_less_output_yaml(),
+            raw_metadata=None,
+            missing_labels=["extract_provider"],
+            required_paths={"output.npi"},
+        )
+        crossed_ctx = _code_only_ctx()
+        crossed_signature = workflow_update_module._output_contract_signature(
+            ctx=crossed_ctx, required_paths={"output.npi"}
+        )
+        crossed_ctx.output_contract_armed_directive_fingerprint_by_signature[crossed_signature] = (
+            "value-bearing-family-fingerprint"
+        )
+        crossed = workflow_update_module._adjudicate_metadata_reject_ladder(
+            crossed_ctx,
+            workflow_yaml=_metadata_less_output_yaml(),
+            raw_metadata=None,
+            missing_labels=["extract_provider"],
+            required_paths={"output.npi"},
+        )
+
+        assert baseline == crossed
+        assert json.dumps(baseline, sort_keys=True) == json.dumps(crossed, sort_keys=True)
+        assert baseline is not None and baseline["rung"] == 1
+
+    def test_empty_signature_retains_fail_closed_reject_without_directive(self) -> None:
+        ctx = self._ctx()
+        workflow_yaml, metadata = self._workflow_and_metadata()
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            enforce_value_bearing_liveness=True,
+        )
+        assert evaluation is not None
+        evaluation = replace(evaluation, canonical_signature="")
+
+        payload = workflow_update_module._record_output_contract_reject(
+            ctx,
+            evaluation,
+            summary="Value-bearing output is still required.",
+            workflow_yaml=workflow_yaml,
+            raw_metadata=metadata,
+        )
+
+        assert payload["reason_code"] == "value_bearing_output_required"
+        assert "value_bearing_convergence_directive" not in payload
+        assert "output_contract_actuation" not in payload
+        assert ctx.output_contract_reject_count_by_signature
+        assert ctx.output_contract_armed_directive_fingerprint_by_signature == {}
 
 
 def test_non_value_deficiency_keeps_granted_advisory_arming_at_preflight() -> None:
@@ -14980,7 +16251,7 @@ def test_non_value_deficiency_keeps_granted_advisory_arming_at_preflight() -> No
     )
 
 
-def test_degraded_criteria_reject_steers_to_criteria_not_code_repair() -> None:
+def test_degraded_criteria_reject_steers_to_root_output_repair() -> None:
     ctx = _degraded_declaration_stamp_ctx()
     workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
     evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
@@ -14997,9 +16268,10 @@ def test_degraded_criteria_reject_steers_to_criteria_not_code_repair() -> None:
 
     assert result["ok"] is False
     assert result["data"]["reason_code"] == "value_bearing_output_required"
-    assert "requested value-bearing output" in result["error"]
-    assert "code_artifact_metadata" not in result["error"]
-    assert "return skeleton" not in result["error"]
+    assert result["data"]["canonical_required_child_paths"] == ["output"]
+    assert result["data"]["declaration_only_child_paths"] == ["output.blocker"]
+    assert "code_artifact_metadata" in result["error"]
+    assert "return skeleton" in result["error"]
 
 
 def test_hollow_code_under_live_contract_keeps_code_repair_steering() -> None:
@@ -15312,7 +16584,7 @@ class TestValueBearingDispatchPreflight:
 
         assert reject is None
 
-    def test_run_reject_degraded_criteria_message_names_criteria_side_cause(self) -> None:
+    def test_run_reject_degraded_criteria_message_names_root_output_repair(self) -> None:
         ctx = _degraded_declaration_stamp_ctx()
 
         reject = workflow_update_module.output_contract_value_bearing_run_reject(
@@ -15320,8 +16592,8 @@ class TestValueBearingDispatchPreflight:
         )
 
         assert reject is not None
-        assert "requested value-bearing output" in reject["error"]
-        assert "Revise the owning code block" not in reject["error"]
+        assert "non-empty top-level `output`" in reject["error"]
+        assert "Revise the owning code block" in reject["error"]
         assert reject["data"]["reason_code"] == "value_bearing_output_required"
 
     def test_run_reject_zero_criteria_message_never_references_a_contract(self) -> None:
