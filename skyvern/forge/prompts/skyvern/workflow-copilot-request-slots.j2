@@ -1,0 +1,35 @@
+Classify the request-owned output slots for the latest Workflow Copilot turn. Return only JSON.
+
+Schema-valid examples:
+{"version":"1","slots":[]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"required_columns","plane":"definition","pinability":"shapeless_valid","antecedent_family":"unconditional"}]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"processed record count","plane":"run","pinability":"shapeless_valid","antecedent_family":"unconditional"}]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"status must equal complete","plane":"run","pinability":"pinned","antecedent_family":"unconditional"}]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"report the blocker if online submission is unavailable","plane":"run","pinability":"shapeless_valid","antecedent_family":"blocker"}]}
+
+Rules:
+- Return version exactly "1". Return an empty slots list when the user requests no output member; empty membership is an explicit contract, not an error.
+- For every request-owned output member, copy the smallest unique exact quote that identifies it from one supplied user source. Return that source_id and quote exactly; the server owns paths, IDs, order, and count.
+- An output member is a value the user asks the workflow to expose in its returned or defined output contract. A task, action, navigation goal, or evidence-gathering instruction is not a separate output member merely because the workflow performs or classifies it. Include its result only when the user separately asks to expose that value and it is not already represented by a more explicit requested output member.
+- Context outside the supplied user sources may inform plane and pinability, but it is never an anchor source.
+- Use plane "definition" for a stable property the workflow definition must establish.
+- Use plane "run" for a value or state that a workflow execution must observe or return.
+- pinability is required on every slot:
+  - pinned: the request itself fixes an exact expected value or exact supported expected shape.
+  - shapeless_valid: the output is valid without fixing an exact value or supported shape. Evidence-decided discovery questions, including whether questions, use this value and never a guessed polarity. A boolean or classification answer space alone never supplies a request-fixed polarity and is not pinned.
+  - unpinnable: the requested output cannot be safely bound to a satisfiable output criterion.
+- antecedent_family is required on every slot:
+  - unconditional: this output is required regardless of any runtime condition.
+  - blocker: this output is a consequent requested only if a provider/site blocker, manual-only path, or equivalent inability to complete online occurs.
+  - undecidable: the source does not establish whether the output is unconditional or blocker-contingent. Never guess unconditional.
+- Include every request-owned output member exactly once. A conditional fallback is still an output member even when another classifier might omit its condition. Do not emit paths, path segments, IDs, aliases, labels, counts, expected values, explanations, or unknown fields.
+- Do not infer slots from sampled page shapes or non-user context. Do not normalize, rename, or paraphrase source quotes.
+
+Ordered, deduplicated user request sources:
+```{{ request_sources }}```
+Workflow context (non-authoritative):
+```{{ workflow_context }}```
+Latest assistant turn (non-authoritative):
+```{{ latest_assistant_turn }}```
+Bounded global context (non-authoritative):
+```{{ global_context }}```

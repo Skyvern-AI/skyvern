@@ -1,6 +1,7 @@
 import type { ActionsApiResponse } from "@/api/types";
 import { useMemo } from "react";
 import { FileIcon } from "@radix-ui/react-icons";
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
@@ -97,12 +98,12 @@ function BlockDownloadedFiles({
             className="flex items-center gap-2 text-sm"
           >
             <FileIcon className="size-4 shrink-0 text-muted-foreground" />
-            <a
+            <ArtifactDownloadLink
               href={file.url}
               className="truncate underline underline-offset-4"
             >
               {file.filename}
-            </a>
+            </ArtifactDownloadLink>
           </div>
         ))}
       </div>

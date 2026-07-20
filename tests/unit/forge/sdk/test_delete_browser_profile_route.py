@@ -20,8 +20,9 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, SimpleNa
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id="org_oss")
 
+    # delete_browser_profile atomically soft-deletes + detaches credentials, returning the cleared ids.
     mocks = SimpleNamespace(
-        delete_db_profile=AsyncMock(),
+        delete_db_profile=AsyncMock(return_value=["cred_1"]),
         delete_profile_blob=AsyncMock(),
     )
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "delete_browser_profile", mocks.delete_db_profile)

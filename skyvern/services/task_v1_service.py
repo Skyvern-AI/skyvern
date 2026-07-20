@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from typing import Any
 
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.schemas.runs import RunEngine, RunStatus, RunType
+from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
 
@@ -113,6 +115,8 @@ async def run_task(
     background_tasks: BackgroundTasks | None = None,
 ) -> Task:
     await _validate_task_v1_model_for_org(organization, task.model)
+    if task.url:
+        task.url = await asyncio.to_thread(validate_fetch_url, task.url)
 
     created_task = await app.agent.create_task(task, organization.organization_id)
     url_hash = generate_url_hash(task.url)

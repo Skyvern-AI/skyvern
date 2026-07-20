@@ -271,11 +271,11 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
-  test("renders the shared run tag editor", () => {
+  test("does not render run tags in Studio Overview", () => {
     seedCompletedRun();
-    const { getByTestId } = renderRunView();
+    const { queryByTestId } = renderRunView();
 
-    expect(getByTestId("run-tags-editor").dataset.workflowRunId).toBe("wr_1");
+    expect(queryByTestId("run-tags-editor")).toBeNull();
   });
 
   test("defaults to the Timeline view with the timeline and step detail", () => {
@@ -286,6 +286,8 @@ describe("RunView view toggles", () => {
     expect(scope.getByRole("group", { name: "Run view" })).not.toBeNull();
     // The timeline tree is visible by default (loop row present).
     expect(scope.queryAllByText("checkout-loop").length).toBeGreaterThan(0);
+    // Studio opts into label search (legacy run view does not).
+    expect(scope.getByRole("button", { name: "Search blocks" })).not.toBeNull();
   });
 
   test("the Timeline view leads with the summary meta line", () => {
@@ -356,6 +358,33 @@ describe("RunView view toggles", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
+  });
+
+  test("definition block prompts count as run inputs", () => {
+    seedCompletedRun({
+      workflow: {
+        workflow_definition: {
+          blocks: [
+            {
+              block_type: "navigation",
+              label: "navigation block",
+              navigation_goal: "Navigate to the next synthetic step",
+            },
+          ],
+          finally_block_label: null,
+        },
+      },
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+
+    expect(scope.queryByText("navigation block")).not.toBeNull();
+    expect(
+      scope.queryByText("Navigate to the next synthetic step"),
+    ).not.toBeNull();
+    expect(scope.queryByText("No inputs for this run")).toBeNull();
   });
 });
 

@@ -379,6 +379,20 @@ def _fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
             return _fix_cutoff_json(json_string, error_position)
 
 
+def loads_with_repair(content: str) -> Any:
+    """Parse JSON, repairing invalid control characters instead of raising.
+
+    Rendering the hashed-href map back into a serialized LLM response injects raw
+    page values (hrefs, attribute text) that can carry literal control characters,
+    which strict ``json.loads`` rejects. json_repair tolerates them.
+    """
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        LOG.warning("Strict JSON parse failed; falling back to json_repair.", exc_info=True)
+        return json_repair.loads(content)
+
+
 def _try_to_extract_json_from_markdown_format(text: str) -> str:
     pattern = r"```json\s*(.*?)\s*```"
     match = re.search(pattern, text, re.DOTALL)

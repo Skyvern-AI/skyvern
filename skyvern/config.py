@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Script reviewer settings
     SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
+    SELF_HEAL_DAILY_CAP: int = 5
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -223,6 +224,8 @@ class Settings(BaseSettings):
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
+    SELF_HEAL_MAX_ACTIONS: int = 15
+    SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     ALLOWED_ORIGIN_REGEX: str | None = None
@@ -756,6 +759,10 @@ class Settings(BaseSettings):
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
 
+    TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS: float = 48.0
+    """Age gate (hours) for the always-on sweep of per-run LOG_PATH/DOWNLOAD_PATH dirs left behind on
+    crash paths. Non-positive disables the sweep."""
+
     # Workflow Schedule Settings
     ENABLE_WORKFLOW_SCHEDULES: bool = True
     """Enable recurring workflow schedules in the OSS/local server."""
@@ -771,6 +778,10 @@ class Settings(BaseSettings):
     OTEL_METRICS_ENABLED: bool = True
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
+    # Log level for the OTLP gRPC exporter's own logger. Raise above WARNING (e.g.
+    # "CRITICAL") to drop its retry/failure records where the OTLP endpoint is
+    # intentionally unavailable; the default keeps export failures visible.
+    OTEL_EXPORTER_LOG_LEVEL: str = "WARNING"
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"

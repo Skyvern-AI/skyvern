@@ -400,15 +400,24 @@ function LoginEditorBody({
               <BlockExecutionOptions
                 continueOnFailure={data.continueOnFailure}
                 nextLoopOnFailure={data.nextLoopOnFailure}
+                includeActionHistoryInVerification={
+                  data.includeActionHistoryInVerification
+                }
                 editable={editable}
                 isInsideForLoop={isInsideForLoop}
                 parentLoopSkipsOnFail={parentLoopSkipsOnFail}
                 blockType="login"
+                showOptions={{
+                  includeActionHistoryInVerification: true,
+                }}
                 onContinueOnFailureChange={(checked) =>
                   update({ continueOnFailure: checked })
                 }
                 onNextLoopOnFailureChange={(checked) =>
                   update({ nextLoopOnFailure: checked })
+                }
+                onIncludeActionHistoryInVerificationChange={(checked) =>
+                  update({ includeActionHistoryInVerification: checked })
                 }
               />
               <DisableCache

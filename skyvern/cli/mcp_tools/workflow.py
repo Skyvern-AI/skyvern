@@ -22,6 +22,7 @@ from pydantic import Field
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -47,6 +48,8 @@ _SUMMARY_SCALAR_PREVIEW_LIMIT = 3
 _SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
 _SUMMARY_STRING_PREVIEW_LIMIT = 120
 _SUMMARY_RECURSION_LIMIT = 10
+_POINTER_MAX_LABELS = 20
+_POINTER_LABEL_BUDGET_CHARS = 800
 _SCREENSHOT_LIST_KEYS = frozenset({"task_screenshots", "workflow_screenshots", "screenshot_urls"})
 _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workflow_screenshot_artifact_ids"})
 
@@ -921,6 +924,47 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _code_block_pointer(blocks: Any, *, hint: str) -> dict[str, Any] | None:
+    """Summarize the workflow's reusable code blocks so a caller learns the code exists without being
+    told in a prompt. Returns None when nothing is reusable, so the key is omitted rather than
+    advertising an empty shell."""
+    if not isinstance(blocks, list):
+        return None
+    code_blocks = [
+        block
+        for block in _iter_blocks_flat(blocks)
+        if block.get("block_type") == BlockType.CODE and isinstance(block.get("code"), str) and block["code"].strip()
+    ]
+    if not code_blocks:
+        return None
+    # Labels are unbounded in the schema, so cap the preview by characters as well as by count: the
+    # oversize branch emits this pointer, and an unbounded preview could push that response back over
+    # the response cap and get the whole pointer stripped. code_block_count stays exact regardless.
+    labels: list[str] = []
+    budget = _POINTER_LABEL_BUDGET_CHARS
+    for block in code_blocks:
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        if len(labels) >= _POINTER_MAX_LABELS:
+            break
+        if len(label) > budget:
+            continue
+        labels.append(label)
+        budget -= len(label)
+    return {
+        "code_block_count": len(code_blocks),
+        "block_labels": labels,
+        "hint": hint,
+    }
+
+
+def _skills_pointer(workflow_system_prompt: Any, *, hint: str) -> dict[str, Any] | None:
+    if not isinstance(workflow_system_prompt, str) or not workflow_system_prompt.strip():
+        return None
+    return {"prompt_chars": len(workflow_system_prompt), "hint": hint}
+
+
 def _iter_positional_block_matches(
     existing_blocks: list[dict[str, Any]],
     update_blocks: list[dict[str, Any]],
@@ -1243,6 +1287,27 @@ def guard_definition_size(
         version_arg = f" --version {version}" if version is not None else ""
         blocks = definition.get("blocks")
         parameters = definition.get("parameters")
+        code_block_pointer = _code_block_pointer(
+            blocks,
+            hint=(
+                "This workflow already carries persisted executable code. Run "
+                f"`skyvern workflow get --id {workflow_id}{version_arg} --definition-file wf.json`, then reuse "
+                "the code blocks from wf.json instead of re-authoring."
+            ),
+        )
+        skills_pointer = data.get("skills")
+        overflow_skills_pointer = None
+        if isinstance(skills_pointer, dict):
+            overflow_skills_pointer = {
+                **skills_pointer,
+                "hint": (
+                    f"This workflow carries {skills_pointer['prompt_chars']} persisted skill-instruction characters, "
+                    "but its definition was omitted from this oversized response. Run "
+                    f"`skyvern workflow get --id {workflow_id}{version_arg} --definition-file wf.json`, edit "
+                    "`workflow_definition.workflow_system_prompt` in wf.json, then run "
+                    f"`skyvern workflow update --id {workflow_id} --definition @wf.json`."
+                ),
+            }
         return make_result(
             "skyvern_workflow_get",
             ok=False,
@@ -1253,6 +1318,8 @@ def guard_definition_size(
                 "block_count": len(_iter_blocks_flat(blocks)) if isinstance(blocks, list) else 0,
                 "parameter_count": len(parameters) if isinstance(parameters, list) else 0,
                 "definition_chars": _response_size(definition),
+                **({"code_block_pointer": code_block_pointer} if code_block_pointer is not None else {}),
+                **({"skills": overflow_skills_pointer} if overflow_skills_pointer is not None else {}),
             },
             timing_ms=result.get("timing_ms"),
             error=make_error(
@@ -1340,7 +1407,12 @@ async def skyvern_workflow_get(
     For very large workflows, run
     `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
     `skyvern workflow update --id <wpid> --definition @wf.json`.
-    The update replaces the whole workflow definition."""
+    The update replaces the whole workflow definition.
+
+    Persisted skill instructions are at `data.workflow_definition.workflow_system_prompt`; `data.skills`
+    reports their raw character count. Preserve them with skyvern_workflow_get → edit →
+    skyvern_workflow_update because omitting the field clears it. JSON preserves skill content exactly;
+    YAML may rewrite Jinja-style references when block labels or parameter keys are sanitized."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_get"):
         return err
 
@@ -1375,11 +1447,31 @@ async def skyvern_workflow_get(
             "workflow_definition": _workflow_definition_to_authoring_shape(wf_data["workflow_definition"]),
         }
 
+    definition = wf_data.get("workflow_definition") if isinstance(wf_data, dict) else None
+    blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    code_block_pointer = _code_block_pointer(
+        blocks,
+        hint=(
+            "This workflow already carries persisted executable code. Read the code blocks' `code` fields in "
+            "workflow_definition and reuse them instead of re-authoring."
+        ),
+    )
+    workflow_system_prompt = definition.get("workflow_system_prompt") if isinstance(definition, dict) else None
+    skills_pointer = _skills_pointer(
+        workflow_system_prompt,
+        hint=(
+            "This workflow carries persisted skill instructions. Read them at "
+            "data.workflow_definition.workflow_system_prompt in this response; preserve them with "
+            "skyvern_workflow_get → edit → skyvern_workflow_update."
+        ),
+    )
     version_str = f", version={version}" if version is not None else ""
     return make_result(
         "skyvern_workflow_get",
         data={
             **wf_data,
+            **({"code_block_pointer": code_block_pointer} if code_block_pointer is not None else {}),
+            **({"skills": skills_pointer} if skills_pointer is not None else {}),
             "sdk_equivalent": f"# No SDK method yet — GET /api/v1/workflows/{workflow_id}{version_str}",
         },
         timing_ms=timer.timing_ms,
@@ -1488,6 +1580,9 @@ async def skyvern_workflow_create(
     max_steps_per_run, totp_identifier, complete_criterion, error_code_mapping,
     continue_on_failure, engine, model, etc.). The schema defaults are intentional; silently
     flipping them changes behavior the user did not request.
+
+    Skill instructions can be stored in `workflow_definition.workflow_system_prompt`; see
+    skyvern_workflow_get for the read/preserve flow and format caveats.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(
@@ -1576,7 +1671,10 @@ async def skyvern_workflow_update(
     For very large workflows, run
     `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
     `skyvern workflow update --id <wpid> --definition @wf.json`.
-    This command replaces the whole workflow definition."""
+    This command replaces the whole workflow definition.
+
+    Preserve `workflow_definition.workflow_system_prompt` when updating — omitting it clears it; see
+    skyvern_workflow_get for the safe get → edit → update flow and format caveats."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
         return err
 

@@ -27,6 +27,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
 import { RunHealChip } from "./RunHealChip";
+import { RunReliabilityUplink } from "./RunReliabilityUplink";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -133,8 +134,9 @@ function WorkflowRunOverview() {
   return (
     <AspectRatio ratio={16 / 9}>
       <div className="relative h-full w-full">
-        <div className="absolute left-2 top-2 z-20">
+        <div className="absolute left-2 top-2 z-20 flex flex-col gap-1">
           <RunHealChip workflowRunId={workflowRunId} />
+          <RunReliabilityUplink workflowRunId={workflowRunId} />
         </div>
         {shouldShowBrowserStream && (
           <BrowserStream

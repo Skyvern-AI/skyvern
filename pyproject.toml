@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.46"
+version = "1.0.47"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -50,7 +50,7 @@ local = [
     "filetype>=1.2.0,<2",
     "fuzzysearch>=0.8,<1",
     "tldextract>=5.1.2,<6",
-    "websockets>=12.0,<15.1",
+    "websockets>=14.0,<15.1",
     "email-validator>=2.2.0,<3",
     "requests-toolbelt>=1.0.0,<2",
     "aiofiles>=24.1.0,<25",
@@ -126,7 +126,7 @@ server = [
     "fuzzysearch>=0.8,<1",
     "aioredlock>=0.7.3,<0.8",
     "tldextract>=5.1.2,<6",
-    "websockets>=12.0,<15.1",
+    "websockets>=14.0,<15.1",
     "email-validator>=2.2.0,<3",
     "requests-toolbelt>=1.0.0,<2",
     "posthog>=3.7.0,<4",
@@ -234,6 +234,7 @@ dev = [
     "python-pptx>=1.0.2",
     "pyinstrument>=5.1.2",
     "pip-audit>=2.10.0",
+    "import-linter>=2.1,<3",
 ]
 
 [tool.hatch.build]
@@ -355,6 +356,48 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 
 [tool.mypy]
 plugins = "sqlalchemy.ext.mypy.plugin"
+
+[tool.importlinter]
+root_packages = ["skyvern"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "proxy core and ports import no framework or I/O libraries"
+type = "forbidden"
+source_modules = ["skyvern.proxy.core", "skyvern.proxy.ports"]
+forbidden_modules = [
+    "aiohttp",
+    "fastapi",
+    "httpx",
+    "playwright",
+    "redis",
+    "requests",
+    "sqlalchemy",
+    "starlette",
+    "structlog",
+    "uvicorn",
+    "websockets",
+]
+
+[[tool.importlinter.contracts]]
+name = "proxy adapters depend on ports and core, never the reverse"
+type = "layers"
+layers = ["skyvern.proxy.adapters", "skyvern.proxy.ports", "skyvern.proxy.core"]
+
+[[tool.importlinter.contracts]]
+name = "proxy never imports runner code or playwright"
+type = "forbidden"
+source_modules = ["skyvern.proxy"]
+forbidden_modules = [
+    "cloud",
+    "codeblock",
+    "playwright",
+    "skyvern.cli",
+    "skyvern.config",
+    "skyvern.forge",
+    "skyvern.webeye",
+    "workers",
+]
 
 [project.scripts]
 skyvern = "skyvern.__main__:main"

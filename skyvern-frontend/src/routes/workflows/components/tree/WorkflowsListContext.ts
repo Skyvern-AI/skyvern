@@ -1,6 +1,7 @@
 import { createContext, useContext, type MouseEvent } from "react";
 import type { ParameterDisplayItem } from "../ParameterDisplayInline";
 import type { Folder } from "../../types/folderTypes";
+import type { WorkflowReliability } from "../../types/reliabilityTypes";
 import type { Tag, TagKey } from "../../types/tagTypes";
 import type { TagColorMap } from "../../types/tagColors";
 
@@ -16,6 +17,7 @@ export interface WorkflowsListContextValue {
   selectedCount: number;
   foldersMap: ReadonlyMap<string, Folder>;
   workflowTagsMap: Record<string, Array<Tag>>;
+  workflowReliabilityMap: Record<string, WorkflowReliability>;
   tagDescriptions: Map<string, string | null>;
   // (key, value) -> palette color for grouped tag chips; undefined until loaded.
   tagColors: TagColorMap | undefined;

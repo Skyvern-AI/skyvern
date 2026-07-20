@@ -5,6 +5,7 @@ of the judge-unavailable success bypass."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -55,6 +56,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    JudgmentTruthCondition,
     RequestPolicy,
     _parse_completion_criteria,
     normalized_criterion_outcome_key,
@@ -296,10 +298,372 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
             ),
             id="contingent-mint-degrade",
         ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="slot-id",
+                    outcome="The requested status is returned.",
+                    output_path="output.status",
+                    request_slot_id="a" * 64,
+                    pinability="pinned",
+                    mint_disposition="pending",
+                ),
+            ),
+            id="request-slot-contract-fields",
+        ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="blocker-family",
+                    outcome="The blocker is reported only when manual service is required.",
+                    antecedent_family="blocker",
+                    request_slot_id="b" * 64,
+                    pinability="shapeless_valid",
+                ),
+            ),
+            id="antecedent-family",
+        ),
     ],
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_terminal_action_verification_mode_round_trips() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert raw[0]["terminal_action_verification_mode"] == "semantic_outcome_v1"
+    assert criteria_from_json(raw) == (criterion,)
+    legacy = {key: value for key, value in raw[0].items() if key != "terminal_action_verification_mode"}
+    assert criteria_from_json([legacy])[0].terminal_action_verification_mode == "family_record_v1"
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(replace(criterion, terminal_action_verification_mode="family_record_v1"),),
+        ),
+        next_epoch=2,
+    )
+    decision = reconcile_completion_criteria(stored, [criterion], actionable=True)
+    assert decision.action == "create"
+    assert decision.criteria[0].terminal_action_verification_mode == "semantic_outcome_v1"
+
+
+def test_terminal_action_reconciliation_cannot_regress_semantic_authority() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+
+    decision = reconcile_completion_criteria(
+        stored,
+        [replace(semantic, terminal_action_verification_mode="family_record_v1")],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.criteria == (semantic,)
+
+
+def test_terminal_action_reconciliation_abstention_cannot_drop_stored_semantic_authority() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+
+    decision = reconcile_completion_criteria(
+        stored,
+        [
+            replace(
+                semantic,
+                kind="outcome",
+                terminal_action_family=None,
+                terminal_action_verification_mode="family_record_v1",
+            )
+        ],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.criteria == (semantic,)
+
+
+def test_terminal_action_semantic_authority_survives_fresh_criterion_reindexing() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+    authenticated = CompletionCriterion(id="c0", outcome="The user is authenticated.")
+    reindexed = replace(
+        semantic,
+        id="c1",
+        kind="outcome",
+        terminal_action_family=None,
+        terminal_action_verification_mode="family_record_v1",
+    )
+
+    decision = reconcile_completion_criteria(stored, [authenticated, reindexed], actionable=True)
+
+    assert decision.action == "create"
+    assert [
+        (criterion.id, criterion.kind, criterion.terminal_action_verification_mode) for criterion in decision.criteria
+    ] == [
+        ("c0", "outcome", "family_record_v1"),
+        ("c1", "terminal_action", "semantic_outcome_v1"),
+    ]
+
+
+def test_expanded_criteria_preserve_stored_terminal_action_semantic_authority() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    added = CompletionCriterion(id="c1", outcome="The confirmation number is returned.")
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+
+    decision = reconcile_completion_criteria(
+        stored,
+        [replace(semantic, terminal_action_verification_mode="family_record_v1"), added],
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == (semantic, added)
+
+
+def test_typed_criteria_list_round_trip_preserves_grading_metadata() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The visible page path label is returned.",
+        output_path="output.visible_page_path_label",
+        expected_output_value="Public start-service path",
+        pinability="unpinnable",
+        mint_degrade="undecidable_judgment",
+        mint_disposition="degraded",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert isinstance(raw, list)
+    assert raw[0]["pinability"] == "unpinnable"
+    assert criteria_from_json(raw) == (criterion,)
+
+
+def test_floor_rekeyed_association_round_trip_preserves_coherent_pair() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The blocker is reported.",
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path="output.blocker",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert raw[0]["requested_output_floor_rekeyed"] is True
+    assert raw[0]["floor_rekeyed_from_path"] == "output.blocker"
+    assert criteria_from_json(raw) == (criterion,)
+
+
+def test_floor_rekeyed_association_legacy_omission_defaults_false() -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done"}])
+
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+
+@pytest.mark.parametrize(
+    "stored_pair",
+    [
+        {"requested_output_floor_rekeyed": True},
+        {"floor_rekeyed_from_path": "output.blocker"},
+        {"requested_output_floor_rekeyed": False, "floor_rekeyed_from_path": "output.blocker"},
+        {"requested_output_floor_rekeyed": True, "floor_rekeyed_from_path": "blocker"},
+        {"requested_output_floor_rekeyed": "true", "floor_rekeyed_from_path": "output.blocker"},
+    ],
+)
+def test_floor_rekeyed_association_decode_fails_closed(stored_pair: dict[str, object]) -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", **stored_pair}])
+
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+
+def test_typed_boolean_validation_classification_round_trip_preserves_shape_and_evidence() -> None:
+    """Typed boolean classifications persist goal_judgment_boolean / independent_run_evidence."""
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The run classifies whether a public form exists.",
+        kind="validation_classification",
+        classification_output_key="public_form_exists",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        judgment_truth_condition=JudgmentTruthCondition(
+            predicate="login_gate_blocks_target", polarity_when_holds=False
+        ),
+        pinability="pinned",
+        mint_disposition="pending",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert raw[0]["expected_output_shape"] == "goal_judgment_boolean"
+    assert raw[0]["requested_output_evidence_source"] == "independent_run_evidence"
+    reloaded = criteria_from_json(raw)
+    assert reloaded == (criterion,)
+    assert reloaded[0].expected_output_shape == "goal_judgment_boolean"
+    assert reloaded[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+def test_untyped_boolean_validation_classification_reload_normalizes_shape_and_evidence() -> None:
+    """Rows without typed mint metadata carry no reliable shape/evidence markers."""
+    legacy = {
+        "id": "c0",
+        "outcome": "The run classifies whether a public form exists.",
+        "kind": "validation_classification",
+        "classification_output_key": "public_form_exists",
+        "expected_output_shape": "goal_judgment_boolean",
+        "requested_output_evidence_source": "independent_run_evidence",
+    }
+
+    reloaded = criteria_from_json([legacy])
+
+    assert reloaded[0].expected_output_shape is None
+    assert reloaded[0].requested_output_evidence_source == "runtime_output"
+
+
+def test_typed_metadata_is_self_describing_without_a_storage_version() -> None:
+    legacy = {"id": "c0", "outcome": "done", "output_path": "output.done"}
+    decorated = {
+        **legacy,
+        "pinability": "unpinnable",
+        "mint_disposition": "degraded",
+    }
+
+    assert criteria_from_json([legacy]) == (CompletionCriterion(id="c0", outcome="done", output_path="output.done"),)
+    assert criteria_from_json([decorated]) == (
+        CompletionCriterion(
+            id="c0",
+            outcome="done",
+            output_path="output.done",
+            pinability="unpinnable",
+            mint_disposition="degraded",
+        ),
+    )
+    assert "antecedent_family" not in criteria_to_json(criteria_from_json([legacy]))[0]
+
+
+def test_antecedent_family_is_reconciliation_identity() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(CompletionCriterion(id="s0", outcome="The blocker is reported.", antecedent_family="blocker"),),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [CompletionCriterion(id="f0", outcome="The blocker is reported.", antecedent_family="unconditional")],
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.reason == "not_subset"
+
+
+def test_floor_rekeyed_association_is_reconciliation_identity() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(
+            CompletionCriterion(
+                id="s0",
+                outcome="The blocker is reported.",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path="output.blocker",
+            ),
+        ),
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [CompletionCriterion(id="f0", outcome="The blocker is reported.")],
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.reason == "not_subset"
+
+
+@pytest.mark.parametrize("invalid_family", ["conditional", [], {"family": "blocker"}])
+def test_criteria_from_json_ignores_invalid_antecedent_family(invalid_family: object) -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", "antecedent_family": invalid_family}])
+
+    assert criterion.antecedent_family is None
+
+
+def test_reconciliation_identity_ignores_pinability_and_derived_mint_state() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(
+            CompletionCriterion(
+                id="s0",
+                outcome="done",
+                output_path="output.done",
+                expected_output_value=True,
+                pinability="pinned",
+            ),
+        ),
+    )
+    fresh = CompletionCriterion(
+        id="f0",
+        outcome="done",
+        output_path="output.done",
+        expected_output_value=True,
+        pinability="unpinnable",
+        mint_degrade="undecidable_judgment",
+        mint_disposition="degraded",
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2), [fresh], actionable=True
+    )
+
+    assert decision.action == "adopt_stored"
 
 
 def test_criteria_from_json_degrades_stored_pathless_contingent() -> None:
@@ -1144,6 +1508,17 @@ def test_reconcile_on_context_adopts_stored_criteria_onto_policy() -> None:
     assert ctx.completion_criteria_turn_state is not None
     assert ctx.completion_criteria_turn_state.decision is not None
     assert ctx.completion_criteria_turn_state.decision.reason == "kept"
+
+
+def test_reconcile_on_context_creates_typed_criteria_without_a_contract_version() -> None:
+    policy = RequestPolicy(completion_criteria=[_criterion("c0", "the item is in the cart")])
+    ctx = _ctx()
+
+    _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(StoredCriteriaSnapshot()))
+
+    plan = plan_persistence(ctx.completion_criteria_turn_state)
+    assert plan is not None
+    assert plan.create_criteria == tuple(policy.completion_criteria)
 
 
 def test_reconcile_on_context_skips_without_snapshot() -> None:

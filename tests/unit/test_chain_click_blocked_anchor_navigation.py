@@ -303,6 +303,12 @@ class TestChainClickBlockedAnchorNavigation:
         action_y: int | None = None,
         action_download: bool = False,
         navigate_result: str | None = "https://portal.example.com/billpay",
+        is_checkbox: bool = False,
+        checked_states: list[bool | None] | None = None,
+        coordinate_raises: bool = False,
+        js_mock: AsyncMock | None = None,
+        is_checked_mock: AsyncMock | None = None,
+        repeat: int = 1,
     ) -> tuple[list, AsyncMock, AsyncMock]:
         """Invoke chain_click through the ``blocking_element is None`` path
         with tightly-scoped stubs.  Returns (results, coordinate_click_mock,
@@ -360,8 +366,17 @@ class TestChainClickBlockedAnchorNavigation:
         elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
         elem.find_blocking_element = AsyncMock(return_value=(None, blocked))  # type: ignore[method-assign]
-        elem.coordinate_click = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        elem.click_in_javascript = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.coordinate_click = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("coordinate click failed") if coordinate_raises else None
+        )
+        elem.click_in_javascript = js_mock if js_mock is not None else AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.is_checkbox = AsyncMock(return_value=is_checkbox)  # type: ignore[method-assign]
+        if is_checked_mock is not None:
+            elem.is_checked = is_checked_mock  # type: ignore[method-assign]
+        elif checked_states is not None:
+            elem.is_checked = AsyncMock(side_effect=list(checked_states))  # type: ignore[method-assign]
+        else:
+            elem.is_checked = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
         try_navigate = AsyncMock(return_value=navigate_result)
         elem.try_navigate_via_href = try_navigate  # type: ignore[method-assign]
@@ -380,6 +395,7 @@ class TestChainClickBlockedAnchorNavigation:
             download=action_download,
             x=action_x,
             y=action_y,
+            repeat=repeat,
         )
 
         results = await handler_module.chain_click(
@@ -504,3 +520,223 @@ class TestChainClickBlockedAnchorNavigation:
 def test_dom_module_exports_try_navigate_via_href() -> None:
     """Sanity check that the helper is a method on ``SkyvernElement``."""
     assert hasattr(dom_module.SkyvernElement, "try_navigate_via_href")
+
+
+class TestChainClickCheckboxCoordinateVerification:
+    """Slice 2 wired through the real ``chain_click`` production branch: a
+    checkbox that reaches the coordinate fallback is state-verified, and
+    non-checkbox elements keep the plain coordinate behavior."""
+
+    _run_chain_click = staticmethod(TestChainClickBlockedAnchorNavigation._run_chain_click)
+
+    @pytest.mark.asyncio
+    async def test_checkbox_coordinate_noop_recovers_via_js(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_checkbox_coordinate_toggle_skips_double_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=False,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, True],
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_not_called()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_checkbox_provable_noop_reports_failure_not_false_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, False],
+            js_mock=js_mock,
+        )
+        js_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionFailure)
+
+    @pytest.mark.asyncio
+    async def test_non_checkbox_keeps_plain_coordinate_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=False,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            is_checkbox=False,
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_not_called()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_multi_click_checkbox_skips_state_verified_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A double-click toggles a checkbox twice and lands on the original state.
+        # The single-click state-verified fallback would misread that net-zero
+        # change as a no-op and add a wrong third JS toggle, so click_count > 1
+        # must keep the plain coordinate path and never consult is_checked.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        is_checked_mock = AsyncMock(side_effect=[False, False, True])
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=False,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            repeat=2,
+            js_mock=js_mock,
+            is_checked_mock=is_checked_mock,
+        )
+        coord_click.assert_awaited_once()
+        is_checked_mock.assert_not_called()
+        js_mock.assert_not_called()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_checkbox_initially_checked_toggles_off_skips_js(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A checkbox that starts checked and flips off is a confirmed toggle:
+        # success is decided by the state change, not a hardcoded ``checked is True``.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[True, False],
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_not_called()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_checkbox_unknown_post_state_reports_success_without_js(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Coordinate click did not raise but the post-click state is unreadable
+        # (detached/navigated): report success and never risk a second toggle.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, None],
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_not_called()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_checkbox_coordinate_raises_and_unknown_state_fails_without_js(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Coordinate click raised and the post-click state is unreadable: the
+        # click may or may not have landed, so a JS retry risks a double toggle.
+        # Report the coordinate failure and stop.
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, None],
+            coordinate_raises=True,
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_not_called()
+        assert results and isinstance(results[-1], ActionFailure)
+        assert "coordinate_click" in results[-1].exception_message
+
+    @pytest.mark.asyncio
+    async def test_checkbox_coordinate_raises_but_provable_noop_recovers_via_js(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Coordinate click raised yet the state is provably unchanged (both reads
+        # known and equal): a single JS toggle is the missing click, not a double.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            coordinate_raises=True,
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_non_checkbox_coordinate_raises_then_js_succeeds_two_result_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Parity guard for the shared ladder: a non-checkbox whose coordinate
+        # click raises but JS click succeeds must still append the coordinate
+        # failure *and* the JS success, in that order.
+        from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
+
+        js_mock = AsyncMock(return_value=None)
+        results, coord_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=False,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            is_checkbox=False,
+            coordinate_raises=True,
+            js_mock=js_mock,
+        )
+        coord_click.assert_awaited_once()
+        js_mock.assert_awaited_once()
+        assert isinstance(results[-2], ActionFailure)
+        assert "coordinate_click" in results[-2].exception_message
+        assert isinstance(results[-1], ActionSuccess)

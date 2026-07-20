@@ -4,6 +4,7 @@ import {
   FileIcon,
 } from "@radix-ui/react-icons";
 
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 
 import { OverviewCodeBlock } from "./OverviewCodeBlock";
@@ -257,7 +258,7 @@ export function RunOutputsSection({
           </span>
           <div className="flex flex-col gap-1">
             {files.map((file) => (
-              <a
+              <ArtifactDownloadLink
                 key={file.url}
                 href={file.url}
                 title={file.url}
@@ -267,7 +268,7 @@ export function RunOutputsSection({
                 <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate">{file.filename}</span>
                 <DownloadIcon className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
-              </a>
+              </ArtifactDownloadLink>
             ))}
           </div>
         </div>

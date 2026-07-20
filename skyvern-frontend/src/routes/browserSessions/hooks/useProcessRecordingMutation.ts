@@ -1,10 +1,12 @@
 import { useParams } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
 import { useRef } from "react";
+import { useFeatureFlagEnabled } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { RECORD_BROWSER_CODE_FIRST_FLAG } from "@/util/featureFlags";
 import {
   useRecordingStore,
   type RecordingDraftStep,
@@ -34,6 +36,9 @@ const useProcessRecordingMutation = ({
   const recordingStore = useRecordingStore();
   const { workflowPermanentId } = useParams();
   const mutationStartedAtRef = useRef<number | null>(null);
+  // Per-user opt-in preview; not enrolled reads as false (agent blocks).
+  const codeFirst =
+    useFeatureFlagEnabled(RECORD_BROWSER_CODE_FIRST_FLAG) ?? false;
 
   const processRecordingMutation = useMutation({
     mutationFn: async (
@@ -86,6 +91,7 @@ const useProcessRecordingMutation = ({
           {
             compressed_chunks: string[];
             draft_steps?: Array<RecordingDraftStep>;
+            code_first: boolean;
           },
           {
             data: {
@@ -96,6 +102,7 @@ const useProcessRecordingMutation = ({
         >(`/browser_sessions/${browserSessionId}/process_recording`, {
           compressed_chunks: compressedChunks,
           workflow_permanent_id: workflowPermanentId,
+          code_first: codeFirst,
           ...(draftSteps !== null ? { draft_steps: draftSteps } : {}),
         })
         .then((response) => ({

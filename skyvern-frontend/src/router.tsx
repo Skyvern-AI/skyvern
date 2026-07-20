@@ -120,6 +120,7 @@ const router = createBrowserRouter([
       { path: "stream", element: <></> },
       { path: "recordings", element: <></> },
       { path: "downloads", element: <></> },
+      { path: "timeline", element: <></> },
       { path: "runs", element: <></> },
     ],
   },

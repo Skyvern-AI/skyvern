@@ -45,12 +45,14 @@ from skyvern.webeye.browser_state import BrowserState
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
+    from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingSnapshot
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
     )
+    from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
     from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -73,6 +76,24 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+DEFINITION_CONTRACT_UNSATISFIED_GATE_ID = "definition_contract_unsatisfied"
+RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID = "recorded_outcome_grounding_binder_ceiling"
+SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID = "synthesized_parameter_binding_ambiguous"
+_POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
+    {
+        DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
+        RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
+        SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
+    }
+)
+_LOCAL_AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
+    {
+        "output_contract_actuation",
+        "metadata_run_preflight_reject",
+        "uncovered_output_rescout_steer",
+        "recorded_outcome_grounding",
+    }
+)
 CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
@@ -151,6 +172,11 @@ class PendingBrowserInteractionObservation:
 class PreRunPageReference:
     text: str
     workflow_run_id: str
+
+
+@dataclass(frozen=True)
+class RejectedCodeArtifactMetadataCapture:
+    payload: Any
 
 
 @dataclass(frozen=True)
@@ -242,6 +268,7 @@ class AgentContext:
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
+    turn_intent: TurnIntent | None = None
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -347,6 +374,7 @@ class AgentContext:
     recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
+    authoring_parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None
     consecutive_non_converging_repair_count: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
@@ -373,6 +401,8 @@ class AgentContext:
     # only normalizes and carries the metadata; sufficiency checks live elsewhere.
     code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
     raw_code_artifact_metadata: object | None = None
+    submitted_code_artifact_metadata_snapshot: Any = None
+    rejected_code_artifact_metadata_captures: list[RejectedCodeArtifactMetadataCapture] = field(default_factory=list)
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
@@ -467,9 +497,12 @@ class AgentContext:
     # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
     pending_goal_complete_landing: bool = False
     synthesized_goal_complete_landed: bool = False
-    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
-    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    # Imposition answered this persist attempt on a goal-complete trajectory; owned-carrier metadata
+    # scaffolding keys off it (workflow_update._scaffold_metadata_from_owned_carrier_produced_output).
     spine_imposition_owned_attempt: bool = False
+    # Synthesized block computed by this persist attempt's imposition pass; the pre-persist spine gate
+    # reuses it so both seams grade one synthesis. Reset at each imposition entry.
+    imposition_synthesized_block: SynthesizedCodeBlock | None = None
     # Label of the code block the imposition attempt owns this call (carrier), including on no-op early
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None
@@ -533,6 +566,7 @@ class AgentContext:
     # extraction_schema declares fields that map to no output the block produces.
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
+    author_time_gate_log_only_ids: frozenset[str] = frozenset()
     author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
     # Single-owner turn-precedence contract. One mechanism owns a turn's steering
     # at a time; a contradicting weaker claim is recorded here and yields.
@@ -543,8 +577,20 @@ class AgentContext:
     blocker_signal_claimant: TurnClaimant | None = None
 
 
-def copilot_author_time_gate_log_only_enabled() -> bool:
-    return not settings.is_cloud_environment() and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+def cache_copilot_author_time_gate_log_only_ids(ctx: AgentContext, resolved_ids: frozenset[str]) -> None:
+    ineligible_ids = resolved_ids - _POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    for gate_id in sorted(ineligible_ids):
+        LOG.info("copilot_gate_log_only_ineligible", gate_id=gate_id)
+    ctx.author_time_gate_log_only_ids = resolved_ids & _POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+
+
+def copilot_author_time_gate_log_only_enabled(ctx: AgentContext, gate_id: str) -> bool:
+    local_blanket_enabled = (
+        not settings.is_cloud_environment()
+        and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+        and gate_id in _LOCAL_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    )
+    return local_blanket_enabled or gate_id in ctx.author_time_gate_log_only_ids
 
 
 def record_author_time_gate_ablation_event(
@@ -556,7 +602,7 @@ def record_author_time_gate_ablation_event(
     blocked_tool: str | None = None,
     payload: AuthorTimeGateAblationPayload | None = None,
 ) -> bool:
-    if not copilot_author_time_gate_log_only_enabled():
+    if not copilot_author_time_gate_log_only_enabled(ctx, gate_id):
         return False
     event = AuthorTimeGateAblationEvent(
         gate_id=gate_id,
@@ -648,6 +694,33 @@ async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, Brow
     return session_id, browser_state, page
 
 
+async def resolve_browser_state_for_context(
+    ctx: AgentContext,
+    *,
+    session_id: str | None = None,
+) -> BrowserState | None:
+    resolved_session_id = session_id if session_id is not None else ctx.browser_session_id
+    if not resolved_session_id:
+        return None
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
+        try:
+            _resolved_session_id, browser_state, _ = await _resolve_self_heal_browser_state(ctx)
+            if _resolved_session_id != resolved_session_id:
+                LOG.info(
+                    "Resolved self-heal browser session id differs from requested",
+                    requested_session_id=resolved_session_id,
+                    resolved_session_id=_resolved_session_id,
+                    organization_id=ctx.organization_id,
+                )
+            return browser_state
+        except HealAdoptionFailed:
+            return None
+    return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+        session_id=resolved_session_id,
+        organization_id=ctx.organization_id,
+    )
+
+
 @asynccontextmanager
 async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
@@ -684,10 +757,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         ctx.browser_session_id = browser_session_id
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
     else:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
         if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
             # Keep the session id out of the raised message -- it can propagate
             # to LLM- or user-visible output -- but log it for operators.
@@ -726,6 +796,12 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             # new SkyvernBrowser's pages[-1] fallback.
             state._active_page = working_page
         register_copilot_session(browser_session_id, state)
+        if is_self_heal_session_id(browser_session_id):
+            LOG.info(
+                "registered self-heal browser session",
+                session_id=browser_session_id,
+                organization_id=ctx.organization_id,
+            )
         try:
             async with scoped_session(state):
                 yield
@@ -737,6 +813,8 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             else:
                 ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
             unregister_copilot_session(browser_session_id)
+            if is_self_heal_session_id(browser_session_id):
+                LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:
         reset_api_key_override(override_token)
 

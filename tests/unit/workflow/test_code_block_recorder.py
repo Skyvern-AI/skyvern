@@ -420,10 +420,12 @@ def _patch_execute_environment(
         "create_action": AsyncMock(return_value=None),
         "update_task": AsyncMock(return_value=None),
         "update_step": AsyncMock(return_value=None),
+        "billing_hook": AsyncMock(return_value=None),
     }
     monkeypatch.setattr(
         "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", validate_code_block
     )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "post_code_block_execution", mocks["billing_hook"], raising=False)
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *args, **kwargs: browser_state)
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: context)
@@ -593,11 +595,20 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
+    # The enabled-gate now lives at the chokepoint, ahead of the mocked floor.
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    # Force the floor path deterministically so this exercises execute()'s seat-finalization
+    # wiring regardless of ambient cap-cache / api-key state leaked by other tests in the suite.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
     monkeypatch.setattr(
         CodeBlock,
         "_attempt_self_heal",
-        AsyncMock(return_value=SimpleNamespace(success=True, output_parameter_value=None)),
+        AsyncMock(return_value=SimpleNamespace(success=True, output_parameter_value=None, failure_reason=None)),
     )
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
@@ -621,6 +632,7 @@ async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.Monke
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
     monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
@@ -632,8 +644,8 @@ async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_goalless_code_block_creates_no_task_or_actions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without a goal there is no task to hang actions on, so none are created or persisted."""
+async def test_goalless_code_block_creates_task_and_persists_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A goalless block still gets a container task so its page activity is visible and billable."""
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
@@ -642,13 +654,15 @@ async def test_goalless_code_block_creates_no_task_or_actions(monkeypatch: pytes
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
-    assert mocks["create_task_and_step"].await_count == 0
-    assert mocks["create_action"].await_count == 0
+    assert mocks["create_task_and_step"].await_count == 1
+    actions = _created_actions(mocks)
+    assert [a.action_type for a in actions] == [ActionType.CLICK]
+    assert all(a.task_id == "tsk_code" and a.step_id == "stp_code" for a in actions)
 
 
 @pytest.mark.asyncio
-async def test_goalless_code_block_skips_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No task means screenshots would have no action row to anchor to, so don't take orphan ones."""
+async def test_goalless_code_block_takes_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a container task now created for goalless blocks, screenshots anchor like goal blocks."""
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
@@ -657,7 +671,60 @@ async def test_goalless_code_block_skips_screenshots(monkeypatch: pytest.MonkeyP
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
-    assert mocks["create_artifact"].await_count == 0
+    assert mocks["create_artifact"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_code_block_success_invokes_billing_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful code block invokes post_code_block_execution with its container task + step, after persist."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    mocks["billing_hook"].assert_awaited_once()
+    task, step = mocks["billing_hook"].await_args.args
+    assert task.task_id == "tsk_code"
+    assert step.step_id == "stp_code"
+    # Billing counts persisted action rows, so the hook must fire after persist.
+    assert mocks["create_action"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_code_block_failure_skips_billing_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed code block is not billed."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("element detached")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    assert mocks["billing_hook"].await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_billing_hook_failure_does_not_fail_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Billing is best-effort at this seam: a hook error must never change the block outcome."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    mocks["billing_hook"].side_effect = RuntimeError("billing backend down")
+
+    block = _make_code_block("value = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
 
 
 @pytest.mark.asyncio

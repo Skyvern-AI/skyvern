@@ -43,6 +43,7 @@ const contextValue: WorkflowsListContextValue = {
   selectedCount: 0,
   foldersMap: new Map(),
   workflowTagsMap: { wpid_1: [{ key: "env", value: "prod" }] },
+  workflowReliabilityMap: {},
   tagDescriptions: new Map(),
   tagColors: new Map(),
   tagKeys: [],

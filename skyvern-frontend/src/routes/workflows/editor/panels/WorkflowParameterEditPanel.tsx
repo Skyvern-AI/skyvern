@@ -13,9 +13,8 @@ import {
 } from "@/components/ui/select";
 import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/util/utils";
-import CloudContext from "@/store/CloudContext";
 import { CodeIcon, Cross2Icon } from "@radix-ui/react-icons";
-import { useContext, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BitwardenItemSelector } from "../../components/BitwardenItemSelector";
 import { CredentialParameterSourceSelector } from "../../components/CredentialParameterSourceSelector";
 import { OnePasswordItemSelector } from "../../components/OnePasswordItemSelector";
@@ -34,6 +33,7 @@ import {
   parameterIsAzureVaultCredential,
   AUTO_GENERATED_CREDENTIAL_KEY_PATTERN,
 } from "../types";
+import { applySkyvernCredentialEdit } from "../utils";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -49,6 +49,7 @@ import {
   header,
   ParameterTypeSelection,
 } from "./WorkflowParameterEditPanel.helpers";
+import { useSkyvernCredentialSourceAvailable } from "../../hooks/useSkyvernCredentialSourceAvailable";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -70,7 +71,7 @@ const workflowParameterTypeOptions = [
 // Determine available sources based on credential data type
 function getAvailableSourcesForDataType(
   dataType: CredentialDataType,
-  isCloud: boolean,
+  skyvernCredentialSourceAvailable: boolean,
   hasCustomCredentialService: boolean,
 ): Array<{ value: CredentialSource; label: string }> {
   const customOption = hasCustomCredentialService
@@ -85,7 +86,9 @@ function getAvailableSourcesForDataType(
   switch (dataType) {
     case "password":
       return [
-        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        ...(skyvernCredentialSourceAvailable
+          ? [{ value: "skyvern" as const, label: "Skyvern" }]
+          : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         { value: "onepassword" as const, label: "1Password" },
         { value: "azurevault" as const, label: "Azure Key Vault" },
@@ -93,13 +96,17 @@ function getAvailableSourcesForDataType(
       ];
     case "secret":
       return [
-        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        ...(skyvernCredentialSourceAvailable
+          ? [{ value: "skyvern" as const, label: "Skyvern" }]
+          : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         ...customOption,
       ];
     case "creditCard":
       return [
-        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        ...(skyvernCredentialSourceAvailable
+          ? [{ value: "skyvern" as const, label: "Skyvern" }]
+          : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         { value: "onepassword" as const, label: "1Password" },
         ...customOption,
@@ -220,7 +227,8 @@ function WorkflowParameterEditPanel({
     "workflow_run_outputs",
     "workflow_run_summary",
   ];
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { parsedConfig: customCredentialServiceConfig } =
     useCustomCredentialServiceConfig();
   const hasCustomCredentialService = customCredentialServiceConfig !== null;
@@ -248,8 +256,31 @@ function WorkflowParameterEditPanel({
       detectInitialCredentialDataType(initialValues),
     );
   const [credentialSource, setCredentialSource] = useState<CredentialSource>(
-    detectInitialCredentialSource(initialValues, isCloud),
+    detectInitialCredentialSource(
+      initialValues,
+      skyvernCredentialSourceAvailable,
+    ),
   );
+  const credentialSourceUserChangedRef = useRef(false);
+  const previousSkyvernCredentialSourceAvailableRef = useRef(
+    skyvernCredentialSourceAvailable,
+  );
+
+  useEffect(() => {
+    const becameAvailable =
+      !previousSkyvernCredentialSourceAvailableRef.current &&
+      skyvernCredentialSourceAvailable;
+    previousSkyvernCredentialSourceAvailableRef.current =
+      skyvernCredentialSourceAvailable;
+
+    if (
+      becameAvailable &&
+      !initialValues &&
+      !credentialSourceUserChangedRef.current
+    ) {
+      setCredentialSource("skyvern");
+    }
+  }, [initialValues, skyvernCredentialSourceAvailable]);
 
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? (initialValues?.urlParameterKey ?? "") : "",
@@ -359,7 +390,7 @@ function WorkflowParameterEditPanel({
     setBitwardenManualEntry(false);
     const availableSources = getAvailableSourcesForDataType(
       newDataType,
-      isCloud,
+      skyvernCredentialSourceAvailable,
       hasCustomCredentialService,
     );
     if (!availableSources.find((s) => s.value === credentialSource)) {
@@ -369,7 +400,7 @@ function WorkflowParameterEditPanel({
 
   const availableSources = getAvailableSourcesForDataType(
     credentialDataType,
-    isCloud,
+    skyvernCredentialSourceAvailable,
     hasCustomCredentialService,
   );
 
@@ -394,7 +425,9 @@ function WorkflowParameterEditPanel({
   const showAzureVaultFields =
     showCredentialFields && credentialSource === "azurevault";
   const showSkyvernCredentialSelector =
-    showCredentialFields && credentialSource === "skyvern" && isCloud;
+    showCredentialFields &&
+    credentialSource === "skyvern" &&
+    skyvernCredentialSourceAvailable;
   const showCustomCredentialSelector =
     showCredentialFields &&
     credentialSource === "custom" &&
@@ -479,9 +512,14 @@ function WorkflowParameterEditPanel({
                     // Clear credential-specific state when switching away from credential
                     // to prevent stale data if user switches back
                     if (wasCredential && !isNowCredential) {
+                      credentialSourceUserChangedRef.current = false;
                       setCredentialId("");
                       setCredentialDataType("password");
-                      setCredentialSource(isCloud ? "skyvern" : "bitwarden");
+                      setCredentialSource(
+                        skyvernCredentialSourceAvailable
+                          ? "skyvern"
+                          : "bitwarden",
+                      );
                       setBitwardenLoginCredentialItemId("");
                       setBitwardenCollectionId("");
                       setUrlParameterKey("");
@@ -638,9 +676,10 @@ function WorkflowParameterEditPanel({
                 </div>
                 <Select
                   value={credentialSource}
-                  onValueChange={(value) =>
-                    setCredentialSource(value as CredentialSource)
-                  }
+                  onValueChange={(value) => {
+                    credentialSourceUserChangedRef.current = true;
+                    setCredentialSource(value as CredentialSource);
+                  }}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue placeholder="Select source" />
@@ -1135,12 +1174,13 @@ function WorkflowParameterEditPanel({
                       });
                       return;
                     }
-                    onSave({
-                      key,
-                      parameterType: "credential",
-                      credentialId,
-                      description,
-                    });
+                    onSave(
+                      applySkyvernCredentialEdit(initialValues, {
+                        key,
+                        credentialId,
+                        description,
+                      }),
+                    );
                     return;
                   }
 

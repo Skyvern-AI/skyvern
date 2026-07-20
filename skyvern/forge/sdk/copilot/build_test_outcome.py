@@ -45,6 +45,7 @@ BuildTestOutcomeReasonCode = Literal[
     "sandbox_unresolved_name",
     "synthesized_parameter_binding_ambiguous",
     "code_safety_reject",
+    "code_block_unrenderable",
     "credential_scout_reject",
     "schema_incompatibility",
     "verified_success",

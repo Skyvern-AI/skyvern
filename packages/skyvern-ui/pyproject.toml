@@ -1,6 +1,6 @@
 [project]
 name = "skyvern-ui"
-version = "1.0.46"
+version = "1.0.47"
 description = "Prebuilt Skyvern UI assets for the Skyvern CLI"
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"

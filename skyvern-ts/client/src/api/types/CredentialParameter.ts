@@ -6,6 +6,8 @@ export interface CredentialParameter {
     credential_parameter_id: string;
     workflow_id: string;
     credential_id: string;
+    credential_ids?: string[];
+    selection_strategy?: string;
     created_at: string;
     modified_at: string;
     deleted_at?: string;

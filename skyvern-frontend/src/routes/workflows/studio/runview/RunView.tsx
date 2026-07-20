@@ -14,7 +14,6 @@ import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { isRecord } from "@/util/utils";
-import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
@@ -34,6 +33,7 @@ import {
 } from "../runProjections";
 import { toReadableSearch } from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
+import { collectBlockPrompts } from "./blockPrompts";
 import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
@@ -288,6 +288,9 @@ export function RunView({
   const runInputs = useMemo(() => {
     const definitionParameters =
       workflowRun?.workflow?.workflow_definition?.parameters;
+    const blockPrompts = collectBlockPrompts(
+      workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+    );
     const runParameters =
       (workflowRun?.parameters as Record<string, unknown> | undefined) ?? {};
     const parameters = getOrderedRunParameters(
@@ -310,7 +313,7 @@ export function RunView({
     pushMeta("Browser session", workflowRun?.browser_session_id);
     pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
-    return { parameters, meta };
+    return { parameters, blockPrompts, meta };
   }, [workflowRun]);
 
   // Task 2.0 runs carry their output (and any webhook failure) on task_v2,
@@ -322,7 +325,9 @@ export function RunView({
     null;
 
   const hasInputs =
-    runInputs.parameters.length > 0 || runInputs.meta.length > 0;
+    runInputs.parameters.length > 0 ||
+    runInputs.blockPrompts.length > 0 ||
+    runInputs.meta.length > 0;
   const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
@@ -340,11 +345,6 @@ export function RunView({
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
         />
-        <RunTagsEditor
-          workflowRunId={workflowRun.workflow_run_id}
-          className="shrink-0"
-        />
-
         {provisioning ? (
           <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-slate-elevation2 px-3 py-1.5 text-xs text-muted-foreground">
             <ClockIcon className="h-3.5 w-3.5 shrink-0" />
@@ -406,6 +406,7 @@ export function RunView({
                   <WorkflowRunTimeline
                     workflowRunId={workflowRunId}
                     hideLiveBadge
+                    enableSearch
                     activeItem={activeItem}
                     activeIteration={activeIteration}
                     onActionItemSelected={(item) => {
@@ -459,6 +460,7 @@ export function RunView({
             {hasInputs ? (
               <RunInputsSection
                 parameters={runInputs.parameters}
+                blockPrompts={runInputs.blockPrompts}
                 meta={runInputs.meta}
               />
             ) : (

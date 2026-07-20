@@ -54,6 +54,7 @@ async def run_sdk_action(
     action = action_request.action
 
     # Use existing workflow_run_id if provided, otherwise create a new one
+    created_workflow_run = not action_request.workflow_run_id
     if action_request.workflow_run_id:
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=action_request.workflow_run_id,
@@ -266,6 +267,18 @@ async def run_sdk_action(
         )
         raise
     finally:
+        # This route runs the whole mini-task in-process, so nothing in the worker
+        # lifecycle ever drains its artifact uploads / step archives or removes its
+        # workflow-run context — without this, every call leaks them (SKY-12524).
+        try:
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
+        except Exception:
+            LOG.warning("Failed to drain artifact uploads for SDK action", task_id=task.task_id, exc_info=True)
+        # Only tear down a run we created. A client-provided workflow_run_id is shared across
+        # concurrent run_action calls on this process-global manager, so removing it here yanks the
+        # context out from under an in-flight sibling call.
+        if created_workflow_run:
+            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
         skyvern_context.reset()
 
     return RunSdkActionResponse(

@@ -9,6 +9,7 @@ import pytest
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 
 
 def make_real_wait_for_timeout() -> AsyncMock:
@@ -75,7 +76,7 @@ def make_probe_locator(
 
 
 def make_skyvern_page(page: MagicMock) -> MagicMock:
-    wrapper = MagicMock()
+    wrapper = MagicMock(spec=SkyvernPage)
     wrapper.page = page
     wrapper.url = page.url
     if "evaluate" in page.__dict__:
@@ -85,6 +86,35 @@ def make_skyvern_page(page: MagicMock) -> MagicMock:
     if "context" in page.__dict__:
         wrapper.context = page.context
     return wrapper
+
+
+def make_select_option_page(*, locator_scope: Any | None = None) -> tuple[SimpleNamespace, AsyncMock]:
+    native_select_option = AsyncMock(return_value="selected")
+    raw_page = MagicMock()
+    # The credential-safety boundary probe reads whether the target is a password input.
+    probe = MagicMock()
+    probe.first = probe
+    probe.evaluate = AsyncMock(return_value=False)
+    probe.select_option = AsyncMock(return_value="selected")
+    raw_page.locator = MagicMock(return_value=probe)
+    page = SimpleNamespace(page=raw_page, select_option=native_select_option)
+    if locator_scope is not None:
+        if isinstance(locator_scope, MagicMock):
+            locator_scope.locator = MagicMock(return_value=probe)
+        page._locator_scope = locator_scope
+    return page, native_select_option
+
+
+def make_select_like_page(target: dict[str, Any]) -> tuple[MagicMock, MagicMock]:
+    control = MagicMock()
+    control.first = control
+    control.evaluate = AsyncMock(return_value=target)
+    control.click = AsyncMock()
+    control.fill = AsyncMock()
+    page = MagicMock()
+    page.evaluate = AsyncMock(return_value=[])
+    page.locator = MagicMock(return_value=control)
+    return page, control
 
 
 def patch_get_page(monkeypatch: pytest.MonkeyPatch, module: Any, page: MagicMock, ctx: BrowserContext) -> AsyncMock:

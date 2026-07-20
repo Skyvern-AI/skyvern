@@ -9,6 +9,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    _artifact_contract_paths,
     _GroundingCtx,
     floor_rekeyed_path_backing,
     grade_requested_output_criteria,
@@ -20,13 +21,16 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
     EvidenceSourceKind,
+    RegisteredBlockerEvidence,
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
+    carry_criterion_metadata,
     carry_degraded_criterion_ids,
     carry_floor_rekeyed_criterion_ids,
     carry_floor_rekeyed_path_backing,
     combine_verification_results,
+    effective_unmet_verdicts,
     evaluate_completion_criteria,
     grade_definition_criteria,
     grade_fallback_floor_reached_end_state_criteria,
@@ -37,6 +41,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_terminal_goal_record_corroboration,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
+    gradeable_completion_criteria,
     is_fallback_floor_base_criterion,
     is_registered_download_completion_criterion,
     only_degraded_blocking,
@@ -54,6 +59,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_KIND_EXTENSION,
     DOWNLOAD_KIND_REGISTERED,
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     ReachedDownloadTarget,
     derive_from_block_outputs,
 )
@@ -96,13 +102,6 @@ _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
 # and observation flag cannot be traversed as observed page content.
 _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
-_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
-_CLASSIFIER_DEFAULT_MINT_SOURCE: RequestedOutputPathMintSource = "classifier_default"
-if REQUESTED_OUTPUT_PATH_MINT_SOURCES != {_CLASSIFIER_DEFAULT_MINT_SOURCE}:
-    raise RuntimeError(
-        "RequestedOutputPathMintSource gained a member; the reconciled registered-download "
-        "requested-output identity carry must be revisited before this equality can stay strict."
-    )
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
@@ -170,25 +169,28 @@ def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool
 
 
 def _registered_download_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    requested_path = criterion.output_path if criterion.output_path is not None else criterion.floor_rekeyed_from_path
     return (
-        criterion.output_path is not None
+        requested_path is not None
         and criterion.level != "definition"
         and not criterion.method_mandated
-        and criterion.output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+        and requested_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
     )
 
 
 def _is_minted_registered_download_requested_output(criterion: CompletionCriterion) -> bool:
     return (
         _registered_download_requested_output_criterion(criterion)
-        and criterion.requested_output_path_mint_source == _CLASSIFIER_DEFAULT_MINT_SOURCE
+        and criterion.requested_output_path_mint_source in REQUESTED_OUTPUT_PATH_MINT_SOURCES
     )
 
 
-def _registered_download_criterion_carrying_requested_output(*, carries_requested_output: bool) -> CompletionCriterion:
+def _registered_download_criterion_carrying_requested_output(
+    *, witnessed_mint_source: RequestedOutputPathMintSource | None
+) -> CompletionCriterion:
     criterion = registered_download_completion_criterion()
-    if carries_requested_output:
-        return replace(criterion, requested_output_path_mint_source=_CLASSIFIER_DEFAULT_MINT_SOURCE)
+    if witnessed_mint_source is not None:
+        return replace(criterion, requested_output_path_mint_source=witnessed_mint_source)
     return criterion
 
 
@@ -197,7 +199,7 @@ def _minted_registered_download_requested_output_count(criteria: list[Completion
         1
         for criterion in criteria
         if is_registered_download_completion_criterion(criterion)
-        and criterion.requested_output_path_mint_source == _CLASSIFIER_DEFAULT_MINT_SOURCE
+        and criterion.requested_output_path_mint_source in REQUESTED_OUTPUT_PATH_MINT_SOURCES
     )
 
 
@@ -209,13 +211,27 @@ def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool
     return _result_has_registered_download_block_output(result)
 
 
+def _formed_completion_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
+    policy = _completion_request_policy(copilot_ctx)
+    return policy.graded_completion_criteria() if policy is not None else []
+
+
 def _reconcile_download_completion_criterion(
     copilot_ctx: Any, result: dict[str, Any], criteria: list[CompletionCriterion]
 ) -> list[CompletionCriterion]:
     has_registered_download_evidence = _result_has_registered_download_block_output(result)
-    stripped_minted_requested_output = has_registered_download_evidence and any(
-        _is_minted_registered_download_requested_output(criterion) for criterion in criteria
-    )
+    # The gradeable filter drops degraded minted asks, so the association witness reads the formed
+    # criteria; a degraded witness supplies requested-output identity only, never confirmation.
+    witnessed_mint_source: RequestedOutputPathMintSource | None = None
+    if has_registered_download_evidence:
+        witnessed_mint_source = next(
+            (
+                criterion.requested_output_path_mint_source
+                for criterion in [*criteria, *_formed_completion_criteria(copilot_ctx)]
+                if _is_minted_registered_download_requested_output(criterion)
+            ),
+            None,
+        )
     reconciled = (
         [criterion for criterion in criteria if not _registered_download_requested_output_criterion(criterion)]
         if has_registered_download_evidence
@@ -227,9 +243,7 @@ def _reconcile_download_completion_criterion(
         return reconciled
     return [
         *reconciled,
-        _registered_download_criterion_carrying_requested_output(
-            carries_requested_output=stripped_minted_requested_output
-        ),
+        _registered_download_criterion_carrying_requested_output(witnessed_mint_source=witnessed_mint_source),
     ]
 
 
@@ -237,15 +251,24 @@ def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriter
     policy = _completion_request_policy(copilot_ctx)
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
-    criteria = policy.graded_completion_criteria() if policy is not None else []
+    formed_criteria = policy.graded_completion_criteria() if policy is not None else []
+    criteria = gradeable_completion_criteria(formed_criteria)
     authored_output_criteria = _authored_output_contract_criteria(copilot_ctx)
-    if authored_output_criteria and (not criteria or all(is_fallback_floor_criterion(c) for c in criteria)):
+    if authored_output_criteria and (
+        not formed_criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)
+    ):
         return authored_output_criteria
     if _accepted_staged_output_contract_missing(copilot_ctx) and (
-        not criteria or all(is_fallback_floor_criterion(c) for c in criteria)
+        not formed_criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)
     ):
         return [_authored_output_contract_missing_criterion()]
     return criteria
+
+
+def _carry_degraded_ids(copilot_ctx: Any, verification: CompletionVerificationResult) -> CompletionVerificationResult:
+    policy = _completion_request_policy(copilot_ctx)
+    formed_criteria = policy.graded_completion_criteria() if policy is not None else []
+    return carry_degraded_criterion_ids(verification, formed_criteria)
 
 
 def _authored_output_contract_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
@@ -277,6 +300,98 @@ def _accepted_staged_output_contract_metadata(copilot_ctx: Any) -> object:
     if _authored_output_contract_metadata_paths(metadata):
         return metadata
     return getattr(copilot_ctx, "code_artifact_metadata", None)
+
+
+def _exact_registered_output_path_value(value: object, output_path: str) -> tuple[bool, object]:
+    parts = output_path.removeprefix("output.").split(".")
+    if not parts or any(not part for part in parts):
+        return False, None
+    current = value
+    for part in parts:
+        if not isinstance(current, Mapping) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _registered_blocker_evidence_by_request_slot_id(
+    copilot_ctx: Any,
+    run_data: Mapping[str, Any],
+) -> dict[str, tuple[RegisteredBlockerEvidence, ...]]:
+    """Bind blocker evidence through exact criterion -> artifact owner -> run row identity."""
+    metadata = _accepted_staged_output_contract_metadata(copilot_ctx)
+    if not isinstance(metadata, Mapping):
+        return {}
+    formed_criteria = _formed_completion_criteria(copilot_ctx)
+    blocker_criteria = [
+        criterion
+        for criterion in formed_criteria
+        if criterion.antecedent_family == "blocker" and criterion.request_slot_id is not None
+    ]
+    criterion_paths: dict[str, list[CompletionCriterion]] = {}
+    for criterion in formed_criteria:
+        output_path = criterion.output_path or criterion.floor_rekeyed_from_path
+        if isinstance(output_path, str) and output_path.startswith("output."):
+            criterion_paths.setdefault(output_path, []).append(criterion)
+
+    metadata_labels_by_path: dict[str, list[str]] = {}
+    for metadata_key, artifact in metadata.items():
+        if not isinstance(artifact, Mapping):
+            continue
+        block_label = str(artifact.get("block_label") or metadata_key).strip()
+        if not block_label:
+            continue
+        for path in _artifact_contract_paths(artifact):
+            metadata_labels_by_path.setdefault(path, []).append(block_label)
+
+    registered_rows = _registered_output_parameter_payloads(run_data)
+    candidates_by_slot_id: dict[str, list[RegisteredBlockerEvidence]] = {}
+    identity_owners: dict[tuple[str, str, str], list[str]] = {}
+    for criterion in blocker_criteria:
+        slot_id = criterion.request_slot_id
+        output_path = criterion.output_path or criterion.floor_rekeyed_from_path
+        if slot_id is None or not isinstance(output_path, str) or len(criterion_paths.get(output_path, ())) != 1:
+            continue
+        metadata_labels = metadata_labels_by_path.get(output_path.removeprefix("output."), ())
+        if len(metadata_labels) != 1:
+            continue
+        metadata_label = metadata_labels[0]
+        candidates: list[RegisteredBlockerEvidence] = []
+        for registered in registered_rows:
+            registered_block_label = registered.get("block_label")
+            registered_output_key = registered.get("output_parameter_key")
+            if (
+                not isinstance(registered_block_label, str)
+                or registered_block_label != metadata_label
+                or not isinstance(registered_output_key, str)
+                or not registered_output_key
+            ):
+                continue
+            found, value = _exact_registered_output_path_value(registered.get("value"), output_path)
+            if not found:
+                continue
+            registered_output_id = registered.get("output_parameter_id")
+            candidates.append(
+                RegisteredBlockerEvidence(
+                    block_label=registered_block_label,
+                    output_path=output_path,
+                    registered_output_key=registered_output_key,
+                    registered_output_id=(registered_output_id if isinstance(registered_output_id, str) else None),
+                    value=value,
+                )
+            )
+            identity_owners.setdefault((registered_block_label, registered_output_key, output_path), []).append(slot_id)
+        candidates_by_slot_id[slot_id] = candidates
+
+    associations: dict[str, tuple[RegisteredBlockerEvidence, ...]] = {}
+    for slot_id, candidates in candidates_by_slot_id.items():
+        if len(candidates) != 1:
+            continue
+        candidate = candidates[0]
+        identity = (candidate.block_label, candidate.registered_output_key, candidate.output_path)
+        if len(identity_owners.get(identity, ())) == 1:
+            associations[slot_id] = (candidate,)
+    return associations
 
 
 def _authored_output_contract_metadata_paths(metadata: object) -> set[str]:
@@ -459,10 +574,13 @@ async def _maybe_run_completion_verification_from_page_observation(
     )
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
-        verification = carry_degraded_criterion_ids(verification, criteria)
+        verification = carry_criterion_metadata(verification, criteria)
+        verification = _carry_degraded_ids(copilot_ctx, verification)
         verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
         copilot_ctx.completion_verification_result = verification
-        record_completion_verification(copilot_ctx, verification)
+        record_completion_verification(
+            copilot_ctx, verification, workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id
+        )
         _record_adjudication_on_turn_state(copilot_ctx, verification)
         _emit_completion_verification_trace(copilot_ctx, verification)
         return verification
@@ -616,7 +734,8 @@ async def _maybe_run_completion_verification_from_page_observation(
                 requested_output_criteria_count=len(requested_output_criteria),
             )
 
-    verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = carry_criterion_metadata(verification, criteria)
+    verification = _carry_degraded_ids(copilot_ctx, verification)
     verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     if (
         isinstance(existing, CompletionVerificationResult)
@@ -626,7 +745,9 @@ async def _maybe_run_completion_verification_from_page_observation(
         return existing
 
     copilot_ctx.completion_verification_result = verification
-    record_completion_verification(copilot_ctx, verification)
+    record_completion_verification(
+        copilot_ctx, verification, workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id
+    )
     _record_adjudication_on_turn_state(copilot_ctx, verification)
     if verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, verification)
@@ -998,6 +1119,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     blocks = data.get("blocks")
     block_outputs: dict[str, Any] = {}
     block_output_sources: dict[str, EvidenceSourceKind] = {}
+    registered_output_values: dict[str, Any] = {}
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
@@ -1022,12 +1144,23 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
+        registered_output_value = _completion_evidence_payload(registered.get("value"))
+        registered_block_label = registered.get("block_label")
+        if isinstance(registered_output_key, str) and registered_output_key:
+            registered_output_values[registered_output_key] = registered_output_value
+        if isinstance(registered_block_label, str) and registered_block_label in current_labels:
+            if isinstance(registered_output_key, str) and registered_output_key:
+                registered_existing = registered_output_values.get(registered_block_label)
+                if isinstance(registered_existing, dict):
+                    registered_existing.setdefault(registered_output_key, registered_output_value)
+                else:
+                    registered_output_values[registered_block_label] = {registered_output_key: registered_output_value}
+            else:
+                registered_output_values[registered_block_label] = registered_output_value
         if not _is_meaningful_extracted_data(
             _registered_output_payload_view(registered.get("value"), registered.get("block_type"))
         ):
             continue
-        registered_output_value = _completion_evidence_payload(registered.get("value"))
-        registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
             block_output_sources[registered_output_key] = "registered_output_parameter"
@@ -1068,6 +1201,10 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         block_outputs=block_outputs,
         block_output_sources=block_output_sources,
+        registered_output_values=registered_output_values,
+        registered_blocker_evidence_by_request_slot_id=_registered_blocker_evidence_by_request_slot_id(
+            copilot_ctx, data
+        ),
         current_url=_valid_runtime_anchor_url(data.get("current_url")),
         page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
         run_terminal_status=run_terminal_status
@@ -1355,7 +1492,14 @@ async def _maybe_run_completion_verification(
     verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
     if verification is None:
         return None
-    verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = replace(
+        verification,
+        registered_blocker_evidence_by_request_slot_id=dict(
+            _build_run_evidence_snapshot(copilot_ctx, result).registered_blocker_evidence_by_request_slot_id
+        ),
+    )
+    verification = carry_criterion_metadata(verification, criteria)
+    verification = _carry_degraded_ids(copilot_ctx, verification)
     verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     run_data = result.get("data")
     return _carry_floor_rekeyed_backing(
@@ -1658,9 +1802,7 @@ def _missing_evidence_detail(
 ) -> str | None:
     outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
     parts: list[str] = []
-    for verdict in completion_verification.verdicts:
-        if verdict.satisfied or completion_verification.is_structural_contingent_abstention(verdict):
-            continue
+    for verdict in effective_unmet_verdicts(completion_verification):
         missing_evidence = verdict_missing_evidence(verdict)
         if not missing_evidence:
             continue
@@ -1688,13 +1830,20 @@ def _outcome_failure_warrants_repair(
         return False
     if only_degraded_blocking(completion_verification):
         return False
-    if any(verdict.reason_code == "evidence_contradicts" for verdict in completion_verification.verdicts):
+    unmet_verdicts = effective_unmet_verdicts(completion_verification)
+    if any(
+        verdict.reason_code == "evidence_contradicts"
+        and not completion_verification.is_structural_contingent_abstention(verdict)
+        for verdict in unmet_verdicts
+    ):
         return True
     # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
     # (absent judge signal, unmappable definition checks) never warrants repair.
     if not any(
-        verdict.state == "unsatisfied" and not _is_structural_requested_output_abstention(verdict)
-        for verdict in completion_verification.verdicts
+        verdict.state == "unsatisfied"
+        and not _is_structural_requested_output_abstention(verdict)
+        and not completion_verification.is_structural_contingent_abstention(verdict)
+        for verdict in unmet_verdicts
     ):
         return False
     return _current_workflow_has_evidence_block(copilot_ctx)

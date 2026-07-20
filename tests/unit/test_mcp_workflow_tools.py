@@ -6,12 +6,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
+from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.mcp_tools import mcp
-from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowRequest
+from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS, size_capped
+from skyvern.schemas.workflows import (
+    WorkflowCreateYAMLRequest,
+    WorkflowRequest,
+    sanitize_workflow_yaml_with_references,
+)
 from tests.unit._mcp_test_helpers import patch_get_workflow_by_id as _patch_get_workflow_by_id
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
@@ -56,6 +62,16 @@ def _fake_workflow_dict(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def _patch_workflow_get_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_definition: dict[str, object],
+) -> None:
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(workflow_definition=workflow_definition)
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
 
 def _large_runtime_workflow_definition() -> dict[str, object]:
@@ -3787,6 +3803,225 @@ async def test_workflow_update_does_not_reinject_intentionally_removed_parameter
 
 
 @pytest.mark.asyncio
+async def test_workflow_get_advertises_persisted_code_blocks_without_mutating_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocks = [
+        {
+            "block_type": "code",
+            "label": f"reusable_step_{index:02d}",
+            "code": f'return {{"step": {index}}}',
+        }
+        for index in range(22)
+    ]
+    workflow_definition: dict[str, object] = {"parameters": [], "blocks": blocks}
+    before = json.dumps(workflow_definition, ensure_ascii=False, separators=(",", ":")).encode()
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    assert result["ok"] is True
+    data = result["data"]
+    pointer = data["code_block_pointer"]
+    assert pointer["code_block_count"] == 22
+    assert pointer["block_labels"] == [f"reusable_step_{index:02d}" for index in range(20)]
+    # The normal path carries the code inline, so it must point at the response — not at the CLI
+    # fallback. Asserting the absence keeps the overflow hint from satisfying this test.
+    assert "workflow_definition" in pointer["hint"]
+    assert "--definition-file" not in pointer["hint"]
+    after = json.dumps(data["workflow_definition"], ensure_ascii=False, separators=(",", ":")).encode()
+    assert after == before
+    assert "code_block_pointer" not in data["workflow_definition"]
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        pytest.param(
+            [
+                {
+                    "block_type": "navigation",
+                    "label": "open_page",
+                    "url": "https://example.com",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+            id="agent-only",
+        ),
+        pytest.param([{"block_type": "code", "label": "empty_shell", "code": ""}], id="empty-code"),
+        pytest.param([{"block_type": "code", "label": "blank_shell", "code": "   \n"}], id="blank-code"),
+        pytest.param([], id="no-blocks"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_workflow_get_omits_code_block_pointer_without_reusable_code(
+    monkeypatch: pytest.MonkeyPatch,
+    blocks: list[dict[str, object]],
+) -> None:
+    workflow_definition: dict[str, object] = {"parameters": [], "blocks": blocks}
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    assert result["ok"] is True
+    assert "code_block_pointer" not in result["data"]
+    assert result["data"]["workflow_definition"] == workflow_definition
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_counts_nested_code_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_definition: dict[str, object] = {
+        "parameters": [],
+        "blocks": [
+            {
+                "block_type": "for_loop",
+                "label": "each_item",
+                "loop_blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "reuse_nested_code",
+                        "code": 'return {"ok": True}',
+                    }
+                ],
+            }
+        ],
+    }
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    assert result["data"]["code_block_pointer"]["code_block_count"] == 1
+    assert result["data"]["code_block_pointer"]["block_labels"] == ["reuse_nested_code"]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_large_workflow_get_preserves_code_block_pointer(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_workflow_get_definition(monkeypatch, _large_runtime_workflow_definition())
+    wrapped_get = size_capped(workflow_tools.guard_definition_size(workflow_tools.skyvern_workflow_get))
+
+    result = await wrapped_get(workflow_id="wpid_test")
+
+    assert result["ok"] is False
+    pointer = result["data"]["code_block_pointer"]
+    assert pointer["code_block_count"] == 88
+    assert pointer["block_labels"] == [f"portal_step_{index:03d}" for index in range(20)]
+    # The overflow branch drops the definition, so the hint must route to the CLI and must NOT tell the
+    # caller to read a workflow_definition that is not in this response.
+    assert "skyvern workflow get --id wpid_test --definition-file wf.json" in pointer["hint"]
+    assert "workflow_definition" not in pointer["hint"]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_large_workflow_get_pointer_survives_oversized_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_definition: dict[str, object] = {
+        "parameters": [],
+        "blocks": [
+            {"block_type": "code", "label": "l" * 20_000, "code": f'return {{"step": {index}}}'} for index in range(30)
+        ],
+    }
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+    wrapped_get = size_capped(workflow_tools.guard_definition_size(workflow_tools.skyvern_workflow_get))
+
+    result = await wrapped_get(workflow_id="wpid_test")
+
+    # 600K of labels must not re-inflate the oversize response past the cap and get the whole pointer
+    # stripped by the outer size_capped. No label is previewable here, but the count stays exact.
+    pointer = result["data"]["code_block_pointer"]
+    assert pointer["code_block_count"] == 30
+    assert pointer["block_labels"] == []
+    assert workflow_tools._response_size(result) <= MCP_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_code_block_pointer_survives_concise_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Concise is the MCP server's default response mode and it drops every key in `_DATA_STRIP_KEYS` —
+    which already contains `sdk_equivalent`, the additive sibling this pointer sits beside and is modelled
+    on. That neighbour is disposable chatter; this pointer is the whole feature. Adding it to that strip
+    list would kill discovery in the only mode that ships, and nothing else would fail.
+    """
+    _patch_workflow_get_definition(
+        monkeypatch,
+        {"parameters": [], "blocks": [{"block_type": "code", "label": "reuse_me", "code": 'return {"ok": True}'}]},
+    )
+
+    set_concise_responses(True)
+    try:
+        result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    finally:
+        set_concise_responses(False)
+
+    assert result["data"]["code_block_pointer"]["code_block_count"] == 1
+    # The contrast that gives this test its point: the neighbouring key IS stripped here.
+    assert "sdk_equivalent" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_code_bearing_workflow_inside_the_pointer_shifted_band_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pointer counts against the cap it is measured by, so a code-bearing workflow that would have
+    fit without it now takes the oversize path. That shift has to fail closed: definition dropped, but
+    the pointer and a working CLI route survive and the response stays under the cap. Not measuring the
+    pointer would be worse — the over-cap response would reach size_capped, which drops `data` entirely.
+    """
+
+    def _definition(pad: int) -> dict[str, object]:
+        return {"parameters": [], "blocks": [{"block_type": "code", "label": "near_cap", "code": "x" * pad}]}
+
+    probe_pad = 1_000
+    _patch_workflow_get_definition(monkeypatch, _definition(probe_pad))
+    probe = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    pointer_chars = workflow_tools._response_size({"code_block_pointer": probe["data"]["code_block_pointer"]})
+    # Response size is linear in the padding, so solve for a payload landing mid-band.
+    base = workflow_tools._response_size(probe) - probe_pad - pointer_chars
+    pad = MCP_MAX_RESPONSE_CHARS - base - pointer_chars // 2
+
+    _patch_workflow_get_definition(monkeypatch, _definition(pad))
+    unwrapped = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    with_pointer = workflow_tools._response_size(unwrapped)
+    without_pointer = with_pointer - pointer_chars
+    # Self-check: the case is only meaningful if it is genuinely in-band. Without this the test would
+    # silently pass on any merely-oversized workflow and prove nothing.
+    assert without_pointer <= MCP_MAX_RESPONSE_CHARS < with_pointer
+
+    wrapped_get = size_capped(workflow_tools.guard_definition_size(workflow_tools.skyvern_workflow_get))
+    result = await wrapped_get(workflow_id="wpid_test")
+
+    assert result["ok"] is False
+    assert "workflow_definition" not in result["data"]
+    assert result["data"]["code_block_pointer"]["code_block_count"] == 1
+    assert "--definition-file" in result["data"]["code_block_pointer"]["hint"]
+    assert workflow_tools._response_size(result) <= MCP_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_previews_labels_up_to_the_budget_while_count_stays_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Labels long enough that the CHAR budget binds before the 20-label count cap does — otherwise this
+    # only re-tests the count cap and says nothing about the budget.
+    blocks = [
+        {
+            "block_type": "code",
+            "label": f"portal_step_{index:03d}_submit_and_verify_the_result_page_loaded",
+            "code": 'return {"ok": True}',
+        }
+        for index in range(25)
+    ]
+    _patch_workflow_get_definition(monkeypatch, {"parameters": [], "blocks": blocks})
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    pointer = result["data"]["code_block_pointer"]
+    assert pointer["code_block_count"] == 25
+    assert pointer["block_labels"]
+    # Fewer than the count cap ⇒ the char budget is what stopped it, not _POINTER_MAX_LABELS.
+    assert len(pointer["block_labels"]) < workflow_tools._POINTER_MAX_LABELS
+    assert len("".join(pointer["block_labels"])) <= workflow_tools._POINTER_LABEL_BUDGET_CHARS
+    assert set(pointer["block_labels"]) <= {str(block["label"]) for block in blocks}
+
+
+@pytest.mark.asyncio
 async def test_workflow_get_emits_parameter_keys_and_strips_runtime_block_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4191,3 +4426,195 @@ async def test_registered_small_workflow_get_passes_through_unchanged(monkeypatc
     assert isinstance(registered.data, dict)
     assert registered.data["data"] == direct["data"]
     assert registered.data["error"] is None and "_truncated" not in registered.data
+
+
+_REPRESENTATIVE_SKILL_MARKDOWN = """# Reuse prior work
+
+```python
+result = {"ok": True}
+```
+
+Read `{{ account-id }}` after `{{ open-page_output }}`.
+"""
+
+
+def _skill_definition(prompt: str | None, *, unsafe_identifiers: bool = False) -> dict[str, object]:
+    parameter_key = "account-id" if unsafe_identifiers else "account_id"
+    block_label = "open-page" if unsafe_identifiers else "open_page"
+    workflow_definition: dict[str, object] = {
+        "parameters": [{"parameter_type": "workflow", "key": parameter_key, "workflow_parameter_type": "string"}],
+        "blocks": [{"block_type": "code", "label": block_label, "code": "result = True"}],
+    }
+    if prompt is not None:
+        workflow_definition["workflow_system_prompt"] = prompt
+    return {
+        "title": "Skill workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": workflow_definition,
+    }
+
+
+def _persisted_write(sent: object, format_name: str) -> dict[str, object]:
+    if format_name == "json":
+        assert isinstance(sent, dict)
+        return sent
+    parsed = workflow_tools.safe_load_no_dates(sent)
+    sanitized = sanitize_workflow_yaml_with_references(parsed)
+    return WorkflowCreateYAMLRequest.model_validate(sanitized).model_dump(mode="json")
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("format_name", ["json", "yaml"])
+@pytest.mark.asyncio
+async def test_workflow_write_preserves_supplied_skill_markdown_with_format_specific_jinja_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    format_name: str,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+    definition = _skill_definition(_REPRESENTATIVE_SKILL_MARKDOWN, unsafe_identifiers=True)
+    serialized = json.dumps(definition) if format_name == "json" else yaml.safe_dump(definition, sort_keys=False)
+
+    if operation == "create":
+        result = await workflow_tools.skyvern_workflow_create(definition=serialized, format=format_name)
+    else:
+        _patch_workflow_get_definition(monkeypatch, {"parameters": [], "blocks": []})
+        result = await workflow_tools.skyvern_workflow_update(
+            workflow_id="wpid_test",
+            definition=serialized,
+            format=format_name,
+        )
+
+    assert result["ok"] is True
+    sent = request_mock.await_args.kwargs["json"][f"{format_name}_definition"]
+    transmitted = sent if format_name == "json" else workflow_tools.safe_load_no_dates(sent)
+    assert transmitted["workflow_definition"]["workflow_system_prompt"] == _REPRESENTATIVE_SKILL_MARKDOWN
+    expected = _REPRESENTATIVE_SKILL_MARKDOWN
+    if format_name == "yaml":
+        expected = expected.replace("account-id", "account_id").replace("open-page_output", "open_page_output")
+    assert _persisted_write(sent, format_name)["workflow_definition"]["workflow_system_prompt"] == expected
+
+
+@pytest.mark.parametrize("format_name", ["json", "yaml"])
+@pytest.mark.asyncio
+async def test_workflow_get_edit_update_preserves_skills_but_omission_clears(
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+) -> None:
+    prompt = "# Durable skill\n\n```python\nresult = account_id\n```\n\nUse `{{ account_id }}`."
+    definition = _skill_definition(prompt)
+    _patch_workflow_get_definition(monkeypatch, definition["workflow_definition"])
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    got = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    omitted = _skill_definition(None)
+    serialized = json.dumps(omitted) if format_name == "json" else yaml.safe_dump(omitted, sort_keys=False)
+    omitted_result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=serialized,
+        format=format_name,
+    )
+
+    assert omitted_result["ok"] is True
+    sent = request_mock.await_args.kwargs["json"][f"{format_name}_definition"]
+    if format_name == "yaml":
+        transmitted = workflow_tools.safe_load_no_dates(sent)
+        assert "workflow_system_prompt" not in transmitted["workflow_definition"]
+    assert _persisted_write(sent, format_name)["workflow_definition"]["workflow_system_prompt"] is None
+    edited = {
+        "title": "Edited title",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": got["data"]["workflow_definition"],
+    }
+    serialized = json.dumps(edited) if format_name == "json" else yaml.safe_dump(edited, sort_keys=False)
+    round_trip_result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=serialized,
+        format=format_name,
+    )
+
+    assert round_trip_result["ok"] is True
+    sent = request_mock.await_args.kwargs["json"][f"{format_name}_definition"]
+    assert _persisted_write(sent, format_name)["workflow_definition"]["workflow_system_prompt"] == prompt
+
+
+@pytest.mark.parametrize(
+    ("prompt", "concise"),
+    [(None, False), ("", False), (" \n\t", False), (" \n# Skill 🧭\n", False), (" \n# Skill 🧭\n", True)],
+)
+@pytest.mark.asyncio
+async def test_workflow_get_emits_only_nonblank_skills_as_concise_safe_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str | None,
+    concise: bool,
+) -> None:
+    definition: dict[str, object] = {"parameters": [], "blocks": []}
+    if prompt is not None:
+        definition["workflow_system_prompt"] = prompt
+    _patch_workflow_get_definition(monkeypatch, definition)
+
+    set_concise_responses(concise)
+    try:
+        result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    finally:
+        set_concise_responses(False)
+
+    data = result["data"]
+    if prompt is None or not prompt.strip():
+        assert "skills" not in data
+        assert data["workflow_definition"] == definition
+        return
+    skills = data["skills"]
+    assert set(skills) == {"prompt_chars", "hint"}
+    assert skills["prompt_chars"] == len(prompt)
+    assert "data.workflow_definition.workflow_system_prompt" in skills["hint"]
+    assert "skills" not in data["workflow_definition"]
+    assert "--definition-file" not in skills["hint"]
+    assert "omitted" not in skills["hint"]
+    assert data["workflow_definition"]["workflow_system_prompt"] == prompt
+    if concise:
+        assert "sdk_equivalent" not in data
+
+
+@pytest.mark.asyncio
+async def test_registered_small_workflow_get_emits_skills_pointer(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompt = "# Skill\n\nReuse the persisted definition."
+    _patch_workflow_get_definition(monkeypatch, {"parameters": [], "blocks": [], "workflow_system_prompt": prompt})
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_get", {"workflow_id": "wpid_test"})
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is True
+    data = result.data["data"]
+    skills = data["skills"]
+    assert set(skills) == {"prompt_chars", "hint"}
+    assert skills["prompt_chars"] == len(prompt)
+    assert "data.workflow_definition.workflow_system_prompt" in skills["hint"]
+    assert data["workflow_definition"]["workflow_system_prompt"] == prompt
+    assert "skills" not in data["workflow_definition"]
+
+
+@pytest.mark.asyncio
+async def test_registered_large_workflow_get_reports_skills_with_overflow_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = " \n# Large workflow skill\n\nPreserve every character. 🧭\n"
+    runtime_definition = _large_runtime_workflow_definition()
+    runtime_definition["workflow_system_prompt"] = prompt
+    _patch_workflow_get_definition(monkeypatch, runtime_definition)
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_get", {"workflow_id": "wpid_test", "version": 7})
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is False
+    data = result.data["data"]
+    assert "workflow_definition" not in data
+    skills = data["skills"]
+    assert set(skills) == {"prompt_chars", "hint"}
+    assert skills["prompt_chars"] == len(prompt)
+    assert f"carries {len(prompt)} persisted skill-instruction characters" in skills["hint"]
+    assert "--id wpid_test --version 7 --definition-file wf.json" in skills["hint"]
+    assert "data.workflow_definition.workflow_system_prompt" not in skills["hint"]

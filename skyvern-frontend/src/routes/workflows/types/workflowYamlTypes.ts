@@ -1,6 +1,7 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   CodeBlockStep,
+  CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   WorkflowBlockType,
   WorkflowModel,
@@ -133,6 +134,8 @@ export type CredentialParameterYAML = ParameterYAMLBase & {
   credential_id: string;
   credential_ids?: Array<string> | null;
   selection_strategy?: CredentialSelectionStrategy | null;
+  fallback_credential_ids?: Array<string> | null;
+  fallback_trigger?: CredentialFallbackTrigger | null;
 };
 
 export type BlockYAML =
@@ -294,6 +297,7 @@ export type LoginBlockYAML = BlockYAMLBase & {
   disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  include_action_history_in_verification: boolean;
   engine: RunEngine | null;
 };
 

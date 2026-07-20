@@ -1,14 +1,16 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
+import { Status, type WorkflowRunApiResponse } from "@/api/types";
 import CloudContext from "@/store/CloudContext";
 import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { WorkflowPage } from "./WorkflowPage";
 
-const { mockFeatureFlagEnabled } = vi.hoisted(() => ({
+const { mockFeatureFlagEnabled, mockWorkflowRunsQuery } = vi.hoisted(() => ({
   mockFeatureFlagEnabled: vi.fn(),
+  mockWorkflowRunsQuery: vi.fn(),
 }));
 
 vi.mock("posthog-js/react", () => ({
@@ -48,6 +50,10 @@ vi.mock("./workflowRun/RunParametersDialog", () => ({
   RunParametersDialog: () => null,
 }));
 
+vi.mock("./workflowRun/WorkflowReliabilityPanel", () => ({
+  WorkflowReliabilityPanel: () => null,
+}));
+
 vi.mock("./hooks/useWorkflowQuery", () => ({
   useWorkflowQuery: () => ({
     data: {
@@ -59,10 +65,7 @@ vi.mock("./hooks/useWorkflowQuery", () => ({
 }));
 
 vi.mock("./hooks/useWorkflowRunsQuery", () => ({
-  useWorkflowRunsQuery: () => ({
-    data: [],
-    isLoading: false,
-  }),
+  useWorkflowRunsQuery: () => mockWorkflowRunsQuery(),
 }));
 
 vi.mock("./hooks/useWorkflowTagsBatchQuery", () => ({
@@ -71,6 +74,10 @@ vi.mock("./hooks/useWorkflowTagsBatchQuery", () => ({
 
 vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
   useRunTagsBatchQuery: () => ({ data: {} }),
+}));
+
+vi.mock("./hooks/useRunsHealSummaryBatchQuery", () => ({
+  useRunsHealSummaryBatchQuery: () => ({ data: {} }),
 }));
 
 vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
@@ -127,6 +134,7 @@ type RenderOptions = {
   analyticsFlagEnabled?: boolean;
   pageSlots?: PageSlots;
   initialEntries?: Array<string>;
+  workflowRuns?: Array<WorkflowRunApiResponse>;
 };
 
 function LocationProbe() {
@@ -139,8 +147,13 @@ function renderWorkflowPage({
   analyticsFlagEnabled = true,
   pageSlots = {},
   initialEntries = ["/workflows/wpid_abc123"],
+  workflowRuns = [],
 }: RenderOptions = {}) {
   mockFeatureFlagEnabled.mockReturnValue(analyticsFlagEnabled);
+  mockWorkflowRunsQuery.mockReturnValue({
+    data: workflowRuns,
+    isLoading: false,
+  });
 
   return render(
     <CloudContext.Provider value={isCloud}>
@@ -161,6 +174,28 @@ function renderWorkflowPage({
       </PageSlotsProvider>
     </CloudContext.Provider>,
   );
+}
+
+function makeWorkflowRun(
+  overrides: Partial<WorkflowRunApiResponse>,
+): WorkflowRunApiResponse {
+  return {
+    created_at: "2026-06-01T12:00:00.000Z",
+    failure_reason: null,
+    started_at: "2026-06-01T12:00:01.000Z",
+    finished_at: "2026-06-01T12:00:10.000Z",
+    modified_at: "2026-06-01T12:00:10.000Z",
+    proxy_location: null,
+    script_run: false,
+    status: Status.Completed,
+    webhook_callback_url: "",
+    workflow_id: "wf_abc123",
+    workflow_permanent_id: "wpid_abc123",
+    workflow_run_id: "wr_default",
+    workflow_title: "Test Workflow",
+    retried_from_workflow_run_id: null,
+    ...overrides,
+  };
 }
 
 describe("WorkflowPage analytics button", () => {
@@ -225,5 +260,33 @@ describe("WorkflowPage analytics button", () => {
     expect(search).toContain("period=custom");
     expect(search).toContain("from=2026-06-01");
     expect(search).toContain("to=2026-06-03");
+  });
+
+  it("shows the fallback retry badge only for runs retried from another run", () => {
+    renderWorkflowPage({
+      workflowRuns: [
+        makeWorkflowRun({
+          workflow_run_id: "wr_retry",
+          retried_from_workflow_run_id: "wr_original",
+        }),
+        makeWorkflowRun({ workflow_run_id: "wr_original" }),
+      ],
+    });
+
+    const retryRow = screen.getByText("wr_retry").closest("tr");
+    const originalRow = screen.getByText("wr_original").closest("tr");
+
+    expect(retryRow).not.toBeNull();
+    expect(originalRow).not.toBeNull();
+    expect(
+      within(retryRow!).getByLabelText(
+        "Automatic retry with fallback credential",
+      ),
+    ).not.toBeNull();
+    expect(
+      within(originalRow!).queryByLabelText(
+        "Automatic retry with fallback credential",
+      ),
+    ).toBeNull();
   });
 });

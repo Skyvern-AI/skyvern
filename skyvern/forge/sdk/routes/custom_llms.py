@@ -1,3 +1,6 @@
+import asyncio
+from urllib.parse import urlparse
+
 import structlog
 from fastapi import Depends, HTTPException, Path
 
@@ -15,6 +18,7 @@ from skyvern.forge.sdk.schemas.custom_llms import (
     CustomLLMConfig,
     CustomLLMCreateRequest,
     CustomLLMListResponse,
+    CustomLLMProvider,
     CustomLLMResponse,
     CustomLLMUpdateRequest,
     custom_llm_from_org_auth_token,
@@ -22,8 +26,21 @@ from skyvern.forge.sdk.schemas.custom_llms import (
 )
 from skyvern.forge.sdk.schemas.organizations import ClearOrganizationAuthTokenResponse, Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
+
+
+async def _validate_custom_llm_api_base(config: CustomLLMConfig) -> None:
+    if SettingsManager.get_settings().ALLOW_CUSTOM_LLM_LOCAL_API_BASES or not config.api_base:
+        return
+    parsed = urlparse(config.api_base)
+    if parsed.scheme != "https" or parsed.port not in {None, 443}:
+        raise HTTPException(status_code=400, detail="Cloud api_base must use HTTPS on port 443")
+    if config.provider is CustomLLMProvider.OPENROUTER and parsed.hostname != "openrouter.ai":
+        raise HTTPException(status_code=400, detail="OpenRouter api_base must use openrouter.ai")
+    config.api_base = await asyncio.to_thread(validate_fetch_url, config.api_base)
 
 
 async def _get_custom_llm(
@@ -105,6 +122,7 @@ async def create_custom_llm(
     request: CustomLLMCreateRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CustomLLMResponse:
+    await _validate_custom_llm_api_base(request.config)
     token = await app.DATABASE.organizations.create_org_auth_token(
         organization_id=current_org.organization_id,
         token_type=OrganizationAuthTokenType.custom_llm,
@@ -136,6 +154,7 @@ async def update_custom_llm(
     try:
         existing_custom_llm = await _get_custom_llm(current_org.organization_id, custom_llm_id)
         config = _config_with_preserved_api_key(request.config, existing_custom_llm)
+        await _validate_custom_llm_api_base(config)
         token = await app.DATABASE.organizations.update_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.custom_llm,

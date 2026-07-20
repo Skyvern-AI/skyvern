@@ -110,6 +110,7 @@ import {
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { copyText } from "@/util/copyText";
@@ -173,6 +174,7 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import {
+  shouldOpenCopilotPaneForHandoff,
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
@@ -402,6 +404,24 @@ function Workspace({
     location.search,
     navigate,
   ]);
+  // A handoff (Discover or the onboarding CTA) lands with the prompt seeded but
+  // only the default editor+browser panes open; open the Copilot pane once on
+  // mount so the handed-off prompt is visible (the non-embedded editor opens
+  // Copilot via isCopilotOpen's initializer below instead). Thread the handoff
+  // route state through the pane-open navigation: the CTA seeds the prompt via
+  // location.state alone (Discover also has a sessionStorage fallback), so a
+  // state-wiping open would drop it before the Copilot consumes it.
+  useMountEffect(() => {
+    if (
+      shouldOpenCopilotPaneForHandoff({
+        embedded,
+        hasInitialCopilotMessage: Boolean(initialCopilotMessage),
+        copilotPaneOpen: studioCopilotOpen,
+      })
+    ) {
+      openStudioPane("copilot", { state: location.state });
+    }
+  });
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const headlessTurnDrainEnabled = ["1", "true"].includes(
     (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
@@ -926,6 +946,10 @@ function Workspace({
     useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
+    // Drop A's unsaved-changes baseline on an A→B same-instance route swap;
+    // a carried snapshot would diff B's graph against A's and surface phantom
+    // "edited" lines. clearSnapshot resets contentDirty + userHasEdited too.
+    useWorkflowSnapshotStore.getState().clearSnapshot();
     cacheKeyInitWpidRef.current = null;
     setReadyBrowserSessionId(null);
     if (workflowPermanentId) {
@@ -1554,7 +1578,7 @@ function Workspace({
 
   const applyWorkflowUpdate = (
     workflowData: WorkflowVersion,
-    options?: { persisted?: boolean },
+    options?: { persisted?: boolean; userDriven?: boolean },
   ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
@@ -1619,6 +1643,11 @@ function Workspace({
       }
     } else {
       workflowChangesStore.setHasChanges(true);
+      if (options?.userDriven) {
+        // A Copilot build has no canvas gesture but is user-driven; mark it so
+        // the dot/summary surface it instead of the baseline absorbing it.
+        useWorkflowSnapshotStore.getState().markUserEdit();
+      }
     }
   };
 
@@ -2930,7 +2959,7 @@ function Workspace({
             const handleCopilotReviewClose = (status: CopilotReviewStatus) => {
               if (status === "approve") {
                 try {
-                  applyWorkflowUpdate(pendingWorkflow);
+                  applyWorkflowUpdate(pendingWorkflow, { userDriven: true });
                 } catch (error) {
                   console.error(
                     "Failed to apply copilot agent",
@@ -2993,7 +3022,10 @@ function Workspace({
         }}
         onWorkflowUpdate={(workflowData, options) => {
           try {
-            applyWorkflowUpdate(workflowData, options);
+            // All Copilot-driven applies are user edits (mid-turn draft, accept,
+            // snap-back); only version-restore/load call applyWorkflowUpdate
+            // without this and stay a clean baseline.
+            applyWorkflowUpdate(workflowData, { ...options, userDriven: true });
             const { fire, nextState } = shouldAutoOpenEditor(
               editorAutoOpenStateRef.current,
               {

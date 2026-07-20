@@ -16,7 +16,13 @@ import {
 } from "@/components/ui/tooltip";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 
+import {
+  BROWSER_PROFILE_ROLE_BADGE,
+  BROWSER_PROFILE_ROLE_FRESHNESS,
+  getBrowserProfileRole,
+} from "./browserProfileRole";
 import { DeleteBrowserProfileButton } from "./DeleteBrowserProfileButton";
+import { RefreshBrowserProfileButton } from "./RefreshBrowserProfileButton";
 import { RenameBrowserProfileDialog } from "./RenameBrowserProfileDialog";
 
 type Props = {
@@ -36,6 +42,13 @@ function BrowserProfileItem({
 }: Props) {
   const navigate = useNavigate();
   const [renameOpen, setRenameOpen] = useState(false);
+  const role = getBrowserProfileRole(profile);
+  const badgeTitle =
+    role === "credential" && profile.linked_credential_name
+      ? `${BROWSER_PROFILE_ROLE_FRESHNESS.credential} Linked to ${profile.linked_credential_name}.`
+      : role === "plain"
+        ? `${BROWSER_PROFILE_ROLE_FRESHNESS.plain} Updated ${compactLocalDateTime(profile.modified_at)}.`
+        : BROWSER_PROFILE_ROLE_FRESHNESS.workflow_memory;
 
   const handleRowClick = (event: React.MouseEvent<HTMLTableRowElement>) => {
     if (event.ctrlKey || event.metaKey) {
@@ -74,15 +87,9 @@ function BrowserProfileItem({
             <span className="truncate" title={profile.name}>
               {profile.name}
             </span>
-            {profile.is_managed ? (
-              <Badge
-                variant="secondary"
-                className="shrink-0"
-                title="Auto-saved from a Save & Reuse Session workflow. Recreated automatically on the next run."
-              >
-                Auto-managed
-              </Badge>
-            ) : null}
+            <Badge variant="secondary" className="shrink-0" title={badgeTitle}>
+              {BROWSER_PROFILE_ROLE_BADGE[role]}
+            </Badge>
           </div>
           <div
             className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground"
@@ -119,6 +126,7 @@ function BrowserProfileItem({
       </TableCell>
       <TableCell onClick={stopRowClick}>
         <div className="flex justify-end gap-2">
+          <RefreshBrowserProfileButton profile={profile} />
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>

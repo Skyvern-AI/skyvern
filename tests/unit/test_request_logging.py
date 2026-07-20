@@ -214,6 +214,49 @@ class TestRedactSensitiveFields:
         assert redact_sensitive_fields(42) == 42
         assert redact_sensitive_fields(None) is None
 
+    def test_strips_signed_artifact_url_queries_only(self) -> None:
+        data = {
+            "artifact_url": (
+                "https://api.skyvern.com/v1/artifacts/art_synthetic/content/?expiry=1800000600&kid=k1&sig=signed-secret"
+            ),
+            "other_url": "https://example.com/report?view=full",
+        }
+
+        assert redact_sensitive_fields(data) == {
+            "artifact_url": "https://api.skyvern.com/v1/artifacts/art_synthetic/content/",
+            "other_url": "https://example.com/report?view=full",
+        }
+
+    def test_strips_signed_artifact_url_embedded_mid_string(self) -> None:
+        data = {
+            "input": (
+                "fetched https://api.skyvern.com/v1/artifacts/art_embed/content"
+                "?expiry=1800000600&kid=k1&sig=embedded-secret then parsed it"
+            ),
+        }
+
+        assert redact_sensitive_fields(data) == {
+            "input": "fetched https://api.skyvern.com/v1/artifacts/art_embed/content then parsed it",
+        }
+
+    def test_strips_multiple_embedded_signed_urls_preserving_other_urls(self) -> None:
+        data = {
+            "input": (
+                "a /v1/artifacts/art_a/content?sig=secret-a and "
+                "https://api.skyvern.com/v1/artifacts/art_b/content?sig=secret-b but "
+                "https://example.com/report?view=full stays"
+            ),
+        }
+
+        result = redact_sensitive_fields(data)
+        assert "secret-a" not in result["input"]
+        assert "secret-b" not in result["input"]
+        assert result["input"] == (
+            "a /v1/artifacts/art_a/content and "
+            "https://api.skyvern.com/v1/artifacts/art_b/content but "
+            "https://example.com/report?view=full stays"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _is_loggable_content_type
@@ -291,6 +334,16 @@ class TestSanitizeResponseBody:
         request = _make_request()
         result = _sanitize_response_body(request, "plain text response", "text/plain")
         assert result == "plain text response"
+
+    def test_strips_embedded_signed_artifact_url_from_plain_text(self) -> None:
+        request = _make_request()
+        body = (
+            "download failed for https://api.skyvern.com/v1/artifacts/art_err/content"
+            "?expiry=1800000600&kid=k1&sig=plain-secret after 3 retries"
+        )
+        result = _sanitize_response_body(request, body, "text/plain")
+        assert "plain-secret" not in result
+        assert result == ("download failed for https://api.skyvern.com/v1/artifacts/art_err/content after 3 retries")
 
     def test_truncates_long_body(self) -> None:
         request = _make_request()
@@ -390,7 +443,12 @@ def _make_app() -> FastAPI:
 
     @app.post("/tasks")
     async def create_task() -> dict:
-        return {"created": True}
+        return {
+            "created": True,
+            "artifact_url": (
+                "https://api.skyvern.com/v1/artifacts/art_response/content?expiry=1800000300&kid=k1&sig=response-secret"
+            ),
+        }
 
     @app.get("/missing")
     async def missing() -> dict:
@@ -470,6 +528,27 @@ class TestMiddlewareLogVolume:
         log_mock.warning.assert_called_once()
         assert log_mock.warning.call_args.args[0] == "api.raw_request"
         assert log_mock.warning.call_args.kwargs["status_code"] == 403
+
+    def test_artifact_url_queries_are_redacted_from_logged_bodies(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        response = client.post(
+            "/tasks",
+            json={
+                "file_url": (
+                    "https://api.skyvern.com/v1/artifacts/art_request/content/"
+                    "?expiry=1800000300&kid=k1&sig=request-secret"
+                )
+            },
+        )
+
+        assert response.status_code == 200
+        logged = log_mock.info.call_args.kwargs
+        assert json.loads(logged["body"])["file_url"] == ("https://api.skyvern.com/v1/artifacts/art_request/content/")
+        assert json.loads(logged["response_body"])["artifact_url"] == (
+            "https://api.skyvern.com/v1/artifacts/art_response/content"
+        )
+        assert "request-secret" not in repr(logged)
+        assert "response-secret" not in repr(logged)
 
     def test_exception_path_is_logged_as_error(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app(), raise_server_exceptions=False)

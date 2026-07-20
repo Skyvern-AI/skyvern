@@ -152,10 +152,10 @@ def resolve_block_outcome(
     statuses = {episode.status for episode in episodes}
     if HealStatus.fired_completed in statuses:
         return "healed"
-    if HealStatus.fired_unverified in statuses:
-        return "unverified"
     if HealStatus.fired_failed in statuses:
         return "failed"
+    if HealStatus.fired_unverified in statuses:
+        return "unverified"
     if HealStatus.skipped in statuses:
         return "skipped"
     return "none"
@@ -209,6 +209,15 @@ def summarize_run_heals(episodes: list[HealEpisode]) -> RunHealSummary:
         blocks_outcome_risk=sorted(blocks_outcome_risk),
         blocks_with_heal_attempt=len(episodes_by_block),
     )
+
+
+def summarize_runs_heals(episodes: list[HealEpisode]) -> dict[str, RunHealSummary]:
+    episodes_by_run: dict[str, list[HealEpisode]] = {}
+    for episode in episodes:
+        episodes_by_run.setdefault(episode.workflow_run_id, []).append(episode)
+    return {
+        workflow_run_id: summarize_run_heals(run_episodes) for workflow_run_id, run_episodes in episodes_by_run.items()
+    }
 
 
 def compute_workflow_reliability(runs: list[RunHealGroup]) -> WorkflowReliability:

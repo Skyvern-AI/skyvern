@@ -10,6 +10,7 @@ import {
 import { Tip } from "@/components/Tip";
 import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
 import {
@@ -98,6 +99,9 @@ import {
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
 import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
+import { WorkflowReliabilityPanel } from "./workflowRun/WorkflowReliabilityPanel";
+import { RunOutcomeRiskMarker } from "./workflowRun/RunOutcomeRiskMarker";
+import { useRunsHealSummaryBatchQuery } from "./hooks/useRunsHealSummaryBatchQuery";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -188,6 +192,7 @@ function WorkflowPage() {
   const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
     enabled: taggingEnabled,
   });
+  const { data: runHealMap = {} } = useRunsHealSummaryBatchQuery(runIds);
   const { data: runTagSuggestions } = useRunTagSuggestionsQuery({
     enabled: taggingEnabled,
   });
@@ -307,6 +312,7 @@ function WorkflowPage() {
             </Button>
           </div>
         </div>
+        <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
         {WorkflowAnalyticsPanel ? (
           <WorkflowAnalyticsPanel workflowPermanentId={workflowPermanentId} />
         ) : null}
@@ -488,7 +494,20 @@ function WorkflowPage() {
                             </div>
                           </TableCell>
                           <TableCell>
-                            <StatusBadge status={workflowRun.status} />
+                            <div className="flex items-center gap-2">
+                              <StatusBadge status={workflowRun.status} />
+                              <CredentialFallbackRetryBadge
+                                retriedFromWorkflowRunId={
+                                  workflowRun.retried_from_workflow_run_id
+                                }
+                              />
+                              <RunOutcomeRiskMarker
+                                outcomeRisk={
+                                  (runHealMap[workflowRun.workflow_run_id]
+                                    ?.blocks_outcome_risk?.length ?? 0) > 0
+                                }
+                              />
+                            </div>
                           </TableCell>
                           <TableCell
                             className="text-muted-foreground"

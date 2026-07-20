@@ -6,13 +6,17 @@ Uses the OpenAI Agents SDK with LiteLLM for multi-provider LLM support.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
+import math
 import re
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -28,10 +32,12 @@ if TYPE_CHECKING:
 import structlog
 import yaml
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.copilot import llm_config
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -81,10 +87,12 @@ from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CodeAuthoringRepairContext,
     CopilotContext,
+    DeliveredUnverifiedPublicOutputs,
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
     NarrativeOutcomeAdjudication,
+    ProposalDisposition,
     ResponseType,
     StructuredContext,
     TurnNarrativePayload,
@@ -163,7 +171,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
-from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
+from skyvern.forge.sdk.copilot.runtime import (
+    _browser_context_is_attachable,
+    cache_copilot_author_time_gate_log_only_ids,
+)
+from skyvern.forge.sdk.copilot.secret_redaction import SECRET_KEYWORD_ASSIGNMENT_PATTERN
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
@@ -193,6 +206,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     classify_turn_intent,
     turn_intent_defers_authoring_live_fill,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
     derive_response_kind,
@@ -844,6 +858,13 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "list the exact key in the code block's parameter_keys, reference the exact key as a bare Python "
             "variable in code, do not hardcode the eval value, and rerun via update_and_run_blocks."
         )
+    if repair_context.parameter_binding_directive is not None:
+        lines.append("parameter_binding_pairs:")
+        for candidate in repair_context.parameter_binding_directive.candidates:
+            key = _clean_authoring_repair_prompt_atom(candidate.declared_key, max_chars=80)
+            selector = _clean_authoring_repair_prompt_atom(candidate.field_selector, max_chars=160)
+            if key and selector:
+                lines.append(f"- {key} -> {selector}")
     if repair_context.reason_code == "synthesized_parameter_binding_ambiguous":
         binding_action_lines = _render_unresolved_name_binding_actions(
             repair_context.unresolved_names, available_parameter_keys
@@ -1696,6 +1717,7 @@ def _make_agent_result(
     *,
     global_llm_context: str | None = None,
     turn_outcome: TurnOutcome | None = None,
+    _delivered_unverified_snapshot: _DeliveredUnverifiedSnapshot | None = None,
     **kwargs: Any,
 ) -> AgentResult:
     """Sole ``AgentResult`` constructor in this module.
@@ -1710,12 +1732,16 @@ def _make_agent_result(
         if ctx is not None
         else global_llm_context
     )
+    kwargs.pop("delivered_unverified_observed_outputs", None)
     narrative_payload = kwargs.get("narrative_payload")
     if ctx is not None and narrative_payload is None:
         raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     response_type = kwargs.get("response_type", "REPLY")
     proposal_disposition = kwargs.get("proposal_disposition")
     if isinstance(narrative_payload, dict):
+        payload_base = {
+            key: value for key, value in narrative_payload.items() if key != "deliveredUnverifiedObservedOutputs"
+        }
         payload_updates: dict[str, Any] = {}
         if "responseType" not in narrative_payload:
             payload_updates["responseType"] = response_type
@@ -1741,8 +1767,15 @@ def _make_agent_result(
             adjudication = _build_outcome_adjudication_payload(ctx)
             if adjudication is not None:
                 payload_updates["outcomeAdjudication"] = adjudication
-        if payload_updates:
-            kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
+        if (
+            ctx is not None
+            and ctx.delivered_unverified_terminal is True
+            and isinstance(_delivered_unverified_snapshot, _DeliveredUnverifiedSnapshot)
+            and _delivered_unverified_snapshot
+        ):
+            payload_updates["deliveredUnverifiedObservedOutputs"] = _delivered_unverified_snapshot
+        if payload_updates or len(payload_base) != len(narrative_payload):
+            kwargs["narrative_payload"] = {**payload_base, **payload_updates}
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None and result.turn_outcome is not None:
         result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
@@ -1900,6 +1933,8 @@ def _build_exit_result(
     global_llm_context: str | None,
     cancelled: bool = False,
     terminal_reason: str | None = None,
+    proposal_disposition: ProposalDisposition = "auto_applicable",
+    _delivered_unverified_snapshot: _DeliveredUnverifiedSnapshot | None = None,
 ) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
@@ -1953,6 +1988,7 @@ def _build_exit_result(
         ctx,
         _make_agent_result(
             ctx,
+            _delivered_unverified_snapshot=_delivered_unverified_snapshot,
             user_response=final_text,
             updated_workflow=verified_workflow,
             global_llm_context=global_llm_context,
@@ -1963,6 +1999,7 @@ def _build_exit_result(
             staged_workflow=ctx.staged_workflow,
             canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
             total_tokens=ctx.total_tokens_used,
+            proposal_disposition=proposal_disposition,
             cancelled=cancelled,
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
@@ -2110,13 +2147,12 @@ def _build_turn_halt_exit_result(
 ) -> AgentResult:
     under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
     if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
-        reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
         return _build_wip_exit_result(
             ctx,
             global_llm_context,
-            default_reply=reply,
-            unvalidated_reply=reply,
-            tested_reply=reply,
+            default_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
+            unvalidated_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
+            tested_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
             terminal_reason=f"turn_halt:{halt.kind.value}",
         )
     signal = halt.blocker_signal
@@ -2239,6 +2275,360 @@ _VERIFIED_CLASSIFICATION_GATE_KEYS = (
 )
 _VERIFIED_CLASSIFICATION_GATE_PHRASES = ("Sign in or register to continue",)
 _VERIFIED_TERMINAL_VALUE_MAX_CHARS = 180
+_DELIVERED_UNVERIFIED_SUMMARY_MAX_CHARS = 720
+_DELIVERED_UNVERIFIED_OMISSION_KEY = "$skyvernOmitted"
+_DELIVERED_UNVERIFIED_METADATA_KEY = "$skyvernOutput"
+_DELIVERED_UNVERIFIED_MAX_DEPTH = 16
+_DELIVERED_UNVERIFIED_MAX_NODES = 64
+_DELIVERED_UNVERIFIED_MAX_STRING_CHARS = 512
+_DELIVERED_UNVERIFIED_MAX_SERIALIZED_BYTES = 65_536
+_DELIVERED_UNVERIFIED_SERIALIZED_METADATA_RESERVE_BYTES = 2_048
+_DELIVERED_UNVERIFIED_MAX_IMAGE_ENCODED_BYTES = 65_536
+_DELIVERED_UNVERIFIED_MAX_IMAGE_DECODED_BYTES = 49_152
+_DELIVERED_UNVERIFIED_MAX_IMAGE_PIXELS = 1_000_000
+_REDACTED_INTERNAL_OUTPUT = "[REDACTED_INTERNAL]"
+_UNSUPPORTED_DELIVERED_OUTPUT = object()
+_INVALID_DELIVERED_IMAGE = object()
+_PNG_START = b"\x89PNG\r\n\x1a\n"
+_PNG_END = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
+_JPEG_START = b"\xff\xd8"
+_JPEG_END = b"\xff\xd9"
+_CAMEL_CASE_ACRONYM_BOUNDARY_RE = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_CASE_KEY_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_DELIMITED_KEY_BOUNDARY_RE = re.compile(r"[-\s]+")
+
+
+def _delivered_unverified_image_payload(value: str) -> tuple[bool, str]:
+    lowered = value[:32].lower()
+    for prefix in ("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/jpg;base64,"):
+        if lowered.startswith(prefix):
+            return True, value[len(prefix) :]
+    if lowered.startswith("data:image/"):
+        return True, ""
+    try:
+        decoded_prefix = base64.b64decode(value[:16], validate=True)
+    except (binascii.Error, ValueError):
+        return False, value
+    return decoded_prefix.startswith((_PNG_START, _JPEG_START)), value
+
+
+def _delivered_unverified_decoded_size(encoded: str) -> int | None:
+    if not encoded or len(encoded) % 4 != 0:
+        return None
+    padding = len(encoded) - len(encoded.rstrip("="))
+    if padding > 2:
+        return None
+    return (len(encoded) // 4) * 3 - padding
+
+
+def _canonical_delivered_unverified_image(value: str) -> tuple[bool, str | None]:
+    image_input, encoded = _delivered_unverified_image_payload(value)
+    if not image_input:
+        return False, None
+    encoded_size = len(encoded.encode("ascii", errors="ignore"))
+    decoded_size = _delivered_unverified_decoded_size(encoded)
+    if (
+        encoded_size != len(encoded)
+        or encoded_size > _DELIVERED_UNVERIFIED_MAX_IMAGE_ENCODED_BYTES
+        or decoded_size is None
+        or decoded_size > _DELIVERED_UNVERIFIED_MAX_IMAGE_DECODED_BYTES
+    ):
+        return True, None
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return True, None
+    if len(decoded) > _DELIVERED_UNVERIFIED_MAX_IMAGE_DECODED_BYTES:
+        return True, None
+    if not decoded.startswith((_PNG_START, _JPEG_START)):
+        return True, None
+    try:
+        with Image.open(BytesIO(decoded)) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _DELIVERED_UNVERIFIED_MAX_IMAGE_PIXELS:
+                return True, None
+            if image.format == "PNG":
+                if not decoded.endswith(_PNG_END):
+                    return True, None
+                canonical_image = image.convert("RGBA")
+            elif image.format == "JPEG":
+                if not decoded.endswith(_JPEG_END):
+                    return True, None
+                canonical_image = image.convert("RGB")
+            else:
+                return True, None
+            image.load()
+            pixels_only = Image.frombytes(canonical_image.mode, canonical_image.size, canonical_image.tobytes())
+            canonical_bytes = BytesIO()
+            pixels_only.save(canonical_bytes, format=image.format)
+    except (binascii.Error, Image.DecompressionBombError, OSError, SyntaxError, UnidentifiedImageError, ValueError):
+        return True, None
+    return True, base64.b64encode(canonical_bytes.getvalue()).decode()
+
+
+def _sanitize_delivered_unverified_scalar(ctx: CopilotContext, value: Any) -> Any:
+    if value is None or isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _UNSUPPORTED_DELIVERED_OUTPUT
+    if isinstance(value, str):
+        image_input, canonical_image = _canonical_delivered_unverified_image(value)
+        if image_input:
+            return canonical_image if canonical_image is not None else _INVALID_DELIVERED_IMAGE
+        registered_scrubbed = scrub_secrets_from_text(ctx, value)
+        redacted = redact_sensitive_fields(redact_raw_secrets_for_prompt(registered_scrubbed))
+        return _REDACTED_INTERNAL_OUTPUT if contains_internal_machinery_leak(redacted) else redacted
+    return _UNSUPPORTED_DELIVERED_OUTPUT
+
+
+def _delivered_unverified_sensitive_key(key: str) -> bool:
+    original = key.strip()
+    normalized = _CAMEL_CASE_ACRONYM_BOUNDARY_RE.sub("_", original)
+    normalized = _CAMEL_CASE_KEY_BOUNDARY_RE.sub("_", normalized)
+    normalized = _DELIMITED_KEY_BOUNDARY_RE.sub("_", normalized).lower()
+    for candidate in dict.fromkeys((original, normalized)):
+        if SECRET_KEYWORD_ASSIGNMENT_PATTERN.fullmatch(candidate) or SECRET_KEYWORD_ASSIGNMENT_PATTERN.fullmatch(
+            f"{candidate}=value"
+        ):
+            return True
+        redacted = redact_sensitive_fields({candidate: None})
+        if isinstance(redacted, dict) and redacted.get(candidate) == "****":
+            return True
+    return False
+
+
+def _disambiguate_captured_output_key(key: str) -> str:
+    if key in {_DELIVERED_UNVERIFIED_OMISSION_KEY, _DELIVERED_UNVERIFIED_METADATA_KEY}:
+        return f"{key} [captured]"
+    return key
+
+
+def _unique_sanitized_output_key(target: dict[str, Any], key: str) -> str:
+    if key not in target:
+        return key
+    collision_index = 2
+    while f"{key} [{collision_index}]" in target:
+        collision_index += 1
+    return f"{key} [{collision_index}]"
+
+
+def _delivered_unverified_omission(reason: str) -> dict[str, dict[str, str | int]]:
+    return {_DELIVERED_UNVERIFIED_OMISSION_KEY: {"reason": reason, "count": 1}}
+
+
+@dataclass
+class _DeliveredUnverifiedAdmissionBudget:
+    nodes: int = 0
+    depth_omitted: int = 0
+    node_omitted: int = 0
+    string_omitted: int = 0
+    serialized_bytes_omitted: int = 0
+    non_finite_omitted: int = 0
+    cycle_omitted: int = 0
+    unsupported_omitted: int = 0
+    image_omitted: int = 0
+
+    def omission_counts(self) -> dict[str, int]:
+        counts = {
+            "depth": self.depth_omitted,
+            "node": self.node_omitted,
+            "string": self.string_omitted,
+            "serializedBytes": self.serialized_bytes_omitted,
+            "nonFinite": self.non_finite_omitted,
+            "cycle": self.cycle_omitted,
+            "unsupported": self.unsupported_omitted,
+            "image": self.image_omitted,
+        }
+        return {reason: count for reason, count in counts.items() if count}
+
+
+def _bounded_delivered_unverified_scalar(
+    ctx: CopilotContext,
+    value: Any,
+    budget: _DeliveredUnverifiedAdmissionBudget,
+) -> Any:
+    scalar = _sanitize_delivered_unverified_scalar(ctx, value)
+    if scalar is _INVALID_DELIVERED_IMAGE:
+        budget.image_omitted += 1
+        return _delivered_unverified_omission("invalid image")
+    return scalar
+
+
+def _delivered_unverified_admission_priority(value: Any) -> int:
+    """Admit bounded scalar outcomes before containers and long prose."""
+    if value is None or isinstance(value, bool | int):
+        return 0
+    if isinstance(value, float):
+        return 0 if math.isfinite(value) else 3
+    if isinstance(value, str):
+        return 0 if len(value) <= _VERIFIED_TERMINAL_VALUE_MAX_CHARS else 2
+    if isinstance(value, dict | list):
+        return 1
+    return 3
+
+
+def _delivered_unverified_fits_serialized_budget(root: dict[str, Any] | list[Any]) -> bool:
+    # Count the conservative ASCII-escaped wire form so alternate JSON
+    # serializers cannot expand admitted Unicode beyond the public cap.
+    serialized_size = len(json.dumps(root, separators=(",", ":")).encode())
+    return serialized_size <= (
+        _DELIVERED_UNVERIFIED_MAX_SERIALIZED_BYTES - _DELIVERED_UNVERIFIED_SERIALIZED_METADATA_RESERVE_BYTES
+    )
+
+
+def _admit_delivered_unverified_mapping_value(
+    root: dict[str, Any] | list[Any],
+    target: dict[str, Any],
+    key: str,
+    value: Any,
+    budget: _DeliveredUnverifiedAdmissionBudget,
+) -> bool:
+    target[key] = value
+    if _delivered_unverified_fits_serialized_budget(root):
+        return True
+    del target[key]
+    budget.serialized_bytes_omitted += 1
+    return False
+
+
+def _admit_delivered_unverified_list_value(
+    root: dict[str, Any] | list[Any],
+    target: list[Any],
+    value: Any,
+    budget: _DeliveredUnverifiedAdmissionBudget,
+) -> bool:
+    target.append(value)
+    if _delivered_unverified_fits_serialized_budget(root):
+        return True
+    target.pop()
+    budget.serialized_bytes_omitted += 1
+    return False
+
+
+def _sanitize_delivered_unverified_value(ctx: CopilotContext, value: Any) -> Any:
+    budget = _DeliveredUnverifiedAdmissionBudget()
+    scalar = _bounded_delivered_unverified_scalar(ctx, value, budget)
+    if scalar is not _UNSUPPORTED_DELIVERED_OUTPUT:
+        return scalar
+    if not isinstance(value, dict | list):
+        return _UNSUPPORTED_DELIVERED_OUTPUT
+
+    root: dict[str, Any] | list[Any] = {} if isinstance(value, dict) else []
+    pending: list[tuple[dict[Any, Any] | list[Any], dict[str, Any] | list[Any], frozenset[int], int]] = [
+        (value, root, frozenset({id(value)}), 0)
+    ]
+    while pending:
+        source, target, ancestors, depth = pending.pop(0)
+        if isinstance(source, dict) and isinstance(target, dict):
+            ordered_items = sorted(source.items(), key=lambda entry: _delivered_unverified_admission_priority(entry[1]))
+            for index, (key, item) in enumerate(ordered_items):
+                if budget.nodes >= _DELIVERED_UNVERIFIED_MAX_NODES:
+                    budget.node_omitted += len(source) - index
+                    break
+                budget.nodes += 1
+                if not isinstance(key, str):
+                    budget.unsupported_omitted += 1
+                    continue
+                if len(key) > _DELIVERED_UNVERIFIED_MAX_STRING_CHARS:
+                    budget.string_omitted += 1
+                    continue
+                source_key_sensitive = _delivered_unverified_sensitive_key(key)
+                sanitized_key = _bounded_delivered_unverified_scalar(ctx, key, budget)
+                if not isinstance(sanitized_key, str) or sanitized_key == _REDACTED_INTERNAL_OUTPUT:
+                    budget.unsupported_omitted += 1
+                    continue
+                sanitized_key = _disambiguate_captured_output_key(sanitized_key)
+                sanitized_key = _unique_sanitized_output_key(target, sanitized_key)
+                if source_key_sensitive or _delivered_unverified_sensitive_key(sanitized_key):
+                    _admit_delivered_unverified_mapping_value(root, target, sanitized_key, "****", budget)
+                    continue
+                sanitized_item = _bounded_delivered_unverified_scalar(ctx, item, budget)
+                if sanitized_item is not _UNSUPPORTED_DELIVERED_OUTPUT:
+                    _admit_delivered_unverified_mapping_value(root, target, sanitized_key, sanitized_item, budget)
+                    continue
+                if isinstance(item, float) and not math.isfinite(item):
+                    budget.non_finite_omitted += 1
+                    _admit_delivered_unverified_mapping_value(
+                        root, target, sanitized_key, _delivered_unverified_omission("non-finite number"), budget
+                    )
+                elif isinstance(item, dict | list) and id(item) in ancestors:
+                    budget.cycle_omitted += 1
+                    _admit_delivered_unverified_mapping_value(
+                        root, target, sanitized_key, _delivered_unverified_omission("cycle"), budget
+                    )
+                elif isinstance(item, dict | list):
+                    if depth >= _DELIVERED_UNVERIFIED_MAX_DEPTH:
+                        budget.depth_omitted += 1
+                        _admit_delivered_unverified_mapping_value(
+                            root, target, sanitized_key, _delivered_unverified_omission("depth budget"), budget
+                        )
+                        continue
+                    child: dict[str, Any] | list[Any] = {} if isinstance(item, dict) else []
+                    if _admit_delivered_unverified_mapping_value(root, target, sanitized_key, child, budget):
+                        pending.append((item, child, ancestors | {id(item)}, depth + 1))
+                else:
+                    budget.unsupported_omitted += 1
+                    _admit_delivered_unverified_mapping_value(
+                        root, target, sanitized_key, _delivered_unverified_omission("unsupported value"), budget
+                    )
+        elif isinstance(source, list) and isinstance(target, list):
+            for index, item in enumerate(source):
+                if budget.nodes >= _DELIVERED_UNVERIFIED_MAX_NODES:
+                    budget.node_omitted += len(source) - index
+                    break
+                budget.nodes += 1
+                sanitized_item = _bounded_delivered_unverified_scalar(ctx, item, budget)
+                if sanitized_item is not _UNSUPPORTED_DELIVERED_OUTPUT:
+                    _admit_delivered_unverified_list_value(root, target, sanitized_item, budget)
+                    continue
+                if isinstance(item, float) and not math.isfinite(item):
+                    budget.non_finite_omitted += 1
+                    _admit_delivered_unverified_list_value(
+                        root, target, _delivered_unverified_omission("non-finite number"), budget
+                    )
+                elif isinstance(item, dict | list) and id(item) in ancestors:
+                    budget.cycle_omitted += 1
+                    _admit_delivered_unverified_list_value(
+                        root, target, _delivered_unverified_omission("cycle"), budget
+                    )
+                elif isinstance(item, dict | list):
+                    if depth >= _DELIVERED_UNVERIFIED_MAX_DEPTH:
+                        budget.depth_omitted += 1
+                        _admit_delivered_unverified_list_value(
+                            root, target, _delivered_unverified_omission("depth budget"), budget
+                        )
+                        continue
+                    child = {} if isinstance(item, dict) else []
+                    if _admit_delivered_unverified_list_value(root, target, child, budget):
+                        pending.append((item, child, ancestors | {id(item)}, depth + 1))
+                else:
+                    budget.unsupported_omitted += 1
+                    _admit_delivered_unverified_list_value(
+                        root, target, _delivered_unverified_omission("unsupported value"), budget
+                    )
+    if isinstance(root, dict):
+        root = {_DELIVERED_UNVERIFIED_METADATA_KEY: {"omitted": budget.omission_counts()}, **root}
+    return root
+
+
+class _DeliveredUnverifiedSnapshot(dict[str, Any]):
+    """Sanitized, admission-bounded output shared by terminal prose and payload."""
+
+
+def _delivered_unverified_observed_outputs(ctx: CopilotContext) -> _DeliveredUnverifiedSnapshot:
+    observed_outputs = ctx.delivered_unverified_observed_outputs
+    producer_halt = ctx.turn_halt
+    producer_admitted = (
+        producer_halt is not None
+        and producer_halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED
+        and ctx.delivered_unverified_terminal is True
+    )
+    if not isinstance(observed_outputs, DeliveredUnverifiedPublicOutputs) and not producer_admitted:
+        return _DeliveredUnverifiedSnapshot()
+    if not observed_outputs:
+        return _DeliveredUnverifiedSnapshot()
+    sanitized = _sanitize_delivered_unverified_value(ctx, observed_outputs)
+    return _DeliveredUnverifiedSnapshot(sanitized) if isinstance(sanitized, dict) else _DeliveredUnverifiedSnapshot()
 
 
 def _terminal_summary_scalar(value: Any) -> str | None:
@@ -2256,26 +2646,99 @@ def _terminal_summary_scalar(value: Any) -> str | None:
     return cleaned
 
 
-def _delivered_unverified_reply(ctx: CopilotContext) -> str | None:
-    if getattr(ctx, "delivered_unverified_terminal", False) is not True:
-        return None
-    parts: list[str] = []
-    observed_outputs = getattr(ctx, "delivered_unverified_observed_outputs", {})
-    if not isinstance(observed_outputs, dict):
-        observed_outputs = {}
+def _terminal_output_root_path(key: str) -> str:
+    if key.strip() == key and key and not any(char in key for char in ('"', "[", "]", "\r", "\n", "\t")):
+        return key
+    return f"$[{json.dumps(key, ensure_ascii=False)}]"
+
+
+def _terminal_output_child_path(path: str, segment: str | int) -> str:
+    if isinstance(segment, int):
+        return f"{path}[{segment}]"
+    return f"{path}[{json.dumps(segment, ensure_ascii=False)}]"
+
+
+def _flatten_terminal_output(value: Any, path: str) -> list[tuple[int, str, str]]:
+    entries: list[tuple[int, str, str]] = []
+    pending: list[tuple[Any, str]] = [(value, path)]
+    while pending:
+        current, current_path = pending.pop()
+        if isinstance(current, dict):
+            if not current:
+                entries.append((3, current_path, "{}"))
+                continue
+            children = [
+                (item, _terminal_output_child_path(current_path, key))
+                for key, item in current.items()
+                if isinstance(key, str)
+            ]
+            pending.extend(reversed(children))
+            continue
+        if isinstance(current, list):
+            if not current:
+                entries.append((3, current_path, "[]"))
+                continue
+            pending.extend(
+                (item, _terminal_output_child_path(current_path, index))
+                for index, item in reversed(list(enumerate(current)))
+            )
+            continue
+        rendered: str | None
+        if isinstance(current, str) and not current.strip():
+            rendered = '""'
+        else:
+            rendered = "null" if current is None else _terminal_summary_scalar(current)
+        if rendered is None:
+            continue
+        if current is None or isinstance(current, bool | int | float):
+            rank = 0
+        elif isinstance(current, str) and len(" ".join(current.strip().split())) <= _VERIFIED_TERMINAL_VALUE_MAX_CHARS:
+            rank = 1
+        else:
+            rank = 2
+        entries.append((rank, current_path, rendered))
+    return entries
+
+
+def _delivered_unverified_summary(observed_outputs: dict[str, Any]) -> str | None:
+    entries: list[tuple[int, str, str]] = []
     for key, value in observed_outputs.items():
-        rendered = _terminal_summary_scalar(value)
-        if rendered is None and isinstance(value, list | dict):
-            try:
-                rendered = redact_raw_secrets_for_prompt(json.dumps(value, sort_keys=True))
-            except TypeError:
-                rendered = None
-        if isinstance(key, str) and key.strip() and rendered and not contains_internal_machinery_leak(rendered):
-            parts.append(f"{key}: {rendered[:_VERIFIED_TERMINAL_VALUE_MAX_CHARS]}")
-    if parts:
+        if key == _DELIVERED_UNVERIFIED_METADATA_KEY:
+            continue
+        entries.extend(_flatten_terminal_output(value, _terminal_output_root_path(key)))
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    if not entries:
+        return None
+
+    parts: list[str] = []
+    for index, (_, path, rendered) in enumerate(entries):
+        part = f"{path}: {rendered}"
+        candidate_parts = [*parts, part]
+        remaining = len(entries) - index - 1
+        suffix = f"; {remaining} more fields available in structured output" if remaining else ""
+        if len("; ".join(candidate_parts)) + len(suffix) <= _DELIVERED_UNVERIFIED_SUMMARY_MAX_CHARS:
+            parts.append(part)
+        else:
+            break
+
+    omitted = len(entries) - len(parts)
+    if omitted:
+        suffix = f"{omitted} more field{'s' if omitted != 1 else ''} available in structured output"
+        return f"{'; '.join(parts)}; {suffix}" if parts else suffix
+    return "; ".join(parts)
+
+
+def _delivered_unverified_reply(
+    ctx: CopilotContext,
+    observed_outputs: _DeliveredUnverifiedSnapshot,
+) -> str | None:
+    if ctx.delivered_unverified_terminal is not True:
+        return None
+    summary = _delivered_unverified_summary(observed_outputs)
+    if summary:
         return (
             "I built and ran the workflow. The latest run returned "
-            f"{'; '.join(parts[:4])}. That value was not independently verified, so review the draft before using it."
+            f"{summary}. That value was not independently verified, so review the draft before using it."
         )
     return (
         "I built and ran the workflow, and the latest run returned the requested output. "
@@ -2916,6 +3379,11 @@ def _build_wip_exit_result(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
     )
     effective_terminal = terminal_reason or ("cancel" if cancelled else None)
+    delivered_unverified_snapshot = (
+        _delivered_unverified_observed_outputs(ctx)
+        if ctx.delivered_unverified_terminal is True
+        else _DeliveredUnverifiedSnapshot()
+    )
 
     def _guard(text: str) -> tuple[str, TurnOutcome]:
         if contains_internal_machinery_leak(text):
@@ -2939,6 +3407,7 @@ def _build_wip_exit_result(
             ctx,
             _make_agent_result(
                 ctx,
+                _delivered_unverified_snapshot=delivered_unverified_snapshot,
                 user_response=final_text,
                 updated_workflow=verified_workflow,
                 global_llm_context=global_llm_context,
@@ -2971,6 +3440,7 @@ def _build_wip_exit_result(
         and ctx.last_good_workflow_yaml
         and ctx.last_workflow is not ctx.last_good_workflow
         and not ctx.last_test_suspicious_success
+        and ctx.delivered_unverified_terminal is not True
     ):
         reply = _last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply
         final_text, outcome = _guard(reply)
@@ -2978,6 +3448,7 @@ def _build_wip_exit_result(
             ctx,
             _make_agent_result(
                 ctx,
+                _delivered_unverified_snapshot=delivered_unverified_snapshot,
                 user_response=final_text,
                 updated_workflow=ctx.last_good_workflow,
                 global_llm_context=global_llm_context,
@@ -3010,7 +3481,7 @@ def _build_wip_exit_result(
     ):
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
-        delivered_reply = _delivered_unverified_reply(ctx)
+        delivered_reply = _delivered_unverified_reply(ctx, delivered_unverified_snapshot)
         if delivered_reply is not None:
             reply = delivered_reply
             unvalidated = True
@@ -3028,6 +3499,7 @@ def _build_wip_exit_result(
             ctx,
             _make_agent_result(
                 ctx,
+                _delivered_unverified_snapshot=delivered_unverified_snapshot,
                 user_response=final_text,
                 updated_workflow=ctx.last_workflow,
                 global_llm_context=global_llm_context,
@@ -3052,12 +3524,17 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_workflow",
         )
+    fallback_reply = recorded_failure_reply or default_reply
+    if ctx.delivered_unverified_terminal is True:
+        fallback_reply = _delivered_unverified_reply(ctx, delivered_unverified_snapshot) or fallback_reply
     return _build_exit_result(
         ctx,
-        recorded_failure_reply or default_reply,
+        fallback_reply,
         global_llm_context,
         cancelled=cancelled,
         terminal_reason=effective_terminal,
+        proposal_disposition="review_untested" if ctx.delivered_unverified_terminal is True else "auto_applicable",
+        _delivered_unverified_snapshot=delivered_unverified_snapshot,
     )
 
 
@@ -3250,6 +3727,13 @@ async def _translate_to_agent_result(
 
     turn_intent = ctx.turn_intent if isinstance(ctx.turn_intent, TurnIntent) else None
     may_update_workflow = turn_intent is None or turn_intent.authority.may_update_workflow
+    if resp_type == "REPLACE_WORKFLOW" and ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        LOG.warning("copilot suppressed inline REPLACE_WORKFLOW on runtime self-heal turn")
+        user_response = _with_inline_reject_note(
+            user_response,
+            "Runtime self-heal cannot update workflow definitions; retrying in read-only recovery mode.",
+        )
+        resp_type = "REPLY"
     if resp_type == "REPLACE_WORKFLOW" and turn_intent is not None and not turn_intent.authority.may_update_workflow:
         # A no-mutation turn (e.g. DIAGNOSE) must not stage a draft even via an inline REPLACE_WORKFLOW, which
         # bypasses the may_update_workflow=False authority enforced on the update_workflow tool. Downgrade to a
@@ -3825,6 +4309,88 @@ def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None
     return fallback_key
 
 
+async def _run_agent_loop_with_surface(
+    *,
+    ctx: Any,
+    stream: EventSourceStream,
+    chat_id: str,
+    user_message: str,
+    system_prompt: Callable[[object, object], str] | str,
+    model_name: str,
+    run_config: Any,
+    llm_key: str,
+    copilot_config: CopilotConfig,
+    native_tools: list[Any],
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+    output_guardrails: list[Any],
+    allow_untested_retry: bool = False,
+) -> Any:
+    from agents import Agent
+    from agents.mcp import MCPServerManager
+
+    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
+    from skyvern.forge.sdk.copilot.enforcement import run_with_enforcement
+    from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+    from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
+
+    mcp_server = SkyvernOverlayMCPServer(
+        transport=skyvern_mcp,
+        overlays=overlays,
+        alias_map=alias_map,
+        allowlist=frozenset(alias_map.values()),
+        context_provider=lambda: ctx,
+    )
+    ctx.discovery_mcp_server = mcp_server
+    agent = Agent(
+        name="workflow-copilot",
+        instructions=system_prompt,
+        tools=native_tools,
+        mcp_servers=[mcp_server],
+        model=model_name,
+        output_guardrails=output_guardrails,
+    )
+    session = create_copilot_session(chat_id)
+    model_token = _copilot_model_name.set(model_name)
+    try:
+        async with MCPServerManager([mcp_server]) as manager:
+            agent.mcp_servers = list(manager.active_servers)
+            attempts = 2 if allow_untested_retry else 1
+            for attempt in range(attempts):
+                try:
+                    result = await run_with_enforcement(
+                        agent=agent,
+                        initial_input=user_message,
+                        ctx=ctx,
+                        stream=stream,
+                        max_turns=copilot_config.max_turns,
+                        hooks=CopilotRunHooks(ctx),
+                        run_config=run_config,
+                        session=session,
+                        copilot_config=copilot_config,
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        attempt + 1 < attempts
+                        and getattr(ctx, "last_workflow", None) is None
+                        and isinstance(exc, LiteLLMNotFoundError)
+                    ):
+                        LOG.warning("Retrying untested draft agent loop after model lookup failure")
+                        continue
+                    raise
+        LOG.info(
+            "Copilot agent model attempt succeeded",
+            workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+            llm_key=llm_key,
+        )
+        return result
+    finally:
+        _copilot_model_name.reset(model_token)
+        session.close()
+
+
 def _build_request_policy_clarification_result(
     policy: RequestPolicy,
     prior_global_llm_context: str | None,
@@ -4131,6 +4697,49 @@ def _build_copilot_output_guardrails(
     ]
 
 
+def _build_self_heal_output_guardrails(
+    OutputGuardrailCls: Any,
+    GuardrailFunctionOutputCls: Any,
+) -> list[Any]:
+    # Self-heal final output is machine-consumed, not user-facing chat text.
+    # Chat output policy requires CopilotContext and fails closed in headless runs; self-heal only trips on mutate/ask-human.
+    def self_heal_output_guardrail(_context: Any, _agent: Any, agent_output: Any) -> Any:
+        try:
+            final_text = extract_final_text(agent_output)
+        except Exception:
+            final_text = _agent_output_to_text(agent_output)
+
+        action_data = parse_final_response(final_text)
+        response_type = str(action_data.get("type") or "REPLY").strip().upper()
+        if response_type not in COPILOT_RESPONSE_TYPES:
+            response_type = "REPLY"
+
+        raw_upper = final_text.upper()
+        replace_marker_present = "REPLACE_WORKFLOW" in raw_upper
+        user_response = action_data.get("user_response")
+        parse_failed = response_type == "REPLY" and (
+            str(user_response or "") == final_text or str(user_response or "") == "Done."
+        )
+        tripwire_triggered = response_type in {"REPLACE_WORKFLOW", "ASK_QUESTION"} or (
+            parse_failed and replace_marker_present
+        )
+
+        trace_data = {
+            "response_type": response_type,
+            "tripwire_triggered": tripwire_triggered,
+            "origin": "runtime_self_heal",
+        }
+        LOG.info("self-heal output guardrail verdict", **trace_data)
+        return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=tripwire_triggered)
+
+    return [
+        OutputGuardrailCls(
+            guardrail_function=self_heal_output_guardrail,
+            name="self_heal_output_guardrail",
+        )
+    ]
+
+
 def _output_policy_verdict_from_guardrail_exception(exc: BaseException) -> OutputPolicyVerdict:
     guardrail_result = getattr(exc, "guardrail_result", None)
     guardrail_output = getattr(guardrail_result, "output", None)
@@ -4366,6 +4975,29 @@ def _reconcile_turn_end_ownership(
         return result
 
 
+async def _cache_copilot_author_time_gate_log_only_ids(ctx: CopilotContext) -> None:
+    try:
+        resolved_ids = await app.AGENT_FUNCTION.resolve_copilot_author_time_gate_log_only_ids(
+            turn_id=ctx.turn_id,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to resolve Copilot author-time gate log-only registry",
+            turn_id=ctx.turn_id,
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+        resolved_ids = frozenset()
+    cache_copilot_author_time_gate_log_only_ids(ctx, resolved_ids)
+    selected_gate_ids = sorted(ctx.author_time_gate_log_only_ids)
+    LOG.info(
+        "copilot_author_time_gate_log_only_registry_resolved",
+        selected_gate_ids=selected_gate_ids,
+        selected_gate_count=len(selected_gate_ids),
+    )
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -4513,7 +5145,6 @@ async def _run_copilot_turn_impl(
             MaxTurnsExceeded,
             OutputGuardrailTripwireTriggered,
         )
-        from agents.mcp import MCPServerManager
         from agents.run_context import RunContextWrapper
     except ModuleNotFoundError as e:
         if e.name == "agents":
@@ -4584,6 +5215,7 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
+    await _cache_copilot_author_time_gate_log_only_ids(ctx)
     if ctx_sink is not None:
         ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(
@@ -4690,7 +5322,6 @@ async def _run_copilot_turn_impl(
             ctx=ctx,
         )
 
-    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotBuiltUnverified,
         CopilotGoalSatisfied,
@@ -4698,12 +5329,8 @@ async def _run_copilot_turn_impl(
         CopilotTotalTimeoutError,
         CopilotUnrecoverableToolError,
         gate_decision_trace_fields,
-        run_with_enforcement,
     )
-    from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-    from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
     from skyvern.forge.sdk.copilot.tools import (
         NATIVE_TOOLS,
         _build_skyvern_mcp_overlays,
@@ -4806,62 +5433,22 @@ async def _run_copilot_turn_impl(
         attempt_run_config: Any,
         attempt_llm_key: str,
     ) -> RunResultStreaming:
-        mcp_server = SkyvernOverlayMCPServer(
-            transport=skyvern_mcp,
-            overlays=overlays,
+        return await _run_agent_loop_with_surface(
+            ctx=ctx,
+            stream=stream,
+            chat_id=chat_id,
+            user_message=user_message,
+            system_prompt=system_prompt,
+            model_name=attempt_model_name,
+            run_config=attempt_run_config,
+            llm_key=attempt_llm_key,
+            copilot_config=copilot_config,
+            native_tools=native_tools,
             alias_map=alias_map,
-            allowlist=frozenset(alias_map.values()),
-            context_provider=lambda: ctx,
-        )
-        # The discovery walker reaches the connected FastMCP client through
-        # ctx, without exposing private overlay state.
-        ctx.discovery_mcp_server = mcp_server
-        agent = Agent(
-            name="workflow-copilot",
-            instructions=system_prompt,
-            tools=native_tools,
-            mcp_servers=[mcp_server],
-            model=attempt_model_name,
+            overlays=overlays,
             output_guardrails=output_guardrails,
+            allow_untested_retry=ctx.allow_untested_workflow_draft,
         )
-        session = create_copilot_session(chat_id)
-        model_token = _copilot_model_name.set(attempt_model_name)
-        try:
-            async with MCPServerManager([mcp_server]) as manager:
-                agent.mcp_servers = list(manager.active_servers)
-                attempts = 2 if ctx.allow_untested_workflow_draft else 1
-                for attempt in range(attempts):
-                    try:
-                        result = await run_with_enforcement(
-                            agent=agent,
-                            initial_input=user_message,
-                            ctx=ctx,
-                            stream=stream,
-                            max_turns=copilot_config.max_turns,
-                            hooks=CopilotRunHooks(ctx),
-                            run_config=attempt_run_config,
-                            session=session,
-                            copilot_config=copilot_config,
-                        )
-                        break
-                    except Exception as exc:
-                        if (
-                            attempt + 1 < attempts
-                            and ctx.last_workflow is None
-                            and isinstance(exc, LiteLLMNotFoundError)
-                        ):
-                            LOG.warning("Retrying untested draft agent loop after model lookup failure")
-                            continue
-                        raise
-            LOG.info(
-                "Copilot agent model attempt succeeded",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                llm_key=attempt_llm_key,
-            )
-            return result
-        finally:
-            _copilot_model_name.reset(model_token)
-            session.close()
 
     try:
         with trace_context:

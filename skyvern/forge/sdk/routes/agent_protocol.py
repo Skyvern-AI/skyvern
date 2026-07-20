@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import structlog
 import yaml
@@ -44,11 +44,12 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
     parse_keyring,
     verify_artifact_signature,
 )
@@ -3074,6 +3075,47 @@ async def get_artifact_content(
 
 
 @base_router.get(
+    "/artifacts/{artifact_id}/signed-url",
+    tags=["Artifacts"],
+    response_model=ArtifactSignedUrl,
+    description="Mint a fresh short-lived URL for the artifact's content, for use at the point of consumption.",
+    summary="Mint a short-lived artifact content URL",
+    responses={
+        200: {"description": "Freshly minted content URL"},
+        404: {"description": "Artifact not found or content unavailable"},
+    },
+    # Kept out of the public OpenAPI schema until the Fern SDK deliberately adopts it.
+    include_in_schema=False,
+)
+@base_router.get("/artifacts/{artifact_id}/signed-url/", response_model=ArtifactSignedUrl, include_in_schema=False)
+async def get_artifact_signed_url(
+    artifact_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ArtifactSignedUrl:
+    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
+        artifact_id=artifact_id,
+        organization_id=current_org.organization_id,
+    )
+    if not artifact:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    signed_url = await app.ARTIFACT_MANAGER.resolve_share_url(
+        artifact,
+        expiry_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    )
+    if not signed_url:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
+    expiry_values = parse_qs(urlparse(signed_url).query).get("expiry")
+    expires_at = int(expiry_values[0]) if expiry_values else None
+    return ArtifactSignedUrl(artifact_id=artifact_id, signed_url=signed_url, expires_at=expires_at)
+
+
+@base_router.get(
     "/runs/{run_id}/artifacts",
     tags=["Artifacts"],
     response_model=list[Artifact],
@@ -3540,30 +3582,6 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
 
 
-def _workflow_request_body_from_existing_run(
-    workflow_run: WorkflowRun,
-    parameters: dict[str, Any] | None = None,
-    run_metadata: dict[str, str] | None = None,
-) -> WorkflowRequestBody:
-    return WorkflowRequestBody(
-        data=parameters,
-        proxy_location=workflow_run.proxy_location,
-        webhook_callback_url=workflow_run.webhook_callback_url,
-        totp_verification_url=workflow_run.totp_verification_url,
-        totp_identifier=workflow_run.totp_identifier,
-        browser_session_id=workflow_run.browser_session_id,
-        browser_profile_id=workflow_run.browser_profile_id,
-        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_run, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_run.extra_http_headers,
-        cdp_connect_headers=workflow_run.cdp_connect_headers,
-        browser_address=workflow_run.browser_address,
-        run_with=workflow_run.run_with,
-        ai_fallback=workflow_run.ai_fallback,
-        run_metadata=run_metadata,
-    )
-
-
 def _workflow_run_request_from_workflow_request(
     *,
     workflow_id: str,
@@ -3694,7 +3712,7 @@ async def retry_workflow_run(
             organization_id=current_org.organization_id,
             exc_info=True,
         )
-    legacy_workflow_request = _workflow_request_body_from_existing_run(
+    legacy_workflow_request = workflow_service.workflow_request_body_from_existing_run(
         workflow_run=original_workflow_run,
         parameters=original_workflow_run_parameters,
         run_metadata=original_run_metadata,

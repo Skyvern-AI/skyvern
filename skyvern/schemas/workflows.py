@@ -617,6 +617,8 @@ class CredentialParameterYAML(ParameterYAML):
     credential_id: str
     credential_ids: list[str] | None = None
     selection_strategy: str | None = None
+    fallback_credential_ids: list[str] | None = None
+    fallback_trigger: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -1069,6 +1071,7 @@ class LoginBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
     skip_saved_profile: bool = False
 
 

@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Literal
 
 import aiohttp
 import httpx
@@ -18,7 +18,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
-from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
+from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -125,6 +125,7 @@ class FieldOptionResolution:
     matched_value: str | None
     confidence: float
     fallback_to_llm: bool
+    matched_tier: Literal["exact", "stem"] | None = None
 
 
 @dataclass
@@ -718,6 +719,12 @@ class AgentFunction:
     def has_proxy_session_extra_http_headers(self, extra_http_headers: dict[str, str] | None) -> bool:
         return False
 
+    def strip_proxy_session_extra_http_headers(
+        self,
+        extra_http_headers: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        return extra_http_headers
+
     def merge_proxy_session_extra_http_headers(
         self,
         extra_http_headers: dict[str, str] | None,
@@ -761,15 +768,15 @@ class AgentFunction:
         self,
         *,
         trigger_type: "WorkflowRunTriggerType | None",
-        organization_id: str,
+        organization: Organization,
         workflow_permanent_id: str,
         workflow_run_id: str,
     ) -> bool:
         """Decide whether a given workflow run is eligible for flex-tier LLM routing.
 
+        Receives the full Organization so implementations can gate on org attributes.
         Cloud overrides this to consult its experimentation provider; OSS has no flex
-        routers so the default returns False.
-        """
+        routers so the default returns False."""
         return False
 
     async def resolve_recording_video_size(
@@ -801,6 +808,14 @@ class AgentFunction:
         request_override: bool | None,
     ) -> bool:
         return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
+
+    async def resolve_copilot_author_time_gate_log_only_ids(
+        self,
+        *,
+        turn_id: str,
+        organization_id: str,
+    ) -> frozenset[str]:
+        return frozenset()
 
     async def should_use_codeblock_runner(
         self,
@@ -964,6 +979,11 @@ class AgentFunction:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
 
+    async def resolve_self_heal_api_key(self, organization_id: str) -> str | None:
+        del organization_id
+        api_key = settings.SKYVERN_API_KEY
+        return api_key if api_key and api_key != "PLACEHOLDER" else None
+
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
@@ -1115,6 +1135,10 @@ class AgentFunction:
         )
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
+        return
+
+    async def post_code_block_execution(self, task: Task, step: Step) -> None:
+        """Billing seam for a code block's container task; called only after a successful execution."""
         return
 
     async def wait_for_challenge_solver(self, page: Page) -> None:
@@ -1897,7 +1921,7 @@ class AgentFunction:
         resolvable. A ``None`` match or ``fallback_to_llm=True`` means the
         caller must defer to the LLM path.
         """
-        matched_index = match_option_exact_or_stem(target_value, option_labels)
+        matched_index, matched_tier = match_option_exact_or_stem_with_tier(target_value, option_labels)
         if matched_index is None:
             return FieldOptionResolution(
                 matched_index=None,
@@ -1905,6 +1929,7 @@ class AgentFunction:
                 matched_value=None,
                 confidence=0.0,
                 fallback_to_llm=True,
+                matched_tier=None,
             )
 
         matched_value = option_values[matched_index] if matched_index < len(option_values) else None
@@ -1914,6 +1939,7 @@ class AgentFunction:
             matched_value=matched_value,
             confidence=1.0,
             fallback_to_llm=False,
+            matched_tier=matched_tier,
         )
 
     async def fill_custom_widget(

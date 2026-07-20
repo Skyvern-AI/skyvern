@@ -14,12 +14,86 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     EXTRACT_ACTION_PROMPT_NAME,
     GEMINI_SAFETY_SETTINGS,
     LLMAPIHandlerFactory,
+    LLMCaller,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
-from tests.unit.helpers import FakeLLMResponse
+from tests.unit.helpers import DummyLogger, FakeLLMResponse
+
+
+def _custom_llm_config(model_name: str, api_base: str = "https://llm.example.test/v1") -> LLMConfig:
+    return LLMConfig(model_name, [], False, False, {"api_key": "test-key", "api_base": api_base})
+
+
+@pytest.mark.parametrize(
+    ("model_name", "http_client_attribute"),
+    [("openai/example-model", "_client"), ("ollama_chat/example-model", "client")],
+)
+@pytest.mark.asyncio
+async def test_custom_llm_http_clients_do_not_follow_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    http_client_attribute: str,
+) -> None:
+    llm_config = _custom_llm_config(model_name)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory.SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", False, raising=False
+    )
+    validate_api_base = MagicMock(return_value="https://llm.example.test/v1")
+    monkeypatch.setattr(api_handler_factory, "validate_fetch_url", validate_api_base)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda **_: 0.0)
+
+    completion = AsyncMock(return_value=FakeLLMResponse(model_name))
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", completion)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_redirect_test")
+    await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    client = completion.await_args.kwargs["client"]
+    http_client = getattr(client, http_client_attribute)
+    assert http_client.follow_redirects is False
+    assert http_client.is_closed is True
+    validate_api_base.assert_called_once_with("https://llm.example.test/v1")
+    if http_client_attribute == "client":
+        retry_client = client.create_client(timeout=None, event_hooks=None)
+        assert retry_client.follow_redirects is False
+        await retry_client.aclose()
+
+
+@pytest.mark.parametrize("request_error", [None, RuntimeError("provider failed")], ids=["success", "failure"])
+@pytest.mark.asyncio
+async def test_custom_openrouter_client_is_scoped_to_request(
+    monkeypatch: pytest.MonkeyPatch, request_error: Exception | None
+) -> None:
+    llm_config = _custom_llm_config("openrouter/example-model", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    completion = MagicMock()
+    completion.model_dump.return_value = {}
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=completion, side_effect=request_error)
+    client.close = AsyncMock()
+    openai_client = MagicMock(return_value=client)
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", openai_client)
+    monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
+
+    caller = LLMCaller("CUSTOM_LLM_openrouter_redirect_test")
+    assert caller.openai_client is None
+    if request_error:
+        with pytest.raises(RuntimeError, match="provider failed"):
+            await caller._dispatch_llm_call(messages=[])
+    else:
+        await caller._dispatch_llm_call(messages=[])
+
+    assert openai_client.call_args.kwargs["http_client"].follow_redirects is False
+    client.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -580,14 +654,26 @@ class TestGemini3ReasoningEffortExperiment:
 
 
 def _make_three_tier_router_config(
-    *, fallback_groups: list[str], redis_max_connections: int | None = None
+    *,
+    fallback_groups: list[str],
+    redis_max_connections: int | None = None,
+    litellm_models: dict[str, str] | None = None,
 ) -> LLMRouterConfig:
     """Synthetic 3+ tier router config that doesn't depend on the cloud
-    `LLMConfigRegistry` registration that's conditional on prod env vars."""
+    `LLMConfigRegistry` registration that's conditional on prod env vars.
+    `litellm_models` overrides the per-group litellm model string (flex-style
+    routers point two groups at the same underlying model)."""
+    litellm_models = litellm_models or {}
     deployments = [
-        LLMRouterModelConfig(model_name="primary-group", litellm_params={"model": "openai/primary", "timeout": 60}),
+        LLMRouterModelConfig(
+            model_name="primary-group",
+            litellm_params={"model": litellm_models.get("primary-group", "openai/primary"), "timeout": 60},
+        ),
     ] + [
-        LLMRouterModelConfig(model_name=group, litellm_params={"model": f"openai/{group}", "timeout": 60})
+        LLMRouterModelConfig(
+            model_name=group,
+            litellm_params={"model": litellm_models.get(group, f"openai/{group}"), "timeout": 60},
+        )
         for group in fallback_groups
     ]
     return LLMRouterConfig(
@@ -1324,3 +1410,187 @@ def test_get_api_parameters_omits_safety_settings_for_non_gemini_config() -> Non
     )
     params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
     assert "safety_settings" not in params
+
+
+# SKY-12589: the fallback-succeeded log and the truncation-retry gate must key off the
+# deployment that actually served the request (litellm _hidden_params.model_id), not the
+# provider label — flex and standard tiers of the same model return identical labels.
+
+
+def _make_flex_style_router_config() -> LLMRouterConfig:
+    return _make_three_tier_router_config(
+        fallback_groups=["standard-group", "gpt-fallback-group"],
+        litellm_models={
+            "primary-group": "vertex_ai/shared-model",
+            "standard-group": "vertex_ai/shared-model",
+            "gpt-fallback-group": "azure/gpt-x",
+        },
+    )
+
+
+class _DeploymentAwareRouter:
+    """FakeRouter whose responses carry _hidden_params.model_id resolvable via get_deployment."""
+
+    responses: list[FakeLLMResponse] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.model_list = kwargs.get("model_list") or []
+        self.calls: list[str] = []
+        type(self).last_instance = self
+
+    async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+        self.calls.append(model)
+        return type(self).responses[len(self.calls) - 1]
+
+    def get_deployment(self, model_id: str) -> Any:
+        group = model_id.removeprefix("id:")
+        return SimpleNamespace(model_name=group)
+
+
+def _run_flex_router_test(
+    monkeypatch: pytest.MonkeyPatch, llm_key: str, responses: list[FakeLLMResponse]
+) -> tuple[DummyLogger, _DeploymentAwareRouter]:
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    class _Router(_DeploymentAwareRouter):
+        pass
+
+    _Router.responses = responses
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _Router)
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=_make_flex_style_router_config())
+    return logger, _Router
+
+
+def _fallback_log_events(logger: DummyLogger) -> list[dict[str, Any]]:
+    return [kwargs for event, kwargs in logger.events if event == "LLM router fallback succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_router_flex_served_primary_does_not_log_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request served by the flex primary returns the same provider label as the standard
+    tier; the serving deployment id must prove it was the primary and suppress the log."""
+    logger, router_cls = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_PRIMARY_SERVED",
+        [FakeLLMResponse("shared-model", hidden_params={"model_id": "id:primary-group"})],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_PRIMARY_SERVED")
+    result = await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert result == {"actions": []}
+    assert router_cls.last_instance.calls == ["primary-group"]
+    assert _fallback_log_events(logger) == []
+
+
+@pytest.mark.asyncio
+async def test_router_same_label_tier_fallback_logs_served_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tier fallback serves the same provider label as the primary; the log must fire and
+    carry the serving deployment group."""
+    logger, _ = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_TIER_FALLBACK",
+        [FakeLLMResponse("shared-model", hidden_params={"model_id": "id:standard-group"})],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_TIER_FALLBACK")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    events = _fallback_log_events(logger)
+    assert len(events) == 1
+    assert events[0]["primary_model"] == "primary-group"
+    assert events[0]["fallback_model"] == "shared-model"
+    assert events[0]["served_model_group"] == "standard-group"
+
+
+@pytest.mark.asyncio
+async def test_router_cross_model_fallback_logs_served_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    logger, _ = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_CROSS_MODEL_FALLBACK",
+        [FakeLLMResponse("gpt-x-2025", hidden_params={"model_id": "id:gpt-fallback-group"})],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_CROSS_MODEL_FALLBACK")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    events = _fallback_log_events(logger)
+    assert len(events) == 1
+    assert events[0]["served_model_group"] == "gpt-fallback-group"
+    assert events[0]["fallback_model"] == "gpt-x-2025"
+
+
+@pytest.mark.asyncio
+async def test_router_degraded_mode_label_match_does_not_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a serving deployment id, a response label matching the primary deployment's
+    configured model must count as primary-served (no false fallback log)."""
+    logger, _ = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_DEGRADED_PRIMARY",
+        [FakeLLMResponse("shared-model")],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_DEGRADED_PRIMARY")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert _fallback_log_events(logger) == []
+
+
+@pytest.mark.asyncio
+async def test_router_degraded_mode_cross_model_still_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    logger, _ = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_DEGRADED_CROSS_MODEL",
+        [FakeLLMResponse("gpt-x-2025")],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_DEGRADED_CROSS_MODEL")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    events = _fallback_log_events(logger)
+    assert len(events) == 1
+    assert events[0]["served_model_group"] is None
+
+
+@pytest.mark.asyncio
+async def test_truncation_retry_fires_for_flex_served_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pre-fix, the label-vs-group comparison made the truncation gate always False for
+    flex-style routers, so truncated flex responses never got the fallback retry."""
+    logger, router_cls = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_TRUNCATION_RETRY",
+        [
+            FakeLLMResponse(
+                "shared-model", content=None, finish_reason="length", hidden_params={"model_id": "id:primary-group"}
+            ),
+            FakeLLMResponse("shared-model", hidden_params={"model_id": "id:standard-group"}),
+        ],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_TRUNCATION_RETRY")
+    result = await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert result == {"actions": []}
+    assert router_cls.last_instance.calls == ["primary-group", "standard-group"]
+
+
+@pytest.mark.asyncio
+async def test_truncation_retry_skipped_when_fallback_served(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A truncated response that was already served by a fallback leg must not retry again
+    (retry-only-from-primary contract)."""
+    logger, router_cls = _run_flex_router_test(
+        monkeypatch,
+        "TEST_FLEX_TRUNCATION_NO_RETRY",
+        [
+            FakeLLMResponse(
+                "gpt-x-2025", content=None, finish_reason="length", hidden_params={"model_id": "id:gpt-fallback-group"}
+            ),
+        ],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FLEX_TRUNCATION_NO_RETRY")
+    with pytest.raises(Exception):
+        await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert router_cls.last_instance.calls == ["primary-group"]

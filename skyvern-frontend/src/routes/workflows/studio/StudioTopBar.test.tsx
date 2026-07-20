@@ -8,19 +8,35 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-const { workflowRunQueryMock } = vi.hoisted(() => ({
+const { workflowRunQueryMock, saveWorkflowSpy } = vi.hoisted(() => ({
   workflowRunQueryMock: vi.fn(),
+  saveWorkflowSpy: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => workflowRunQueryMock(),
+}));
+vi.mock("../editor/hooks/useSaveWorkflow", () => ({
+  useSaveWorkflow: () => saveWorkflowSpy,
 }));
 vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
 
-import { RunStopButton } from "./StudioTopBar";
+import { stringify as toYaml } from "yaml";
+
+import type { BlockYAML } from "@/routes/workflows/types/workflowYamlTypes";
+import { snapshotOf } from "@/routes/workflows/editor/workflowChangesSummary";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import {
+  useWorkflowHasChangesStore,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+
+import { RunStopButton, SaveButton } from "./StudioTopBar";
 
 function LocationProbe() {
   const location = useLocation();
@@ -243,5 +259,118 @@ describe("RunStopButton stopOnly (global workflows)", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
     renderAt("/workflows/wpid_1/studio", <RunStopButton stopOnly />);
     expect(screen.queryByRole("button")).toBeNull();
+  });
+});
+
+const block = (label: string, extra: Record<string, unknown> = {}): BlockYAML =>
+  ({ label, block_type: "task", ...extra }) as unknown as BlockYAML;
+
+const saveData = (blocks: Array<BlockYAML>): WorkflowSaveData =>
+  ({
+    title: "T",
+    blocks,
+    parameters: [],
+    settings: { proxyLocation: "RESIDENTIAL" },
+    workflow: {
+      title: "T",
+      workflow_definition: { version: 2, blocks: [], parameters: [] },
+    },
+  }) as unknown as WorkflowSaveData;
+
+function renderSaveButton() {
+  return render(
+    <TooltipProvider delayDuration={0}>
+      <SaveButton />
+    </TooltipProvider>,
+  );
+}
+
+// The confirmation is gated on live dirtiness computed in the click handler, not
+// on the debounced canvas-only `contentDirty` dot — so a YAML edit or an
+// edit-then-save inside the debounce window still shows the "Saving Changes"
+// list. Each case here has `contentDirty` stale-false to exercise that gap.
+describe("SaveButton confirmation gating", () => {
+  afterEach(() => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => null,
+      saveIsPending: false,
+    });
+    useWorkflowYamlEditorStore.setState({
+      active: false,
+      draft: "",
+      entrySnapshot: "",
+    });
+    useRecordingStore.setState({ isRecording: false });
+  });
+
+  test("confirms a dirty draft even when contentDirty is stale-false", () => {
+    const clean = saveData([block("a", { url: "x" })]);
+    const dirty = saveData([block("a", { url: "y" })]);
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => dirty,
+      saveIsPending: false,
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(clean),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.queryByText("Saving Changes")).not.toBeNull();
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+
+  test("saves directly with no confirmation when the draft matches the baseline", () => {
+    const clean = saveData([block("a", { url: "x" })]);
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => clean,
+      saveIsPending: false,
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(clean),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.queryByText("Saving Changes")).toBeNull();
+    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("confirms an uncommitted YAML-draft edit the canvas hasn't caught up to", () => {
+    const canvas = saveData([block("a", { block_type: "code", code: "# a" })]);
+    // Baseline and canvas agree; the edit lives only in the YAML draft.
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => canvas,
+      saveIsPending: false,
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(canvas),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+    useWorkflowYamlEditorStore.setState({
+      active: true,
+      entrySnapshot: toYaml({ parameters: [], blocks: canvas.blocks }),
+      draft: toYaml({
+        parameters: [],
+        blocks: [
+          ...canvas.blocks,
+          { label: "b", block_type: "code", code: "# b" },
+        ],
+      }),
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.queryByText("Saving Changes")).not.toBeNull();
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
   });
 });

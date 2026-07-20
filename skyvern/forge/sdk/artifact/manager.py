@@ -136,6 +136,36 @@ class ArtifactManager:
         # step_id -> accumulator for step archive artifacts
         self._step_archives: dict[str, StepArchiveAccumulator] = {}
 
+    def _track_upload_aiotask(self, primary_key: str, aio_task: asyncio.Task[None]) -> None:
+        """Track a fire-and-forget upload so wait_for_upload_aiotasks can barrier on it.
+
+        Tasks self-discard on completion: writers key this map by ids no lifecycle ever
+        drains (script deploys, ai suggestions, SDK actions), so relying on
+        wait_for_upload_aiotasks as the sole reclaim path pins completed tasks — and, for
+        failed uploads, the artifact bytes their tracebacks retain — forever (SKY-12524).
+        """
+        self.upload_aiotasks_map[primary_key].append(aio_task)
+
+        def _discard(task: asyncio.Task[None]) -> None:
+            if not task.cancelled() and (exc := task.exception()) is not None:
+                LOG.warning(
+                    "Artifact upload task failed",
+                    primary_key=primary_key,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:200],
+                )
+            tasks = self.upload_aiotasks_map.get(primary_key)
+            if tasks is None:
+                return
+            try:
+                tasks.remove(task)
+            except ValueError:
+                return
+            if not tasks:
+                self.upload_aiotasks_map.pop(primary_key, None)
+
+        aio_task.add_done_callback(_discard)
+
     @staticmethod
     def _build_artifact_model(
         artifact_id: str,
@@ -247,11 +277,11 @@ class ArtifactManager:
         if data:
             # Fire and forget
             aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
-            self.upload_aiotasks_map[aio_task_primary_key].append(aio_task)
+            self._track_upload_aiotask(aio_task_primary_key, aio_task)
         elif path:
             # Fire and forget
             aio_task = asyncio.create_task(app.STORAGE.store_artifact_from_path(artifact, path))
-            self.upload_aiotasks_map[aio_task_primary_key].append(aio_task)
+            self._track_upload_aiotask(aio_task_primary_key, aio_task)
 
         return artifact_id
 
@@ -818,10 +848,10 @@ class ArtifactManager:
         for artifact, artifact_data in zip(artifacts, request.artifacts):
             if artifact_data.data is not None:
                 aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, artifact_data.data))
-                self.upload_aiotasks_map[request.primary_key].append(aio_task)
+                self._track_upload_aiotask(request.primary_key, aio_task)
             elif artifact_data.path is not None:
                 aio_task = asyncio.create_task(app.STORAGE.store_artifact_from_path(artifact, artifact_data.path))
-                self.upload_aiotasks_map[request.primary_key].append(aio_task)
+                self._track_upload_aiotask(request.primary_key, aio_task)
 
         return [model.artifact_id for model in artifact_models]
 
@@ -1125,7 +1155,7 @@ class ArtifactManager:
         aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
         if not aio_task_key:
             raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")
-        self.upload_aiotasks_map[aio_task_key].append(aio_task)
+        self._track_upload_aiotask(aio_task_key, aio_task)
         return aio_task_key
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
@@ -1182,8 +1212,8 @@ class ArtifactManager:
         and carries expiry/kid/sig query parameters so the endpoint can authenticate
         requests without an org-level API key.
 
-        artifact_name and artifact_type are appended as informational query params
-        for client use only — they are not part of the signature.
+        Metadata query parameters are retained only on the API-authenticated unsigned
+        fallback. Signed URLs carry authorization fields only.
         """
         base = settings.SKYVERN_BASE_URL.rstrip("/")
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
@@ -1192,8 +1222,6 @@ class ArtifactManager:
                 base_url=base,
                 artifact_id=artifact_id,
                 keyring=keyring,
-                artifact_name=artifact_name,
-                artifact_type=artifact_type,
                 expiry_seconds=expiry_seconds,
             )
         path = f"{base}/v1/artifacts/{artifact_id}/content"
@@ -1218,8 +1246,8 @@ class ArtifactManager:
         storage backend's presigned URL (S3 / Azure SAS / local URI).
         """
         if _bundling_enabled() or artifact.bundle_key:
-            # Frontend parses ``artifact_name`` out of the URL query for the
-            # download-files display. Bundled members carry the in-ZIP filename
+            # Legacy unsigned URLs expose ``artifact_name`` for download display.
+            # Bundled members carry the in-ZIP filename
             # in ``bundle_key``; non-bundled artifacts have it as the URI
             # basename. Without this fallback the path basename is just
             # "content" and the UI falls back to a literal "download" label.
@@ -1760,7 +1788,7 @@ class ArtifactManager:
                     *[
                         aio_task
                         for primary_key in primary_keys
-                        for aio_task in self.upload_aiotasks_map[primary_key]
+                        for aio_task in self.upload_aiotasks_map.get(primary_key, ())
                         if not aio_task.done()
                     ]
                 )

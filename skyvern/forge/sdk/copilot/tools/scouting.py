@@ -12,12 +12,12 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import normalized_scout_selector
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
 )
@@ -59,6 +59,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
     ScoutedInteraction,
+    resolve_browser_state_for_context,
 )
 
 from ._shared import (
@@ -127,10 +128,7 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
     if not ctx.browser_session_id:
         return None
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=ctx.browser_session_id)
         if not browser_state:
             return None
         page = await browser_state.get_or_create_page()
@@ -530,8 +528,8 @@ def _page_evidence_with_inputs_as_fields(page_evidence: dict[str, Any]) -> dict[
             continue
         field = dict(item)
         selector = field.get("selector")
-        if isinstance(selector, str) and selector.startswith("input#"):
-            field["selector"] = f"#{selector.split('#', 1)[1]}"
+        if isinstance(selector, str):
+            field["selector"] = normalized_scout_selector(selector)
         fields.append(field)
     if not fields:
         return page_evidence

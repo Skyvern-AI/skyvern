@@ -2745,12 +2745,20 @@ export function WorkflowCopilotChat({
   const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
   // Mid-turn Accept would be clobbered by the in-flight turn's terminal
   // restore, so gate actions wait for idle.
-  const gateActionable = Boolean(proposedWorkflow) && !isLoading;
+  const gateActionable =
+    Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
   const hasComposerText = inputValue.trim().length > 0;
   // A live_browser-reason queued prompt parks with no active turn to stop and
   // a disabled, emptied textarea — the morph button would otherwise render as
   // a live "Send" that's a guaranteed no-op; only the Queued chip's ✕ acts.
   const waitingOnQueueOnly = queuedPrompt?.reason === "live_browser";
+  // When the initial history load drops the queued bubble, the composer chip
+  // takes over its live_browser status/Cancel (footer-else-chip).
+  const queuedBubbleOrphaned = Boolean(
+    queuedPrompt &&
+    queuedPrompt.reason === "live_browser" &&
+    !messages.some((message) => message.id === queuedPrompt.id),
+  );
   const morphButtonLabel = waitingOnQueueOnly
     ? "Send disabled — waiting for live browser"
     : !isLoading
@@ -3066,6 +3074,7 @@ export function WorkflowCopilotChat({
                       </>
                     ) : null}
                     {copilotUxV1Enabled &&
+                    !isLoadingHistory &&
                     isLastMessage &&
                     shouldShowConfirmCard(message.narrative) ? (
                       <ConfirmCard
@@ -3077,6 +3086,7 @@ export function WorkflowCopilotChat({
                       />
                     ) : null}
                     {docked &&
+                    !isLoadingHistory &&
                     isLastMessage &&
                     shouldShowFixCard(message.narrative) ? (
                       <FixCard
@@ -3089,7 +3099,12 @@ export function WorkflowCopilotChat({
                       />
                     ) : null}
                     {(() => {
-                      if (!copilotUxV1Enabled || turnId === null) return null;
+                      if (
+                        isLoadingHistory ||
+                        !copilotUxV1Enabled ||
+                        turnId === null
+                      )
+                        return null;
                       const credFrame = credentialCardFrameFor(
                         message.narrative,
                       );
@@ -3231,6 +3246,7 @@ export function WorkflowCopilotChat({
                   uxV1={copilotUxV1Enabled}
                 />
                 {copilotUxV1Enabled &&
+                !isLoadingHistory &&
                 livePauseFrame &&
                 livePauseFrame.turn_id === narrative.turnId ? (
                   <CredentialCard
@@ -3340,7 +3356,7 @@ export function WorkflowCopilotChat({
         {copilotUxV1Enabled &&
         copilotV2Enabled &&
         queuedPrompt &&
-        queuedPrompt.reason === "working" ? (
+        (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-slate-elevation2 px-2.5 py-1.5 text-xs text-muted-foreground">
             <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
             <span className="shrink-0 font-medium text-foreground">Queued</span>

@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentMode,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
@@ -637,6 +638,22 @@ def _authority_tool_error(
     *,
     ignore_request_policy_error: bool = False,
 ) -> str | None:
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        return _emit_tool_blocker_signal(
+            ctx,
+            _build_turn_intent_signal(
+                tool_name=tool_name,
+                classifier_mode="runtime_self_heal",
+                reason_code="runtime_self_heal_native_tool_blocked",
+                agent_steering_text=(
+                    "Runtime self-heal allows browser MCP tools only; do not call native copilot tools."
+                ),
+                user_facing_reason="Runtime self-heal cannot use this tool.",
+                recovery_hint="stop",
+                blocker_kind="tool_error",
+                renders_final_reply=False,
+            ),
+        )
     # Request-policy precedes turn-intent unless explicitly ignored.
     turn_intent_signal = _turn_intent_tool_error(ctx, tool_name)
     request_policy_signal = _request_policy_tool_error(ctx, tool_name)

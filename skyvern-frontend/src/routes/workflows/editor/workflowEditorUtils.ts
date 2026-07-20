@@ -709,7 +709,7 @@ function convertToNode(
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -763,7 +763,7 @@ function convertToNode(
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
         },
       };
@@ -781,7 +781,7 @@ function convertToNode(
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -803,7 +803,7 @@ function convertToNode(
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -855,7 +855,7 @@ function convertToNode(
               : typeof block.data_schema === "string"
                 ? block.data_schema
                 : JSON.stringify(block.data_schema, null, 2),
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
@@ -874,13 +874,15 @@ function convertToNode(
           navigationGoal: block.navigation_goal ?? "",
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          includeActionHistoryInVerification:
+            block.include_action_history_in_verification ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
@@ -908,7 +910,7 @@ function convertToNode(
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -947,7 +949,7 @@ function convertToNode(
         data: {
           ...commonData,
           code: block.code,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
         },
@@ -981,7 +983,7 @@ function convertToNode(
           ...commonData,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1146,7 +1148,7 @@ function convertToNode(
           files: JSON.stringify(block.files || {}, null, 2),
           timeout: block.timeout,
           followRedirects: block.follow_redirects,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           downloadFilename: block.download_filename ?? "",
           saveResponseAsFile: block.save_response_as_file ?? false,
           secretResponsePaths: block.secret_response_paths ?? [],
@@ -1165,7 +1167,7 @@ function convertToNode(
           format: block.format ?? "A4",
           landscape: block.landscape ?? false,
           printBackground: block.print_background ?? true,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1183,7 +1185,7 @@ function convertToNode(
               ? block.payload
               : JSON.stringify(block.payload || {}, null, 2),
           llmKey: block.llm_key ?? "",
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1197,7 +1199,7 @@ function convertToNode(
           fileUrl: block.file_url ?? "",
           prompt: block.prompt ?? "",
           llmKey: block.llm_key ?? "",
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1214,7 +1216,7 @@ function convertToNode(
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
           useParentBrowserSession: block.use_parent_browser_session ?? false,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1234,7 +1236,7 @@ function convertToNode(
           newerThanDays: block.newer_than_days ?? null,
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1250,7 +1252,7 @@ function convertToNode(
           range: block.range ?? "",
           credentialId: block.credential_id ?? "",
           hasHeaderRow: block.has_header_row ?? true,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1271,7 +1273,7 @@ function convertToNode(
             ? JSON.stringify(block.column_mapping, null, 2)
             : "",
           createSheetIfMissing: block.create_sheet_if_missing ?? false,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -3058,6 +3060,8 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
+        include_action_history_in_verification:
+          node.data.includeActionHistoryInVerification,
         engine: node.data.engine,
       };
     }
@@ -4249,6 +4253,8 @@ function convertParametersToParameterYAML(
             credential_id: parameter.credential_id,
             credential_ids: parameter.credential_ids ?? null,
             selection_strategy: parameter.selection_strategy ?? null,
+            fallback_credential_ids: parameter.fallback_credential_ids ?? null,
+            fallback_trigger: parameter.fallback_trigger ?? null,
           };
         }
         case WorkflowParameterTypes.OnePassword: {
@@ -4321,7 +4327,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           complete_on_download: block.complete_on_download,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4351,7 +4357,7 @@ function convertBlocksToBlockYAML(
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4398,7 +4404,7 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           complete_on_download: block.complete_on_download,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4420,7 +4426,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           complete_on_download: block.complete_on_download,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4441,7 +4447,7 @@ function convertBlocksToBlockYAML(
           data_schema: block.data_schema,
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
         };
@@ -4457,12 +4463,14 @@ function convertBlocksToBlockYAML(
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
+          include_action_history_in_verification:
+            block.include_action_history_in_verification,
           engine: block.engine,
         };
         return blockYaml;
@@ -4486,7 +4494,7 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4562,7 +4570,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "code",
           code: block.code,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           prompt: block.prompt,
           steps: block.steps,
         };
@@ -4575,7 +4583,7 @@ function convertBlocksToBlockYAML(
           llm_key: block.llm_key,
           prompt: block.prompt,
           json_schema: block.json_schema,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4676,7 +4684,7 @@ function convertBlocksToBlockYAML(
           files: block.files,
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           download_filename: block.download_filename,
           secret_response_paths: serializeSecretResponsePaths(
             block.secret_response_paths ?? [],
@@ -4693,7 +4701,7 @@ function convertBlocksToBlockYAML(
           format: block.format,
           landscape: block.landscape,
           print_background: block.print_background,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4705,7 +4713,7 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           payload: block.payload,
           llm_key: block.llm_key,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4716,7 +4724,7 @@ function convertBlocksToBlockYAML(
           file_url: block.file_url,
           prompt: block.prompt,
           llm_key: block.llm_key,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4729,7 +4737,7 @@ function convertBlocksToBlockYAML(
           wait_for_completion: block.wait_for_completion,
           browser_session_id: block.browser_session_id,
           use_parent_browser_session: block.use_parent_browser_session,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4746,7 +4754,7 @@ function convertBlocksToBlockYAML(
           newer_than_days: block.newer_than_days,
           max_results: block.max_results,
           include_body: block.include_body,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4759,7 +4767,7 @@ function convertBlocksToBlockYAML(
           range: block.range,
           credential_id: block.credential_id,
           has_header_row: block.has_header_row,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4775,7 +4783,7 @@ function convertBlocksToBlockYAML(
           values: block.values,
           column_mapping: block.column_mapping,
           create_sheet_if_missing: block.create_sheet_if_missing,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }

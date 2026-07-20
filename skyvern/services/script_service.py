@@ -40,11 +40,13 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     get_path_for_workflow_download_directory,
     list_files_in_directory,
+    recover_download_extension,
     rename_file,
     resolve_run_download_id,
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -2322,6 +2324,14 @@ async def download(
                     # Skip incomplete downloads
                     if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
+                    if not file_extension:
+                        file_extension = recover_download_extension(file_path, download_suffix)
+                        if file_extension:
+                            LOG.info(
+                                "Recovered missing download file extension from file content",
+                                file=file_path,
+                                extension=file_extension,
+                            )
                     local_basename = Path(file_path).name
                     existing_names = {
                         Path(f).name
@@ -2329,6 +2339,22 @@ async def download(
                         if Path(f).name != local_basename
                     }
                     desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    # context suffix fields are omitted: cached-script mode bakes the suffix into the
+                    # generated script (no per-step contextvar stamping), so there is no task_block-vs-
+                    # context divergence to attribute; task_id/block_label give per-download attribution.
+                    # finalize_* keys avoid the forge_log processor overwriting bare task_id/
+                    # workflow_run_id with the ambient context's values (see agent finalize path).
+                    LOG.info(
+                        "download_suffix_finalize_rename",
+                        execution_path="cached_script",
+                        finalize_workflow_run_id=run_id,
+                        finalize_task_id=task_id,
+                        block_label=cache_key,
+                        pre_rename_filename_fp=diagnostic_fingerprint(local_basename),
+                        passed_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+                        desired_name_fp=diagnostic_fingerprint(desired_name),
+                        will_rename=local_basename != desired_name,
+                    )
                     if local_basename != desired_name:
                         file_path = rename_file(file_path, desired_name)
                     newly_downloaded_files.append(file_path)

@@ -86,6 +86,7 @@ export type AzureVaultCredentialParameter = WorkflowParameterBase & {
 };
 
 export type CredentialSelectionStrategy = "round_robin" | "random";
+export type CredentialFallbackTrigger = "credential_failures" | "any_failure";
 
 export type CredentialParameter = WorkflowParameterBase & {
   parameter_type: "credential";
@@ -94,6 +95,8 @@ export type CredentialParameter = WorkflowParameterBase & {
   credential_id: string;
   credential_ids?: Array<string> | null;
   selection_strategy?: CredentialSelectionStrategy | null;
+  fallback_credential_ids?: Array<string> | null;
+  fallback_trigger?: CredentialFallbackTrigger | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -552,6 +555,7 @@ export type LoginBlock = WorkflowBlockBase & {
   disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  include_action_history_in_verification: boolean;
   engine: RunEngine | null;
 };
 

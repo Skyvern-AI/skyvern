@@ -95,6 +95,22 @@ class TestSkyvernFrameEvaluateRouting:
         page.context.new_cdp_session.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
+    async def test_page_like_with_none_context_falls_back_to_direct_evaluate(self) -> None:
+        """A page-like object whose context is None (a future engine's pre-attach
+        state) must take direct frame.evaluate and never reach the prefix
+        WeakKeyDictionary, whose get(None) would raise TypeError."""
+        page = MagicMock(spec=Page)
+        page.context = None
+        page.evaluate = AsyncMock(return_value="page-evaluate-result")
+
+        with patch("skyvern.webeye.utils.page.get_main_world_prefix") as get_prefix:
+            result = await SkyvernFrame.evaluate(page, "() => 1")
+
+        assert result == "page-evaluate-result"
+        page.evaluate.assert_awaited_once_with(expression="() => 1", arg=None)
+        get_prefix.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_frame_target_never_routes_through_runtime_evaluate(self) -> None:
         """Iframe Frames have their own world; page-level Runtime.evaluate lands elsewhere."""
         frame = _make_frame_mock()

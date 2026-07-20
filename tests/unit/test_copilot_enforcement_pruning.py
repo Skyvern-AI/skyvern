@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _maybe_synthesized_block_offer_msg,
     _needs_suspicious_success_nudge,
     _prune_input_list,
+    _requested_output_paths_for_ctx,
     _should_block_mutating_tool_after_synthesized_offer,
     _should_force_advisory_run_dispatch,
     _should_force_synthesized_block_persistence,
@@ -154,6 +155,7 @@ class _Ctx:
         self.last_run_blocks_workflow_run_id = None
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
+        self.author_time_gate_log_only_ids: frozenset[str] = frozenset()
         self.author_time_gate_ablation_events = []
         self.request_policy = None
         self.blocker_signal = None
@@ -2476,17 +2478,18 @@ class TestScoutOutputCoverageGate:
 
     def test_independent_run_evidence_is_exempt_from_repair_context(self) -> None:
         independent = CompletionCriterion(
-            id="output.login_gate_present",
-            outcome="whether a login gate blocked the target is recorded",
-            output_path="output.login_gate_present",
+            id="output.login_gate_blocks_target",
+            outcome="the login-gate judgment is independently observed after the run",
+            output_path="output.login_gate_blocks_target",
+            expected_output_shape="goal_judgment_boolean",
             requested_output_evidence_source="independent_run_evidence",
         )
-        runtime = _criterion("output.document_name", "the order status document name is captured")
+        runtime = _criterion("output.document_name", "the document name is captured")
         ctx = self._authoring_ctx(independent, runtime)
         ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
             block_label="extract_order",
             reason_code="metadata_reject",
-            required_goal_value_paths=["login_gate_present", "document_name"],
+            required_goal_value_paths=["login_gate_blocks_target", "document_name"],
         )
 
         assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
@@ -2555,6 +2558,22 @@ class TestScoutOutputCoverageGate:
 
         assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
         assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_pathless_post_run_criterion_does_not_erase_repair_output_field(self) -> None:
+        independent = CompletionCriterion(
+            id="c_independent",
+            outcome="the judgment is independently observed after the run",
+            output_path=None,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        ctx = self._authoring_ctx(independent)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["field"],
+        )
+
+        assert _requested_output_paths_for_ctx(ctx) == {"output.field"}
 
     def test_runtime_output_stays_gated_alongside_exempt_source(self) -> None:
         registered = CompletionCriterion(

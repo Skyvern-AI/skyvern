@@ -126,7 +126,8 @@
       "rollup": "npm:@rollup/wasm-node"
     },
     "vitest": {
-      "vite": "^7.3.2"
+      "vite": "^7.3.2",
+      "esbuild": "^0.28.1"
     },
     "@types/node": "$@types/node",
     "protobufjs": "^8.6.0",

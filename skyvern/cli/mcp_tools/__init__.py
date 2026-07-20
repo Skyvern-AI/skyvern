@@ -153,6 +153,7 @@ from .tabs import (
     skyvern_tab_switch,
     skyvern_tab_wait_for_new,
 )
+from .trajectory import skyvern_trajectory_get
 from .workflow import (
     guard_definition_size,
     skyvern_workflow_cancel,
@@ -171,7 +172,7 @@ from .workflow import (
 _RUN_TASK_TOOL_DESCRIPTION = (
     "Run a one-off autonomous trial via the highest-cost AI path. "
     "Not for production or reusable automations. "
-    "Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute."
+    "Prefer direct tools (click/type/select via selector) and skyvern_observe + skyvern_execute."
 )
 
 
@@ -234,7 +235,7 @@ static JSON/XML fetches, or generic web search.
 | Quick inspection | "what does the page show?" | skyvern_extract | 1 LLM + screenshots | Dedicated extraction LLM + schema validation + caching. Better than screenshot+read. |
 | Single action (known target) | "click #submit" | skyvern_click / skyvern_type | 0 LLM | Deterministic Playwright. No AI. Fastest. |
 | Single action (unknown target) | "click the submit button" | skyvern_act | 2-3 LLM, no screenshots | No screenshots in reasoning. Economy a11y tree. For visual targets, use observe first. |
-| Multi-step (simple, fast) | "fill the form and submit" | skyvern_observe + skyvern_execute | 0 Skyvern LLM | A11y tree + YOUR LLM plans from refs + batched primitives. Fast, cheap. |
+| Multi-step (simple, fast) | "fill the form and submit" | skyvern_observe + skyvern_execute | 0 Skyvern LLM | On stdio, refs persist across calls until the next observe, navigation, or page/document change. On hosted stateless HTTP, prefer selector/intent; refs work only within one execute batch when predictable in advance, never adaptively from an inline observe. |
 | Throwaway autonomous trial | "try this once", "see if this works" | skyvern_run_task | Higher | One-off autonomous agent for exploratory work. Do not use for reusable or multi-page production automations. |
 | Multi-step (complex) | "navigate a multi-page wizard" | skyvern_workflow_create (multi-block) | N LLM + screenshots | Build a workflow with one navigation block per step. Each block gets visual reasoning + verification. |
 | Reusable workflow | "automate this", "wizard", "multi-step", "production" | skyvern_workflow_create | Varies | Caching converts AI runs into deterministic scripts over time (10-100x faster on repeat). |
@@ -244,7 +245,7 @@ static JSON/XML fetches, or generic web search.
 
 1. If the user gives a selector, id, XPath, or exact field target, use browser primitives -- not skyvern_act.
 2. If you only need a yes/no answer, use skyvern_validate -- not skyvern_extract or skyvern_act.
-3. If the work stays on one page and the UI is standard, prefer skyvern_observe + skyvern_execute.
+3. If the work stays on one page and the UI is standard, prefer skyvern_observe + skyvern_execute on stdio, where refs persist across calls until the next observe, navigation, or page/document change. On hosted stateless HTTP, prefer selector or intent; use refs within one skyvern_execute batch only when predictable before the call, never adaptively from an inline observe.
 4. If the user says "try this once", "see if this works", or clearly wants a one-off exploratory trial, use skyvern_run_task.
 5. If the task spans multiple pages and is meant to be reusable/repeatable, use skyvern_workflow_create. To run it on a recurring cadence, follow up with skyvern_schedule_create against the resulting workflow_permanent_id.
 6. Never type passwords. Always use skyvern_login with stored credentials.
@@ -255,13 +256,13 @@ static JSON/XML fetches, or generic web search.
 - **Inspection:** skyvern_extract(prompt="Extract all prices", schema='{"type":"object","properties":{...}}')
 - **Known selector:** skyvern_click(selector="#submit") or skyvern_type(selector="#email", text="user@co.com")
 - **Unknown target:** skyvern_act(prompt="Click the Sign In button")
-- **Multi-step form:** skyvern_observe() -> skyvern_execute(steps=[...])
+- **Multi-step form:** stdio: skyvern_observe() -> skyvern_execute(steps=[...]); hosted stateless HTTP: prefer selector/intent, or use refs in one execute batch only when known before the call (not adaptively from an inline observe).
 - **One-off trial:** skyvern_run_task(prompt="Try the checkout flow once")
 - **Reusable workflow:** skyvern_workflow_create(definition='{"title":"...","workflow_definition":{"blocks":[...]}}', format="json")
 
 ## Key Warnings
 
-1. **act has NO screenshots** — uses economy a11y tree. For visual targets, use observe then click with ref.
+1. **act has NO screenshots** — uses economy a11y tree. For visual targets, use observe, then execute with refs on stdio; on hosted stateless HTTP prefer selector/intent (see decision rule 3).
 2. **observe+execute ≠ workflows.** observe+execute: YOUR LLM plans, no Skyvern calls. Workflows: full ForgeAgent per block with screenshots.
 3. **validate is cheapest AI** for yes/no. **extract uses screenshots** with dedicated LLM.
 4. **NEVER type passwords** — use skyvern_login with stored credentials.
@@ -461,6 +462,7 @@ mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Synthesize Code Block"))(skyvern_code_block_synthesize)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Browser Trajectory"))(skyvern_trajectory_get)
 
 # -- Organization settings (no browser needed) --
 mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
@@ -587,6 +589,7 @@ __all__ = [
     "skyvern_block_validate",
     "skyvern_code_block_lint",
     "skyvern_code_block_synthesize",
+    "skyvern_trajectory_get",
     # Organization settings
     "skyvern_org_get",
     "skyvern_org_update",

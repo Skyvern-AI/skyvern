@@ -206,7 +206,7 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_page_inspected, _mark_post_run_page_observed
-from .workflow_update import record_output_contract_run_output_evidence
+from .workflow_update import output_contract_value_bearing_run_reject, record_output_contract_run_output_evidence
 
 LOG = structlog.get_logger()
 
@@ -1545,6 +1545,23 @@ async def _run_blocks_and_collect_debug(
         ctx.last_executed_block_labels = []
         return runtime_security_failure
 
+    # The lane asserts a saved-workflow property, so its evidence set is every saved code
+    # block, never just the selected subset (security lanes above stay selection-scoped).
+    value_bearing_reject = output_contract_value_bearing_run_reject(
+        ctx,
+        {
+            code_input.label: code_input.code
+            for code_input in _selected_code_security_inputs(
+                _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+                selected_labels=set(),
+                include_descendants=True,
+            )
+        },
+    )
+    if value_bearing_reject is not None:
+        ctx.last_executed_block_labels = []
+        return value_bearing_reject
+
     credential_ids = list(
         dict.fromkeys(
             _extract_credential_ids_from_tool_value(params.get("parameters") or {})
@@ -2731,7 +2748,9 @@ def _record_run_blocks_result(
     )
     copilot_ctx.completion_verification_result = completion_verification
     if prior_committed_outcome is None or _verification_fully_satisfied(completion_verification):
-        record_completion_verification(copilot_ctx, completion_verification)
+        record_completion_verification(
+            copilot_ctx, completion_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+        )
         _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
@@ -2867,7 +2886,9 @@ def _record_run_blocks_result(
         if blocked_verification is not completion_verification:
             completion_verification = blocked_verification
             copilot_ctx.completion_verification_result = blocked_verification
-            record_completion_verification(copilot_ctx, blocked_verification)
+            record_completion_verification(
+                copilot_ctx, blocked_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+            )
             _record_adjudication_on_turn_state(copilot_ctx, blocked_verification)
         _mark_page_inspected(copilot_ctx)
         result["ok"] = False

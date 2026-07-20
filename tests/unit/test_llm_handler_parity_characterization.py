@@ -487,6 +487,30 @@ async def test_provider_prefixed_response_model(span_exporter: InMemorySpanExpor
             id="api-error",
         ),
         pytest.param(
+            lambda: litellm.exceptions.Timeout("timed out", "gpt-4", "openai"),
+            LLMProviderErrorRetryableTask,
+            "error",
+            id="timeout",
+        ),
+        pytest.param(
+            lambda: litellm.exceptions.APIConnectionError("connection reset", "openai", "gpt-4"),
+            LLMProviderErrorRetryableTask,
+            "error",
+            id="connection",
+        ),
+        pytest.param(
+            lambda: litellm.exceptions.ServiceUnavailableError("no healthy deployment", "openai", "gpt-4"),
+            LLMProviderErrorRetryableTask,
+            "error",
+            id="service-unavailable",
+        ),
+        pytest.param(
+            lambda: litellm.exceptions.InternalServerError("overloaded", "openai", "gpt-4"),
+            LLMProviderErrorRetryableTask,
+            "error",
+            id="internal-server",
+        ),
+        pytest.param(
             lambda: litellm.exceptions.RateLimitError("rl", "openai", "gpt-4"),
             LLMProviderError,
             "rate_limited",

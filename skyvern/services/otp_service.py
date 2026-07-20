@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.tasks import Task
@@ -86,7 +86,18 @@ async def parse_otp_login(
     resp = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, prompt_name="parse-otp-login", organization_id=organization_id
     )
-    otp_result = OTPResultParsedByLLM.model_validate(resp)
+    try:
+        otp_result = OTPResultParsedByLLM.model_validate(resp)
+    except ValidationError as e:
+        # Off-schema JSON from a successful LLM call is unparseable content (-> caller's 400
+        # path), not a backend outage (-> 502). Log the exception type only; the raw response
+        # can carry OTP/PII.
+        LOG.warning(
+            "OTP login parser returned off-schema response",
+            organization_id=organization_id,
+            exception_type=type(e).__name__,
+        )
+        return None
     LOG.info(
         "OTP Login Parser Response",
         enforced_otp_type=enforced_otp_type,

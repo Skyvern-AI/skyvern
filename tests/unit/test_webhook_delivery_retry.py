@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -13,6 +15,8 @@ from skyvern.services.webhook_delivery import (
     deliver_webhook_with_retries,
     is_retryable_status,
 )
+
+_STDLIB_ASYNCIO_SLEEP = asyncio.sleep
 
 
 def _response(status_code: int, body: str = "", headers: dict[str, str] | None = None) -> httpx.Response:
@@ -34,13 +38,13 @@ async def _deliver_with_mock(deliver: AsyncMock, **kwargs) -> httpx.Response:
 
 @pytest.fixture
 def fake_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Replace asyncio.sleep with a no-op recorder so tests don't actually wait."""
+    """Replace only the webhook module's sleep so unrelated tasks keep waiting."""
     recorded: list[float] = []
 
     async def _sleep(delay: float) -> None:
         recorded.append(delay)
 
-    monkeypatch.setattr("skyvern.services.webhook_delivery.asyncio.sleep", _sleep)
+    monkeypatch.setattr("skyvern.services.webhook_delivery.asyncio", SimpleNamespace(sleep=_sleep))
     return recorded
 
 
@@ -48,6 +52,10 @@ def fake_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def no_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin random.uniform to 0 so backoff delays are deterministic."""
     monkeypatch.setattr("skyvern.services.webhook_delivery.random.uniform", lambda a, b: 0.0)
+
+
+def test_fake_sleep_does_not_patch_process_wide_asyncio(fake_sleep: list[float]) -> None:
+    assert asyncio.sleep is _STDLIB_ASYNCIO_SLEEP
 
 
 @pytest.mark.asyncio

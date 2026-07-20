@@ -101,8 +101,12 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
+from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult, run_self_heal_recovery
+from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -168,7 +172,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
 )
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -181,6 +185,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
+from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
@@ -1118,6 +1123,12 @@ class BaseTaskBlock(Block):
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
+            LOG.info(
+                "download_suffix_rendered",
+                block_label=self.label,
+                current_index=workflow_run_context.get_block_metadata(self.label).get("current_index"),
+                download_suffix_fp=diagnostic_fingerprint(self.download_suffix),
+            )
 
         if self.navigation_goal:
             self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
@@ -4066,6 +4077,35 @@ async def wrapper({default_args}):
                 return line_url
         return ""
 
+    def _matched_step_index_for_failing_line(self, failing_line: int | None) -> int | None:
+        if failing_line is None:
+            return None
+        matched_step = self._match_step_for_failing_line(failing_line)
+        if matched_step is None:
+            return None
+        steps = self.steps or []
+        for idx, step in enumerate(steps):
+            if step is matched_step:
+                return idx
+        return None
+
+    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
+        safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
+        matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
+        if matched_step is None or not matched_step.description:
+            return safe_main
+        steps = self.steps or []
+        matched_index = next((idx for idx, step in enumerate(steps) if step is matched_step), None)
+        if matched_index is None:
+            matched_index = len(steps) - 1
+        descriptions = [matched_step.description] + [
+            step.description for step in steps[matched_index + 1 :] if step.description
+        ]
+        safe_mini = "\nThen: ".join(
+            workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+        )
+        return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4197,27 +4237,10 @@ async def wrapper({default_args}):
         escalation_step: Step | None = None
         recovery_block_id: str | None = None
         try:
-            # block.prompt is the operative goal; a confidently-matched step only narrows it. The match
-            # is advisory (spans are display-oriented and render-shifted), so any miss heals on the prompt.
-            safe_main = workflow_run_context.mask_secrets_in_data(self.prompt)
-            matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
-            if matched_step is not None and matched_step.description:
-                # The heal owns the failing step plus every subsequent authored step — a
-                # step-only goal would complete the block while trailing steps ran by no one.
-                steps = self.steps or []
-                # Identity scan, not .index(): value equality would match an earlier duplicate step.
-                matched_index = next((i for i, step in enumerate(steps) if step is matched_step), None)
-                if matched_index is None:
-                    matched_index = len(steps) - 1  # defensive; matched_step always comes from self.steps
-                descriptions = [matched_step.description] + [
-                    step.description for step in steps[matched_index + 1 :] if step.description
-                ]
-                safe_mini = "\nThen: ".join(
-                    workflow_run_context.mask_secrets_in_data(description) for description in descriptions
-                )
-                navigation_goal = compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
-            else:
-                navigation_goal = safe_main
+            navigation_goal = self._compose_heal_goal(
+                workflow_run_context=workflow_run_context,
+                failing_line=failing_line,
+            )
 
             workflow_system_prompt = (
                 None
@@ -4423,6 +4446,117 @@ async def wrapper({default_args}):
             skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
         )
 
+    @staticmethod
+    def _workflow_definition_hash(workflow_definition: Any) -> str:
+        if hasattr(workflow_definition, "model_dump"):
+            payload = workflow_definition.model_dump(mode="json")
+        else:
+            payload = workflow_definition
+        normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    async def _self_heal_mutation_guard_snapshot(
+        self,
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> tuple[int, str]:
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if workflow is None:
+            raise RuntimeError("workflow_not_found_for_self_heal_guard")
+        versions = await app.DATABASE.workflows.get_workflow_versions_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        return len(versions), self._workflow_definition_hash(workflow.workflow_definition)
+
+    @staticmethod
+    def _output_obligation_for_heal_result(result: BlockResult | None) -> OutputObligation:
+        if result is None or not result.success:
+            return OutputObligation.none
+        if result.output_parameter_value is not None:
+            return OutputObligation.observed
+        return OutputObligation.vestigial
+
+    @staticmethod
+    def _heal_parameter_binding_keys(workflow_run_context: WorkflowRunContext) -> list[str]:
+        # Episode metadata is best-effort; it must never fail the heal path.
+        try:
+            return sorted(str(key) for key in workflow_run_context.parameters.keys())
+        except Exception:
+            return []
+
+    async def _write_heal_episode_safe(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        block_label: str,
+        engine: str,
+        status: Literal["fired_completed", "fired_failed", "fired_unverified", "skipped"],
+        skip_reason: HealSkipReason | None,
+        parameter_binding_keys: list[str],
+        exception_class: str | None,
+        failing_line: int | None,
+        matched_step_index: int | None,
+        failure_message: str | None,
+        wall_clock_ms: int | None,
+        action_count: int | None,
+        output_obligation: OutputObligation,
+    ) -> None:
+        LOG.info(
+            "self-heal episode",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=block_label,
+            engine=engine,
+            status=status,
+            skip_reason=skip_reason.value if skip_reason is not None else None,
+            origin=TurnOrigin.runtime_self_heal.value,
+        )
+        try:
+            await app.DATABASE.self_heal.create_heal_episode(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=block_label,
+                engine=engine,
+                status=HealStatus(status),
+                skip_reason=skip_reason,
+                snapshot_available=False,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=failure_message,
+                wall_clock_ms=wall_clock_ms,
+                action_count=action_count,
+                output_obligation=output_obligation,
+            )
+        except Exception:
+            LOG.warning(
+                "self-heal episode persistence failed; continuing",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=block_label,
+                engine=engine,
+                status=status,
+                exc_info=True,
+            )
+
     async def _resolve_failure_with_heal(
         self,
         *,
@@ -4439,13 +4573,60 @@ async def wrapper({default_args}):
         browser_state: BrowserState | None = None,
         page: Page | None = None,
     ) -> BlockResult:
-        healed: BlockResult | None = None
-        if classification.healable:
-            live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(
-                workflow_run_id=workflow_run_id
+        async def _finalize_heal_result(result: BlockResult | None) -> BlockResult:
+            if result is not None:
+                output_obligation = self._output_obligation_for_heal_result(result)
+                # Record output before finalizing so a failed write fails closed, never leaving a
+                # completed block without the output downstream consumers require.
+                if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
+                    await self.record_output_parameter_value(
+                        workflow_run_context,
+                        workflow_run_id,
+                        result.output_parameter_value,
+                    )
+                await recorder.finalize(success=result.success)
+                return result
+            await recorder.finalize(success=False)
+            return await build_failure_result()
+
+        if not classification.healable:
+            return await _finalize_heal_result(None)
+        if not await self._self_heal_enabled(workflow_run_context):
+            return await _finalize_heal_result(None)
+        if not organization_id:
+            return await _finalize_heal_result(None)
+
+        workflow_permanent_id = workflow_run_context.workflow_permanent_id
+        workflow_id = workflow_run_context.workflow_id
+        exception_for_heal = exception or RuntimeError("CodeBlock failed")
+        exception_class = type(exception_for_heal).__name__
+        matched_step_index = self._matched_step_index_for_failing_line(failing_line)
+        parameter_binding_keys = self._heal_parameter_binding_keys(workflow_run_context)
+        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+
+        async def _record_harness_skip(skip_reason: HealSkipReason, failure_message: str | None = None) -> None:
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="skipped",
+                skip_reason=skip_reason,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=failure_message,
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
             )
-            exception_for_heal = exception or RuntimeError("CodeBlock failed")
-            healed = await self._attempt_self_heal(
+
+        async def _run_floor_recovery() -> BlockResult | None:
+            floor_result = await self._attempt_self_heal(
                 exception=exception_for_heal,
                 failing_line=failing_line,
                 recording_page=recorder.recording_page,
@@ -4459,26 +4640,252 @@ async def wrapper({default_args}):
                 page=page,
                 record_output_parameter=False,
             )
-        if healed is not None:
-            output_obligation = OutputObligation.none
-            if healed.success:
-                output_obligation = (
-                    OutputObligation.observed
-                    if healed.output_parameter_value is not None
-                    else OutputObligation.vestigial
+            floor_output_obligation = self._output_obligation_for_heal_result(floor_result)
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="floor",
+                status="fired_completed" if floor_result is not None and floor_result.success else "fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=floor_result.failure_reason if floor_result is not None else "floor_no_result",
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=floor_output_obligation,
+            )
+            return floor_result
+
+        api_key = await app.AGENT_FUNCTION.resolve_self_heal_api_key(organization_id)
+        if not api_key:
+            await _record_harness_skip(
+                HealSkipReason.credential_unavailable, failure_message="self_heal_api_key_missing"
+            )
+            return await _finalize_heal_result(await _run_floor_recovery())
+
+        browser_context = (
+            getattr(live_browser_state, "browser_context", None) if live_browser_state is not None else None
+        )
+        if live_browser_state is None or not _browser_context_is_attachable(browser_context):
+            await _record_harness_skip(HealSkipReason.adoption_failed, failure_message="self_heal_browser_unavailable")
+            return await _finalize_heal_result(await _run_floor_recovery())
+        # Reserve cap only once harness preconditions are satisfied so transient infra skips
+        # do not consume slots; cap limits harness attempts, not floor fallback attempts.
+        cap_reserved = await check_and_increment_self_heal_cap(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if cap_reserved is None:
+            await _record_harness_skip(HealSkipReason.capped, failure_message="self_heal_daily_cap_exceeded")
+            return await _finalize_heal_result(await _run_floor_recovery())
+
+        recovery: SelfHealRecoveryResult | None = None
+        try:
+            before_snapshot = await self._self_heal_mutation_guard_snapshot(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            recovery = await run_self_heal_recovery(
+                block=self,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_state=live_browser_state,
+                failing_line=failing_line,
+                api_key=api_key,
+                max_actions=settings.SELF_HEAL_MAX_ACTIONS,
+                wall_clock_budget_seconds=settings.SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS,
+            )
+            after_snapshot = await self._self_heal_mutation_guard_snapshot(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            if before_snapshot != after_snapshot:
+                raise RuntimeError("workflow_mutated_during_runtime_self_heal")
+
+            if recovery.success:
+                # Compute the obligation from a non-persisted result: an unverified or
+                # fail-closed outcome must never leave the block row marked completed, so the
+                # block row is written only on the verified path below.
+                harness_result = await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=None,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=None,
+                    organization_id=organization_id,
                 )
-            # Record output before finalizing so a failed write fails closed, never leaving a
-            # completed block without the output downstream consumers require.
-            if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
-                await self.record_output_parameter_value(
-                    workflow_run_context,
-                    workflow_run_id,
-                    healed.output_parameter_value,
+                harness_output_obligation = self._output_obligation_for_heal_result(harness_result)
+                if not recovery.verified:
+                    await self._write_heal_episode_safe(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        block_label=self.label,
+                        engine="harness",
+                        status="fired_unverified",
+                        skip_reason=None,
+                        parameter_binding_keys=parameter_binding_keys,
+                        exception_class=exception_class,
+                        failing_line=failing_line,
+                        matched_step_index=matched_step_index,
+                        failure_message=recovery.failure_note,
+                        wall_clock_ms=recovery.wall_clock_ms,
+                        action_count=recovery.action_count,
+                        output_obligation=harness_output_obligation,
+                    )
+                    # Fail closed when an unverified harness run already mutated controls:
+                    # rerunning floor could duplicate side effects (submit/send/delete).
+                    if recovery.performed_mutation:
+                        LOG.info(
+                            "Runtime self-heal unverified after mutating actions; suppressing floor fallback",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                            organization_id=organization_id,
+                            block_label=self.label,
+                            origin=TurnOrigin.runtime_self_heal.value,
+                        )
+                        return await _finalize_heal_result(None)
+                    return await _finalize_heal_result(await _run_floor_recovery())
+                # Verified: only now write status=completed to the block row.
+                harness_result = await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=None,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
-            await recorder.finalize(success=healed.success)
-            return healed
-        await recorder.finalize(success=False)
-        return await build_failure_result()
+                await self._write_heal_episode_safe(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                    engine="harness",
+                    status="fired_completed",
+                    skip_reason=None,
+                    parameter_binding_keys=parameter_binding_keys,
+                    exception_class=exception_class,
+                    failing_line=failing_line,
+                    matched_step_index=matched_step_index,
+                    failure_message=None,
+                    wall_clock_ms=recovery.wall_clock_ms,
+                    action_count=recovery.action_count,
+                    output_obligation=harness_output_obligation,
+                )
+                return await _finalize_heal_result(harness_result)
+
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=recovery.failure_note,
+                wall_clock_ms=recovery.wall_clock_ms,
+                action_count=recovery.action_count,
+                output_obligation=OutputObligation.none,
+            )
+            # A failed harness turn that already mutated controls must not hand off to floor:
+            # rerunning could duplicate the side effect (submit/send/delete).
+            if recovery.performed_mutation:
+                LOG.info(
+                    "Runtime self-heal failed after mutating actions; suppressing floor fallback",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    origin=TurnOrigin.runtime_self_heal.value,
+                )
+                return await _finalize_heal_result(None)
+            return await _finalize_heal_result(await _run_floor_recovery())
+        except HealAdoptionFailed as exc:
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=str(exc),
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
+            )
+            return await _finalize_heal_result(await _run_floor_recovery())
+        except Exception as exc:
+            LOG.error(
+                "Runtime self-heal harness recovery failed",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                block_label=self.label,
+                origin=TurnOrigin.runtime_self_heal.value,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=type(exc).__name__,
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
+            )
+            # If the harness already mutated a control before the error (e.g. the workflow-mutation
+            # guard tripped after a click), a floor rerun could duplicate the side effect.
+            if recovery is not None and recovery.performed_mutation:
+                LOG.info(
+                    "Runtime self-heal errored after mutating actions; suppressing floor fallback",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    origin=TurnOrigin.runtime_self_heal.value,
+                )
+                return await _finalize_heal_result(None)
+            return await _finalize_heal_result(await _run_floor_recovery())
 
     async def execute(
         self,
@@ -4632,9 +5039,9 @@ async def wrapper({default_args}):
             block_label=self.label,
         )
 
-        # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
-        # the standard action/artifact timeline and the agent can later take over on failure.
-        # Promptless blocks have no task and persist neither actions nor screenshots.
+        # Every code block gets a container task v1 + step so its recorded calls render through
+        # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
+        # task also seats a later agent takeover on failure.
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,

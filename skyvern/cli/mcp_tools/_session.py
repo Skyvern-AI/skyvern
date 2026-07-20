@@ -9,9 +9,11 @@ from skyvern.cli.core.client import get_skyvern
 from skyvern.cli.core.session_manager import (
     BrowserNotAvailableError,
     SessionState,
+    active_api_key_hash,
     browser_session,
     clear_session_ref_map,
     close_current_session,
+    current_api_key_hash,
     get_current_session,
     get_page,
     get_session_ref,
@@ -26,9 +28,11 @@ from skyvern.cli.core.session_manager import (
 __all__ = [
     "BrowserNotAvailableError",
     "SessionState",
+    "active_api_key_hash",
     "browser_session",
     "clear_session_ref_map",
     "close_current_session",
+    "current_api_key_hash",
     "get_current_session",
     "get_page",
     "get_session_ref",
