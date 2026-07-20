@@ -68,6 +68,7 @@ from skyvern.exceptions import (
     NoTOTPSecretFound,
     OptionIndexOutOfBound,
     PhoneNumberInputMismatch,
+    SecretInputMismatch,
     SkyvernException,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
@@ -2085,6 +2086,113 @@ async def _verify_masked_input_after_fill(
         expected_char_count=len(_alnum(expected_value)),
         committed_char_count=len(_alnum(committed_value)),
     )
+
+
+# Native input types whose DOM .value round-trips typed text exactly, so an exact read-back is meaningful.
+# password/text/email/search/url and an untyped input default to a text field; tel/number/date-like inputs
+# normalize or auto-format their value and are excluded, as are textarea/contenteditable/select (non-input
+# sinks whose read-back is trimmed).
+_EXACT_VALUE_INPUT_TYPES = frozenset({"password", "text", "email", "search", "url", ""})
+# Mask glyphs a reveal/obfuscation widget may render into a non-password .value, optionally grouped by
+# these separators (e.g. "•••• ••••" / "****-****").
+_SECRET_MASK_CHARS = frozenset("•●·*∗＊")
+_SECRET_MASK_SEPARATORS = re.compile(r"[\s\-./]")
+
+
+def _exact_value_input_type(input_type: str | None) -> str:
+    return (input_type or "").strip().lower()
+
+
+def _secret_readback_is_unreadable_mask(actual_value: str | None, *, is_password: bool) -> bool:
+    # Unreadable only when the read-back is ENTIRELY mask glyphs (optionally separator-grouped, e.g.
+    # "•••• ••••" / "****-****"): a custom reveal/mask widget is rendering only bullets, not the real
+    # .value, so it cannot be compared and the field is left as typed. A value with any real character is
+    # readable and compared exactly -- a revealed secret that merely contains a "*"/"•" must NOT be skipped
+    # (that would silently defeat the fix for exactly the "show password" text fields this covers). Callers
+    # check exact equality first, so a legitimately all-glyph secret that round-trips is a match, not a
+    # skip. A native password input's .value is always the real typed value (mask is visual only).
+    if is_password or not actual_value:
+        return False
+    stripped = _SECRET_MASK_SEPARATORS.sub("", actual_value)
+    return bool(stripped) and all(char in _SECRET_MASK_CHARS for char in stripped)
+
+
+def _secret_input_cannot_round_trip(text: str, *, maxlength: str | None) -> bool:
+    # Some fields cannot hold the intended value exactly by their declared browser contract: a single-line
+    # input strips CR/LF, and a positive maxlength shorter than the value truncates it. A read-back would
+    # never equal the intended value there, so skip the exact-readback recovery rather than false-failing
+    # an as-correct-as-possible fill.
+    if "\r" in text or "\n" in text:
+        return True
+    if maxlength:
+        try:
+            limit = int(maxlength)
+        except ValueError:
+            return False
+        return 0 <= limit < len(text)
+    return False
+
+
+def _secret_readback_is_mismatch(expected: str, actual_value: str | None) -> bool:
+    # A confirmed rendered value that differs from the intended secret, INCLUDING an empty read-back (the
+    # fill was rejected/async-cleared): an empty credential field must be re-entered atomically rather than
+    # left as a silent empty submit (SKY-12143). Masked/unreadable and can't-round-trip values are filtered
+    # out by the caller before this comparison.
+    return actual_value != expected
+
+
+def _secret_readback_matches(expected: str, actual_value: str | None) -> bool:
+    # Positive confirmation after clearing a known-bad value: only an exact, non-empty readable match is
+    # success. An empty or still-mismatched retry read-back forces a loud failure over an unverified secret.
+    return bool(actual_value) and actual_value == expected
+
+
+async def _fill_secret_with_readback(
+    *, skyvern_element: SkyvernElement, tag_name: str, text: str, input_type: str, maxlength: str | None
+) -> ActionFailure | None:
+    # Character-by-character credential entry can race a hardened field's caret restore and rotate the
+    # value, or be dropped by a controlled field and truncate it, while the block still completes --
+    # submitting a wrong/empty credential with no visible error (SKY-12143 rotation; SKY-12597/12579
+    # truncation; same family as the card-number read-back, SKY-11720). On the native exact-value inputs
+    # this runs for, read the value back and, on an empty or mismatched read-back, re-enter atomically (a
+    # single value-set has no per-keystroke race) and positively confirm. Fields that cannot round-trip the
+    # value by their declared contract, or whose .value renders only mask glyphs, are left as typed. Logs
+    # carry only the element id, never the secret, its length, or its character classes.
+    is_password = input_type == "password"
+
+    await skyvern_element.input_sequentially(text=text)
+
+    if _secret_input_cannot_round_trip(text, maxlength=maxlength):
+        LOG.info(
+            "Leaving credential as typed: field cannot round-trip the value by its declared contract",
+            element_id=skyvern_element.get_id(),
+        )
+        return None
+
+    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    # Exact equality first: a value that round-trips exactly is confirmed, even one made only of mask-like
+    # characters -- so an all-"*" secret is a match, never misclassified as an unreadable mask.
+    if not _secret_readback_is_mismatch(text, actual_value):
+        return None
+
+    if _secret_readback_is_unreadable_mask(actual_value, is_password=is_password):
+        LOG.info(
+            "Leaving credential as typed: rendered value is masked and cannot be verified",
+            element_id=skyvern_element.get_id(),
+        )
+        return None
+
+    await skyvern_element.input_clear()
+    await skyvern_element.input_fill(text=text)
+    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    if _secret_readback_matches(text, actual_value):
+        return None
+
+    LOG.warning(
+        "Secret input read-back mismatch after retry",
+        element_id=skyvern_element.get_id(),
+    )
+    return ActionFailure(SecretInputMismatch())
 
 
 def _select_option_target_value(option: SelectOption) -> str | None:
@@ -4345,11 +4453,32 @@ async def handle_input_text_action(
         if is_card_number_input:
             card_expected_digits = candidate_card_digits
 
+        # SKY-12143 / SKY-12597 / SKY-12579: character-by-character credential entry can race a hardened
+        # field's caret restore (rotating the value) or be dropped by a controlled field (truncating it),
+        # submitting a wrong or empty credential while the block still completes. On native inputs whose DOM
+        # .value round-trips typed text exactly, read the value back and re-enter atomically on an empty or
+        # mismatched read-back, compared character-for-character. Scoped to non-TOTP secrets on exact-value
+        # input types (password/text/email/search/url/untyped); tel and card keep their digit-normalized
+        # paths above, and number/date/textarea/contenteditable/select cannot round-trip exactly so they are
+        # excluded. Evaluated on the actual element being filled, which find_blocking_element may have
+        # retargeted above. A single character cannot be order-scrambled, so it is skipped.
+        secret_input_type = _exact_value_input_type(await skyvern_element.get_attr("type"))
+        verify_secret_input = (
+            is_secret_value
+            and not is_totp_value
+            and len(text) > 1
+            and not is_card_number_input
+            and tag_name == InteractiveElement.INPUT
+            and secret_input_type in _EXACT_VALUE_INPUT_TYPES
+        )
+        secret_maxlength = await skyvern_element.get_attr("maxlength") if verify_secret_input else None
+
         # Masked inputs (postal code, SSN) can report a successful fill while the mask committed nothing.
-        # Read the value back for masked fields and, on an empty/placeholder commit, retype once.
+        # Read the value back for masked fields and, on an empty/placeholder commit, retype once. Scoped to
+        # non-credential fields: a credential value is handled by the exact secret read-back above.
         verify_masked_input_after_fill = False
         mask_attr_evidence = False
-        if not is_tel and await _is_masked_input_readback_fix_enabled(task):
+        if not is_tel and not verify_secret_input and await _is_masked_input_readback_fix_enabled(task):
             mask_attr_evidence = _has_input_mask_evidence(
                 pattern=await skyvern_element.get_attr("pattern"),
                 placeholder=await skyvern_element.get_attr("placeholder"),
@@ -4357,7 +4486,12 @@ async def handle_input_text_action(
             verify_masked_input_after_fill = True
 
         generic_commit_input_type = None
-        if not is_tel and not card_expected_digits and await _is_input_text_commit_verification_enabled(task):
+        if (
+            not is_tel
+            and not card_expected_digits
+            and not verify_secret_input
+            and await _is_input_text_commit_verification_enabled(task)
+        ):
             generic_commit_input_type = _is_generic_input_commit_candidate(
                 tag_name=tag_name,
                 live_input_type=live_input_type,
@@ -4366,6 +4500,7 @@ async def handle_input_text_action(
         input_context_destroyed = False
 
         try:
+            # Read-back/recover priority: card > tel > secret > masked > plain fill (each gate is mutually exclusive).
             if card_expected_digits:
                 card_failure = await _fill_card_number_with_readback(
                     skyvern_element=skyvern_element,
@@ -4390,6 +4525,16 @@ async def handle_input_text_action(
                         actual_digit_count=phone_mismatch.actual_digit_count,
                     )
                     return [ActionFailure(phone_mismatch)]
+            elif verify_secret_input:
+                secret_failure = await _fill_secret_with_readback(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    text=text,
+                    input_type=secret_input_type,
+                    maxlength=secret_maxlength,
+                )
+                if secret_failure is not None:
+                    return [secret_failure]
             elif verify_masked_input_after_fill:
                 await skyvern_element.input_sequentially(text=text)
                 # Read the committed value back; on an empty/placeholder commit, refocus, clear and retype
