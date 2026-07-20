@@ -19735,6 +19735,7 @@
           "created",
           "queued",
           "running",
+          "paused",
           "timed_out",
           "failed",
           "terminated",

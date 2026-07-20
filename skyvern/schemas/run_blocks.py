@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.credential_type import CredentialType
 from skyvern.schemas.proxy_location import ProxyLocation
 
@@ -38,7 +39,7 @@ class BaseRunBlockRequest(BaseModel):
             "to a remote browser via browser_address. Never forwarded to target websites."
         ),
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolling_times: MaxScreenshotScrolls = Field(
         default=None, description="Maximum number of times to scroll for screenshots"
     )
 
