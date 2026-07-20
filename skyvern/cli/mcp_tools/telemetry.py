@@ -179,17 +179,25 @@ def _capture_mcp_event(
     )
 
 
+def _extract_ok(payload: Any) -> bool | None:
+    if isinstance(payload, dict):
+        candidate = payload.get("ok")
+        if isinstance(candidate, bool):
+            return candidate
+    return None
+
+
 def _resolve_tool_call_ok(result: Any) -> bool:
     is_error = getattr(result, "is_error", None)
     if not isinstance(is_error, bool):
         is_error = False
 
-    data = getattr(result, "data", None)
-    result_ok = None
-    if isinstance(data, dict):
-        candidate = data.get("ok")
-        if isinstance(candidate, bool):
-            result_ok = candidate
+    # A FastMCP ToolResult exposes the tool's dict via `structured_content`, not
+    # `data`, so a tool (or the argument-validation middleware) reporting failure
+    # with `ok=False` must be read there too, or the failure is miscounted as ok.
+    result_ok = _extract_ok(getattr(result, "data", None))
+    if result_ok is None:
+        result_ok = _extract_ok(getattr(result, "structured_content", None))
 
     if result_ok is None:
         return not is_error
