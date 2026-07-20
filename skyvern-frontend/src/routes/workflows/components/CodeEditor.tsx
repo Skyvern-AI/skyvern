@@ -35,6 +35,9 @@ function getLanguageExtension(
 type Props = {
   value: string;
   onChange?: (value: string) => void;
+  // Invoked once with the CodeMirror view when it is created (e.g. to drive
+  // the search panel from a toolbar button).
+  onEditorView?: (view: EditorView) => void;
   language?: "python" | "json" | "html" | "yaml";
   lineWrap?: boolean;
   readOnly?: boolean;
@@ -69,6 +72,7 @@ const VIEWPORT_PREMOUNT_MARGIN = "200px";
 function CodeEditorImpl({
   value,
   onChange,
+  onEditorView,
   minHeight,
   maxHeight,
   language,
@@ -141,6 +145,11 @@ function CodeEditorImpl({
     latestOnChangeRef.current = onChange;
   }, [onChange]);
 
+  const latestOnEditorViewRef = useRef(onEditorView);
+  useEffect(() => {
+    latestOnEditorViewRef.current = onEditorView;
+  }, [onEditorView]);
+
   const debouncedOnChange = useDebouncedCallback((newValue: string) => {
     latestOnChangeRef.current?.(newValue);
   }, 300);
@@ -161,6 +170,7 @@ function CodeEditorImpl({
 
   const handleCreateEditor = useCallback((view: EditorView) => {
     viewRef.current = view;
+    latestOnEditorViewRef.current?.(view);
   }, []);
 
   const handleEditorUpdate = useCallback((viewUpdate: ViewUpdate) => {
