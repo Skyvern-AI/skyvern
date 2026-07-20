@@ -31,6 +31,15 @@ COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
 
+class DeliveredUnverifiedPublicOutputs(dict[str, Any]):
+    """Run-output values explicitly selected for terminal presentation.
+
+    The values remain dynamically shaped JSON until the presentation sanitizer
+    validates them.  The concrete marker prevents arbitrary result-factory
+    callers from minting the public structured-output surface.
+    """
+
+
 class NarrativeDraft(TypedDict):
     blockCount: int
     blockLabels: list[str]
@@ -86,6 +95,8 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
+    # Sanitized JSON boundary for reviewing outputs that were delivered but not independently verified.
+    deliveredUnverifiedObservedOutputs: NotRequired[dict[str, Any]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
@@ -739,7 +750,7 @@ class CopilotContext(AgentContext):
     last_outcome_gate_workflow_run_id: str | None = None
     delivered_unverified_terminal: bool = False
     delivered_unverified_workflow_run_id: str | None = None
-    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=dict)
+    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=DeliveredUnverifiedPublicOutputs)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
