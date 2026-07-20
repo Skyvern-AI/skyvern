@@ -25,7 +25,7 @@ from skyvern.webeye.browser_engine import (
     BrowserEngineSelection,
     BrowserSourceNotSupportedByEngine,
 )
-from skyvern.webeye.real_browser_manager import RealBrowserManager, canonical_run_key
+from skyvern.webeye.real_browser_manager import RealBrowserManager, _EngineSelectionOwner, canonical_run_key
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 
@@ -561,6 +561,342 @@ async def test_cleanup_drops_pinned_engine_owner_for_run(_restore_resolver: None
 
     assert "wr_1" not in manager._engine_owners
     assert "tsk_1" not in manager._engine_owners
+
+
+@pytest.mark.asyncio
+async def test_sole_waiter_cancelled_then_resolver_fails_reaps_owner(_restore_resolver: None) -> None:
+    # MF1: the sole waiter is cancelled while the shared resolution is still pending; when the resolver
+    # LATER fails with no live waiter, the owner-managed done-callback must reap the failed owner and
+    # consume its exception — no lingering owner, no "task exception was never retrieved" warning.
+    gate = asyncio.Event()
+
+    async def late_failing_resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        await gate.wait()
+        raise RuntimeError("late boom")
+
+    browser_engine.set_browser_engine_resolver(late_failing_resolver)
+    manager = RealBrowserManager()
+    ctx = BrowserEngineContext(workflow_run_id="wr_1", browser_source="local-browser")
+
+    waiter: asyncio.Future | None = None
+    owner_task: asyncio.Task | None = None
+    reaper_consumed_exception = False
+    try:
+        waiter = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx))
+        # A single semantic yield lets the just-scheduled waiter run to its first suspension: the manager
+        # installs the owner and the waiter parks on its shared task (both happen before this yield returns).
+        await asyncio.sleep(0)
+        # Observe the reaping directly instead of guessing scheduler turns: our done-callback is registered
+        # after the manager's own _reap_failed_owner, so it fires strictly after the reap has already run.
+        owner_task = manager._engine_owners["wr_1"].task
+        reaped = asyncio.Event()
+        owner_task.add_done_callback(lambda _t: reaped.set())
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        # The waiter's cancellation must NOT remove the owner while the shared task is still pending.
+        assert "wr_1" in manager._engine_owners
+
+        gate.set()  # the resolver now fails with no live waiter to observe it
+        await reaped.wait()  # the shared task finished and its reaping done-callback has run
+        # asyncio clears a task's private _log_traceback flag exactly when its exception is retrieved, and
+        # the reaping callback is the only retriever at this point. Capture it BEFORE the teardown drains
+        # owner_task: a gather(return_exceptions=True) would itself retrieve the exception and clear the
+        # flag, masking a _reap_failed_owner that evicted the owner WITHOUT calling task.exception(). This
+        # is deterministic — unlike observing a "Task exception was never retrieved" warning, which only
+        # fires at non-deterministic GC time.
+        reaper_consumed_exception = owner_task._log_traceback is False
+    finally:
+        for task in (waiter, owner_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in (waiter, owner_task) if t is not None], return_exceptions=True)
+
+    # The done-callback reaped the failed owner AND consumed its exception (both are load-bearing).
+    assert "wr_1" not in manager._engine_owners
+    assert reaper_consumed_exception
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_completion_does_not_evict_newer_owner(_restore_resolver: None) -> None:
+    # MF1 identity guard: a stale owner whose resolution finished exceptionally AFTER it was already
+    # replaced (terminal drop + reacquire under the reused key) must not evict the NEWER owner when its
+    # late done-callback finally fires.
+    manager = RealBrowserManager()
+
+    async def _boom() -> BrowserEngineSelection:
+        raise RuntimeError("stale")
+
+    stale_task = asyncio.ensure_future(_boom())
+    await asyncio.gather(stale_task, return_exceptions=True)  # drive the stale resolution to failure
+    stale_owner = _EngineSelectionOwner(stale_task)
+
+    await _seed_engine_owner(manager, "wr_1", "engine-new")  # the newer, current owner for the reused key
+    newer_owner = manager._engine_owners["wr_1"]
+
+    manager._reap_failed_owner("wr_1", stale_owner, stale_task)  # the stale completion fires late
+
+    assert manager._engine_owners["wr_1"] is newer_owner  # the newer owner survived the stale callback
+
+
+@pytest.mark.asyncio
+async def test_terminal_drop_awaits_suppressing_resolver_before_second_resolver_starts(
+    _restore_resolver: None,
+) -> None:
+    # MF2: terminal cleanup must await the in-flight resolver to definitive termination — even one that
+    # SUPPRESSES cancellation — before returning, so a second same-key resolver never runs concurrently
+    # with the first. The concurrent first waiter coalesces onto the single resolution.
+    live = {"now": 0, "max": 0, "starts": 0}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def suppressing_resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        live["starts"] += 1
+        live["now"] += 1
+        live["max"] = max(live["max"], live["now"])
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)  # suppress the cancellation and keep unwinding cooperatively
+        finally:
+            live["now"] -= 1
+        return _fake_selection("engine-1")
+
+    browser_engine.set_browser_engine_resolver(suppressing_resolver)
+    manager = RealBrowserManager()
+    ctx = BrowserEngineContext(workflow_run_id="wr_1", browser_source="local-browser")
+
+    first: asyncio.Future | None = None
+    owner_task: asyncio.Task | None = None
+    drop_task: asyncio.Future | None = None
+    try:
+        first = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx))
+        await started.wait()  # resolver #1 is running
+        owner_task = manager._engine_owners["wr_1"].task  # the single in-flight resolution
+        assert live["now"] == 1
+
+        # The drop must await resolver #1 to definitive termination (suppression and all). If it regressed to
+        # await the resolver WITHOUT cancelling it, resolver #1 would stay gated on `release` — set only in
+        # the finally, unreachable from here — and this await would hang the shard (no repo-wide pytest
+        # timeout). Race the drop against a non-cancelling timer so the regression fails cleanly. A watchdog
+        # rather than asyncio.wait_for: the resolver suppresses cancellation, which defeats wait_for's own
+        # timeout-cancel.
+        drop_task = asyncio.ensure_future(manager._drop_engine_owner("wr_1"))
+        timer = asyncio.ensure_future(asyncio.sleep(5.0))
+        try:
+            done, _ = await asyncio.wait({drop_task, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+        assert drop_task in done  # the drop returned; a non-cancelling regression would hang here instead
+        await drop_task  # re-raise any exception / retrieve the result
+        assert live["now"] == 0  # resolver #1 has definitively terminated before the drop returned
+        assert "wr_1" not in manager._engine_owners
+        assert (await first).name == "engine-1"  # the coalesced first waiter got the single resolution's value
+
+        release.set()
+        second = await manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx)
+        assert second.name == "engine-1"
+        assert live["starts"] == 2  # a brand-new resolver ran for the reused key...
+        assert live["max"] == 1  # ...but never concurrently with the first
+    finally:
+        # Failure-safe teardown: if any assertion above trips while resolver #1 is still gated on
+        # release, ungate it and reap both the coalesced waiter and the owner task so neither survives
+        # to contaminate a later test.
+        release.set()
+        for task in (first, owner_task, drop_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in (first, owner_task, drop_task) if t is not None], return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancelled_mid_drop_keeps_owner_and_blocks_second_resolver(
+    _restore_resolver: None,
+) -> None:
+    # MF2 (cancellation variant): if terminal cleanup is ITSELF cancelled while a resolver suppresses its
+    # initial cancellation and stays gated, the cancellation must propagate to the caller, the terminal
+    # owner must stay registered (no resolver #2 starts alongside #1), and only once resolver #1 finally
+    # completes may a fresh owner/resolver install — at most one live resolver per key throughout.
+    live = {"now": 0, "max": 0, "starts": 0}
+    started = asyncio.Event()
+    release = asyncio.Event()
+    suppressed = asyncio.Event()
+
+    async def gated_suppressing_resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        live["starts"] += 1
+        live["now"] += 1
+        live["max"] = max(live["max"], live["now"])
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            suppressed.set()  # signal we absorbed the drop's cancel before re-gating (deterministic readiness)
+            await release.wait()  # suppress the initial cancellation but stay gated until released
+        finally:
+            live["now"] -= 1
+        return _fake_selection("engine-1")
+
+    manager = RealBrowserManager()
+    ctx = BrowserEngineContext(workflow_run_id="wr_1", browser_source="local-browser")
+    await _seed_engine_owner(manager, "wr_other", "engine-other")  # unrelated key must stay independent
+    browser_engine.set_browser_engine_resolver(gated_suppressing_resolver)
+
+    unretrieved: list[dict] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unretrieved.append(context))
+    first: asyncio.Future | None = None
+    drop: asyncio.Future | None = None
+    second: asyncio.Future | None = None
+    owner1_task: asyncio.Task | None = None
+    try:
+        first = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx))
+        await started.wait()  # resolver #1 is running
+        owner1 = manager._engine_owners["wr_1"]
+        owner1_task = owner1.task
+
+        drop = asyncio.ensure_future(manager._drop_engine_owner("wr_1"))
+        # Bounded readiness wait: if _drop_engine_owner regressed to mark the owner terminal without
+        # cancelling resolver #1, the resolver would never enter its CancelledError handler and never set
+        # `suppressed`, hanging this wait forever (there is no repo-wide pytest timeout). wait_for bounds it
+        # reliably here because `suppressed.wait()` is a plain cancellable Event wait — not a cancellation-
+        # swallowing task — so on timeout it fails the test cleanly instead of hanging the shard.
+        await asyncio.wait_for(suppressed.wait(), timeout=5.0)
+        assert owner1.terminal is True
+        assert live["now"] == 1  # resolver #1 suppressed the cancel and is still gated
+
+        drop.cancel()  # externally cancel the cleanup task itself
+        with pytest.raises(asyncio.CancelledError):
+            await drop  # cancellation propagates to the caller, never swallowed into a successful drop
+
+        # The terminal owner stays registered and resolver #1 is still alive.
+        assert manager._engine_owners.get("wr_1") is owner1
+        assert live["now"] == 1
+
+        # A same-key acquisition must NOT start resolver #2 while resolver #1 lives. A single semantic
+        # yield lets the just-scheduled acquirer run to its first suspension (parking on the terminal
+        # owner); if it wrongly started resolver #2 that would already show up in live["starts"] below.
+        second = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx))
+        await asyncio.sleep(0)
+        assert live["starts"] == 1  # no resolver #2 began
+        assert not second.done()
+        assert manager._engine_owners.get("wr_1") is owner1  # still the terminal owner, not superseded
+
+        release.set()  # resolver #1 finally completes
+        result = await second  # the acquisition now installs and awaits a fresh resolver #2
+        # Awaiting the acquirer already drove resolver #1 to completion and resolver #2 to its result;
+        # draining both the coalesced waiter and resolver #1's task retrieves their outcomes explicitly.
+        await asyncio.gather(first, owner1_task, return_exceptions=True)
+    finally:
+        # Failure-safe teardown: resolver #1 suppresses its initial cancel and re-gates on `release`,
+        # so cancelling/draining alone would hang forever. Ungate it first, then reap first/drop/second
+        # and the owner task so none survives to contaminate a later test.
+        release.set()
+        for task in (first, drop, second, owner1_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in (first, drop, second, owner1_task) if t is not None], return_exceptions=True)
+        loop.set_exception_handler(previous_handler)
+
+    assert result.name == "engine-1"
+    assert live["starts"] == 2  # a brand-new resolver ran for the reused key...
+    assert live["max"] == 1  # ...never concurrently with the first (max one live resolver per key)
+    fresh = manager._engine_owners["wr_1"]
+    assert fresh is not owner1 and fresh.task.result() is result  # fresh, non-terminal owner installed
+    assert manager._engine_owners["wr_other"].task.result().name == "engine-other"  # unrelated key intact
+    assert not any("never retrieved" in str(c.get("message", "")) for c in unretrieved)
+
+
+@pytest.mark.asyncio
+async def test_acquirer_cancelled_while_waiting_out_terminal_owner(_restore_resolver: None) -> None:
+    # An acquirer that arrives during terminal teardown waits the dying owner out. If THAT acquirer is
+    # itself cancelled, it must propagate its own CancelledError — not swallow it, delete the still-
+    # running terminal owner, and install resolver #2 in its place (which would hang the acquirer and
+    # break single-flight). The terminal owner and its lone live resolver must survive untouched.
+    live = {"now": 0, "starts": 0}
+    started = asyncio.Event()
+    release = asyncio.Event()
+    suppressed = asyncio.Event()
+
+    async def gated_suppressing_resolver(ctx: BrowserEngineContext) -> BrowserEngineSelection:
+        live["starts"] += 1
+        live["now"] += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            suppressed.set()  # signal we absorbed the drop's cancel before re-gating (deterministic readiness)
+            await release.wait()  # suppress the initial cancel and stay gated
+        finally:
+            live["now"] -= 1
+        return _fake_selection("engine-1")
+
+    browser_engine.set_browser_engine_resolver(gated_suppressing_resolver)
+    manager = RealBrowserManager()
+    ctx = BrowserEngineContext(workflow_run_id="wr_1", browser_source="local-browser")
+
+    first: asyncio.Future | None = None
+    drop: asyncio.Future | None = None
+    acquirer: asyncio.Future | None = None
+    owner1_task: asyncio.Task | None = None
+    try:
+        first = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx))
+        await started.wait()
+        owner1 = manager._engine_owners["wr_1"]
+        owner1_task = owner1.task
+        reaped = asyncio.Event()
+        # Registered after the manager's own _reap_failed_owner, so it fires strictly after the reap ran.
+        owner1_task.add_done_callback(lambda _t: reaped.set())
+
+        drop = asyncio.ensure_future(manager._drop_engine_owner("wr_1"))
+        # Bounded readiness wait (see the mid-drop test): a drop that marks terminal without cancelling
+        # resolver #1 would never set `suppressed`; wait_for bounds this plain Event wait so the regression
+        # fails cleanly instead of hanging the shard.
+        await asyncio.wait_for(suppressed.wait(), timeout=5.0)
+        drop.cancel()  # leave owner1 terminal + resolver #1 still gated
+        with pytest.raises(asyncio.CancelledError):
+            await drop
+
+        acquirer = asyncio.ensure_future(manager.get_or_resolve_engine_selection(run_key="wr_1", context=ctx))
+        # A single semantic yield lets the just-scheduled acquirer run to its first suspension: it parks
+        # waiting the terminal owner out. Any wrongful resolver #2 would already show in live["starts"].
+        await asyncio.sleep(0)
+        acquirer.cancel()
+        # Non-cancelling watchdog: under the guarded regression the acquirer swallows its own cancel and
+        # loops back to re-park on the still-gated terminal owner, so it never settles. Awaiting it to
+        # completion — even via asyncio.wait_for, which must itself await the swallowed cancellation to
+        # land — would hang the shard (there is no repo-wide pytest timeout). Race it against a timer we
+        # never cancel for its timing, so a non-settling acquirer trips a clean assertion instead of hanging.
+        timer = asyncio.ensure_future(asyncio.sleep(5.0))
+        try:
+            done, _ = await asyncio.wait({acquirer, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+        assert acquirer in done and acquirer.cancelled()  # its OWN cancellation propagated, not swallowed
+
+        assert manager._engine_owners.get("wr_1") is owner1  # still-running terminal owner untouched
+        assert live["now"] == 1
+        assert live["starts"] == 1  # no resolver #2 was installed in the terminal owner's place
+
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        await reaped.wait()  # resolver #1 finished and owner1's reaping done-callback has run
+    finally:
+        # Failure-safe teardown: resolver #1 suppresses its initial cancel and re-gates on `release`,
+        # so cancelling/draining alone would hang forever. Ungate it first, then reap first/drop/acquirer
+        # and the owner task so none survives to contaminate a later test.
+        release.set()
+        for task in (first, drop, acquirer, owner1_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *[t for t in (first, drop, acquirer, owner1_task) if t is not None], return_exceptions=True
+        )
+    assert "wr_1" not in manager._engine_owners  # owner1 reaped once its resolver finished
 
 
 def _coro(value: BrowserEngineSelection):
