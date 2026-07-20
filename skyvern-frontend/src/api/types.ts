@@ -753,7 +753,6 @@ export interface RuntimeCostSummaryResponse {
   captured_at: string | null;
   models: RuntimeCostModelSummary[];
 }
-
 export type DebugSessionApiResponse = {
   debug_session_id: string;
   browser_session_id: string;
