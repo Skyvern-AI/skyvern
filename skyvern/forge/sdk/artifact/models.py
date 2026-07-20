@@ -13,6 +13,7 @@ class ArtifactType(StrEnum):
     SESSION_REPLAY = "session_replay"
     EVAL_SCORE = "eval_score"
     BROWSER_CONSOLE_LOG = "browser_console_log"
+    BROWSER_SESSION_ACTION_LOG = "browser_session_action_log"
 
     SKYVERN_LOG = "skyvern_log"
     SKYVERN_LOG_RAW = "skyvern_log_raw"
