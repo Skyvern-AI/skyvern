@@ -22,6 +22,11 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from ._common import ErrorCode, make_error, make_result
 from .trajectory import skyvern_trajectory_get
 
+PARAMETER_WIRING_HINT = (
+    "Non-credential workflow parameters are auto-wired into code blocks on code-only create/update "
+    "when a block omits parameter_keys; pass explicit parameter_keys to wire anything else, or [] to opt out."
+)
+
 
 def _serialize_diagnostic(diagnostic: CodeBlockPreflightDiagnostic) -> dict[str, str]:
     return {"code": diagnostic.code, "message": diagnostic.message}
@@ -217,6 +222,7 @@ async def skyvern_code_block_synthesize(
         "notes": synthesized.notes,
         "emitted_interaction_count": synthesized.diagnostics.emitted_interaction_count,
         "truncated": synthesized.diagnostics.truncated,
+        "parameter_wiring_hint": PARAMETER_WIRING_HINT,
     }
     if capture_truncated is not None:
         data["capture_truncated"] = capture_truncated
