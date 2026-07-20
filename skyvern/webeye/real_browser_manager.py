@@ -8,7 +8,12 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT
-from skyvern.exceptions import FailedToNavigateToUrl, MissingBrowserState
+from skyvern.exceptions import (
+    FailedToNavigateToUrl,
+    MissingBrowserState,
+    MissingBrowserStateForBrowserSession,
+    MissingOrganizationForBrowserSession,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
@@ -992,28 +997,31 @@ class RealBrowserManager(BrowserManager):
         self,
         script_id: str | None = None,
         browser_session_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BrowserState:
         browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
             return browser_state
 
         if browser_session_id:
+            # Fail closed: look the session up under its real organization_id (release's symmetric key).
+            if not organization_id:
+                raise MissingOrganizationForBrowserSession(browser_session_id)
             LOG.info(
                 "Getting browser state for script",
                 browser_session_id=browser_session_id,
             )
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id, organization_id=script_id
+                browser_session_id, organization_id=organization_id
             )
             if browser_state is None:
-                LOG.warning(
-                    "Browser state not found in persistent sessions manager",
-                    browser_session_id=browser_session_id,
-                )
-            else:
-                page = await browser_state.get_working_page()
-                if not page:
-                    LOG.warning("Browser state has no page to run the script", script_id=script_id)
+                # Fail closed: a cold/evicted session has no reusable state. Silently creating a local
+                # browser below would produce an unregistered state that terminal cleanup misclassifies as
+                # a reusable persistent session (keyed off browser_session_id) and leaks instead of closes.
+                raise MissingBrowserStateForBrowserSession(browser_session_id)
+            page = await browser_state.get_working_page()
+            if not page:
+                LOG.warning("Browser state has no page to run the script", script_id=script_id)
         proxy_location = ProxyLocation.RESIDENTIAL
         if not browser_state:
             browser_state = await self._create_browser_state(
@@ -1029,6 +1037,96 @@ class RealBrowserManager(BrowserManager):
         )
 
         return browser_state
+
+    async def cleanup_for_script(
+        self,
+        script_id: str,
+        close_browser_on_completion: bool = True,
+        browser_session_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> BrowserState | None:
+        """Terminal reclamation of a standalone script's browser resources, mirroring
+        ``cleanup_for_task``. Drops the run's pinned engine owner and the script-keyed page together
+        so a completed script leaves no page, engine selection, or coordination entry behind. Called
+        once at the script run's terminal boundary — never on a transient page/resource close, so a
+        script that reconnects/reuses its state within a run keeps it. A state backing a persistent
+        browser session is released (not driver-closed) so the session can be reused; its driver
+        closes with the session. Errors are logged, not raised.
+        """
+        LOG.info("Cleaning up for script", script_id=script_id)
+        pending_cancel: asyncio.CancelledError | None = None
+        try:
+            await self._drop_engine_owner(script_id)
+        except asyncio.CancelledError as exc:
+            # Our own cancellation surfaced while awaiting the owner's termination. Still reclaim the page and
+            # session below — a cancelled terminal run must not leak them — then re-raise so the caller's
+            # cancellation stays native. Only this first await parks on an in-flight resolver; the remaining
+            # cleanup awaits run to completion because the delivered cancellation was already consumed here.
+            pending_cancel = exc
+        except Exception:
+            # Contain an ordinary owner-drop failure so page/trace/close/release cleanup below is still
+            # attempted.
+            LOG.warning("Failed to drop engine owner during script cleanup", script_id=script_id, exc_info=True)
+
+        async def _reclaim() -> BrowserState | None:
+            browser_state_to_close = self.pages.pop(script_id, None)
+            if browser_state_to_close:
+                if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
+                    trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{script_id}.zip"
+                    try:
+                        await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
+                        LOG.info("Stopped tracing", trace_path=trace_path)
+                    except Exception:
+                        LOG.warning("Failed to stop tracing during script cleanup", script_id=script_id, exc_info=True)
+                try:
+                    # Persistent session survives cleanup for reuse: don't close its context/driver, only release.
+                    effective_close = close_browser_on_completion and not browser_session_id
+                    await browser_state_to_close.close(
+                        close_browser_on_completion=effective_close,
+                        release_driver=False if browser_session_id else None,
+                    )
+                except Exception:
+                    LOG.warning("Failed to close script browser state", script_id=script_id, exc_info=True)
+            if browser_session_id and organization_id:
+                # Best-effort per the "errors are logged, not raised" contract: a release failure must not
+                # escape cleanup and mask the script's own exception (this runs in run_script's finally).
+                try:
+                    await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                        browser_session_id, organization_id=organization_id
+                    )
+                    LOG.info("Released browser session", browser_session_id=browser_session_id)
+                except Exception:
+                    LOG.warning(
+                        "Failed to release browser session during script cleanup",
+                        script_id=script_id,
+                        browser_session_id=browser_session_id,
+                        exc_info=True,
+                    )
+            elif browser_session_id:
+                LOG.warning("Organization ID not specified, cannot release browser session", script_id=script_id)
+            return browser_state_to_close
+
+        # Shield the page/trace/close/release reclamation as one unit: a caller cancellation (shutdown or
+        # timeout) arriving mid-trace/close/release must not skip the rest and leak, so let it finish, then
+        # re-raise so the caller's cancellation stays native. (_drop_engine_owner above keeps its own
+        # cancellation handling — it must not block on a suppressing resolver.)
+        reclaim = asyncio.ensure_future(_reclaim())
+        try:
+            browser_state_to_close = await asyncio.shield(reclaim)
+        except asyncio.CancelledError as exc:
+            pending_cancel = pending_cancel or exc
+            # Keep shielding across further cancellations while draining: a second cancel (e.g. a shutdown
+            # re-cancel) must not cancel the reclamation and recreate the leak. Preserve the FIRST
+            # cancellation for the native re-raise.
+            while not reclaim.done():
+                try:
+                    await asyncio.shield(reclaim)
+                except asyncio.CancelledError:
+                    pass
+            browser_state_to_close = reclaim.result()
+        if pending_cancel is not None:
+            raise pending_cancel
+        return browser_state_to_close
 
     def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
         if script_id and script_id in self.pages:

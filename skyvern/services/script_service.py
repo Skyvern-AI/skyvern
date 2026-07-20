@@ -2998,14 +2998,35 @@ async def run_script(
     user_script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(user_script)
 
-    if hasattr(user_script, "run_workflow"):
-        # If parameters is None, pass an empty dict
-        if parameters:
-            await user_script.run_workflow(parameters=parameters)
+    try:
+        if hasattr(user_script, "run_workflow"):
+            # If parameters is None, pass an empty dict
+            if parameters:
+                await user_script.run_workflow(parameters=parameters)
+            else:
+                await user_script.run_workflow(parameters={})
         else:
-            await user_script.run_workflow(parameters={})
-    else:
-        raise Exception(f"No 'run_workflow' function found in {path}")
+            raise Exception(f"No 'run_workflow' function found in {path}")
+    finally:
+        # A standalone script pins its browser under script_id via get_or_create_for_script; this is
+        # its terminal boundary, so reclaim the script-keyed page and engine owner here. The
+        # workflow-backed path keys its browser under workflow_run_id and is cleaned by
+        # cleanup_for_workflow_run, so it is skipped.
+        if script_id and not workflow_run_id:
+            try:
+                await app.BROWSER_MANAGER.cleanup_for_script(
+                    script_id,
+                    # Release the session the script actually acquired, under the org it was acquired with:
+                    # setup() records both on context, which may differ from this call's args (e.g. an
+                    # explicit setup session, or a pre-existing context org, while run_script got None).
+                    browser_session_id=context.browser_session_id,
+                    organization_id=context.organization_id,
+                )
+            except Exception:
+                # Terminal cleanup is best-effort: an ordinary failure (alternate BrowserManager impls may
+                # raise) must not replace the script's own result/exception. CancelledError (BaseException)
+                # is not caught, so an original script cancellation stays cancellation.
+                LOG.warning("Failed to clean up script browser resources", script_id=script_id, exc_info=True)
 
 
 def _render_template_with_label(template: str, label: str | None = None) -> str:
