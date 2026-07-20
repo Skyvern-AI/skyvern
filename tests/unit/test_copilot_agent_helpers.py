@@ -27,6 +27,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _synthesized_block_offer_prompt,
     _verified_workflow_or_none,
 )
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingCandidate,
+    build_authoring_parameter_binding_directive,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
@@ -845,6 +849,16 @@ workflow_definition:
             parameter_keys=["enter_confirmation"],
             available_parameter_keys=["confirmation_number"],
             binding_candidates=["enter_confirmation", "confirmation_number"],
+            parameter_binding_directive=build_authoring_parameter_binding_directive(
+                structural_key="definition-reject",
+                source_origin="https://example.com",
+                candidates=[
+                    AuthoringParameterBindingCandidate(
+                        declared_key="confirmation_number",
+                        field_selector="#confirmation",
+                    )
+                ],
+            ),
         )
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -855,6 +869,8 @@ workflow_definition:
 
         assert "reason_code: synthesized_parameter_binding_ambiguous" in prompt
         assert "binding_candidates: enter_confirmation, confirmation_number" in prompt
+        assert "parameter_binding_pairs:" in prompt
+        assert "confirmation_number -> #confirmation" in prompt
         assert "declare and use the exact workflow input key" in prompt
         assert "include that exact key in the code block's parameter_keys" in prompt
         assert "reference it as a bare Python variable in code" in prompt

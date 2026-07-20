@@ -253,6 +253,7 @@ from .workflow_update import _metadata_contract_run_preflight_reject as _metadat
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
+from .workflow_update import _run_dispatch_definition_reject as _run_dispatch_definition_reject
 from .workflow_update import _scaffold_metadata_contract_for_update as _scaffold_metadata_contract_for_update
 from .workflow_update import _update_workflow as _update_workflow
 from .workflow_update import (
@@ -455,6 +456,21 @@ async def run_blocks_tool(
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", loop_error)
+
+    definition_reject_result = _run_dispatch_definition_reject(copilot_ctx, copilot_ctx.workflow_yaml or "")
+    if definition_reject_result is not None:
+        record_tool_step_result_for_ctx(
+            copilot_ctx,
+            "run_blocks_and_collect_debug",
+            arguments,
+            definition_reject_result,
+        )
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=definition_reject_result,
+        )
+        return json.dumps(definition_reject_result)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(

@@ -26,6 +26,19 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingCandidate,
+    AuthoringParameterBindingDirective,
+    AuthoringParameterBindingMatchBasis,
+    AuthoringParameterBindingSnapshot,
+    AuthoringParameterBindingTerminalTool,
+    AuthoringParameterFieldBinding,
+    AuthoringParameterTerminalBinding,
+    authored_selector_parameter_bindings,
+    authoring_parameter_binding_directive_consumed,
+    build_authoring_parameter_binding_directive,
+    build_authoring_parameter_binding_snapshot,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
@@ -83,6 +96,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _get_by_role_expr_strict,
     _is_ignorable_entry_opener_drop,
     _is_positional_selector,
+    _is_submit_interaction,
     _selector_refines,
     artifact_dependency_id,
     artifact_observation_ref_id,
@@ -90,7 +104,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     credential_scout_gap,
     freeze_requested_output_extraction_candidate,
     grounded_parameter_key_is_safe,
-    grounded_submit_rung_binding_fingerprint,
     input_correspondences_for_interaction,
     locator_selector_literals,
     missing_rung_text,
@@ -101,9 +114,11 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     produce_covered_static_return_envelope,
     render_missing_rung_call_sources,
     render_obligation_findings,
+    selection_option_value_admissible,
     spine_partition_findings,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
+    templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
     uncovered_rung_records,
 )
@@ -181,9 +196,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     AuthorTimeGateAblationPayload,
     RejectedCodeArtifactMetadataCapture,
-    ScoutedFieldParameterBinding,
     ScoutedInteraction,
-    ScoutedSubmitRungBinding,
     copilot_author_time_gate_log_only_enabled,
     record_author_time_gate_ablation_event,
 )
@@ -200,6 +213,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_and_stash_blocker_signal,
@@ -2184,6 +2198,44 @@ def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
     return "The submitted workflow does not satisfy its active definition-level requirements."
 
 
+def _definition_plane_structural_payload(
+    workflow_yaml: str,
+    rejection: _DefinitionPlaneReject,
+    code_artifact_metadata: object = None,
+) -> tuple[dict[str, object], str | None]:
+    authored_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
+    return (
+        {
+            "reason_code": "definition_contract_unsatisfied",
+            "criterion_ids": rejection.criterion_ids,
+            "definition_reason_codes": rejection.reason_codes,
+            "unreferenced_parameter_keys": rejection.unreferenced_parameter_keys,
+            "authored_structure_signature": authored_signature,
+        },
+        authored_signature,
+    )
+
+
+def _definition_plane_structural_key(
+    workflow_yaml: str,
+    rejection: _DefinitionPlaneReject,
+    code_artifact_metadata: object = None,
+) -> str:
+    structural_payload, authored_signature = _definition_plane_structural_payload(
+        workflow_yaml,
+        rejection,
+        code_artifact_metadata,
+    )
+    outcome = recorded_outcome_from_author_time_reject(
+        reason_code="definition_contract_unsatisfied",
+        block_labels=sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml)),
+        structural_payload=structural_payload,
+        authored_structure_signature=authored_signature,
+        observed_evidence_summary=_definition_plane_reject_error(rejection),
+    )
+    return outcome.structural_key or authored_signature or ""
+
+
 def _record_definition_plane_reject(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -2191,19 +2243,17 @@ def _record_definition_plane_reject(
     *,
     code_artifact_metadata: object = None,
 ) -> None:
-    authored_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
+    structural_payload, authored_signature = _definition_plane_structural_payload(
+        workflow_yaml,
+        rejection,
+        code_artifact_metadata,
+    )
     block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
     _record_author_time_reject_outcome(
         ctx,
         reason_code="definition_contract_unsatisfied",
         summary=_definition_plane_reject_error(rejection),
-        structural_payload={
-            "reason_code": "definition_contract_unsatisfied",
-            "criterion_ids": rejection.criterion_ids,
-            "definition_reason_codes": rejection.reason_codes,
-            "unreferenced_parameter_keys": rejection.unreferenced_parameter_keys,
-            "authored_structure_signature": authored_signature,
-        },
+        structural_payload=structural_payload,
         authored_structure_signature=authored_signature,
         block_labels=block_labels,
     )
@@ -2285,27 +2335,179 @@ def _stash_unresolved_recorded_outcome_grounding_halt(
     return True
 
 
-def _trajectory_with_grounded_submit_rung_binding(
+def _scout_trajectory_index(interaction: Mapping[str, Any], position: int) -> int:
+    raw_index = interaction.get("trajectory_index")
+    return raw_index if isinstance(raw_index, int) and raw_index >= 0 else position
+
+
+class _AuthoringParameterBindingResolution(NamedTuple):
+    snapshot: AuthoringParameterBindingSnapshot | None
+    directive: AuthoringParameterBindingDirective | None
+
+
+class _SelectionBindingRecord(NamedTuple):
+    declared_key: str
+    match_basis: AuthoringParameterBindingMatchBasis
+    field_selector: str
+    trajectory_index: int
+    terminal_tool: AuthoringParameterBindingTerminalTool
+    terminal_selector: str
+
+
+def _selection_parameter_binding_resolution(
+    ctx: AgentContext,
+    *,
+    target_keys: Sequence[str],
+    ephemeral_values: Mapping[str, Any],
+    structural_key: str,
+    source_origin: str,
+) -> _AuthoringParameterBindingResolution:
+    trajectory = ctx.scout_trajectory
+    if not isinstance(trajectory, list) or not trajectory:
+        return _AuthoringParameterBindingResolution(None, None)
+    target = set(target_keys)
+    admitted: list[_SelectionBindingRecord] = []
+    for position, interaction in enumerate(trajectory):
+        if not isinstance(interaction, Mapping):
+            continue
+        if url_origin(str(interaction.get("source_url") or "").strip()) != source_origin:
+            continue
+        tool = str(interaction.get("tool_name") or "")
+        index = _scout_trajectory_index(interaction, position)
+        if tool == "click":
+            templated = templated_selection_locator_binding(interaction)
+            if templated is None:
+                continue
+            key, join_selector = templated
+            if key in target:
+                admitted.append(
+                    _SelectionBindingRecord(
+                        key,
+                        "scouted_selection_value",
+                        join_selector,
+                        index,
+                        "click",
+                        str(interaction.get("selector") or "").strip(),
+                    )
+                )
+        elif tool == "select_option":
+            value = str(interaction.get("value") or "").strip()
+            selector = _safe_selector_repair_atom(interaction.get("selector"))
+            if not value or not selector:
+                continue
+            for key in target_keys:
+                key_value = ephemeral_values.get(key)
+                if isinstance(key_value, str) and key_value == value and selection_option_value_admissible(value, key):
+                    admitted.append(
+                        _SelectionBindingRecord(key, "scouted_option_value", selector, index, "select_option", selector)
+                    )
+    if not admitted:
+        return _AuthoringParameterBindingResolution(None, None)
+    directive = build_authoring_parameter_binding_directive(
+        structural_key=structural_key,
+        source_origin=source_origin,
+        candidates=[
+            AuthoringParameterBindingCandidate(declared_key=record.declared_key, field_selector=record.field_selector)
+            for record in admitted
+        ],
+    )
+    resolved: list[AuthoringParameterFieldBinding] = []
+    for key in target_keys:
+        matches = [record for record in admitted if record.declared_key == key]
+        if len(matches) != 1:
+            return _AuthoringParameterBindingResolution(None, directive)
+        record = matches[0]
+        resolved.append(
+            AuthoringParameterFieldBinding(
+                declared_key=key,
+                field_selector=record.field_selector,
+                field_trajectory_index=record.trajectory_index,
+                match_basis=record.match_basis,
+            )
+        )
+    if len({binding.field_selector for binding in resolved}) != len(resolved):
+        return _AuthoringParameterBindingResolution(None, directive)
+    terminal_record = max(admitted, key=lambda record: record.trajectory_index)
+    terminal = AuthoringParameterTerminalBinding(
+        tool_name=terminal_record.terminal_tool,
+        trajectory_index=terminal_record.trajectory_index,
+        selector=terminal_record.terminal_selector,
+    )
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key=structural_key,
+        source_origin=source_origin,
+        field_bindings=resolved,
+        terminal=terminal,
+    )
+    LOG.info(
+        "copilot recorded outcome selection rung bound",
+        binding_fingerprint=snapshot.fingerprint,
+        parameter_keys=[binding.declared_key for binding in snapshot.field_bindings],
+        binding_count=len(snapshot.field_bindings),
+        terminal_tool=snapshot.terminal.tool_name,
+        terminal_trajectory_index=snapshot.terminal.trajectory_index,
+    )
+    return _AuthoringParameterBindingResolution(snapshot, directive)
+
+
+def _pending_authoring_parameter_binding_directive(
+    ctx: AgentContext,
+) -> tuple[CodeAuthoringRepairContext, AuthoringParameterBindingDirective] | None:
+    repair_context = ctx.last_code_authoring_repair_context
+    if (
+        not isinstance(repair_context, CodeAuthoringRepairContext)
+        or repair_context.reason_code != _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
+        or repair_context.parameter_binding_directive is None
+    ):
+        return None
+    return repair_context, repair_context.parameter_binding_directive
+
+
+def _authoring_parameter_binding_resolution(
     ctx: AgentContext,
     parsed: Mapping[str, Any],
     runtime_parameters: Mapping[str, Any] | None,
-) -> tuple[ScoutedInteraction, ...] | None:
+    *,
+    unreferenced_parameter_keys: Sequence[str],
+    carrier_code: str,
+    diagnostic_structural_key: str,
+) -> _AuthoringParameterBindingResolution:
     requirement = ctx.recorded_outcome_grounding_requirement
     constraint = ctx.recorded_outcome_binding_constraint
+    repeated_grounding_payload = None
+    structural_key = diagnostic_structural_key
     if (
-        not isinstance(requirement, RecordedOutcomeGroundingRequirement)
-        or not requirement.satisfied
-        or requirement.payload is None
-        or requirement.payload.source_tool != "inspect_page_for_composition"
-        or requirement.payload.target_url != "current_page"
-        or not isinstance(constraint, RecordedOutcomeBindingConstraint)
-        or constraint.repeated_structural_key != requirement.structural_key
+        isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        and requirement.satisfied
+        and requirement.payload is not None
+        and requirement.payload.source_tool == "inspect_page_for_composition"
+        and requirement.payload.target_url == "current_page"
+        and isinstance(constraint, RecordedOutcomeBindingConstraint)
+        and constraint.repeated_structural_key == requirement.structural_key
     ):
-        return None
+        repeated_grounding_payload = requirement.payload
+        structural_key = constraint.repeated_structural_key
+    if not structural_key:
+        return _AuthoringParameterBindingResolution(None, None)
+    target_keys = tuple(sorted(set(unreferenced_parameter_keys)))
+    if not target_keys or any(not grounded_parameter_key_is_safe(key) for key in target_keys):
+        return _AuthoringParameterBindingResolution(None, None)
     declared_keys = _declared_string_workflow_parameter_keys(parsed)
-    if not declared_keys or any(not grounded_parameter_key_is_safe(key) for key in declared_keys):
-        return None
-    supplied = runtime_parameters if isinstance(runtime_parameters, Mapping) else {}
+    if not set(target_keys).issubset(declared_keys):
+        return _AuthoringParameterBindingResolution(None, None)
+
+    evidence = ctx.composition_page_evidence
+    forms = evidence.get("forms") if isinstance(evidence, Mapping) else None
+    current_url = str(evidence.get("current_url") or "").strip() if isinstance(evidence, Mapping) else ""
+    source_tool = str(evidence.get("source_tool") or "").strip() if isinstance(evidence, Mapping) else ""
+    if not isinstance(forms, list) or not current_url or source_tool != "inspect_page_for_composition":
+        return _AuthoringParameterBindingResolution(None, None)
+    if repeated_grounding_payload is not None and repeated_grounding_payload.source_url != current_url:
+        return _AuthoringParameterBindingResolution(None, None)
+    source_origin = url_origin(current_url)
+    if source_origin is None:
+        return _AuthoringParameterBindingResolution(None, None)
+
     definition = parsed.get("workflow_definition")
     rows = definition.get("parameters") if isinstance(definition, Mapping) else None
     defaults = (
@@ -2313,103 +2515,201 @@ def _trajectory_with_grounded_submit_rung_binding(
         if isinstance(rows, list)
         else {}
     )
-    values: dict[str, str] = {}
-    for key in sorted(declared_keys):
-        value = supplied.get(key, defaults.get(key))
-        if not isinstance(value, str) or not value:
-            return None
-        values[key] = value
+    supplied = runtime_parameters if isinstance(runtime_parameters, Mapping) else {}
+    ephemeral_values = {key: supplied.get(key, defaults.get(key)) for key in target_keys}
+    authored_bindings = authored_selector_parameter_bindings(carrier_code, set(target_keys))
+    if authored_bindings is None:
+        return _AuthoringParameterBindingResolution(None, None)
 
-    evidence = ctx.composition_page_evidence
-    forms = evidence.get("forms") if isinstance(evidence, Mapping) else None
-    current_url = str(evidence.get("current_url") or "").strip() if isinstance(evidence, Mapping) else ""
-    if not isinstance(forms, list) or not current_url or requirement.payload.source_url != current_url:
-        return None
-    captured_clicks: list[tuple[int, int, str, str]] = []
-    for fallback_index, interaction in enumerate(ctx.scout_trajectory):
-        if not isinstance(interaction, Mapping) or interaction.get("tool_name") != "click":
+    terminal_records: list[tuple[int, Mapping[str, Any]]] = []
+    for position, interaction in enumerate(ctx.scout_trajectory):
+        if not isinstance(interaction, Mapping):
             continue
-        raw_index = interaction.get("trajectory_index")
-        trajectory_index = raw_index if isinstance(raw_index, int) and raw_index >= 0 else fallback_index
-        captured_clicks.append(
-            (
-                fallback_index,
-                trajectory_index,
-                str(interaction.get("selector") or "").strip(),
-                str(interaction.get("source_url") or "").strip(),
-            )
-        )
+        if _is_submit_interaction(interaction) and str(interaction.get("source_url") or "").strip() == current_url:
+            terminal_records.append((position, interaction))
 
-    candidates: list[tuple[int, int, ScoutedSubmitRungBinding]] = []
+    snapshots: list[AuthoringParameterBindingSnapshot] = []
+    candidate_pairs: list[AuthoringParameterBindingCandidate] = []
+    any_active_fields = False
     for form in forms:
         if not isinstance(form, Mapping):
             continue
         fields = [field for field in form.get("fields") or [] if isinstance(field, Mapping)]
-        controls = [control for control in form.get("submit_controls") or [] if isinstance(control, Mapping)]
-        submit_matches: set[tuple[int, int, str]] = set()
-        for control in controls:
-            submit_selector = str(control.get("selector") or "").strip()
-            if control.get("disabled") is True or not submit_selector:
-                continue
-            matching_clicks = [
-                click for click in captured_clicks if click[2] == submit_selector and click[3] == current_url
-            ]
-            if len(matching_clicks) == 1:
-                submit_matches.add((matching_clicks[0][0], matching_clicks[0][1], submit_selector))
-        if len(submit_matches) != 1:
-            continue
-        submit_position, submit_trajectory_index, submit_selector = next(iter(submit_matches))
-        bindings: list[ScoutedFieldParameterBinding] = []
-        used_selectors: set[str] = set()
-        for key, value in values.items():
-            matching_fields = [
-                field
-                for field in fields
-                if field.get("disabled") is not True
-                and str(field.get("selector") or "").strip()
-                and field.get("value") == value
-            ]
-            if len(matching_fields) != 1:
-                bindings = []
-                break
-            selector = str(matching_fields[0].get("selector") or "").strip()
-            if selector in used_selectors:
-                bindings = []
-                break
-            used_selectors.add(selector)
-            bindings.append({"parameter_key": key, "field_selector": selector})
-        if len(bindings) == len(values):
-            fingerprint = grounded_submit_rung_binding_fingerprint(
-                repeated_structural_key=constraint.repeated_structural_key,
-                source_url=current_url,
-                submit_selector=submit_selector,
-                submit_trajectory_index=submit_trajectory_index,
-                field_bindings=bindings,
+        active_fields = [
+            field for field in fields if field.get("disabled") is not True and str(field.get("selector") or "").strip()
+        ]
+        any_active_fields = any_active_fields or bool(active_fields)
+        field_selectors = {str(field.get("selector") or "").strip() for field in active_fields}
+        submit_selectors = {
+            str(control.get("selector") or "").strip()
+            for control in form.get("submit_controls") or []
+            if isinstance(control, Mapping)
+            and control.get("disabled") is not True
+            and str(control.get("selector") or "").strip()
+        }
+        terminals = [
+            (position, interaction)
+            for position, interaction in terminal_records
+            if (
+                str(interaction.get("tool_name") or "") == "click"
+                and str(interaction.get("selector") or "").strip() in submit_selectors
             )
-            candidates.append(
-                (
-                    submit_position,
-                    submit_trajectory_index,
+            or (
+                str(interaction.get("tool_name") or "") == "press_key"
+                and str(interaction.get("selector") or "").strip() in field_selectors
+            )
+        ]
+        if len(terminals) != 1:
+            continue
+        terminal_trajectory_index = _scout_trajectory_index(terminals[0][1], terminals[0][0])
+
+        resolved: list[AuthoringParameterFieldBinding] = []
+        used_selectors: set[str] = set()
+        ambiguous = False
+        for key in target_keys:
+            selector_basis: list[tuple[str, str]] = []
+            authored_selectors = sorted(
+                selector for selector, keys in authored_bindings.items() if key in keys and selector in field_selectors
+            )
+            if authored_selectors:
+                selector_basis = [(selector, "exact_authored_selector") for selector in authored_selectors]
+            else:
+                correspondence_selectors = sorted(
                     {
-                        "repeated_structural_key": constraint.repeated_structural_key,
-                        "fingerprint": fingerprint,
-                        "field_bindings": bindings,
-                    },
+                        str(interaction.get("selector") or "").strip()
+                        for interaction in ctx.scout_trajectory
+                        if isinstance(interaction, Mapping)
+                        and str(interaction.get("selector") or "").strip() in field_selectors
+                        and any(
+                            isinstance(correspondence, Mapping) and correspondence.get("input_key") == key
+                            for correspondence in interaction.get("input_correspondences") or []
+                        )
+                    }
+                )
+                if correspondence_selectors:
+                    selector_basis = [
+                        (selector, "grounded_input_correspondence") for selector in correspondence_selectors
+                    ]
+                else:
+                    value = ephemeral_values.get(key)
+                    if isinstance(value, str) and value:
+                        value_selectors = sorted(
+                            str(field.get("selector") or "").strip()
+                            for field in active_fields
+                            if field.get("value") == value
+                        )
+                        selector_basis = [(selector, "unique_ephemeral_value") for selector in value_selectors]
+            for selector, _basis in selector_basis:
+                sanitized_selector = _safe_selector_repair_atom(selector)
+                if sanitized_selector:
+                    candidate_pairs.append(
+                        AuthoringParameterBindingCandidate(
+                            declared_key=key,
+                            field_selector=sanitized_selector,
+                        )
+                    )
+            if len(selector_basis) != 1:
+                ambiguous = True
+                continue
+            selector, basis = selector_basis[0]
+            matching_fills = [
+                _scout_trajectory_index(interaction, position)
+                for position, interaction in enumerate(ctx.scout_trajectory)
+                if isinstance(interaction, Mapping)
+                and str(interaction.get("tool_name") or "") == "type_text"
+                and str(interaction.get("source_url") or "").strip() == current_url
+                and str(interaction.get("selector") or "").strip() == selector
+            ]
+            if len(matching_fills) > 1 or selector in used_selectors:
+                ambiguous = True
+                continue
+            if any(fill_index > terminal_trajectory_index for fill_index in matching_fills):
+                ambiguous = True
+                continue
+            used_selectors.add(selector)
+            resolved.append(
+                AuthoringParameterFieldBinding(
+                    declared_key=key,
+                    field_selector=selector,
+                    field_trajectory_index=matching_fills[0] if matching_fills else None,
+                    match_basis=cast(AuthoringParameterBindingMatchBasis, basis),
                 )
             )
-    if len(candidates) != 1:
-        return None
-    submit_position, submit_trajectory_index, submit_rung_binding = candidates[0]
-    derived = [cast(ScoutedInteraction, dict(interaction)) for interaction in ctx.scout_trajectory]
-    derived[submit_position]["submit_rung_binding"] = submit_rung_binding
+        if ambiguous or len(resolved) != len(target_keys):
+            continue
+        terminal_position, terminal_interaction = terminals[0]
+        terminal = AuthoringParameterTerminalBinding(
+            tool_name=cast(AuthoringParameterBindingTerminalTool, str(terminal_interaction.get("tool_name") or "")),
+            trajectory_index=_scout_trajectory_index(terminal_interaction, terminal_position),
+            selector=str(terminal_interaction.get("selector") or "").strip(),
+            key=str(terminal_interaction.get("key") or "").strip(),
+        )
+        snapshots.append(
+            build_authoring_parameter_binding_snapshot(
+                structural_key=structural_key,
+                source_origin=source_origin,
+                field_bindings=resolved,
+                terminal=terminal,
+            )
+        )
+
+    unique_snapshots = {snapshot.fingerprint: snapshot for snapshot in snapshots}
+    directive = (
+        build_authoring_parameter_binding_directive(
+            structural_key=structural_key,
+            source_origin=source_origin,
+            candidates=candidate_pairs,
+        )
+        if candidate_pairs
+        else None
+    )
+    if len(unique_snapshots) != 1:
+        if not any_active_fields:
+            selection = _selection_parameter_binding_resolution(
+                ctx,
+                target_keys=target_keys,
+                ephemeral_values=ephemeral_values,
+                structural_key=structural_key,
+                source_origin=source_origin,
+            )
+            if selection.snapshot is not None:
+                return selection
+            return _AuthoringParameterBindingResolution(None, directive or selection.directive)
+        return _AuthoringParameterBindingResolution(None, directive)
+    snapshot = next(iter(unique_snapshots.values()))
     LOG.info(
         "copilot recorded outcome submit rung bound",
-        binding_fingerprint=submit_rung_binding["fingerprint"],
-        parameter_keys=[binding["parameter_key"] for binding in submit_rung_binding["field_bindings"]],
-        binding_count=len(submit_rung_binding["field_bindings"]),
-        submit_trajectory_index=submit_trajectory_index,
+        binding_fingerprint=snapshot.fingerprint,
+        parameter_keys=[binding.declared_key for binding in snapshot.field_bindings],
+        binding_count=len(snapshot.field_bindings),
+        terminal_tool=snapshot.terminal.tool_name,
+        terminal_trajectory_index=snapshot.terminal.trajectory_index,
     )
-    return tuple(derived)
+    return _AuthoringParameterBindingResolution(snapshot, directive)
+
+
+def _authoring_parameter_binding_resolution_for_definition(
+    ctx: AgentContext,
+    parsed: Mapping[str, Any],
+    runtime_parameters: Mapping[str, Any] | None,
+    code_artifact_metadata: object = None,
+) -> _AuthoringParameterBindingResolution | None:
+    workflow_yaml = yaml.safe_dump(dict(parsed), sort_keys=False)
+    rejection = _definition_plane_preflight_reject(ctx, workflow_yaml)
+    if rejection is None:
+        return None
+    return _authoring_parameter_binding_resolution(
+        ctx,
+        parsed,
+        runtime_parameters,
+        unreferenced_parameter_keys=rejection.unreferenced_parameter_keys,
+        carrier_code="",
+        diagnostic_structural_key=_definition_plane_structural_key(
+            workflow_yaml,
+            rejection,
+            code_artifact_metadata,
+        ),
+    )
 
 
 def _judgment_output_paths(ctx: AgentContext) -> set[str]:
@@ -6048,6 +6348,49 @@ def _metadata_preflight_reject_yields_to_ladder(ctx: AgentContext) -> bool:
     )
 
 
+def _run_dispatch_definition_reject(ctx: AgentContext, workflow_yaml: str) -> dict[str, Any] | None:
+    # A keyless draft may persist (draft-first authoring), but a run must never dispatch
+    # while declared string keys are unreferenced — mirrors the update_and_run gate.
+    if not workflow_yaml:
+        return None
+    definition_reject = _definition_plane_preflight_reject(
+        ctx,
+        workflow_yaml,
+        enforce_untagged_declared_inputs=True,
+    )
+    if definition_reject is None:
+        return None
+    halted = _stash_unresolved_recorded_outcome_grounding_halt(
+        ctx,
+        definition_reject.unreferenced_parameter_keys,
+    )
+    if not halted:
+        if _record_definition_plane_ablation_event(
+            ctx,
+            workflow_yaml,
+            definition_reject,
+            code_artifact_metadata=ctx.code_artifact_metadata,
+        ):
+            return None
+        _record_definition_plane_reject(
+            ctx,
+            workflow_yaml,
+            definition_reject,
+            code_artifact_metadata=ctx.code_artifact_metadata,
+        )
+    return {
+        "ok": False,
+        "error": _definition_plane_reject_error(definition_reject),
+        "user_facing_summary": _compiled_authoring_user_summary(),
+        "data": {
+            "reason_code": "definition_contract_unsatisfied",
+            "definition_criterion_ids": list(definition_reject.criterion_ids),
+            "definition_reason_codes": list(definition_reject.reason_codes),
+            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+        },
+    }
+
+
 def _metadata_contract_run_preflight_reject(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -6068,12 +6411,20 @@ def _metadata_contract_run_preflight_reject(
         else None
     )
     parsed = parse_workflow_yaml(workflow_yaml)
-    grounded_binding_available = (
-        isinstance(ctx, AgentContext)
-        and isinstance(parsed, Mapping)
-        and _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters) is not None
+    binding_resolution = (
+        _authoring_parameter_binding_resolution_for_definition(
+            ctx,
+            parsed,
+            runtime_parameters,
+            raw_code_artifact_metadata,
+        )
+        if isinstance(ctx, AgentContext) and isinstance(parsed, Mapping)
+        else None
     )
-    if definition_reject is not None and (enforce_untagged_declared_inputs or not grounded_binding_available):
+    binding_path_available = binding_resolution is not None and (
+        binding_resolution.snapshot is not None or binding_resolution.directive is not None
+    )
+    if definition_reject is not None and (enforce_untagged_declared_inputs or not binding_path_available):
         definition_corrective = (
             None
             if copilot_author_time_gate_log_only_enabled(ctx, DEFINITION_CONTRACT_UNSATISFIED_GATE_ID)
@@ -6124,7 +6475,7 @@ def _metadata_contract_run_preflight_reject(
         workflow_yaml=workflow_yaml,
         code_artifact_metadata=raw_code_artifact_metadata,
     )
-    if convergence_reject is not None and not grounded_binding_available:
+    if convergence_reject is not None and not binding_path_available:
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
         _record_author_time_reject_outcome(
             ctx,
@@ -10040,6 +10391,7 @@ def _synthesized_parameter_binding_repair_context(
     parameter_keys: list[str],
     scout_trajectory: list[ScoutedInteraction],
     synthesized_parameters: list[dict[str, str]],
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> CodeAuthoringRepairContext:
     available_parameter_keys = sorted(_declared_string_workflow_parameter_keys(parsed))
     binding_candidates = [synthesized_key] + [key for key in available_parameter_keys if key != synthesized_key]
@@ -10047,6 +10399,7 @@ def _synthesized_parameter_binding_repair_context(
         synthesized_key=synthesized_key,
         scout_trajectory=scout_trajectory,
         synthesized_parameters=synthesized_parameters,
+        parameter_binding_snapshot=parameter_binding_snapshot,
     )
     selector = _safe_selector_repair_atom(matched_scout.get("selector")) if matched_scout is not None else ""
     source_url = str(matched_scout.get("source_url") or "").strip() if matched_scout is not None else ""
@@ -10071,7 +10424,30 @@ def _scout_interaction_for_synthesized_parameter(
     synthesized_key: str,
     scout_trajectory: list[ScoutedInteraction],
     synthesized_parameters: list[dict[str, str]],
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> ScoutedInteraction | None:
+    if parameter_binding_snapshot is not None:
+        matches = [
+            binding
+            for binding in parameter_binding_snapshot.field_bindings
+            if binding.declared_key == synthesized_key and binding.field_trajectory_index is not None
+        ]
+        if len(matches) != 1:
+            return None
+        trajectory_index = matches[0].field_trajectory_index
+        if trajectory_index is None:
+            return None
+        interactions = [
+            interaction
+            for position, interaction in enumerate(scout_trajectory)
+            if _scout_trajectory_index(interaction, position) == trajectory_index
+        ]
+        if len(interactions) != 1:
+            return None
+        interaction = interactions[0]
+        if str(interaction.get("selector") or "").strip() != matches[0].field_selector:
+            return None
+        return interaction
     non_credential_keys = [
         str(parameter.get("key") or "").strip()
         for parameter in synthesized_parameters
@@ -10097,6 +10473,7 @@ def _reconcile_synthesized_parameters(
     submitted_code: str,
     synthesized_parameters: list[dict[str, str]],
     scout_trajectory: list[ScoutedInteraction],
+    parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
 ) -> _SynthesizedParameterReconciliation:
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
@@ -10143,6 +10520,7 @@ def _reconcile_synthesized_parameters(
                 parameter_keys=parameter_keys,
                 scout_trajectory=scout_trajectory,
                 synthesized_parameters=synthesized_parameters,
+                parameter_binding_snapshot=parameter_binding_snapshot,
             )
 
     for synthesized_param in synthesized_parameters:
@@ -10163,13 +10541,18 @@ def _reconcile_synthesized_parameters(
             synthesized_key=key,
             scout_trajectory=scout_trajectory,
             synthesized_parameters=synthesized_parameters,
+            parameter_binding_snapshot=parameter_binding_snapshot,
         )
         matched_selector = str(matched_scout.get("selector") or "").strip() if matched_scout is not None else ""
-        selector_join_alias = _selector_join_parameter_alias_by_authored_fill(
-            parameters=parameters,
-            submitted_code=submitted_code,
-            synthesized_key=key,
-            selector=matched_selector,
+        selector_join_alias = (
+            None
+            if parameter_binding_snapshot is not None
+            else _selector_join_parameter_alias_by_authored_fill(
+                parameters=parameters,
+                submitted_code=submitted_code,
+                synthesized_key=key,
+                selector=matched_selector,
+            )
         )
         if selector_join_alias is not None:
             if selector_join_alias in used_selector_join_aliases:
@@ -10204,10 +10587,14 @@ def _reconcile_synthesized_parameters(
             continue
 
         if existing is not None:
-            alias_key = _matching_string_parameter_key_by_default(
-                parameters,
-                default_value=synthesized_default,
-                exclude_key=key,
+            alias_key = (
+                None
+                if parameter_binding_snapshot is not None
+                else _matching_string_parameter_key_by_default(
+                    parameters,
+                    default_value=synthesized_default,
+                    exclude_key=key,
+                )
             )
             if alias_key is not None:
                 aliases[key] = alias_key
@@ -10239,10 +10626,14 @@ def _reconcile_synthesized_parameters(
                     f"Unable to bind synthesized parameter `{key}`: synthesized default looks credential-like.",
                 )
                 continue
-            alias_key = _matching_string_parameter_key_by_default(
-                parameters,
-                default_value=synthesized_default,
-                exclude_key=key,
+            alias_key = (
+                None
+                if parameter_binding_snapshot is not None
+                else _matching_string_parameter_key_by_default(
+                    parameters,
+                    default_value=synthesized_default,
+                    exclude_key=key,
+                )
             )
             if alias_key is not None:
                 aliases[key] = alias_key
@@ -10419,6 +10810,9 @@ def _maybe_impose_synthesized_code_block(
     ctx.spine_imposition_owned_attempt = False
     ctx.spine_imposition_carrier_label = None
     ctx.imposition_synthesized_block = None
+    ctx.authoring_parameter_binding_snapshot = None
+    if ctx.turn_origin != TurnOrigin.interactive:
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if not getattr(ctx, "impose_synthesized_code_block", False):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
@@ -10443,24 +10837,8 @@ def _maybe_impose_synthesized_code_block(
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
-    grounded_trajectory = _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters)
     requirement = ctx.recorded_outcome_grounding_requirement
     constraint = ctx.recorded_outcome_binding_constraint
-    declared_keys = _declared_string_workflow_parameter_keys(parsed)
-    if (
-        grounded_trajectory is None
-        and declared_keys
-        and isinstance(requirement, RecordedOutcomeGroundingRequirement)
-        and requirement.satisfied
-        and isinstance(constraint, RecordedOutcomeBindingConstraint)
-        and constraint.repeated_structural_key == requirement.structural_key
-        and _stash_unresolved_recorded_outcome_grounding_halt(ctx, declared_keys)
-    ):
-        return _SynthesizedCodeImpositionResult(
-            workflow_yaml=workflow_yaml,
-            violations=["Unable to impose synthesized code block: current-page parameter binding is unresolved."],
-        )
-    synthesis_trajectory: Sequence[Mapping[str, Any]] = grounded_trajectory or scout_trajectory
     code_blocks = _workflow_code_blocks(parsed)
     prior_source, prior_yaml = _prior_yaml_source(ctx)
     code_block = _select_synthesized_imposition_code_block(
@@ -10476,6 +10854,87 @@ def _maybe_impose_synthesized_code_block(
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     submitted_code = str(code_block.get("code") or "")
     ctx.spine_imposition_carrier_label = _code_block_label(code_block)
+
+    definition_diagnostic = _definition_plane_preflight_reject(ctx, workflow_yaml)
+    carrier_label = _code_block_label(code_block)
+    pending_directive = _pending_authoring_parameter_binding_directive(ctx)
+    active_repair_context, prior_directive = pending_directive or (None, None)
+    if active_repair_context is not None and active_repair_context.block_label != carrier_label:
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: stored parameter binding directive is stale."],
+            repair_context=active_repair_context,
+        )
+    declared_keys = (
+        set(definition_diagnostic.unreferenced_parameter_keys)
+        if definition_diagnostic is not None and definition_diagnostic.unreferenced_parameter_keys
+        else set(active_repair_context.unresolved_names)
+        if active_repair_context is not None
+        else set()
+    )
+    diagnostic_structural_key = (
+        prior_directive.structural_key
+        if prior_directive is not None
+        else _definition_plane_structural_key(
+            workflow_yaml,
+            definition_diagnostic,
+            ctx.raw_code_artifact_metadata,
+        )
+        if definition_diagnostic is not None
+        else ""
+    )
+    binding_resolution = (
+        _authoring_parameter_binding_resolution(
+            ctx,
+            parsed,
+            runtime_parameters,
+            unreferenced_parameter_keys=sorted(declared_keys),
+            carrier_code=submitted_code,
+            diagnostic_structural_key=diagnostic_structural_key,
+        )
+        if declared_keys
+        else _AuthoringParameterBindingResolution(None, None)
+    )
+    binding_snapshot = binding_resolution.snapshot
+    ctx.authoring_parameter_binding_snapshot = binding_snapshot
+    if prior_directive is not None and binding_snapshot is None:
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: stored parameter binding directive is stale."],
+            repair_context=active_repair_context,
+        )
+    if binding_snapshot is None and declared_keys and binding_resolution.directive is not None:
+        binding_repair_context = CodeAuthoringRepairContext(
+            block_label=carrier_label,
+            reason_code=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+            unresolved_names=sorted(declared_keys),
+            parameter_keys=sorted(declared_keys),
+            available_parameter_keys=sorted(_declared_string_workflow_parameter_keys(parsed)),
+            parameter_binding_directive=binding_resolution.directive,
+            repair_instruction=(
+                "Use each declared workflow key for its exact selector pair, include every key in parameter_keys, "
+                "and rerun via update_and_run_blocks."
+            ),
+        )
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: current-page parameter binding is ambiguous."],
+            repair_context=binding_repair_context,
+        )
+    grounding_repair_active = (
+        binding_snapshot is None
+        and bool(declared_keys)
+        and isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        and requirement.satisfied
+        and isinstance(constraint, RecordedOutcomeBindingConstraint)
+        and constraint.repeated_structural_key == requirement.structural_key
+    )
+    if grounding_repair_active and _stash_unresolved_recorded_outcome_grounding_halt(ctx, declared_keys):
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: current-page parameter binding is unresolved."],
+        )
+    synthesis_trajectory: Sequence[Mapping[str, Any]] = scout_trajectory
 
     owns_spine = reaches_goal
     ctx.spine_imposition_owned_attempt = owns_spine
@@ -10500,12 +10959,14 @@ def _maybe_impose_synthesized_code_block(
             extraction_plan,
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
+            parameter_binding_snapshot=binding_snapshot,
         )
         if extraction_plan is not None
         else synthesize_code_block(
             synthesis_trajectory,
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
+            parameter_binding_snapshot=binding_snapshot,
         )
     )
     if synthesized is None:
@@ -10690,6 +11151,7 @@ def _maybe_impose_synthesized_code_block(
         submitted_code=submitted_code,
         synthesized_parameters=synthesized.parameters,
         scout_trajectory=scout_trajectory,
+        parameter_binding_snapshot=binding_snapshot,
     )
     parameter_binding_is_only_violation = not violations and bool(parameter_reconciliation.violations)
     violations.extend(parameter_reconciliation.violations)
@@ -10890,6 +11352,36 @@ def _maybe_impose_synthesized_code_block(
         selected_extraction_metadata_disposition = "self_authored_extraction_preserved"
     elif extraction_suffix or append_selected_extraction:
         selected_extraction_metadata_disposition = "sibling_or_suffix_extraction_preserved"
+    if prior_directive is not None and binding_snapshot is not None:
+        binding_artifacts: list[tuple[str, Sequence[str]]] = []
+        for final_block in _workflow_code_blocks(parsed):
+            raw_parameter_keys = final_block.get("parameter_keys")
+            final_parameter_keys = (
+                tuple(str(key) for key in raw_parameter_keys if isinstance(key, str) and key)
+                if isinstance(raw_parameter_keys, list)
+                else ()
+            )
+            binding_artifacts.append((str(final_block.get("code") or ""), final_parameter_keys))
+        if not any(
+            authoring_parameter_binding_directive_consumed(
+                prior_directive,
+                binding_snapshot,
+                code=block_code,
+                parameter_keys=block_parameter_keys,
+            )
+            for block_code, block_parameter_keys in binding_artifacts
+        ):
+            return _SynthesizedCodeImpositionResult(
+                workflow_yaml=workflow_yaml,
+                violations=["Unable to impose synthesized code block: stored parameter binding directive is stale."],
+                repair_context=active_repair_context,
+            )
+        LOG.info(
+            "copilot authoring parameter binding directive consumed",
+            binding_fingerprint=binding_snapshot.fingerprint,
+            directive_fingerprint=prior_directive.fingerprint,
+            parameter_keys=[binding.declared_key for binding in binding_snapshot.field_bindings],
+        )
     if extraction_plan is not None:
         LOG.info(
             "copilot_requested_output_extraction_candidate_imposed",

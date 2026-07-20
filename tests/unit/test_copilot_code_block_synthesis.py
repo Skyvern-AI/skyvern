@@ -17,6 +17,17 @@ from typing import Any
 
 import pytest
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    _SELECTION_MATCH_BASES,
+    AuthoringParameterBindingCandidate,
+    AuthoringParameterFieldBinding,
+    AuthoringParameterTerminalBinding,
+    authored_selection_parameter_bindings,
+    authored_selector_parameter_bindings,
+    authoring_parameter_binding_directive_consumed,
+    build_authoring_parameter_binding_directive,
+    build_authoring_parameter_binding_snapshot,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -55,6 +66,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_code_block,
     synthesize_code_block_with_extraction,
     synthesize_extraction_suffix,
+    templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
     witness_prelude_lines,
 )
@@ -199,6 +211,316 @@ def test_grounded_submit_rung_binding_fails_closed_on_invalid_bundle(mutation: s
         interaction["submit_rung_binding"]["fingerprint"] = "stale"
 
     assert synthesize_code_block(trajectory, strict_selectors=True) is None
+
+
+def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    assert result.code.count(fill) == 1
+    assert result.code.index(fill) < result.code.index('page.locator("#submit").click()')
+    assert result.parameters == [{"key": "search_location"}]
+    assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+def test_authoring_parameter_snapshot_recovers_missing_fill_before_enter() -> None:
+    trajectory = [
+        _interaction(
+            "press_key",
+            selector="#location",
+            key="Enter",
+            source_url="https://example.com/form",
+            trajectory_index=0,
+        )
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="press_key",
+            trajectory_index=0,
+            selector="#location",
+            key="Enter",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    press = 'page.locator("#location").press("Enter")'
+    assert result.code.count(fill) == 1
+    assert result.code.index(fill) < result.code.index(press)
+    assert result.parameters == [{"key": "search_location"}]
+
+
+def test_authoring_parameter_directive_consumption_requires_structural_and_final_code_evidence() -> None:
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=0,
+                match_basis="exact_authored_selector",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=1,
+            selector="#submit",
+        ),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[
+            AuthoringParameterBindingCandidate(
+                declared_key="search_location",
+                field_selector="#location",
+            )
+        ],
+    )
+    code = 'await page.locator("#location").fill(str(search_location))'
+
+    assert authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code=code,
+        parameter_keys=["search_location"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive.model_copy(update={"structural_key": "stale"}),
+        snapshot,
+        code=code,
+        parameter_keys=["search_location"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#other").fill(str(search_location))',
+        parameter_keys=["search_location"],
+    )
+
+
+def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_changes() -> None:
+    trajectory = [_interaction("press_key", selector="#location", key="Tab", source_url="https://example.com/form")]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="press_key",
+            trajectory_index=0,
+            selector="#location",
+            key="Enter",
+        ),
+    )
+
+    assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
+
+
+def _templated_selection_click(selector: str, key: str, value: str, index: int) -> dict[str, Any]:
+    interaction = _interaction(
+        "click", selector=selector, source_url="https://example.com/list", trajectory_index=index
+    )
+    interaction["input_correspondences"] = input_correspondences_for_interaction(interaction, {key: value})
+    return interaction
+
+
+def test_authored_selection_bindings_recognizes_templated_click_and_select_option() -> None:
+    code = (
+        'await page.locator(f"[data-account=\\"{account_number}\\"]").click()\n'
+        'await page.locator("#plan").select_option(str(plan_tier))\n'
+    )
+    bindings = authored_selection_parameter_bindings(code, {"account_number", "plan_tier"})
+    assert bindings is not None
+    assert bindings.get("#plan") == {"plan_tier"}
+    assert {key for keys in bindings.values() for key in keys} == {"account_number", "plan_tier"}
+    assert authored_selector_parameter_bindings(code, {"account_number", "plan_tier"}) == {}
+
+
+def test_authored_selection_bindings_ignores_literal_only_click() -> None:
+    code = 'await page.locator("#row-account-AC12345").click()\n'
+    assert authored_selection_parameter_bindings(code, {"account_number"}) == {}
+
+
+def test_authoring_parameter_directive_consumed_via_templated_click() -> None:
+    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
+    key, join = templated_selection_locator_binding(click)
+    assert key == "account_number"
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="account_number",
+                field_selector=join,
+                field_trajectory_index=0,
+                match_basis="scouted_selection_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
+        ),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[AuthoringParameterBindingCandidate(declared_key="account_number", field_selector=join)],
+    )
+    consumed_code = 'await page.locator(f"[data-account=\\"{account_number}\\"]").click()'
+    assert authoring_parameter_binding_directive_consumed(
+        directive, snapshot, code=consumed_code, parameter_keys=["account_number"]
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#row-account-AC12345").click()',
+        parameter_keys=["account_number"],
+    )
+
+
+def test_authoring_parameter_directive_consumed_via_select_option_value_argument() -> None:
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="plan_tier",
+                field_selector="#plan",
+                field_trajectory_index=0,
+                match_basis="scouted_option_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[AuthoringParameterBindingCandidate(declared_key="plan_tier", field_selector="#plan")],
+    )
+    assert authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#plan").select_option(str(plan_tier))',
+        parameter_keys=["plan_tier"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#plan").select_option("premium")',
+        parameter_keys=["plan_tier"],
+    )
+
+
+def test_selection_snapshot_click_binding_references_declared_key() -> None:
+    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
+    _key, join = templated_selection_locator_binding(click)
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="account_number",
+                field_selector=join,
+                field_trajectory_index=0,
+                match_basis="scouted_selection_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
+        ),
+    )
+    result = synthesize_code_block([click], strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert 'page.locator(f"[data-account=\\"{account_number}\\"]").click()' in result.code
+    assert ".fill(" not in result.code
+
+
+def test_selection_snapshot_select_option_binds_value_argument() -> None:
+    select = _interaction(
+        "select_option", selector="#plan", value="premium", source_url="https://example.com/list", trajectory_index=0
+    )
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="plan_tier",
+                field_selector="#plan",
+                field_trajectory_index=0,
+                match_basis="scouted_option_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
+    )
+    result = synthesize_code_block([select], strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert 'page.locator("#plan").select_option(str(plan_tier))' in result.code
+    assert '"premium"' not in result.code
+    assert result.parameters == [{"key": "plan_tier"}]
+
+
+def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="click", trajectory_index=9, selector="#submit"),
+    )
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert ".select_option(" not in result.code
+    assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
