@@ -1,0 +1,366 @@
+{
+  "artifact_set": "copilot-status-and-amendments-2026-07-15-ce981015d2",
+  "prompt": "P3",
+  "fixture_site": "telco_apexbiz (localhost mock)",
+  "note": "Byte-exact definition_contract_unsatisfied reject packets extracted from the recorded gauntlet backend.logs. recorded_summary fields are truncated by the source logger; turn_halts carry the only complete unresolved-key lists.",
+  "runs": [
+    {
+      "run": "run1",
+      "source_log": "copilot-status-and-amendments-2026-07-15-ce981015d2/P3/run1/backend.log",
+      "workflow_permanent_id": "wpid_551759210240752682",
+      "workflow_copilot_chat_id": "wcc_551759231715589168",
+      "turn_id": "0ea14e17c78a4c5aba461a4bf875bce6",
+      "block_labels": [
+        "download_matching_invoice_pdf"
+      ],
+      "stored_rejects": [
+        {
+          "source_line": 667,
+          "timestamp": "2026-07-15T21:10:25.755544Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "0a22aed0d6523592032c0017443c21179d8e14df5f61bd29faccabda342500ad",
+          "authored_structure_signature": "2a0aa4e3998a019f1638f10c2cb1767ef9700a561be8ecf21554ae203ec61e81",
+          "raw": "2026-07-15T21:10:25.755544Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=0a22aed0d6523592032c0017443c21179d8e14df5f61bd29faccabda342500ad is_authoritative=True workflow_run_id=None authored_structure_signature=2a0aa4e3998a019f1638f10c2cb1767ef9700a561be8ecf21554ae203ec61e81 entrypoint=unknown"
+        },
+        {
+          "source_line": 704,
+          "timestamp": "2026-07-15T21:11:13.769247Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "8a23f5d48c49f2dc10c31876c38167688ddb46fe9f80c23a2039edab3ea65cee",
+          "authored_structure_signature": "6cfb1d15806cf8d3a14a2c0fb55550a1d0f0b71175ada587782d47ae8dc2faf7",
+          "raw": "2026-07-15T21:11:13.769247Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=8a23f5d48c49f2dc10c31876c38167688ddb46fe9f80c23a2039edab3ea65cee is_authoritative=True workflow_run_id=None authored_structure_signature=6cfb1d15806cf8d3a14a2c0fb55550a1d0f0b71175ada587782d47ae8dc2faf7 entrypoint=unknown"
+        },
+        {
+          "source_line": 739,
+          "timestamp": "2026-07-15T21:12:00.486376Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "0a22aed0d6523592032c0017443c21179d8e14df5f61bd29faccabda342500ad",
+          "authored_structure_signature": "2a0aa4e3998a019f1638f10c2cb1767ef9700a561be8ecf21554ae203ec61e81",
+          "raw": "2026-07-15T21:12:00.486376Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=0a22aed0d6523592032c0017443c21179d8e14df5f61bd29faccabda342500ad is_authoritative=True workflow_run_id=None authored_structure_signature=2a0aa4e3998a019f1638f10c2cb1767ef9700a561be8ecf21554ae203ec61e81 entrypoint=unknown"
+        },
+        {
+          "source_line": 772,
+          "timestamp": "2026-07-15T21:12:35.922113Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "0a22aed0d6523592032c0017443c21179d8e14df5f61bd29faccabda342500ad",
+          "authored_structure_signature": "2a0aa4e3998a019f1638f10c2cb1767ef9700a561be8ecf21554ae203ec61e81",
+          "raw": "2026-07-15T21:12:35.922113Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=0a22aed0d6523592032c0017443c21179d8e14df5f61bd29faccabda342500ad is_authoritative=True workflow_run_id=None authored_structure_signature=2a0aa4e3998a019f1638f10c2cb1767ef9700a561be8ecf21554ae203ec61e81 entrypoint=unknown"
+        }
+      ],
+      "reject_summaries": [
+        {
+          "source_line": 670,
+          "timestamp": "2026-07-15T21:10:25.759931Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:10:25.759931Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=570999 workflow_permanent_id=wpid_551759210240752682 turn_id=0ea14e17c78a4c5aba461a4bf875bce6 workflow_copilot_chat_id=wcc_551759231715589168 entrypoint=unknown"
+        },
+        {
+          "source_line": 711,
+          "timestamp": "2026-07-15T21:11:13.773768Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:11:13.773768Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=570999 workflow_permanent_id=wpid_551759210240752682 turn_id=0ea14e17c78a4c5aba461a4bf875bce6 workflow_copilot_chat_id=wcc_551759231715589168 entrypoint=unknown"
+        },
+        {
+          "source_line": 742,
+          "timestamp": "2026-07-15T21:12:00.488299Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:12:00.488299Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=570999 workflow_permanent_id=wpid_551759210240752682 turn_id=0ea14e17c78a4c5aba461a4bf875bce6 workflow_copilot_chat_id=wcc_551759231715589168 entrypoint=unknown"
+        },
+        {
+          "source_line": 776,
+          "timestamp": "2026-07-15T21:12:35.924560Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:12:35.924560Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=570999 workflow_permanent_id=wpid_551759210240752682 turn_id=0ea14e17c78a4c5aba461a4bf875bce6 workflow_copilot_chat_id=wcc_551759231715589168 entrypoint=unknown"
+        },
+        {
+          "source_line": 872,
+          "timestamp": "2026-07-15T21:14:05.779754Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:14:05.779754Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=570999 workflow_permanent_id=wpid_551759210240752682 turn_id=0ea14e17c78a4c5aba461a4bf875bce6 workflow_copilot_chat_id=wcc_551759231715589168 entrypoint=unknown"
+        }
+      ],
+      "turn_halts": [
+        {
+          "source_line": 864,
+          "timestamp": "2026-07-15T21:14:05.774759Z",
+          "turn_halt_verdict": "blocked",
+          "unresolved_parameter_keys": [
+            "account_number",
+            "billing_end_date",
+            "billing_start_date"
+          ],
+          "grounding_unresolved": true,
+          "source": "recorded_outcome_regrounding",
+          "raw": "2026-07-15T21:14:05.774759Z [info     ] [turn_halt.py                  :305 ] copilot turn halt stashed      [skyvern.forge.sdk.copilot.turn_halt] turn_halt_kind=definition_contract_unsatisfied turn_halt_verdict=blocked turn_halt_extra={'unresolved_parameter_keys': ['account_number', 'billing_end_date', 'billing_start_date'], 'grounding_unresolved': True, 'source': 'recorded_outcome_regrounding'} blocker_kind=tool_error recovery_hint=report_blocker_to_user cleared_by_tools=[] renders_final_reply=True internal_reason_code=definition_contract_unsatisfied blocked_tool=None classifier_mode=None exception_type=None extra={'unresolved_parameter_keys': ['account_number', 'billing_end_date', 'billing_start_date'], 'grounding_unresolved': True} entrypoint=unknown"
+        }
+      ],
+      "scouted_interactions": [
+        {
+          "source_line": 204,
+          "tool_name": "click",
+          "selector": "button.icon-btn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 0
+        },
+        {
+          "source_line": 244,
+          "tool_name": "fill_credential_field",
+          "selector": "#user",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 1
+        },
+        {
+          "source_line": 313,
+          "tool_name": "click",
+          "selector": "#contBtn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 2
+        },
+        {
+          "source_line": 425,
+          "tool_name": "fill_credential_field",
+          "selector": "#pass",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 3
+        },
+        {
+          "source_line": 465,
+          "tool_name": "click",
+          "selector": "#signinBtn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 4
+        },
+        {
+          "source_line": 609,
+          "tool_name": "click",
+          "selector": "#current-statement-row",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 5
+        }
+      ]
+    },
+    {
+      "run": "run2",
+      "source_log": "copilot-status-and-amendments-2026-07-15-ce981015d2/P3/run2/backend.log",
+      "workflow_permanent_id": "wpid_551761624012373050",
+      "workflow_copilot_chat_id": "wcc_551761645487209536",
+      "turn_id": "a95b0af1f2bb472599d908bfd34be177",
+      "block_labels": [
+        "download_matching_invoice_pdf"
+      ],
+      "stored_rejects": [
+        {
+          "source_line": 691,
+          "timestamp": "2026-07-15T21:19:36.330734Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "0ea850bd0b98bc0445c418b76b4a0d26484b865fd0edf6f46b3ebbaae5077e2c",
+          "authored_structure_signature": "d329b9cbbaa1fae0b5932217dd862b73f1ce88dafc5b32ccd999e1cfc9e2b3c2",
+          "raw": "2026-07-15T21:19:36.330734Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=0ea850bd0b98bc0445c418b76b4a0d26484b865fd0edf6f46b3ebbaae5077e2c is_authoritative=True workflow_run_id=None authored_structure_signature=d329b9cbbaa1fae0b5932217dd862b73f1ce88dafc5b32ccd999e1cfc9e2b3c2 entrypoint=unknown"
+        },
+        {
+          "source_line": 726,
+          "timestamp": "2026-07-15T21:20:12.002103Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "47bf1213538d589b34ea1a2c767e27168aeebf28122316ece6e56fb201e5e538",
+          "authored_structure_signature": "76b867325620b851d76fb1b8ab0a976265b95b7b1bf97a85e17a879297ed90e6",
+          "raw": "2026-07-15T21:20:12.002103Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=47bf1213538d589b34ea1a2c767e27168aeebf28122316ece6e56fb201e5e538 is_authoritative=True workflow_run_id=None authored_structure_signature=76b867325620b851d76fb1b8ab0a976265b95b7b1bf97a85e17a879297ed90e6 entrypoint=unknown"
+        },
+        {
+          "source_line": 757,
+          "timestamp": "2026-07-15T21:20:47.993066Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "47bf1213538d589b34ea1a2c767e27168aeebf28122316ece6e56fb201e5e538",
+          "authored_structure_signature": "76b867325620b851d76fb1b8ab0a976265b95b7b1bf97a85e17a879297ed90e6",
+          "raw": "2026-07-15T21:20:47.993066Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=47bf1213538d589b34ea1a2c767e27168aeebf28122316ece6e56fb201e5e538 is_authoritative=True workflow_run_id=None authored_structure_signature=76b867325620b851d76fb1b8ab0a976265b95b7b1bf97a85e17a879297ed90e6 entrypoint=unknown"
+        }
+      ],
+      "reject_summaries": [
+        {
+          "source_line": 698,
+          "timestamp": "2026-07-15T21:19:36.334623Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_period_end`,...",
+          "raw": "2026-07-15T21:19:36.334623Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_period_end`,... total_tokens=103944 workflow_permanent_id=wpid_551761624012373050 turn_id=a95b0af1f2bb472599d908bfd34be177 workflow_copilot_chat_id=wcc_551761645487209536 entrypoint=unknown"
+        },
+        {
+          "source_line": 729,
+          "timestamp": "2026-07-15T21:20:12.004293Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_period_end`,...",
+          "raw": "2026-07-15T21:20:12.004293Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_period_end`,... total_tokens=103944 workflow_permanent_id=wpid_551761624012373050 turn_id=a95b0af1f2bb472599d908bfd34be177 workflow_copilot_chat_id=wcc_551761645487209536 entrypoint=unknown"
+        },
+        {
+          "source_line": 761,
+          "timestamp": "2026-07-15T21:20:47.994841Z",
+          "tool_name": "update_workflow",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_period_end`,...",
+          "raw": "2026-07-15T21:20:47.994841Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_workflow ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_period_end`,... total_tokens=103944 workflow_permanent_id=wpid_551761624012373050 turn_id=a95b0af1f2bb472599d908bfd34be177 workflow_copilot_chat_id=wcc_551761645487209536 entrypoint=unknown"
+        }
+      ],
+      "turn_halts": [],
+      "scouted_interactions": [
+        {
+          "source_line": 165,
+          "tool_name": "click",
+          "selector": "button.icon-btn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 0
+        },
+        {
+          "source_line": 291,
+          "tool_name": "fill_credential_field",
+          "selector": "#user",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 1
+        },
+        {
+          "source_line": 335,
+          "tool_name": "click",
+          "selector": "#contBtn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 2
+        },
+        {
+          "source_line": 430,
+          "tool_name": "fill_credential_field",
+          "selector": "#pass",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 3
+        },
+        {
+          "source_line": 481,
+          "tool_name": "click",
+          "selector": "#signinBtn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 4
+        },
+        {
+          "source_line": 625,
+          "tool_name": "click",
+          "selector": "#current-statement-row",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 5
+        }
+      ]
+    },
+    {
+      "run": "run3",
+      "source_log": "copilot-status-and-amendments-2026-07-15-ce981015d2/P3/run3/backend.log",
+      "workflow_permanent_id": "wpid_551763415013735498",
+      "workflow_copilot_chat_id": "wcc_551763449373473872",
+      "turn_id": "c068547c7c694d4bbec6ebb551d76767",
+      "block_labels": [
+        "download_matching_invoice"
+      ],
+      "stored_rejects": [
+        {
+          "source_line": 643,
+          "timestamp": "2026-07-15T21:26:15.712587Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "e45beae88b1e162ea36d5d193bb41cb130e96e6d4f2e038cf25485cbeb4702d3",
+          "authored_structure_signature": "b4afec68ce4e36632f2b83fdda98fdc4e2c0f335264f241fc11abb63ffef48dd",
+          "raw": "2026-07-15T21:26:15.712587Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=e45beae88b1e162ea36d5d193bb41cb130e96e6d4f2e038cf25485cbeb4702d3 is_authoritative=True workflow_run_id=None authored_structure_signature=b4afec68ce4e36632f2b83fdda98fdc4e2c0f335264f241fc11abb63ffef48dd entrypoint=unknown"
+        },
+        {
+          "source_line": 691,
+          "timestamp": "2026-07-15T21:27:13.679961Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "a31619ea8653e6e40b8a23cb827919f4a9e43ab0c7f32ef6c4c3433e11038788",
+          "authored_structure_signature": "0f163c36bec7c636748540a680c6e7844fbce4e0437c34c91d6db084cce21d2d",
+          "raw": "2026-07-15T21:27:13.679961Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=a31619ea8653e6e40b8a23cb827919f4a9e43ab0c7f32ef6c4c3433e11038788 is_authoritative=True workflow_run_id=None authored_structure_signature=0f163c36bec7c636748540a680c6e7844fbce4e0437c34c91d6db084cce21d2d entrypoint=unknown"
+        },
+        {
+          "source_line": 735,
+          "timestamp": "2026-07-15T21:27:48.351068Z",
+          "reason_code": "definition_contract_unsatisfied",
+          "verdict": "authoring_rejected",
+          "structural_key": "a31619ea8653e6e40b8a23cb827919f4a9e43ab0c7f32ef6c4c3433e11038788",
+          "authored_structure_signature": "0f163c36bec7c636748540a680c6e7844fbce4e0437c34c91d6db084cce21d2d",
+          "raw": "2026-07-15T21:27:48.351068Z [info     ] [build_test_outcome.py         :265 ] copilot recorded build-test outcome stored [skyvern.forge.sdk.copilot.build_test_outcome] phase=author_time_reject reason_code=definition_contract_unsatisfied verdict=authoring_rejected structural_key=a31619ea8653e6e40b8a23cb827919f4a9e43ab0c7f32ef6c4c3433e11038788 is_authoritative=True workflow_run_id=None authored_structure_signature=0f163c36bec7c636748540a680c6e7844fbce4e0437c34c91d6db084cce21d2d entrypoint=unknown"
+        }
+      ],
+      "reject_summaries": [
+        {
+          "source_line": 650,
+          "timestamp": "2026-07-15T21:26:15.717864Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:26:15.717864Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=103992 workflow_permanent_id=wpid_551763415013735498 turn_id=c068547c7c694d4bbec6ebb551d76767 workflow_copilot_chat_id=wcc_551763449373473872 entrypoint=unknown"
+        },
+        {
+          "source_line": 694,
+          "timestamp": "2026-07-15T21:27:13.685243Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:27:13.685243Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=103992 workflow_permanent_id=wpid_551763415013735498 turn_id=c068547c7c694d4bbec6ebb551d76767 workflow_copilot_chat_id=wcc_551763449373473872 entrypoint=unknown"
+        },
+        {
+          "source_line": 739,
+          "timestamp": "2026-07-15T21:27:48.352756Z",
+          "tool_name": "update_and_run_blocks",
+          "recorded_summary": "Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `...",
+          "raw": "2026-07-15T21:27:48.352756Z [info     ] [hooks.py                      :95  ] copilot tool completed         [skyvern.forge.sdk.copilot.hooks] tool_name=update_and_run_blocks ok=False summary=Failed: The submitted workflow declares reusable parameters that no block references: `account_number`, `billing_end_date`, `... total_tokens=103992 workflow_permanent_id=wpid_551763415013735498 turn_id=c068547c7c694d4bbec6ebb551d76767 workflow_copilot_chat_id=wcc_551763449373473872 entrypoint=unknown"
+        }
+      ],
+      "turn_halts": [],
+      "scouted_interactions": [
+        {
+          "source_line": 150,
+          "tool_name": "click",
+          "selector": "button.icon-btn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 0
+        },
+        {
+          "source_line": 276,
+          "tool_name": "fill_credential_field",
+          "selector": "#user",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 1
+        },
+        {
+          "source_line": 320,
+          "tool_name": "click",
+          "selector": "#contBtn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 2
+        },
+        {
+          "source_line": 421,
+          "tool_name": "fill_credential_field",
+          "selector": "#pass",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 3
+        },
+        {
+          "source_line": 467,
+          "tool_name": "click",
+          "selector": "#signinBtn",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 4
+        },
+        {
+          "source_line": 611,
+          "tool_name": "click",
+          "selector": "#current-statement-row",
+          "source_url": "http://localhost:8900/telco_billing/apexbiz/",
+          "trajectory_index": 5
+        }
+      ]
+    }
+  ]
+}

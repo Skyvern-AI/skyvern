@@ -1165,6 +1165,44 @@ def test_steer_only_never_terminals_click_only_and_skips_declick() -> None:
     assert second.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 
 
+def test_value_bearing_reject_uses_steer_only_structure_directive() -> None:
+    signature = "sig_value_bearing_steer"
+    evaluation = _make_evaluation(
+        signature,
+        block_label="collect",
+        shape_violations=["value_bearing_output_required"],
+    )
+    non_steer_ctx = _ladder_ctx()
+
+    inert = wu._adjudicate_output_contract_ladder_after_reject(
+        non_steer_ctx,
+        evaluation,
+        workflow_yaml=_PAGE_READ_YAML,
+        current_fingerprint="value-bearing:fp",
+    )
+
+    assert inert is None
+    assert non_steer_ctx.output_contract_armed_directive_fingerprint_by_signature == {}
+
+    ctx = _ladder_ctx()
+    actuation = wu._adjudicate_output_contract_ladder_after_reject(
+        ctx,
+        evaluation,
+        workflow_yaml=_PAGE_READ_YAML,
+        current_fingerprint="value-bearing:fp",
+        steer_only=True,
+    )
+
+    assert actuation is not None
+    assert actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert ctx.output_contract_armed_directive_fingerprint_by_signature[signature] == "value-bearing:fp"
+    assert ctx.output_contract_actuation_by_signature == {}
+    assert ctx.output_contract_pending_run_evidence == {}
+    assert ctx.output_contract_actuation_count_by_signature == {}
+    assert ctx.output_contract_declick_attempted_by_signature == {}
+    assert ctx.turn_halt is None
+
+
 def test_observed_required_values_exact_and_lineage_match() -> None:
     ctx = SimpleNamespace(scouted_output_covered_paths={"output.order.id"}, composition_page_evidence=None)
     assert wu._observed_required_output_values(ctx, {"output.order.id"}) is True
@@ -1783,6 +1821,25 @@ def test_contingent_antecedent_alone_forms_declaration_only_contract() -> None:
     assert contract.union == {"output.blocker"}
 
 
+def test_blocker_family_path_is_declaration_only_for_authoring() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_blocker",
+            outcome="A blocker is reported when the site blocks submission.",
+            output_path="output.blocker",
+            antecedent_family="blocker",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == set()
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.union == {"output.blocker"}
+    assert contract.liveness is wu._OutputContractLiveness.ABSENT
+    assert wu._value_bearing_directive_paths(contract) == {"output"}
+
+
 def test_antecedent_overlapping_requested_output_stays_observation() -> None:
     ctx = _antecedent_ctx(
         CompletionCriterion(
@@ -2070,7 +2127,9 @@ def test_mint_degraded_output_path_leaves_observation_lane() -> None:
     )
 
     assert wu._requested_output_child_paths(ctx) == set()
-    assert wu._output_contract_required_paths_source(ctx).union == set()
+    contract = wu._output_contract_required_paths_source(ctx)
+    assert contract.union == set()
+    assert contract.degraded_request_slots == ()
 
 
 def test_face_c_degraded_mint_preserves_satisfiable_value_bearing_authoring_path() -> None:

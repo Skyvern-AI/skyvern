@@ -13,6 +13,7 @@ import structlog
 from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.result_evidence import (
@@ -224,6 +225,7 @@ class CodeAuthoringRepairContext(BaseModel):
     spine_stage_count: int | None = None
     spine_split_blockers: list[str] = Field(default_factory=list)
     output_owner_candidate_labels: list[str] = Field(default_factory=list)
+    parameter_binding_directive: AuthoringParameterBindingDirective | None = None
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
