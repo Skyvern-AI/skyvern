@@ -1612,6 +1612,200 @@ class TestCodeRepairProgressClassification:
         assert workflow_update_module._definition_plane_preflight_reject(ctx, ctx.workflow_yaml) is None
 
     @pytest.mark.asyncio
+    async def test_selection_shaped_binding_references_declared_keys_without_fillable_surface(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        submitted = _yaml(
+            """
+            title: Retrieve statement rows
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "AC12345"}
+              - {parameter_type: workflow, key: billing_start_date, workflow_parameter_type: string, default_value: "2026-08-01"}
+              blocks:
+              - block_type: code
+                label: open_statement_rows
+                parameter_keys: []
+                code: |
+                  await page.locator("[data-account=\\"AC12345\\"]").click()
+                  await page.locator("[data-range=\\"2026-08-01\\"]").click()
+            """
+        )
+        for _ in range(2):
+            assert (await _update_workflow({"workflow_yaml": submitted}, ctx))["ok"] is False
+        assert arm_recorded_outcome_grounding_requirement(ctx) is not None
+        source_url = "https://example.com/statements"
+        values = {"account_number": "AC12345", "billing_start_date": "2026-08-01"}
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": '[data-account="AC12345"]',
+                "source_url": source_url,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": '[data-range="2026-08-01"]',
+                "source_url": source_url,
+                "trajectory_index": 1,
+            },
+        ]
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": source_url,
+            "forms": [],
+        }
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+
+        result = await _update_workflow(
+            {"workflow_yaml": submitted, "parameters": values},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = next(block for block in workflow_blocks(parsed) if block.get("label") == "open_statement_rows")
+        code = str(block["code"])
+        assert 'f"[data-account=\\"{account_number}\\"]"' in code
+        assert 'f"[data-range=\\"{billing_start_date}\\"]"' in code
+        assert set(block["parameter_keys"]) == {"account_number", "billing_start_date"}
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, ctx.workflow_yaml) is None
+        assert ctx.authoring_parameter_binding_snapshot is not None
+
+    def test_selection_resolution_binds_witnessed_click_value(self) -> None:
+        ctx = SimpleNamespace(
+            scout_trajectory=[
+                {
+                    "tool_name": "click",
+                    "selector": '[data-account="100245"]',
+                    "source_url": "https://example.com/statements",
+                    "trajectory_index": 0,
+                }
+            ]
+        )
+        for interaction in ctx.scout_trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is not None
+        binding = resolution.snapshot.field_bindings[0]
+        assert binding.declared_key == "account_number"
+        assert binding.match_basis == "scouted_selection_value"
+
+    def test_selection_resolution_rejects_prose_echo_without_scouted_interaction(self) -> None:
+        ctx = SimpleNamespace(
+            scout_trajectory=[
+                {
+                    "tool_name": "click",
+                    "selector": "#unrelated-open-button",
+                    "source_url": "https://example.com/statements",
+                    "trajectory_index": 0,
+                }
+            ]
+        )
+        for interaction in ctx.scout_trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is None
+
+    def test_selection_resolution_short_value_below_witness_bar_does_not_bind(self) -> None:
+        ctx = SimpleNamespace(
+            scout_trajectory=[
+                {
+                    "tool_name": "select_option",
+                    "selector": "#plan",
+                    "value": "US",
+                    "source_url": "https://example.com/statements",
+                    "trajectory_index": 0,
+                }
+            ]
+        )
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["region"],
+            ephemeral_values={"region": "US"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is None
+
+    def test_selection_resolution_multiple_matches_yield_candidates_without_snapshot(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "click",
+                "selector": '[data-account="100245"]',
+                "source_url": "https://example.com/statements",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": '[data-ref="100245"]',
+                "source_url": "https://example.com/statements",
+                "trajectory_index": 1,
+            },
+        ]
+        for interaction in trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        ctx = SimpleNamespace(scout_trajectory=trajectory)
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is not None
+
+    def test_selection_resolution_cross_origin_click_is_not_admitted(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "click",
+                "selector": '[data-account="100245"]',
+                "source_url": "https://other.example.org/statements",
+                "trajectory_index": 0,
+            }
+        ]
+        for interaction in trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        ctx = SimpleNamespace(scout_trajectory=trajectory)
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is None
+
+    @pytest.mark.asyncio
     async def test_corrective_pass_satisfies_definition_and_scouted_spine_gates_jointly(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
