@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     output_path_segments,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.runtime import ScoutedFieldParameterBinding, ScoutedInputCorrespondence
+from skyvern.forge.sdk.copilot.runtime import ScoutedInputCorrespondence
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -329,30 +329,6 @@ def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
     )
 
 
-def grounded_submit_rung_binding_fingerprint(
-    *,
-    repeated_structural_key: str,
-    source_url: str,
-    submit_selector: str,
-    submit_trajectory_index: int,
-    field_bindings: Sequence[ScoutedFieldParameterBinding],
-) -> str:
-    payload = {
-        "repeated_structural_key": repeated_structural_key,
-        "source_url": source_url,
-        "submit_selector": submit_selector,
-        "submit_trajectory_index": submit_trajectory_index,
-        "field_bindings": [
-            {
-                "parameter_key": binding["parameter_key"],
-                "field_selector": binding["field_selector"],
-            }
-            for binding in field_bindings
-        ],
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _binding_source_origin(source_url: str) -> str:
     parsed = urlsplit(source_url)
     return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
@@ -445,53 +421,6 @@ def _validated_authoring_parameter_binding_snapshot(
             return None
         fill_by_index[field_position] = (binding.declared_key, binding.field_selector)
     return _ValidatedSnapshotBindings(fill_by_index, select_option_by_index)
-
-
-def _validated_submit_rung_binding(
-    interaction: Mapping[str, Any], trajectory_index: int
-) -> tuple[str, tuple[tuple[str, str], ...]] | None:
-    raw = interaction.get("submit_rung_binding")
-    if not isinstance(raw, Mapping) or str(interaction.get("tool_name") or "") != "click":
-        return None
-    repeated_structural_key = str(raw.get("repeated_structural_key") or "").strip()
-    fingerprint = str(raw.get("fingerprint") or "").strip()
-    raw_fields = raw.get("field_bindings")
-    if not repeated_structural_key or not fingerprint or not isinstance(raw_fields, list) or not raw_fields:
-        return None
-    fields: list[ScoutedFieldParameterBinding] = []
-    parameter_keys: set[str] = set()
-    field_selectors: set[str] = set()
-    for raw_field in raw_fields:
-        if not isinstance(raw_field, Mapping):
-            return None
-        parameter_key = str(raw_field.get("parameter_key") or "").strip()
-        field_selector = str(raw_field.get("field_selector") or "").strip()
-        if (
-            not grounded_parameter_key_is_safe(parameter_key)
-            or not field_selector
-            or parameter_key in parameter_keys
-            or field_selector in field_selectors
-        ):
-            return None
-        parameter_keys.add(parameter_key)
-        field_selectors.add(field_selector)
-        fields.append({"parameter_key": parameter_key, "field_selector": field_selector})
-    if [field["parameter_key"] for field in fields] != sorted(parameter_keys):
-        return None
-    submit_selector = str(interaction.get("selector") or "").strip()
-    source_url = str(interaction.get("source_url") or "").strip()
-    if not submit_selector or not source_url:
-        return None
-    expected = grounded_submit_rung_binding_fingerprint(
-        repeated_structural_key=repeated_structural_key,
-        source_url=source_url,
-        submit_selector=submit_selector,
-        submit_trajectory_index=trajectory_index,
-        field_bindings=fields,
-    )
-    if fingerprint != expected:
-        return None
-    return fingerprint, tuple((field["parameter_key"], field["field_selector"]) for field in fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1443,9 +1372,6 @@ def synthesize_code_block(
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
     used_download_vars: set[str] = set()
-    grounded_binding_count = sum(1 for interaction in trajectory if "submit_rung_binding" in interaction)
-    if grounded_binding_count > 1 or (grounded_binding_count and parameter_binding_snapshot is not None):
-        return None
     validated_snapshot_bindings = (
         _validated_authoring_parameter_binding_snapshot(parameter_binding_snapshot, trajectory)
         if parameter_binding_snapshot is not None
@@ -1479,8 +1405,6 @@ def synthesize_code_block(
                 anchor=reached_download_target.trajectory_anchor,
                 dropped_trailing_count=dropped_trailing,
             )
-    if grounded_binding_count != sum(1 for interaction in trajectory if "submit_rung_binding" in interaction):
-        return None
     diagnostics.retained_trajectory_indices = list(range(len(trajectory)))
 
     input_templated_keys, input_templated_needs_month = _prescan_input_templating(trajectory)
@@ -1838,23 +1762,6 @@ def synthesize_code_block(
         line_start = len(lines) + 1
         if tool_name == "click":
             emit_snapshot_recovery(trajectory_index, action_indent)
-            captured_index = interaction.get("trajectory_index")
-            submit_trajectory_index = (
-                captured_index if isinstance(captured_index, int) and captured_index >= 0 else trajectory_index
-            )
-            if "submit_rung_binding" in interaction:
-                grounded_binding = _validated_submit_rung_binding(interaction, submit_trajectory_index)
-                if grounded_binding is None:
-                    return None
-                binding_fingerprint, field_bindings = grounded_binding
-                for parameter_key, field_selector in field_bindings:
-                    if parameter_key not in used_param_keys:
-                        used_param_keys.add(parameter_key)
-                        parameters.append({"key": parameter_key})
-                    lines.append(
-                        f"{action_indent}await page.locator({_py_str(field_selector)}).fill(str({parameter_key}))"
-                    )
-                diagnostics.grounded_submit_binding_fingerprints.append(binding_fingerprint)
             reclassify_terminal_required = (
                 trajectory_index == terminal_action_index
                 and _is_anonymous_structural_dismissal_click(interaction)
@@ -2087,7 +1994,7 @@ def synthesize_code_block(
 
     if not lines:
         return None
-    expected_binding_fingerprint_count = grounded_binding_count + (1 if parameter_binding_snapshot is not None else 0)
+    expected_binding_fingerprint_count = 1 if parameter_binding_snapshot is not None else 0
     if len(diagnostics.grounded_submit_binding_fingerprints) != expected_binding_fingerprint_count:
         return None
     emitted_code = "\n".join(lines)
