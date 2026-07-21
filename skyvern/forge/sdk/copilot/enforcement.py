@@ -905,12 +905,13 @@ def _completion_verification_only_structural_abstentions(ctx: CopilotContext) ->
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
-    if outcome_fully_verified(ctx):
-        return True
-    # The judge verdict is authoritative: once it has evaluated, an unconfirmed
-    # criterion means the outcome is unmet regardless of run status. The block-count
-    # heuristic (which counts method verbs in the request) governs only when there
-    # is no evaluated verdict.
+    return outcome_fully_verified(ctx)
+
+
+def built_complete_without_evaluated_outcome(ctx: CopilotContext) -> bool:
+    """A run that looks built and repair-inert but carries no evaluated verdict.
+    It ends the turn like ``built_unverified_repair_inert_context`` does, but must
+    never authorize a verified-satisfaction claim."""
     if _outcome_criteria_evaluated(ctx):
         return False
     if not (
@@ -952,6 +953,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
         "gate_built_unverified_repair_inert": built_unverified_repair_inert_context(ctx),
+        "gate_built_complete_without_evaluated_outcome": built_complete_without_evaluated_outcome(ctx),
         "gate_claim_authorized": verified_goal_claim_authorized(ctx),
         "gate_last_test_ok": ctx.last_test_ok is True,
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
@@ -1546,7 +1548,7 @@ def _check_enforcement(
 
     if verified_goal_satisfied_context(ctx):
         raise CopilotGoalSatisfied()
-    if built_unverified_repair_inert_context(ctx):
+    if built_unverified_repair_inert_context(ctx) or built_complete_without_evaluated_outcome(ctx):
         raise CopilotBuiltUnverified()
 
     if _needs_repair_ceiling_halt(ctx):

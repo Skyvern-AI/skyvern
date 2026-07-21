@@ -54,6 +54,7 @@ BuildTestOutcomeReasonCode = Literal[
     "terminal_challenge_blocker",
     "blocker_reported",
     "failed_run",
+    "run_completed_unevaluated",
     "suspicious_success",
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
@@ -1139,7 +1140,11 @@ def recorded_outcome_from_run_blocks_result(
     verdict: BuildTestOutcomeVerdict = "repairable_failure" if bool(result.get("ok")) is False else "progress_observed"
     if not structural_identity and not page_refs and not output_refs:
         verdict = "not_authoritative"
-    reason_code = "runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run"
+    reason_code = (
+        "runtime_block_failure"
+        if failed_block is not None or not bool(result.get("ok"))
+        else "run_completed_unevaluated"
+    )
     has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
     if (
         verdict == "repairable_failure"
@@ -1555,6 +1560,8 @@ def _run_outcome_reason_code(recorded_run_outcome: RecordedRunOutcome) -> BuildT
         return reason_code
     if recorded_run_outcome.verdict == "demonstrated":
         return "verified_success"
+    if recorded_run_outcome.verdict == "not_evaluated":
+        return "run_completed_unevaluated"
     return "failed_run"
 
 
