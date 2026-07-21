@@ -8,10 +8,20 @@ class Constants:
     MissingVariablePattern = var_pattern = r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_.\[\]'\"]*)\s*\}\}"
 
 
+# Closed Jinja expression/statement spans. DOTALL because expressions may span lines.
+_JINJA_SPAN_PATTERN = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.DOTALL)
+
+
 def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     """Replaces jinja-style references in a string.
 
-    Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}}
+    Rewrites the key wherever it appears as a full token inside {{ ... }} expressions or
+    {% ... %} statements: {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}},
+    {{ other < oldKey }}, {% if oldKey %}, {% for x in oldKey %}.
+
+    Left untouched: occurrences outside Jinja delimiters, attribute accesses (foo.oldKey),
+    quoted string literals ('oldKey'), and longer identifiers that merely contain the key
+    (oldKeyExtended).
 
     Args:
         text: The text to search in
@@ -21,13 +31,22 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     Returns:
         The text with references replaced
     """
-    # Match {{oldKey}} or {{oldKey.something}} or {{oldKey | filter}} or {{oldKey[0]}} etc.
-    # Use negative lookahead to ensure key is not followed by identifier characters,
-    # which prevents matching {{keyOther}} when searching for {{key}}
-    # Capture whitespace after {{ to preserve formatting (e.g., "{{ key }}" stays "{{ newKey }}")
     escaped_old_key = re.escape(old_key)
-    pattern = rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])"
-    return re.sub(pattern, rf"{{{{\1{new_key}", text)
+    # A full-token occurrence: not preceded by an identifier character, a dot (attribute
+    # access), or a quote (string literal), and not followed by an identifier character or
+    # a quote. A trailing dot/bracket stays allowed so {{oldKey.field}} and {{oldKey[0]}}
+    # keep their access path with only the root renamed.
+    token_pattern = re.compile(rf"(?<![a-zA-Z0-9_.'\"]){escaped_old_key}(?![a-zA-Z0-9_'\"])")
+
+    def _rewrite_span(span: re.Match[str]) -> str:
+        return token_pattern.sub(lambda _: new_key, span.group(0))
+
+    text = _JINJA_SPAN_PATTERN.sub(_rewrite_span, text)
+
+    # An unclosed "{{ oldKey" has always been rewritten at the leading position; the span
+    # pattern above can't see it, so keep the legacy leading-position rewrite as a fallback.
+    leading_pattern = rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])"
+    return re.sub(leading_pattern, lambda m: "{{" + m.group(1) + new_key, text)
 
 
 def get_missing_variables(template_source: str, template_data: dict) -> set[str]:

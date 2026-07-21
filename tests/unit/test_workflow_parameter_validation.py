@@ -129,6 +129,33 @@ class TestReplaceJinjaReference:
             ),
             pytest.param("{{ old_key_extended }}", "{{ old_key_extended }}", id="partial-match-unchanged"),
             pytest.param("{{ other_key }}", "{{ other_key }}", id="different-key-unchanged"),
+            pytest.param(
+                "{{ current_index < old_key }}",
+                "{{ current_index < new_key }}",
+                id="mid-expression-comparison",
+            ),
+            pytest.param(
+                "{{ old_key + old_key }}",
+                "{{ new_key + new_key }}",
+                id="repeated-within-expression",
+            ),
+            pytest.param("{% if old_key %}yes{% endif %}", "{% if new_key %}yes{% endif %}", id="if-statement"),
+            pytest.param(
+                "{% for item in old_key %}{{ item }}{% endfor %}",
+                "{% for item in new_key %}{{ item }}{% endfor %}",
+                id="for-statement",
+            ),
+            pytest.param("{%- if old_key -%}", "{%- if new_key -%}", id="whitespace-control-statement"),
+            pytest.param("{{\n  old_key\n  | trim }}", "{{\n  new_key\n  | trim }}", id="multiline-expression"),
+            pytest.param("{% if old_key_extended %}", "{% if old_key_extended %}", id="statement-partial-unchanged"),
+            pytest.param("{{ foo.old_key }}", "{{ foo.old_key }}", id="attribute-position-unchanged"),
+            pytest.param("{{ func('old_key') }}", "{{ func('old_key') }}", id="string-literal-unchanged"),
+            pytest.param(
+                "old_key outside delimiters",
+                "old_key outside delimiters",
+                id="outside-delimiters-unchanged",
+            ),
+            pytest.param("{{ old_key", "{{ new_key", id="unclosed-expression-leading-rewritten"),
         ],
     )
     def test_replace_jinja_reference(self, text: str, expected: str) -> None:
@@ -245,6 +272,54 @@ class TestSanitizeWorkflowYamlWithReferences:
         result = sanitize_workflow_yaml_with_references(workflow_yaml)
         assert result["workflow_definition"]["blocks"][0]["label"] == "block_1"
         assert result["workflow_definition"]["parameters"][0]["source_parameter_key"] == "block_1_output"
+
+    def test_sanitize_updates_references_in_statements_and_mid_expression(self) -> None:
+        """Renamed keys are rewritten inside {% ... %} statements and mid-expression, not just after {{."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [{"key": "max attempts", "parameter_type": "workflow"}],
+                "blocks": [
+                    {
+                        "label": "retry_loop",
+                        "block_type": "while_loop",
+                        "complete_criterion": "{{ current_index < max attempts }}",
+                        "loop_blocks": [],
+                    },
+                    {
+                        "label": "notify",
+                        "block_type": "task",
+                        "navigation_goal": "{% if max attempts %}Retry up to {{ max attempts }} times{% endif %}",
+                    },
+                ],
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        blocks = result["workflow_definition"]["blocks"]
+        assert result["workflow_definition"]["parameters"][0]["key"] == "max_attempts"
+        assert blocks[0]["complete_criterion"] == "{{ current_index < max_attempts }}"
+        assert blocks[1]["navigation_goal"] == "{% if max_attempts %}Retry up to {{ max_attempts }} times{% endif %}"
+
+    def test_sanitize_updates_output_references_in_statements(self) -> None:
+        """Renamed block labels are rewritten in {label}_output references inside {% ... %} statements."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {"label": "my-block", "block_type": "task"},
+                    {
+                        "label": "guard",
+                        "block_type": "task",
+                        "navigation_goal": "{% if my-block_output.success %}Continue{% endif %}",
+                    },
+                ],
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        blocks = result["workflow_definition"]["blocks"]
+        assert blocks[0]["label"] == "my_block"
+        assert blocks[1]["navigation_goal"] == "{% if my_block_output.success %}Continue{% endif %}"
 
     def test_sanitize_parameter_key(self) -> None:
         """Test that parameter keys with invalid characters are sanitized."""
