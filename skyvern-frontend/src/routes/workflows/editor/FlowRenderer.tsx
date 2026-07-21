@@ -2391,7 +2391,7 @@ function FlowRenderer({
                 panOnDrag={true}
                 panOnScroll={true}
                 panOnScrollMode={PanOnScrollMode.Vertical}
-                zoomOnDoubleClick={!flowIsConstrained}
+                zoomOnDoubleClick={false}
                 zoomOnPinch={!flowIsConstrained}
                 zoomOnScroll={!flowIsConstrained}
               >
