@@ -845,8 +845,89 @@ def test_not_evaluated_recorded_outcome_is_not_authoritative_repair_failure() ->
 
     assert outcome is not None
     assert outcome.verdict == "not_authoritative"
-    assert outcome.reason_code == "failed_run"
+    assert outcome.reason_code == "run_completed_unevaluated"
     assert outcome.is_authoritative is False
+
+
+def test_completed_run_with_registered_outputs_is_not_classified_as_failed_run() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_completed",
+            "overall_status": "completed",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+            "registered_output_parameter_values": [
+                {"output_parameter_id": "op_1", "value": {"output": {"top_entry": "First listed entry"}}}
+            ],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_completed"),
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code != "failed_run"
+    assert outcome.reason_code == "run_completed_unevaluated"
+
+
+def test_failed_run_classification_preserved_for_not_ok_run() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_not_ok",
+            "overall_status": "failed",
+            "failure_type": "block_failure",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.reason_code == "runtime_block_failure"
+    assert outcome.verdict == "repairable_failure"
+
+
+def test_failed_run_classification_preserved_for_failed_block() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_failed_block",
+            "overall_status": "completed",
+            "failure_type": "block_failure",
+            "blocks": [{"label": "collect_top_entry", "status": "failed", "failure_reason": "selector not found"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.reason_code == "runtime_block_failure"
+
+
+def test_judge_evaluated_non_satisfaction_keeps_failure_classification() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_judged",
+            "overall_status": "completed",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_judged",
+        ),
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
 
 
 def test_outcome_not_demonstrated_does_not_mark_presence_only_abstention_as_missing_output() -> None:
