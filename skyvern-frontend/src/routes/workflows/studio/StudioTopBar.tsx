@@ -438,7 +438,7 @@ export function StudioTopBar() {
           </div>
           <div className="h-6 w-px bg-border" aria-hidden />
           <div className="flex items-center gap-2">
-            <PanelToggle content="parameters" label="Agent Inputs" />
+            <PanelToggle content="parameters" label="Inputs" />
             <RunStopButton />
           </div>
         </div>
