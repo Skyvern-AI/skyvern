@@ -1984,6 +1984,63 @@
           }
         },
         "x-fern-sdk-method-name": "list_tag_values"
+      },
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Create tag value",
+        "description": "Register a grouped tag (key, value) with a palette color before any workflow uses it. The label shows a zero workflow count until applied to a workflow.",
+        "operationId": "create_tag_value_v1_tag_values_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully registered tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValue"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Tag value already exists"
+          },
+          "422": {
+            "description": "Invalid key, value, or color"
+          }
+        },
+        "x-fern-sdk-method-name": "create_tag_value"
       }
     },
     "/v1/tag-values/{key}": {
@@ -2499,6 +2556,59 @@
         "x-fern-sdk-method-name": "batch_get_run_tags_post"
       }
     },
+    "/v1/run-tag-suggestions": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List run tag suggestions",
+        "description": "List distinct (key, value) pairs ever set on a run for the organization, sourced from the run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys (which are never registered) so pickers can offer them alongside user-defined tags.",
+        "operationId": "get_run_tag_suggestions_v1_run_tag_suggestions_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run tag suggestions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagSuggestionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tag_suggestions"
+      }
+    },
     "/v1/artifacts/{artifact_id}/content": {
       "get": {
         "tags": [
@@ -2949,6 +3059,34 @@
               ],
               "title": "Run Type"
             }
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
           },
           {
             "name": "x-api-key",
@@ -3539,6 +3677,76 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/browser_profiles/{profile_id}/usage": {
+      "get": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Get browser profile usage",
+        "description": "List the workflows, credentials, and recent runs that depend on a browser profile.",
+        "operationId": "get_browser_profile_usage_v1_browser_profiles__profile_id__usage_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved browser profile usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfileUsage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile_usage"
       }
     },
     "/v1/browser_sessions": {
@@ -6391,6 +6599,34 @@
             "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -8507,7 +8743,9 @@
           "recording",
           "audio",
           "session_replay",
+          "eval_score",
           "browser_console_log",
+          "browser_session_action_log",
           "skyvern_log",
           "skyvern_log_raw",
           "screenshot",
@@ -9550,6 +9788,17 @@
               }
             ],
             "title": "Deleted At"
+          },
+          "linked_credential_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Name"
           }
         },
         "type": "object",
@@ -9561,6 +9810,74 @@
           "modified_at"
         ],
         "title": "BrowserProfile"
+      },
+      "BrowserProfileUsage": {
+        "properties": {
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageWorkflow"
+            },
+            "type": "array",
+            "title": "Workflows",
+            "default": []
+          },
+          "credentials": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageCredential"
+            },
+            "type": "array",
+            "title": "Credentials",
+            "default": []
+          },
+          "recent_seeded_run_count": {
+            "type": "integer",
+            "title": "Recent Seeded Run Count",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "BrowserProfileUsage"
+      },
+      "BrowserProfileUsageCredential": {
+        "properties": {
+          "credential_id": {
+            "type": "string",
+            "title": "Credential Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential_id",
+          "name"
+        ],
+        "title": "BrowserProfileUsageCredential"
+      },
+      "BrowserProfileUsageWorkflow": {
+        "properties": {
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "via": {
+            "type": "string",
+            "title": "Via"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_permanent_id",
+          "title",
+          "via"
+        ],
+        "title": "BrowserProfileUsageWorkflow"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -11071,6 +11388,31 @@
             ],
             "title": "Selection Strategy"
           },
+          "fallback_credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Credential Ids"
+          },
+          "fallback_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Trigger"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -11156,6 +11498,31 @@
               }
             ],
             "title": "Selection Strategy"
+          },
+          "fallback_credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Credential Ids"
+          },
+          "fallback_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Trigger"
           }
         },
         "type": "object",
@@ -13030,6 +13397,222 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "azure_storage_account_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Name"
+          },
+          "azure_storage_account_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Key"
+          },
+          "azure_blob_container_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language control over which downloaded files are uploaded; empty means upload all."
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
+            "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -13269,6 +13852,10 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "download_target": {
+            "$ref": "#/components/schemas/FileDownloadTarget",
+            "default": "website"
           }
         },
         "type": "object",
@@ -13328,6 +13915,224 @@
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
+            "default": false
+          },
+          "download_target": {
+            "$ref": "#/components/schemas/FileDownloadTarget",
+            "default": "website"
+          },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "azure_storage_account_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Name"
+          },
+          "azure_storage_account_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Key"
+          },
+          "azure_blob_container_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
             "default": false
           },
           "navigation_goal": {
@@ -13454,6 +14259,17 @@
           "navigation_goal"
         ],
         "title": "FileDownloadBlockYAML"
+      },
+      "FileDownloadTarget": {
+        "type": "string",
+        "enum": [
+          "website",
+          "s3",
+          "azure",
+          "google_drive",
+          "sftp"
+        ],
+        "title": "FileDownloadTarget"
       },
       "FileEncoding": {
         "type": "string",
@@ -13865,10 +14681,6 @@
             "title": "Next Loop On Failure",
             "default": false
           },
-          "storage_type": {
-            "$ref": "#/components/schemas/FileStorageType",
-            "default": "s3"
-          },
           "s3_bucket": {
             "anyOf": [
               {
@@ -14084,6 +14896,10 @@
             "title": "Continue On Empty",
             "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
             "default": false
+          },
+          "storage_type": {
+            "$ref": "#/components/schemas/FileStorageType",
+            "default": "s3"
           }
         },
         "type": "object",
@@ -17258,6 +18074,11 @@
             "title": "Complete Verification",
             "default": true
           },
+          "include_action_history_in_verification": {
+            "type": "boolean",
+            "title": "Include Action History In Verification",
+            "default": false
+          },
           "skip_saved_profile": {
             "type": "boolean",
             "title": "Skip Saved Profile",
@@ -19655,6 +20476,40 @@
         ],
         "title": "RunTagHistoryResponse"
       },
+      "RunTagSuggestionsResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keys",
+            "description": "Distinct grouped tag keys seen on runs."
+          },
+          "values_by_key": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Values By Key",
+            "description": "Values seen for each grouped key."
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Labels",
+            "description": "Distinct standalone (keyless) labels seen on runs."
+          }
+        },
+        "type": "object",
+        "title": "RunTagSuggestionsResponse",
+        "description": "Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs\never set on a run for the org, sourced from the event log rather than the\ntag-key/tag-value registry so reserved ``skyvern.*`` system keys (never\nregistered) reach the pickers too."
+      },
       "RunTagsBatchRequest": {
         "properties": {
           "workflow_run_ids": {
@@ -21252,6 +22107,39 @@
         "title": "TagValue",
         "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
       },
+      "TagValueCreate": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key",
+            "description": "Tag key (group) for the new label."
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) to register under the key."
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color",
+            "description": "Palette color name for the label; a random palette color when omitted."
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "TagValueCreate",
+        "description": "Body for ``POST /v1/tag-values``: register a grouped label before any\nworkflow uses it. The label shows a zero workflow count until applied."
+      },
       "TagValueDelete": {
         "properties": {
           "value": {
@@ -22665,6 +23553,7 @@
               "created",
               "queued",
               "running",
+              "paused",
               "timed_out",
               "failed",
               "terminated",
@@ -26982,6 +27871,28 @@
             ],
             "title": "Failure Category"
           },
+          "retried_from_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retried From Workflow Run Id"
+          },
+          "fallback_attempt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Attempt"
+          },
           "parent_workflow_run_id": {
             "anyOf": [
               {
@@ -28208,6 +29119,7 @@
               "created",
               "queued",
               "running",
+              "paused",
               "timed_out",
               "failed",
               "terminated",
