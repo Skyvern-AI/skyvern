@@ -3,7 +3,7 @@ import type {
   WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
 import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
-import { BlockThoughtList } from "./shared";
+import { BlockDetailFailure, BlockThoughtList } from "./shared";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -13,12 +13,14 @@ type Props = {
 };
 
 function BlockDetailTask({
+  block,
   activeItem,
   thoughts = [],
   onThoughtSelect,
 }: Props) {
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
+      <BlockDetailFailure block={block} />
       <BlockThoughtList
         thoughts={thoughts}
         activeItem={activeItem}
