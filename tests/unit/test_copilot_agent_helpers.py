@@ -42,7 +42,11 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     plan_persistence,
     reconcile_completion_criteria,
 )
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    gradeable_completion_criteria,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -66,6 +70,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
     ACTUATION_OBLIGATION_STEER_REASON_CODE,
@@ -1181,6 +1186,11 @@ class TestVerifiedGoalSatisfiedStop:
             last_full_workflow_test_ok=True,
             latest_diagnosis_repair_contract=_verified_goal_contract(),
         )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
         hook = CopilotRunHooks(ctx)
         result = json.dumps(
             {
@@ -1214,8 +1224,59 @@ class TestVerifiedGoalSatisfiedStop:
             last_full_workflow_test_ok=True,
             latest_diagnosis_repair_contract=_verified_goal_contract(),
         )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
 
         assert verified_goal_satisfied_context(ctx)
+
+    @pytest.mark.asyncio
+    async def test_block_run_hook_does_not_claim_goal_satisfied_without_evaluated_outcome(self) -> None:
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+        hook = CopilotRunHooks(ctx)
+        result = json.dumps(
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_1",
+                    "blocks": [{"label": "search", "output": {"status": "found"}}],
+                },
+            }
+        )
+
+        assert ctx.completion_verification_result is None
+        assert verified_goal_satisfied_context(ctx) is False
+
+        await hook.on_tool_end(
+            context=MagicMock(),
+            agent=MagicMock(),
+            tool=SimpleNamespace(name="update_and_run_blocks"),
+            result=result,
+        )
+
+        assert ctx.goal_satisfied_tool_name is None
+
+    def test_turn_telemetry_distinguishes_unevaluated_gate_from_repair_inert(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import gate_decision_trace_fields
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+
+        assert ctx.completion_verification_result is None
+        fields = gate_decision_trace_fields(ctx)
+
+        assert fields["gate_built_complete_without_evaluated_outcome"] is True
+        assert fields["gate_built_unverified_repair_inert"] is False
+        assert fields["gate_satisfied"] is False
 
     @pytest.mark.asyncio
     async def test_wrapped_exception_fallback_reaches_goal_satisfied_after_verified_consume(self) -> None:
@@ -6868,6 +6929,74 @@ class TestDeclaredEqualsGradedCompletionCriteria:
         }
         assert not any(verdict.satisfied for verdict in verification.verdicts)
         assert all(verdict.reason_code != "evidence_confirms" for verdict in verification.verdicts)
+
+    @pytest.mark.asyncio
+    async def test_ungradeable_formed_criteria_fall_back_to_authored_output_contract(self) -> None:
+        label = "collect_top_entry"
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=[
+                    CompletionCriterion(
+                        id="c0",
+                        outcome="the top listed entry is returned",
+                        mint_degrade="undecidable_judgment",
+                    )
+                ],
+                classifier_status="success",
+            ),
+            code_artifact_metadata={
+                label: {"claimed_outcomes": [{"goal_value_paths": ["output.top_entry"]}]},
+            },
+            workflow_yaml=(
+                "title: Utility path\n"
+                "workflow_definition:\n"
+                "  blocks:\n"
+                "    - block_type: code\n"
+                f"      label: {label}\n"
+                "      code: |\n"
+                "        return {}\n"
+            ),
+            last_workflow_yaml=None,
+            completion_verification_result=None,
+            copilot_total_timeout_exceeded=False,
+            reached_download_target=None,
+            workflow_verification_evidence=SimpleNamespace(block_verified=[]),
+            verified_prefix_labels=[],
+            verified_block_outputs={},
+            post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
+            completion_criteria_turn_state=None,
+        )
+
+        assert ctx.request_policy.graded_completion_criteria() != []
+        assert gradeable_completion_criteria(ctx.request_policy.graded_completion_criteria()) == []
+
+        criteria = _completion_verification_criteria(ctx)
+        assert [criterion.output_path for criterion in criteria] == ["output.top_entry"]
+
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_completed",
+                    "overall_status": "completed",
+                    "blocks": [
+                        {
+                            "label": label,
+                            "status": "completed",
+                            "extracted_data": {"output": {"top_entry": "First listed entry"}},
+                        }
+                    ],
+                    "executed_block_labels": [label],
+                },
+            },
+            0,
+        )
+
+        assert verification is not None
+        assert verification.status == "evaluated"
+        assert [verdict.output_path for verdict in verification.verdicts] == ["output.top_entry"]
 
     def test_fallback_floor_uses_repair_context_output_contract_paths_when_metadata_missing(self) -> None:
         ctx = SimpleNamespace(
