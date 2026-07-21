@@ -176,8 +176,10 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
             model_options.extend(
                 [
                     "GEMINI_3.1_PRO",
+                    "GEMINI_3.6_FLASH",
                     "GEMINI_3.5_FLASH",
                     "GEMINI_3.0_FLASH",
+                    "GEMINI_3.5_FLASH_LITE",
                     "GEMINI_3.1_FLASH_LITE",
                     "GEMINI_2.5_PRO",
                     "GEMINI_2.5_FLASH",

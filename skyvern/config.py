@@ -796,6 +796,8 @@ class Settings(BaseSettings):
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
             ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
+            ("gemini-3.5-flash-lite", "VERTEX_GEMINI_3.5_FLASH_LITE", "GEMINI_3.5_FLASH_LITE", "Gemini 3.5 Flash Lite"),
+            ("gemini-3.6-flash", "VERTEX_GEMINI_3.6_FLASH", "GEMINI_3.6_FLASH", "Gemini 3.6 Flash"),
         ]
         for model_name, vertex_key, gemini_key, label in gemini_models:
             mapping[model_name] = {
