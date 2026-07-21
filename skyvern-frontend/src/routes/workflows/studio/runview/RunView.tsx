@@ -352,7 +352,7 @@ export function RunView({
           </div>
         ) : null}
 
-        {failed && !failureDismissed ? (
+        {failed && !failureDismissed && view === "timeline" ? (
           <div className="shrink-0 rounded-lg border border-destructive/40 bg-slate-elevation1 p-4">
             <div className="flex items-start gap-2 text-sm font-semibold text-foreground">
               <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />

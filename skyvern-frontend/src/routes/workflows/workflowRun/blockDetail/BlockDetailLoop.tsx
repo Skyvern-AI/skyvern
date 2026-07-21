@@ -1,6 +1,6 @@
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { stringifyTimelineValue } from "./formatValue";
-import { BlockDetailFailure, CodeBlock, Section } from "./shared";
+import { CodeBlock, Section } from "./shared";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -29,7 +29,6 @@ function BlockDetailLoop({ block, iterationIndex = null }: Props) {
 
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
-      <BlockDetailFailure block={block} />
       {showIterationOnly && (
         <Section title={`Iteration ${(highlightIndex ?? 0) + 1} value`}>
           <CodeBlock>{stringifyTimelineValue(highlightedValue)}</CodeBlock>

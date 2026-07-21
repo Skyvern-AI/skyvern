@@ -31,25 +31,38 @@ _entrypoint: str = "unknown"
 _DRIVER_PIPE_CLOSED_ERROR = "Connection closed while reading from the driver"
 _TARGET_CLOSED_ERROR = "Target page, context or browser has been closed"
 _ORPHANED_FUTURE_MESSAGE = "Future exception was never retrieved"
+_ORPHANED_TASK_MESSAGE = "Task exception was never retrieved"
 _TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
+_CHANNEL_COLLECTED_ERROR = "The object has been collected to prevent unbounded heap growth"
 
 
 class _DriverPipeNoiseFilter(logging.Filter):
-    """Drop asyncio's orphaned-future noise from a torn-down Playwright driver/target.
+    """Drop asyncio's orphaned-task/future noise from a torn-down Playwright driver/target.
 
-    Benign teardown race: a fire-and-forget driver op left a future behind, then the
-    target closed before it resolved, so asyncio logs the un-retrieved exception at
-    ERROR. Two variants are suppressed: the driver-pipe close (matched by its
-    distinctive message) and patchright's TargetClosedError. The latter is matched by
-    exception *type*, not text — the same "...has been closed" message can also come
-    from a crashed/killed browser, so a type check keeps real failures visible.
+    All variants are the same benign artifact: a fire-and-forget driver coroutine left a
+    task/future behind, then the target/driver went away before it resolved, so asyncio's
+    __del__ logs the un-retrieved exception at ERROR. Suppressed cases:
+      - driver-pipe close (matched by its distinctive message);
+      - patchright's TargetClosedError, matched by exception *type* not text — the same
+        "...has been closed" message can also come from a crashed/killed browser, so a
+        type check keeps real failures visible (Future variant only, unchanged);
+      - Playwright's "Channel.send: The object has been collected ..." teardown, matched by
+        its distinctive message on either the Task or Future orphaned-artifact variant.
+        This is a recurring, high-volume, pre-existing teardown pattern; it is unrelated to
+        OTEL instrumentation (asyncio's __del__ emits it whether or not AsyncioInstrumentor
+        is loaded — the instrumentor only adds a trace_coroutine frame to the traceback).
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
+        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
+        is_orphaned = _ORPHANED_FUTURE_MESSAGE in message or _ORPHANED_TASK_MESSAGE in message
+        if is_orphaned and (
+            _CHANNEL_COLLECTED_ERROR in message or (exc is not None and _CHANNEL_COLLECTED_ERROR in str(exc))
+        ):
+            return False
         if _ORPHANED_FUTURE_MESSAGE not in message:
             return True
-        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
         if _DRIVER_PIPE_CLOSED_ERROR in message or (exc is not None and _DRIVER_PIPE_CLOSED_ERROR in str(exc)):
             return False
         if exc is not None:
