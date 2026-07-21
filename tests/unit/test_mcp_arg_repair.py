@@ -299,7 +299,7 @@ async def test_block_validate_block_alias_validates_at_boundary() -> None:
 
 @pytest.mark.asyncio
 async def test_parameter_keys_string_lints_at_boundary() -> None:
-    res = await _call("skyvern_code_block_lint", {"code": "value = 1\n", "parameter_keys": '["value"]'})
+    res = await _call("skyvern_code_block_lint", {"code": "value = 1\n", "parameter_keys": "['value']"})
     assert res.is_error is False
 
 
