@@ -45,11 +45,7 @@ def _make_workflow(
     )
 
 
-def _make_run(
-    run_with: str | None = "agent",
-    workflow_run_id: str = "wr_test",
-    retried_from_workflow_run_id: str | None = None,
-) -> WorkflowRun:
+def _make_run(run_with: str | None = "agent", workflow_run_id: str = "wr_test") -> WorkflowRun:
     return WorkflowRun(
         workflow_run_id=workflow_run_id,
         workflow_id="wf_test",
@@ -57,7 +53,6 @@ def _make_run(
         organization_id="org_test",
         status=WorkflowRunStatus.running,
         run_with=run_with,
-        retried_from_workflow_run_id=retried_from_workflow_run_id,
         created_at=datetime.now(timezone.utc),
         modified_at=datetime.now(timezone.utc),
     )
@@ -233,83 +228,6 @@ class TestCodeModeGate:
         wr = _make_run(run_with=None)
         assert await service.should_run_script(wf, wr) is False
         assert len(agent_function.calls) == 1
-
-
-class _UpgradingAgentFunction(AgentFunction):
-    def __init__(self, upgrade: bool, keep_code: bool = True) -> None:
-        self.upgrade = upgrade
-        self.keep_code = keep_code
-        self.upgrade_calls: list[tuple[str, str, str]] = []
-
-    async def should_upgrade_to_code_mode(self, *, workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-        self.upgrade_calls.append(
-            (workflow_run.workflow_run_id, workflow_run.organization_id, workflow.workflow_permanent_id)
-        )
-        return self.upgrade
-
-    async def should_keep_code_mode_for_workflow_run(self, *, workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-        return self.keep_code
-
-
-class TestCodeModeUpgrade:
-    """A flag-gated rollout can upgrade an agent-intended run to code."""
-
-    @pytest.mark.asyncio
-    async def test_upgrade_flips_agent_to_code(self, monkeypatch):
-        agent_function = _UpgradingAgentFunction(upgrade=True, keep_code=True)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        wf = _make_workflow(run_with="agent")
-        wr = _make_run(run_with="agent")
-        assert await WorkflowService().should_run_script(wf, wr) is True
-        assert agent_function.upgrade_calls == [("wr_test", "org_test", "wpid_test")]
-
-    @pytest.mark.asyncio
-    async def test_upgrade_disabled_stays_agent(self, monkeypatch):
-        agent_function = _UpgradingAgentFunction(upgrade=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        wf = _make_workflow(run_with="agent")
-        wr = _make_run(run_with="agent")
-        assert await WorkflowService().should_run_script(wf, wr) is False
-
-    @pytest.mark.asyncio
-    async def test_upgraded_run_still_passes_keep_code_gate(self, monkeypatch):
-        """Upgrade True but keep-code gate False → still agent (gate can veto)."""
-        agent_function = _UpgradingAgentFunction(upgrade=True, keep_code=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        wf = _make_workflow(run_with="agent")
-        wr = _make_run(run_with="agent")
-        assert await WorkflowService().should_run_script(wf, wr) is False
-
-    @pytest.mark.asyncio
-    async def test_upgrade_not_consulted_when_already_code(self, monkeypatch):
-        agent_function = _UpgradingAgentFunction(upgrade=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        wf = _make_workflow(run_with="code")
-        wr = _make_run(run_with="code")
-        assert await WorkflowService().should_run_script(wf, wr) is True
-        assert agent_function.upgrade_calls == []
-
-    @pytest.mark.asyncio
-    async def test_fallback_retry_never_re_upgraded(self, monkeypatch):
-        # A code->agent fallback retry (run_with=agent, retried_from set) must never be re-upgraded
-        # to code, or the rollout would re-run the very script that just failed and the fallback
-        # would be a no-op for exactly the rollout population.
-        agent_function = _UpgradingAgentFunction(upgrade=True, keep_code=True)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        wf = _make_workflow(run_with="agent")
-        wr = _make_run(run_with="agent", retried_from_workflow_run_id="wr_orig")
-        assert await WorkflowService().should_run_script(wf, wr) is False
-        assert agent_function.upgrade_calls == []
 
 
 class TestScriptReviewerGate:
