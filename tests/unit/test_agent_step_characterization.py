@@ -9,14 +9,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.exceptions import NoTOTPVerificationCodeFound, RepeatedActionFailure
-from skyvern.forge.agent import ForgeAgent, StepPromptResult, _get_repeated_action_failure
+from skyvern.exceptions import NoTOTPVerificationCodeFound
+from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -24,7 +23,6 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     ExtractAction,
-    InputTextAction,
     WaitAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -79,7 +77,6 @@ def make_agent_step_rig(
     injected_actions: list[Action] | None = None,
     task_overrides: dict[str, Any] | None = None,
     disable_user_goal_check: bool = True,
-    repeated_action_breaker: bool = False,
 ) -> AgentStepRig:
     agent = ForgeAgent()
     now = datetime.now(UTC)
@@ -151,8 +148,6 @@ def make_agent_step_rig(
     async def _flag(flag_name: str, *_args, **_kwargs) -> bool:
         if flag_name == "DISABLE_USER_GOAL_CHECK":
             return disable_user_goal_check
-        if flag_name == "REPEATED_ACTION_CIRCUIT_BREAKER":
-            return repeated_action_breaker
         return False
 
     monkeypatch.setattr(
@@ -287,137 +282,6 @@ async def test_failed_action_marks_step_failed_and_skips_remaining(monkeypatch: 
     assert len(output.actions_and_results) == 1
     assert output.actions_and_results[0][0] is first
     assert output.actions_and_results[0][1][0].success is False
-
-
-@pytest.mark.asyncio
-async def test_third_identical_failed_persisted_input_surfaces_repeated_action_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    action = InputTextAction(element_id="framework-managed-input", text="private payload")
-    handler = AsyncMock(
-        return_value=[ActionFailure(Exception("value did not commit"), stop_execution_on_failure=False)]
-    )
-    rig = make_agent_step_rig(
-        monkeypatch, parsed_actions=[action], action_handler=handler, repeated_action_breaker=True
-    )
-    previous_steps = []
-    for order in range(2):
-        previous_action = action.model_copy(update={"step_id": f"step-{order}", "step_order": order})
-        persisted_output = AgentStepOutput.model_validate(
-            AgentStepOutput(
-                action_results=[ActionFailure(Exception("value did not commit"), stop_execution_on_failure=False)],
-                actions_and_results=[
-                    (
-                        previous_action,
-                        [ActionFailure(Exception("value did not commit"), stop_execution_on_failure=False)],
-                    ),
-                ],
-                errors=[],
-            ).model_dump(mode="json")
-        )
-        assert persisted_output.actions_and_results is not None
-        persisted_action = persisted_output.actions_and_results[0][0]
-        assert type(persisted_action) is Action
-        assert persisted_action.action_type == ActionType.INPUT_TEXT
-        assert persisted_action.element_id == "framework-managed-input"
-        assert persisted_action.text == "private payload"
-        previous_step = make_step(
-            datetime.now(UTC),
-            rig.task,
-            step_id=f"step-{order}",
-            status=StepStatus.failed,
-            order=order,
-            output=persisted_output,
-        )
-        previous_steps.append(previous_step)
-    monkeypatch.setattr(
-        "skyvern.forge.agent.app.DATABASE.tasks.get_task_steps",
-        AsyncMock(return_value=previous_steps),
-    )
-
-    step, output = await rig.run()
-
-    assert step.status == StepStatus.completed
-    assert handler.await_count == 1
-    assert output.actions_and_results is not None
-    repeated_result = output.actions_and_results[-1][1][-1]
-    assert repeated_result.exception_type == RepeatedActionFailure.__name__
-    assert "framework-managed-input" in (repeated_result.exception_message or "")
-    assert "3" in (repeated_result.exception_message or "")
-    assert "Exception" in (repeated_result.exception_message or "")
-    assert "private payload" not in (repeated_result.exception_message or "")
-    assert repeated_result.stop_execution_on_failure is False
-
-
-@pytest.mark.asyncio
-async def test_repeat_ineligible_failure_does_not_load_task_history(monkeypatch: pytest.MonkeyPatch) -> None:
-    action = WaitAction(seconds=1)
-    history = AsyncMock()
-    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task_steps", history)
-    rig = make_agent_step_rig(
-        monkeypatch,
-        parsed_actions=[action],
-        action_handler=AsyncMock(return_value=[ActionFailure(Exception("failed"))]),
-    )
-
-    await rig.run()
-
-    history.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_repeated_action_breaker_disabled_adds_no_db_read_and_no_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Flag off is today's behavior: the failure surfaces as itself and the task-steps history is never
-    loaded, so a flag-off org pays nothing for the detector on the failing-action hot path."""
-    action = InputTextAction(element_id="framework-managed-input", text="private payload")
-    history = AsyncMock(return_value=[])
-    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task_steps", history)
-    rig = make_agent_step_rig(
-        monkeypatch,
-        parsed_actions=[action, action.model_copy(), action.model_copy()],
-        action_handler=AsyncMock(
-            return_value=[ActionFailure(Exception("value did not commit"), stop_execution_on_failure=False)]
-        ),
-        repeated_action_breaker=False,
-    )
-
-    _, output = await rig.run()
-
-    history.assert_not_awaited()
-    for _action, results in output.actions_and_results:
-        assert results[-1].exception_type == "Exception"
-        assert results[-1].exception_type != RepeatedActionFailure.__name__
-
-
-@pytest.mark.asyncio
-async def test_repeated_action_history_loaded_at_most_once_per_step(monkeypatch: pytest.MonkeyPatch) -> None:
-    action = InputTextAction(element_id="framework-managed-input", text="private payload")
-    history = AsyncMock(return_value=[])
-    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task_steps", history)
-    rig = make_agent_step_rig(
-        monkeypatch,
-        parsed_actions=[action, action.model_copy()],
-        action_handler=AsyncMock(
-            return_value=[ActionFailure(Exception("value did not commit"), stop_execution_on_failure=False)]
-        ),
-        repeated_action_breaker=True,
-    )
-
-    await rig.run()
-
-    assert rig.action_handler.await_count == 2
-    assert history.await_count == 1
-
-
-def test_repeated_action_failure_requires_matching_unsuccessful_attempts() -> None:
-    first = InputTextAction(element_id="field", text="first")
-    second = InputTextAction(element_id="field", text="second")
-    failure = [ActionFailure(Exception("failed"))]
-
-    assert _get_repeated_action_failure([(first, failure), (first, [ActionSuccess()]), (first, failure)]) is None
-    assert _get_repeated_action_failure([(first, failure), (second, failure), (first, failure)]) is None
 
 
 @pytest.mark.asyncio
