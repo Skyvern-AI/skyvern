@@ -225,7 +225,7 @@ export function RunOutputsSection({
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-muted-foreground">
-              Agent run outputs
+              Run outputs
             </span>
             <SummarizeOutput
               key={`run:${workflowRunId}`}

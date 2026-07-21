@@ -147,7 +147,7 @@ export function RunInputsSection({
       {parameters.length > 0 ? (
         <div className="flex flex-col gap-2">
           <span className="text-xs font-medium text-muted-foreground">
-            Agent inputs
+            Run inputs
           </span>
           <OverviewCodeBlock
             value={JSON.stringify(agentInputs, null, 2)}

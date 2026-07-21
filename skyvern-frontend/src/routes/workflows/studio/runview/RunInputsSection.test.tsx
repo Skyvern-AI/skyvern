@@ -47,7 +47,7 @@ describe("RunInputsSection", () => {
         parameters={[["synthetic_key", "synthetic value"]]}
       />,
     );
-    expect(screen.queryByText("Agent inputs")).not.toBeNull();
+    expect(screen.queryByText("Run inputs")).not.toBeNull();
     expect(screen.queryByText(/synthetic_key/)).not.toBeNull();
     parametersOnly.unmount();
 
@@ -64,7 +64,7 @@ describe("RunInputsSection", () => {
       />,
     );
     expect(screen.queryByText("Block prompts")).not.toBeNull();
-    expect(screen.queryByText("Agent inputs")).toBeNull();
+    expect(screen.queryByText("Run inputs")).toBeNull();
     expect(screen.queryByText("Prompt-only value")).not.toBeNull();
     promptsOnly.unmount();
 
@@ -87,8 +87,8 @@ describe("RunInputsSection", () => {
       parameterJson.compareDocumentPosition(combinedPrompt) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
-    // Agent inputs and Block prompts are distinct sibling sections.
-    expect(screen.queryByText("Agent inputs")).not.toBeNull();
+    // Run inputs and Block prompts are distinct sibling sections.
+    expect(screen.queryByText("Run inputs")).not.toBeNull();
     expect(screen.queryByText("Block prompts")).not.toBeNull();
     combined.unmount();
 

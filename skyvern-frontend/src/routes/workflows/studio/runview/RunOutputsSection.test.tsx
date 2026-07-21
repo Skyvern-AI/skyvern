@@ -36,13 +36,13 @@ const baseProps = {
 
 afterEach(cleanup);
 
-describe("RunOutputsSection agent run outputs", () => {
+describe("RunOutputsSection run outputs", () => {
   const outputs = {
     extracted_information: { answer: 42 },
     additional_output: "full-run-only",
   };
 
-  test("renders extracted information, then agent run outputs, then files", () => {
+  test("renders extracted information, then run outputs, then files", () => {
     render(
       <RunOutputsSection
         {...baseProps}
@@ -52,13 +52,11 @@ describe("RunOutputsSection agent run outputs", () => {
       />,
     );
     const labels = screen
-      .getAllByText(
-        /^(Extracted information|Agent run outputs|Downloaded files)$/,
-      )
+      .getAllByText(/^(Extracted information|Run outputs|Downloaded files)$/)
       .map((el) => el.textContent);
     expect(labels).toEqual([
       "Extracted information",
-      "Agent run outputs",
+      "Run outputs",
       "Downloaded files",
     ]);
     // The full outputs object carries a field that is absent from extracted info.
@@ -81,7 +79,7 @@ describe("RunOutputsSection agent run outputs", () => {
     );
   });
 
-  test("shows the generated summary under agent run outputs", () => {
+  test("shows the generated summary under run outputs", () => {
     render(
       <RunOutputsSection
         {...baseProps}
@@ -93,14 +91,14 @@ describe("RunOutputsSection agent run outputs", () => {
     expect(screen.getByText("A short summary.")).not.toBeNull();
   });
 
-  test("renders no agent run outputs section when outputs is null", () => {
+  test("renders no run outputs section when outputs is null", () => {
     render(
       <RunOutputsSection
         {...baseProps}
         files={[{ url: "https://x.test/y.pdf", filename: "y.pdf" }]}
       />,
     );
-    expect(screen.queryByText("Agent run outputs")).toBeNull();
+    expect(screen.queryByText("Run outputs")).toBeNull();
     expect(screen.queryByTestId("summarize")).toBeNull();
   });
 });
