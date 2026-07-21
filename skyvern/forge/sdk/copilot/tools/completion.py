@@ -254,9 +254,9 @@ def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriter
     formed_criteria = policy.graded_completion_criteria() if policy is not None else []
     criteria = gradeable_completion_criteria(formed_criteria)
     authored_output_criteria = _authored_output_contract_criteria(copilot_ctx)
-    if authored_output_criteria and (
-        not formed_criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)
-    ):
+    # With nothing gradeable left (no criteria formed, or every formed criterion degraded
+    # out), the authored output contract is the only remaining evidence surface.
+    if authored_output_criteria and (not criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)):
         return authored_output_criteria
     if _accepted_staged_output_contract_missing(copilot_ctx) and (
         not formed_criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)
