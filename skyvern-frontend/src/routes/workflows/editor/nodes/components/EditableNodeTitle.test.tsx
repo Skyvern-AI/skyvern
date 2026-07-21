@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { EditableNodeTitle } from "./EditableNodeTitle";
 
@@ -56,5 +56,38 @@ describe("EditableNodeTitle edit-mode input sizing", () => {
     expect(input.className).toContain("relative");
     expect(input.className).toContain("-left-1");
     expect(input.className).toContain("px-1");
+  });
+});
+
+describe("EditableNodeTitle renderIdle seam", () => {
+  test("without renderIdle, idle still renders the default click-to-edit heading (other consumers unchanged)", () => {
+    render(<EditableNodeTitle value="Foo" editable onChange={() => {}} />);
+
+    expect(screen.getByRole("heading", { name: "Foo" })).toBeTruthy();
+  });
+
+  test("with renderIdle, the custom idle replaces the heading and startEditing enters the shared input and commits", () => {
+    const onChange = vi.fn();
+    render(
+      <EditableNodeTitle
+        value="Foo"
+        editable
+        onChange={onChange}
+        renderIdle={({ startEditing }) => (
+          <button onClick={startEditing}>go-edit</button>
+        )}
+      />,
+    );
+
+    // default heading is suppressed for renderIdle callers
+    expect(screen.queryByRole("heading")).toBeNull();
+
+    fireEvent.click(screen.getByText("go-edit"));
+
+    const input = screen.getByDisplayValue("Foo");
+    fireEvent.change(input, { target: { value: "Bar" } });
+    fireEvent.blur(input);
+
+    expect(onChange).toHaveBeenCalledWith("Bar");
   });
 });
