@@ -846,7 +846,7 @@ async def test_mark_workflow_run_as_failed_does_not_schedule_before_cleanup() ->
     service = WorkflowService()
     workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
     service._update_workflow_run_status = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
-    service._schedule_run_fallback_retries = MagicMock()  # type: ignore[method-assign]
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
 
     result = await service.mark_workflow_run_as_failed(
         workflow_run_id="wr_failed",
@@ -855,7 +855,7 @@ async def test_mark_workflow_run_as_failed_does_not_schedule_before_cleanup() ->
     )
 
     assert result == workflow_run
-    service._schedule_run_fallback_retries.assert_not_called()
+    service._schedule_credential_fallback_retry.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -866,7 +866,7 @@ async def test_mark_workflow_run_as_terminated_does_not_schedule_before_cleanup(
         failure_category=[{"category": "AUTH_FAILURE"}],
     )
     service._update_workflow_run_status = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
-    service._schedule_run_fallback_retries = MagicMock()  # type: ignore[method-assign]
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
 
     result = await service.mark_workflow_run_as_terminated(
         workflow_run_id="wr_failed",
@@ -875,7 +875,7 @@ async def test_mark_workflow_run_as_terminated_does_not_schedule_before_cleanup(
     )
 
     assert result == workflow_run
-    service._schedule_run_fallback_retries.assert_not_called()
+    service._schedule_credential_fallback_retry.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -883,7 +883,7 @@ async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
     service = WorkflowService()
     workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
     workflow = _workflow([])
-    service._schedule_run_fallback_retries = MagicMock()  # type: ignore[method-assign]
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
     browser_cleanup_result = SimpleNamespace(
         browser_state=None,
         tasks=[],
@@ -909,7 +909,7 @@ async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
             browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
         )
 
-    service._schedule_run_fallback_retries.assert_called_once_with(workflow_run)
+    service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
 
 
 @pytest.mark.asyncio
@@ -919,7 +919,7 @@ async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> N
     service = WorkflowService()
     workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
     workflow = _workflow([])
-    service._schedule_run_fallback_retries = MagicMock()  # type: ignore[method-assign]
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
     service.execute_workflow_webhook = AsyncMock(side_effect=RuntimeError("webhook prep failed"))  # type: ignore[method-assign]
     browser_cleanup_result = SimpleNamespace(
         browser_state=None,
@@ -947,7 +947,7 @@ async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> N
                 browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
             )
 
-    service._schedule_run_fallback_retries.assert_called_once_with(workflow_run)
+    service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
 
 
 @pytest.mark.asyncio
@@ -957,7 +957,7 @@ async def test_clean_up_workflow_schedules_retry_when_earlier_cleanup_step_raise
     service = WorkflowService()
     workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
     workflow = _workflow([])
-    service._schedule_run_fallback_retries = MagicMock()  # type: ignore[method-assign]
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
     browser_cleanup_result = SimpleNamespace(
         browser_state=None,
         tasks=[],
@@ -984,7 +984,7 @@ async def test_clean_up_workflow_schedules_retry_when_earlier_cleanup_step_raise
                 browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
             )
 
-    service._schedule_run_fallback_retries.assert_called_once_with(workflow_run)
+    service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
 
 
 @pytest.mark.asyncio
@@ -995,4 +995,4 @@ async def test_fallback_hook_exception_does_not_raise() -> None:
         "skyvern.forge.sdk.workflow.service.maybe_start_credential_fallback_retry",
         AsyncMock(side_effect=RuntimeError("boom")),
     ):
-        await WorkflowService._start_run_fallback_retries_best_effort(workflow_run)
+        await WorkflowService._start_credential_fallback_retry_best_effort(workflow_run)
