@@ -1,10 +1,5 @@
-import {
-  CheckCircledIcon,
-  CrossCircledIcon,
-  ReloadIcon,
-} from "@radix-ui/react-icons";
-import { Status } from "@/api/types";
 import { CopyButton } from "@/components/CopyButton";
+import { StatusBadge } from "@/components/StatusBadge";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Tooltip,
@@ -47,47 +42,6 @@ function TruncatedWithTooltip({
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
-  );
-}
-
-function StatusPill({ status }: { status: Status | null }) {
-  if (status === null) return null;
-  const isSuccess = status === Status.Completed;
-  const isFailure =
-    status === Status.Failed ||
-    status === Status.Terminated ||
-    status === Status.TimedOut ||
-    status === Status.Canceled;
-  const isRunning = status === Status.Running;
-
-  if (isSuccess) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded bg-success/15 px-2 py-0.5 text-xs text-success">
-        <CheckCircledIcon className="size-3.5" />
-        <span>Completed</span>
-      </span>
-    );
-  }
-  if (isFailure) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded bg-destructive/15 px-2 py-0.5 text-xs text-destructive">
-        <CrossCircledIcon className="size-3.5" />
-        <span className="capitalize">{status}</span>
-      </span>
-    );
-  }
-  if (isRunning) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-2 py-0.5 text-xs text-sky-700 dark:text-sky-300">
-        <ReloadIcon className="size-3.5 animate-spin" />
-        <span>Running</span>
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5 text-xs capitalize text-tertiary-foreground dark:bg-slate-700">
-      {status}
-    </span>
   );
 }
 
@@ -155,7 +109,9 @@ function BlockDetailHeader({
               {duration}
             </span>
           )}
-          <StatusPill status={block.status} />
+          {block.status && (
+            <StatusBadge status={block.status} alwaysShowLabel />
+          )}
         </span>
       </div>
       <div
@@ -364,5 +320,4 @@ export {
   GoalText,
   JsonView,
   Section,
-  StatusPill,
 };

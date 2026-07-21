@@ -536,7 +536,8 @@ describe("WorkflowRunBlockDetail router", () => {
     // Should render the running extraction's detail header
     expect(screen.getByText("Extraction")).toBeDefined();
     expect(screen.getByText("extract_posts")).toBeDefined();
-    expect(screen.getByText("Running")).toBeDefined();
+    // StatusBadge renders the raw status token ("running"), capitalized via CSS.
+    expect(screen.getByText("running")).toBeDefined();
   });
 
   it("does not show a redundant Selected action section when a child action is selected", () => {
