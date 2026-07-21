@@ -1,3 +1,4 @@
+import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
 import { CopyButton } from "@/components/CopyButton";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -220,8 +221,11 @@ function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
       <div className="text-[11px] font-medium uppercase tracking-wide text-destructive">
         Failure
       </div>
-      <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs leading-relaxed text-destructive">
-        {block.failure_reason}
+      <div className="flex items-start gap-1.5 rounded border border-destructive/40 bg-slate-elevation1 px-2.5 py-2 text-xs leading-relaxed text-foreground">
+        <ExclamationTriangleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+        <span className="min-w-0 flex-1 break-words">
+          {block.failure_reason}
+        </span>
       </div>
     </div>
   );
