@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+from dataclasses import replace
 
 import structlog
 
@@ -255,6 +256,11 @@ class RealBrowserManager(BrowserManager):
         re-resolves cleanly — no orphan owner accumulates on failed run keys."""
         if run_key is None:
             return await resolve_browser_engine(context)
+        # Resolve the flag under the SAME key the owner is pinned by, so a run selects one engine no
+        # matter which resource creates the browser first — a caller may pin under workflow_run_id while
+        # deliberately leaving it out of the context (task-first creation keeps its download-dir scoping).
+        if context.run_key != run_key:
+            context = replace(context, run_key=run_key)
         while True:
             owner = self._engine_owners.get(run_key)
             if owner is None:
@@ -337,13 +343,18 @@ class RealBrowserManager(BrowserManager):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         engine_run_key: str | None = None,
+        engine_workflow_run_id: str | None = None,
     ) -> BrowserState:
         engine_selection = await self.get_or_resolve_engine_selection(
             run_key=engine_run_key
             or canonical_run_key(workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id),
             context=BrowserEngineContext(
                 organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
+                # Engine-flag identity only: a caller that pins under workflow_run_id while keeping it out
+                # of browser-context creation (task-first, for download-dir scoping) passes it via
+                # engine_workflow_run_id, so the flag's distinct_id AND its workflow_run_id property both
+                # match the pinned run. The browser context below still uses the raw workflow_run_id.
+                workflow_run_id=engine_workflow_run_id or workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
                 task_id=task_id,
                 script_id=script_id,
@@ -471,10 +482,11 @@ class RealBrowserManager(BrowserManager):
                 url=task.url,
                 task_id=task.task_id,
                 # Pin the engine under the workflow_run_id for a workflow-owned task so it shares one
-                # selection owner with the workflow path (not a second task_id owner). Passed only as
-                # the engine key — workflow_run_id is deliberately kept out of browser-context creation
-                # here to preserve the task path's existing download-dir / artifact behavior.
+                # selection owner (and one flag distinct_id/property) with the workflow path. Both go to
+                # engine-flag resolution only — workflow_run_id is still kept out of browser-context
+                # creation here to preserve the task path's existing download-dir / artifact behavior.
                 engine_run_key=canonical_run_key(workflow_run_id=task.workflow_run_id, task_id=task.task_id),
+                engine_workflow_run_id=task.workflow_run_id,
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
                 extra_http_headers=extra_http_headers,

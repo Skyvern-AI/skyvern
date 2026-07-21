@@ -255,6 +255,10 @@ class BrowserEngineContext:
     workflow_permanent_id: str | None = None
     task_id: str | None = None
     script_id: str | None = None
+    # The canonical key this run's selection is pinned/owned under (set by get_or_resolve_engine_selection).
+    # A resolver keys the flag on this so every resource in one run resolves identically even when a caller
+    # deliberately leaves workflow_run_id unset here (task-first creation keeps its download-dir scoping).
+    run_key: str | None = None
     browser_source: str | None = None
 
 
