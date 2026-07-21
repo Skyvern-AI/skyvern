@@ -8,7 +8,6 @@ import pytest
 
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.handler import (
-    _is_org_flag_enabled,
     _is_tel_digit_fix_enabled,
     _nanp_e164_fallback,
     _nanp_national_digits,
@@ -187,29 +186,3 @@ async def test_is_tel_digit_fix_enabled_uses_org_keyed_rollout(monkeypatch: pyte
         organization.organization_id,
         properties={"organization_id": organization.organization_id},
     )
-
-
-@pytest.mark.asyncio
-async def test_is_org_flag_enabled_buckets_any_flag_by_org(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task = make_task(now, organization)
-    provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True))
-    monkeypatch.setattr("skyvern.webeye.actions.handler.app.EXPERIMENTATION_PROVIDER", provider)
-
-    assert await _is_org_flag_enabled(task, "SOME_OTHER_FLAG", "some-other") is True
-    provider.is_feature_enabled_cached.assert_awaited_once_with(
-        "SOME_OTHER_FLAG",
-        organization.organization_id,
-        properties={"organization_id": organization.organization_id},
-    )
-
-
-@pytest.mark.asyncio
-async def test_is_org_flag_enabled_fails_closed_when_provider_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now))
-    provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(side_effect=RuntimeError("posthog down")))
-    monkeypatch.setattr("skyvern.webeye.actions.handler.app.EXPERIMENTATION_PROVIDER", provider)
-
-    assert await _is_org_flag_enabled(task, "SOME_OTHER_FLAG", "some-other") is False

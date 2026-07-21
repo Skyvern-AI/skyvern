@@ -206,10 +206,6 @@ async def _run_combobox_input(
         ),
         patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
         patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
-        patch(
-            "skyvern.webeye.actions.handler._is_input_text_commit_verification_enabled",
-            new=AsyncMock(return_value=False),
-        ),
     ):
         results = await handle_input_text_action(
             action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
