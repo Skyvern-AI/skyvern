@@ -215,7 +215,7 @@ class Settings(BaseSettings):
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
     # coordinate the poller with a /credential-response POST that may land on another worker,
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
-    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = False
+    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
