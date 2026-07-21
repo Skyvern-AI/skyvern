@@ -602,6 +602,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[str] | None = None,
         search_key: str | None = None,
         run_type: list[str] | None = None,
+        workflow_permanent_ids: list[str] | None = None,
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
@@ -653,6 +654,9 @@ class WorkflowRunsRepository(BaseRepository):
             if run_type:
                 query = query.filter(TaskRunModel.task_run_type.in_(run_type))
 
+            if workflow_permanent_ids:
+                query = query.filter(effective_wpid.in_(workflow_permanent_ids))
+
             for subquery in run_tag_subqueries:
                 query = query.filter(TaskRunModel.run_id.in_(subquery))
 
@@ -673,16 +677,17 @@ class WorkflowRunsRepository(BaseRepository):
                 )
 
             offset = (page - 1) * page_size
-            # Search merges task_runs and fallback workflow_runs before slicing, so each source fetches enough rows.
-            query_limit = min(page * page_size, MAX_SEARCH_FETCH_LIMIT) if search_key else page_size
+            use_fallback_merge = bool(search_key) or bool(workflow_permanent_ids)
+            # Filtered merges slice task_runs and fallback workflow_runs together, so each source fetches enough rows.
+            query_limit = min(page * page_size, MAX_SEARCH_FETCH_LIMIT) if use_fallback_merge else page_size
             query = query.order_by(TaskRunModel.created_at.desc()).limit(query_limit)
-            if not search_key:
+            if not use_fallback_merge:
                 query = query.offset(offset)
 
             result = await session.execute(query)
             rows = [dict(row) for row in result.mappings().all()]
 
-            if search_key:
+            if use_fallback_merge:
                 # The fallback only yields workflow_run rows, so skip it when the run_type filter excludes them.
                 if not run_type or RunType.workflow_run in run_type:
                     task_run_exists = (
@@ -720,9 +725,14 @@ class WorkflowRunsRepository(BaseRepository):
                         .filter(WorkflowRunModel.copilot_session_id.is_(None))
                         .filter(~task_run_exists)
                     )
-                    fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
+                    if search_key:
+                        fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
                         fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                    if workflow_permanent_ids:
+                        fallback_query = fallback_query.filter(
+                            WorkflowRunModel.workflow_permanent_id.in_(workflow_permanent_ids)
+                        )
                     for subquery in run_tag_subqueries:
                         fallback_query = fallback_query.filter(WorkflowRunModel.workflow_run_id.in_(subquery))
                     fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)

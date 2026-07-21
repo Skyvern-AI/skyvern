@@ -92,6 +92,10 @@ vi.mock("@/components/StatusFilterDropdown", () => ({
   StatusFilterDropdown: () => <div data-testid="status-filter" />,
 }));
 
+vi.mock("@/components/AgentFilterDropdown", () => ({
+  AgentFilterDropdown: () => <div data-testid="agent-filter" />,
+}));
+
 vi.mock("@/components/onboarding/OnboardingEmptyState", () => ({
   OnboardingEmptyState: () => <div data-testid="onboarding-empty" />,
 }));

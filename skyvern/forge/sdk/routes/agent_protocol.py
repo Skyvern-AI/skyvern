@@ -4051,6 +4051,13 @@ async def get_runs_v2(
         examples=["login_url", "wr_abc123"],
     ),
     run_type: Annotated[list[RunType] | None, Query()] = None,
+    workflow_permanent_id: Annotated[
+        list[str] | None,
+        Query(
+            max_length=50,
+            description="Filter to runs of these workflows (agents). Repeat the param to include multiple.",
+        ),
+    ] = None,
     tags: Annotated[
         list[str] | None,
         Query(
@@ -4068,7 +4075,7 @@ async def get_runs_v2(
     ] = None,
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
-    if search_key and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
+    if (search_key or workflow_permanent_id) and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=f"Search pagination is limited to the first {MAX_SEARCH_FETCH_LIMIT} matches. Use a narrower search.",
@@ -4083,6 +4090,7 @@ async def get_runs_v2(
         status=[s.value for s in status] if status else None,
         search_key=search_key,
         run_type=[r.value for r in run_type] if run_type else None,
+        workflow_permanent_ids=workflow_permanent_id,
         run_tags=run_tags or None,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
