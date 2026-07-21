@@ -110,6 +110,7 @@ from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -5192,6 +5193,8 @@ async def wrapper({default_args}):
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
                     Action(
+                        # Synthesized outside the recorder, so it needs its own stable id for the upsert path.
+                        action_id=generate_action_id(),
                         action_type=ActionType.NULL_ACTION,
                         status=ActionStatus.failed,
                         action_order=len(recorded),
