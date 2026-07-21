@@ -83,6 +83,29 @@ vi.mock("@/components/StatusFilterDropdown", () => ({
   StatusFilterDropdown: () => <div data-testid="status-filter" />,
 }));
 
+vi.mock("@/components/AgentFilterDropdown", () => ({
+  AgentFilterDropdown: ({
+    values,
+    onChange,
+  }: {
+    values: Array<string>;
+    onChange: (values: Array<string>) => void;
+  }) => (
+    <button
+      data-testid="agent-filter"
+      onClick={() =>
+        onChange(
+          values.includes("wpid_1")
+            ? values.filter((value) => value !== "wpid_1")
+            : [...values, "wpid_1"],
+        )
+      }
+    >
+      toggle-agent-filter
+    </button>
+  ),
+}));
+
 vi.mock("@/components/RunTypeFilterDropdown", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@/components/RunTypeFilterDropdown")>();
@@ -155,13 +178,13 @@ vi.mock("@/api/AxiosClient", () => ({
   })),
 }));
 
-function renderRunHistory() {
+function renderRunHistory(initialEntries = ["/history"]) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={["/history"]}>
+      <MemoryRouter initialEntries={initialEntries}>
         <RunHistory />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -209,6 +232,59 @@ describe("RunHistory search highlighting", () => {
     const calls = useRunsQuerySpy.mock.calls;
     const lastCall = calls[calls.length - 1]?.[0] as { search?: string };
     expect(lastCall.search).toBe("123");
+  });
+});
+
+describe("RunHistory agent filters", () => {
+  it("passes selected agent filters to the runs query", () => {
+    renderRunHistory();
+
+    expect(
+      runsQueryCalls[runsQueryCalls.length - 1]?.workflowPermanentIds,
+    ).toBeUndefined();
+
+    fireEvent.click(screen.getByTestId("agent-filter"));
+    expect(
+      runsQueryCalls[runsQueryCalls.length - 1]?.workflowPermanentIds,
+    ).toEqual(["wpid_1"]);
+
+    fireEvent.click(screen.getByTestId("agent-filter"));
+    expect(
+      runsQueryCalls[runsQueryCalls.length - 1]?.workflowPermanentIds,
+    ).toBeUndefined();
+  });
+
+  it("uses a legacy workflow filter without hijacking or disabling search", () => {
+    renderRunHistory(["/history?workflow_permanent_id=wpid_legacy"]);
+
+    const lastCall = runsQueryCalls[runsQueryCalls.length - 1];
+    expect(lastCall?.workflowPermanentIds).toEqual(["wpid_legacy"]);
+    expect(lastCall?.search).toBe("");
+    expect(
+      (screen.getByLabelText("search-runs") as HTMLInputElement).disabled,
+    ).toBe(false);
+  });
+
+  it("composes text search with a legacy workflow filter", () => {
+    renderRunHistory(["/history?workflow_permanent_id=wpid_legacy"]);
+
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: "city" },
+    });
+
+    const lastCall = runsQueryCalls[runsQueryCalls.length - 1];
+    expect(lastCall?.search).toBe("city");
+    expect(lastCall?.workflowPermanentIds).toEqual(["wpid_legacy"]);
+  });
+
+  it("deduplicates agent and legacy workflow filters", () => {
+    renderRunHistory([
+      "/history?agent=wpid_a,wpid_b&workflow_permanent_id=wpid_a",
+    ]);
+
+    expect(
+      runsQueryCalls[runsQueryCalls.length - 1]?.workflowPermanentIds,
+    ).toEqual(["wpid_a", "wpid_b"]);
   });
 });
 
