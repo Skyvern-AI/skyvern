@@ -150,16 +150,43 @@ describe("WorkflowRunBlockDetail router", () => {
     expect(screen.queryByText("Pull the price from the page")).toBeNull();
   });
 
-  it("renders the failure_reason in the detail body (not the header) when set", () => {
+  it("shows the failure_reason once, scoped to the Summary sub-panel", () => {
     const block = buildBlock({
       block_type: "extraction",
       failure_reason: "Could not locate the price element",
     });
     render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    // A failed block opens on Summary and shows the failure exactly once — no
+    // longer duplicated between the Summary field and a persistent callout.
     expect(screen.getByText("Failure")).toBeDefined();
     expect(
-      screen.getAllByText("Could not locate the price element").length,
-    ).toBeGreaterThanOrEqual(1);
+      screen.getAllByText("Could not locate the price element"),
+    ).toHaveLength(1);
+    // Switching sub-panels no longer repeats the failure.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Inputs" }));
+    expect(screen.queryByText("Could not locate the price element")).toBeNull();
+  });
+
+  it("shows a triggered-workflow failure once, not in a separate body section", () => {
+    // The backend copies the child failure into both block.failure_reason and
+    // block.output.failure_reason, so the Summary callout already covers it.
+    const reason = "Triggered workflow execution failed: boom";
+    const block = buildBlock({
+      block_type: "workflow_trigger",
+      failure_reason: reason,
+      output: {
+        workflow_run_id: "wr_child",
+        status: "failed",
+        failure_reason: reason,
+      },
+    });
+    render(
+      <MemoryRouter>
+        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+      </MemoryRouter>,
+    );
+    expect(screen.getAllByText(reason)).toHaveLength(1);
+    expect(screen.queryByText("Sub-workflow failure")).toBeNull();
   });
 
   it("renders code block extracted information without the raw output wrapper", () => {
