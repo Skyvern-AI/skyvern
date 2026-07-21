@@ -79,19 +79,23 @@ _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "faile
 DEFINITION_CONTRACT_UNSATISFIED_GATE_ID = "definition_contract_unsatisfied"
 RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID = "recorded_outcome_grounding_binder_ceiling"
 SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID = "synthesized_parameter_binding_ambiguous"
-_POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
+OUTPUT_CONTRACT_ACTUATION_GATE_ID = "output_contract_actuation"
+METADATA_RUN_PREFLIGHT_REJECT_GATE_ID = "metadata_run_preflight_reject"
+UNCOVERED_OUTPUT_RESCOUT_STEER_GATE_ID = "uncovered_output_rescout_steer"
+RECORDED_OUTCOME_GROUNDING_GATE_ID = "recorded_outcome_grounding"
+# Every author-time gate that has a suppression seam, and therefore everything the flag
+# payload and the local blanket can disable. Security lanes are absent by construction, not
+# by omission: they never call record_author_time_gate_ablation_event, so no payload reaches
+# them. A gate that gains a seam belongs here, or the flag cannot address it.
+AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
     {
         DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
         RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
         SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
-    }
-)
-_LOCAL_AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
-    {
-        "output_contract_actuation",
-        "metadata_run_preflight_reject",
-        "uncovered_output_rescout_steer",
-        "recorded_outcome_grounding",
+        OUTPUT_CONTRACT_ACTUATION_GATE_ID,
+        METADATA_RUN_PREFLIGHT_REJECT_GATE_ID,
+        UNCOVERED_OUTPUT_RESCOUT_STEER_GATE_ID,
+        RECORDED_OUTCOME_GROUNDING_GATE_ID,
     }
 )
 CodeArtifactMetadataValue: TypeAlias = (
@@ -564,17 +568,17 @@ class AgentContext:
 
 
 def cache_copilot_author_time_gate_log_only_ids(ctx: AgentContext, resolved_ids: frozenset[str]) -> None:
-    ineligible_ids = resolved_ids - _POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    ineligible_ids = resolved_ids - AUTHOR_TIME_GATE_LOG_ONLY_IDS
     for gate_id in sorted(ineligible_ids):
         LOG.info("copilot_gate_log_only_ineligible", gate_id=gate_id)
-    ctx.author_time_gate_log_only_ids = resolved_ids & _POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    ctx.author_time_gate_log_only_ids = resolved_ids & AUTHOR_TIME_GATE_LOG_ONLY_IDS
 
 
 def copilot_author_time_gate_log_only_enabled(ctx: AgentContext, gate_id: str) -> bool:
     local_blanket_enabled = (
         not settings.is_cloud_environment()
         and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
-        and gate_id in _LOCAL_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+        and gate_id in AUTHOR_TIME_GATE_LOG_ONLY_IDS
     )
     return local_blanket_enabled or gate_id in ctx.author_time_gate_log_only_ids
 

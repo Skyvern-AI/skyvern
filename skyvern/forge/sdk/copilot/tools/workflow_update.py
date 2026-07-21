@@ -191,6 +191,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import (
     DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
+    METADATA_RUN_PREFLIGHT_REJECT_GATE_ID,
+    OUTPUT_CONTRACT_ACTUATION_GATE_ID,
     RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
     SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     AgentContext,
@@ -2877,8 +2879,8 @@ _METADATA_FAMILY_REJECT_FAMILIES = frozenset(
     }
 )
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
-_OUTPUT_CONTRACT_ABLATION_GATE_ID = "output_contract_actuation"
-_METADATA_PREFLIGHT_ABLATION_GATE_ID = "metadata_run_preflight_reject"
+_OUTPUT_CONTRACT_ABLATION_GATE_ID = OUTPUT_CONTRACT_ACTUATION_GATE_ID
+_METADATA_PREFLIGHT_ABLATION_GATE_ID = METADATA_RUN_PREFLIGHT_REJECT_GATE_ID
 _VALUE_BEARING_ROOT_GUIDANCE_PATH = "output"
 _VALUE_BEARING_PREARM_FINGERPRINT_PREFIX = "value-bearing:prearm:"
 _VALUE_BEARING_GUIDANCE_FINGERPRINT_PREFIX = "value-bearing:guidance:"
@@ -2939,6 +2941,32 @@ def _record_output_contract_ablation_event(
         reason_code=reason_code,
         fingerprint=fingerprint,
         blocked_tool=blocked_tool,
+        payload=payload,
+    )
+
+
+def _record_output_contract_actuation_ablation_event(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    *,
+    reason_code: str,
+    signature: str,
+    block_labels: Sequence[str],
+    required_paths: Iterable[str],
+) -> bool:
+    if not copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
+        return False
+    payload: AuthorTimeGateAblationPayload = {
+        "block_labels": list(block_labels),
+        "canonical_output_contract_signature": signature,
+        "canonical_required_child_paths": sorted(required_paths),
+    }
+    return record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+        reason_code=reason_code,
+        fingerprint=_output_contract_structural_fingerprint(workflow_yaml, signature),
+        blocked_tool="update_workflow",
         payload=payload,
     )
 
@@ -12817,10 +12845,23 @@ async def _update_workflow(
             params.get("code_artifact_metadata"),
         )
     )
+    missing_labels = (
+        []
+        if missing_metadata_error is None
+        else _missing_code_artifact_metadata_labels(workflow_yaml, ctx, params.get("code_artifact_metadata"))
+    )
+    metadata_reject_ablated = False
+    if missing_metadata_error is not None and _record_output_contract_actuation_ablation_event(
+        ctx,
+        workflow_yaml,
+        reason_code=_MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY,
+        signature=(output_contract_evaluation.canonical_signature if output_contract_evaluation is not None else ""),
+        block_labels=missing_labels,
+        required_paths=required_child_output_paths,
+    ):
+        missing_metadata_error = None
+        metadata_reject_ablated = True
     if missing_metadata_error is not None:
-        missing_labels = _missing_code_artifact_metadata_labels(
-            workflow_yaml, ctx, params.get("code_artifact_metadata")
-        )
         missing_metadata_output_facts = _missing_requested_output_facts(
             required_child_output_paths,
             reason_code=output_path_coverage_reason_code,
@@ -12923,6 +12964,26 @@ async def _update_workflow(
     )
     code_artifact_metadata = normalization.normalized
     code_artifact_metadata_error = normalization.error
+    # A schema incompatibility rejects below regardless, so suppressing here would emit an
+    # ablation event for a save that never lands and overstate what the flag let through.
+    if (
+        code_artifact_metadata_error is not None
+        and not normalization.schema_incompatibilities
+        and (
+            metadata_reject_ablated
+            or _record_output_contract_actuation_ablation_event(
+                ctx,
+                workflow_yaml,
+                reason_code=_METADATA_NORMALIZATION_REJECT_FAMILY,
+                signature=(
+                    output_contract_evaluation.canonical_signature if output_contract_evaluation is not None else ""
+                ),
+                block_labels=normalization.offending_labels,
+                required_paths=required_child_output_paths,
+            )
+        )
+    ):
+        code_artifact_metadata_error = None
     if code_artifact_metadata_error is not None:
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
         normalization_reject_count = _record_output_contract_family_reject(
