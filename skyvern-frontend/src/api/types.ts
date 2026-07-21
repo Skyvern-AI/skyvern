@@ -699,6 +699,7 @@ export interface EvalBrowserSession extends Eval {
   kind: "browser_session";
   session_id: string;
   arm?: string | null;
+  difficulty?: "easy" | "medium" | "hard" | null;
   model?: string | null;
   task_id?: string | null;
   task_title?: string | null;
