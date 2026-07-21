@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import re
 import time
@@ -13,6 +15,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
@@ -22,8 +25,10 @@ from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOA
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotContractV1,
+    RequestSlotDatumTargetV1,
     RequestSlotProducerInputV1,
     produce_request_slots,
+    request_slot_request_digest,
     request_slot_source_text,
     request_slot_sources,
 )
@@ -345,6 +350,90 @@ class TerminalActionReconciliationV1:
     version: Literal["1"]
     criterion_id: str | None
     terminal_action_family: TerminalActionFamily | None
+
+
+@dataclass(frozen=True)
+class RequestSlotFailureSurfaceV1:
+    version: Literal["1"]
+    reason: Literal["request_slot_failure"]
+    failure_kind: Literal["request_slot_failure"]
+    retryable: Literal[False]
+    request_slot_failure_kind: str
+
+
+RequestSlotDatumField = Literal["output_path", "classification_output_key"]
+
+
+@dataclass(frozen=True)
+class RequestSlotDatumBindingV1:
+    version: Literal["1"]
+    criterion_index: int
+    datum_field: RequestSlotDatumField
+    datum_value: str
+    source_id: str
+    source_quote: str
+
+
+@dataclass(frozen=True)
+class RequestSlotDatumBindingTargetV1:
+    criterion_index: int
+    datum_field: RequestSlotDatumField
+    datum_value: str
+    criterion_outcome_sha256: str
+
+
+@dataclass(frozen=True)
+class TrustedRequestSlotDatumBindingV1:
+    version: Literal["1"]
+    criterion_index: int
+    datum_field: RequestSlotDatumField
+    datum_value: str
+    criterion_outcome_sha256: str
+    source_id: str
+    source_quote: str
+    slot_id: str
+
+
+DatumBindingApplicationPredicate = Literal[
+    "accepted",
+    "invalid_criteria_container",
+    "invalid_contract",
+    "anchor_incoherent",
+    "anchor_not_unique",
+]
+
+
+@dataclass(frozen=True)
+class RequestSlotDatumBindingApplicationDecisionV1:
+    version: Literal["1"]
+    predicate: DatumBindingApplicationPredicate
+    criterion_index: int | None = None
+    accepted_payload: dict[str, Any] | None = None
+    trusted_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = ()
+
+
+AnchorCorrectionPredicate = Literal[
+    "accepted",
+    "invalid_criteria_container",
+    "criterion_count_changed",
+    "payload_semantics_changed",
+    "criteria_semantics_changed",
+    "criterion_not_object",
+    "criterion_semantics_changed",
+    "missing_corrected_anchor",
+    "original_quote_not_admissible",
+    "missing_request_slot_fields",
+    "corrected_anchor_not_admissible",
+    "unexpected_anchor_change",
+]
+
+
+@dataclass(frozen=True)
+class RequestSlotAnchorCorrectionDecisionV1:
+    version: Literal["1"]
+    predicate: AnchorCorrectionPredicate
+    criterion_index: int | None = None
+    accepted_payload: dict[str, Any] | None = None
 
 
 @dataclass
@@ -929,6 +1018,108 @@ def _request_slot_anchor_is_valid(
     return start >= 0 and source.text.find(source_quote, start + 1) < 0
 
 
+def _request_slot_datum_binding(
+    item: dict[str, Any],
+    *,
+    criterion_index: int,
+) -> RequestSlotDatumBindingV1 | None:
+    raw = item.get("request_slot_datum_binding")
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "criterion_index",
+        "datum_field",
+        "datum_value",
+        "source_id",
+        "source_quote",
+    }:
+        return None
+    version = raw.get("version")
+    raw_index = raw.get("criterion_index")
+    datum_field = raw.get("datum_field")
+    datum_value = raw.get("datum_value")
+    source_id = raw.get("source_id")
+    source_quote = raw.get("source_quote")
+    if (
+        version != "1"
+        or type(raw_index) is not int
+        or raw_index != criterion_index
+        or datum_field not in {"output_path", "classification_output_key"}
+        or not isinstance(datum_value, str)
+        or not datum_value
+        or not isinstance(source_id, str)
+        or not isinstance(source_quote, str)
+        or not source_quote
+    ):
+        return None
+    return RequestSlotDatumBindingV1(
+        version="1",
+        criterion_index=raw_index,
+        datum_field=cast(RequestSlotDatumField, datum_field),
+        datum_value=datum_value,
+        source_id=source_id,
+        source_quote=source_quote,
+    )
+
+
+def _request_slot_datum_binding_is_valid(
+    item: dict[str, Any],
+    *,
+    criterion_index: int,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    binding = _request_slot_datum_binding(item, criterion_index=criterion_index)
+    if binding is None:
+        return False
+    anchor = _request_slot_anchor(item)
+    kind = _coerce_criterion_kind(item.get("kind"))
+    if kind == "validation_classification":
+        expected_datum_field: RequestSlotDatumField | None = "classification_output_key"
+        active_datum_value = _coerce_classification_output_key(item.get("classification_output_key"))
+    elif isinstance(item.get("output_path"), str) and item["output_path"].strip():
+        expected_datum_field = "output_path"
+        active_datum_value = item[expected_datum_field].strip()
+    else:
+        expected_datum_field = None
+        active_datum_value = None
+    return (
+        binding.datum_field == expected_datum_field
+        and active_datum_value is not None
+        and item.get(binding.datum_field) == active_datum_value == binding.datum_value
+        and anchor == (binding.source_id, binding.source_quote)
+        and _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request)
+    )
+
+
+def _trusted_request_slot_datum_binding_is_valid(
+    item: dict[str, Any],
+    *,
+    binding: TrustedRequestSlotDatumBindingV1,
+    criterion_index: int,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    raw_binding = item.get("request_slot_datum_binding")
+    outcome = item.get("outcome")
+    return _type_strict_json_equal(
+        raw_binding,
+        {
+            "version": binding.version,
+            "criterion_index": binding.criterion_index,
+            "datum_field": binding.datum_field,
+            "datum_value": binding.datum_value,
+            "criterion_outcome_sha256": binding.criterion_outcome_sha256,
+            "source_id": binding.source_id,
+            "source_quote": binding.source_quote,
+        },
+    ) and (
+        binding.criterion_index == criterion_index
+        and item.get(binding.datum_field) == binding.datum_value
+        and isinstance(outcome, str)
+        and hashlib.sha256(outcome.encode()).hexdigest() == binding.criterion_outcome_sha256
+        and _request_slot_anchor(item) == (binding.source_id, binding.source_quote)
+        and _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request)
+    )
+
+
 def _request_slot_anchor_matches_criterion_datum(item: dict[str, Any]) -> bool:
     anchor = _request_slot_anchor(item)
     if anchor is None:
@@ -954,11 +1145,216 @@ def _request_slot_anchor_is_admissible(
     item: dict[str, Any],
     *,
     request_slot_request: RequestSlotProducerInputV1,
+    criterion_index: int | None = None,
+    trusted_binding: TrustedRequestSlotDatumBindingV1 | None = None,
+    allow_embedded_binding: bool = False,
 ) -> bool:
-    return _request_slot_anchor_is_valid(
-        item,
+    if (
+        criterion_index is not None
+        and trusted_binding is not None
+        and _trusted_request_slot_datum_binding_is_valid(
+            item,
+            binding=trusted_binding,
+            criterion_index=criterion_index,
+            request_slot_request=request_slot_request,
+        )
+    ):
+        return True
+    if (
+        criterion_index is not None
+        and allow_embedded_binding
+        and _request_slot_datum_binding_is_valid(
+            item,
+            criterion_index=criterion_index,
+            request_slot_request=request_slot_request,
+        )
+    ):
+        return True
+    return _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request) and (
+        _request_slot_anchor_matches_criterion_datum(item)
+    )
+
+
+def _type_strict_json_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_type_strict_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _type_strict_json_equal(left_item, right_item) for left_item, right_item in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
+def _request_slot_datum_target(
+    item: dict[str, Any],
+    *,
+    criterion_index: int,
+) -> RequestSlotDatumBindingTargetV1 | None:
+    outcome = item.get("outcome")
+    if not isinstance(outcome, str) or not outcome:
+        return None
+    kind = _coerce_criterion_kind(item.get("kind"))
+    if kind == "validation_classification":
+        datum_value = _coerce_classification_output_key(item.get("classification_output_key"))
+        datum_field: RequestSlotDatumField = "classification_output_key"
+    elif kind == "terminal_action":
+        return None
+    else:
+        raw_output_path = item.get("output_path")
+        datum_value = raw_output_path.strip() if isinstance(raw_output_path, str) and raw_output_path.strip() else None
+        datum_field = "output_path"
+    if datum_value is None:
+        return None
+    return RequestSlotDatumBindingTargetV1(
+        criterion_index=criterion_index,
+        datum_field=datum_field,
+        datum_value=datum_value,
+        criterion_outcome_sha256=hashlib.sha256(outcome.encode()).hexdigest(),
+    )
+
+
+def _request_slot_datum_binding_targets(
+    raw_criteria: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> tuple[RequestSlotDatumBindingTargetV1, ...]:
+    if not isinstance(raw_criteria, list):
+        return ()
+    targets: list[RequestSlotDatumBindingTargetV1] = []
+    for criterion_index, item in enumerate(raw_criteria):
+        if not isinstance(item, dict):
+            continue
+        target = _request_slot_datum_target(item, criterion_index=criterion_index)
+        if target is None:
+            continue
+        # First-pass model assertions are not provenance. Only the unchanged legacy
+        # lexical check or a server-joined producer contract may license the datum.
+        if _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request) and (
+            _request_slot_anchor_matches_criterion_datum(item)
+        ):
+            continue
+        targets.append(target)
+    return tuple(targets)
+
+
+def _apply_request_slot_datum_bindings(
+    original: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+) -> RequestSlotDatumBindingApplicationDecisionV1:
+    criteria = original.get("completion_criteria")
+    if not isinstance(criteria, list):
+        return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_criteria_container")
+    if request_slot_contract.request_digest != request_slot_request_digest(request_slot_request):
+        return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_contract")
+
+    targets = _request_slot_datum_binding_targets(
+        criteria,
         request_slot_request=request_slot_request,
-    ) and _request_slot_anchor_matches_criterion_datum(item)
+    )
+    target_by_key = {(target.criterion_index, target.datum_field): target for target in targets}
+    binding_by_key = {
+        (binding.criterion_index, binding.datum_field): binding for binding in request_slot_contract.datum_bindings
+    }
+    decline_by_key = {
+        (decline.criterion_index, decline.datum_field): decline for decline in request_slot_contract.datum_declines
+    }
+    if (
+        len(binding_by_key) != len(request_slot_contract.datum_bindings)
+        or len(decline_by_key) != len(request_slot_contract.datum_declines)
+        or set(binding_by_key) & set(decline_by_key)
+        or set(binding_by_key) | set(decline_by_key) != set(target_by_key)
+    ):
+        return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_contract")
+
+    for key, decline in decline_by_key.items():
+        target = target_by_key[key]
+        if (
+            decline.datum_value != target.datum_value
+            or decline.criterion_outcome_sha256 != target.criterion_outcome_sha256
+        ):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+
+    trusted_bindings: list[TrustedRequestSlotDatumBindingV1] = []
+    for key, binding in binding_by_key.items():
+        target = target_by_key[key]
+        criterion = criteria[target.criterion_index]
+        if not isinstance(criterion, dict):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+        outcome = criterion.get("outcome")
+        if (
+            binding.datum_value != target.datum_value
+            or binding.criterion_outcome_sha256 != target.criterion_outcome_sha256
+        ):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+        if (
+            not isinstance(outcome, str)
+            or hashlib.sha256(outcome.encode()).hexdigest() != target.criterion_outcome_sha256
+        ):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="anchor_incoherent", criterion_index=target.criterion_index
+            )
+        candidate = {
+            **criterion,
+            "request_slot_source_id": binding.source_id,
+            "request_slot_source_quote": binding.source_quote,
+        }
+        if not _request_slot_anchor_is_valid(candidate, request_slot_request=request_slot_request):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="anchor_not_unique", criterion_index=target.criterion_index
+            )
+        resolved_slot = _request_slot_for_anchor(
+            (binding.source_id, binding.source_quote),
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+        )
+        if resolved_slot is None or binding.slot_id != resolved_slot.slot_id:
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+        trusted_bindings.append(
+            TrustedRequestSlotDatumBindingV1(
+                version="1",
+                criterion_index=target.criterion_index,
+                datum_field=target.datum_field,
+                datum_value=target.datum_value,
+                criterion_outcome_sha256=target.criterion_outcome_sha256,
+                source_id=binding.source_id,
+                source_quote=binding.source_quote,
+                slot_id=binding.slot_id,
+            )
+        )
+
+    accepted_payload = copy.deepcopy(original)
+    accepted_criteria = accepted_payload["completion_criteria"]
+    for trusted_binding in trusted_bindings:
+        accepted_item = accepted_criteria[trusted_binding.criterion_index]
+        accepted_item["request_slot_source_id"] = trusted_binding.source_id
+        accepted_item["request_slot_source_quote"] = trusted_binding.source_quote
+        accepted_item["request_slot_datum_binding"] = {
+            "version": trusted_binding.version,
+            "criterion_index": trusted_binding.criterion_index,
+            "datum_field": trusted_binding.datum_field,
+            "datum_value": trusted_binding.datum_value,
+            "criterion_outcome_sha256": trusted_binding.criterion_outcome_sha256,
+            "source_id": trusted_binding.source_id,
+            "source_quote": trusted_binding.source_quote,
+        }
+    return RequestSlotDatumBindingApplicationDecisionV1(
+        version="1",
+        predicate="accepted",
+        accepted_payload=accepted_payload,
+        trusted_bindings=tuple(trusted_bindings),
+    )
 
 
 def _request_slot_claims_need_anchor_correction(
@@ -969,8 +1365,12 @@ def _request_slot_claims_need_anchor_correction(
     return isinstance(raw_criteria, list) and any(
         isinstance(item, dict)
         and _item_claims_request_slot(item)
-        and not _request_slot_anchor_is_admissible(item, request_slot_request=request_slot_request)
-        for item in raw_criteria
+        and not _request_slot_anchor_is_admissible(
+            item,
+            request_slot_request=request_slot_request,
+            criterion_index=criterion_index,
+        )
+        for criterion_index, item in enumerate(raw_criteria)
     )
 
 
@@ -979,17 +1379,17 @@ def _accept_request_slot_anchor_correction(
     corrected: dict[str, Any],
     *,
     request_slot_request: RequestSlotProducerInputV1,
-) -> dict[str, Any] | None:
+) -> RequestSlotAnchorCorrectionDecisionV1:
     original_criteria = original.get("completion_criteria")
     corrected_criteria = corrected.get("completion_criteria")
     if not isinstance(original_criteria, list) or not isinstance(corrected_criteria, list):
-        return None
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="invalid_criteria_container")
     if len(original_criteria) != len(corrected_criteria):
-        return None
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="criterion_count_changed")
 
     anchor_fields = {"request_slot_source_id", "request_slot_source_quote"}
     if _classifier_payload_semantics(original) != _classifier_payload_semantics(corrected):
-        return None
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="payload_semantics_changed")
     original_semantic_criteria = [
         {key: value for key, value in item.items() if key not in anchor_fields}
         for item in original_criteria
@@ -1003,24 +1403,40 @@ def _accept_request_slot_anchor_correction(
     if _parse_completion_criteria(original_semantic_criteria, emit_mint_events=False) != _parse_completion_criteria(
         corrected_semantic_criteria, emit_mint_events=False
     ):
-        return None
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="criteria_semantics_changed")
 
     accepted_criteria: list[dict[str, Any]] = []
-    for original_item, corrected_item in zip(original_criteria, corrected_criteria, strict=True):
+    binding_absent = object()
+    for criterion_index, (original_item, corrected_item) in enumerate(
+        zip(original_criteria, corrected_criteria, strict=True)
+    ):
         if not isinstance(original_item, dict) or not isinstance(corrected_item, dict):
-            return None
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="criterion_not_object", criterion_index=criterion_index
+            )
+        if not _type_strict_json_equal(
+            original_item.get("request_slot_datum_binding", binding_absent),
+            corrected_item.get("request_slot_datum_binding", binding_absent),
+        ):
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="criterion_semantics_changed", criterion_index=criterion_index
+            )
         original_without_anchors = {key: value for key, value in original_item.items() if key not in anchor_fields}
         corrected_without_anchors = {key: value for key, value in corrected_item.items() if key not in anchor_fields}
         if _classifier_criterion_semantics(original_without_anchors) != _classifier_criterion_semantics(
             corrected_without_anchors
         ):
-            return None
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="criterion_semantics_changed", criterion_index=criterion_index
+            )
         accepted_item = dict(original_item)
         if _item_claims_request_slot(original_item):
             original_quote = original_item.get("request_slot_source_quote")
             corrected_anchor = _request_slot_anchor(corrected_item)
             if corrected_anchor is None:
-                return None
+                return RequestSlotAnchorCorrectionDecisionV1(
+                    version="1", predicate="missing_corrected_anchor", criterion_index=criterion_index
+                )
             corrected_source_id, corrected_quote = corrected_anchor
             if isinstance(original_quote, str) and original_quote:
                 corrected_source_for_original_quote = {
@@ -1030,12 +1446,18 @@ def _accept_request_slot_anchor_correction(
                 if not _request_slot_anchor_is_admissible(
                     corrected_source_for_original_quote,
                     request_slot_request=request_slot_request,
+                    criterion_index=criterion_index,
+                    allow_embedded_binding=True,
                 ):
-                    return None
+                    return RequestSlotAnchorCorrectionDecisionV1(
+                        version="1", predicate="original_quote_not_admissible", criterion_index=criterion_index
+                    )
                 accepted_item["request_slot_source_id"] = corrected_source_id
             else:
                 if not _item_claims_request_slot_fields(original_item):
-                    return None
+                    return RequestSlotAnchorCorrectionDecisionV1(
+                        version="1", predicate="missing_request_slot_fields", criterion_index=criterion_index
+                    )
                 corrected_anchor_for_original_datum = {
                     **original_item,
                     "request_slot_source_id": corrected_source_id,
@@ -1044,14 +1466,66 @@ def _accept_request_slot_anchor_correction(
                 if not _request_slot_anchor_is_admissible(
                     corrected_anchor_for_original_datum,
                     request_slot_request=request_slot_request,
+                    criterion_index=criterion_index,
+                    allow_embedded_binding=True,
                 ):
-                    return None
+                    return RequestSlotAnchorCorrectionDecisionV1(
+                        version="1", predicate="corrected_anchor_not_admissible", criterion_index=criterion_index
+                    )
                 accepted_item["request_slot_source_id"] = corrected_source_id
                 accepted_item["request_slot_source_quote"] = corrected_quote
         elif any(corrected_item.get(field) != original_item.get(field) for field in anchor_fields):
-            return None
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="unexpected_anchor_change", criterion_index=criterion_index
+            )
         accepted_criteria.append(accepted_item)
-    return {**original, "completion_criteria": accepted_criteria}
+    return RequestSlotAnchorCorrectionDecisionV1(
+        version="1",
+        predicate="accepted",
+        accepted_payload={**original, "completion_criteria": accepted_criteria},
+    )
+
+
+def _redact_anchor_correction_capture_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_raw_secrets_for_prompt(value)
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            if key == "raw_secret_evidence":
+                redacted[key] = None if item is None else "[REDACTED_SECRET]"
+            else:
+                redacted[key] = _redact_anchor_correction_capture_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_anchor_correction_capture_value(item) for item in value]
+    return value
+
+
+def _anchor_correction_rejection_capture(
+    original: dict[str, Any],
+    corrected: dict[str, Any],
+) -> dict[str, str] | None:
+    try:
+        original_redacted = _redact_anchor_correction_capture_value(redact_sensitive_fields(original))
+        corrected_redacted = _redact_anchor_correction_capture_value(redact_sensitive_fields(corrected))
+        original_json = json.dumps(original_redacted, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        corrected_json = json.dumps(corrected_redacted, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        pair_json = json.dumps(
+            {"corrected": corrected_redacted, "original": original_redacted},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return {
+        "original_payload_json": original_json,
+        "corrected_payload_json": corrected_json,
+        "original_sha256": hashlib.sha256(original_json.encode()).hexdigest(),
+        "corrected_sha256": hashlib.sha256(corrected_json.encode()).hexdigest(),
+        "pair_sha256": hashlib.sha256(pair_json.encode()).hexdigest(),
+    }
 
 
 def _classifier_payload_semantics(payload: dict[str, Any]) -> RequestPolicy:
@@ -1200,12 +1674,16 @@ def _parse_fresh_request_slot_criteria(
     *,
     request_slot_request: RequestSlotProducerInputV1,
     request_slot_contract: RequestSlotContractV1,
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = (),
 ) -> list[CompletionCriterion]:
     if request_slot_contract.version != "1" or not isinstance(raw, list):
         return []
+    criterion_index_by_item_id = {id(item): index for index, item in enumerate(raw) if isinstance(item, dict)}
+    trusted_binding_by_index = {binding.criterion_index: binding for binding in trusted_datum_bindings}
     bound_by_slot_id: dict[str, CompletionCriterion] = {}
     non_slot_criteria: list[CompletionCriterion] = []
     for item, criterion in _parse_completion_criterion_entries(raw):
+        criterion_index = criterion_index_by_item_id[id(item)]
         anchor = _request_slot_anchor(item)
         slot = (
             _request_slot_for_anchor(
@@ -1213,7 +1691,13 @@ def _parse_fresh_request_slot_criteria(
                 request_slot_request=request_slot_request,
                 request_slot_contract=request_slot_contract,
             )
-            if _request_slot_anchor_is_admissible(item, request_slot_request=request_slot_request)
+            if _request_slot_anchor_is_admissible(
+                item,
+                request_slot_request=request_slot_request,
+                criterion_index=criterion_index,
+                trusted_binding=trusted_binding_by_index.get(criterion_index),
+                allow_embedded_binding=False,
+            )
             else None
         )
         if anchor is None or slot is None:
@@ -1268,6 +1752,7 @@ def _classification_from_raw(
     request_slot_request: RequestSlotProducerInputV1 | None = None,
     request_slot_contract: RequestSlotContractV1 | None = None,
     request_slot_failure_kind: str | None = None,
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = (),
 ) -> RequestPolicy:
     raw = _coerce_classifier_payload(raw)
     if raw is None:
@@ -1288,6 +1773,7 @@ def _classification_from_raw(
             raw_criteria,
             request_slot_request=request_slot_request,
             request_slot_contract=request_slot_contract,
+            trusted_datum_bindings=trusted_datum_bindings,
         )
     elif claims_request_slots:
         completion_criteria = _fresh_request_slot_failure_criteria(raw_criteria)
@@ -2720,6 +3206,26 @@ def _log_terminal_action_reconciliation_omitted(
     failure_kind: str = "none",
     retry_count: int = 0,
 ) -> None:
+    request_slot_failure_kind = policy.request_slot_failure_kind
+    if request_slot_failure_kind:
+        surface = RequestSlotFailureSurfaceV1(
+            version="1",
+            reason="request_slot_failure",
+            failure_kind="request_slot_failure",
+            retryable=False,
+            request_slot_failure_kind=request_slot_failure_kind,
+        )
+        LOG.info(
+            "copilot_terminal_action_reconciliation_omitted",
+            reason=surface.reason,
+            failure_kind=surface.failure_kind,
+            retryable=surface.retryable,
+            request_slot_failure_kind=surface.request_slot_failure_kind,
+            retry_count=retry_count,
+            credential_input_kind=policy.credential_input_kind,
+            completion_criteria_count=len(policy.completion_criteria),
+        )
+        return
     LOG.info(
         "copilot_terminal_action_reconciliation_omitted",
         reason=reason,
@@ -2929,10 +3435,79 @@ async def _classify_request(
             requested_output_path_aliases=requested_output_path_aliases,
         )
 
+    # The primary classifier may describe candidate criteria, but it cannot mint
+    # provenance for itself. Datum bindings become trusted only after the separate
+    # producer-owned envelope is mechanically joined below.
+    raw_payload = copy.deepcopy(raw_payload)
+    raw_criteria = raw_payload.get("completion_criteria")
+    if isinstance(raw_criteria, list):
+        for item in raw_criteria:
+            if isinstance(item, dict):
+                item.pop("request_slot_datum_binding", None)
+
     request_slot_contract: RequestSlotContractV1 | None = None
     request_slot_failure_kind: str | None = None
-    raw_criteria = raw_payload.get("completion_criteria")
-    if _request_slot_claims_need_anchor_correction(
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = ()
+    datum_binding_targets = _request_slot_datum_binding_targets(
+        raw_criteria,
+        request_slot_request=request_slot_request,
+    )
+    if datum_binding_targets:
+        targeted_request_data = request_slot_request.model_dump()
+        try:
+            targeted_request_data["datum_targets"] = tuple(
+                RequestSlotDatumTargetV1(
+                    criterion_index=target.criterion_index,
+                    datum_field=target.datum_field,
+                    datum_value=target.datum_value,
+                    criterion_outcome_sha256=target.criterion_outcome_sha256,
+                )
+                for target in datum_binding_targets
+            )
+            targeted_request = RequestSlotProducerInputV1.model_validate(targeted_request_data)
+        except ValueError:
+            targeted_request = None
+            request_slot_failure_kind = "invalid_output"
+            LOG.warning(
+                "request-policy request-slot target construction failed",
+                failure_kind=request_slot_failure_kind,
+                target_count=len(datum_binding_targets),
+            )
+        if targeted_request is not None:
+            request_slot_result = await produce_request_slots(request=targeted_request, handler=handler)
+            if request_slot_result.status == "success":
+                request_slot_contract = request_slot_result.contract
+            else:
+                request_slot_failure_kind = (
+                    request_slot_result.failure_kind.value
+                    if request_slot_result.failure_kind is not None
+                    else "unknown"
+                )
+                LOG.warning(
+                    "request-policy request-slot producer failed",
+                    failure_kind=request_slot_failure_kind,
+                    attempts=request_slot_result.attempts,
+                )
+        if request_slot_contract is not None:
+            datum_binding_decision = _apply_request_slot_datum_bindings(
+                raw_payload,
+                request_slot_request=targeted_request,
+                request_slot_contract=request_slot_contract,
+            )
+            if datum_binding_decision.accepted_payload is not None:
+                raw_payload = datum_binding_decision.accepted_payload
+                raw_criteria = raw_payload.get("completion_criteria")
+                trusted_datum_bindings = datum_binding_decision.trusted_bindings
+            else:
+                request_slot_failure_kind = "invalid_anchor_correction"
+                request_slot_contract = None
+                LOG.warning(
+                    "copilot_request_slot_datum_binding_contract_rejected",
+                    event_version="1",
+                    predicate=datum_binding_decision.predicate,
+                    criterion_index=datum_binding_decision.criterion_index,
+                )
+    elif _request_slot_claims_need_anchor_correction(
         raw_criteria,
         request_slot_request=request_slot_request,
     ):
@@ -2946,7 +3521,7 @@ async def _classify_request(
         )
         retry_count += correction_retry_count
         corrected_payload = _coerce_classifier_payload(corrected_raw)
-        accepted_payload = (
+        anchor_correction_decision = (
             _accept_request_slot_anchor_correction(
                 raw_payload,
                 corrected_payload,
@@ -2955,16 +3530,36 @@ async def _classify_request(
             if corrected_payload is not None
             else None
         )
+        accepted_payload = (
+            anchor_correction_decision.accepted_payload if anchor_correction_decision is not None else None
+        )
         if accepted_payload is not None:
             raw_payload = accepted_payload
             raw_criteria = raw_payload.get("completion_criteria")
         else:
             request_slot_failure_kind = "invalid_anchor_correction"
+            capture = (
+                _anchor_correction_rejection_capture(raw_payload, corrected_payload)
+                if corrected_payload is not None
+                else None
+            )
+            if anchor_correction_decision is not None and capture is not None:
+                LOG.warning(
+                    "copilot_request_slot_anchor_correction_rejected",
+                    event_version="1",
+                    predicate=anchor_correction_decision.predicate,
+                    criterion_index=anchor_correction_decision.criterion_index,
+                    **capture,
+                )
             LOG.warning(
                 "request-policy request-slot anchor correction failed",
                 failure_kind=correction_failure_kind,
+                predicate=(anchor_correction_decision.predicate if anchor_correction_decision is not None else None),
+                criterion_index=(
+                    anchor_correction_decision.criterion_index if anchor_correction_decision is not None else None
+                ),
             )
-    if request_slot_failure_kind is None:
+    if request_slot_failure_kind is None and request_slot_contract is None:
         # The independent producer owns slot membership as well as type. Run it even
         # when the primary classifier declares no slots so an omitted conditional
         # fallback cannot disappear from the completion contract.
@@ -2985,6 +3580,7 @@ async def _classify_request(
         request_slot_request=request_slot_request,
         request_slot_contract=request_slot_contract,
         request_slot_failure_kind=request_slot_failure_kind,
+        trusted_datum_bindings=trusted_datum_bindings,
     )
     policy.classifier_retry_count = retry_count
     policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
