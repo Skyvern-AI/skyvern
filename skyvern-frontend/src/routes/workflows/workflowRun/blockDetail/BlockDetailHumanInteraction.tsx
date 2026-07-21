@@ -1,6 +1,6 @@
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { WorkflowRunHumanInteraction } from "../WorkflowRunHumanInteraction";
-import { BlockDetailFailure, GoalText, Section } from "./shared";
+import { GoalText, Section } from "./shared";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -10,7 +10,6 @@ function BlockDetailHumanInteraction({ block }: Props) {
   const recipients = block.recipients ?? [];
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
-      <BlockDetailFailure block={block} />
       {block.instructions && (
         <Section title="Instructions">
           <GoalText text={block.instructions} />

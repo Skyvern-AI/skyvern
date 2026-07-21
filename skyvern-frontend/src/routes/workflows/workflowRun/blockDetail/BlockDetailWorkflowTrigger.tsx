@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
-import { BlockDetailFailure, JsonView, Section } from "./shared";
+import { JsonView, Section } from "./shared";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -10,7 +10,6 @@ type SubWorkflowRun = {
   workflow_run_id?: string;
   workflow_permanent_id?: string;
   status?: string;
-  failure_reason?: string | null;
   outputs?: unknown;
 };
 
@@ -35,7 +34,6 @@ function BlockDetailWorkflowTrigger({ block }: Props) {
 
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
-      <BlockDetailFailure block={block} />
       {subRun?.workflow_run_id && (
         <Section title="Triggered run">
           <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -53,13 +51,6 @@ function BlockDetailWorkflowTrigger({ block }: Props) {
                 </span>
               </span>
             )}
-          </div>
-        </Section>
-      )}
-      {subRun?.failure_reason && (
-        <Section title="Sub-workflow failure">
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs leading-relaxed text-destructive">
-            {subRun.failure_reason}
           </div>
         </Section>
       )}
