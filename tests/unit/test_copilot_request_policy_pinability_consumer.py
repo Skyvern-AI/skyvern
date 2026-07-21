@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +20,8 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 from skyvern.forge.sdk.copilot.completion_verification import RunEvidenceSnapshot, evaluate_completion_criteria
 from skyvern.forge.sdk.copilot.request_policy import (
     _accept_request_slot_anchor_correction,
+    _anchor_correction_rejection_capture,
+    _apply_request_slot_datum_bindings,
     _classification_from_raw,
     _classify_request,
     schema_output_path_aliases_from_criteria,
@@ -23,12 +29,19 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_PROMPT_NAME
 from skyvern.forge.sdk.copilot.request_slots import (
     RequestSlotAntecedentFamily,
+    RequestSlotDatumBindingDeclarationV1,
+    RequestSlotDatumDeclineDeclarationV1,
+    RequestSlotDatumTargetV1,
     RequestSlotDeclarationV1,
     RequestSlotEnvelopeV1,
     RequestSlotPinability,
     RequestSlotPlane,
     RequestSlotProducerInputV1,
     canonicalize_request_slots,
+)
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
 )
 
 P9_REQUEST = "Return completion status, the visible path label, and whether the path is login-only."
@@ -42,6 +55,167 @@ EXAMPLE_WATER_SERVICE_REQUEST = (
     "account number, selected start date, deposit amount, and next owner. If the site only exposes an email/manual-"
     "service path instead of an online form, report that as the blocker rather than inventing values."
 )
+P8_QUICKCONNECT_REQUEST = (
+    "I need a reusable workflow that creates or verifies a gas QuickConnect request in the mock Peach State Gas "
+    "GasConnect Hub at http://localhost:8906/utility_services/peach_gas/. Sign in with the saved credential named "
+    "mock-portal-login. The service address parts, desired start date, and business name should be reusable inputs; "
+    "for this run use 77 Gaslight Way, Decatur, GA 30030, 2026-06-24, and Example Realty Labs Inc. After sign-in, "
+    "the workflow should open the QuickConnect create flow, use only the sourced address/date/business data, submit "
+    "only when the exact address is visible, then read the My QuickConnects table and output the request id, "
+    "provider-captured address, requested date, status, and whether the request was newly submitted or already present."
+)
+P8_QUICKCONNECT_REQUEST_SHA256 = "87440c6781124905ac58113b2fdc4629415ef883e69fdc479fc23ba380d3e353"
+P8_QUICKCONNECT_PRIOR_TURN = (
+    "The prior QuickConnect result included the request id, provider-captured address, requested date, and status."
+)
+P8_QUICKCONNECT_WORKFLOW_CONTEXT = (
+    "Existing workflow context also mentions request id, provider-captured address, requested date, and status."
+)
+P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "copilot" / "request_policy" / "sky_12671_p8_noop_anchor_correction_pair.json"
+)
+P8_LIVE_ORIGINAL_PAYLOAD_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "copilot" / "request_policy" / "sky_12671_p8_original_payload.json"
+)
+P8_CLEAN_RETRY_CUSTODY_GAP_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "copilot" / "request_policy" / "sky_12671_p8_clean_retry_custody_gap.json"
+)
+
+
+def _recorded_p8_original_payload_bytes() -> bytes:
+    # The fixture stores backend.log:1316's original_payload_json verbatim; the
+    # repository text-file newline is not part of the recorded JSON field.
+    return P8_LIVE_ORIGINAL_PAYLOAD_FIXTURE.read_bytes().removesuffix(b"\n")
+
+
+def test_clean_retry_custody_gap_is_explicit_and_never_substituted_with_a_synthetic_replay() -> None:
+    custody = json.loads(P8_CLEAN_RETRY_CUSTODY_GAP_FIXTURE.read_text())
+
+    assert custody["workflow_permanent_id"] == "wpid_553704674845352182"
+    assert custody["original_payload_sha256"] == ("9f3a7ee247f6c15f677c68402930a7a5c3d23f334b5719442198127724c00cab")
+    assert custody["predicate"] == "target_coverage_mismatch"
+    assert custody["raw_original_payload_retained"] is False
+    assert custody["raw_correction_payload_retained"] is False
+    assert custody["custody_status"] == "exact_replay_unavailable"
+
+
+def _request_slot_envelope_with_target_bindings(
+    prompt: str,
+    envelope: RequestSlotEnvelopeV1,
+    *,
+    anchors_by_index: dict[int, tuple[str, str]],
+) -> dict[str, Any]:
+    marker = "Datum targets from the immutable request-policy payload:\n```"
+    assert marker in prompt
+    targets = json.loads(prompt.split(marker, 1)[1].split("```", 1)[0])
+    payload = envelope.model_dump(mode="json")
+    payload["datum_bindings"] = [
+        {
+            "criterion_index": target["criterion_index"],
+            "datum_field": target["datum_field"],
+            "declined": False,
+            "source_id": anchors_by_index[target["criterion_index"]][0],
+            "source_quote": anchors_by_index[target["criterion_index"]][1],
+        }
+        for target in targets
+    ]
+    return payload
+
+
+def _p8_quickconnect_classifier_fixture(*, source_id: str) -> dict[str, Any]:
+    # Only P8_QUICKCONNECT_REQUEST is copied from the admitted backend logs. The
+    # classifier packet was not retained, so this response is deliberately fixture-labeled.
+    return {
+        "testing_intent": "require_test",
+        "credential_input_kind": "credential_name",
+        "credential_refs": ["mock-portal-login"],
+        "requires_user_clarification": False,
+        "completion_criteria": [
+            {
+                "outcome": "A matching QuickConnect request is created or verified.",
+                "kind": "terminal_action",
+                "terminal_action_family": "request",
+                "request_slot_source_id": source_id,
+                "request_slot_source_quote": "creates or verifies a gas QuickConnect request",
+            },
+            {
+                "outcome": "Only the sourced address, date, and business data are used.",
+                "request_slot_source_id": source_id,
+                "request_slot_source_quote": "use only the sourced address/date/business data",
+            },
+            {
+                "outcome": "Submission occurs only when the exact address is visible.",
+                "request_slot_source_id": source_id,
+                "request_slot_source_quote": "submit only when the exact address is visible",
+            },
+            *[
+                {
+                    "outcome": outcome,
+                    "output_path": output_path,
+                    "expected_output_shape": "status_label",
+                    "request_slot_source_id": source_id,
+                    "request_slot_source_quote": source_quote,
+                }
+                for outcome, output_path, source_quote in (
+                    ("The request id is returned.", "output.request_id", "request id"),
+                    (
+                        "The provider-captured address is returned.",
+                        "output.provider_captured_address",
+                        "provider-captured address",
+                    ),
+                    ("The requested date is returned.", "output.requested_date", "requested date"),
+                    ("The request status is returned.", "output.status", "status"),
+                )
+            ],
+        ],
+    }
+
+
+def _p8_quickconnect_envelope(*, source_id: str = "u0") -> RequestSlotEnvelopeV1:
+    return RequestSlotEnvelopeV1(
+        version="1",
+        slots=tuple(
+            RequestSlotDeclarationV1(
+                source_id=source_id,
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            )
+            for source_quote in ("request id", "provider-captured address", "requested date", "status")
+        ),
+    )
+
+
+def _p8_payload_with_typed_state_binding(
+    payload: dict[str, Any], *, binding_overrides: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    enriched = json.loads(json.dumps(payload))
+    criterion_index = 6
+    criterion = enriched["completion_criteria"][criterion_index]
+    criterion["request_slot_datum_binding"] = {
+        "version": "1",
+        "criterion_index": criterion_index,
+        "datum_field": "output_path",
+        "datum_value": "output.request_submission_state",
+        "source_id": "u0",
+        "source_quote": "whether the request was newly submitted or already present",
+        **(binding_overrides or {}),
+    }
+    return enriched
+
+
+def _request_slot_input(latest_request: str) -> RequestSlotProducerInputV1:
+    return RequestSlotProducerInputV1(
+        version="1",
+        latest_request=latest_request,
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
 
 
 def _synthetic_anchor_only_payload() -> dict[str, Any]:
@@ -817,7 +991,7 @@ def test_anchor_correction_semantic_validation_does_not_emit_mint_events(
         ]
     }
 
-    accepted = _accept_request_slot_anchor_correction(
+    decision = _accept_request_slot_anchor_correction(
         original,
         corrected,
         request_slot_request=RequestSlotProducerInputV1(
@@ -832,7 +1006,7 @@ def test_anchor_correction_semantic_validation_does_not_emit_mint_events(
         ),
     )
 
-    assert accepted is not None
+    assert decision.predicate == "accepted"
     assert events == []
 
 
@@ -840,7 +1014,7 @@ def test_anchor_correction_semantic_validation_does_not_emit_mint_events(
 async def test_eight_row_anchor_correction_accepts_representation_drift_only() -> None:
     original = _synthetic_eight_row_anchor_payload(valid_anchors=False)
     corrected = _semantically_identical_anchor_correction()
-    accepted = _accept_request_slot_anchor_correction(
+    decision = _accept_request_slot_anchor_correction(
         original,
         corrected,
         request_slot_request=RequestSlotProducerInputV1(
@@ -855,7 +1029,9 @@ async def test_eight_row_anchor_correction_accepts_representation_drift_only() -
         ),
     )
 
-    assert accepted is not None
+    assert decision.predicate == "accepted"
+    assert decision.accepted_payload is not None
+    accepted = decision.accepted_payload
     assert accepted["opaque_provider_metadata"] == {"source": "original"}
     accepted_criteria = accepted["completion_criteria"]
     assert len(accepted_criteria) == 8
@@ -884,6 +1060,1281 @@ async def test_eight_row_anchor_correction_accepts_representation_drift_only() -
     assert sum(criterion.request_slot_id is not None for criterion in policy.completion_criteria) == 6
     assert all(criterion.mint_disposition == "decidable" for criterion in policy.completion_criteria)
     assert policy.to_trace_data()["mint_degraded_criterion_count"] == 0
+
+
+@pytest.mark.parametrize("recorded_run", ["run1", "run2", "run3"])
+def test_p8_custody_triplet_source_bytes_accepts_fixture_labeled_anchor_correction(recorded_run: str) -> None:
+    assert recorded_run in {"run1", "run2", "run3"}
+    assert hashlib.sha256(P8_QUICKCONNECT_REQUEST.encode()).hexdigest() == P8_QUICKCONNECT_REQUEST_SHA256
+    original = _p8_quickconnect_classifier_fixture(source_id="u9")
+    corrected = _p8_quickconnect_classifier_fixture(source_id="u0")
+
+    decision = _accept_request_slot_anchor_correction(
+        original,
+        corrected,
+        request_slot_request=RequestSlotProducerInputV1(
+            version="1",
+            latest_request=P8_QUICKCONNECT_REQUEST,
+            workflow_context="",
+            earliest_user_turn="",
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history=(),
+            global_context="",
+        ),
+    )
+
+    assert decision.predicate == "accepted"
+    assert decision.accepted_payload is not None
+    accepted = decision.accepted_payload
+    assert [item["outcome"] for item in accepted["completion_criteria"]] == [
+        item["outcome"] for item in original["completion_criteria"]
+    ]
+    assert [item.get("request_slot_source_quote") for item in accepted["completion_criteria"]] == [
+        item.get("request_slot_source_quote") for item in original["completion_criteria"]
+    ]
+    assert [item.get("request_slot_source_id") for item in accepted["completion_criteria"]] == ["u0"] * 7
+
+
+@pytest.mark.asyncio
+async def test_p8_admitted_source_fixture_mints_ordered_decidable_canonical_slots() -> None:
+    assert hashlib.sha256(P8_QUICKCONNECT_REQUEST.encode()).hexdigest() == P8_QUICKCONNECT_REQUEST_SHA256
+    original = _p8_quickconnect_classifier_fixture(source_id="u9")
+    envelope = _p8_quickconnect_envelope(source_id="u1")
+    calls: list[str] = []
+    request_slot_envelopes: list[RequestSlotEnvelopeV1] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            response = _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={
+                    3: ("u1", "request id"),
+                    4: ("u1", "provider-captured address"),
+                    5: ("u1", "requested date"),
+                    6: ("u1", "status"),
+                },
+            )
+            request_slot_envelopes.append(RequestSlotEnvelopeV1.model_validate_json(json.dumps(response)))
+            return response
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("two-pass producer consensus must not be echoed through a third model call")
+        if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
+            return {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"}
+        return original
+
+    policy = await _classify_request(
+        P8_QUICKCONNECT_REQUEST,
+        P8_QUICKCONNECT_WORKFLOW_CONTEXT,
+        [
+            WorkflowCopilotChatHistoryMessage(
+                sender=WorkflowCopilotChatSender.USER,
+                content=P8_QUICKCONNECT_PRIOR_TURN,
+                created_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            )
+        ],
+        "",
+        handler,
+    )
+
+    assert calls == [
+        "workflow-copilot-request-policy",
+        REQUEST_SLOT_PROMPT_NAME,
+        REQUEST_SLOT_PROMPT_NAME,
+        "workflow-copilot-request-policy",
+    ]
+    assert policy.request_slot_failure_kind is None
+    assert [criterion.outcome for criterion in policy.completion_criteria] == [
+        "The request id is returned.",
+        "The provider-captured address is returned.",
+        "The requested date is returned.",
+        "The request status is returned.",
+        "A matching QuickConnect request is created or verified.",
+        "Only the sourced address, date, and business data are used.",
+        "Submission occurs only when the exact address is visible.",
+    ]
+    expected_request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=P8_QUICKCONNECT_REQUEST,
+        workflow_context=P8_QUICKCONNECT_WORKFLOW_CONTEXT,
+        earliest_user_turn=P8_QUICKCONNECT_PRIOR_TURN,
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+        datum_targets=tuple(
+            RequestSlotDatumTargetV1(
+                criterion_index=index,
+                datum_field="output_path",
+                datum_value=original["completion_criteria"][index]["output_path"],
+                criterion_outcome_sha256=hashlib.sha256(
+                    original["completion_criteria"][index]["outcome"].encode()
+                ).hexdigest(),
+            )
+            for index in range(3, 7)
+        ),
+    )
+    assert [criterion.request_slot_id for criterion in policy.completion_criteria[:4]] == [
+        slot.slot_id
+        for slot in canonicalize_request_slots(
+            request=expected_request,
+            envelope=request_slot_envelopes[0],
+        ).slots
+    ]
+    assert all(criterion.mint_disposition == "decidable" for criterion in policy.completion_criteria[:4])
+    assert all(criterion.mint_degrade == "undecidable_judgment" for criterion in policy.completion_criteria[4:])
+    assert sum(criterion.kind == "terminal_action" for criterion in policy.completion_criteria) == 1
+    trace_data = policy.to_trace_data()
+    assert "request_slot_failure_kind" not in trace_data
+    assert trace_data["mint_degraded_criterion_count"] == 3
+
+
+def test_live_p8_noop_pair_rejects_unbound_and_accepts_typed_datum_binding() -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    original_payload_bytes = _recorded_p8_original_payload_bytes()
+    assert hashlib.sha256(original_payload_bytes).hexdigest() == packet["source"]["original_sha256"]
+    recorded_original = json.loads(original_payload_bytes)
+    assert recorded_original == packet["original"]
+    capture = _anchor_correction_rejection_capture(recorded_original, packet["corrected"])
+
+    assert capture is not None
+    assert capture["original_sha256"] == packet["source"]["original_sha256"]
+    assert capture["corrected_sha256"] == packet["source"]["corrected_sha256"]
+    assert capture["pair_sha256"] == packet["source"]["pair_sha256"]
+    assert capture["pair_sha256"] == "e5be31a1cc861dd40c26a9c4df5d0240e6fabe42ca37bc1c5e2bcedbe56fbac5"
+
+    request_slot_request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=packet["latest_request"],
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    legacy = _accept_request_slot_anchor_correction(
+        recorded_original,
+        packet["corrected"],
+        request_slot_request=request_slot_request,
+    )
+    assert legacy.predicate == packet["source"]["predicate"] == "original_quote_not_admissible"
+    assert legacy.criterion_index == packet["source"]["criterion_index"] == 6
+
+    enriched_original = _p8_payload_with_typed_state_binding(packet["original"])
+    enriched_corrected = _p8_payload_with_typed_state_binding(packet["corrected"])
+    accepted = _accept_request_slot_anchor_correction(
+        enriched_original,
+        enriched_corrected,
+        request_slot_request=request_slot_request,
+    )
+    assert accepted.predicate == "accepted"
+    assert accepted.accepted_payload == enriched_original
+
+
+def test_p8_producer_consensus_joins_only_the_enumerated_datum() -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    request = _request_slot_input(packet["latest_request"])
+    outcome_sha256 = hashlib.sha256(packet["original"]["completion_criteria"][6]["outcome"].encode()).hexdigest()
+    request = request.model_copy(
+        update={
+            "datum_targets": (
+                RequestSlotDatumTargetV1(
+                    criterion_index=6,
+                    datum_field="output_path",
+                    datum_value="output.request_submission_state",
+                    criterion_outcome_sha256=outcome_sha256,
+                ),
+            )
+        }
+    )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="whether the request was newly submitted or already present",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=6,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id="u0",
+                    source_quote="whether the request was newly submitted or already present",
+                ),
+            ),
+        ),
+    )
+    decision = _apply_request_slot_datum_bindings(
+        packet["original"],
+        request_slot_request=request,
+        request_slot_contract=contract,
+    )
+
+    assert decision.predicate == "accepted"
+    assert decision.accepted_payload is not None
+    assert decision.accepted_payload["completion_criteria"][:6] == packet["original"]["completion_criteria"][:6]
+    assert decision.accepted_payload["completion_criteria"][6]["request_slot_datum_binding"] == {
+        "version": "1",
+        "criterion_index": 6,
+        "datum_field": "output_path",
+        "datum_value": "output.request_submission_state",
+        "criterion_outcome_sha256": outcome_sha256,
+        "source_id": "u0",
+        "source_quote": "whether the request was newly submitted or already present",
+    }
+    assert decision.trusted_bindings == (
+        request_policy_module.TrustedRequestSlotDatumBindingV1(
+            version="1",
+            criterion_index=6,
+            datum_field="output_path",
+            datum_value="output.request_submission_state",
+            criterion_outcome_sha256=outcome_sha256,
+            source_id="u0",
+            source_quote="whether the request was newly submitted or already present",
+            slot_id=contract.datum_bindings[0].slot_id,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_producer_decline_degrades_junk_without_discarding_legitimate_sibling() -> None:
+    sibling_quote = "whether submission was new or existing"
+    junk_quote = "account number"
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "Submission state is returned.",
+                "output_path": "output.submission_state",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": sibling_quote,
+            },
+            {
+                "outcome": "Confirmation ID is returned.",
+                "output_path": "output.confirmation_id",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": junk_quote,
+            },
+        ]
+    }
+    request_text = "Return whether submission was new or existing and the adjacent account number."
+    slots = tuple(
+        RequestSlotDeclarationV1(
+            source_id="u0",
+            source_quote=quote,
+            plane=RequestSlotPlane.RUN,
+            pinability=RequestSlotPinability.SHAPELESS_VALID,
+            antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+        )
+        for quote in dict.fromkeys((sibling_quote, "account number" if junk_quote != sibling_quote else sibling_quote))
+    )
+    calls: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            marker = "Datum targets from the immutable request-policy payload:\n```"
+            targets = json.loads(prompt.split(marker, 1)[1].split("```", 1)[0])
+            return {
+                "version": "1",
+                "slots": [slot.model_dump(mode="json") for slot in slots],
+                "datum_bindings": [
+                    {
+                        "criterion_index": targets[0]["criterion_index"],
+                        "datum_field": targets[0]["datum_field"],
+                        "declined": False,
+                        "source_id": "u0",
+                        "source_quote": sibling_quote,
+                    },
+                    {"criterion_index": 1, "datum_field": "output_path", "declined": True},
+                ],
+            }
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("producer consensus must not be echoed through a correction call")
+        return original
+
+    policy = await _classify_request(request_text, "", [], "", handler)
+
+    assert calls.count(REQUEST_SLOT_PROMPT_NAME) == 2
+    assert policy.request_slot_failure_kind is None
+    by_path = {criterion.floor_rekeyed_from_path: criterion for criterion in policy.completion_criteria}
+    assert by_path["output.submission_state"].mint_disposition == "decidable"
+    assert by_path["output.submission_state"].request_slot_id is not None
+    assert by_path["output.confirmation_id"].mint_disposition == "degraded"
+    assert by_path["output.confirmation_id"].mint_degrade == "undecidable_judgment"
+
+
+@pytest.mark.parametrize("producer_declines", [False, True])
+def test_server_applies_consensus_binding_or_local_decline(producer_declines: bool) -> None:
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "Submission state is returned.",
+                "output_path": "output.submission_state",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": "whether submission was new or existing",
+            }
+        ]
+    }
+    target = RequestSlotDatumTargetV1(
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.submission_state",
+        criterion_outcome_sha256=hashlib.sha256(b"Submission state is returned.").hexdigest(),
+    )
+    request = _request_slot_input("Return whether submission was new or existing.").model_copy(
+        update={"datum_targets": (target,)}
+    )
+    producer_resolution: RequestSlotDatumBindingDeclarationV1 | RequestSlotDatumDeclineDeclarationV1
+    if producer_declines:
+        producer_resolution = RequestSlotDatumDeclineDeclarationV1(
+            criterion_index=0,
+            datum_field="output_path",
+            declined=True,
+        )
+    else:
+        producer_resolution = RequestSlotDatumBindingDeclarationV1(
+            criterion_index=0,
+            datum_field="output_path",
+            declined=False,
+            source_id="u0",
+            source_quote="whether submission was new or existing",
+        )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="whether submission was new or existing",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(producer_resolution,),
+        ),
+    )
+    decision = _apply_request_slot_datum_bindings(
+        original,
+        request_slot_request=request,
+        request_slot_contract=contract,
+    )
+
+    assert decision.predicate == "accepted"
+    assert decision.accepted_payload is not None
+    if producer_declines:
+        assert decision.accepted_payload == original
+        assert decision.trusted_bindings == ()
+    else:
+        assert decision.accepted_payload["completion_criteria"][0]["request_slot_source_quote"] == (
+            "whether submission was new or existing"
+        )
+        assert decision.trusted_bindings[0].slot_id == contract.slots[0].slot_id
+
+
+@pytest.mark.parametrize(
+    ("contract_mutation", "producer_declines"),
+    [
+        ("missing_resolution", False),
+        ("duplicate_binding", False),
+        ("stale_binding_value", False),
+        ("stale_decline_hash", True),
+    ],
+)
+def test_server_rejects_malformed_or_stale_consensus_contracts_without_mutating_payload(
+    contract_mutation: str,
+    producer_declines: bool,
+) -> None:
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "Submission state is returned.",
+                "output_path": "output.submission_state",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": "whether submission was new or existing",
+            }
+        ]
+    }
+    target = RequestSlotDatumTargetV1(
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.submission_state",
+        criterion_outcome_sha256=hashlib.sha256(b"Submission state is returned.").hexdigest(),
+    )
+    request = _request_slot_input("Return whether submission was new or existing.").model_copy(
+        update={"datum_targets": (target,)}
+    )
+    resolution: RequestSlotDatumBindingDeclarationV1 | RequestSlotDatumDeclineDeclarationV1
+    if producer_declines:
+        resolution = RequestSlotDatumDeclineDeclarationV1(
+            criterion_index=0,
+            datum_field="output_path",
+            declined=True,
+        )
+    else:
+        resolution = RequestSlotDatumBindingDeclarationV1(
+            criterion_index=0,
+            datum_field="output_path",
+            declined=False,
+            source_id="u0",
+            source_quote="whether submission was new or existing",
+        )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="whether submission was new or existing",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(resolution,),
+        ),
+    )
+
+    if contract_mutation == "missing_resolution":
+        malformed_contract = contract.model_copy(update={"datum_bindings": (), "datum_declines": ()})
+    elif contract_mutation == "duplicate_binding":
+        malformed_contract = contract.model_copy(update={"datum_bindings": contract.datum_bindings * 2})
+    elif contract_mutation == "stale_binding_value":
+        stale_binding = contract.datum_bindings[0].model_copy(update={"datum_value": "output.other_state"})
+        malformed_contract = contract.model_copy(update={"datum_bindings": (stale_binding,)})
+    else:
+        stale_decline = contract.datum_declines[0].model_copy(update={"criterion_outcome_sha256": "0" * 64})
+        malformed_contract = contract.model_copy(update={"datum_declines": (stale_decline,)})
+
+    decision = _apply_request_slot_datum_bindings(
+        original,
+        request_slot_request=request,
+        request_slot_contract=malformed_contract,
+    )
+
+    assert decision.predicate == "invalid_contract"
+    assert decision.accepted_payload is None
+    assert decision.trusted_bindings == ()
+    assert original["completion_criteria"][0]["request_slot_source_quote"] == ("whether submission was new or existing")
+    assert "request_slot_datum_binding" not in original["completion_criteria"][0]
+
+
+def test_server_rejects_binding_contract_minted_for_different_request() -> None:
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "Submission state is returned.",
+                "output_path": "output.submission_state",
+            }
+        ]
+    }
+    target = RequestSlotDatumTargetV1(
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.submission_state",
+        criterion_outcome_sha256=hashlib.sha256(b"Submission state is returned.").hexdigest(),
+    )
+    current_request = _request_slot_input("Return whether submission was new or existing.").model_copy(
+        update={"datum_targets": (target,)}
+    )
+    foreign_request = _request_slot_input(
+        "Return whether submission was new or existing. Do not submit a replacement."
+    ).model_copy(update={"datum_targets": (target,)})
+    foreign_contract = canonicalize_request_slots(
+        request=foreign_request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="whether submission was new or existing",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id="u0",
+                    source_quote="whether submission was new or existing",
+                ),
+            ),
+        ),
+    )
+
+    decision = _apply_request_slot_datum_bindings(
+        original,
+        request_slot_request=current_request,
+        request_slot_contract=foreign_contract,
+    )
+
+    assert decision.predicate == "invalid_contract"
+    assert decision.accepted_payload is None
+    assert "request_slot_datum_binding" not in original["completion_criteria"][0]
+
+
+def test_trusted_binding_rejects_non_string_outcome_without_coercion() -> None:
+    item = {
+        "outcome": 123,
+        "output_path": "output.submission_state",
+        "request_slot_source_id": "u0",
+        "request_slot_source_quote": "submission state",
+        "request_slot_datum_binding": {
+            "version": "1",
+            "criterion_index": 0,
+            "datum_field": "output_path",
+            "datum_value": "output.submission_state",
+            "criterion_outcome_sha256": hashlib.sha256(b"123").hexdigest(),
+            "source_id": "u0",
+            "source_quote": "submission state",
+        },
+    }
+    request = _request_slot_input("Return the submission state.")
+    binding = request_policy_module.TrustedRequestSlotDatumBindingV1(
+        version="1",
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.submission_state",
+        criterion_outcome_sha256=hashlib.sha256(b"123").hexdigest(),
+        source_id="u0",
+        source_quote="submission state",
+        slot_id="slot-submission-state",
+    )
+
+    assert not request_policy_module._trusted_request_slot_datum_binding_is_valid(
+        item,
+        binding=binding,
+        criterion_index=0,
+        request_slot_request=request,
+    )
+
+
+@pytest.mark.asyncio
+async def test_datum_target_index_overflow_degrades_through_typed_failure_path() -> None:
+    raw = {
+        "completion_criteria": [
+            {
+                "outcome": f"Datum {index} is returned.",
+                "output_path": f"output.datum_{index}",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": "all requested data",
+            }
+            for index in range(65)
+        ]
+    }
+    calls: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        del prompt
+        calls.append(prompt_name)
+        return raw
+
+    policy = await _classify_request("Return all requested data.", "", [], "", handler)
+
+    assert calls == ["workflow-copilot-request-policy"]
+    assert policy.request_slot_failure_kind == "invalid_output"
+    assert policy.completion_criteria
+    assert all(criterion.mint_disposition == "degraded" for criterion in policy.completion_criteria)
+
+
+@pytest.mark.parametrize(
+    "binding_overrides",
+    [
+        {"version": "2"},
+        {"criterion_index": 5},
+        {"datum_field": "outcome"},
+        {"datum_value": "output.other"},
+        {"source_id": "u1"},
+        {"source_quote": "status"},
+        {"unknown": "value"},
+    ],
+)
+def test_live_p8_invalid_typed_binding_preserves_existing_rejection(binding_overrides: dict[str, Any]) -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    original = _p8_payload_with_typed_state_binding(packet["original"], binding_overrides=binding_overrides)
+    corrected = _p8_payload_with_typed_state_binding(packet["corrected"], binding_overrides=binding_overrides)
+
+    decision = _accept_request_slot_anchor_correction(
+        original,
+        corrected,
+        request_slot_request=RequestSlotProducerInputV1(
+            version="1",
+            latest_request=packet["latest_request"],
+            workflow_context="",
+            earliest_user_turn="",
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history=(),
+            global_context="",
+        ),
+    )
+
+    assert decision.predicate == "original_quote_not_admissible"
+    assert decision.criterion_index == 6
+
+
+@pytest.mark.asyncio
+async def test_live_p8_typed_binding_mints_state_criterion_through_production_path() -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    original_payload_bytes = _recorded_p8_original_payload_bytes()
+    assert hashlib.sha256(original_payload_bytes).hexdigest() == packet["source"]["original_sha256"]
+    raw = json.loads(original_payload_bytes)
+    assert raw == packet["original"]
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=tuple(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            )
+            for source_quote in (
+                "output the request id",
+                "provider-captured address",
+                "requested date",
+                "status",
+                "whether the request was newly submitted or already present",
+            )
+        ),
+    )
+    calls: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={
+                    6: ("u0", "whether the request was newly submitted or already present"),
+                },
+            )
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("two-pass producer consensus must not be echoed through a third model call")
+        if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
+            return {"version": "1", "criterion_id": None, "terminal_action_family": None}
+        return raw
+
+    policy = await _classify_request(packet["latest_request"], "", [], "", handler)
+
+    assert calls == [
+        "workflow-copilot-request-policy",
+        REQUEST_SLOT_PROMPT_NAME,
+        REQUEST_SLOT_PROMPT_NAME,
+        "workflow-copilot-request-policy",
+    ]
+    assert policy.request_slot_failure_kind is None
+    state = next(
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.floor_rekeyed_from_path == "output.request_submission_state"
+    )
+    assert state.request_slot_id is not None
+    assert state.mint_disposition == "decidable"
+    assert state.mint_degrade is None
+
+
+@pytest.mark.asyncio
+async def test_primary_self_asserted_binding_is_replaced_by_two_pass_producer_consensus() -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    raw = _p8_payload_with_typed_state_binding(packet["original"])
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote="whether the request was newly submitted or already present",
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            ),
+        ),
+    )
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={
+                    6: ("u0", "whether the request was newly submitted or already present"),
+                },
+            )
+        return raw
+
+    policy = await _classify_request(packet["latest_request"], "", [], "", handler)
+
+    state = next(
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.floor_rekeyed_from_path == "output.request_submission_state"
+    )
+    assert policy.request_slot_failure_kind is None
+    assert state.request_slot_id is not None
+    assert state.mint_disposition == "decidable"
+
+
+@pytest.mark.parametrize("binding", [None, {"version": "2"}])
+def test_invalid_typed_binding_uses_unchanged_legacy_admissibility(binding: Any) -> None:
+    criterion = {
+        "outcome": "The request id is returned.",
+        "output_path": "output.request_id",
+        "request_slot_source_id": "u0",
+        "request_slot_source_quote": "request id",
+        "request_slot_datum_binding": binding,
+    }
+    payload = {"completion_criteria": [criterion]}
+
+    decision = _accept_request_slot_anchor_correction(
+        payload,
+        payload,
+        request_slot_request=RequestSlotProducerInputV1(
+            version="1",
+            latest_request="Return the request id.",
+            workflow_context="",
+            earliest_user_turn="",
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history=(),
+            global_context="",
+        ),
+    )
+
+    assert decision.predicate == "accepted"
+
+
+def test_typed_classification_binding_accepts_nonlexical_datum_name() -> None:
+    criterion = {
+        "outcome": "Whether the request was approved or denied is returned.",
+        "kind": "validation_classification",
+        "classification_output_key": "decision_state",
+        "request_slot_source_id": "u0",
+        "request_slot_source_quote": "whether the request was approved or denied",
+        "request_slot_datum_binding": {
+            "version": "1",
+            "criterion_index": 0,
+            "datum_field": "classification_output_key",
+            "datum_value": "decision_state",
+            "source_id": "u0",
+            "source_quote": "whether the request was approved or denied",
+        },
+    }
+    payload = {"completion_criteria": [criterion]}
+
+    decision = _accept_request_slot_anchor_correction(
+        payload,
+        payload,
+        request_slot_request=RequestSlotProducerInputV1(
+            version="1",
+            latest_request="Return whether the request was approved or denied.",
+            workflow_context="",
+            earliest_user_turn="",
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history=(),
+            global_context="",
+        ),
+    )
+
+    assert decision.predicate == "accepted"
+
+
+def test_anchor_correction_rejects_typed_binding_drift() -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    original = _p8_payload_with_typed_state_binding(packet["original"])
+    corrected = _p8_payload_with_typed_state_binding(
+        packet["corrected"],
+        binding_overrides={"datum_value": "output.other"},
+    )
+
+    decision = _accept_request_slot_anchor_correction(
+        original,
+        corrected,
+        request_slot_request=RequestSlotProducerInputV1(
+            version="1",
+            latest_request=packet["latest_request"],
+            workflow_context="",
+            earliest_user_turn="",
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history=(),
+            global_context="",
+        ),
+    )
+
+    assert decision.predicate == "criterion_semantics_changed"
+    assert decision.criterion_index == 6
+
+
+@pytest.mark.parametrize(
+    ("latest_request", "source_id"),
+    [
+        ("Return whether the request was approved or denied.", "u9"),
+        (
+            "Return whether the request was approved or denied and repeat whether the request was approved or denied.",
+            "u0",
+        ),
+    ],
+)
+def test_typed_binding_requires_unique_span_in_nominated_source(latest_request: str, source_id: str) -> None:
+    source_quote = "whether the request was approved or denied"
+    criterion = {
+        "outcome": "Whether the request was approved or denied is returned.",
+        "output_path": "output.decision_state",
+        "request_slot_source_id": source_id,
+        "request_slot_source_quote": source_quote,
+        "request_slot_datum_binding": {
+            "version": "1",
+            "criterion_index": 0,
+            "datum_field": "output_path",
+            "datum_value": "output.decision_state",
+            "source_id": source_id,
+            "source_quote": source_quote,
+        },
+    }
+    payload = {"completion_criteria": [criterion]}
+
+    decision = _accept_request_slot_anchor_correction(
+        payload,
+        payload,
+        request_slot_request=_request_slot_input(latest_request),
+    )
+
+    assert decision.predicate == "original_quote_not_admissible"
+    assert decision.criterion_index == 0
+
+
+@pytest.mark.parametrize("binding", [[], {"version": "1"}])
+@pytest.mark.asyncio
+async def test_malformed_binding_uses_legacy_path_through_classifier(binding: Any) -> None:
+    source_quote = "request id"
+    raw = {
+        "testing_intent": "require_test",
+        "credential_input_kind": "none",
+        "requires_user_clarification": False,
+        "completion_criteria": [
+            {
+                "outcome": "The request id is returned.",
+                "output_path": "output.request_id",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": source_quote,
+                "request_slot_datum_binding": binding,
+            }
+        ],
+    }
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            ),
+        ),
+    )
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return envelope.model_dump(mode="json")
+        if "REQUEST SLOT ANCHOR CORRECTION" in prompt:
+            pytest.fail("malformed binding must not disable legacy admissibility")
+        return raw
+
+    policy = await _classify_request("Return the request id.", "", [], "", handler)
+
+    criterion = policy.completion_criteria[0]
+    assert criterion.request_slot_id is not None
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.mint_degrade is None
+
+
+@pytest.mark.asyncio
+async def test_typed_classification_binding_mints_through_independent_producer() -> None:
+    source_quote = "whether the request was approved or denied"
+    raw = {
+        "testing_intent": "require_test",
+        "credential_input_kind": "none",
+        "requires_user_clarification": False,
+        "completion_criteria": [
+            {
+                "outcome": "Whether the request was approved or denied is returned.",
+                "kind": "validation_classification",
+                "classification_output_key": "decision_state",
+                "expected_classification": "approved",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": source_quote,
+                "request_slot_datum_binding": {
+                    "version": "1",
+                    "criterion_index": 0,
+                    "datum_field": "classification_output_key",
+                    "datum_value": "decision_state",
+                    "source_id": "u0",
+                    "source_quote": source_quote,
+                },
+            }
+        ],
+    }
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.PINNED,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            ),
+        ),
+    )
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={0: ("u0", source_quote)},
+            )
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("producer consensus must not be echoed through a correction call")
+        return raw
+
+    policy = await _classify_request(
+        "Return whether the request was approved or denied.",
+        "",
+        [],
+        "",
+        handler,
+    )
+
+    criterion = policy.completion_criteria[0]
+    assert criterion.request_slot_id is not None
+    assert criterion.classification_output_key == "decision_state"
+    assert criterion.expected_classification == "approved"
+    assert criterion.mint_disposition == "decidable"
+
+
+@pytest.mark.parametrize("corrected_binding", [None, {}])
+def test_anchor_correction_rejects_removed_or_malformed_binding_on_one_side(corrected_binding: Any) -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    original = _p8_payload_with_typed_state_binding(packet["original"])
+    corrected = _p8_payload_with_typed_state_binding(packet["corrected"])
+    corrected_criterion = corrected["completion_criteria"][6]
+    if corrected_binding is None:
+        corrected_criterion.pop("request_slot_datum_binding")
+    else:
+        corrected_criterion["request_slot_datum_binding"] = corrected_binding
+
+    decision = _accept_request_slot_anchor_correction(
+        original,
+        corrected,
+        request_slot_request=_request_slot_input(packet["latest_request"]),
+    )
+
+    assert decision.predicate == "criterion_semantics_changed"
+    assert decision.criterion_index == 6
+
+
+@pytest.mark.parametrize("mutated_index", [False, 0.0])
+def test_anchor_correction_compares_binding_values_type_strictly(mutated_index: Any) -> None:
+    source_quote = "whether the request was approved or denied"
+    criterion = {
+        "outcome": "Whether the request was approved or denied is returned.",
+        "output_path": "output.decision_state",
+        "request_slot_source_id": "u0",
+        "request_slot_source_quote": source_quote,
+        "request_slot_datum_binding": {
+            "version": "1",
+            "criterion_index": 0,
+            "datum_field": "output_path",
+            "datum_value": "output.decision_state",
+            "source_id": "u0",
+            "source_quote": source_quote,
+        },
+    }
+    original = {"completion_criteria": [criterion]}
+    corrected = json.loads(json.dumps(original))
+    corrected["completion_criteria"][0]["request_slot_datum_binding"]["criterion_index"] = mutated_index
+
+    decision = _accept_request_slot_anchor_correction(
+        original,
+        corrected,
+        request_slot_request=_request_slot_input(f"Return {source_quote}."),
+    )
+
+    assert decision.predicate == "criterion_semantics_changed"
+    assert decision.criterion_index == 0
+
+
+def test_validation_classification_binding_cannot_certify_inactive_output_path() -> None:
+    source_quote = "whether the request was approved or denied"
+    criterion = {
+        "outcome": "Whether the request was approved or denied is returned.",
+        "kind": "validation_classification",
+        "output_path": "output.zzz",
+        "classification_output_key": "unrelated_key",
+        "expected_classification": "approved",
+        "request_slot_source_id": "u0",
+        "request_slot_source_quote": source_quote,
+        "request_slot_datum_binding": {
+            "version": "1",
+            "criterion_index": 0,
+            "datum_field": "output_path",
+            "datum_value": "output.zzz",
+            "source_id": "u0",
+            "source_quote": source_quote,
+        },
+    }
+    payload = {"completion_criteria": [criterion]}
+
+    decision = _accept_request_slot_anchor_correction(
+        payload,
+        payload,
+        request_slot_request=_request_slot_input(f"Return {source_quote}."),
+    )
+
+    assert decision.predicate == "original_quote_not_admissible"
+    assert decision.criterion_index == 0
+
+
+def test_typed_binding_cannot_certify_classification_key_rejected_by_parser() -> None:
+    source_quote = "whether the request was approved or denied"
+    criterion = {
+        "outcome": "Whether the request was approved or denied is returned.",
+        "kind": "validation_classification",
+        "classification_output_key": "bad.key",
+        "expected_classification": "approved",
+        "request_slot_source_id": "u0",
+        "request_slot_source_quote": source_quote,
+        "request_slot_datum_binding": {
+            "version": "1",
+            "criterion_index": 0,
+            "datum_field": "classification_output_key",
+            "datum_value": "bad.key",
+            "source_id": "u0",
+            "source_quote": source_quote,
+        },
+    }
+    payload = {"completion_criteria": [criterion]}
+
+    request = _request_slot_input(f"Return {source_quote}.")
+    decision = _accept_request_slot_anchor_correction(
+        payload,
+        payload,
+        request_slot_request=request,
+    )
+
+    assert decision.predicate == "original_quote_not_admissible"
+    assert decision.criterion_index == 0
+
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote=source_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.PINNED,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+        ),
+    )
+    policy = _classification_from_raw(
+        payload,
+        request_slot_request=request,
+        request_slot_contract=contract,
+    )
+    parsed = next(criterion for criterion in policy.completion_criteria if criterion.request_slot_id is None)
+    assert parsed.request_slot_id is None
+    assert parsed.classification_output_key is None
+    assert parsed.mint_disposition == "degraded"
+    assert parsed.mint_degrade == "undecidable_judgment"
+
+
+@pytest.mark.asyncio
+async def test_valid_typed_binding_degrades_when_independent_producer_disagrees() -> None:
+    packet = json.loads(P8_LIVE_NOOP_ANCHOR_CORRECTION_FIXTURE.read_text())
+    raw = _p8_payload_with_typed_state_binding(packet["original"])
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=tuple(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            )
+            for source_quote in ("output the request id", "provider-captured address", "requested date", "status")
+        ),
+    )
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return envelope.model_dump(mode="json")
+        if "REQUEST SLOT ANCHOR CORRECTION" in prompt:
+            pytest.fail("valid typed binding must not enter correction")
+        if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
+            return {"version": "1", "criterion_id": None, "terminal_action_family": None}
+        return raw
+
+    policy = await _classify_request(packet["latest_request"], "", [], "", handler)
+
+    state = next(
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.floor_rekeyed_from_path == "output.request_submission_state"
+    )
+    assert state.request_slot_id is None
+    assert state.mint_disposition == "degraded"
+    assert state.mint_degrade == "undecidable_judgment"
+
+
+def test_anchor_correction_accepts_quote_unique_in_nominated_source_with_cross_source_overlap() -> None:
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request="Return the request id for the current QuickConnect.",
+        workflow_context="",
+        earliest_user_turn="Return the request id from the prior QuickConnect.",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "The request id is returned.",
+                "output_path": "output.request_id",
+                "request_slot_source_id": "u9",
+                "request_slot_source_quote": "request id",
+            }
+        ]
+    }
+    corrected = {
+        "completion_criteria": [
+            {
+                **original["completion_criteria"][0],
+                "request_slot_source_id": "u1",
+            }
+        ]
+    }
+
+    decision = _accept_request_slot_anchor_correction(
+        original,
+        corrected,
+        request_slot_request=request,
+    )
+
+    assert decision.predicate == "accepted"
+    assert decision.accepted_payload is not None
+    accepted = decision.accepted_payload
+    assert accepted["completion_criteria"][0]["request_slot_source_id"] == "u1"
+
+
+def test_anchor_correction_rejection_names_exact_failed_predicate() -> None:
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request="Return the request id.",
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "The request id is returned.",
+                "output_path": "output.request_id",
+                "request_slot_source_id": "u9",
+                "request_slot_source_quote": "request id",
+            }
+        ]
+    }
+    corrected = {
+        "completion_criteria": [
+            {
+                **original["completion_criteria"][0],
+                "request_slot_source_id": "u1",
+                "request_slot_source_quote": "request",
+            }
+        ]
+    }
+
+    decision = _accept_request_slot_anchor_correction(original, corrected, request_slot_request=request)
+
+    assert decision.predicate == "original_quote_not_admissible"
+    assert decision.criterion_index == 0
+    assert decision.accepted_payload is None
+
+
+def test_anchor_correction_rejection_capture_is_redacted_and_content_addressed() -> None:
+    original = {
+        "password": "unredacted-password",
+        "raw_secret_evidence": "bare-credential-value-1234567890",
+        "completion_criteria": [
+            {
+                "outcome": "Return the request id after password=another-secret",
+                "request_slot_source_id": "u9",
+            }
+        ],
+    }
+    corrected = {
+        "api_key": "sk-abcdefghijklmnop",
+        "completion_criteria": [
+            {
+                "outcome": "Return the request id after password=another-secret",
+                "request_slot_source_id": "u0",
+            }
+        ],
+    }
+
+    capture = _anchor_correction_rejection_capture(original, corrected)
+
+    assert capture is not None
+    serialized_capture = json.dumps(capture, sort_keys=True)
+    assert "unredacted-password" not in serialized_capture
+    assert "bare-credential-value-1234567890" not in serialized_capture
+    assert "another-secret" not in serialized_capture
+    assert "sk-abcdefghijklmnop" not in serialized_capture
+    assert "****" in capture["original_payload_json"]
+    assert json.loads(capture["original_payload_json"])["raw_secret_evidence"] == "[REDACTED_SECRET]"
+    assert "[REDACTED_SECRET]" in capture["corrected_payload_json"]
+    assert hashlib.sha256(capture["original_payload_json"].encode()).hexdigest() == capture["original_sha256"]
+    assert hashlib.sha256(capture["corrected_payload_json"].encode()).hexdigest() == capture["corrected_sha256"]
+    pair_json = json.dumps(
+        {
+            "corrected": json.loads(capture["corrected_payload_json"]),
+            "original": json.loads(capture["original_payload_json"]),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert hashlib.sha256(pair_json.encode()).hexdigest() == capture["pair_sha256"]
 
 
 @pytest.mark.asyncio
@@ -1032,81 +2483,7 @@ async def test_anchor_only_unpinnable_slots_degrade() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unanchored_requested_output_with_invalid_correction_fails_closed() -> None:
-    calls: list[str] = []
-    unanchored = {
-        "testing_intent": "require_test",
-        "credential_input_kind": "none",
-        "requires_user_clarification": False,
-        "completion_criteria": [
-            {
-                "outcome": "The workflow returns the confirmation number.",
-                "output_path": "output.confirmation_number",
-                "expected_output_shape": "status_label",
-            }
-        ],
-    }
-
-    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
-        calls.append(prompt_name)
-        return unanchored
-
-    policy = await _classify_request(CONFIRMATION_NUMBER_REQUEST, "", [], "", handler)
-
-    assert calls == ["workflow-copilot-request-policy", "workflow-copilot-request-policy"]
-    criterion = policy.completion_criteria[0]
-    assert criterion.level == "run"
-    assert criterion.kind == "outcome"
-    assert criterion.pinability is None
-    assert criterion.output_path is None
-    assert criterion.expected_output_shape is None
-    assert criterion.floor_rekeyed_from_path == "output.confirmation_number"
-    assert criterion.mint_disposition == "degraded"
-    assert criterion.mint_degrade == "undecidable_judgment"
-    assert policy.request_slot_failure_kind == "invalid_anchor_correction"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("corrected_quote", ["account number", "number"])
-async def test_unanchored_correction_must_match_its_structured_datum(corrected_quote: str) -> None:
-    calls: list[str] = []
-    request = "Return the confirmation code beside the adjacent account number."
-    unanchored = {
-        "completion_criteria": [
-            {
-                "outcome": "The workflow returns the confirmation code beside the account number.",
-                "output_path": "output.confirmation_code",
-                "expected_output_shape": "reference_code",
-            }
-        ]
-    }
-    corrected = {
-        "completion_criteria": [
-            {
-                **unanchored["completion_criteria"][0],
-                "request_slot_source_id": "u0",
-                "request_slot_source_quote": corrected_quote,
-            }
-        ]
-    }
-
-    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
-        calls.append(prompt_name)
-        return unanchored if len(calls) == 1 else corrected
-
-    policy = await _classify_request(request, "", [], "", handler)
-
-    assert calls == ["workflow-copilot-request-policy", "workflow-copilot-request-policy"]
-    criterion = policy.completion_criteria[0]
-    assert policy.request_slot_failure_kind == "invalid_anchor_correction"
-    assert criterion.output_path is None
-    assert criterion.expected_output_shape is None
-    assert criterion.mint_disposition == "degraded"
-    assert criterion.mint_degrade == "undecidable_judgment"
-
-
-@pytest.mark.asyncio
-async def test_unanchored_correction_tied_to_its_structured_datum_mints_decidable() -> None:
+async def test_unanchored_requested_output_uses_producer_consensus_and_mints_decidable() -> None:
     calls: list[str] = []
     request = "Return the confirmation code."
     unanchored = {
@@ -1115,15 +2492,6 @@ async def test_unanchored_correction_tied_to_its_structured_datum_mints_decidabl
                 "outcome": "The workflow returns the confirmation code.",
                 "output_path": "output.confirmation_code",
                 "expected_output_shape": "reference_code",
-            }
-        ]
-    }
-    corrected = {
-        "completion_criteria": [
-            {
-                **unanchored["completion_criteria"][0],
-                "request_slot_source_id": "u0",
-                "request_slot_source_quote": "confirmation code",
             }
         ]
     }
@@ -1143,13 +2511,18 @@ async def test_unanchored_correction_tied_to_its_structured_datum_mints_decidabl
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
         if prompt_name == REQUEST_SLOT_PROMPT_NAME:
-            return envelope.model_dump(mode="json")
-        return unanchored if calls.count("workflow-copilot-request-policy") == 1 else corrected
+            return _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={0: ("u0", "confirmation code")},
+            )
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("producer consensus must not be echoed through a correction call")
+        return unanchored
 
     policy = await _classify_request(request, "", [], "", handler)
 
     assert calls == [
-        "workflow-copilot-request-policy",
         "workflow-copilot-request-policy",
         REQUEST_SLOT_PROMPT_NAME,
         REQUEST_SLOT_PROMPT_NAME,
@@ -1162,7 +2535,7 @@ async def test_unanchored_correction_tied_to_its_structured_datum_mints_decidabl
 
 
 @pytest.mark.asyncio
-async def test_source_valid_wrong_datum_anchor_gets_one_correction_and_fails_closed() -> None:
+async def test_source_valid_wrong_primary_anchor_is_replaced_by_producer_consensus() -> None:
     calls: list[str] = []
     request = "Return the confirmation ID and the adjacent account number."
     wrong_datum = {
@@ -1181,6 +2554,13 @@ async def test_source_valid_wrong_datum_anchor_gets_one_correction_and_fails_clo
         slots=(
             RequestSlotDeclarationV1(
                 source_id="u0",
+                source_quote="confirmation ID",
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            ),
+            RequestSlotDeclarationV1(
+                source_id="u0",
                 source_quote="account number",
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
@@ -1192,21 +2572,104 @@ async def test_source_valid_wrong_datum_anchor_gets_one_correction_and_fails_clo
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
         if prompt_name == REQUEST_SLOT_PROMPT_NAME:
-            return envelope.model_dump(mode="json")
+            return _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={0: ("u0", "confirmation ID")},
+            )
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("producer consensus must not be echoed through a correction call")
         return wrong_datum
 
     policy = await _classify_request(request, "", [], "", handler)
 
-    assert calls == ["workflow-copilot-request-policy", "workflow-copilot-request-policy"]
+    assert calls == [
+        "workflow-copilot-request-policy",
+        REQUEST_SLOT_PROMPT_NAME,
+        REQUEST_SLOT_PROMPT_NAME,
+    ]
     criterion = policy.completion_criteria[0]
-    assert policy.request_slot_failure_kind == "invalid_anchor_correction"
-    assert criterion.request_slot_id is None
-    assert criterion.mint_disposition == "degraded"
-    assert criterion.mint_degrade == "undecidable_judgment"
+    assert policy.request_slot_failure_kind is None
+    assert criterion.request_slot_id is not None
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.mint_degrade is None
+
+
+def test_producer_consensus_replaces_primary_anchor_with_agreed_datum_slot() -> None:
+    latest_request = "Return the confirmation ID and the adjacent account number."
+    original = {
+        "completion_criteria": [
+            {
+                "outcome": "The workflow returns the confirmation ID beside the account number.",
+                "output_path": "output.confirmation_id",
+                "request_slot_source_id": "u0",
+                "request_slot_source_quote": "account number",
+            }
+        ]
+    }
+    outcome_sha256 = hashlib.sha256(original["completion_criteria"][0]["outcome"].encode()).hexdigest()
+    request = _request_slot_input(latest_request).model_copy(
+        update={
+            "datum_targets": (
+                RequestSlotDatumTargetV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    datum_value="output.confirmation_id",
+                    criterion_outcome_sha256=outcome_sha256,
+                ),
+            )
+        }
+    )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=tuple(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote=quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                )
+                for quote in ("confirmation ID", "account number")
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id="u0",
+                    source_quote="confirmation ID",
+                ),
+            ),
+        ),
+    )
+    decision = _apply_request_slot_datum_bindings(
+        original,
+        request_slot_request=request,
+        request_slot_contract=contract,
+    )
+
+    assert decision.predicate == "accepted"
+    assert decision.accepted_payload is not None
+    assert decision.accepted_payload["completion_criteria"][0]["request_slot_source_quote"] == "confirmation ID"
+    assert decision.trusted_bindings == (
+        request_policy_module.TrustedRequestSlotDatumBindingV1(
+            version="1",
+            criterion_index=0,
+            datum_field="output_path",
+            datum_value="output.confirmation_id",
+            criterion_outcome_sha256=outcome_sha256,
+            source_id="u0",
+            source_quote="confirmation ID",
+            slot_id=contract.datum_bindings[0].slot_id,
+        ),
+    )
 
 
 @pytest.mark.asyncio
-async def test_anchor_correction_preserves_original_criterion_datum_quote() -> None:
+async def test_producer_consensus_replaces_invalid_primary_source_identity() -> None:
     calls: list[str] = []
     request = "Return the confirmation code."
     original = {
@@ -1217,15 +2680,6 @@ async def test_anchor_correction_preserves_original_criterion_datum_quote() -> N
                 "expected_output_shape": "reference_code",
                 "request_slot_source_id": "u9",
                 "request_slot_source_quote": "confirmation code",
-            }
-        ]
-    }
-    corrected = {
-        "completion_criteria": [
-            {
-                **original["completion_criteria"][0],
-                "request_slot_source_id": "u0",
-                "request_slot_source_quote": "Return the confirmation code",
             }
         ]
     }
@@ -1245,13 +2699,18 @@ async def test_anchor_correction_preserves_original_criterion_datum_quote() -> N
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
         if prompt_name == REQUEST_SLOT_PROMPT_NAME:
-            return envelope.model_dump(mode="json")
-        return original if calls.count("workflow-copilot-request-policy") == 1 else corrected
+            return _request_slot_envelope_with_target_bindings(
+                prompt,
+                envelope,
+                anchors_by_index={0: ("u0", "confirmation code")},
+            )
+        if "REQUEST SLOT DATUM BINDING" in prompt:
+            pytest.fail("producer consensus must not be echoed through a correction call")
+        return original
 
     policy = await _classify_request(request, "", [], "", handler)
 
     assert calls == [
-        "workflow-copilot-request-policy",
         "workflow-copilot-request-policy",
         REQUEST_SLOT_PROMPT_NAME,
         REQUEST_SLOT_PROMPT_NAME,
@@ -1259,77 +2718,8 @@ async def test_anchor_correction_preserves_original_criterion_datum_quote() -> N
     criterion = policy.completion_criteria[0]
     assert policy.request_slot_failure_kind is None
     assert criterion.floor_rekeyed_from_path == "output.confirmation_code"
+    assert criterion.request_slot_id is not None
     assert criterion.mint_disposition == "decidable"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "correction_kind",
-    ["semantic_drift", "duplicate_quote", "unknown_source", "adjacent_datum", "bare_shared_token"],
-)
-async def test_invalid_anchor_correction_fails_closed(correction_kind: str) -> None:
-    calls: list[str] = []
-    if correction_kind == "duplicate_quote":
-        request = "Return status and status."
-    elif correction_kind in {"adjacent_datum", "bare_shared_token"}:
-        request = "Return the confirmation ID and the adjacent account number."
-    else:
-        request = CONFIRMATION_NUMBER_REQUEST
-    unanchored = {
-        "testing_intent": "require_test",
-        "credential_input_kind": "none",
-        "requires_user_clarification": False,
-        "completion_criteria": [
-            {
-                "outcome": "The workflow returns the confirmation number.",
-                "output_path": "output.confirmation_number",
-                "expected_output_shape": "status_label",
-            }
-        ],
-    }
-    if correction_kind in {"adjacent_datum", "bare_shared_token"}:
-        unanchored["completion_criteria"][0]["outcome"] = (
-            "The workflow returns the confirmation number beside the account data."
-        )
-    original_quote = (
-        "status"
-        if correction_kind == "duplicate_quote"
-        else "confirmation ID"
-        if correction_kind in {"adjacent_datum", "bare_shared_token"}
-        else "return the confirmation number"
-    )
-    unanchored["completion_criteria"][0]["request_slot_source_id"] = "u8"
-    unanchored["completion_criteria"][0]["request_slot_source_quote"] = original_quote
-    corrected_item = {
-        **unanchored["completion_criteria"][0],
-        "request_slot_source_id": "u9" if correction_kind == "unknown_source" else "u0",
-        "request_slot_source_quote": (
-            "status"
-            if correction_kind == "duplicate_quote"
-            else "account number"
-            if correction_kind == "adjacent_datum"
-            else "number"
-            if correction_kind == "bare_shared_token"
-            else original_quote
-        ),
-    }
-    if correction_kind == "semantic_drift":
-        corrected_item["outcome"] = "The workflow returns a guessed confirmation."
-    corrected = {**unanchored, "completion_criteria": [corrected_item]}
-
-    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
-        calls.append(prompt_name)
-        return unanchored if len(calls) == 1 else corrected
-
-    policy = await _classify_request(request, "", [], "", handler)
-
-    assert calls == ["workflow-copilot-request-policy", "workflow-copilot-request-policy"]
-    criterion = policy.completion_criteria[0]
-    assert criterion.output_path is None
-    assert criterion.expected_output_shape is None
-    assert criterion.mint_disposition == "degraded"
-    assert criterion.mint_degrade == "undecidable_judgment"
-    assert policy.request_slot_failure_kind == "invalid_anchor_correction"
 
 
 @pytest.mark.asyncio
@@ -1365,7 +2755,6 @@ async def test_anchor_correction_still_requires_slot_producer_agreement() -> Non
     policy = await _classify_request(CONFIRMATION_NUMBER_REQUEST, "", [], "", handler)
 
     assert calls == [
-        "workflow-copilot-request-policy",
         "workflow-copilot-request-policy",
         *([REQUEST_SLOT_PROMPT_NAME] * 4),
     ]

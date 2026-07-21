@@ -3,7 +3,7 @@ import {
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
 import { JsonExplorer } from "./BlockInspector";
-import { CodeBlock, Section } from "./shared";
+import { BlockDetailFailure, CodeBlock, Section } from "./shared";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -44,6 +44,7 @@ function BlockDetailConditional({ block }: Props) {
 
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
+      <BlockDetailFailure block={block} />
       {hasExecutedBranch && evaluations && evaluations.length > 0 ? (
         <Section title="Branches">
           <div className="space-y-2">

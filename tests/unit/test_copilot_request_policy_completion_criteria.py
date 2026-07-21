@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
 )
+from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_PROMPT_NAME
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from tests.unit.conftest import make_copilot_context
@@ -80,6 +81,8 @@ async def _classify_with_terminal_action_reconciliation(
     prompts: list[str] = []
 
     async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return {"version": "1", "slots": []}
         assert prompt_name == request_policy_module.PROMPT_NAME
         prompts.append(prompt)
         if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
@@ -236,6 +239,87 @@ async def test_ambiguous_terminal_action_reconciliation_abstains_without_rekeyin
     assert [
         entry["reason"] for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted"
     ] == ["malformed_response"]
+
+
+@pytest.mark.asyncio
+async def test_request_slot_failure_precedes_later_transient_reconciliation_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = {
+        "testing_intent": "require_test",
+        "credential_input_kind": "credential_name",
+        "credential_refs": ["Portal Login"],
+        "requires_user_clarification": False,
+        "completion_criteria": [
+            {
+                "outcome": "The requested service setup is created.",
+                "request_slot_source_id": "u9",
+                "request_slot_source_quote": "create the requested service setup",
+            }
+        ],
+    }
+    drifted = {
+        **original,
+        "completion_criteria": [
+            {
+                **original["completion_criteria"][0],
+                "outcome": "A guessed service setup is created.",
+            }
+        ],
+    }
+    classifier_calls = 0
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+        nonlocal classifier_calls
+        assert prompt_name == request_policy_module.PROMPT_NAME
+        classifier_calls += 1
+        return original if classifier_calls == 1 else drifted
+
+    run_classifier = request_policy_module._run_request_policy_classifier
+
+    async def run_with_transient_reconciliation(
+        handler: Any,
+        prompt: str,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[Any | None, str, int]:
+        if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
+            return None, "transient_error", 0
+        return await run_classifier(handler, prompt, deadline=deadline)
+
+    monkeypatch.setattr(request_policy_module, "_run_request_policy_classifier", run_with_transient_reconciliation)
+
+    with capture_logs() as logs:
+        policy = await request_policy_module._classify_request(
+            "Sign in and create the requested service setup.", "", [], "", handler
+        )
+
+    assert policy.request_slot_failure_kind == "invalid_anchor_correction"
+    (event,) = (entry for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted")
+    assert event["reason"] == "request_slot_failure"
+    assert event["failure_kind"] == "request_slot_failure"
+    assert event["retryable"] is False
+    assert event["request_slot_failure_kind"] == "invalid_anchor_correction"
+
+
+def test_unknown_request_slot_failure_kind_fails_closed_at_omission_boundary() -> None:
+    policy = RequestPolicy(
+        credential_input_kind="credential_name",
+        request_slot_failure_kind="future_request_slot_failure",
+    )
+
+    with capture_logs() as logs:
+        request_policy_module._log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="classifier_failed",
+            failure_kind="transient_error",
+        )
+
+    (event,) = (entry for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted")
+    assert event["reason"] == "request_slot_failure"
+    assert event["failure_kind"] == "request_slot_failure"
+    assert event["retryable"] is False
+    assert event["request_slot_failure_kind"] == "future_request_slot_failure"
 
 
 @pytest.mark.asyncio

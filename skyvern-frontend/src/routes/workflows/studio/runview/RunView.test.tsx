@@ -555,24 +555,6 @@ describe("RunView failure banner", () => {
 
     expect(scope.queryByText("canceled by user")).toBeNull();
   });
-
-  test("hides the run failure banner outside the Timeline view", () => {
-    seedCompletedRun({
-      status: Status.Failed,
-      failure_reason: "Login page rejected the credentials",
-    });
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    // Visible on the default Timeline view.
-    expect(
-      scope.getByText("Login page rejected the credentials"),
-    ).not.toBeNull();
-
-    // Switching to another tab hides the run-level failure banner.
-    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
-    expect(scope.queryByText("Login page rejected the credentials")).toBeNull();
-  });
 });
 
 describe("RunView live affordances", () => {

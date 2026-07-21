@@ -19,7 +19,6 @@ import {
   shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
-import { BlockDetailFailure } from "./shared";
 
 type InspectorField = {
   label: string;
@@ -381,6 +380,7 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   const fields: Array<InspectorField> = [];
   pushField(fields, "Task ID", block.task_id);
   pushField(fields, "Engine", block.engine);
+  pushField(fields, "Failure reason", block.failure_reason);
   pushField(fields, "Executed branch", block.executed_branch_expression);
   pushField(fields, "Executed branch result", block.executed_branch_result);
   pushField(fields, "Executed next block", block.executed_branch_next_block);
@@ -543,13 +543,7 @@ function BlockInspector({
   const outputTabLabel = showsExtractedInformation
     ? "Extracted Information"
     : "Outputs";
-  // A failed block/action opens on Summary so its failure reason (the only
-  // place it now renders) is visible without hunting through tabs.
-  const defaultTab = block.failure_reason
-    ? "summary"
-    : hasOutput
-      ? "outputs"
-      : "summary";
+  const defaultTab = hasOutput ? "outputs" : "summary";
   const [activeTab, setActiveTab] = useState(defaultTab);
   const diagnosticsTaskId = action?.task_id ?? block.task_id;
   const diagnosticsStepIndex = action
@@ -605,8 +599,7 @@ function BlockInspector({
             </Link>
           )}
         </TabsList>
-        <TabsContent value="summary" className="m-0 space-y-3">
-          <BlockDetailFailure block={block} />
+        <TabsContent value="summary" className="m-0">
           <FieldList
             fields={summaryFields}
             emptyText="No additional summary data."

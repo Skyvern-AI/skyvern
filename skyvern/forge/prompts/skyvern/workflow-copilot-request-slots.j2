@@ -1,11 +1,13 @@
 Classify the request-owned output slots for the latest Workflow Copilot turn. Return only JSON.
 
 Schema-valid examples:
-{"version":"1","slots":[]}
-{"version":"1","slots":[{"source_id":"u0","source_quote":"required_columns","plane":"definition","pinability":"shapeless_valid","antecedent_family":"unconditional"}]}
-{"version":"1","slots":[{"source_id":"u0","source_quote":"processed record count","plane":"run","pinability":"shapeless_valid","antecedent_family":"unconditional"}]}
-{"version":"1","slots":[{"source_id":"u0","source_quote":"status must equal complete","plane":"run","pinability":"pinned","antecedent_family":"unconditional"}]}
-{"version":"1","slots":[{"source_id":"u0","source_quote":"report the blocker if online submission is unavailable","plane":"run","pinability":"shapeless_valid","antecedent_family":"blocker"}]}
+{"version":"1","slots":[],"datum_bindings":[]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"required_columns","plane":"definition","pinability":"shapeless_valid","antecedent_family":"unconditional"}],"datum_bindings":[]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"processed record count","plane":"run","pinability":"shapeless_valid","antecedent_family":"unconditional"}],"datum_bindings":[]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"status must equal complete","plane":"run","pinability":"pinned","antecedent_family":"unconditional"}],"datum_bindings":[]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"report the blocker if online submission is unavailable","plane":"run","pinability":"shapeless_valid","antecedent_family":"blocker"}],"datum_bindings":[]}
+{"version":"1","slots":[{"source_id":"u0","source_quote":"request id","plane":"run","pinability":"shapeless_valid","antecedent_family":"unconditional"}],"datum_bindings":[{"criterion_index":0,"datum_field":"output_path","declined":false,"source_id":"u0","source_quote":"request id"}]}
+{"version":"1","slots":[],"datum_bindings":[{"criterion_index":0,"datum_field":"output_path","declined":true}]}
 
 Rules:
 - Return version exactly "1". Return an empty slots list when the user requests no output member; empty membership is an explicit contract, not an error.
@@ -24,6 +26,7 @@ Rules:
   - undecidable: the source does not establish whether the output is unconditional or blocker-contingent. Never guess unconditional.
 - Include every request-owned output member exactly once. A conditional fallback is still an output member even when another classifier might omit its condition. Do not emit paths, path segments, IDs, aliases, labels, counts, expected values, explanations, or unknown fields.
 - Do not infer slots from sampled page shapes or non-user context. Do not normalize, rename, or paraphrase source quotes.
+- Return datum_bindings as an array. When DATUM TARGETS is empty, return an empty array. Otherwise answer every target exactly once and no others, identifying each target only by its criterion_index and datum_field. When user text names the datum, return exactly {"criterion_index":<target integer>,"datum_field":<target field>,"declined":false,"source_id":<source ID>,"source_quote":<smallest unique exact quote>} whose independently declared slot names that target datum. Every accepted binding must name one exact slot in your slots array, and two targets may not bind the same slot. When no source quote actually names a target datum, return exactly {"criterion_index":<target integer>,"datum_field":<target field>,"declined":true}. The server owns datum_value and criterion_outcome_sha256; never return either field. Decline instead of guessing or borrowing an adjacent datum.
 
 Ordered, deduplicated user request sources:
 ```{{ request_sources }}```
@@ -33,3 +36,5 @@ Latest assistant turn (non-authoritative):
 ```{{ latest_assistant_turn }}```
 Bounded global context (non-authoritative):
 ```{{ global_context }}```
+Datum targets from the immutable request-policy payload:
+```{{ datum_targets }}```

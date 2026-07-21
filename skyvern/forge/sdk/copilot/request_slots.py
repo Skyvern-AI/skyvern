@@ -62,6 +62,15 @@ class RequestSlotProducerFailureKind(StrEnum):
     INCONSISTENT_OUTPUT = "inconsistent_output"
 
 
+class RequestSlotDatumTargetV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    criterion_index: int = Field(ge=0, le=63)
+    datum_field: Literal["output_path", "classification_output_key"]
+    datum_value: str = Field(min_length=1, max_length=256)
+    criterion_outcome_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
 class RequestSlotProducerInputV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -73,6 +82,7 @@ class RequestSlotProducerInputV1(BaseModel):
     latest_assistant_turn: str = Field(max_length=4_096)
     retained_history: tuple[str, ...] = Field(max_length=8)
     global_context: str = Field(max_length=32_768)
+    datum_targets: tuple[RequestSlotDatumTargetV1, ...] = Field(default=(), max_length=64)
 
     @field_validator("retained_history")
     @classmethod
@@ -80,6 +90,16 @@ class RequestSlotProducerInputV1(BaseModel):
         if any(not entry.strip() or len(entry) > 4_096 for entry in entries):
             raise ValueError("retained history entries must be non-empty and at most 4096 characters")
         return entries
+
+    @field_validator("datum_targets")
+    @classmethod
+    def _validate_datum_targets(
+        cls, targets: tuple[RequestSlotDatumTargetV1, ...]
+    ) -> tuple[RequestSlotDatumTargetV1, ...]:
+        identities = [(target.criterion_index, target.datum_field) for target in targets]
+        if len(set(identities)) != len(identities):
+            raise ValueError("datum targets must have unique criterion/field identities")
+        return targets
 
 
 class RequestSlotSourceV1(BaseModel):
@@ -113,20 +133,64 @@ class RequestSlotDeclarationV1(BaseModel):
         return quote
 
 
+class RequestSlotDatumBindingDeclarationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    criterion_index: int = Field(ge=0, le=63)
+    datum_field: Literal["output_path", "classification_output_key"]
+    declined: Literal[False]
+    source_id: str = Field(min_length=2, max_length=3, pattern=_SOURCE_ID_PATTERN.pattern)
+    source_quote: str = Field(min_length=1, max_length=_MAX_SOURCE_QUOTE_CHARS)
+
+    @field_validator("source_quote")
+    @classmethod
+    def _validate_source_quote(cls, quote: str) -> str:
+        if not quote.strip():
+            raise ValueError("source_quote must contain non-whitespace request text")
+        return quote
+
+
+class RequestSlotDatumDeclineDeclarationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    criterion_index: int = Field(ge=0, le=63)
+    datum_field: Literal["output_path", "classification_output_key"]
+    declined: Literal[True]
+
+
 class RequestSlotEnvelopeV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal["1"]
     slots: tuple[RequestSlotDeclarationV1, ...] = Field(max_length=64)
+    datum_bindings: tuple[RequestSlotDatumBindingDeclarationV1 | RequestSlotDatumDeclineDeclarationV1, ...] = Field(
+        default=(), max_length=64
+    )
 
 
-def _request_digest(version: str, sources: tuple[RequestSlotSourceV1, ...]) -> str:
+def _request_digest(
+    version: str,
+    sources: tuple[RequestSlotSourceV1, ...],
+    datum_targets: tuple[RequestSlotDatumTargetV1, ...],
+) -> str:
+    digest_payload: list[object] = [
+        version,
+        [[source.source_id, source.text] for source in sources],
+    ]
+    # Preserve persisted slot identities for legacy/unbound contracts while making
+    # targeted producer contracts identity-complete for replay and caching.
+    if datum_targets:
+        digest_payload.append([target.model_dump(mode="json") for target in datum_targets])
     encoded = json.dumps(
-        [version, [[source.source_id, source.text] for source in sources]],
+        digest_payload,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def request_slot_request_digest(request: RequestSlotProducerInputV1) -> str:
+    return _request_digest(request.version, request_slot_sources(request), request.datum_targets)
 
 
 def _canonical_path(request_digest: str, ordinal: int) -> tuple[str, tuple[str, str]]:
@@ -175,6 +239,27 @@ class CanonicalRequestSlotV1(BaseModel):
         return self
 
 
+class CanonicalRequestSlotDatumBindingV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    criterion_index: int = Field(ge=0, le=63)
+    datum_field: Literal["output_path", "classification_output_key"]
+    datum_value: str = Field(min_length=1, max_length=256)
+    criterion_outcome_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    source_id: str = Field(min_length=2, max_length=3, pattern=_SOURCE_ID_PATTERN.pattern)
+    source_quote: str = Field(min_length=1, max_length=_MAX_SOURCE_QUOTE_CHARS)
+    slot_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class CanonicalRequestSlotDatumDeclineV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    criterion_index: int = Field(ge=0, le=63)
+    datum_field: Literal["output_path", "classification_output_key"]
+    datum_value: str = Field(min_length=1, max_length=256)
+    criterion_outcome_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
 class RequestSlotContractV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -182,6 +267,8 @@ class RequestSlotContractV1(BaseModel):
     request_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     slots: tuple[CanonicalRequestSlotV1, ...] = Field(max_length=64)
     count: int = Field(ge=0, le=64)
+    datum_bindings: tuple[CanonicalRequestSlotDatumBindingV1, ...] = Field(default=(), max_length=64)
+    datum_declines: tuple[CanonicalRequestSlotDatumDeclineV1, ...] = Field(default=(), max_length=64)
 
     @model_validator(mode="after")
     def _validate_derived_membership(self) -> RequestSlotContractV1:
@@ -193,6 +280,19 @@ class RequestSlotContractV1(BaseModel):
             raise ValueError("slot membership contains a canonical path collision")
         if len({slot.slot_id for slot in self.slots}) != self.count:
             raise ValueError("slot membership contains a canonical slot identity collision")
+        if len({binding.slot_id for binding in self.datum_bindings}) != len(self.datum_bindings):
+            raise ValueError("datum bindings must map injectively to canonical slots")
+        binding_identities = [(binding.criterion_index, binding.datum_field) for binding in self.datum_bindings]
+        if len(set(binding_identities)) != len(binding_identities):
+            raise ValueError("datum bindings must have unique criterion/field identities")
+        decline_identities = [(decline.criterion_index, decline.datum_field) for decline in self.datum_declines]
+        if len(set(decline_identities)) != len(decline_identities):
+            raise ValueError("datum declines must have unique criterion/field identities")
+        if set(binding_identities) & set(decline_identities):
+            raise ValueError("datum targets cannot be both bound and declined")
+        slot_ids = {slot.slot_id for slot in self.slots}
+        if any(binding.slot_id not in slot_ids for binding in self.datum_bindings):
+            raise ValueError("datum binding references an unknown canonical slot")
 
         previous: CanonicalRequestSlotV1 | None = None
         for slot in self.slots:
@@ -305,6 +405,18 @@ def canonicalize_request_slots(
         raise ValueError("request and response contract versions must match")
     sources = request_slot_sources(request)
     source_by_id = {source.source_id: source for source in sources}
+    target_by_identity = {(target.criterion_index, target.datum_field): target for target in request.datum_targets}
+    if len(envelope.datum_bindings) != len(target_by_identity):
+        raise ValueError("datum bindings must cover every requested target exactly once")
+    resolution_by_identity: dict[
+        tuple[int, str], RequestSlotDatumBindingDeclarationV1 | RequestSlotDatumDeclineDeclarationV1
+    ] = {}
+    for resolution in envelope.datum_bindings:
+        identity = (resolution.criterion_index, resolution.datum_field)
+        target = target_by_identity.get(identity)
+        if target is None or identity in resolution_by_identity:
+            raise ValueError("datum resolution has an unknown or duplicate target")
+        resolution_by_identity[identity] = resolution
     resolved: list[tuple[RequestSlotDeclarationV1, RequestSlotSourceV1, int, int]] = []
     for declaration in envelope.slots:
         source = source_by_id.get(declaration.source_id)
@@ -324,7 +436,7 @@ def canonicalize_request_slots(
             raise ValueError(f"source anchors overlap in {item[1].source_id}")
         previous = item
 
-    digest = _request_digest(envelope.version, sources)
+    digest = request_slot_request_digest(request)
     canonical_slots: list[CanonicalRequestSlotV1] = []
     seen_paths: set[str] = set()
     seen_slot_ids: set[str] = set()
@@ -351,11 +463,53 @@ def canonicalize_request_slots(
                 antecedent_family=declaration.antecedent_family,
             )
         )
+    slot_by_anchor = {(slot.source_id, slot.source_start, slot.source_end): slot for slot in canonical_slots}
+    canonical_bindings: list[CanonicalRequestSlotDatumBindingV1] = []
+    canonical_declines: list[CanonicalRequestSlotDatumDeclineV1] = []
+    seen_binding_slot_ids: set[str] = set()
+    for target in request.datum_targets:
+        resolution = resolution_by_identity[(target.criterion_index, target.datum_field)]
+        if isinstance(resolution, RequestSlotDatumDeclineDeclarationV1):
+            canonical_declines.append(
+                CanonicalRequestSlotDatumDeclineV1(
+                    criterion_index=target.criterion_index,
+                    datum_field=target.datum_field,
+                    datum_value=target.datum_value,
+                    criterion_outcome_sha256=target.criterion_outcome_sha256,
+                )
+            )
+            continue
+        binding = resolution
+        source = source_by_id.get(binding.source_id)
+        if source is None:
+            raise ValueError(f"unknown datum-binding source: {binding.source_id}")
+        start = source.text.find(binding.source_quote)
+        if start < 0 or source.text.find(binding.source_quote, start + 1) >= 0:
+            raise ValueError("datum-binding source quote must be present exactly once")
+        slot = slot_by_anchor.get((binding.source_id, start, start + len(binding.source_quote)))
+        if slot is None:
+            raise ValueError("datum binding must name one exact independently produced request slot")
+        if slot.slot_id in seen_binding_slot_ids:
+            raise ValueError("datum bindings must map injectively to canonical slots")
+        seen_binding_slot_ids.add(slot.slot_id)
+        canonical_bindings.append(
+            CanonicalRequestSlotDatumBindingV1(
+                criterion_index=binding.criterion_index,
+                datum_field=binding.datum_field,
+                datum_value=target.datum_value,
+                criterion_outcome_sha256=target.criterion_outcome_sha256,
+                source_id=binding.source_id,
+                source_quote=binding.source_quote,
+                slot_id=slot.slot_id,
+            )
+        )
     return RequestSlotContractV1(
         version=envelope.version,
         request_digest=digest,
         slots=tuple(canonical_slots),
         count=len(canonical_slots),
+        datum_bindings=tuple(canonical_bindings),
+        datum_declines=tuple(canonical_declines),
     )
 
 
@@ -372,6 +526,11 @@ def _render_prompt(request: RequestSlotProducerInputV1) -> str:
         workflow_context=_safe_prompt_text(request.workflow_context, _MAX_WORKFLOW_PROMPT_CHARS),
         latest_assistant_turn=_safe_prompt_text(request.latest_assistant_turn, _MAX_TRANSCRIPT_ANCHOR_PROMPT_CHARS),
         global_context=_safe_prompt_text(safe_global_context, _MAX_GLOBAL_CONTEXT_PROMPT_CHARS),
+        datum_targets=json.dumps(
+            [target.model_dump(mode="json") for target in request.datum_targets],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
     )
 
 
@@ -393,7 +552,7 @@ def request_slot_contracts_agree(
 ) -> bool:
     if first.version != second.version or first.request_digest != second.request_digest or first.count != second.count:
         return False
-    return all(
+    slots_agree = all(
         first_slot.ordinal == second_slot.ordinal
         and first_slot.source_id == second_slot.source_id
         and first_slot.plane == second_slot.plane
@@ -403,6 +562,15 @@ def request_slot_contracts_agree(
         and second_slot.source_start < first_slot.source_end
         for first_slot, second_slot in zip(first.slots, second.slots, strict=True)
     )
+    bindings_agree = len(first.datum_bindings) == len(second.datum_bindings) and all(
+        first_binding.criterion_index == second_binding.criterion_index
+        and first_binding.datum_field == second_binding.datum_field
+        and first_binding.datum_value == second_binding.datum_value
+        and first_binding.criterion_outcome_sha256 == second_binding.criterion_outcome_sha256
+        and first_binding.slot_id == second_binding.slot_id
+        for first_binding, second_binding in zip(first.datum_bindings, second.datum_bindings, strict=True)
+    )
+    return slots_agree and bindings_agree and first.datum_declines == second.datum_declines
 
 
 async def produce_request_slots(

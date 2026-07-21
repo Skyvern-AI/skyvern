@@ -1,0 +1,17 @@
+{
+  "version": "1",
+  "workflow_permanent_id": "wpid_553704674845352182",
+  "observed_at": "2026-07-21T02:57:20.557924Z",
+  "event": "copilot_request_slot_datum_binding_correction_rejected",
+  "predicate": "target_coverage_mismatch",
+  "criterion_index": 2,
+  "original_payload_sha256": "9f3a7ee247f6c15f677c68402930a7a5c3d23f334b5719442198127724c00cab",
+  "raw_original_payload_retained": false,
+  "raw_correction_payload_retained": false,
+  "retained_evidence": [
+    ".skyvern-agentic-qa/evidence/sky-12671-p8-clean-retry-4678cd58/visual-monitor/journey.md",
+    ".skyvern-agentic-qa/evidence/sky-12671-p8-clean-retry-4678cd58/visual-monitor/final-report.md"
+  ],
+  "custody_status": "exact_replay_unavailable",
+  "custody_note": "The clean retry retained the typed rejection event and visual evidence, but not the original or correction payload bytes. This record must not be represented as an exact replay fixture."
+}
