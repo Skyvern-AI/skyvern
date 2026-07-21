@@ -229,6 +229,10 @@ export interface WorkflowCopilotNarrationUpdate {
 export interface WorkflowCopilotBlockProgressUpdate {
   type: "block_progress";
   workflow_run_block_id: string;
+  // Present once the backend stamps the dispatched run id onto progress frames
+  // (surfaced mid-execution). Absent against older backends, which only carry
+  // the run id on run_outcome; the chat falls back to that.
+  workflow_run_id?: string | null;
   block_label: string;
   block_type: string;
   status: string;
