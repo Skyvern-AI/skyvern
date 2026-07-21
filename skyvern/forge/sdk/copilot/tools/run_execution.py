@@ -1879,6 +1879,7 @@ async def _run_blocks_and_collect_debug(
                     block_state_map=ctx.block_state_map,
                     block_started_at_map=ctx.block_started_at_map,
                     block_ended_at_map=ctx.block_ended_at_map,
+                    workflow_run_id=workflow_run.workflow_run_id,
                 )
                 prior_block_ts = tick_result.prior_block_ts
                 last_block_fetch_monotonic = tick_result.last_block_fetch_monotonic
