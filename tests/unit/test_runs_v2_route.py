@@ -65,6 +65,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         status=None,
         search_key="abc",
         run_type=["workflow_run", "task_v1"],
+        workflow_permanent_ids=None,
         run_tags=None,
     )
     assert orjson.loads(response.body) == [
@@ -86,6 +87,32 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_get_runs_v2_forwards_workflow_permanent_id_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(return_value=[]))
+    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs)
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    await agent_protocol.get_runs_v2(
+        current_org=SimpleNamespace(organization_id="org_123"),
+        page=1,
+        page_size=10,
+        search_key=None,
+        workflow_permanent_id=["wpid_a", "wpid_b"],
+    )
+
+    mock_workflow_runs.get_all_runs_v2.assert_awaited_once_with(
+        "org_123",
+        page=1,
+        page_size=10,
+        status=None,
+        search_key=None,
+        run_type=None,
+        workflow_permanent_ids=["wpid_a", "wpid_b"],
+        run_tags=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_runs_v2_rejects_search_page_beyond_fetch_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(return_value=[]))
     mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs)
@@ -100,6 +127,29 @@ async def test_get_runs_v2_rejects_search_page_beyond_fetch_cap(monkeypatch: pyt
             page=page,
             page_size=page_size,
             search_key="wr_abc123",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert str(MAX_SEARCH_FETCH_LIMIT) in exc_info.value.detail
+    mock_workflow_runs.get_all_runs_v2.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_runs_v2_rejects_workflow_filter_page_beyond_fetch_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(return_value=[]))
+    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs)
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    page_size = 100
+    page = (MAX_SEARCH_FETCH_LIMIT // page_size) + 1
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=page,
+            page_size=page_size,
+            search_key=None,
+            workflow_permanent_id=["wpid_x"],
         )
 
     assert exc_info.value.status_code == 400

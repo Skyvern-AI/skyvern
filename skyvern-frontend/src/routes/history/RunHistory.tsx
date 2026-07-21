@@ -22,6 +22,7 @@ import {
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import { AgentFilterDropdown } from "@/components/AgentFilterDropdown";
 import {
   RunTypeFilterDropdown,
   RunTypeGroup,
@@ -141,6 +142,20 @@ function parseRunTypeParam(raw: string | null): Array<RunTypeGroup> {
   return out;
 }
 
+function parseAgentParam(raw: string | null): Array<string> {
+  if (!raw) {
+    return [];
+  }
+  return [
+    ...new Set(
+      raw
+        .split(",")
+        .map((token) => token.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
 // Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
 function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   if (run.trigger_type) {
@@ -188,7 +203,16 @@ function RunHistory() {
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
     : 10;
-  const workflowPermanentIdFilter = searchParams.get("workflow_permanent_id");
+  const agentFilters = useMemo(() => {
+    const filters = parseAgentParam(searchParams.get("agent"));
+    const legacyFilter = searchParams.get("workflow_permanent_id")?.trim();
+    if (legacyFilter && !filters.includes(legacyFilter)) {
+      filters.push(legacyFilter);
+    }
+    return filters;
+  }, [searchParams]);
+  const workflowPermanentIds =
+    agentFilters.length > 0 ? agentFilters : undefined;
   const statusFilters = useMemo(
     () => parseStatusParam(searchParams.get("status")),
     [searchParams],
@@ -214,10 +238,9 @@ function RunHistory() {
   // The /runs search_key requires min 3 chars (trigram index); shorter queries 422.
   const trimmedSearch = debouncedSearch.trim();
   const textSearch = trimmedSearch.length >= 3 ? trimmedSearch : "";
-  const effectiveSearch = workflowPermanentIdFilter || textSearch;
 
   const {
-    data: rawRuns,
+    data: runs,
     isFetching,
     isError,
     refetch,
@@ -226,45 +249,23 @@ function RunHistory() {
     pageSize: itemsPerPage,
     statusFilters,
     runTypeFilters,
-    search: effectiveSearch,
+    search: textSearch,
     tags: effectiveTagsParam,
+    workflowPermanentIds,
   });
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
 
-  const { data: rawNextPageRuns } = useRunsQuery({
+  const { data: nextPageRuns } = useRunsQuery({
     page: page + 1,
     pageSize: itemsPerPage,
     statusFilters,
     runTypeFilters,
-    search: effectiveSearch,
+    search: textSearch,
     tags: effectiveTagsParam,
-    enabled: rawRuns?.length === itemsPerPage,
+    workflowPermanentIds,
+    enabled: runs?.length === itemsPerPage,
   });
-
-  // /runs treats `search` as a substring match across searchable_text,
-  // run_id, and workflow_permanent_id. When the user is filtering by a
-  // specific workflow_permanent_id we tighten the result client-side so
-  // unrelated runs whose text shares a substring with this id don't bleed in.
-  // Pagination becomes best-effort under this filter — pages may be shorter
-  // than itemsPerPage when matches are sparse.
-  const runs = useMemo(() => {
-    if (!rawRuns || !workflowPermanentIdFilter) {
-      return rawRuns;
-    }
-    return rawRuns.filter(
-      (run) => run.workflow_permanent_id === workflowPermanentIdFilter,
-    );
-  }, [rawRuns, workflowPermanentIdFilter]);
-
-  const nextPageRuns = useMemo(() => {
-    if (!rawNextPageRuns || !workflowPermanentIdFilter) {
-      return rawNextPageRuns;
-    }
-    return rawNextPageRuns.filter(
-      (run) => run.workflow_permanent_id === workflowPermanentIdFilter,
-    );
-  }, [rawNextPageRuns, workflowPermanentIdFilter]);
 
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
@@ -332,7 +333,7 @@ function RunHistory() {
       statusFilters,
       runTypeGroups,
       tagsParam,
-      workflowPermanentIdFilter,
+      agentFilters,
       textSearch,
       taggingEnabled,
     ]),
@@ -589,19 +590,12 @@ function RunHistory() {
     });
   };
 
-  function clearWorkflowFilter() {
-    const params = new URLSearchParams(searchParams);
-    params.delete("workflow_permanent_id");
-    params.set("page", "1");
-    setSearchParams(params, { replace: true });
-  }
-
   const hasActiveFilters =
     statusFilters.length > 0 ||
     runTypeGroups.length > 0 ||
     tagTerms.length > 0 ||
     !!textSearch ||
-    !!workflowPermanentIdFilter;
+    agentFilters.length > 0;
   const showOnboardingEmpty =
     !isFetching &&
     runs?.length === 0 &&
@@ -634,25 +628,6 @@ function RunHistory() {
         </div>
       ) : (
         <>
-          {workflowPermanentIdFilter ? (
-            <div
-              className="flex items-center justify-between gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs"
-              data-testid="workflow-filter-banner"
-            >
-              <span className="truncate">
-                Filtering runs for workflow{" "}
-                <span className="font-mono">{workflowPermanentIdFilter}</span>
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={clearWorkflowFilter}
-                className="h-auto py-1 text-xs"
-              >
-                Clear
-              </Button>
-            </div>
-          ) : null}
           <div className="flex items-center justify-between gap-4">
             <div className="flex items-center gap-2">
               <TableSearchInput
@@ -663,12 +638,7 @@ function RunHistory() {
                   params.set("page", "1");
                   setSearchParams(params, { replace: true });
                 }}
-                placeholder={
-                  workflowPermanentIdFilter
-                    ? "Clear the agent filter above to search"
-                    : "Search by run ID or input..."
-                }
-                disabled={!!workflowPermanentIdFilter}
+                placeholder="Search by run ID or input..."
                 className="w-48 lg:w-72"
               />
               {taggingEnabled ? (
@@ -683,6 +653,20 @@ function RunHistory() {
               ) : null}
             </div>
             <div className="flex items-center gap-2">
+              <AgentFilterDropdown
+                values={agentFilters}
+                onChange={(filters) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (filters.length === 0) {
+                    params.delete("agent");
+                  } else {
+                    params.set("agent", filters.join(","));
+                  }
+                  params.delete("workflow_permanent_id");
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
               <RunTypeFilterDropdown
                 values={runTypeGroups}
                 onChange={(groups) => {
