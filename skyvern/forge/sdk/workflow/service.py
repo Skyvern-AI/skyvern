@@ -83,6 +83,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
+from skyvern.forge.sdk.workflow.code_mode_fallback import maybe_start_code_mode_fallback_retry
 from skyvern.forge.sdk.workflow.credential_fallback import (
     VALID_FALLBACK_TRIGGERS,
     maybe_start_credential_fallback_retry,
@@ -737,9 +738,12 @@ class WorkflowService:
             )
 
     @staticmethod
-    async def _start_credential_fallback_retry_best_effort(workflow_run: WorkflowRun) -> None:
+    async def _start_run_fallback_retries_best_effort(workflow_run: WorkflowRun) -> None:
+        # Credential fallback first: it targets auth failures specifically. If it claims the
+        # single retry slot (retried_from unique index), code-mode fallback no-ops. Run them
+        # sequentially in one task so they can't race to create the retry.
         try:
-            await maybe_start_credential_fallback_retry(workflow_run, workflow_run.organization_id)
+            retry_run_id = await maybe_start_credential_fallback_retry(workflow_run, workflow_run.organization_id)
         except Exception:
             LOG.warning(
                 "Credential fallback retry hook failed",
@@ -747,9 +751,21 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 exc_info=True,
             )
+            retry_run_id = None
+        if retry_run_id:
+            return
+        try:
+            await maybe_start_code_mode_fallback_retry(workflow_run, workflow_run.organization_id)
+        except Exception:
+            LOG.warning(
+                "Code-mode fallback retry hook failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                exc_info=True,
+            )
 
-    def _schedule_credential_fallback_retry(self, workflow_run: WorkflowRun) -> None:
-        task = asyncio.create_task(self._start_credential_fallback_retry_best_effort(workflow_run))
+    def _schedule_run_fallback_retries(self, workflow_run: WorkflowRun) -> None:
+        task = asyncio.create_task(self._start_run_fallback_retries_best_effort(workflow_run))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -7465,13 +7481,14 @@ class WorkflowService:
             for child_workflow_run_id in child_workflow_run_ids:
                 app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
 
-            # Schedule the credential fallback retry only after this run's cleanup (artifact/video
-            # persistence, browser/session write-back, webhook) has run, so the replacement run
-            # cannot overlap it and race browser-profile/session writes. In the finally wrapping the
-            # whole cleanup sequence — not after it — so an exception in any cleanup step can't skip
-            # it; scheduling was removed from the status markers, which fired before cleanup and for
-            # cascade/reaper failures that never reach cleanup. A no-op for non-eligible runs.
-            self._schedule_credential_fallback_retry(workflow_run)
+            # Schedule the fallback retries (credential, then code→agent) only after this run's
+            # cleanup (artifact/video persistence, browser/session write-back, webhook) has run, so
+            # the replacement run cannot overlap it and race browser-profile/session writes. In the
+            # finally wrapping the whole cleanup sequence — not after it — so an exception in any
+            # cleanup step can't skip it; scheduling was removed from the status markers, which fired
+            # before cleanup and for cascade/reaper failures that never reach cleanup. A no-op for
+            # non-eligible runs.
+            self._schedule_run_fallback_retries(workflow_run)
 
     async def prepare_workflow_webhook(
         self,
@@ -9162,12 +9179,26 @@ class WorkflowService:
         """Whether this run should attempt cached-script execution.
 
         Priority: run-level run_with > workflow-level run_with. Intended-code
-        runs are then passed through the app-level code-mode gate.
+        runs are then passed through the app-level code-mode gate. Runs not
+        already intended as code may be upgraded by a flag-gated rollout;
+        an upgraded run has no matching script for a non-ATS workflow and so
+        degrades cleanly to agent per block.
         """
         if workflow_run.run_with is not None:
             intended_code = workflow_run.run_with == "code"
         else:
             intended_code = workflow.run_with == "code"
+        # A fallback retry has already made a deliberate execution-mode choice — in particular the
+        # code->agent fallback sets run_with=agent precisely so the retry does NOT run the script
+        # that just failed. The rollout must not re-upgrade it back to code, or the fallback would be
+        # a no-op for exactly the rollout population. Gate on the retry marker rather than
+        # `run_with is None`: normal runs inherit run_with="agent" from the workflow, so keying on
+        # None would disable the rollout for every ordinary run.
+        if not intended_code and workflow_run.retried_from_workflow_run_id is None:
+            intended_code = await app.AGENT_FUNCTION.should_upgrade_to_code_mode(
+                workflow=workflow,
+                workflow_run=workflow_run,
+            )
         if not intended_code:
             return False
         return await app.AGENT_FUNCTION.should_keep_code_mode_for_workflow_run(
