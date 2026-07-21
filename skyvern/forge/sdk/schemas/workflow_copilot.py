@@ -364,6 +364,11 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.BLOCK_PROGRESS, description="Message type"
     )
     workflow_run_block_id: str = Field(..., description="Stable per-block id; used as the row key in the activity pane")
+    workflow_run_id: str | None = Field(
+        None,
+        description="Dispatched run id for this block; lets the FE fetch recorded actions live during execution. "
+        "Optional for backward compatibility with clients that only read the run id from run_outcome.",
+    )
     block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
     block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
     status: str = Field(

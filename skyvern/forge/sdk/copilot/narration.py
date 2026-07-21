@@ -823,6 +823,7 @@ async def narrator_poll_tick(
     block_state_map: dict[str, str] | None = None,
     block_started_at_map: dict[str, str] | None = None,
     block_ended_at_map: dict[str, str] | None = None,
+    workflow_run_id: str | None = None,
 ) -> NarratorPollTickResult:
     """Per-tick narrator bookkeeping; returns updated (prior_block_ts, last_block_fetch_monotonic).
 
@@ -900,6 +901,7 @@ async def narrator_poll_tick(
                         WorkflowCopilotBlockProgressUpdate(
                             type=WorkflowCopilotStreamMessageType.BLOCK_PROGRESS,
                             workflow_run_block_id=event.block_id,
+                            workflow_run_id=workflow_run_id,
                             block_label=event.block_label,
                             block_type=event.block_type,
                             status=event.status,
