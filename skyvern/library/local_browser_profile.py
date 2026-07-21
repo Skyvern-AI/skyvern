@@ -204,14 +204,16 @@ def create_local_browser_profile() -> LocalBrowserProfile | None:
 
     sweep_local_browser_profiles_once_in_background()
 
-    # A concurrent startup sweep can win the race in the mkdtemp->flock window: reaping the
-    # still-lockless dir (FileNotFoundError) or acquiring the just-published lock first
-    # (BlockingIOError — nobody else can hold a lock we created O_EXCL). Retry with a fresh dir.
-    last_error: OSError | None = None
+    # A concurrent startup sweep can win the race in the mkdtemp->revalidate window: reaping the
+    # still-lockless dir (FileNotFoundError), acquiring the just-published lock first
+    # (BlockingIOError — nobody else can hold a lock we created O_EXCL), or tombstone-renaming a
+    # dir it saw lockless just as we locked it, failing our revalidate before its ENOTEMPTY rmdir
+    # makes it rename the dir back (_ProfileIdentityChangedError). Retry with a fresh dir.
+    last_error: Exception | None = None
     for _ in range(3):
         try:
             return _create_local_browser_profile_once()
-        except (FileNotFoundError, BlockingIOError) as exc:
+        except (FileNotFoundError, BlockingIOError, _ProfileIdentityChangedError) as exc:
             last_error = exc
     raise RuntimeError("Local browser profile creation kept losing its directory") from last_error
 
