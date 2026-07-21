@@ -103,6 +103,7 @@ import {
 import { useIsCanvasLocked } from "../../controls/useIsCanvasLocked";
 import { isBlockFinallyGated } from "../../sortable/finallyBlockGate";
 import { collapsibleWorkflowBlockTypes } from "../../collapse/collapsibleBlockTypes";
+import { isCollapseGated } from "../../collapse/collapseModeGate";
 import {
   useIsBlockCollapsed,
   useNodeCollapseStore,
@@ -889,13 +890,11 @@ function NodeHeader({
     );
   }
 
-  // Recording mid-collapse would change captured DOM, so freeze only on
-  // isRecording. Read-only renders (comparison canvases) must not mutate
-  // the workflow's persisted collapse state — `isReadOnlyScope` (read
-  // above) is true when FlowRenderer is mounted with `readOnly`, in
-  // which case the toggle is disabled so a compare-canvas click cannot
-  // persist collapse state into the editor view the user returns to.
-  const collapseToggleGated = isRecording || isReadOnlyScope;
+  const collapseToggleGated = isCollapseGated({
+    isRecording,
+    isReadOnlyScope,
+    isCanvasLocked,
+  });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
   const collapseToggleButton =
     isCollapsible &&
