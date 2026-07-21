@@ -802,14 +802,6 @@ class AgentFunction:
     ) -> bool:
         return True
 
-    async def should_upgrade_to_code_mode(
-        self,
-        *,
-        workflow: "Workflow",
-        workflow_run: "WorkflowRun",
-    ) -> bool:
-        return False
-
     async def resolve_mcp_code_only_mode(
         self,
         organization_id: str | None,
