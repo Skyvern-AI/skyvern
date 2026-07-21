@@ -12,6 +12,9 @@ from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotAntecedentFamily,
     RequestSlotContractV1,
+    RequestSlotDatumBindingDeclarationV1,
+    RequestSlotDatumDeclineDeclarationV1,
+    RequestSlotDatumTargetV1,
     RequestSlotDeclarationV1,
     RequestSlotEnvelopeV1,
     RequestSlotPinability,
@@ -377,6 +380,53 @@ def test_contract_agreement_requires_antecedent_family_consensus() -> None:
     assert not request_slot_contracts_agree(unconditional, blocker)
 
 
+def test_contract_agreement_uses_canonical_slot_not_redundant_binding_quote_bytes() -> None:
+    target = RequestSlotDatumTargetV1(
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.submission_state",
+        criterion_outcome_sha256="1" * 64,
+    )
+    request = _input(
+        latest_request="Return whether the request was newly submitted or already present.",
+        datum_targets=(target,),
+    )
+    source_id = _source_id(request, "newly submitted")
+
+    def contract_for_quote(quote: str) -> RequestSlotContractV1:
+        return canonicalize_request_slots(
+            request=request,
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(
+                    RequestSlotDeclarationV1(
+                        source_id=source_id,
+                        source_quote=quote,
+                        plane=RequestSlotPlane.RUN,
+                        pinability=RequestSlotPinability.SHAPELESS_VALID,
+                        antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                    ),
+                ),
+                datum_bindings=(
+                    RequestSlotDatumBindingDeclarationV1(
+                        criterion_index=0,
+                        datum_field="output_path",
+                        declined=False,
+                        source_id=source_id,
+                        source_quote=quote,
+                    ),
+                ),
+            ),
+        )
+
+    broad = contract_for_quote("whether the request was newly submitted or already present")
+    narrow = contract_for_quote("newly submitted or already present")
+
+    assert broad.datum_bindings[0].source_quote != narrow.datum_bindings[0].source_quote
+    assert broad.datum_bindings[0].slot_id == narrow.datum_bindings[0].slot_id
+    assert request_slot_contracts_agree(broad, narrow)
+
+
 @pytest.mark.asyncio
 async def test_producer_accepts_two_agreeing_empty_contracts() -> None:
     calls = 0
@@ -501,6 +551,55 @@ async def test_producer_retries_disagreement_until_consecutive_contracts_agree()
     assert result.attempts == 3
     assert result.contract is not None
     assert result.contract.count == 2
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_producer_binding_and_decline_disagreement_never_mints_a_contract() -> None:
+    target = RequestSlotDatumTargetV1(
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.submission_state",
+        criterion_outcome_sha256="1" * 64,
+    )
+    request = _input(
+        latest_request="Return whether submission was new or existing.",
+        datum_targets=(target,),
+    )
+    source_id = _source_id(request, "whether submission was new or existing")
+    slot = {
+        "source_id": source_id,
+        "source_quote": "whether submission was new or existing",
+        "plane": "run",
+        "pinability": "shapeless_valid",
+        "antecedent_family": "unconditional",
+    }
+    binding = {
+        "criterion_index": 0,
+        "datum_field": "output_path",
+        "declined": False,
+        "source_id": source_id,
+        "source_quote": "whether submission was new or existing",
+    }
+    decline = {
+        "criterion_index": 0,
+        "datum_field": "output_path",
+        "declined": True,
+    }
+    responses = [
+        {"version": "1", "slots": [slot], "datum_bindings": [resolution]}
+        for resolution in (binding, decline, binding, decline)
+    ]
+
+    async def handler(prompt: str, prompt_name: str, **_: object) -> dict[str, object]:
+        return responses.pop(0)
+
+    result = await produce_request_slots(request=request, handler=handler, timeout_seconds=1.0)
+
+    assert result.status == "failure"
+    assert result.attempts == 4
+    assert result.failure_kind == RequestSlotProducerFailureKind.INCONSISTENT_OUTPUT
+    assert result.contract is None
     assert responses == []
 
 
@@ -727,3 +826,266 @@ def test_contract_namespace_never_collides_with_legacy_semantic_paths() -> None:
     assert contract.slots[0].canonical_path != "output.path_is_login_only"
     assert contract.slots[0].canonical_path.startswith("output.request_slot_")
     assert request_slots_module.PROMPT_NAME == "workflow-copilot-request-slots"
+
+
+def test_datum_targets_must_map_injectively_to_independent_slots() -> None:
+    request = _input(
+        latest_request="Return the request id.",
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.request_id",
+                criterion_outcome_sha256="1" * 64,
+            ),
+            RequestSlotDatumTargetV1(
+                criterion_index=1,
+                datum_field="output_path",
+                datum_value="output.confirmation_id",
+                criterion_outcome_sha256="2" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, "request id")
+    slot = RequestSlotDeclarationV1(
+        source_id=source_id,
+        source_quote="request id",
+        plane=RequestSlotPlane.RUN,
+        pinability=RequestSlotPinability.SHAPELESS_VALID,
+        antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+    )
+
+    with pytest.raises(ValueError, match="injectively"):
+        canonicalize_request_slots(
+            request=request,
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(slot,),
+                datum_bindings=tuple(
+                    RequestSlotDatumBindingDeclarationV1(
+                        criterion_index=target.criterion_index,
+                        datum_field=target.datum_field,
+                        declined=False,
+                        source_id=source_id,
+                        source_quote="request id",
+                    )
+                    for target in request.datum_targets
+                ),
+            ),
+        )
+
+
+def test_datum_binding_model_accepts_only_identity_and_new_source_evidence() -> None:
+    binding = RequestSlotDatumBindingDeclarationV1.model_validate(
+        {
+            "criterion_index": 0,
+            "datum_field": "output_path",
+            "declined": False,
+            "source_id": "u0",
+            "source_quote": "request id",
+        }
+    )
+
+    assert binding.model_dump() == {
+        "criterion_index": 0,
+        "datum_field": "output_path",
+        "declined": False,
+        "source_id": "u0",
+        "source_quote": "request id",
+    }
+    with pytest.raises(ValidationError):
+        RequestSlotDatumBindingDeclarationV1.model_validate(
+            {key: value for key, value in binding.model_dump().items() if key != "declined"}
+        )
+    with pytest.raises(ValidationError):
+        RequestSlotDatumBindingDeclarationV1.model_validate(
+            {
+                **binding.model_dump(),
+                "datum_value": "output.request_id",
+                "criterion_outcome_sha256": "1" * 64,
+            }
+        )
+
+
+def test_datum_decline_model_accepts_only_identity_and_explicit_decline() -> None:
+    decline = RequestSlotDatumDeclineDeclarationV1.model_validate(
+        {
+            "criterion_index": 0,
+            "datum_field": "classification_output_key",
+            "declined": True,
+        }
+    )
+
+    assert decline.model_dump() == {
+        "criterion_index": 0,
+        "datum_field": "classification_output_key",
+        "declined": True,
+    }
+    for extra in (
+        {"datum_value": "submission_state"},
+        {"criterion_outcome_sha256": "1" * 64},
+        {"source_id": "u0", "source_quote": "submission state"},
+    ):
+        with pytest.raises(ValidationError):
+            RequestSlotDatumDeclineDeclarationV1.model_validate({**decline.model_dump(), **extra})
+
+
+@pytest.mark.parametrize("resolution_kind", ["missing", "unknown", "duplicate"])
+def test_datum_resolution_preserves_exact_identity_coverage(resolution_kind: str) -> None:
+    request = _input(
+        latest_request="Return status.",
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.status",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    resolution = RequestSlotDatumDeclineDeclarationV1(
+        criterion_index=1 if resolution_kind == "unknown" else 0,
+        datum_field="output_path",
+        declined=True,
+    )
+    resolutions = () if resolution_kind == "missing" else (resolution,)
+    if resolution_kind == "duplicate":
+        resolutions = (resolution, resolution)
+
+    with pytest.raises(ValueError, match="cover every|unknown or duplicate"):
+        canonicalize_request_slots(
+            request=request,
+            envelope=RequestSlotEnvelopeV1(version="1", slots=(), datum_bindings=resolutions),
+        )
+
+
+def test_typed_decline_preserves_bound_sibling_and_exact_target_coverage() -> None:
+    request = _input(
+        latest_request="Return whether submission was new or existing and ignore the adjacent account number.",
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.submission_state",
+                criterion_outcome_sha256="1" * 64,
+            ),
+            RequestSlotDatumTargetV1(
+                criterion_index=1,
+                datum_field="output_path",
+                datum_value="output.confirmation_id",
+                criterion_outcome_sha256="2" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, "whether submission was new or existing")
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id=source_id,
+                    source_quote="whether submission was new or existing",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id=source_id,
+                    source_quote="whether submission was new or existing",
+                ),
+                RequestSlotDatumDeclineDeclarationV1(
+                    criterion_index=1,
+                    datum_field="output_path",
+                    declined=True,
+                ),
+            ),
+        ),
+    )
+
+    assert [(binding.criterion_index, binding.datum_field) for binding in contract.datum_bindings] == [
+        (0, "output_path")
+    ]
+    assert [binding.model_dump() for binding in contract.datum_bindings] == [
+        {
+            "criterion_index": 0,
+            "datum_field": "output_path",
+            "datum_value": "output.submission_state",
+            "criterion_outcome_sha256": "1" * 64,
+            "source_id": source_id,
+            "source_quote": "whether submission was new or existing",
+            "slot_id": contract.slots[0].slot_id,
+        }
+    ]
+    assert [decline.model_dump() for decline in contract.datum_declines] == [
+        {
+            "criterion_index": 1,
+            "datum_field": "output_path",
+            "datum_value": "output.confirmation_id",
+            "criterion_outcome_sha256": "2" * 64,
+        }
+    ]
+
+
+def test_untargeted_request_digest_preserves_legacy_slot_identity() -> None:
+    request = _input(latest_request="Return status.")
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=_envelope(request, ("status", "run", "shapeless_valid")),
+    )
+
+    assert contract.request_digest == "07a98d0716f45eb84e11d7435ad3431331253f87cbac549a8e6514e4f97d658a"
+    assert contract.slots[0].slot_id == "70f1f255440256d7e42a583556a62d20c2b2b051ec990bd8fef83c2f3db97638"
+
+
+def test_request_digest_covers_every_datum_target_identity_member_and_order() -> None:
+    request = _input(latest_request="Return status.")
+    base_target = RequestSlotDatumTargetV1(
+        criterion_index=0,
+        datum_field="output_path",
+        datum_value="output.status",
+        criterion_outcome_sha256="1" * 64,
+    )
+
+    def contract_for(targets: tuple[RequestSlotDatumTargetV1, ...]) -> RequestSlotContractV1:
+        targeted = request.model_copy(update={"datum_targets": targets})
+        return canonicalize_request_slots(
+            request=targeted,
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(),
+                datum_bindings=tuple(
+                    RequestSlotDatumDeclineDeclarationV1(
+                        criterion_index=target.criterion_index,
+                        datum_field=target.datum_field,
+                        declined=True,
+                    )
+                    for target in targets
+                ),
+            ),
+        )
+
+    base_digest = contract_for((base_target,)).request_digest
+    for mutated_target in (
+        base_target.model_copy(update={"criterion_index": 1}),
+        base_target.model_copy(update={"datum_field": "classification_output_key"}),
+        base_target.model_copy(update={"datum_value": "output.state"}),
+        base_target.model_copy(update={"criterion_outcome_sha256": "2" * 64}),
+    ):
+        assert contract_for((mutated_target,)).request_digest != base_digest
+
+    second_target = base_target.model_copy(
+        update={
+            "criterion_index": 1,
+            "datum_value": "output.state",
+            "criterion_outcome_sha256": "2" * 64,
+        }
+    )
+    pair_digest = contract_for((base_target, second_target)).request_digest
+    assert pair_digest != base_digest
+    assert contract_for((second_target, base_target)).request_digest != pair_digest
