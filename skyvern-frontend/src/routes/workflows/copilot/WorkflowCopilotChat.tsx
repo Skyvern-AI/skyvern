@@ -116,6 +116,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
 
+// Cadence for re-fetching a live test run's recorded actions. Mirrors the
+// backend block-status poll (5s) closely enough to surface rows soon after
+// they land without hammering the timeline endpoint.
+const RECORDED_ACTIONS_POLL_INTERVAL_MS = 2500;
+
 function normalizeInline(value: string | null | undefined): string | null {
   if (!value) return null;
   const trimmed = value.replace(/\s+/g, " ").trim();
@@ -831,10 +836,11 @@ export function WorkflowCopilotChat({
   // Most recent turn_id observed via turn_start; used by Reject and by
   // legacy error frames that don't carry a turn_id.
   const latestTurnId = useRef<string | null>(null);
-  // One-shot guard for the recorded-actions timeline fetch, keyed by
-  // workflow_run_id — a run's evaluating and final verdict frames share an
-  // id, so this stops the same run from being fetched twice.
-  const fetchedActionRunIds = useRef<Set<string>>(new Set());
+  // Active recorded-action timeline polls keyed by workflow_run_id, and the
+  // ids whose poll already converged on a terminal verdict. Together they stop
+  // a run from being polled twice and from restarting after it finalized.
+  const actionPollRef = useRef<Map<string, number>>(new Map());
+  const finalizedActionRunIds = useRef<Set<string>>(new Set());
   // Run ids the copilot claimed via run_outcome — the turn narrates these
   // itself, so useRunLifecycleAnnouncements suppresses their lifecycle lines by
   // identity (an unrelated run seen in the same window must still be narrated).
@@ -843,8 +849,11 @@ export function WorkflowCopilotChat({
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
   useEffect(() => {
+    const activePolls = actionPollRef.current;
     return () => {
       streamingAbortController.current?.abort();
+      activePolls.forEach((timer) => clearInterval(timer));
+      activePolls.clear();
       if (cancelSafetyTimer.current !== null) {
         clearTimeout(cancelSafetyTimer.current);
         cancelSafetyTimer.current = null;
@@ -902,27 +911,15 @@ export function WorkflowCopilotChat({
     turnOwnedRunIds,
     announce: announceRunLifecycle,
   });
-  // Recorded actions arrive well after block_progress (they're persisted in
-  // batch at block end), so fetch them once a run reaches adjudication
-  // instead of waiting on the narrower block_progress/tool-call cadence.
-  const maybeFetchRecordedActions = useCallback(
-    async (payload: WorkflowCopilotRunOutcomeUpdate) => {
-      if (!copilotUxV1Enabled) return;
-      const runId = payload.workflow_run_id;
-      if (
-        !runId ||
-        !workflowPermanentId ||
-        fetchedActionRunIds.current.has(runId)
-      ) {
-        return;
-      }
-      const seen = fetchedActionRunIds.current;
-      seen.add(runId);
-      while (seen.size > MAX_TURN_SNAPSHOTS) {
-        const oldest = seen.values().next().value;
-        if (oldest === undefined) break;
-        seen.delete(oldest);
-      }
+  // Recorded actions stream into the run timeline as the test run executes.
+  // Fetch them repeatedly while a run is live (started from the earliest frame
+  // that carries the run id: block_progress on a new backend, run_outcome on an
+  // old one), so rows resolve during execution instead of only at adjudication.
+  // The reducer merges by actionId (idempotent + grow), so re-fetching the same
+  // growing set never duplicates rows and the terminal fetch just converges.
+  const fetchRecordedActions = useCallback(
+    async (runId: string) => {
+      if (!copilotUxV1Enabled || !workflowPermanentId) return;
       try {
         const client = await getClient(credentialGetter);
         const response = await client.get<WorkflowRunTimelineItem[]>(
@@ -967,6 +964,51 @@ export function WorkflowCopilotChat({
       workflowPermanentId,
     ],
   );
+  const finalizeRecordedActionsPoll = useCallback((runId: string) => {
+    const timer = actionPollRef.current.get(runId);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      actionPollRef.current.delete(runId);
+    }
+    const done = finalizedActionRunIds.current;
+    done.add(runId);
+    while (done.size > MAX_TURN_SNAPSHOTS) {
+      const oldest = done.values().next().value;
+      if (oldest === undefined) break;
+      done.delete(oldest);
+    }
+  }, []);
+  const startRecordedActionsPoll = useCallback(
+    (runId: string | null | undefined) => {
+      if (!copilotUxV1Enabled || !runId || !workflowPermanentId) return;
+      if (
+        actionPollRef.current.has(runId) ||
+        finalizedActionRunIds.current.has(runId)
+      ) {
+        return;
+      }
+      const timers = actionPollRef.current;
+      while (timers.size >= MAX_TURN_SNAPSHOTS) {
+        const oldest = timers.entries().next().value;
+        if (oldest === undefined) break;
+        clearInterval(oldest[1]);
+        timers.delete(oldest[0]);
+      }
+      void fetchRecordedActions(runId);
+      timers.set(
+        runId,
+        window.setInterval(
+          () => void fetchRecordedActions(runId),
+          RECORDED_ACTIONS_POLL_INTERVAL_MS,
+        ),
+      );
+    },
+    [copilotUxV1Enabled, fetchRecordedActions, workflowPermanentId],
+  );
+  const stopAllRecordedActionsPolls = useCallback(() => {
+    actionPollRef.current.forEach((timer) => clearInterval(timer));
+    actionPollRef.current.clear();
+  }, []);
   // Fetch the stored credentials once a pause is live. ponytail: page_size 100,
   // no pagination — a >100-credential org may miss a match and fall back to the
   // Connect CTA. Add pagination if that shows up. Setting credentialsList back
@@ -2209,8 +2251,13 @@ export function WorkflowCopilotChat({
               case "tool_call":
               case "tool_result":
               case "narration":
+                applyStoredNarrativeEvent(payload);
+                return false;
               case "block_progress":
                 applyStoredNarrativeEvent(payload);
+                // Earliest frame carrying the run id on a new backend — start
+                // the live poll here so rows appear mid-execution.
+                startRecordedActionsPoll(payload.workflow_run_id);
                 return false;
               case "run_outcome":
                 applyStoredNarrativeEvent(payload);
@@ -2222,8 +2269,16 @@ export function WorkflowCopilotChat({
                     if (oldest === undefined) break;
                     owned.delete(oldest);
                   }
+                  if (payload.verdict === "evaluating") {
+                    // Fallback start against an old backend whose block_progress
+                    // carried no run id: this is the first sighting.
+                    startRecordedActionsPoll(payload.workflow_run_id);
+                  } else {
+                    // Terminal verdict: one convergent fetch, then stop polling.
+                    void fetchRecordedActions(payload.workflow_run_id);
+                    finalizeRecordedActionsPoll(payload.workflow_run_id);
+                  }
                 }
-                maybeFetchRecordedActions(payload);
                 return false;
               case "credential_required":
                 setLivePauseFrame(payload);
@@ -2317,6 +2372,9 @@ export function WorkflowCopilotChat({
         pendingMessageId.current = null;
         pendingCancelToken.current = null;
         setIsLoading(false);
+        // Backstop: a turn that ends without a terminal run_outcome (thrown
+        // stream) would otherwise leave a live poll running past the run.
+        stopAllRecordedActionsPolls();
       }
     },
     [
@@ -2329,14 +2387,17 @@ export function WorkflowCopilotChat({
       copilotUxV1Enabled,
       copilotV2Enabled,
       credentialGetter,
+      fetchRecordedActions,
+      finalizeRecordedActionsPoll,
       getSaveData,
       inputValue,
       isSpeechListening,
       isBuild,
       isLiveBrowserReady,
       liveBrowserSessionId,
-      maybeFetchRecordedActions,
       pendingProposalTurnId,
+      startRecordedActionsPoll,
+      stopAllRecordedActionsPolls,
       requiresLiveBrowser,
       resyncProposalFromChatRow,
       stopSpeech,

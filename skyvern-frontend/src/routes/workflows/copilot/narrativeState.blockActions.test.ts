@@ -94,7 +94,11 @@ describe("applyNarrativeEvent — client_block_actions", () => {
     expect(block.recordedActionsAt).toBe(1_000);
   });
 
-  it("is idempotent — a duplicate dispatch for the same block keeps the first application", () => {
+  it("grows the action list when a later live-poll fetch returns new actions", () => {
+    // First poll sees one action; a later poll returns the growing set. The new
+    // action appends (keyed by actionId) and the reveal anchor stays put so
+    // already-revealed rows don't restart. Fails on the old freeze-once reducer,
+    // which dropped everything after the first application.
     const first = blockActions({
       blocks: [
         {
@@ -108,14 +112,43 @@ describe("applyNarrativeEvent — client_block_actions", () => {
       blocks: [
         {
           workflowRunBlockId: "wrb_open_search",
-          actions: [recordedAction({ actionId: "a2" })],
+          actions: [
+            recordedAction({ actionId: "a1" }),
+            recordedAction({ actionId: "a2" }),
+          ],
         },
       ],
     });
     const s = reduce([...oneBlockRunning, first, second]);
     const block = s.blocks.find((b) => b.label === "open_search")!;
+    expect(block.recordedActions!.map((a) => a.actionId)).toEqual(["a1", "a2"]);
+    expect(block.recordedActionsAt).toBe(1_000);
+  });
+
+  it("is idempotent — a re-fetch returning already-seen actions is a no-op", () => {
+    const first = blockActions({
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_open_search",
+          actions: [recordedAction({ actionId: "a1" })],
+        },
+      ],
+    });
+    const second = blockActions({
+      receivedAtMs: 99_999,
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_open_search",
+          actions: [recordedAction({ actionId: "a1" })],
+        },
+      ],
+    });
+    const withFirst = reduce([...oneBlockRunning, first]);
+    const after = applyNarrativeEvent(withFirst, second);
+    // No new actionId -> same state reference, so no re-render and no duplicate row.
+    expect(after).toBe(withFirst);
+    const block = after.blocks.find((b) => b.label === "open_search")!;
     expect(block.recordedActions).toHaveLength(1);
-    expect(block.recordedActions![0]!.actionId).toBe("a1");
     expect(block.recordedActionsAt).toBe(1_000);
   });
 

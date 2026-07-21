@@ -20,8 +20,9 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
 
-// A code block's recorded actions, fetched once from the run timeline after
-// a run_outcome frame arrives (block_progress carries no action detail).
+// A block's recorded actions, fetched from the run timeline while the test run
+// is live (polled from the first frame that carries the run id) and again at
+// adjudication. block_progress carries no action detail, only the run id.
 export interface RecordedActionSummary {
   actionId: string;
   label: string;
@@ -104,8 +105,8 @@ export interface BlockState {
   // ``done · 0:14``-style elapsed pill in the card.
   startedAt: string | null;
   endedAt: string | null;
-  // Recorded actions fetched post-run for progressive reveal. Undefined
-  // until the one-shot fetch resolves; set at most once (idempotent).
+  // Recorded actions for progressive reveal. Undefined until the first fetch
+  // resolves; grows by actionId as live polls return more (idempotent merge).
   recordedActions?: RecordedActionSummary[];
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
@@ -716,25 +717,37 @@ export function applyNarrativeEvent(
     }
 
     case "client_block_actions": {
-      // Idempotent merge: a block's recordedActions is set at most once, so
-      // a duplicate fetch response (or a re-dispatched event) is a no-op.
-      // Stagger each matched block's reveal start past the running total of
-      // its predecessors' own schedules, so a multi-block run replays in
-      // execution order instead of all at once.
+      // Idempotent grow-merge: live polling re-fetches the same run repeatedly
+      // and returns a growing action set. First sighting seeds the reveal
+      // anchor (recordedActionsAt), staggered past preceding blocks' schedules
+      // so a multi-block run replays in execution order. Later fetches append
+      // only actions we haven't seen (keyed by actionId) and keep the anchor
+      // fixed, so already-revealed rows never restart or duplicate.
+      // ponytail: an existing action's fields (duration/summary) are frozen at
+      // first sighting; if code-block streaming (null-then-backfill) makes that
+      // visibly wrong, re-merge matched actionIds instead of skipping them.
       let carry = 0;
       let changed = false;
       const blocks = prev.blocks.map((b) => {
-        if (b.recordedActions !== undefined) return b;
         const match = event.blocks.find(
           (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
         );
         if (!match || match.actions.length === 0) return b;
+        const existing = b.recordedActions;
+        if (existing === undefined) {
+          changed = true;
+          const recordedActionsAt = event.receivedAtMs + carry;
+          const offsets = buildRevealOffsets(
+            match.actions.map((a) => a.durationMs),
+          );
+          carry += offsets[offsets.length - 1] ?? 0;
+          return { ...b, recordedActions: match.actions, recordedActionsAt };
+        }
+        const known = new Set(existing.map((a) => a.actionId));
+        const additions = match.actions.filter((a) => !known.has(a.actionId));
+        if (additions.length === 0) return b;
         changed = true;
-        const recordedActionsAt = event.receivedAtMs + carry;
-        const durations = match.actions.map((a) => a.durationMs);
-        const offsets = buildRevealOffsets(durations);
-        carry += offsets[offsets.length - 1] ?? 0;
-        return { ...b, recordedActions: match.actions, recordedActionsAt };
+        return { ...b, recordedActions: [...existing, ...additions] };
       });
       return changed ? { ...prev, blocks } : prev;
     }
