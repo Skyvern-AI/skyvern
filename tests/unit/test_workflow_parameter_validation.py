@@ -4,6 +4,7 @@ These tests ensure that parameter keys and block labels are valid Python/Jinja2 
 preventing runtime errors like "'State_' is undefined" when using keys like "State_/_Province".
 """
 
+import time
 from collections.abc import Callable
 
 import pytest
@@ -151,6 +152,31 @@ class TestReplaceJinjaReference:
             pytest.param("{{ foo.old_key }}", "{{ foo.old_key }}", id="attribute-position-unchanged"),
             pytest.param("{{ func('old_key') }}", "{{ func('old_key') }}", id="string-literal-unchanged"),
             pytest.param(
+                "{{ notify('ping old_key now') }}",
+                "{{ notify('ping old_key now') }}",
+                id="embedded-in-single-quoted-literal-unchanged",
+            ),
+            pytest.param(
+                '{{ notify("ping old_key now") }}',
+                '{{ notify("ping old_key now") }}',
+                id="embedded-in-double-quoted-literal-unchanged",
+            ),
+            pytest.param(
+                "{% if 'use old_key here' == mode %}",
+                "{% if 'use old_key here' == mode %}",
+                id="embedded-in-statement-literal-unchanged",
+            ),
+            pytest.param(
+                r"{{ f('it\'s old_key here') }}",
+                r"{{ f('it\'s old_key here') }}",
+                id="escaped-quote-literal-unchanged",
+            ),
+            pytest.param(
+                "{{ f('old_key') + old_key }}",
+                "{{ f('old_key') + new_key }}",
+                id="literal-preserved-bare-token-rewritten",
+            ),
+            pytest.param(
                 "old_key outside delimiters",
                 "old_key outside delimiters",
                 id="outside-delimiters-unchanged",
@@ -160,6 +186,28 @@ class TestReplaceJinjaReference:
     )
     def test_replace_jinja_reference(self, text: str, expected: str) -> None:
         assert replace_jinja_reference(text, "old_key", "new_key") == expected
+
+    @pytest.mark.parametrize(
+        ("malformed",),
+        [
+            pytest.param("{{ " * 65536 + "old_key", id="unmatched-openers-with-spaces"),
+            pytest.param("{{" * 65536 + "old_key", id="unmatched-openers-dense"),
+            pytest.param("{% " * 65536 + "old_key", id="unmatched-statement-openers"),
+        ],
+    )
+    def test_malformed_delimiters_scan_linearly(self, malformed: str) -> None:
+        """Unmatched openers must not trigger quadratic rescans.
+
+        The span search resumes where the previous span ended, so an input full of
+        unmatched braces is scanned once. A lazy-regex implementation rescanned to the
+        end of the input from every opener (~0.5s at 16k openers, quadrupling with input
+        size); the generous absolute bound below fails that implementation at this size
+        while leaving two orders of magnitude of headroom for a linear scan on slow CI.
+        """
+        start = time.perf_counter()
+        replace_jinja_reference(malformed, "old_key", "new_key")
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"malformed-delimiter scan took {elapsed:.2f}s — quadratic rescan regression"
 
 
 class TestSanitizeWorkflowYamlWithReferences:
