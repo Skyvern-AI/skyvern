@@ -714,7 +714,7 @@ describe("RunView output signals", () => {
     expect(scope.getByText("report.pdf")).not.toBeNull();
   });
 
-  test("surfaces the full agent run outputs below extracted information", () => {
+  test("surfaces the full run outputs below extracted information", () => {
     seedCompletedRun({
       outputs: {
         extracted_information: { answer: 42 },
@@ -729,7 +729,7 @@ describe("RunView output signals", () => {
     fireEvent.click(scope.getByRole("button", { name: /^Outputs/ }));
 
     expect(scope.getByText("Extracted information")).not.toBeNull();
-    expect(scope.getByText("Agent run outputs")).not.toBeNull();
+    expect(scope.getByText("Run outputs")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {
