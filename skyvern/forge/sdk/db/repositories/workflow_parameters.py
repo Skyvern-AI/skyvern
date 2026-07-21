@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
@@ -949,6 +950,49 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_action)
             return hydrate_action(new_action)
+
+    @traced(name="skyvern.db.upsert_recorded_action")
+    @db_operation("upsert_recorded_action")
+    async def upsert_recorded_action(self, action: Action) -> None:
+        # Idempotent on action_id: a code block's streamed write (mid-execution, screenshot not yet
+        # uploaded) and its end-of-block batch converge on the same row, so the batch backfills the
+        # screenshot instead of inserting a duplicate. Isolated from create_action to leave the agent
+        # write path untouched.
+        action_log_payload = redact_action_for_log(action)
+        values = {
+            "action_id": action.action_id,
+            "action_type": action.action_type,
+            "source_action_id": action.source_action_id,
+            "organization_id": action.organization_id,
+            "workflow_run_id": action.workflow_run_id,
+            "task_id": action.task_id,
+            "step_id": action.step_id,
+            "step_order": action.step_order,
+            "action_order": action.action_order,
+            "status": action.status,
+            "reasoning": action.reasoning,
+            "intention": action.intention,
+            "response": action_log_payload.get("response"),
+            "element_id": action.element_id,
+            "skyvern_element_hash": action.skyvern_element_hash,
+            "skyvern_element_data": action.skyvern_element_data,
+            "screenshot_artifact_id": action.screenshot_artifact_id,
+            "action_json": action.model_dump(),
+            "confidence_float": action.confidence_float,
+            "created_by": action.created_by,
+        }
+        async with self.Session() as session:
+            stmt = pg_insert(ActionModel).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["action_id"],
+                set_={
+                    "screenshot_artifact_id": stmt.excluded.screenshot_artifact_id,
+                    "action_json": stmt.excluded.action_json,
+                    "modified_at": datetime.now(timezone.utc),
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
 
     @db_operation("update_action_reasoning")
     async def update_action_reasoning(

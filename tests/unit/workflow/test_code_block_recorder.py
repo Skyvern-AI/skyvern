@@ -418,6 +418,7 @@ def _patch_execute_environment(
         "create_artifact": AsyncMock(return_value="artifact_1"),
         "create_task_and_step": AsyncMock(return_value=(_FakeTask(), _FakeStep())),
         "create_action": AsyncMock(return_value=None),
+        "upsert_recorded_action": AsyncMock(return_value=None),
         "update_task": AsyncMock(return_value=None),
         "update_step": AsyncMock(return_value=None),
         "billing_hook": AsyncMock(return_value=None),
@@ -435,13 +436,26 @@ def _patch_execute_environment(
     monkeypatch.setattr(app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", mocks["create_artifact"])
     monkeypatch.setattr(app.agent, "create_task_and_step_from_code_block", mocks["create_task_and_step"], raising=False)
     monkeypatch.setattr(app.DATABASE.workflow_params, "create_action", mocks["create_action"])
+    monkeypatch.setattr(
+        app.DATABASE.workflow_params, "upsert_recorded_action", mocks["upsert_recorded_action"], raising=False
+    )
     monkeypatch.setattr(app.DATABASE.tasks, "update_task", mocks["update_task"])
     monkeypatch.setattr(app.DATABASE.tasks, "update_step", mocks["update_step"])
     return mocks
 
 
+def _upsert_calls(mocks: dict[str, AsyncMock]) -> list[Action]:
+    """Every recorded-action write, in order — the streamed (mid-block) writes then the end-of-block batch."""
+    return [call.args[0] for call in mocks["upsert_recorded_action"].await_args_list]
+
+
 def _created_actions(mocks: dict[str, AsyncMock]) -> list[Action]:
-    return [call.args[0] for call in mocks["create_action"].await_args_list]
+    # Final persisted row per action: the streamed write and the end-of-block batch converge on action_id,
+    # so keep the last write (which carries the drained screenshot) and dedupe.
+    by_id: dict[str | None, Action] = {}
+    for action in _upsert_calls(mocks):
+        by_id[action.action_id] = action
+    return list(by_id.values())
 
 
 @pytest.mark.asyncio
@@ -689,8 +703,10 @@ async def test_code_block_success_invokes_billing_hook(monkeypatch: pytest.Monke
     task, step = mocks["billing_hook"].await_args.args
     assert task.task_id == "tsk_code"
     assert step.step_id == "stp_code"
-    # Billing counts persisted action rows, so the hook must fire after persist.
-    assert mocks["create_action"].await_count == 1
+    # Billing counts persisted action rows, so the hook must fire after persist. Streaming + the
+    # end-of-block batch converge on one row per action via action_id — exactly one distinct action here.
+    assert len(_created_actions(mocks)) == 1
+    assert mocks["create_action"].await_count == 0  # recorder writes via the isolated upsert, not create_action
 
 
 @pytest.mark.asyncio
@@ -820,11 +836,70 @@ async def test_page_evaluate_action_captures_and_links_screenshot(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_actions_stream_before_block_end_and_converge_on_one_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each action is written mid-block (streamed) AND in the end-of-block batch, but both writes share the
+    action's stable id and upsert one row — no duplicate. This is the ticket's core idempotency guarantee."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    writes = _upsert_calls(mocks)
+    # one streamed write during execution + one end-of-block batch write for the single action
+    assert len(writes) == 2
+    assert writes[0].action_id is not None
+    assert writes[0].action_id == writes[1].action_id  # converge on one row, not a duplicate
+    assert len(_created_actions(mocks)) == 1  # deduped to exactly one persisted action
+    assert mocks["create_action"].await_count == 0  # shared agent write path left untouched
+
+
+@pytest.mark.asyncio
+async def test_streamed_write_precedes_screenshot_backfilled_by_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The streamed row is written before the deferred screenshot upload finishes (screenshot_artifact_id is
+    None); the end-of-block batch upserts the same id with the drained screenshot."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    writes = _upsert_calls(mocks)
+    assert writes[0].screenshot_artifact_id is None  # streamed: upload still deferred
+    assert writes[-1].screenshot_artifact_id == "artifact_1"  # batch: screenshot backfilled
+    assert writes[0].action_id == writes[-1].action_id
+
+
+@pytest.mark.asyncio
+async def test_streamed_write_masks_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Secrets must be masked on the streamed path too, not only in the end-of-block batch."""
+    secret = "s3cr3t-token"
+    page = FakePage()
+    context = FakeWorkflowRunContext(secrets={"pw": secret})
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block(f"await page.locator('#{secret}').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    writes = _upsert_calls(mocks)
+    assert writes, "expected at least the streamed write"
+    for action in writes:
+        dumped = json.dumps(action.model_dump(mode="json"))
+        assert secret not in dumped
+        assert "*****" in dumped  # control: the secret was present and got masked, not simply absent
+
+
+@pytest.mark.asyncio
 async def test_persist_failure_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
-    mocks["create_action"].side_effect = RuntimeError("db unavailable")
+    mocks["upsert_recorded_action"].side_effect = RuntimeError("db unavailable")
 
     block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
@@ -851,7 +926,7 @@ async def test_create_task_failure_does_not_fail_the_block(monkeypatch: pytest.M
     assert result.status == BlockStatus.completed
     assert result.output_parameter_value is not None
     assert result.output_parameter_value["value"] == "ok"
-    assert mocks["create_action"].await_count == 0
+    assert mocks["upsert_recorded_action"].await_count == 0
     assert mocks["create_artifact"].await_count == 0
 
 
@@ -873,7 +948,7 @@ async def test_link_block_failure_fails_task_and_disables_recording(monkeypatch:
 
     assert result.success is True
     assert result.status == BlockStatus.completed
-    assert mocks["create_action"].await_count == 0
+    assert mocks["upsert_recorded_action"].await_count == 0
     assert mocks["create_artifact"].await_count == 0
     assert [call.kwargs.get("status") for call in mocks["update_task"].await_args_list] == [TaskStatus.failed]
     assert [call.kwargs.get("status") for call in mocks["update_step"].await_args_list] == [StepStatus.failed]
@@ -906,6 +981,9 @@ async def test_caught_page_failure_then_unrelated_raise_persists_synthetic_actio
     assert actions[-1].status == ActionStatus.failed
     assert isinstance(actions[-1].output, dict) and actions[-1].output["code_line"] == 5
     assert "later failure" in (actions[-1].response or "")
+    # The synthetic error row is built outside the recorder; it still needs a stable id or the upsert
+    # inserts a null primary key and the code-error row is lost.
+    assert all(a.action_id for a in _upsert_calls(mocks))
 
 
 @pytest.mark.asyncio
