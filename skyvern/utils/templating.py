@@ -64,8 +64,9 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     merely contain the key (oldKeyExtended).
 
     The scan is a single left-to-right pass: each span search resumes where the previous
-    span ended, so malformed input (e.g. thousands of unmatched braces) stays linear
-    instead of rescanning to the end from every opener.
+    span ended, and an unclosed opener is stepped over after its leading-position rewrite,
+    so malformed input (e.g. thousands of unmatched braces) stays linear while well-formed
+    spans after an unclosed opener are still fully rewritten.
 
     Args:
         text: The text to search in
@@ -76,30 +77,50 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
         The text with references replaced
     """
     escaped_old_key = re.escape(old_key)
-    # An unclosed "{{ oldKey" has always been rewritten at the leading position; spans
-    # that never close fall back to this legacy leading-position rewrite. The pattern is
-    # anchored on the literal "{{" with no wildcards, so it scans linearly.
+    # An unclosed "{{ oldKey" has always been rewritten at the leading position; openers
+    # that never close get this legacy leading-position rewrite. The pattern is anchored
+    # on the literal "{{" with no wildcards, so it scans linearly.
     leading_pattern = re.compile(rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])")
 
     parts: list[str] = []
     i = 0
     n = len(text)
+    # Opener positions are cached until the scan passes them, and a closer type known to
+    # be absent from the rest of the text is never searched for again, so every find()
+    # covers a distinct stretch of input — the scan stays linear even when thousands of
+    # openers never close.
+    expr_start = text.find("{{")
+    stmt_start = text.find("{%")
+    have_expr_closer = True
+    have_stmt_closer = True
     while i < n:
-        # Find the next opener; -1 sentinels normalized to n so min() picks the earliest.
-        expr_start = text.find("{{", i)
-        stmt_start = text.find("{%", i)
+        if expr_start != -1 and expr_start < i:
+            expr_start = text.find("{{", i)
+        if stmt_start != -1 and stmt_start < i:
+            stmt_start = text.find("{%", i)
         starts = [pos for pos in (expr_start, stmt_start) if pos != -1]
         if not starts:
             parts.append(text[i:])
             break
         start = min(starts)
         parts.append(text[i:start])
-        closer = "}}" if text.startswith("{{", start) else "%}"
-        end = text.find(closer, start + 2)
+        if text.startswith("{{", start):
+            end = text.find("}}", start + 2) if have_expr_closer else -1
+            have_expr_closer = end != -1
+        else:
+            end = text.find("%}", start + 2) if have_stmt_closer else -1
+            have_stmt_closer = end != -1
         if end == -1:
-            # Unclosed span: the remainder gets only the legacy leading-position rewrite.
-            parts.append(leading_pattern.sub(lambda m: "{{" + m.group(1) + new_key, text[start:]))
-            break
+            # Unclosed opener: apply the legacy leading-position rewrite at this opener
+            # only, then keep scanning — later well-formed spans still get full coverage.
+            head = leading_pattern.match(text, start)
+            if head is not None:
+                parts.append("{{" + head.group(1) + new_key)
+                i = head.end()
+            else:
+                parts.append(text[start : start + 2])
+                i = start + 2
+            continue
         span_end = end + 2
         parts.append(_rewrite_span_tokens(text[start:span_end], old_key, new_key))
         i = span_end

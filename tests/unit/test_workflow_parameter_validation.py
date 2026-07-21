@@ -182,6 +182,21 @@ class TestReplaceJinjaReference:
                 id="outside-delimiters-unchanged",
             ),
             pytest.param("{{ old_key", "{{ new_key", id="unclosed-expression-leading-rewritten"),
+            pytest.param(
+                "{{ oops {% if old_key %}",
+                "{{ oops {% if new_key %}",
+                id="closed-statement-after-unclosed-expression-rewritten",
+            ),
+            pytest.param(
+                "{% oops {{ x < old_key }}",
+                "{% oops {{ x < new_key }}",
+                id="closed-expression-after-unclosed-statement-rewritten",
+            ),
+            pytest.param(
+                "{{ old_key {{ old_key",
+                "{{ new_key {{ new_key",
+                id="repeated-unclosed-leading-rewritten",
+            ),
         ],
     )
     def test_replace_jinja_reference(self, text: str, expected: str) -> None:
