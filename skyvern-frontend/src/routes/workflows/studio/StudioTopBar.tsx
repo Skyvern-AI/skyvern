@@ -348,7 +348,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
               className="h-8 border border-transparent px-3"
               disabled={isRecording}
             >
-              <PlayIcon className="mr-2 size-4" /> Run agent
+              <PlayIcon className="mr-2 size-4" /> Run
             </Button>
           </DialogTrigger>
           <DialogContent>
@@ -384,7 +384,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
       onClick={startFullRun}
     >
       <PlayIcon className="mr-2 size-4" />
-      {rerunEligible ? "Re-run agent" : "Run agent"}
+      {rerunEligible ? "Re-run" : "Run"}
     </Button>
   );
 }
