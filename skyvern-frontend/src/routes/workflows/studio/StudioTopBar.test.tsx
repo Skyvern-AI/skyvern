@@ -34,9 +34,10 @@ import {
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
-import { RunStopButton, SaveButton } from "./StudioTopBar";
+import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
 
 function LocationProbe() {
   const location = useLocation();
@@ -372,5 +373,66 @@ describe("SaveButton confirmation gating", () => {
 
     expect(screen.queryByText("Saving Changes")).not.toBeNull();
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("TitleSection title link + edit affordance", () => {
+  beforeEach(() => {
+    useWorkflowTitleStore.setState({ title: "My Workflow" });
+    useWorkflowHasChangesStore.setState({ hasChanges: false });
+    useRecordingStore.setState({ isRecording: false });
+  });
+
+  function renderTitleSection(editable = true) {
+    return render(
+      <TooltipProvider delayDuration={0}>
+        <MemoryRouter initialEntries={["/agents/wpid_abc/studio"]}>
+          <Routes>
+            <Route
+              path="/agents/:workflowPermanentId/studio"
+              element={<TitleSection editable={editable} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+  }
+
+  test("renders the title as a link to the workflow runs page", () => {
+    renderTitleSection();
+    const link = screen.getByRole("link", { name: "My Workflow" });
+    expect(link.getAttribute("href")).toBe("/agents/wpid_abc/runs");
+  });
+
+  test("enters the shared rename input from the edit button and commits into the title + dirty stores", () => {
+    renderTitleSection();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Click to edit title" }),
+    );
+
+    const input = screen.getByDisplayValue("My Workflow");
+    fireEvent.change(input, { target: { value: "Renamed WF" } });
+    fireEvent.blur(input);
+
+    expect(useWorkflowTitleStore.getState().title).toBe("Renamed WF");
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+  });
+
+  test("keeps the runs link but hides the edit button when not editable", () => {
+    renderTitleSection(false);
+    expect(screen.getByRole("link", { name: "My Workflow" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Click to edit title" }),
+    ).toBeNull();
+  });
+
+  test("renders the edit pencil visibly at rest with a borderless hover-bg affordance", () => {
+    renderTitleSection();
+    const button = screen.getByRole("button", { name: "Click to edit title" });
+    // Always visible (no opacity reveal), soft hover background, no border/outline.
+    expect(button.className).not.toContain("opacity-0");
+    expect(button.className).toContain("hover:bg-slate-500/20");
+    expect(button.className).not.toContain("border");
   });
 });
