@@ -146,7 +146,7 @@ describe("RunStopButton concurrency with a live block run", () => {
     mockRun(Status.Completed);
     renderAt("/workflows/wpid_1/studio?wr=wr_1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Re-run agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Re-run" }));
 
     expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.getByTestId("location").textContent).toBe(
@@ -166,7 +166,7 @@ describe("RunStopButton concurrency with a live block run", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
     renderAt("/workflows/wpid_1/studio");
 
-    fireEvent.click(screen.getByRole("button", { name: "Run agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
@@ -180,7 +180,7 @@ describe("RunStopButton concurrency with a live block run", () => {
     mockRun(Status.Completed, { workflow_run_id: "wr_previous" });
     renderAt("/workflows/wpid_1/studio?wr=wr_1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Run agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
@@ -192,7 +192,7 @@ describe("RunStopButton concurrency with a live block run", () => {
     mockRun(Status.Completed);
     renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
 
-    fireEvent.click(screen.getByRole("button", { name: "Run agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
@@ -204,7 +204,7 @@ describe("RunStopButton concurrency with a live block run", () => {
     mockRun(Status.Failed, { task_v2: { task_id: "task_synthetic" } });
     renderAt("/workflows/wpid_1/studio?wr=wr_1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Run agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
@@ -216,7 +216,7 @@ describe("RunStopButton concurrency with a live block run", () => {
     mockRun(Status.Completed);
     renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,copilot");
 
-    fireEvent.click(screen.getByRole("button", { name: "Re-run agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Re-run" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
