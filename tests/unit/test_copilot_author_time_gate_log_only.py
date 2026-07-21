@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import copy
+import json
+import pathlib
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -7,7 +11,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot import agent
+from skyvern.forge.sdk.copilot import agent, runtime
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
@@ -17,7 +21,10 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
+    AUTHOR_TIME_GATE_LOG_ONLY_IDS,
     DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
+    METADATA_RUN_PREFLIGHT_REJECT_GATE_ID,
+    OUTPUT_CONTRACT_ACTUATION_GATE_ID,
     RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
     SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     cache_copilot_author_time_gate_log_only_ids,
@@ -26,6 +33,9 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as wu
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.test_copilot_code_artifact_metadata_violations import _valid_metadata
+
+_GOAL_PATH_PLACEHOLDER = "<fill: output JSON path(s) carrying requested goal values>"
 
 _UNREFERENCED_DEFINITION_YAML = """\
 title: Submit reusable request
@@ -327,3 +337,310 @@ def test_unselected_new_gate_keeps_enforcing() -> None:
         is False
     )
     assert ctx.author_time_gate_ablation_events == []
+
+
+_MISSING_METADATA_OUTPUT_YAML = """\
+title: Collect provider records
+workflow_definition:
+  parameters:
+  - {parameter_type: output, key: records}
+  blocks:
+  - block_type: code
+    label: collect_records
+    parameter_keys: []
+    code: |
+      await page.goto("https://example.com/records")
+      return {"records": [{"number": "123"}]}
+"""
+
+
+_IMPOSABLE_METADATA = {
+    "block_label": "collect_records",
+    "declared_goal": "Collect the provider records",
+    "terminal_verifier_expectations": [{"goal_value_paths": ["records[].number"]}],
+}
+
+
+def _missing_metadata_ctx() -> CopilotContext:
+    ctx = make_copilot_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    return ctx
+
+
+def test_metadata_family_gate_ids_are_posthog_eligible() -> None:
+    ctx = make_copilot_ctx()
+    with capture_logs() as logs:
+        cache_copilot_author_time_gate_log_only_ids(
+            ctx,
+            frozenset(
+                {
+                    OUTPUT_CONTRACT_ACTUATION_GATE_ID,
+                    METADATA_RUN_PREFLIGHT_REJECT_GATE_ID,
+                    "raw_secret_leak",
+                    "credential_reference_presence",
+                }
+            ),
+        )
+
+    assert ctx.author_time_gate_log_only_ids == frozenset(
+        {OUTPUT_CONTRACT_ACTUATION_GATE_ID, METADATA_RUN_PREFLIGHT_REJECT_GATE_ID}
+    )
+    assert copilot_author_time_gate_log_only_enabled(ctx, OUTPUT_CONTRACT_ACTUATION_GATE_ID) is True
+    assert copilot_author_time_gate_log_only_enabled(ctx, METADATA_RUN_PREFLIGHT_REJECT_GATE_ID) is True
+    ineligible = {log["gate_id"] for log in logs if log["event"] == "copilot_gate_log_only_ineligible"}
+    assert ineligible == {"raw_secret_leak", "credential_reference_presence"}
+    for security_gate_id in ("raw_secret_leak", "credential_reference_presence"):
+        assert copilot_author_time_gate_log_only_enabled(ctx, security_gate_id) is False
+
+
+@pytest.mark.asyncio
+async def test_missing_metadata_reject_persists_draft_under_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _missing_metadata_ctx()
+    cache_copilot_author_time_gate_log_only_ids(ctx, frozenset({OUTPUT_CONTRACT_ACTUATION_GATE_ID}))
+
+    result = await wu._update_workflow(
+        {"workflow_yaml": _MISSING_METADATA_OUTPUT_YAML},
+        ctx,
+        allow_missing_credentials=True,
+        allow_static_output_uncertainty=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.latest_recorded_build_test_outcome is None
+    event = ctx.author_time_gate_ablation_events[-1]
+    assert event.gate_id == OUTPUT_CONTRACT_ACTUATION_GATE_ID
+    assert event.reason_code == "missing_code_artifact_metadata"
+    assert event.log_only is True
+    assert event.blocked_tool == "update_workflow"
+    assert event.fingerprint
+    assert event.payload["block_labels"] == ["collect_records"]
+    # No request-policy output contract is in play, so there is nothing to scaffold from and the
+    # draft persists carrying no metadata rows.
+    assert not ctx.code_artifact_metadata
+
+
+@pytest.mark.asyncio
+async def test_missing_metadata_reject_stays_enforcing_when_gate_unselected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _missing_metadata_ctx()
+
+    result = await wu._update_workflow(
+        {"workflow_yaml": _MISSING_METADATA_OUTPUT_YAML},
+        ctx,
+        allow_missing_credentials=True,
+        allow_static_output_uncertainty=True,
+    )
+
+    assert result["ok"] is False
+    assert "code_artifact_metadata" in str(result["error"])
+    assert ctx.author_time_gate_ablation_events == []
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.reason_code == "metadata_reject"
+
+
+_NORMALIZATION_YAML = """\
+title: Collect provider records
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: code
+    label: collect_records
+    parameter_keys: []
+    code: |
+      await page.goto("https://example.com/records")
+      return {"records": [{"number": "123"}]}
+"""
+
+
+_TWO_BLOCK_YAML = """\
+title: Collect provider records
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: code
+    label: block_ok
+    parameter_keys: []
+    code: |
+      await page.goto("https://example.com/a")
+      return {"records": [{"number": "1"}]}
+  - block_type: code
+    label: block_bad
+    parameter_keys: []
+    code: |
+      await page.goto("https://example.com/b")
+      return {"records": [{"number": "2"}]}
+"""
+
+
+@pytest.mark.asyncio
+async def test_normalization_seam_keeps_rows_the_enforcing_pass_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = make_copilot_ctx()
+    cache_copilot_author_time_gate_log_only_ids(ctx, frozenset({OUTPUT_CONTRACT_ACTUATION_GATE_ID}))
+    conforming = copy.deepcopy(_valid_metadata("block_ok"))
+    conforming["claimed_outcomes"][0]["goal_value_paths"] = [_GOAL_PATH_PLACEHOLDER]
+
+    result = await wu._update_workflow(
+        {
+            "workflow_yaml": _TWO_BLOCK_YAML,
+            "code_artifact_metadata": [conforming, {"block_label": "block_bad", "declared_goal": "g"}],
+        },
+        ctx,
+        allow_missing_credentials=True,
+        allow_static_output_uncertainty=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.latest_recorded_build_test_outcome is None
+    assert ctx.author_time_gate_ablation_events[-1].reason_code == "metadata_normalization"
+    # block_ok normalizes on the enforcing pass; the seam must not drop it while relieving block_bad.
+    assert set(ctx.code_artifact_metadata or {}) == {"block_ok"}
+
+
+@pytest.mark.asyncio
+async def test_schema_incompatibility_still_rejects_and_records_no_ablation_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = make_copilot_ctx()
+    cache_copilot_author_time_gate_log_only_ids(ctx, frozenset({OUTPUT_CONTRACT_ACTUATION_GATE_ID}))
+    incompatible = copy.deepcopy(_valid_metadata("collect_records"))
+    incompatible["terminal_verifier_expectations"] = [
+        {
+            "goal_value_paths": ["records[].number"],
+            "extraction_schema": json.dumps(
+                {"type": "object", "properties": {"unrelated": {"type": "string"}}, "required": ["unrelated"]}
+            ),
+        }
+    ]
+
+    result = await wu._update_workflow(
+        {"workflow_yaml": _NORMALIZATION_YAML, "code_artifact_metadata": [incompatible]},
+        ctx,
+        allow_missing_credentials=True,
+        allow_static_output_uncertainty=True,
+    )
+
+    if result["ok"] is False and ctx.author_time_gate_ablation_events:
+        raise AssertionError("a rejected save must not also report a log-only ablation for the same call")
+
+
+@pytest.mark.asyncio
+async def test_undefaultable_normalization_contradiction_saves_no_row_under_log_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = make_copilot_ctx()
+    cache_copilot_author_time_gate_log_only_ids(ctx, frozenset({OUTPUT_CONTRACT_ACTUATION_GATE_ID}))
+
+    result = await wu._update_workflow(
+        {
+            "workflow_yaml": _NORMALIZATION_YAML,
+            "code_artifact_metadata": [
+                {
+                    "block_label": "collect_records",
+                    "declared_goal": "collect records",
+                    "claimed_outcomes": [{"id": "claim:x", "scope": "outcome", "text": "x", "status": "satisfied"}],
+                }
+            ],
+        },
+        ctx,
+        allow_missing_credentials=True,
+        allow_static_output_uncertainty=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.author_time_gate_ablation_events[-1].reason_code == "metadata_normalization"
+    assert not ctx.code_artifact_metadata
+
+
+@pytest.mark.asyncio
+async def test_normalization_reject_stays_enforcing_when_gate_unselected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = make_copilot_ctx()
+
+    result = await wu._update_workflow(
+        {
+            "workflow_yaml": _NORMALIZATION_YAML,
+            "code_artifact_metadata": [_IMPOSABLE_METADATA],
+        },
+        ctx,
+        allow_missing_credentials=True,
+        allow_static_output_uncertainty=True,
+    )
+
+    assert result["ok"] is False
+    assert ctx.author_time_gate_ablation_events == []
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.reason_code == "metadata_reject"
+
+
+def test_eligible_gate_set_matches_the_seamed_gates_exactly() -> None:
+    """Gate ids reaching an ablation recorder are the ground truth for what can be disabled:
+    the flag's list must cover all of them, and every listed id must emit ablation events."""
+    recorders = r"(?:record_author_time_gate_ablation_event|_record_output_contract_ablation_event)"
+    seamed: set[str] = set()
+    for path in pathlib.Path("skyvern/forge/sdk/copilot").rglob("*.py"):
+        source = path.read_text()
+        for match in re.finditer(recorders + r"\((.*?)\)", source, re.S):
+            gate = re.search(r"gate_id=([A-Za-z_][A-Za-z_0-9]*|\"[a-z_]+\")", match.group(1))
+            if gate is None:
+                continue
+            token = gate.group(1)
+            if token == "gate_id":
+                continue
+            resolved = (
+                token.strip('"') if token.startswith('"') else getattr(runtime, token, None) or getattr(wu, token, None)
+            )
+            if isinstance(resolved, str):
+                seamed.add(resolved)
+
+    assert seamed, "found no gate ids; the seam-detection regex needs updating"
+    unreachable = seamed - AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    assert not unreachable, (
+        f"these gates have a suppression seam but the flag cannot disable them: {sorted(unreachable)}. "
+        "Add them to AUTHOR_TIME_GATE_LOG_ONLY_IDS."
+    )
+    eventless = AUTHOR_TIME_GATE_LOG_ONLY_IDS - seamed
+    assert not eventless, (
+        f"these flag-eligible gates emit no ablation events when suppressed: {sorted(eventless)}. "
+        "Suppression without events cannot be graded or monitored — add a recording seam."
+    )
+
+
+_SECURITY_GATE_IDS = frozenset(
+    {
+        "raw_secret_leak",
+        "raw_secret_handling",
+        "code_safety_reject",
+        "credential_reference_presence",
+        "unapproved_credential_reference",
+        "credential_scout_reopen",
+    }
+)
+
+
+def test_eligible_gate_ids_are_exactly_the_sanctioned_seven() -> None:
+    """Security-critical: OutputPolicy security gates must never become flag-suppressible.
+    Exact-content assertion is intentional — any change to this set is a security decision."""
+    assert AUTHOR_TIME_GATE_LOG_ONLY_IDS == frozenset(
+        {
+            "definition_contract_unsatisfied",
+            "recorded_outcome_grounding_binder_ceiling",
+            "synthesized_parameter_binding_ambiguous",
+            "output_contract_actuation",
+            "metadata_run_preflight_reject",
+            "uncovered_output_rescout_steer",
+            "recorded_outcome_grounding",
+        }
+    )
+    assert not (AUTHOR_TIME_GATE_LOG_ONLY_IDS & _SECURITY_GATE_IDS)
