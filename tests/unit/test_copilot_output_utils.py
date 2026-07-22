@@ -357,6 +357,57 @@ class TestSummarizeToolResult:
         summary = self._summarize("unknown_tool", {"ok": True})
         assert summary == "OK"
 
+    def test_update_and_run_blocks_success_reports_run_status(self) -> None:
+        # The non-skip result is run-blocks-shaped (overall_status, executed_block_labels);
+        # it never carries block_count, so the summary must not fabricate a count.
+        summary = self._summarize(
+            "update_and_run_blocks",
+            {"ok": True, "data": {"overall_status": "completed", "executed_block_labels": ["step_1"]}},
+        )
+        assert summary == "Updated the workflow and ran it: completed"
+
+    def test_update_and_run_blocks_success_without_status(self) -> None:
+        summary = self._summarize(
+            "update_and_run_blocks",
+            {"ok": True, "data": {"executed_block_labels": ["step_1"]}},
+        )
+        assert summary == "Updated the workflow and ran it"
+
+    def test_update_and_run_blocks_skipped_run_still_reported(self) -> None:
+        summary = self._summarize(
+            "update_and_run_blocks",
+            {"ok": True, "data": {"block_count": 3, "skipped_run": True}},
+        )
+        assert summary == "Workflow updated (3 blocks); browser run skipped"
+
+    def test_discover_workflow_entrypoint_found(self) -> None:
+        summary = self._summarize(
+            "discover_workflow_entrypoint",
+            {"ok": True, "data": {"candidate_url": "https://example.com/apply"}},
+        )
+        assert summary == "Found the entry page: https://example.com/apply"
+
+    def test_discover_workflow_entrypoint_not_found(self) -> None:
+        summary = self._summarize(
+            "discover_workflow_entrypoint",
+            {"ok": True, "data": {"candidate_url": None, "failure_reason": "no_candidate"}},
+        )
+        assert summary == "No entry page found"
+
+    def test_inspect_page_for_composition_reports_field_count(self) -> None:
+        summary = self._summarize(
+            "inspect_page_for_composition",
+            {"ok": True, "data": {"forms": [{"fields": [{}, {}]}, {"fields": [{}]}]}},
+        )
+        assert summary == "Inspected the page (3 form field(s))"
+
+    def test_inspect_page_for_composition_no_forms(self) -> None:
+        summary = self._summarize(
+            "inspect_page_for_composition",
+            {"ok": True, "data": {"forms": []}},
+        )
+        assert summary == "Inspected the page"
+
     def test_evaluate_does_not_dump_raw_list(self) -> None:
         # The activity bullet must describe shape only — JS return values
         # (which are page-controlled) must never reach the SSE payload.
