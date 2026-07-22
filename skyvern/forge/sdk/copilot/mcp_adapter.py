@@ -68,6 +68,8 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_browser_interaction_observation",
     "scouted_interactions",
     "scout_trajectory",
+    "never_captured_obligation",
+    "synthesized_block_reopened_for_capture_obligation",
     "pending_scout_source_url",
     "pending_scout_typed_value",
     "pending_scout_role_name",
@@ -91,6 +93,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "synthesized_block_offered",
     "synthesized_block_offered_trajectory_len",
     "synthesized_block_offered_goal_complete",
+    "synthesized_business_required_parameter_keys",
     "scouted_output_covered_paths",
     "scout_observed_terminal_criterion_ids",
     "scout_observation_contract",
@@ -465,7 +468,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
                 return _copilot_to_call_tool_result({"ok": False, "error": terminal_challenge_payload})
 
-        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name)
+        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name, arguments)
         if persistence_signal is not None:
             LOG.warning(
                 "Synthesized block persistence required before MCP tool",

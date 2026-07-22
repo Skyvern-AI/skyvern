@@ -1531,7 +1531,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     if uncovered_output_steer is not None:
         return _emit_tool_blocker_signal(ctx, uncovered_output_steer)
 
-    persistence_signal = synthesized_block_persistence_signal(ctx, tool_name)
+    persistence_signal = synthesized_block_persistence_signal(ctx, tool_name, arguments)
     if persistence_signal is not None:
         grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
         if grounding_signal is not None:
