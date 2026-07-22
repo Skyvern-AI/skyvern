@@ -18,7 +18,7 @@ from cachetools import TTLCache
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Response, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Request, Response, TimeoutError
 from pydantic import BaseModel, field_validator
 
 from skyvern.config import settings
@@ -210,6 +210,8 @@ class CustomSelectFamilyOutcome(StrEnum):
 
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
+DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
+DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
 SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
 SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
@@ -2051,23 +2053,61 @@ class AutoCompletionResult(BaseModel):
 class ScopedXhrDownloadCapture:
     """Install on a page before a download action; remove after the polling window.
 
-    Skipped when CDPDownloadInterceptor is active on the browser context
-    (detected via ``_skyvern_cdp_download_active`` flag) because the CDP path
-    already handles downloads at the Fetch domain level.
+    Response-body capture is skipped when CDPDownloadInterceptor is active on
+    the browser context, while request lifecycle tracking remains enabled for
+    the bounded download wait.
 
     Automatically attaches to new pages opened during the action window
     (e.g. target="_blank" links) so XHR responses on child tabs are captured.
     """
 
-    def __init__(self, page: Page, download_dir: Path) -> None:
+    def __init__(self, page: Page, download_dir: Path, timeout_seconds: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
         self._page = page
         self._download_dir = download_dir
+        self._timeout_seconds = timeout_seconds
         self._saved: set[str] = set()
         self._extra_pages: list[Page] = []
+        self._capture_responses = False
         self._active = False
+        self._accept_new_requests = False
+        # Response-body drain count is separate from request-lifecycle tracking for the bounded wait extension.
         self._in_flight = 0
+        self._response_tasks: set[asyncio.Task[None]] = set()
+        self._in_flight_requests: set[Request] = set()
+        self._admitted_requests: set[Request] = set()
+        self._child_pages_with_bootstrap_allowance: set[Page] = set()
         self._drained = asyncio.Event()
         self._drained.set()
+
+    @property
+    def has_in_flight_requests(self) -> bool:
+        return bool(self._in_flight_requests)
+
+    def _on_request(self, request: Request) -> None:
+        redirected_from_admitted_request = request.redirected_from in self._admitted_requests
+        if not self._active or request.resource_type not in ("xhr", "fetch"):
+            return
+
+        child_page_has_bootstrap_allowance = False
+        if not self._accept_new_requests and request.redirected_from is None:
+            try:
+                request_page = request.frame.page
+                child_page_has_bootstrap_allowance = request_page in self._child_pages_with_bootstrap_allowance
+            except Exception:
+                pass
+
+        if child_page_has_bootstrap_allowance:
+            self._child_pages_with_bootstrap_allowance.discard(request_page)
+
+        if self._accept_new_requests or redirected_from_admitted_request or child_page_has_bootstrap_allowance:
+            self._in_flight_requests.add(request)
+            self._admitted_requests.add(request)
+
+    def _on_request_finished(self, request: Request) -> None:
+        self._in_flight_requests.discard(request)
+
+    def seal_in_flight_requests(self) -> None:
+        self._accept_new_requests = False
 
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
@@ -2087,82 +2127,140 @@ class ScopedXhrDownloadCapture:
             return False
         return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
 
-    async def _on_response(self, response: Response) -> None:
+    def _on_response_event(self, response: Response) -> None:
         self._in_flight += 1
         self._drained.clear()
-        try:
-            try:
-                if response.request.resource_type not in ("xhr", "fetch"):
-                    return
-                headers = response.headers
-                if not self._is_xhr_download(headers, response.status):
-                    return
-                response_url = response.url
-                raw_filename = extract_filename(
-                    {"content-disposition": headers.get("content-disposition", "")}, response_url
-                )
-                filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
-                if not filename or filename in self._saved:
-                    return
-                content_length = headers.get("content-length", "")
-                if content_length:
-                    try:
-                        if int(content_length) > MAX_FILE_SIZE_BYTES:
-                            return
-                    except ValueError:
-                        pass
-                save_path = self._download_dir / filename
-                body = await response.body()
-                if len(body) > MAX_FILE_SIZE_BYTES:
-                    return
-                try:
-                    with open(save_path, "xb") as f:
-                        f.write(body)
-                except FileExistsError:
-                    pass
-                self._saved.add(filename)
-                LOG.info(
-                    "XHR download captured during download action",
-                    filename=filename,
-                    size=len(body),
-                )
-            except Exception:
-                LOG.warning("Failed to capture XHR download response", exc_info=True)
-        finally:
-            self._in_flight -= 1
-            if self._in_flight == 0:
-                self._drained.set()
+        task = asyncio.create_task(self._on_response(response))
+        self._response_tasks.add(task)
+        task.add_done_callback(self._on_response_done)
 
-    async def drain(self) -> None:
-        """Wait for in-flight XHR captures to finish. Best-effort: late events
-        after drain returns are cleaned up by the caller's finally block."""
-        await self._drained.wait()
+    def _on_response_done(self, task: asyncio.Task[None]) -> None:
+        self._response_tasks.discard(task)
+        self._in_flight -= 1
+        if self._in_flight == 0:
+            self._drained.set()
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            LOG.warning("Unhandled XHR download response capture failure", exc_info=exception)
+
+    async def _on_response(self, response: Response) -> None:
+        try:
+            if response.request not in self._admitted_requests:
+                return
+            headers = response.headers
+            if not self._is_xhr_download(headers, response.status):
+                return
+            response_url = response.url
+            raw_filename = extract_filename(
+                {"content-disposition": headers.get("content-disposition", "")}, response_url
+            )
+            filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
+            if not filename or filename in self._saved:
+                return
+            content_length = headers.get("content-length", "")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_FILE_SIZE_BYTES:
+                        return
+                except ValueError:
+                    pass
+            save_path = self._download_dir / filename
+            body = await response.body()
+            if len(body) > MAX_FILE_SIZE_BYTES:
+                return
+            try:
+                with open(save_path, "xb") as f:
+                    f.write(body)
+            except FileExistsError:
+                pass
+            self._saved.add(filename)
+            LOG.info(
+                "XHR download captured during download action",
+                filename=filename,
+                size=len(body),
+            )
+        except Exception:
+            LOG.warning("Failed to capture XHR download response", exc_info=True)
+
+    async def _cancel_response_tasks(self) -> None:
+        tasks = list(self._response_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _cancel_response_tasks_safely(self) -> None:
+        cleanup_task = asyncio.create_task(self._cancel_response_tasks())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
+    async def drain(self, timeout_seconds: float | None = None) -> bool:
+        """Wait for owned XHR captures, cancelling and awaiting them at the deadline."""
+        budget_seconds = self._timeout_seconds if timeout_seconds is None else timeout_seconds
+        timed_out = False
+        try:
+            async with asyncio.timeout(budget_seconds):
+                await self._drained.wait()
+        except asyncio.TimeoutError:
+            timed_out = True
+            LOG.warning(
+                "Timed out waiting for XHR download response capture drainage",
+                timeout_seconds=budget_seconds,
+                in_flight_response_count=self._in_flight,
+            )
+        finally:
+            if self._response_tasks:
+                await self._cancel_response_tasks_safely()
+        return not timed_out
 
     def _on_new_page(self, page: Page) -> None:
         if not self._active:
             return
-        page.on("response", self._on_response)
+        self._child_pages_with_bootstrap_allowance.add(page)
+        self._attach_page(page)
         self._extra_pages.append(page)
 
+    def _attach_page(self, page: Page) -> None:
+        if self._capture_responses:
+            page.on("response", self._on_response_event)
+        page.on("request", self._on_request)
+        page.on("requestfinished", self._on_request_finished)
+        page.on("requestfailed", self._on_request_finished)
+
+    def _detach_page(self, page: Page) -> None:
+        if self._capture_responses:
+            page.remove_listener("response", self._on_response_event)
+        page.remove_listener("request", self._on_request)
+        page.remove_listener("requestfinished", self._on_request_finished)
+        page.remove_listener("requestfailed", self._on_request_finished)
+
     def enable(self) -> None:
-        if getattr(self._page.context, "_skyvern_cdp_download_active", False):
-            return
-        self._page.on("response", self._on_response)
-        self._page.context.on("page", self._on_new_page)
+        self._capture_responses = not getattr(self._page.context, "_skyvern_cdp_download_active", False)
         self._active = True
+        self._accept_new_requests = True
+        self._attach_page(self._page)
+        self._page.context.on("page", self._on_new_page)
 
     def disable(self) -> None:
         if not self._active:
             return
-        self._page.remove_listener("response", self._on_response)
+        self._active = False
+        self._accept_new_requests = False
+        self._detach_page(self._page)
         self._page.context.remove_listener("page", self._on_new_page)
         for page in self._extra_pages:
             try:
-                page.remove_listener("response", self._on_response)
+                self._detach_page(page)
             except Exception:
                 pass
         self._extra_pages.clear()
-        self._active = False
+        self._child_pages_with_bootstrap_allowance.clear()
+        self._in_flight_requests.clear()
 
 
 class ActionHandler:
@@ -2227,9 +2325,8 @@ class ActionHandler:
         trigger_download_action = (
             isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
         )
-        # triggers_download splits the bimodal distribution: non-download actions
-        # finish in ~1s while download actions can burn up to BROWSER_DOWNLOAD_MAX_WAIT_TIME
-        # (120s) polling for the file. Explains the 36s p95 on this wrapper.
+        # Without an explicit timeout, download actions can use a 120s no-signal grace plus a bounded 120s
+        # in-flight extension (up to 240s total); an explicit action timeout remains the hard cap.
         _action_span.set_attribute("triggers_download", trigger_download_action)
         _tracer = otel_trace.get_tracer("skyvern")
         if not trigger_download_action:
@@ -2403,8 +2500,8 @@ class ActionHandler:
                 files = files + files_in_browser_session
             return files
 
-        async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str]) -> bool:
-            await xhr_capture.drain()
+        async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str], timeout_seconds: float) -> bool:
+            await xhr_capture.drain(timeout_seconds=timeout_seconds)
             if not staging_dir.exists():
                 return False
             staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
@@ -2448,7 +2545,13 @@ class ActionHandler:
         )
 
         staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
-        xhr_capture = ScopedXhrDownloadCapture(page, staging_dir)
+        xhr_capture = ScopedXhrDownloadCapture(
+            page,
+            staging_dir,
+            timeout_seconds=float(task.download_timeout)
+            if task.download_timeout is not None
+            else BROWSER_DOWNLOAD_TIMEOUT,
+        )
         download_triggered = False
         xhr_fallback_moved_paths: set[str] = set()
         transient_text_observer = TransientPageTextObserver(
@@ -2459,7 +2562,7 @@ class ActionHandler:
         )
         page.on("download", _capture_download_event)
         try:
-            await transient_text_observer.start()
+            await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
@@ -2472,14 +2575,31 @@ class ActionHandler:
                 )
             if not results:
                 return results
-            await transient_text_observer.start()
-            _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
-            _download_event_grace_seconds = min(DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, _download_timeout)
+            # Let request events already queued by the action enter before closing admission.
+            await asyncio.sleep(0)
+            xhr_capture.seal_in_flight_requests()
+            # Deliberately reinstall and rescan in case the action replaced the document or exposed initial visible text.
+            await transient_text_observer.start(scan_initial_visible_state=True)
+            if task.download_timeout is not None:
+                download_wait_hard_timeout_seconds = float(task.download_timeout)
+                no_signal_grace_seconds = min(download_wait_hard_timeout_seconds, BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
+            else:
+                no_signal_grace_seconds = BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME
+                download_wait_hard_timeout_seconds = no_signal_grace_seconds + DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS
+            download_wait_started_at = time.monotonic()
+            download_wait_deadline = download_wait_started_at + download_wait_hard_timeout_seconds
+
+            def _remaining_download_wait_seconds() -> float:
+                return max(0.0, download_wait_deadline - time.monotonic())
+
+            _download_event_grace_seconds = min(
+                DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, download_wait_hard_timeout_seconds
+            )
             with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
                 apply_context_attrs(_dl_wait_span)
-                _dl_wait_span.set_attribute("timeout_seconds", _download_timeout)
+                _dl_wait_span.set_attribute("timeout_seconds", download_wait_hard_timeout_seconds)
                 _dl_wait_span.set_attribute("download_event_grace_seconds", _download_event_grace_seconds)
-                no_signal_grace_seconds = min(_download_timeout, BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
+                _dl_wait_span.set_attribute("in_flight_extension_max_seconds", DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS)
                 _dl_wait_span.set_attribute("no_signal_grace_seconds", no_signal_grace_seconds)
                 _poll_iterations = 0
                 captured_download: Download | None = None
@@ -2493,7 +2613,7 @@ class ActionHandler:
                 download_signal_elapsed_seconds: float | None = None
                 download_signal_poll_iterations: int | None = None
                 download_wait_matched_errors: list[UserDefinedError] = []
-                download_wait_started_at = time.monotonic()
+                download_wait_extended_for_in_flight_request = False
 
                 def _record_download_signal(source: str) -> None:
                     nonlocal download_signal_observed
@@ -2513,7 +2633,7 @@ class ActionHandler:
                         "Checking if there is any new files after click",
                         download_dir=download_dir,
                     )
-                    async with asyncio.timeout(_download_timeout):
+                    async with asyncio.timeout(download_wait_hard_timeout_seconds):
                         while True:
                             _poll_iterations += 1
                             if download_event.done() and captured_download is None:
@@ -2558,7 +2678,9 @@ class ActionHandler:
                                     workflow_run_id=task.workflow_run_id,
                                 )
                                 # Keep polling: the shared browser may still land the file in the session folder.
-                                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths):
+                                if await _drain_and_move_staged_xhr(
+                                    xhr_fallback_moved_paths, _remaining_download_wait_seconds()
+                                ):
                                     download_triggered = True
                                     break
 
@@ -2637,15 +2759,21 @@ class ActionHandler:
                                     )
                                     break
 
+                            if elapsed_since_action >= download_wait_hard_timeout_seconds:
+                                raise asyncio.TimeoutError
+
                             if not download_signal_observed and elapsed_since_action >= no_signal_grace_seconds:
-                                LOG.warning(
-                                    "No download signal observed after action",
-                                    workflow_run_id=task.workflow_run_id,
-                                    no_signal_grace_seconds=no_signal_grace_seconds,
-                                )
-                                break
-                            sleep_seconds: float = 1.0
-                            if not download_signal_observed:
+                                if xhr_capture.has_in_flight_requests:
+                                    download_wait_extended_for_in_flight_request = True
+                                else:
+                                    LOG.warning(
+                                        "No download signal observed after action",
+                                        workflow_run_id=task.workflow_run_id,
+                                        no_signal_grace_seconds=no_signal_grace_seconds,
+                                    )
+                                    break
+                            sleep_seconds = DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS
+                            if not download_signal_observed and elapsed_since_action < no_signal_grace_seconds:
                                 sleep_seconds = min(1, max(0.0, no_signal_grace_seconds - elapsed_since_action))
                             await asyncio.sleep(sleep_seconds)
 
@@ -2676,6 +2804,18 @@ class ActionHandler:
                         "download_wait_user_error_detected",
                         bool(download_wait_matched_errors),
                     )
+                    _dl_wait_span.set_attribute(
+                        "download_wait_extended_for_in_flight_request",
+                        download_wait_extended_for_in_flight_request,
+                    )
+                    LOG.info(
+                        "Transient download observation completed",
+                        workflow_run_id=task.workflow_run_id,
+                        observer_event_count=len(transient_text_observer.events),
+                        user_error_matched=bool(download_wait_matched_errors),
+                        extended_for_in_flight_request=download_wait_extended_for_in_flight_request,
+                        elapsed_seconds=time.monotonic() - download_wait_started_at,
+                    )
                     if download_wait_matched_errors:
                         _dl_wait_span.set_attribute(
                             "download_wait_user_error_codes",
@@ -2683,7 +2823,9 @@ class ActionHandler:
                         )
 
             if not download_triggered:
-                if await _drain_and_move_staged_xhr(xhr_fallback_moved_paths):
+                if download_wait_matched_errors:
+                    await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, 0)
+                elif await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, _remaining_download_wait_seconds()):
                     download_triggered = True
 
             if not download_triggered:
@@ -2721,11 +2863,15 @@ class ActionHandler:
                     )
             return results
         finally:
-            await transient_text_observer.stop()
-            xhr_capture.disable()
-            await xhr_capture.drain()
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir, ignore_errors=True)
+            try:
+                await transient_text_observer.stop()
+            finally:
+                xhr_capture.disable()
+                try:
+                    await xhr_capture.drain(timeout_seconds=0)
+                finally:
+                    if staging_dir.exists():
+                        shutil.rmtree(staging_dir, ignore_errors=True)
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()

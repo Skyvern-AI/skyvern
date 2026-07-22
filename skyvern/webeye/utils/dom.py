@@ -56,6 +56,14 @@ def is_incompatible_text_input_error(exc: BaseException) -> bool:
     return "is not an" in str(exc).lower()
 
 
+def is_element_detached_error(exc: BaseException) -> bool:
+    # "Element is not attached to the DOM" (ElementHandle ops on a replaced node) and
+    # "Frame was detached" (ops routed through a frame that navigated or was removed)
+    # both mean the resolved target no longer exists in the live page.
+    message = str(exc).lower()
+    return "not attached to the dom" in message or "frame was detached" in message
+
+
 def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
     """A Playwright `TimeoutError` whose message references the post-click
     auto-wait for scheduled navigations means the click was physically
@@ -95,7 +103,23 @@ async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css:
         if frame_handler is None:
             raise NoneFrameError(frame_id=child_frame)
 
-        content_frame = await frame_handler.content_frame()
+        try:
+            content_frame = await frame_handler.content_frame()
+        except PlaywrightError as exc:
+            if not is_element_detached_error(exc):
+                raise
+            # The iframe node detached between query_selector and content_frame (page
+            # mutation). Re-query once for a fresh handle; if it is gone or detaches
+            # again, classify as a missing element instead of leaking the raw error.
+            frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+            if frame_handler is None:
+                raise MissingElement(element_id=child_frame) from exc
+            try:
+                content_frame = await frame_handler.content_frame()
+            except PlaywrightError as retry_exc:
+                if not is_element_detached_error(retry_exc):
+                    raise
+                raise MissingElement(element_id=child_frame) from retry_exc
         if content_frame is None:
             raise NoneFrameError(frame_id=child_frame)
         current_frame = content_frame
@@ -942,15 +966,61 @@ class SkyvernElement:
     async def focus(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().focus(timeout=timeout)
 
+    async def refresh_locator_if_stale(self) -> None:
+        """Re-resolve via the tag-name xpath (same fallback as get_skyvern_element_by_id)
+        when the scraped css selector no longer matches — a page mutation replaced the node
+        and the stamped unique-id attribute went with it. Best-effort: swaps the locator
+        only on an unambiguous xpath match; a detach can be transient (mid re-render), so
+        anything else falls through to Playwright's own auto-wait instead of failing fast."""
+        if await self._safe_match_count(self.get_locator()) > 0:
+            return
+        xpath: str | None = self.get_element_dict().get("xpath")
+        if not xpath:
+            return
+        fresh_locator = self.get_frame().locator(f"xpath={xpath}")
+        if await self._safe_match_count(fresh_locator) == 1:
+            LOG.info(
+                "Re-resolved stale element locator by xpath",
+                element_id=self.get_id(),
+                xpath=xpath,
+            )
+            self.locator = fresh_locator
+
+    async def _safe_match_count(self, locator: Locator) -> int:
+        # count() itself raises when the locator's frame detached; that means 0 matches
+        # here, not a new error to surface.
+        try:
+            return await locator.count()
+        except PlaywrightError as exc:
+            if is_element_detached_error(exc):
+                return 0
+            raise
+
+    async def _classify_typing_timeout(self, exc: TimeoutError) -> None:
+        """Raise MissingElement when the typing target vanished mid-action; otherwise
+        return so the caller re-raises the original timeout (a readiness problem)."""
+        if await self._safe_match_count(self.get_locator()) == 0:
+            raise MissingElement(element_id=self.get_id()) from exc
+
     async def input_sequentially(self, text: str, default_timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
+        await self.refresh_locator_if_stale()
+        try:
+            await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
+        except TimeoutError as exc:
+            await self._classify_typing_timeout(exc)
+            raise
 
     async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.refresh_locator_if_stale()
         locator = self.get_locator()
-        await EventStrategyFactory.type_text(locator.page, locator, text)
+        try:
+            await EventStrategyFactory.type_text(locator.page, locator, text)
+        except TimeoutError as exc:
+            await self._classify_typing_timeout(exc)
+            raise
 
     async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:
