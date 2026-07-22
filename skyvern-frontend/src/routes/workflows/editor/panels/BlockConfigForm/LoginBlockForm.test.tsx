@@ -88,12 +88,31 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
   BlockExecutionOptions: (props: {
     continueOnFailure: boolean;
     blockType: string;
+    includeActionHistoryInVerification?: boolean;
+    onIncludeActionHistoryInVerificationChange?: (checked: boolean) => void;
+    showOptions?: { includeActionHistoryInVerification?: boolean };
   }) => (
     <div
       data-testid="block-execution-options"
       data-continue={String(props.continueOnFailure)}
       data-block-type={props.blockType}
-    />
+      data-include-action-history={String(
+        props.includeActionHistoryInVerification ?? false,
+      )}
+    >
+      {props.showOptions?.includeActionHistoryInVerification ? (
+        <button
+          type="button"
+          onClick={() =>
+            props.onIncludeActionHistoryInVerificationChange?.(
+              !(props.includeActionHistoryInVerification ?? false),
+            )
+          }
+        >
+          Include Action History
+        </button>
+      ) : null}
+    </div>
   ),
 }));
 
@@ -192,6 +211,7 @@ function makeLoginFixture(
     disableCache: false,
     completeCriterion: "",
     terminateCriterion: "",
+    includeActionHistoryInVerification: false,
     engine: null,
     model: null,
     ...overrides,
@@ -337,6 +357,30 @@ describe("LoginBlockForm (SKY-9374)", () => {
     expect(screen.queryByTestId("error-code-mapping-editor")).toBeNull();
   });
 
+  test("shows Include Action History and updates the login block", () => {
+    mockNodeFixtures.set(
+      "b1",
+      makeLoginFixture("b1", {
+        includeActionHistoryInVerification: true,
+      } as never),
+    );
+    render(<LoginBlockForm blockId="b1" />);
+
+    fireEvent.click(screen.getByText("Advanced Settings"));
+
+    expect(screen.getByText("Include Action History")).toBeDefined();
+    expect(
+      screen
+        .getByTestId("block-execution-options")
+        .getAttribute("data-include-action-history"),
+    ).toBe("true");
+
+    fireEvent.click(screen.getByText("Include Action History"));
+    expect(updateNodeDataMock).toHaveBeenCalledWith("b1", {
+      includeActionHistoryInVerification: false,
+    });
+  });
+
   test("renders the error-code-mapping editor when mapping is non-null", () => {
     mockNodeFixtures.set(
       "b1",
@@ -372,6 +416,7 @@ describe("LoginBlockForm (SKY-9374)", () => {
       errorCodeMapping: "null",
       parameterKeys: [],
       continueOnFailure: false,
+      includeActionHistoryInVerification: false,
       disableCache: false,
     });
   });

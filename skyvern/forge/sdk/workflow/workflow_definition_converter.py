@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     WorkflowTriggerBlock,
 )
+from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
@@ -171,6 +172,8 @@ def convert_workflow_definition(
                 credential_id=parameter.credential_id,
                 credential_ids=parameter.credential_ids,
                 selection_strategy=parameter.selection_strategy,
+                fallback_credential_ids=parameter.fallback_credential_ids,
+                fallback_trigger=parameter.fallback_trigger,
                 created_at=now,
                 modified_at=now,
             )
@@ -636,6 +639,15 @@ def block_yaml_to_block(
             azure_blob_container_name=block_yaml.azure_blob_container_name,
             google_credential_id=block_yaml.google_credential_id,
             google_drive_folder_id=block_yaml.google_drive_folder_id,
+            sftp_host=block_yaml.sftp_host,
+            sftp_port=block_yaml.sftp_port,
+            sftp_username=block_yaml.sftp_username,
+            sftp_password=block_yaml.sftp_password,
+            sftp_private_key=block_yaml.sftp_private_key,
+            sftp_private_key_passphrase=block_yaml.sftp_private_key_passphrase,
+            sftp_remote_path=block_yaml.sftp_remote_path,
+            sftp_host_key=block_yaml.sftp_host_key,
+            prompt=block_yaml.prompt,
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:
@@ -806,6 +818,7 @@ def block_yaml_to_block(
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
+            include_action_history_in_verification=block_yaml.include_action_history_in_verification,
             skip_saved_profile=block_yaml.skip_saved_profile,
         )
 
@@ -822,6 +835,27 @@ def block_yaml_to_block(
         file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return FileDownloadBlock(
             **base_kwargs,
+            download_target=block_yaml.download_target,
+            s3_bucket=block_yaml.s3_bucket,
+            aws_access_key_id=block_yaml.aws_access_key_id,
+            aws_secret_access_key=block_yaml.aws_secret_access_key,
+            region_name=block_yaml.region_name,
+            azure_storage_account_name=block_yaml.azure_storage_account_name,
+            azure_storage_account_key=block_yaml.azure_storage_account_key,
+            azure_blob_container_name=block_yaml.azure_blob_container_name,
+            google_credential_id=block_yaml.google_credential_id,
+            google_drive_folder_id=block_yaml.google_drive_folder_id,
+            sftp_host=block_yaml.sftp_host,
+            sftp_port=block_yaml.sftp_port,
+            sftp_username=block_yaml.sftp_username,
+            sftp_password=block_yaml.sftp_password,
+            sftp_private_key=block_yaml.sftp_private_key,
+            sftp_private_key_passphrase=block_yaml.sftp_private_key_passphrase,
+            sftp_remote_path=block_yaml.sftp_remote_path,
+            sftp_host_key=block_yaml.sftp_host_key,
+            path=block_yaml.path,
+            prompt=block_yaml.prompt,
+            continue_on_empty=block_yaml.continue_on_empty,
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
@@ -925,6 +959,21 @@ def block_yaml_to_block(
             credential_id=block_yaml.credential_id,
             has_header_row=block_yaml.has_header_row,
             parameters=google_sheets_read_parameters,
+        )
+    elif block_yaml.block_type == BlockType.EMAIL_INBOX:
+        email_inbox_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return EmailInboxBlock(
+            **base_kwargs,
+            email_client=block_yaml.email_client,
+            credential_id=block_yaml.credential_id,
+            folder=block_yaml.folder,
+            prompt=block_yaml.prompt,
+            sender=block_yaml.sender,
+            subject=block_yaml.subject,
+            newer_than_days=block_yaml.newer_than_days,
+            max_results=block_yaml.max_results,
+            include_body=block_yaml.include_body,
+            parameters=email_inbox_parameters,
         )
     elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:
         google_sheets_write_parameters = _resolve_block_parameters(block_yaml, parameters)

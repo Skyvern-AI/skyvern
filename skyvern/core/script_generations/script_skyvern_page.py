@@ -18,7 +18,12 @@ from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ActionCall, ActionMetadata, RunContext, SkyvernPage
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException, WorkflowRunNotFound
+from skyvern.exceptions import (
+    BrowserSessionSwitchNotAllowed,
+    IllegitCompleteScriptTermination,
+    ScriptTerminationException,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -103,7 +108,30 @@ class ScriptSkyvernPage(SkyvernPage):
             else:
                 raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
         else:
-            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script(browser_session_id=browser_session_id)
+            script_id = context.script_id if context else None
+            bound_session_id = context.browser_session_id if context else None
+            if (
+                browser_session_id is not None
+                and browser_session_id != bound_session_id
+                and app.BROWSER_MANAGER.get_for_script(script_id) is not None
+            ):
+                # A browser is already pinned under this script_id (first acquire); get_or_create_for_script
+                # would return that cached state and ignore a different requested session. Reject the switch
+                # before recording, so terminal cleanup keeps the bound identity rather than releasing an
+                # unattached session and leaking the cached browser.
+                raise BrowserSessionSwitchNotAllowed(script_id, bound_session_id, browser_session_id)
+            # Key the session off the run context (like organization_id).
+            effective_session_id = browser_session_id or bound_session_id
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script(
+                script_id=script_id,
+                browser_session_id=effective_session_id,
+                organization_id=context.organization_id if context else None,
+            )
+            # Record the effective session on context ONLY after a successful attach, so run_script's terminal
+            # cleanup releases exactly the session acquired here — and a fail-closed acquire (cold/evicted
+            # session) leaves the prior binding intact rather than releasing a session never acquired.
+            if context is not None:
+                context.browser_session_id = effective_session_id
         return browser_state
 
     @classmethod
@@ -139,7 +167,6 @@ class ScriptSkyvernPage(SkyvernPage):
         url: str | None = None,
     ) -> ScrapedPage:
         # initialize browser state
-        # TODO: add workflow_run_id or eventually script_id/script_run_id
         browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id, url=url)
         return await browser_state.scrape_website(
             url="",

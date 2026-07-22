@@ -4,8 +4,30 @@ import { describe, test, expect } from "vitest";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
+  formatDurationSeconds,
   formatExecutionTime,
+  normalizeUtcTimestamp,
 } from "./timeFormat";
+
+describe("normalizeUtcTimestamp", () => {
+  test("appends Z to timezone-less timestamps", () => {
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00.123456")).toBe(
+      "2026-03-04T18:30:00.123Z",
+    );
+  });
+
+  test("leaves offset-carrying timestamps intact", () => {
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00+00:00")).toBe(
+      "2026-03-04T18:30:00+00:00",
+    );
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00-07:00")).toBe(
+      "2026-03-04T18:30:00-07:00",
+    );
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00Z")).toBe(
+      "2026-03-04T18:30:00Z",
+    );
+  });
+});
 
 describe("basicLocalTimeFormat", () => {
   test("appends Z to parse a no-suffix UTC timestamp as UTC, not local time", () => {
@@ -91,6 +113,17 @@ describe("formatExecutionTime", () => {
   test("clamps negative duration to 0s when finishedAt is before createdAt", () => {
     const finishedAt = "2025-12-31T23:59:59.000Z";
     expect(formatExecutionTime(base, finishedAt)).toBe("0s");
+  });
+});
+
+describe("formatDurationSeconds", () => {
+  test("formats valid durations and leaves unavailable values blank", () => {
+    expect(formatDurationSeconds(42.4)).toBe("42s");
+    expect(formatDurationSeconds(125.2)).toBe("2m 5s");
+    expect(formatDurationSeconds(119.6)).toBe("2m 0s");
+    expect(formatDurationSeconds(59.6)).toBe("1m 0s");
+    expect(formatDurationSeconds(null)).toBe("—");
+    expect(formatDurationSeconds(-1)).toBe("—");
   });
 });
 

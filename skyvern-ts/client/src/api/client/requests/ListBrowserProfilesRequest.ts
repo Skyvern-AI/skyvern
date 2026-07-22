@@ -6,7 +6,8 @@
  *         page: 1,
  *         page_size: 1,
  *         include_deleted: true,
- *         search_key: "search_key"
+ *         search_key: "search_key",
+ *         managed: true
  *     }
  */
 export interface ListBrowserProfilesRequest {
@@ -16,4 +17,6 @@ export interface ListBrowserProfilesRequest {
     include_deleted?: boolean;
     /** Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches. */
     search_key?: string;
+    /** Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles. */
+    managed?: boolean;
 }

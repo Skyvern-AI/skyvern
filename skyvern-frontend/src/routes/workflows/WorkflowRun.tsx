@@ -4,6 +4,7 @@ import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
+import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import {
   SwitchBarNavigation,
   type SwitchBarNavigationOption,
@@ -48,6 +49,7 @@ import {
 } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
+import { ResizableTimelineSplit } from "./workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "./workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
@@ -55,6 +57,7 @@ import {
   findActiveItem,
   parseActiveIterationParam,
 } from "./workflowRun/workflowTimelineUtils";
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { pickDownloadedFileFilename } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
@@ -80,6 +83,7 @@ import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecove
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isFirstFailedRunRecoveryEligible } from "@/util/onboarding/rolloutGating";
+import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
 
 function WorkflowRunRightColumn({
   activeItem,
@@ -97,43 +101,48 @@ function WorkflowRunRightColumn({
   onSetActiveIteration: (loopBlockId: string, iterationIndex: number) => void;
 }) {
   return (
-    <div className="grid min-h-0 w-[clamp(28rem,34vw,36rem)] shrink-0 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
-      <div className="min-h-0 w-full overflow-hidden">
-        <WorkflowRunTimeline
-          activeItem={activeItem}
-          activeIteration={activeIteration}
-          onActionItemSelected={(item) => {
-            onSetActiveItem(item.action.action_id);
-          }}
-          onBlockItemSelected={(item) => {
-            onSetActiveItem(item.workflow_run_block_id);
-          }}
-          onThoughtItemSelected={(item) => {
-            onSetActiveItem(item.thought_id);
-          }}
-          onLiveStreamSelected={() => {
-            onSetActiveItem("stream");
-          }}
-          onIterationSelected={(loopBlock, iterationIndex) => {
-            onSetActiveIteration(
-              loopBlock.workflow_run_block_id,
-              iterationIndex,
-            );
-          }}
-        />
-      </div>
-      <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
-        <WorkflowRunBlockDetail
-          activeItem={activeItem}
-          activeIteration={activeIteration}
-          timeline={timeline}
-          timelineReady={timelineReady}
-          onThoughtSelect={(thought) => {
-            onSetActiveItem(thought.thought_id);
-          }}
-        />
-      </div>
-    </div>
+    <ResizableTimelineSplit
+      className="w-[clamp(28rem,34vw,36rem)] shrink-0"
+      top={
+        <div className="min-h-0 w-full overflow-hidden">
+          <WorkflowRunTimeline
+            activeItem={activeItem}
+            activeIteration={activeIteration}
+            onActionItemSelected={(item) => {
+              onSetActiveItem(item.action.action_id);
+            }}
+            onBlockItemSelected={(item) => {
+              onSetActiveItem(item.workflow_run_block_id);
+            }}
+            onThoughtItemSelected={(item) => {
+              onSetActiveItem(item.thought_id);
+            }}
+            onLiveStreamSelected={() => {
+              onSetActiveItem("stream");
+            }}
+            onIterationSelected={(loopBlock, iterationIndex) => {
+              onSetActiveIteration(
+                loopBlock.workflow_run_block_id,
+                iterationIndex,
+              );
+            }}
+          />
+        </div>
+      }
+      bottom={
+        <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
+          <WorkflowRunBlockDetail
+            activeItem={activeItem}
+            activeIteration={activeIteration}
+            timeline={timeline}
+            timelineReady={timelineReady}
+            onThoughtSelect={(thought) => {
+              onSetActiveItem(thought.thought_id);
+            }}
+          />
+        </div>
+      }
+    />
   );
 }
 
@@ -304,6 +313,8 @@ function WorkflowRun() {
     workflowRun?.status === Status.Terminated
       ? "Termination Reason"
       : "Failure Reason";
+  const siblingRunLinkClassName =
+    "font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200";
 
   const finallyBlockInTimeline = finallyBlockLabel
     ? workflowRunTimeline?.find(
@@ -385,7 +396,7 @@ function WorkflowRun() {
         />
       )}
       {shouldShowFinallyNote && (
-        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-200">
+        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-700 dark:text-amber-200">
           <span className="font-medium">Note:</span>
           <span>
             "Execute on any outcome" block ({finallyBlockLabel}){" "}
@@ -555,15 +566,42 @@ function WorkflowRun() {
               {workflowRunIsLoading ? (
                 <Skeleton className="h-8 w-28" />
               ) : workflowRun ? (
-                <StatusBadge
-                  className="mt-[0.27rem]"
-                  status={workflowRun?.status}
-                />
+                <div className="mt-[0.27rem] flex items-center gap-2">
+                  <StatusBadge status={workflowRun?.status} />
+                  <CredentialFallbackRetryBadge
+                    retriedFromWorkflowRunId={
+                      workflowRun.retried_from_workflow_run_id
+                    }
+                  />
+                </div>
               ) : null}
             </div>
             <h2 className="text-2xl text-neutral-600 dark:text-slate-400">
               {workflowRunId}
             </h2>
+            {workflowRunId ? (
+              <RunTagsEditor workflowRunId={workflowRunId} />
+            ) : null}
+            {workflowRun && workflowPermanentId && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                {workflowRun.retried_from_workflow_run_id && (
+                  <Link
+                    className={siblingRunLinkClassName}
+                    to={`/agents/${workflowPermanentId}/${workflowRun.retried_from_workflow_run_id}/overview`}
+                  >
+                    Retried from {workflowRun.retried_from_workflow_run_id}
+                  </Link>
+                )}
+                {workflowRun.retried_by_workflow_run_id && (
+                  <Link
+                    className={siblingRunLinkClassName}
+                    to={`/agents/${workflowPermanentId}/${workflowRun.retried_by_workflow_run_id}/overview`}
+                  >
+                    Retried by {workflowRun.retried_by_workflow_run_id}
+                  </Link>
+                )}
+              </div>
+            )}
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||
@@ -755,12 +793,12 @@ function WorkflowRun() {
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
-                          <a
+                          <ArtifactDownloadLink
                             href={url}
                             className="underline underline-offset-4"
                           >
                             <span>{filename}</span>
-                          </a>
+                          </ArtifactDownloadLink>
                         </div>
                       );
                     })

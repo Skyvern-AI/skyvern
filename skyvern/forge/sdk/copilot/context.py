@@ -13,6 +13,7 @@ import structlog
 from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.result_evidence import (
@@ -28,6 +29,15 @@ LOG = structlog.get_logger()
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
+
+
+class DeliveredUnverifiedPublicOutputs(dict[str, Any]):
+    """Run-output values explicitly selected for terminal presentation.
+
+    The values remain dynamically shaped JSON until the presentation sanitizer
+    validates them.  The concrete marker prevents arbitrary result-factory
+    callers from minting the public structured-output surface.
+    """
 
 
 class NarrativeDraft(TypedDict):
@@ -85,8 +95,13 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
+    # Sanitized JSON boundary for reviewing outputs that were delivered but not independently verified.
+    deliveredUnverifiedObservedOutputs: NotRequired[dict[str, Any]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
+    # credential pause (credential_pause.py) resolved during this turn.
+    credentialPause: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -110,11 +125,12 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
+    from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentClassifierResult
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -167,6 +183,7 @@ class FillCarry(BaseModel):
     control_value_satisfied: bool | None = None
     credential_id: str = ""
     credential_field: str = ""
+    available_fields: list[str] | None = None
 
 
 class LoadedResultTargetContext(BaseModel):
@@ -219,6 +236,7 @@ class CodeAuthoringRepairContext(BaseModel):
     spine_stage_count: int | None = None
     spine_split_blockers: list[str] = Field(default_factory=list)
     output_owner_candidate_labels: list[str] = Field(default_factory=list)
+    parameter_binding_directive: AuthoringParameterBindingDirective | None = None
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
@@ -416,7 +434,10 @@ def _carry_bool(value: FillCarryPrimitive) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarryPrimitive]]) -> list[FillCarry]:
+def _fill_carry_from_scout_trajectory(
+    trajectory: Sequence[Mapping[str, FillCarryPrimitive]],
+    credential_field_inventory: Mapping[str, frozenset[str]] | None = None,
+) -> list[FillCarry]:
     carry: list[FillCarry] = []
     for interaction in trajectory:
         tool_name = _carry_text(interaction.get("tool_name"), max_chars=40)
@@ -459,6 +480,7 @@ def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarr
             credential_id = _carry_text(interaction.get("credential_id"))
             credential_field = _carry_text(interaction.get("credential_field"), max_chars=20)
             if credential_id and credential_field in _FILL_CARRY_CREDENTIAL_FIELDS:
+                inventory = (credential_field_inventory or {}).get(credential_id)
                 carry.append(
                     FillCarry(
                         source_url=source_url,
@@ -469,6 +491,7 @@ def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarr
                         typed_length=typed_length,
                         credential_id=credential_id,
                         credential_field=credential_field,
+                        available_fields=sorted(inventory) if inventory else None,
                     )
                 )
     return carry[-_MAX_FILL_CARRY:]
@@ -535,8 +558,10 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     )
     raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
     scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
+    raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
     fill_carry = _fill_carry_from_scout_trajectory(
-        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)]
+        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
+        credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
     )
     if (
         not raw_context
@@ -653,10 +678,23 @@ class CopilotContext(AgentContext):
     impose_synthesized_code_block: bool = False
     target_block_label: str | None = None
     turn_intent: TurnIntent | None = None
+    # Retained so a policy mutated after the pre-flight credential pause can be
+    # re-derived into an authority envelope without re-running the classifier.
+    turn_intent_classifier_result: TurnIntentClassifierResult | None = None
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
+    requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+
+    # Mid-build credential pause (credential_pause.py). last_run_skipped_unbound_credentials
+    # is set by tools/__init__.py's update_and_run_blocks skip branch; client_supports_credential_pause
+    # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
+    last_run_skipped_unbound_credentials: bool = False
+    client_supports_credential_pause: bool = False
+    credential_pause_used: bool = False
+    copilot_credential_pause_seconds: float = 0.0
+    credential_pause_outcome: str | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
@@ -715,7 +753,7 @@ class CopilotContext(AgentContext):
     last_outcome_gate_workflow_run_id: str | None = None
     delivered_unverified_terminal: bool = False
     delivered_unverified_workflow_run_id: str | None = None
-    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=dict)
+    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=DeliveredUnverifiedPublicOutputs)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
@@ -759,7 +797,7 @@ class CopilotContext(AgentContext):
     repeated_failure_streak_count: int = 0
     last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
-    # Unlike the identity-keyed repair ceiling, this climbs even when every
+    # Unlike the progress-gated repair ceiling, this climbs even when every
     # rejection is different; it resets only on an accepted persist.
     code_authoring_guardrail_reject_count: int = 0
     # True when the most-recent such rejection deferred to the credential-scout

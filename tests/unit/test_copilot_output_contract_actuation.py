@@ -8,15 +8,23 @@ OSS-synced: only synthetic labels and RFC-2606 placeholder identifiers.
 from __future__ import annotations
 
 import itertools
+import json
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot import enforcement
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
+    CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
+    blocker_signal_is_genuinely_terminal,
     build_output_source_unobservable_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -28,12 +36,31 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     classify_output_contract_bail_family,
     resolve_output_contract_actuation,
 )
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    RequestPolicy,
+    _bind_criterion_to_request_slot,
+)
+from skyvern.forge.sdk.copilot.request_slots import (
+    CanonicalRequestSlotV1,
+    RequestSlotAntecedentFamily,
+    RequestSlotPinability,
+    RequestSlotPlane,
+)
+from skyvern.forge.sdk.copilot.result_evidence import loaded_result_composition_evidence_from_page
 from skyvern.forge.sdk.copilot.runtime import (
+    RejectedCodeArtifactMetadataCapture,
     output_contract_ladder_unresolved,
     record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as wu
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind, turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import (
+    TurnClaimant,
+    claim_and_stash_blocker_signal,
+    current_turn_owner,
+)
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _ALL_SPLIT_BLOCKERS = [
     "static_return_envelope_unavailable",
@@ -413,6 +440,11 @@ def test_observed_values_suppresses_no_source_terminal() -> None:
     has_source = OutputContractActuationEvidence(False, True, True, True, False, OutputContractAdvisoryState.UNUSED)
     actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=has_source)
     assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
+    loaded_source = OutputContractActuationEvidence(
+        False, True, False, True, False, OutputContractAdvisoryState.UNUSED, loaded_result_source_producible=True
+    )
+    actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=loaded_source)
+    assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
 
 
 def test_classifier_maps_every_emitted_blocker_string() -> None:
@@ -453,6 +485,7 @@ def test_option_a_falls_through_on_two_mapping_locals() -> None:
 def _counter_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         turn_id="turn_example",
+        request_policy=None,
         output_contract_reject_count_by_signature={},
         output_contract_last_reject_fingerprint_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
@@ -507,9 +540,14 @@ _FINGERPRINT = "fp_stage_topology"
 
 def _advisory_ctx() -> SimpleNamespace:
     return SimpleNamespace(
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        request_policy=None,
+        gate_precedence_conflict_events=[],
         output_contract_reject_count_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
         output_contract_armed_directive_fingerprint_by_signature={},
+        output_contract_output_owner_directive_candidates_by_signature={},
         output_contract_actuation_by_signature={},
         output_contract_actuation_count_by_signature={},
         output_contract_declick_attempted_by_signature={},
@@ -519,12 +557,17 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_run_output_observed_by_signature={},
         output_contract_run_bound_required_path_by_signature={},
         output_contract_bail_actuated_this_call=False,
+        submitted_code_artifact_metadata_snapshot=None,
+        rejected_code_artifact_metadata_captures=[],
+        author_time_gate_log_only_ids=frozenset(),
         author_time_gate_ablation_events=[],
         latest_recorded_build_test_outcome=None,
         recorded_build_test_outcome_history=[],
         scouted_output_covered_paths=set(),
         composition_page_evidence=None,
         recorded_outcome_binding_constraint=None,
+        latest_evaluate_result_composition_steer=None,
+        latest_evaluate_result_composition_signature=None,
     )
 
 
@@ -721,6 +764,95 @@ def test_log_only_metadata_preflight_skips_run_attemptable_without_advisory(
     assert ctx.output_contract_reject_count_by_signature == {}
 
 
+def _genuine_terminal_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="stop",
+        user_facing_reason="I can't get past this page, so I'll stop here.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        renders_final_reply=True,
+        internal_reason_code="probable_site_block_stop",
+        blocked_tool="update_workflow",
+    )
+
+
+def test_metadata_preflight_yields_to_live_ladder_and_records_conflict() -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is True
+    assert any(
+        event.owner == "output_contract_actuation" and event.yielded == "metadata_run_preflight_reject"
+        for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_metadata_preflight_does_not_yield_without_a_live_grant() -> None:
+    ctx = make_copilot_ctx()
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
+    assert ctx.gate_precedence_conflict_events == []
+
+
+def test_metadata_preflight_does_not_yield_during_ordinary_reject_without_a_grant() -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_count_by_signature["sig_landed"] = 1
+    assert output_contract_ladder_unresolved(ctx) is True
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
+
+
+def test_metadata_preflight_does_not_yield_to_a_genuine_terminal_owner() -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
+    terminal = _genuine_terminal_signal()
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal)
+    ctx.turn_halt = turn_halt_from_blocker_signal(terminal, source="test")
+    assert current_turn_owner(ctx).claimant is TurnClaimant.GENUINELY_TERMINAL
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
+
+
+def test_metadata_preflight_reject_returns_none_at_call_site_while_ladder_owns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
+    monkeypatch.setattr(
+        wu,
+        "_recorded_outcome_convergence_reject",
+        lambda *args, **kwargs: wu._ConvergenceReject("sig_target", "frontier_unchanged", False),
+    )
+    monkeypatch.setattr(wu, "_workflow_yaml_code_blocks_by_label", lambda *args: {})
+    monkeypatch.setattr(wu, "_record_author_time_reject_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda *args, **kwargs: None)
+
+    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
+
+    assert result is None
+    assert any(event.yielded == "metadata_run_preflight_reject" for event in ctx.gate_precedence_conflict_events)
+
+
+def test_metadata_preflight_reject_still_rejects_without_a_live_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx()
+    monkeypatch.setattr(
+        wu,
+        "_recorded_outcome_convergence_reject",
+        lambda *args, **kwargs: wu._ConvergenceReject("sig_target", "frontier_unchanged", False),
+    )
+    monkeypatch.setattr(wu, "_workflow_yaml_code_blocks_by_label", lambda *args: {})
+    monkeypatch.setattr(wu, "_record_author_time_reject_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda *args, **kwargs: None)
+
+    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
+
+    assert result is not None
+    assert result["ok"] is False
+
+
 def test_credential_scout_submit_gate_still_blocks_with_author_time_log_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -798,6 +930,33 @@ def test_advisory_grant_is_not_consumed_without_workflow_run_id() -> None:
 
     assert consumed == []
     assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
+
+
+def test_reject_shaped_run_result_suppresses_missing_run_id_warning() -> None:
+    signature = "sig_reject_shape"
+    ctx = _arm_static_return_advisory_ctx(signature)
+    reject = {"ok": False, "error": "refused", "data": {"reason_code": "value_bearing_output_required"}}
+
+    with capture_logs() as logs:
+        consumed = wu.consume_output_contract_advisory_grant_for_run_result(ctx, reject)
+
+    assert consumed == []
+    assert not [
+        log for log in logs if log["event"] == "copilot_output_contract_advisory_run_result_missing_workflow_run_id"
+    ]
+
+
+def test_non_reject_run_result_missing_run_id_still_warns() -> None:
+    signature = "sig_missing_run_id"
+    ctx = _arm_static_return_advisory_ctx(signature)
+
+    with capture_logs() as logs:
+        consumed = wu.consume_output_contract_advisory_grant_for_run_result(ctx, {"ok": True, "data": {"note": "x"}})
+
+    assert consumed == []
+    assert [
+        log for log in logs if log["event"] == "copilot_output_contract_advisory_run_result_missing_workflow_run_id"
+    ]
 
 
 def test_advisory_grant_arms_pending_run_output_evidence() -> None:
@@ -947,6 +1106,103 @@ def test_click_only_declick_flag_clears_when_source_becomes_observable() -> None
     assert signature not in ctx.output_contract_declick_attempted_by_signature
 
 
+def test_steer_only_downgrades_advisory_run_and_grants_nothing() -> None:
+    signature = "sig_steer_advisory"
+    baseline_ctx = _advisory_ctx()
+    baseline_ctx.output_contract_reject_count_by_signature[signature] = 1
+    baseline_ctx.output_contract_armed_directive_fingerprint_by_signature[signature] = _FINGERPRINT
+    baseline = wu._actuate_output_contract_bail(
+        baseline_ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_PAGE_READ_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint=_FINGERPRINT,
+    )
+    assert baseline.kind == OutputContractActuationKind.ADVISORY_RUN
+
+    ctx = _advisory_ctx()
+    ctx.output_contract_reject_count_by_signature[signature] = 1
+    ctx.output_contract_armed_directive_fingerprint_by_signature[signature] = _FINGERPRINT
+    steered = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_PAGE_READ_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint=_FINGERPRINT,
+        steer_only=True,
+    )
+    assert steered.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert ctx.output_contract_actuation_by_signature == {}
+    assert ctx.output_contract_actuation_count_by_signature == {}
+
+
+def test_steer_only_never_terminals_click_only_and_skips_declick() -> None:
+    signature = "sig_steer_click_only"
+    ctx = _advisory_ctx()
+    first = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_CLICK_ONLY_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint="fp_0",
+        steer_only=True,
+    )
+    assert first.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert signature not in ctx.output_contract_declick_attempted_by_signature
+    second = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_CLICK_ONLY_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint="fp_1",
+        steer_only=True,
+    )
+    assert second.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert second.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
+
+
+def test_value_bearing_reject_uses_steer_only_structure_directive() -> None:
+    signature = "sig_value_bearing_steer"
+    evaluation = _make_evaluation(
+        signature,
+        block_label="collect",
+        shape_violations=["value_bearing_output_required"],
+    )
+    non_steer_ctx = _ladder_ctx()
+
+    inert = wu._adjudicate_output_contract_ladder_after_reject(
+        non_steer_ctx,
+        evaluation,
+        workflow_yaml=_PAGE_READ_YAML,
+        current_fingerprint="value-bearing:fp",
+    )
+
+    assert inert is None
+    assert non_steer_ctx.output_contract_armed_directive_fingerprint_by_signature == {}
+
+    ctx = _ladder_ctx()
+    actuation = wu._adjudicate_output_contract_ladder_after_reject(
+        ctx,
+        evaluation,
+        workflow_yaml=_PAGE_READ_YAML,
+        current_fingerprint="value-bearing:fp",
+        steer_only=True,
+    )
+
+    assert actuation is not None
+    assert actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert ctx.output_contract_armed_directive_fingerprint_by_signature[signature] == "value-bearing:fp"
+    assert ctx.output_contract_actuation_by_signature == {}
+    assert ctx.output_contract_pending_run_evidence == {}
+    assert ctx.output_contract_actuation_count_by_signature == {}
+    assert ctx.output_contract_declick_attempted_by_signature == {}
+    assert ctx.turn_halt is None
+
+
 def test_observed_required_values_exact_and_lineage_match() -> None:
     ctx = SimpleNamespace(scouted_output_covered_paths={"output.order.id"}, composition_page_evidence=None)
     assert wu._observed_required_output_values(ctx, {"output.order.id"}) is True
@@ -1020,6 +1276,8 @@ def _make_evaluation(signature: str, *, block_label: str = "", shape_violations:
         block_label=block_label,
         artifact_id="",
         required_paths={"output.confirmation_number"},
+        observation_paths={"output.confirmation_number"},
+        declaration_paths=set(),
         source="requested_output",
         reason_code="output_contract_required",
         missing_metadata_paths=[],
@@ -1081,6 +1339,110 @@ def test_reject_seam_adjudication_grants_advisory_within_caps_when_imposition_ea
         )
     assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
     assert ctx.turn_halt is None
+
+
+def test_same_fresh_signature_emits_one_reject_before_typed_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ladder_ctx()
+    signature = "sig_first_contact_example"
+    evaluation = _make_evaluation(signature, block_label="collect")
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: None)
+
+    first = wu._record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="First typed deficiency.",
+        authored_structural_fingerprint="fp_first_contact",
+        workflow_yaml=_PAGE_READ_YAML,
+    )
+    first_outcome = ctx.latest_recorded_build_test_outcome
+    ctx.output_contract_bail_actuated_this_call = False
+    second = wu._record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="Same typed deficiency.",
+        authored_structural_fingerprint="fp_first_contact",
+        workflow_yaml=_PAGE_READ_YAML,
+    )
+
+    assert first["output_contract_actuation"] == OutputContractActuationKind.STRUCTURE_DIRECTIVE.value
+    assert first_outcome is not None
+    assert first_outcome.phase == "author_time_reject"
+    assert second["output_contract_actuation"] == OutputContractActuationKind.ADVISORY_RUN.value
+    assert ctx.latest_recorded_build_test_outcome is None
+    assert [entry["phase"] for entry in ctx.recorded_build_test_outcome_history] == ["author_time_reject"]
+    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
+
+
+def test_has_metadata_reject_attaches_no_metadata_convergence_directive(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ladder_ctx()
+    evaluation = _make_evaluation("sig_complete_metadata", block_label="collect")
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: None)
+    complete_metadata = [
+        {
+            "block_label": "collect",
+            "declared_goal": "Collect the provider summary",
+            "claimed_outcomes": ["summary extracted"],
+            "page_dependencies": ["provider page"],
+            "completion_criteria": ["summary non-empty"],
+            "terminal_verifier_expectations": ["summary rendered"],
+            "evidence_refs": ["scout:provider-page"],
+        }
+    ]
+
+    payload = wu._record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="Value-required deficiency on a metadata-complete block.",
+        authored_structural_fingerprint="fp_complete_metadata",
+        workflow_yaml=_PAGE_READ_YAML,
+        raw_metadata=complete_metadata,
+    )
+
+    assert payload["output_contract_actuation"] == OutputContractActuationKind.STRUCTURE_DIRECTIVE.value
+    assert "metadata_convergence_directive" not in payload
+
+
+def test_synthesized_metadata_less_reject_arms_convergence_directive() -> None:
+    ctx = _ladder_ctx()
+    ctx.turn_id = "turn-synth-metadata-less"
+
+    with capture_logs() as logs:
+        directive = wu._synthesized_metadata_reject_directive(
+            ctx,
+            workflow_yaml=_PAGE_READ_YAML,
+            raw_metadata=[],
+            label_candidates=["collect"],
+            required_paths={"output.confirmation_number"},
+        )
+
+    assert directive is not None
+    assert any(entry["event"] == "copilot_output_contract_spine_structure_directive_emitted" for entry in logs)
+
+
+def test_synthesized_metadata_complete_reject_arms_no_directive() -> None:
+    ctx = _ladder_ctx()
+    ctx.turn_id = "turn-synth-metadata-complete"
+    complete_metadata = [
+        {
+            "block_label": "collect",
+            "declared_goal": "Collect the confirmation number",
+            "claimed_outcomes": ["confirmation captured"],
+            "page_dependencies": ["confirmation page"],
+            "completion_criteria": ["confirmation non-empty"],
+            "terminal_verifier_expectations": ["confirmation rendered"],
+            "evidence_refs": ["scout:confirmation"],
+        }
+    ]
+
+    directive = wu._synthesized_metadata_reject_directive(
+        ctx,
+        workflow_yaml=_PAGE_READ_YAML,
+        raw_metadata=complete_metadata,
+        label_candidates=["collect"],
+        required_paths={"output.confirmation_number"},
+    )
+
+    assert directive is None
 
 
 def test_reject_seam_metadata_required_reaches_advisory_before_no_source_terminal() -> None:
@@ -1358,3 +1720,962 @@ def test_advisory_grant_downgraded_to_directive_when_run_authority_forbids_dispa
     )
     assert actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
     assert signature not in ctx.output_contract_actuation_by_signature
+
+
+def test_loaded_result_carrier_is_selector_bound_and_claimed_by_one_contract_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _advisory_ctx()
+    events: list[dict[str, object]] = []
+
+    def capture_event(_ctx: object, **kwargs: object) -> bool:
+        events.append(kwargs)
+        return False
+
+    monkeypatch.setattr(wu, "record_author_time_gate_ablation_event", capture_event)
+    ctx.latest_evaluate_result_composition_steer = loaded_result_composition_evidence_from_page(
+        {"result_containers": [{"selector": "#results", "row_count": 1, "sample_rows": ["Example customer record"]}]},
+        source_tool="evaluate",
+        source_url="https://example.com/results",
+    )
+
+    first = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=["static_return_envelope_unavailable"],
+        target_code='await page.locator("#results").click()',
+        required_paths={"output.record_id"},
+        signature="sig-a",
+        current_fingerprint="fp-a",
+    )
+
+    assert ctx.latest_evaluate_result_composition_signature == "sig-a"
+
+    ctx.output_contract_bail_actuated_this_call = False
+    second = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=["static_return_envelope_unavailable"],
+        target_code='await page.locator("#results").click()',
+        required_paths={"output.other_id"},
+        signature="sig-b",
+        current_fingerprint="fp-b",
+    )
+
+    assert ctx.latest_evaluate_result_composition_signature == "sig-a"
+    assert first.kind is not OutputContractActuationKind.BLOCKED_TERMINAL
+    assert second.kind is OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    first_payload = events[0]["payload"]
+    second_payload = events[1]["payload"]
+    assert isinstance(first_payload, dict)
+    assert isinstance(second_payload, dict)
+    assert first_payload["loaded_result_source_producible"] is True
+    assert second_payload["loaded_result_source_producible"] is False
+
+
+def _antecedent_ctx(*criteria: CompletionCriterion) -> CopilotContext:
+    ctx = make_copilot_ctx()
+    ctx.block_authoring_policy = wu.BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria))
+    return ctx
+
+
+def _blocker_contingent_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id="c_blocker",
+        outcome="A blocker is reported when the site blocks submission.",
+        contingent_on="the site blocks submission",
+        contingent_antecedent_output_path="output.blocker",
+    )
+
+
+def test_contingent_antecedent_joins_declaration_lane_schema_and_skeleton() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == {"output.record_id"}
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.union == {"output.record_id", "output.blocker"}
+    assert contract.source == "requested_output_contract"
+    assert contract.reason_code == "requested_output_contract_missing_output_coverage"
+    schema = wu._schema_template_for_required_paths(contract.union, contract.declaration_paths)
+    output_properties = schema["properties"]["output"]
+    assert output_properties["properties"]["blocker"] == {"type": ["string", "null"]}
+    assert output_properties["properties"]["record_id"] == {}
+    assert set(output_properties["required"]) == {"record_id", "blocker"}
+    skeleton = wu._return_skeleton_for_required_paths(contract.union, contract.declaration_paths)
+    assert skeleton == 'return {"output": {"blocker": None, "record_id": record_id}}'
+
+
+def test_contingent_antecedent_alone_forms_declaration_only_contract() -> None:
+    ctx = _antecedent_ctx(_blocker_contingent_criterion())
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == set()
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.union == {"output.blocker"}
+
+
+def test_blocker_family_path_is_declaration_only_for_authoring() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_blocker",
+            outcome="A blocker is reported when the site blocks submission.",
+            output_path="output.blocker",
+            antecedent_family="blocker",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == set()
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.union == {"output.blocker"}
+    assert contract.liveness is wu._OutputContractLiveness.ABSENT
+    assert wu._value_bearing_directive_paths(contract) == {"output"}
+
+
+def test_antecedent_overlapping_requested_output_stays_observation() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        CompletionCriterion(
+            id="c_overlap",
+            outcome="The record id is reported when lookup is blocked.",
+            contingent_on="the lookup is blocked",
+            contingent_antecedent_output_path="output.record_id",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == {"output.record_id"}
+    assert contract.declaration_paths == set()
+
+
+def test_judgment_and_classification_criteria_antecedents_still_contribute() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_judgment",
+            outcome="The run reports whether a login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+            contingent_on="a login gate blocks the target",
+            contingent_antecedent_output_path="output.login_blocker",
+        ),
+        CompletionCriterion(
+            id="c_classify",
+            outcome="The run classifies the reached path.",
+            kind="validation_classification",
+            classification_output_key="path_classification",
+            expected_classification="login_gated",
+            contingent_on="the flow is blocked",
+            contingent_antecedent_output_path="output.flow_blocker",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == set()
+    assert contract.declaration_paths == {"output.login_blocker", "output.flow_blocker"}
+
+
+def test_definition_level_antecedent_does_not_contribute() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_definition",
+            outcome="The workflow definition names a blocker report.",
+            level="definition",
+            contingent_on="the site blocks submission",
+            contingent_antecedent_output_path="output.blocker",
+        )
+    )
+
+    assert wu._contingent_antecedent_child_paths(ctx) == set()
+
+
+def test_mint_degraded_antecedent_does_not_contribute() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_degraded",
+            outcome="A blocker is reported when the site blocks submission.",
+            contingent_on="the site blocks submission",
+            contingent_antecedent_output_path="output.blocker",
+            mint_degrade="turn_unsatisfiable_fallback",
+        )
+    )
+
+    assert wu._contingent_antecedent_child_paths(ctx) == set()
+
+
+def test_recorded_outcome_source_unions_antecedent() -> None:
+    ctx = _antecedent_ctx(_blocker_contingent_criterion())
+    ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="outcome_not_demonstrated",
+        structural_failure_identity="completion:typed-output",
+        missing_requested_output_facts=[
+            {"output_path": "output.recorded_value", "output_root": "output", "value_status": "no_typed_value"},
+        ],
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == {"output.recorded_value"}
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.source == "recorded_outcome"
+
+
+def test_metadata_reject_merge_still_fires_with_antecedent_declaration() -> None:
+    ctx = _antecedent_ctx(_blocker_contingent_criterion())
+    ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+        block_label="collect",
+        reason_code="metadata_reject",
+        required_goal_value_paths=["output.record_id"],
+        metadata_contract_source="metadata_reject",
+        metadata_contract_reason_code="metadata_contract_missing",
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == {"output.record_id"}
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.source == "metadata_reject"
+    assert contract.reason_code == "metadata_contract_missing"
+
+
+def test_metadata_reject_round_trip_preserves_lanes() -> None:
+    repair = wu._metadata_output_repair_context(
+        block_labels=["collect"],
+        required_paths={"output.record_id"},
+        coverage_reason_code="metadata_contract_missing",
+        source="metadata_reject",
+        summary="missing contract",
+        declaration_paths={"output.blocker"},
+    )
+    assert repair is not None
+    assert repair.required_goal_value_paths == ["output.record_id"]
+    assert repair.required_extraction_schema_paths == ["output.blocker", "output.record_id"]
+    assert repair.required_code_return_paths == ["output.blocker", "output.record_id"]
+    rehydration_ctx = _antecedent_ctx(_blocker_contingent_criterion())
+    rehydration_ctx.last_code_authoring_repair_context = repair
+
+    contract = wu._output_contract_required_paths_source(rehydration_ctx)
+
+    assert contract.observation_paths == {"output.record_id"}
+    assert contract.declaration_paths == {"output.blocker"}
+
+
+def test_evaluation_routes_lanes_per_consumer() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+    workflow_yaml = (
+        "title: Record lookup\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: extract_record\n"
+        "    code: |\n"
+        '      record_id = await page.inner_text("#record")\n'
+        "      return record_id\n"
+    )
+
+    evaluation = wu._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+    assert evaluation is not None
+    assert evaluation.block_label == "extract_record"
+    assert evaluation.required_paths == {"output.record_id", "output.blocker"}
+    assert evaluation.observation_paths == {"output.record_id"}
+    assert evaluation.declaration_paths == {"output.blocker"}
+    assert "output.blocker" not in evaluation.missing_metadata_paths
+    assert "output.blocker" in evaluation.missing_schema_paths  # nosemgrep: incomplete-url-substring-sanitization
+    assert "output.blocker" in evaluation.missing_return_paths  # nosemgrep: incomplete-url-substring-sanitization
+    payload = evaluation.payload
+    assert payload["canonical_required_child_paths"] == ["output.blocker", "output.record_id"]
+    assert payload["declaration_only_child_paths"] == ["output.blocker"]
+    assert payload["missing_goal_value_paths"] == ["output.record_id"]
+    assert payload["satisfying_templates"]["return_skeleton"] == (
+        'return {"output": {"blocker": None, "record_id": record_id}}'
+    )
+    template = payload["satisfying_templates"]["code_artifact_metadata"]
+    assert template["claimed_outcomes"][0]["goal_value_paths"] == ["output.record_id"]
+    blocker_facts = [
+        fact for fact in payload["missing_requested_output_facts"] if fact["output_path"] == "output.blocker"
+    ]
+    assert blocker_facts and blocker_facts[0]["value_status"] == "declaration_required_default_none"
+    record_facts = [
+        fact for fact in payload["missing_requested_output_facts"] if fact["output_path"] == "output.record_id"
+    ]
+    assert record_facts and record_facts[0]["value_status"] == "no_typed_value"
+    assert evaluation.repair_context is not None
+    assert evaluation.repair_context.required_goal_value_paths == ["output.record_id"]
+    assert evaluation.repair_context.required_code_return_paths == ["output.blocker", "output.record_id"]
+    assert evaluation.canonical_signature == wu._stable_output_contract_key(
+        wu._output_contract_scope_key(ctx), evaluation.required_paths
+    )
+
+
+def test_declaration_only_contract_evaluates_with_single_block_owner() -> None:
+    ctx = _antecedent_ctx(_blocker_contingent_criterion())
+    workflow_yaml = (
+        "title: Blocker only\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: submit\n"
+        "    code: |\n"
+        '      await page.click("#submit")\n'
+        "      return {}\n"
+    )
+
+    evaluation = wu._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+    assert evaluation is not None
+    assert evaluation.block_label == "submit"
+    assert evaluation.observation_paths == set()
+    assert "output.blocker" in evaluation.missing_return_paths  # nosemgrep: incomplete-url-substring-sanitization
+    assert evaluation.missing_metadata_paths == []
+
+
+def test_repair_context_goal_role_never_feeds_enforcement_uncovered_paths() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+    ctx.last_code_authoring_repair_context = wu._metadata_output_repair_context(
+        block_labels=["extract_record"],
+        required_paths={"output.record_id"},
+        coverage_reason_code="metadata_contract_missing",
+        source="metadata_reject",
+        summary="missing contract",
+        declaration_paths={"output.blocker"},
+    )
+
+    uncovered = enforcement.uncovered_requested_output_paths(ctx)
+
+    assert "output.blocker" not in uncovered
+    assert "output.record_id" in uncovered
+
+
+def test_static_return_imposition_renders_declaration_as_none_literal() -> None:
+    code = 'record_id = await page.inner_text("#record")'
+
+    keyed, violations = wu._extraction_code_with_required_static_return(
+        code,
+        required_paths={"output.record_id"},
+        declaration_paths={"output.blocker"},
+    )
+
+    assert violations == []
+    assert keyed.endswith('return {"output": {"blocker": None, "record_id": record_id}}')
+    produced = wu._code_block_produced_output_paths(keyed)
+    assert {"output.record_id", "output.blocker"} <= produced
+
+
+def test_scaffolded_metadata_goal_rows_exclude_declaration_paths() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+    workflow_yaml = (
+        "title: Record lookup\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: extract_record\n"
+        "    code: |\n"
+        '      record_id = await page.inner_text("#record")\n'
+        '      return {"output": {"record_id": record_id, "blocker": None}}\n'
+    )
+
+    scaffolded, applied = wu._scaffold_metadata_contract_for_update(ctx, workflow_yaml, [])
+
+    assert applied is True
+    row = scaffolded[0]["claimed_outcomes"][0]
+    assert row["goal_value_paths"] == ["output.record_id"]
+    schema = json.loads(row["extraction_schema"])
+    assert schema["properties"]["output"]["properties"]["blocker"] == {"type": ["string", "null"]}
+    assert set(schema["properties"]["output"]["required"]) == {"record_id", "blocker"}
+
+
+def test_mint_degraded_output_path_leaves_observation_lane() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_degraded",
+            outcome="The returned record includes record id.",
+            output_path="output.record_id",
+            contingent_on="the lookup is blocked",
+            mint_degrade="contingent_missing_antecedent",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    contract = wu._output_contract_required_paths_source(ctx)
+    assert contract.union == set()
+    assert contract.degraded_request_slots == ()
+
+
+def test_face_c_degraded_mint_preserves_satisfiable_value_bearing_authoring_path() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_degraded",
+            outcome="Whether the requested action is available is returned.",
+            output_path="output.action_is_available",
+            contingent_on="the action is unavailable",
+            contingent_antecedent_output_path="output.blocker",
+            mint_degrade="undecidable_judgment",
+            mint_disposition="degraded",
+            pinability="unpinnable",
+        ),
+        CompletionCriterion(
+            id="c_visible_label",
+            outcome="The visible action label is returned.",
+            output_path="output.visible_action_label",
+            pinability="shapeless_valid",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+    skeleton = wu._return_skeleton_for_required_paths(contract.union, contract.declaration_paths)
+
+    assert contract.observation_paths == {"output.visible_action_label"}
+    assert contract.declaration_paths == set()
+    assert contract.union != {"output.blocker"}
+    assert skeleton == 'return {"output": {"visible_action_label": visible_action_label}}'
+    assert "None" not in skeleton
+
+
+def test_canonically_bound_shapeless_valid_criterion_stays_dispatchable() -> None:
+    slot_hash = "a" * 48
+    slot = CanonicalRequestSlotV1(
+        slot_id="a" * 64,
+        canonical_path=f"output.request_slot_{slot_hash}_00",
+        path_segments=("output", f"request_slot_{slot_hash}_00"),
+        ordinal=0,
+        source_id="u0",
+        source_start=0,
+        source_end=10,
+        plane=RequestSlotPlane.RUN,
+        pinability=RequestSlotPinability.SHAPELESS_VALID,
+        antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+    )
+    bound = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c1",
+            outcome="The visible action label is returned.",
+            output_path="output.visible_action_label",
+        ),
+        slot=slot,
+        source_quote="visible action label",
+    )
+
+    assert bound.request_slot_id == slot.slot_id
+    assert bound.output_path is None
+    assert bound.floor_rekeyed_from_path == "output.visible_action_label"
+    assert bound.mint_disposition != "degraded"
+    assert bound.mint_degrade is None
+
+    ctx = _antecedent_ctx(bound)
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.degraded_request_slots == ()
+    assert contract.liveness is not wu._OutputContractLiveness.DEGRADED_EMPTY
+    code = 'label = await page.inner_text("#action")\nreturn {"output": {"visible_action_label": label}}\n'
+    assert wu.output_contract_value_bearing_run_reject(ctx, {"b1": code}) is None
+
+
+def test_classifier_minted_download_path_excluded_from_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+            requested_output_path_mint_source="classifier_default",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).union == set()
+
+
+def test_classifier_declared_download_path_excluded_from_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+            requested_output_path_mint_source="classifier_declared",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).union == set()
+
+
+def test_non_minted_registered_download_path_still_requires_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == {"output.downloaded_files"}
+
+
+def test_independent_validation_classification_is_post_run_only() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c1",
+            outcome="The run classifies whether the path is login-only.",
+            kind="validation_classification",
+            classification_output_key="login_only",
+            expected_classification=True,
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).observation_paths == set()
+
+
+def test_runtime_repair_contract_carries_declaration_lane_with_stable_signature() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+    pre_run = wu._output_contract_required_paths_source(ctx)
+    pre_signature = wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), pre_run.union)
+    ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="outcome_not_demonstrated",
+        workflow_run_id="wr_run_1",
+        runtime_output_repair_facts=[
+            {"workflow_run_id": "wr_run_1", "output_path": "output.record_id", "block_label": "extract_record"}
+        ],
+    )
+
+    post_run = wu._output_contract_required_paths_source(ctx)
+
+    assert post_run.source == "runtime_output_repair"
+    assert post_run.observation_paths == {"output.record_id"}
+    assert post_run.declaration_paths == {"output.blocker"}
+    assert wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), post_run.union) == pre_signature
+
+
+def _declaration_waiver_yaml(code_body: str) -> str:
+    indented = "\n".join(f"      {line}" for line in code_body.splitlines())
+    return (
+        "title: Record lookup\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: extract_record\n"
+        "    code: |\n"
+        f"{indented}\n"
+    )
+
+
+def _declaration_waiver_metadata(union: set[str]) -> list[dict[str, object]]:
+    return [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths=union,
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            declaration_paths={"output.blocker"},
+        )
+    ]
+
+
+def test_typed_advisory_grant_never_waives_declaration_return_miss() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+    union = {"output.record_id", "output.blocker"}
+    signature = wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), union)
+    wu._grant_output_contract_advisory_run(ctx, signature)
+    workflow_yaml = _declaration_waiver_yaml("result = await collect()\nreturn result")
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, _declaration_waiver_metadata(union), allow_static_return_advisory=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.payload["actuated_static_return_advisory"] is True
+    assert evaluation.payload["static_return_advisory_paths"] == ["output.record_id"]
+    assert evaluation.missing_return_paths == ["output.blocker"]
+    assert evaluation.can_attempt_run is False
+
+
+def test_stamped_declaration_with_advisory_accepts_run() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        ),
+        _blocker_contingent_criterion(),
+    )
+    union = {"output.record_id", "output.blocker"}
+    signature = wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), union)
+    wu._grant_output_contract_advisory_run(ctx, signature)
+    workflow_yaml = _declaration_waiver_yaml('await page.click("#submit")\nreturn {"output": {"blocker": None}}')
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, _declaration_waiver_metadata(union), allow_static_return_advisory=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.missing_return_paths == []
+    assert evaluation.payload["static_return_advisory_paths"] == ["output.record_id"]
+    assert evaluation.can_attempt_run is True
+
+
+def test_merge_declaration_children_into_empty_literal_return() -> None:
+    merged = wu._merge_declaration_children_into_literal_returns("return {}", {"output.blocker"})
+
+    assert merged == 'return {"output": {"blocker": None}}'
+
+
+def test_merge_declaration_children_into_existing_output_literal() -> None:
+    code = 'value = await page.inner_text("#r")\nreturn {"output": {"record_id": value}}'
+
+    merged = wu._merge_declaration_children_into_literal_returns(code, {"output.blocker"})
+
+    assert merged.endswith('return {"output": {"blocker": None, "record_id": value}}')
+    assert {"output.blocker", "output.record_id"} <= wu._code_block_produced_output_paths(merged)
+
+
+def test_code_with_declared_contract_defaults_appends_return_when_abstained() -> None:
+    stamped = wu._code_with_declared_contract_defaults('await page.click("#submit")', {"output.blocker"})
+
+    assert stamped.endswith('return {"output": {"blocker": None}}')
+
+
+def test_code_with_declared_contract_defaults_is_idempotent() -> None:
+    stamped = wu._code_with_declared_contract_defaults('await page.click("#submit")', {"output.blocker"})
+
+    assert wu._code_with_declared_contract_defaults(stamped, {"output.blocker"}) == ""
+
+
+def test_code_with_declared_contract_defaults_skips_dynamic_return() -> None:
+    assert wu._code_with_declared_contract_defaults("result = await collect()\nreturn result", {"output.blocker"}) == ""
+
+
+def test_stamped_declaration_keeps_click_only_spine_classification() -> None:
+    code = 'await page.click("#submit")\nreturn {"output": {"blocker": None}}'
+
+    assert wu._output_contract_click_only_spine(code, {"output.blocker"}) is True
+    assert wu._output_contract_click_only_spine(code) is False
+
+
+def test_observation_production_is_not_click_only_spine() -> None:
+    code = 'await page.click("#submit")\nreturn {"output": {"record_id": "x"}}'
+
+    assert wu._output_contract_click_only_spine(code, {"output.blocker"}) is False
+
+
+_METADATA_REQUIRED = {"output.confirmation_number"}
+
+
+def test_metadata_family_reject_holds_streak_across_fingerprint_rotation() -> None:
+    ctx = _counter_ctx()
+    for family in ("missing_code_artifact_metadata", "metadata_normalization", "output_contract_required"):
+        sub = _counter_ctx()
+        counts = [
+            wu._record_output_contract_family_reject(
+                sub, _METADATA_REQUIRED, reject_family=family, authored_structural_fingerprint=f"fp_{i}"
+            )
+            for i in range(4)
+        ]
+        assert counts == [1, 2, 3, 4], family
+    imposed = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="missing_code_artifact_metadata", authored_structural_fingerprint="fp_0"
+    )
+    signature = next(iter(ctx.output_contract_reject_count_by_signature))
+    ctx.output_contract_imposed_since_last_reject_by_signature[signature] = True
+    after_imposition = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="missing_code_artifact_metadata", authored_structural_fingerprint="fp_1"
+    )
+    assert (imposed, after_imposition) == (1, 1)
+
+
+def test_out_of_family_reject_resets_on_fingerprint_rotation() -> None:
+    ctx = _counter_ctx()
+    first = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="definition_contract_unsatisfied", authored_structural_fingerprint="fp_a"
+    )
+    rotated = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="definition_contract_unsatisfied", authored_structural_fingerprint="fp_b"
+    )
+    assert (first, rotated) == (1, 1)
+
+
+def test_reject_budget_exhausted_reason_code_is_genuinely_terminal() -> None:
+    signal = build_output_source_unobservable_blocker_signal(
+        reason_code=OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
+        required_paths=_METADATA_REQUIRED,
+        block_label="collect",
+    )
+    assert blocker_signal_is_genuinely_terminal(signal) is True
+
+
+def test_metadata_family_budget_reaches_typed_terminal_at_bound_without_churn() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_bound")
+    terminal_at = None
+    for candidate in range(1, 7):
+        count = wu._record_output_contract_family_reject(
+            ctx, _METADATA_REQUIRED, reject_family="missing_code_artifact_metadata"
+        )
+        assert count == candidate
+        exhausted = wu._adjudicate_output_contract_budget(ctx, _METADATA_REQUIRED, count=count, block_label="collect")
+        if exhausted and terminal_at is None:
+            terminal_at = candidate
+    assert terminal_at == 6
+    assert ctx.turn_halt is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
+    assert blocker_signal_is_genuinely_terminal(ctx.blocker_signal) is True
+    assert ctx.code_authoring_guardrail_reject_count == 0
+
+
+def test_budget_terminal_names_paths_and_omits_generic_churn_string() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_copy")
+    wu._stash_output_contract_reject_budget_terminal(
+        ctx, required_paths=_METADATA_REQUIRED, block_label="collect", signature="sig_copy"
+    )
+    assert ctx.blocker_signal is not None
+    user_facing = ctx.blocker_signal.user_facing_reason
+    assert_clean_user_facing_text(user_facing)
+    assert "output.confirmation_number" in user_facing
+    assert "safety checks rejected each version" not in user_facing
+    assert ctx.blocker_signal.renders_final_reply is True
+
+
+def test_main_gate_defers_churn_to_budget_ladder_when_reject_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_defer")
+    calls: list[object] = []
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: calls.append(_ctx))
+    count = wu._record_output_contract_reject(
+        ctx,
+        _make_evaluation("", block_label="collect"),
+        summary="Typed deficiency.",
+        authored_structural_fingerprint="fp_defer",
+        workflow_yaml=_PAGE_READ_YAML,
+    )
+    assert count["output_contract_reject_count"] >= 1
+    assert calls == []
+
+
+def test_undeclared_contract_rejects_count_toward_budget_and_reach_typed_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A candidate deriving NO required child paths must still consume the reject budget: skipping
+    # the count degrades repeated preflight rejects to the generic churn stop (loop_detected).
+    ctx = make_copilot_ctx(turn_id="turn_budget_undeclared")
+    calls: list[object] = []
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: calls.append(_ctx))
+    malformed = {"collect": {"goal_value_paths": [], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = malformed
+
+    def undeclared_evaluation() -> wu._OutputContractEvaluation:
+        return wu._OutputContractEvaluation(
+            block_label="collect",
+            artifact_id="",
+            required_paths=set(),
+            observation_paths=set(),
+            declaration_paths=set(),
+            source="requested_output",
+            reason_code="output_contract_required",
+            missing_metadata_paths=[],
+            missing_schema_paths=[],
+            missing_return_paths=[],
+            shape_violations=[],
+            canonical_signature="",
+            payload={},
+            repair_context=None,
+        )
+
+    terminal_at = None
+    for candidate in range(1, 8):
+        payload = wu._record_output_contract_reject(
+            ctx,
+            undeclared_evaluation(),
+            summary="Undeclared contract deficiency.",
+            authored_structural_fingerprint=f"fp_{candidate}",
+            workflow_yaml="",
+        )
+        assert payload["output_contract_reject_count"] == candidate
+        if ctx.turn_halt is not None and terminal_at is None:
+            terminal_at = candidate
+            break
+    assert terminal_at is not None and terminal_at <= 7
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
+    assert calls == []
+    assert ctx.rejected_code_artifact_metadata_captures[-1] == RejectedCodeArtifactMetadataCapture(payload=malformed)
+
+
+def test_recorded_identical_reject_shape_replays_to_budget_terminal_with_per_reject_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Replays the recorded live churn shape — identical value_bearing_output_required rejects on a
+    # candidate deriving no required paths — through the real seam to budget exhaustion.
+    ctx = make_copilot_ctx(turn_id="turn_recorded_shape_replay")
+    churn_calls: list[object] = []
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: churn_calls.append(_ctx))
+    malformed = {"collect": {"goal_value_paths": [], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = malformed
+
+    def recorded_shape_evaluation() -> wu._OutputContractEvaluation:
+        return wu._OutputContractEvaluation(
+            block_label="collect",
+            artifact_id="",
+            required_paths=set(),
+            observation_paths=set(),
+            declaration_paths=set(),
+            source="requested_output",
+            reason_code=wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+            missing_metadata_paths=[],
+            missing_schema_paths=[],
+            missing_return_paths=[],
+            shape_violations=[wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE],
+            canonical_signature="",
+            payload={"reason_code": wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE},
+            repair_context=None,
+        )
+
+    terminal_at = None
+    for candidate in range(1, 8):
+        payload = wu._record_output_contract_reject(
+            ctx,
+            recorded_shape_evaluation(),
+            summary="Identical value-bearing deficiency.",
+            authored_structural_fingerprint="fp_identical",
+            workflow_yaml="",
+        )
+        assert payload["output_contract_reject_count"] == candidate
+        assert len(ctx.rejected_code_artifact_metadata_captures) == min(candidate, 5)
+        if ctx.turn_halt is not None:
+            terminal_at = candidate
+            break
+    assert terminal_at is not None and terminal_at <= 7
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
+    assert blocker_signal_is_genuinely_terminal(ctx.blocker_signal) is True
+    assert churn_calls == []
+
+
+def test_no_reject_leaves_no_budget_terminal() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_yes")
+    assert wu._adjudicate_output_contract_budget(ctx, _METADATA_REQUIRED, count=0, block_label="collect") is False
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+
+
+def test_rejected_code_artifact_metadata_capture_is_byte_exact_and_bounded() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_capture")
+    malformed = {"collect": {"goal_value_paths": ["output.confirmation_number"], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = malformed
+    wu._capture_rejected_code_artifact_metadata(ctx)
+    assert ctx.rejected_code_artifact_metadata_captures[-1] == RejectedCodeArtifactMetadataCapture(payload=malformed)
+    for index in range(7):
+        ctx.submitted_code_artifact_metadata_snapshot = {"collect": {"variant": index}}
+        wu._capture_rejected_code_artifact_metadata(ctx)
+    captures = ctx.rejected_code_artifact_metadata_captures
+    assert len(captures) == 5
+    assert [c.payload["collect"]["variant"] for c in captures] == [2, 3, 4, 5, 6]
+
+
+def test_rejected_capture_log_carries_payload_kept_off_user_facing_text() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_capture_log")
+    payload = {"collect": {"goal_value_paths": ["output.confirmation_number"], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = payload
+    with capture_logs() as logs:
+        wu._capture_rejected_code_artifact_metadata(ctx)
+    entries = [line for line in logs if line.get("event") == "copilot_rejected_code_artifact_metadata_captured"]
+    assert entries
+    assert entries[0]["rejected_code_artifact_metadata_payload"] == payload
+    assert entries[0]["submitted_metadata_labels"] == ["collect"]
+
+    wu._stash_output_contract_reject_budget_terminal(
+        ctx, required_paths=_METADATA_REQUIRED, block_label="collect", signature="sig_capture"
+    )
+    assert ctx.blocker_signal is not None
+    assert "extraction_schema" not in ctx.blocker_signal.user_facing_reason
+    assert "goal_value_paths" not in ctx.blocker_signal.user_facing_reason
+
+
+def test_contract_satisfying_candidate_admits_run_no_reject() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    workflow_yaml = _declaration_waiver_yaml(
+        'record_id = await page.inner_text("#record")\nreturn {"output": {"record_id": record_id}}'
+    )
+    metadata = [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output.record_id"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+        )
+    ]
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is False
+    assert evaluation.missing_return_paths == []
+    assert evaluation.missing_metadata_paths == []
+
+
+def test_deficient_candidate_still_rejected_by_gate() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")\nreturn record_id')
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, [], enforce_value_bearing_liveness=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is True
+    assert "output.record_id" in evaluation.missing_return_paths
+    assert "output.record_id" in evaluation.missing_metadata_paths

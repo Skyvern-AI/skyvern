@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, unquote, urlparse
 
 import aiohttp
+import filetype
 import structlog
 from multidict import CIMultiDictProxy
 from yarl import URL
@@ -277,15 +278,18 @@ async def download_file(
                     # response.headers stays a CIMultiDictProxy: dict() would make header
                     # lookups case-sensitive and miss lowercase wire headers.
                     file_name = _determine_download_filename(filename, response.headers, url)
-                    final_path = (download_dir_resolved / file_name).resolve()
+                    allowed_dir = os.path.realpath(download_dir_resolved)
+                    resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
                     # sanitize_filename strips separators but keeps dots, so a dots-only name can
                     # still resolve outside the download dir; require a direct child. Checked
                     # before streaming so a rejected name downloads zero bytes.
                     if (
-                        not final_path.is_relative_to(download_dir_resolved)
-                        or final_path.parent != download_dir_resolved
+                        resolved_final_path == allowed_dir
+                        or not resolved_final_path.startswith(allowed_dir + os.sep)
+                        or os.path.dirname(resolved_final_path) != allowed_dir
                     ):
                         raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                    final_path = Path(resolved_final_path)
 
                     temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
                     file_path = Path(temp_file.name).resolve()
@@ -571,6 +575,26 @@ def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -
 
 def sanitize_filename(filename: str) -> str:
     return "".join(c for c in filename if c.isalnum() or c in ["-", "_", ".", "%", " "])
+
+
+def guess_extension_from_file(file_path: str | Path) -> str:
+    """Infer a file's extension (with leading dot) from its magic bytes, or "" if unreadable/unknown."""
+    try:
+        kind = filetype.guess(str(file_path))
+    except OSError:
+        return ""
+    return f".{kind.extension}" if kind else ""
+
+
+def recover_download_extension(file_path: str | Path, download_suffix: str | None = None) -> str:
+    """Extension to append to a downloaded file that has none, sniffed from its content.
+
+    Returns "" when ``download_suffix`` already carries its own extension, so the final
+    ``download_suffix + extension`` name is not doubled (e.g. invoice.pdf + .pdf).
+    """
+    if download_suffix and Path(download_suffix).suffix:
+        return ""
+    return guess_extension_from_file(file_path)
 
 
 def rename_file(file_path: str, new_file_name: str) -> str:

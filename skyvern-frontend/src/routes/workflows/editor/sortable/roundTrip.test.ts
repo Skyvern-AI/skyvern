@@ -11,8 +11,10 @@ import {
 } from "../workflowEditorUtils";
 import {
   type CodeBlock,
+  type EmailInboxBlock,
   type OutputParameter,
   type WorkflowBlock,
+  type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
 import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
@@ -76,6 +78,21 @@ function makeOutputParameter(label: string): OutputParameter {
   };
 }
 
+function makeWorkflowParameter(key: string): WorkflowParameter {
+  return {
+    parameter_type: "workflow",
+    key,
+    description: null,
+    workflow_id: "wf-fixture",
+    workflow_parameter_id: `wp-${key}`,
+    workflow_parameter_type: "string",
+    default_value: "",
+    created_at: "2026-04-20T00:00:00Z",
+    modified_at: "2026-04-20T00:00:00Z",
+    deleted_at: null,
+  };
+}
+
 function makeCodeBlock(
   label: string,
   nextBlockLabel: string | null,
@@ -89,6 +106,30 @@ function makeCodeBlock(
     output_parameter: makeOutputParameter(label),
     code: `# ${label}`,
     parameters: [],
+  };
+}
+
+function makeEmailInboxBlock(
+  label: string,
+  parameters: Array<WorkflowParameter>,
+): EmailInboxBlock {
+  return {
+    label,
+    block_type: "email_inbox",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: null,
+    output_parameter: makeOutputParameter(label),
+    email_client: "outlook",
+    credential_id: "{{ microsoft_credential_id }}",
+    folder: "Inbox",
+    prompt: "",
+    sender: null,
+    subject: null,
+    newer_than_days: null,
+    max_results: 25,
+    include_body: true,
+    parameters,
   };
 }
 
@@ -220,6 +261,29 @@ function reloadFromSavedYaml(
 }
 
 describe("round-trip reorder → save → reload (M1 top-level)", () => {
+  test("email inbox preserves parameter keys across load and save", () => {
+    const credentialParameter = makeWorkflowParameter(
+      "microsoft_credential_id",
+    );
+    const initialBlocks: Array<WorkflowBlock> = [
+      makeEmailInboxBlock("Read Inbox", [credentialParameter]),
+    ];
+
+    const { nodes, edges } = getElements(initialBlocks, DEFAULT_SETTINGS, true);
+
+    const emailNode = nodes.find((node) => node.type === "emailInbox");
+    expect(emailNode?.data).toMatchObject({
+      parameterKeys: ["microsoft_credential_id"],
+    });
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      block_type: "email_inbox",
+      parameter_keys: ["microsoft_credential_id"],
+    });
+  });
+
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {
     // 1. Load the workflow: YAML-like blocks → nodes + edges via getElements.
     const initialBlocks = buildFiveBlockFixture();
@@ -488,5 +552,54 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     });
     expect(recovered.finallyBlockLabel).toBe("B5");
     expect(recovered.workflowSystemPrompt).toBe("always double-check totals");
+  });
+});
+
+describe("login block configuration round trip", () => {
+  test("preserves Include Action History through load and save", () => {
+    const loginBlock = {
+      label: "login",
+      block_type: "login",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("login"),
+      url: "https://example.test/login",
+      title: "Login",
+      navigation_goal: "Log in",
+      error_code_mapping: null,
+      max_retries: 0,
+      max_steps_per_run: null,
+      parameters: [],
+      totp_verification_url: null,
+      totp_identifier: null,
+      disable_cache: false,
+      complete_criterion: null,
+      terminate_criterion: null,
+      engine: null,
+      include_action_history_in_verification: true,
+    } as unknown as WorkflowBlock;
+
+    const { nodes, edges } = getElements([loginBlock], DEFAULT_SETTINGS, true);
+    const loginNode = nodes.find((node) => node.type === "login");
+
+    expect(loginNode).toBeDefined();
+    expect(
+      (
+        loginNode!.data as unknown as {
+          includeActionHistoryInVerification?: boolean;
+        }
+      ).includeActionHistoryInVerification,
+    ).toBe(true);
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(
+      (
+        saved[0] as unknown as {
+          include_action_history_in_verification?: boolean;
+        }
+      ).include_action_history_in_verification,
+    ).toBe(true);
   });
 });

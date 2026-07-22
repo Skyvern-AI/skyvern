@@ -62,7 +62,6 @@
 - [Docker Setup](https://skyvern.com/docs/developers/self-hosted/docker.md): Get Skyvern running in 10 minutes with Docker Compose
 - [LLM Configuration](https://skyvern.com/docs/developers/self-hosted/llm-configuration.md): Connect OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Ollama, or any OpenAI-compatible LLM provider
 - [Browser Configuration](https://skyvern.com/docs/developers/self-hosted/browser.md): Configure browser modes, display settings, headless vs headed, and external Chrome connections via Playwright
-- [Proxy Setup](https://skyvern.com/docs/developers/self-hosted/proxy.md): Configure residential proxies and geolocation for bot detection avoidance in self-hosted deployments
 - [Kubernetes Deployment](https://skyvern.com/docs/developers/self-hosted/kubernetes.md): Deploy Skyvern at scale with Kubernetes manifests and Helm charts
 - [Storage Configuration](https://skyvern.com/docs/developers/self-hosted/storage.md): Configure where Skyvern stores artifacts, recordings, and screenshots; local filesystem or S3-compatible storage
 - [Local LLMs](https://skyvern.com/docs/integrations/local-llms.md): Run Skyvern with Ollama, LiteLLM, or any OpenAI-compatible endpoint for self-hosted LLM inference

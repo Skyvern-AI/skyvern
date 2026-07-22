@@ -158,6 +158,19 @@ class TestSignArtifactUrl:
         expiry = int(qs["expiry"][0])
         assert before + ARTIFACT_URL_EXPIRY_SECONDS <= expiry <= after + ARTIFACT_URL_EXPIRY_SECONDS
 
+    def test_url_omits_artifact_metadata(self) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        url = sign_artifact_url(
+            _BASE_URL,
+            _ARTIFACT_ID,
+            _make_keyring(),
+            artifact_name="sensitive-screenshot.png",
+            artifact_type="screenshot_action",
+        )
+
+        assert set(parse_qs(urlparse(url).query)) == {"expiry", "kid", "sig"}
+
     def test_sig_is_url_safe_base64_no_padding(self) -> None:
         kr = _make_keyring()
         url = sign_artifact_url(_BASE_URL, _ARTIFACT_ID, kr)

@@ -33,6 +33,38 @@ def make_workflow_run(
     return wfr
 
 
+class _StopBeforeBrowserContext(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_task_first_creation_gives_engine_flag_the_pinned_workflow_id() -> None:
+    """A workflow-owned task that creates the browser first pins under workflow_run_id but keeps it
+    out of browser-context creation (download-dir scoping). The engine-flag context must still carry
+    that workflow_run_id — so both the flag distinct_id and its workflow_run_id property match the
+    pinned run — while the browser context keeps the raw (None) workflow_run_id."""
+    manager = RealBrowserManager()
+    seen: dict[str, object] = {}
+
+    async def capture(*, run_key: str | None, context: object) -> object:
+        seen["run_key"] = run_key
+        seen["context"] = context
+        raise _StopBeforeBrowserContext
+
+    with patch.object(manager, "get_or_resolve_engine_selection", side_effect=capture):
+        with pytest.raises(_StopBeforeBrowserContext):
+            await manager._create_browser_state(
+                task_id="tsk_1",
+                workflow_run_id=None,  # kept out of browser-context creation (download-dir scoping)
+                engine_run_key="wr_1",
+                engine_workflow_run_id="wr_1",
+            )
+
+    assert seen["run_key"] == "wr_1"
+    assert seen["context"].workflow_run_id == "wr_1"  # engine flag sees the pinned workflow run
+    assert seen["context"].task_id == "tsk_1"
+
+
 @pytest.mark.asyncio
 async def test_pbs_workflow_run_cache_hit_on_second_call() -> None:
     """PBS runs must hit the cache on subsequent calls and NOT re-enter the PBS branch."""

@@ -26,6 +26,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { RunHealChip } from "./RunHealChip";
+import { RunReliabilityUplink } from "./RunReliabilityUplink";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -131,55 +133,61 @@ function WorkflowRunOverview() {
 
   return (
     <AspectRatio ratio={16 / 9}>
-      {shouldShowBrowserStream && (
-        <BrowserStream
-          key={browserSessionId}
-          browserSessionId={browserSessionId!}
-          interactive={isPaused}
-          showControlButtons={isPaused}
-          workflow={undefined}
-          onClose={handleVncClose}
-        />
-      )}
-      {!shouldShowBrowserStream &&
-        (shouldShowScreencastFallback || selection === "stream") && (
-          <WorkflowRunStream
-            alwaysShowStream={shouldShowScreencastFallback}
+      <div className="relative h-full w-full">
+        <div className="absolute left-2 top-2 z-20 flex flex-col gap-1">
+          <RunHealChip workflowRunId={workflowRunId} />
+          <RunReliabilityUplink workflowRunId={workflowRunId} />
+        </div>
+        {shouldShowBrowserStream && (
+          <BrowserStream
+            key={browserSessionId}
+            browserSessionId={browserSessionId!}
             interactive={isPaused}
             showControlButtons={isPaused}
+            workflow={undefined}
+            onClose={handleVncClose}
           />
         )}
-      {!isStreamActive && isAction(selection) && (
-        <ActionScreenshot
-          artifactId={selection.screenshot_artifact_id ?? undefined}
-          index={selection.action_order ?? 0}
-          stepId={selection.step_id ?? ""}
-        />
-      )}
-      {isWorkflowRunBlock(selection) &&
-        !isStreamActive &&
-        (() => {
-          // A container selection (loop/conditional) resolves to a descendant leaf, so read the
-          // leaf's type rather than the container's so a nested code block is treated as one.
-          const screenshotBlockId = resolveScreenshotBlockId(
-            workflowRunTimeline,
-            selection,
-            activeIteration,
-          );
-          const screenshotBlockType =
-            findTimelineBlock(workflowRunTimeline, screenshotBlockId)
-              ?.block_type ?? selection.block_type;
-          return (
-            <WorkflowRunBlockScreenshot
-              workflowRunBlockId={screenshotBlockId}
-              blockType={screenshotBlockType}
-              runStatus={workflowRun?.status}
+        {!shouldShowBrowserStream &&
+          (shouldShowScreencastFallback || selection === "stream") && (
+            <WorkflowRunStream
+              alwaysShowStream={shouldShowScreencastFallback}
+              interactive={isPaused}
+              showControlButtons={isPaused}
             />
-          );
-        })()}
-      {isObserverThought(selection) && (
-        <ObserverThoughtScreenshot observerThoughtId={selection.thought_id} />
-      )}
+          )}
+        {!isStreamActive && isAction(selection) && (
+          <ActionScreenshot
+            artifactId={selection.screenshot_artifact_id ?? undefined}
+            index={selection.action_order ?? 0}
+            stepId={selection.step_id ?? ""}
+          />
+        )}
+        {isWorkflowRunBlock(selection) &&
+          !isStreamActive &&
+          (() => {
+            // A container selection (loop/conditional) resolves to a descendant leaf, so read the
+            // leaf's type rather than the container's so a nested code block is treated as one.
+            const screenshotBlockId = resolveScreenshotBlockId(
+              workflowRunTimeline,
+              selection,
+              activeIteration,
+            );
+            const screenshotBlockType =
+              findTimelineBlock(workflowRunTimeline, screenshotBlockId)
+                ?.block_type ?? selection.block_type;
+            return (
+              <WorkflowRunBlockScreenshot
+                workflowRunBlockId={screenshotBlockId}
+                blockType={screenshotBlockType}
+                runStatus={workflowRun?.status}
+              />
+            );
+          })()}
+        {isObserverThought(selection) && (
+          <ObserverThoughtScreenshot observerThoughtId={selection.thought_id} />
+        )}
+      </div>
     </AspectRatio>
   );
 }

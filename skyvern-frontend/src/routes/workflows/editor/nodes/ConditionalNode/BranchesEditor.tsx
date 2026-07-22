@@ -468,7 +468,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                           {
                             "border-slate-50 bg-slate-50 text-slate-950 hover:bg-slate-50 hover:text-slate-950":
                               branch.id === activeBranch?.id,
-                            "border-transparent bg-slate-elevation5 text-slate-300 hover:bg-slate-elevation4 hover:text-slate-300":
+                            "border-transparent bg-slate-elevation5 text-tertiary-foreground hover:bg-slate-elevation4 hover:text-tertiary-foreground":
                               branch.id !== activeBranch?.id,
                           },
                         )}
@@ -489,7 +489,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                                 {
                                   "text-slate-950 hover:bg-slate-300 hover:text-slate-950":
                                     branch.id === activeBranch?.id,
-                                  "text-slate-300 hover:bg-slate-600 hover:text-slate-300":
+                                  "text-tertiary-foreground hover:bg-accent hover:text-tertiary-foreground dark:hover:bg-slate-600":
                                     branch.id !== activeBranch?.id,
                                 },
                               )}
@@ -533,7 +533,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                                   e.stopPropagation();
                                   handleRemoveBranch(branch.id);
                                 }}
-                                className="cursor-pointer text-red-400 focus:text-red-400"
+                                className="cursor-pointer text-red-700 focus:text-red-700 dark:text-red-400 dark:focus:text-red-400"
                               >
                                 Remove
                               </DropdownMenuItem>
@@ -552,7 +552,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                         type="button"
                         variant="ghost"
                         size="sm"
-                        className="h-auto gap-1 rounded-full border border-transparent bg-slate-elevation5 p-0 px-3 py-1 text-xs font-normal text-slate-300 transition-colors hover:bg-slate-elevation4 hover:text-slate-300"
+                        className="h-auto gap-1 rounded-full border border-transparent bg-slate-elevation5 p-0 px-3 py-1 text-xs font-normal text-tertiary-foreground transition-colors hover:bg-slate-elevation4 hover:text-tertiary-foreground"
                         disabled={!data.editable}
                       >
                         {overflowBranches.length} More
@@ -585,7 +585,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                   size="sm"
                   onClick={handleAddCondition}
                   disabled={!data.editable}
-                  className="size-7 rounded-full border border-transparent bg-slate-elevation5 p-0 text-slate-300 hover:bg-slate-elevation4 hover:text-slate-300"
+                  className="size-7 rounded-full border border-transparent bg-slate-elevation5 p-0 text-tertiary-foreground hover:bg-slate-elevation4 hover:text-tertiary-foreground"
                   title="Add new condition"
                 >
                   <PlusIcon className="size-4" />
@@ -598,7 +598,7 @@ function BranchesEditor({ nodeId, data }: Props) {
       {activeBranch && (
         <div className="space-y-2">
           <div className="flex items-center gap-1">
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               {activeBranch.is_default ? "Else branch" : "Expression"}
             </Label>
             {!activeBranch.is_default && (

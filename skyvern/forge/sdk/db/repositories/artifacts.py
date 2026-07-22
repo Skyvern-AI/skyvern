@@ -284,6 +284,7 @@ class ArtifactsRepository(BaseRepository):
         thought_id: str | None = None,
         task_v2_id: str | None = None,
         limit: int | None = None,
+        include_legacy_null_org: bool = True,
     ) -> list[Artifact]:
         async with self.Session() as session:
             # Build base query
@@ -303,11 +304,15 @@ class ArtifactsRepository(BaseRepository):
                 query = query.filter_by(observer_thought_id=thought_id)
             if task_v2_id is not None:
                 query = query.filter_by(observer_cruise_id=task_v2_id)
-            # Handle backward compatibility where old artifact rows were stored with organization_id NULL
             if organization_id is not None:
-                query = query.filter(
-                    or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
-                )
+                if include_legacy_null_org:
+                    # Backward compatibility: old artifact rows were stored with organization_id NULL.
+                    # Only safe when the entity id is already trusted to belong to the caller's org.
+                    query = query.filter(
+                        or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
+                    )
+                else:
+                    query = query.filter(ArtifactModel.organization_id == organization_id)
 
             query = query.order_by(ArtifactModel.created_at.desc())
 
@@ -474,6 +479,40 @@ class ArtifactsRepository(BaseRepository):
                 )
             ).all()
             return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
+
+    @db_operation("list_artifacts_for_browser_session_by_type_after")
+    async def list_artifacts_for_browser_session_by_type_after(
+        self,
+        *,
+        browser_session_id: str,
+        organization_id: str,
+        artifact_type: ArtifactType,
+        created_after: datetime.datetime | None,
+        artifact_id_after: str | None,
+        limit: int,
+    ) -> list[Artifact]:
+        """Return a bounded creation-ordered page after an optional stable cursor."""
+        async with self.Session() as session:
+            query = (
+                select(ArtifactModel)
+                .filter(ArtifactModel.browser_session_id == browser_session_id)
+                .filter(ArtifactModel.artifact_type == artifact_type)
+                .filter(ArtifactModel.organization_id == organization_id)
+            )
+            if created_after is not None and artifact_id_after is not None:
+                query = query.filter(
+                    or_(
+                        ArtifactModel.created_at > created_after,
+                        and_(
+                            ArtifactModel.created_at == created_after,
+                            ArtifactModel.artifact_id > artifact_id_after,
+                        ),
+                    )
+                )
+            artifacts = (
+                await session.scalars(query.order_by(ArtifactModel.created_at, ArtifactModel.artifact_id).limit(limit))
+            ).all()
+            return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
 
     @db_operation("claim_session_download_artifacts_for_run")
     async def claim_session_download_artifacts_for_run(

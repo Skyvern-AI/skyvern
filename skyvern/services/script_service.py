@@ -7,7 +7,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Sequence, cast
 
@@ -36,9 +36,17 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
+from skyvern.forge.sdk.api.files import (
+    check_downloading_files_and_wait_for_download_to_complete,
+    get_path_for_workflow_download_directory,
+    list_files_in_directory,
+    recover_download_extension,
+    rename_file,
+    resolve_run_download_id,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -53,6 +61,7 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
     to_downloaded_file_signature as _to_downloaded_file_signature,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    CURRENT_DATE_FORMAT,
     DEFAULT_MAX_LOOP_ITERATIONS,
     ActionBlock,
     CodeBlock,
@@ -88,7 +97,7 @@ from skyvern.schemas.scripts import (
     ScriptStatus,
 )
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
@@ -1927,7 +1936,7 @@ async def run_task(
             await _handle_script_termination(e, "task block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run task block. Falling back to AI run.")
+            LOG.warning("Failed to run task block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.NAVIGATION,
                 cache_key=cache_key,
@@ -1985,32 +1994,180 @@ async def download(
     cache_key: str | None = None,
     model: dict[str, Any] | None = None,
     error_code_mapping: dict[str, str] | None = None,
+    navigation_goal: str | None = None,
+    download_target: str = "website",
+    s3_bucket: str | None = None,
+    aws_access_key_id: str | None = None,
+    aws_secret_access_key: str | None = None,
+    region_name: str | None = None,
+    azure_storage_account_name: str | None = None,
+    azure_storage_account_key: str | None = None,
+    azure_blob_container_name: str | None = None,
+    google_credential_id: str | None = None,
+    google_drive_folder_id: str | None = None,
+    sftp_host: str | None = None,
+    sftp_port: int | None = None,
+    sftp_username: str | None = None,
+    sftp_password: str | None = None,
+    sftp_private_key: str | None = None,
+    sftp_private_key_passphrase: str | None = None,
+    sftp_remote_path: str | None = None,
+    sftp_host_key: str | None = None,
+    path: str | None = None,
+    continue_on_empty: bool | None = None,
 ) -> None:
     cache_key = cache_key or label
+    navigation_prompt = navigation_goal or prompt
+    destination_prompt = prompt if navigation_goal is not None else None
+    if s3_bucket:
+        s3_bucket = _render_template_with_label(s3_bucket, cache_key)
+    if aws_access_key_id:
+        aws_access_key_id = _render_template_with_label(aws_access_key_id, cache_key)
+    if aws_secret_access_key:
+        aws_secret_access_key = _render_template_with_label(aws_secret_access_key, cache_key)
+    if region_name:
+        region_name = _render_template_with_label(region_name, cache_key)
+    if azure_storage_account_name:
+        azure_storage_account_name = _render_template_with_label(azure_storage_account_name, cache_key)
+    if azure_storage_account_key:
+        azure_storage_account_key = _render_template_with_label(azure_storage_account_key, cache_key)
+    if azure_blob_container_name:
+        azure_blob_container_name = _render_template_with_label(azure_blob_container_name, cache_key)
+    if google_credential_id:
+        google_credential_id = _render_template_with_label(google_credential_id, cache_key)
+    if google_drive_folder_id:
+        google_drive_folder_id = _render_template_with_label(google_drive_folder_id, cache_key)
+    if sftp_host:
+        sftp_host = _render_template_with_label(sftp_host, cache_key)
+    if sftp_username:
+        sftp_username = _render_template_with_label(sftp_username, cache_key)
+    if sftp_password:
+        sftp_password = _render_template_with_label(sftp_password, cache_key)
+    if sftp_private_key:
+        sftp_private_key = _render_template_with_label(sftp_private_key, cache_key)
+    if sftp_private_key_passphrase:
+        sftp_private_key_passphrase = _render_template_with_label(sftp_private_key_passphrase, cache_key)
+    if sftp_remote_path:
+        sftp_remote_path = _render_template_with_label(sftp_remote_path, cache_key)
+    if sftp_host_key:
+        sftp_host_key = _render_template_with_label(sftp_host_key, cache_key)
+    if destination_prompt:
+        destination_prompt = _render_template_with_label(destination_prompt, cache_key)
+    if path:
+        path = _render_template_with_label(path, cache_key)
+
+    resolved_download_target = FileDownloadTarget(download_target)
+    destination_block_kwargs = {
+        "download_target": resolved_download_target,
+        "s3_bucket": s3_bucket,
+        "aws_access_key_id": aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "region_name": region_name,
+        "azure_storage_account_name": azure_storage_account_name,
+        "azure_storage_account_key": azure_storage_account_key,
+        "azure_blob_container_name": azure_blob_container_name,
+        "google_credential_id": google_credential_id,
+        "google_drive_folder_id": google_drive_folder_id,
+        "sftp_host": sftp_host,
+        "sftp_port": sftp_port,
+        "sftp_username": sftp_username,
+        "sftp_password": sftp_password,
+        "sftp_private_key": sftp_private_key,
+        "sftp_private_key_passphrase": sftp_private_key_passphrase,
+        "sftp_remote_path": sftp_remote_path,
+        "sftp_host_key": sftp_host_key,
+        "prompt": destination_prompt,
+        "path": path,
+        "continue_on_empty": continue_on_empty if continue_on_empty is not None else False,
+    }
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     context: skyvern_context.SkyvernContext | None
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.FILE_DOWNLOAD,
-            prompt=prompt,
+            prompt=navigation_prompt,
             url=url,
             label=cache_key,
             model=model,
             created_by="script",
         )
-        prompt = _render_template_with_label(prompt, cache_key)
-        # set the prompt in the RunContext
+        navigation_prompt = _render_template_with_label(navigation_prompt, cache_key)
         context = skyvern_context.ensure_context()
-        context.prompt = prompt
+        file_download_block: FileDownloadBlock | None = None
+        storage_type: FileStorageType | None = None
+        destination_delivery_started = False
+        if resolved_download_target != FileDownloadTarget.WEBSITE:
+            file_download_block = FileDownloadBlock.model_construct(
+                label=cache_key,
+                output_parameter=None,
+                **destination_block_kwargs,
+            )
+            storage_type = FileStorageType(resolved_download_target.value)
+            missing_parameters = file_download_block._validate_destination_fields(storage_type)
+            if missing_parameters:
+                failure_reason = f"Missing download destination values: {', '.join(missing_parameters)}"
+                LOG.error(
+                    "Cached download destination configuration is invalid",
+                    block_label=cache_key,
+                    download_target=resolved_download_target,
+                    missing_parameters=missing_parameters,
+                )
+                if workflow_run_block_id:
+                    await _update_workflow_block(
+                        workflow_run_block_id,
+                        BlockStatus.failed,
+                        task_id=task_id,
+                        task_status=TaskStatus.failed,
+                        step_id=step_id,
+                        step_status=StepStatus.failed,
+                        label=cache_key,
+                        failure_reason=failure_reason,
+                    )
+                _clear_cached_block_overrides(cache_key)
+                # Halt the cached script: run_script does not stop on a recorded failed status, so a
+                # plain return would let later generated statements run after this misconfiguration.
+                raise ScriptTerminationException(failure_reason)
+
+        async def dispatch_to_destination(files_to_upload: list[str]) -> None:
+            if file_download_block is None or storage_type is None:
+                return
+            if destination_prompt and destination_prompt.strip():
+                files_to_upload, _ = await FileDownloadBlock._select_files_to_upload_with_prompt(
+                    file_download_block,
+                    prompt=destination_prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id or "",
+                    organization_id=context.organization_id,
+                )
+            if files_to_upload:
+                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                    context.workflow_run_id or ""
+                )
+                await file_download_block._dispatch_files_to_storage(
+                    storage_type=storage_type,
+                    files_to_upload=files_to_upload,
+                    workflow_run_id=context.workflow_run_id or "",
+                    workflow_run_block_id=workflow_run_block_id or "",
+                    organization_id=context.organization_id,
+                    workflow_run_context=workflow_run_context,
+                )
+
+        # set the prompt in the RunContext
+        context.prompt = navigation_prompt
+        download_run_id = resolve_run_download_id(context, fallback_run_id=context.workflow_run_id or "") or (
+            context.workflow_run_id or ""
+        )
 
         try:
-            await _prepare_cached_block_inputs(cache_key, prompt)
+            await _prepare_cached_block_inputs(cache_key, navigation_prompt)
 
             # Count downloaded files before running cached function so we can
             # verify that the download actually produced a new file.
             org_id = context.organization_id or ""
-            run_id = context.workflow_run_id or ""
+            # Use the resolved download run id for storage baseline/save/verify too, so they match
+            # the directory the browser actually writes to (the inherited parent for child runs).
+            run_id = download_run_id
             files_before: list = []
             files_before_ok = False
             try:
@@ -2028,10 +2185,29 @@ async def download(
                 )
 
             # Track local files before download for renaming with download_suffix
-            local_download_dir = get_path_for_workflow_download_directory(run_id)
+            local_download_dir = get_path_for_workflow_download_directory(download_run_id)
             local_files_before = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+            local_file_signatures_before: dict[str, tuple[int, int]] = {}
+            for file_path in local_files_before:
+                try:
+                    file_stat = Path(file_path).stat()
+                except OSError:
+                    continue
+                local_file_signatures_before[file_path] = (file_stat.st_mtime_ns, file_stat.st_size)
+            newly_downloaded_files: list[str] = []
+            replaced_downloaded_files: list[str] = []
 
             await _run_cached_function(cached_fn)
+
+            # Wait for any in-flight browser downloads (including multiple concurrent CDP
+            # downloads from a single click) to finish before snapshotting, matching the agent
+            # path. Returns immediately when nothing is downloading, so the fast single-file
+            # case keeps passing without added latency.
+            await check_downloading_files_and_wait_for_download_to_complete(
+                download_dir=local_download_dir,
+                organization_id=org_id,
+                browser_session_id=context.browser_session_id,
+            )
 
             # Poll local filesystem for newly downloaded files.
             #
@@ -2064,13 +2240,21 @@ async def download(
                 _now = _loop.time()
                 _elapsed = _now - _poll_start
                 _local_files_now = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
-                _new_files = set(_local_files_now) - set(local_files_before)
-                _new_complete = [f for f in _new_files if not f.endswith(BROWSER_DOWNLOADING_SUFFIX)]
-                _new_downloading = [f for f in _new_files if f.endswith(BROWSER_DOWNLOADING_SUFFIX)]
-
-                # A complete file appeared — download succeeded
-                if _new_complete:
-                    break
+                _new_files = [file_path for file_path in _local_files_now if file_path not in local_files_before]
+                _changed_files = []
+                for file_path in _local_files_now:
+                    signature_before = local_file_signatures_before.get(file_path)
+                    if signature_before is None:
+                        continue
+                    try:
+                        file_stat = Path(file_path).stat()
+                    except OSError:
+                        continue
+                    if (file_stat.st_mtime_ns, file_stat.st_size) != signature_before:
+                        _changed_files.append(file_path)
+                _download_candidates = [*_new_files, *_changed_files]
+                _new_complete = [f for f in _download_candidates if not f.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+                _new_downloading = [f for f in _download_candidates if f.endswith(BROWSER_DOWNLOADING_SUFFIX)]
 
                 # A .crdownload file exists — browser-native download in progress
                 if _new_downloading:
@@ -2090,6 +2274,12 @@ async def download(
                         )
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
+
+                # A complete file appeared — download succeeded
+                if _new_complete:
+                    newly_downloaded_files = _new_complete
+                    replaced_downloaded_files = [f for f in _changed_files if f in _new_complete]
+                    break
 
                 # Download was detected earlier but .crdownload disappeared without a
                 # complete file replacing it (cancelled/failed). Use a shorter timeout
@@ -2127,12 +2317,21 @@ async def download(
             # This matches the agent path ordering in agent.py.
             if download_suffix and local_download_dir.exists():
                 local_files_after = list_files_in_directory(local_download_dir)
-                new_files = list(set(local_files_after) - set(local_files_before))
-                for file_path in new_files:
+                files_to_rename = [file_path for file_path in newly_downloaded_files if file_path in local_files_after]
+                newly_downloaded_files = []
+                for file_path in files_to_rename:
                     file_extension = Path(file_path).suffix
                     # Skip incomplete downloads
                     if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
+                    if not file_extension:
+                        file_extension = recover_download_extension(file_path, download_suffix)
+                        if file_extension:
+                            LOG.info(
+                                "Recovered missing download file extension from file content",
+                                file=file_path,
+                                extension=file_extension,
+                            )
                     local_basename = Path(file_path).name
                     existing_names = {
                         Path(f).name
@@ -2140,8 +2339,25 @@ async def download(
                         if Path(f).name != local_basename
                     }
                     desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    # context suffix fields are omitted: cached-script mode bakes the suffix into the
+                    # generated script (no per-step contextvar stamping), so there is no task_block-vs-
+                    # context divergence to attribute; task_id/block_label give per-download attribution.
+                    # finalize_* keys avoid the forge_log processor overwriting bare task_id/
+                    # workflow_run_id with the ambient context's values (see agent finalize path).
+                    LOG.info(
+                        "download_suffix_finalize_rename",
+                        execution_path="cached_script",
+                        finalize_workflow_run_id=run_id,
+                        finalize_task_id=task_id,
+                        block_label=cache_key,
+                        pre_rename_filename_fp=diagnostic_fingerprint(local_basename),
+                        passed_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+                        desired_name_fp=diagnostic_fingerprint(desired_name),
+                        will_rename=local_basename != desired_name,
+                    )
                     if local_basename != desired_name:
-                        rename_file(file_path, desired_name)
+                        file_path = rename_file(file_path, desired_name)
+                    newly_downloaded_files.append(file_path)
 
             # Upload downloaded files from local filesystem to remote storage
             # so that get_downloaded_files() can find them for verification.
@@ -2187,18 +2403,27 @@ async def download(
                             organization_id=org_id,
                             workflow_run_id=run_id,
                         )
-                    if len(files_after) > len(files_before):
+                    if replaced_downloaded_files or len(files_after) > len(files_before):
                         break
                     if _attempt < 2:
                         await asyncio.sleep(2)
 
             # Only raise if all storage calls succeeded — if any timed out, skip
             # the check to avoid spurious AI fallbacks under degraded storage.
-            if files_before_ok and files_after_ok and len(files_after) <= len(files_before):
+            if (
+                files_before_ok
+                and files_after_ok
+                and len(files_after) <= len(files_before)
+                and not replaced_downloaded_files
+            ):
                 raise Exception(
                     "Cached download function did not produce a new file. "
                     f"Files before: {len(files_before)}, after: {len(files_after)}"
                 )
+
+            if file_download_block is not None and storage_type is not None:
+                destination_delivery_started = True
+                await dispatch_to_destination(newly_downloaded_files)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -2214,11 +2439,37 @@ async def download(
             await _handle_script_termination(e, "download block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run download block. Falling back to AI run.")
+            if destination_delivery_started:
+                LOG.exception("Failed to deliver cached download to destination")
+                if workflow_run_block_id:
+                    await _update_workflow_block(
+                        workflow_run_block_id,
+                        BlockStatus.failed,
+                        task_id=task_id,
+                        task_status=TaskStatus.failed,
+                        step_id=step_id,
+                        step_status=StepStatus.failed,
+                        label=cache_key,
+                        failure_reason=str(e),
+                    )
+                raise
+
+            LOG.warning("Failed to run download block. Falling back to AI run.", exc_info=True)
+            fallback_download_dir = get_path_for_workflow_download_directory(download_run_id)
+            fallback_files_before = (
+                list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
+            )
+            fallback_file_signatures_before: dict[str, tuple[int, int]] = {}
+            for file_path in fallback_files_before:
+                try:
+                    file_stat = Path(file_path).stat()
+                except OSError:
+                    continue
+                fallback_file_signatures_before[file_path] = (file_stat.st_mtime_ns, file_stat.st_size)
             await _fallback_to_ai_run(
                 block_type=BlockType.FILE_DOWNLOAD,
                 cache_key=cache_key,
-                prompt=prompt,
+                prompt=navigation_prompt,
                 url=url,
                 max_steps=max_steps,
                 complete_on_download=complete_on_download,
@@ -2227,6 +2478,57 @@ async def download(
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
             )
+            if file_download_block is not None and storage_type is not None:
+                fallback_files_after = (
+                    list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
+                )
+                fallback_downloaded_files = []
+                for file_path in fallback_files_after:
+                    signature_before = fallback_file_signatures_before.get(file_path)
+                    try:
+                        file_stat = Path(file_path).stat()
+                    except OSError:
+                        continue
+                    if signature_before is None or (file_stat.st_mtime_ns, file_stat.st_size) != signature_before:
+                        fallback_downloaded_files.append(file_path)
+
+                if not fallback_downloaded_files:
+                    if file_download_block.continue_on_empty:
+                        return
+                    failure_reason = (
+                        f"AI fallback completed without a scoped local download; nothing was sent to {storage_type}."
+                    )
+                    if workflow_run_block_id:
+                        await _update_workflow_block(
+                            workflow_run_block_id,
+                            BlockStatus.failed,
+                            task_id=task_id,
+                            task_status=TaskStatus.failed,
+                            step_id=step_id,
+                            step_status=StepStatus.failed,
+                            label=cache_key,
+                            failure_reason=failure_reason,
+                            ai_fallback_triggered=True,
+                        )
+                    raise CachedDownloadError(failure_reason)
+
+                try:
+                    await dispatch_to_destination(fallback_downloaded_files)
+                except Exception as dispatch_error:
+                    LOG.exception("Failed to deliver AI fallback download to destination")
+                    if workflow_run_block_id:
+                        await _update_workflow_block(
+                            workflow_run_block_id,
+                            BlockStatus.failed,
+                            task_id=task_id,
+                            task_status=TaskStatus.failed,
+                            step_id=step_id,
+                            step_status=StepStatus.failed,
+                            label=cache_key,
+                            failure_reason=str(dispatch_error),
+                            ai_fallback_triggered=True,
+                        )
+                    raise
         finally:
             context.prompt = None
             _clear_cached_block_overrides(cache_key)
@@ -2237,7 +2539,7 @@ async def download(
             output_parameter=block_validation_output.output_parameter,
             url=url,
             complete_on_download=complete_on_download,
-            navigation_goal=prompt,
+            navigation_goal=navigation_prompt,
             max_steps_per_run=max_steps,
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
@@ -2245,13 +2547,18 @@ async def download(
             engine=RunEngine.skyvern_v1,
             model=model,
             download_suffix=download_suffix,
+            **destination_block_kwargs,
         )
-        await file_download_block.execute_safe(
+        download_result = await file_download_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        if not download_result.success:
+            # Halt the script on a failed download/delivery instead of ignoring the result, matching
+            # the cached path; otherwise later generated statements would run after the failure.
+            raise ScriptTerminationException(download_result.failure_reason or "File download block failed")
 
 
 async def action(
@@ -2304,7 +2611,7 @@ async def action(
             await _handle_script_termination(e, "action block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run action block. Falling back to AI run.")
+            LOG.warning("Failed to run action block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.ACTION,
                 cache_key=cache_key,
@@ -2691,14 +2998,35 @@ async def run_script(
     user_script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(user_script)
 
-    if hasattr(user_script, "run_workflow"):
-        # If parameters is None, pass an empty dict
-        if parameters:
-            await user_script.run_workflow(parameters=parameters)
+    try:
+        if hasattr(user_script, "run_workflow"):
+            # If parameters is None, pass an empty dict
+            if parameters:
+                await user_script.run_workflow(parameters=parameters)
+            else:
+                await user_script.run_workflow(parameters={})
         else:
-            await user_script.run_workflow(parameters={})
-    else:
-        raise Exception(f"No 'run_workflow' function found in {path}")
+            raise Exception(f"No 'run_workflow' function found in {path}")
+    finally:
+        # A standalone script pins its browser under script_id via get_or_create_for_script; this is
+        # its terminal boundary, so reclaim the script-keyed page and engine owner here. The
+        # workflow-backed path keys its browser under workflow_run_id and is cleaned by
+        # cleanup_for_workflow_run, so it is skipped.
+        if script_id and not workflow_run_id:
+            try:
+                await app.BROWSER_MANAGER.cleanup_for_script(
+                    script_id,
+                    # Release the session the script actually acquired, under the org it was acquired with:
+                    # setup() records both on context, which may differ from this call's args (e.g. an
+                    # explicit setup session, or a pre-existing context org, while run_script got None).
+                    browser_session_id=context.browser_session_id,
+                    organization_id=context.organization_id,
+                )
+            except Exception:
+                # Terminal cleanup is best-effort: an ordinary failure (alternate BrowserManager impls may
+                # raise) must not replace the script's own result/exception. CancelledError (BaseException)
+                # is not caught, so an original script cancellation stays cancellation.
+                LOG.warning("Failed to clean up script browser resources", script_id=script_id, exc_info=True)
 
 
 def _render_template_with_label(template: str, label: str | None = None) -> str:
@@ -2727,6 +3055,18 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
                 template_data["current_item"] = block_reference_data["current_item"]
             if "current_value" in block_reference_data:
                 template_data["current_value"] = block_reference_data["current_value"]
+        if "workflow_title" not in template_data:
+            template_data["workflow_title"] = workflow_run_context.workflow_title
+        if "workflow_id" not in template_data:
+            template_data["workflow_id"] = workflow_run_context.workflow_id
+        if "workflow_permanent_id" not in template_data:
+            template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
+        if "workflow_run_id" not in template_data:
+            template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
+        if "current_date" not in template_data:
+            template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
+        if "browser_session_id" not in template_data:
+            template_data["browser_session_id"] = workflow_run_context.browser_session_id or ""
     return render_template(template, data=template_data)
 
 
@@ -2872,7 +3212,16 @@ async def upload_file(
     azure_blob_container_name: str | None = None,
     google_credential_id: str | None = None,
     google_drive_folder_id: str | None = None,
+    sftp_host: str | None = None,
+    sftp_port: int | None = None,
+    sftp_username: str | None = None,
+    sftp_password: str | None = None,
+    sftp_private_key: str | None = None,
+    sftp_private_key_passphrase: str | None = None,
+    sftp_remote_path: str | None = None,
+    sftp_host_key: str | None = None,
     path: str | None = None,
+    prompt: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     if s3_bucket:
@@ -2893,6 +3242,22 @@ async def upload_file(
         google_credential_id = _render_template_with_label(google_credential_id, label)
     if google_drive_folder_id:
         google_drive_folder_id = _render_template_with_label(google_drive_folder_id, label)
+    if sftp_host:
+        sftp_host = _render_template_with_label(sftp_host, label)
+    if sftp_username:
+        sftp_username = _render_template_with_label(sftp_username, label)
+    if sftp_password:
+        sftp_password = _render_template_with_label(sftp_password, label)
+    if sftp_private_key:
+        sftp_private_key = _render_template_with_label(sftp_private_key, label)
+    if sftp_private_key_passphrase:
+        sftp_private_key_passphrase = _render_template_with_label(sftp_private_key_passphrase, label)
+    if sftp_remote_path:
+        sftp_remote_path = _render_template_with_label(sftp_remote_path, label)
+    if sftp_host_key:
+        sftp_host_key = _render_template_with_label(sftp_host_key, label)
+    if prompt:
+        prompt = _render_template_with_label(prompt, label)
     if path:
         path = _render_template_with_label(path, label)
     file_upload_block = FileUploadBlock(
@@ -2909,6 +3274,15 @@ async def upload_file(
         azure_blob_container_name=azure_blob_container_name,
         google_credential_id=google_credential_id,
         google_drive_folder_id=google_drive_folder_id,
+        sftp_host=sftp_host,
+        sftp_port=sftp_port,
+        sftp_username=sftp_username,
+        sftp_password=sftp_password,
+        sftp_private_key=sftp_private_key,
+        sftp_private_key_passphrase=sftp_private_key_passphrase,
+        sftp_remote_path=sftp_remote_path,
+        sftp_host_key=sftp_host_key,
+        prompt=prompt,
         path=path,
     )
     await file_upload_block.execute_safe(

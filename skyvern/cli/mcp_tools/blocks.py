@@ -23,6 +23,7 @@ from skyvern.schemas.workflows import (
     CodeBlockYAML,
     ConditionalBlockYAML,
     DownloadToS3BlockYAML,
+    EmailInboxBlockYAML,
     ExtractionBlockYAML,
     FileDownloadBlockYAML,
     FileParserBlockYAML,
@@ -87,6 +88,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.SPLIT_PDF.value: SplitPdfBlockYAML,
     BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
     BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
+    BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
     BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
 }
 
@@ -121,6 +123,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "split_pdf": "Split one PDF into multiple PDFs by prompt and save each to S3",
     "workflow_trigger": "Trigger another workflow by permanent ID, with optional payload and wait-for-completion",
     "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
+    "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
 }
 
@@ -277,6 +280,14 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "credential_id": "{{ google_credential_id }}",
         "has_header_row": True,
     },
+    "email_inbox": {
+        "block_type": "email_inbox",
+        "label": "find_invoice_email",
+        "email_client": "gmail",
+        "credential_id": "{{ gmail_credential_id }}",
+        "folder": "INBOX",
+        "prompt": "Find invoice approval emails that need a reply.",
+    },
     "google_sheets_write": {
         "block_type": "google_sheets_write",
         "label": "write_sheet_data",
@@ -392,7 +403,11 @@ async def skyvern_block_schema(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Get the schema for a workflow block type, or list all available types if block_type is omitted."""
+    """Get the schema for a workflow block type, or list all available types if block_type is omitted.
+
+    Accepts ONLY a block_type string (e.g. 'navigation'); it does NOT accept a block definition or a
+    format argument. To check a full block definition you have authored, use skyvern_block_validate
+    (block_json=...) instead."""
 
     action = "skyvern_block_schema"
 
@@ -479,7 +494,9 @@ async def skyvern_block_validate(
         Field(description="When true, structurally reject non-code browser/page block types (code-only mode)"),
     ] = False,
 ) -> dict[str, Any]:
-    """Validate a workflow block definition before using it in skyvern_workflow_create. Returns field-level errors."""
+    """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
+    it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
+    block type first, use skyvern_block_schema(block_type=...)."""
     action = "skyvern_block_validate"
 
     try:

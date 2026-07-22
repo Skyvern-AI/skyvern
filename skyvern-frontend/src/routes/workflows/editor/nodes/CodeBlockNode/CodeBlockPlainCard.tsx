@@ -21,9 +21,9 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
   return (
     <div data-testid="code-block-plain-card" className="space-y-2">
       <div className="flex items-center justify-between gap-2">
-        <Label className="text-xs text-slate-300">Steps</Label>
+        <Label className="text-xs text-tertiary-foreground">Steps</Label>
         {generating ? (
-          <div className="flex items-center gap-2 text-xs text-slate-400">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <span className="flex items-center gap-1">
               <ReloadIcon className="size-3 animate-spin" />
               Generating…
@@ -32,7 +32,7 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
               <button
                 type="button"
                 onClick={onStop}
-                className="nodrag nopan flex items-center gap-1 rounded border border-slate-700 px-1.5 py-0.5 text-slate-300 hover:bg-slate-elevation2"
+                className="nodrag nopan flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-tertiary-foreground hover:bg-slate-elevation2"
               >
                 <Cross2Icon className="size-3" />
                 Stop
@@ -41,7 +41,7 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
           </div>
         ) : (
           steps.length > 0 && (
-            <span className="shrink-0 text-xs tabular-nums text-slate-400">
+            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
               {steps.length} {steps.length === 1 ? "step" : "steps"}
             </span>
           )
@@ -52,7 +52,7 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
           {[0, 1, 2].map((index) => (
             <li
               key={index}
-              className="flex items-center gap-2.5 rounded-md border border-slate-700/60 bg-slate-elevation1 px-2.5 py-2"
+              className="flex items-center gap-2.5 rounded-md border border-border/60 bg-slate-elevation1 px-2.5 py-2"
             >
               <div className="size-7 shrink-0 animate-pulse rounded-md bg-slate-elevation2" />
               <div className="min-w-0 flex-1 space-y-1.5">
@@ -63,7 +63,7 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
           ))}
         </ol>
       ) : steps.length === 0 ? (
-        <p className="rounded-md border border-dashed border-slate-700/70 px-3 py-4 text-xs text-slate-400">
+        <p className="rounded-md border border-dashed border-border/70 px-3 py-4 text-xs text-muted-foreground">
           No steps yet. Steps appear once Skyvern generates them.
         </p>
       ) : (
@@ -73,7 +73,7 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
             return (
               <li
                 key={index}
-                className="flex items-start gap-2.5 rounded-md border border-slate-700/60 bg-slate-elevation1 px-2.5 py-2"
+                className="flex items-start gap-2.5 rounded-md border border-border/60 bg-slate-elevation1 px-2.5 py-2"
               >
                 <div
                   className={cn(
@@ -85,16 +85,16 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
-                    className="truncate text-xs font-medium text-slate-100"
+                    className="truncate text-xs font-medium text-foreground"
                     title={plainText}
                   >
                     {plainText}
                   </div>
-                  <div className="mt-0.5 text-[11px] text-slate-400">
+                  <div className="mt-0.5 text-[11px] text-muted-foreground">
                     {getStepLabel(step.action_type)}
                   </div>
                 </div>
-                <span className="shrink-0 text-[11px] tabular-nums text-slate-500">
+                <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground dark:text-slate-500">
                   {index + 1}
                 </span>
               </li>

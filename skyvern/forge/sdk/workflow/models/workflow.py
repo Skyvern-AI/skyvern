@@ -17,6 +17,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, 
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -35,7 +36,7 @@ class WorkflowRequestBody(BaseModel):
     totp_identifier: str | None = None
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
-    max_screenshot_scrolls: int | None = None
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
@@ -239,6 +240,8 @@ class WorkflowRun(BaseModel):
     totp_identifier: str | None = None
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
+    retried_from_workflow_run_id: str | None = None
+    fallback_attempt: int | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
@@ -346,6 +349,8 @@ class WorkflowRunResponseBase(BaseModel):
     status: WorkflowRunStatus
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
+    retried_from_workflow_run_id: str | None = None
+    retried_by_workflow_run_id: str | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None

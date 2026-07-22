@@ -1640,6 +1640,50 @@ def _build_download_statement(
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.download statement."""
     args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
+    download_target = str(block.get("download_target") or "")
+    destination_fields_by_target = {
+        "s3": ["s3_bucket", "aws_access_key_id", "aws_secret_access_key", "region_name"],
+        "azure": ["azure_storage_account_name", "azure_storage_account_key", "azure_blob_container_name"],
+        "google_drive": ["google_credential_id", "google_drive_folder_id"],
+        "sftp": [
+            "sftp_host",
+            "sftp_port",
+            "sftp_username",
+            "sftp_password",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_remote_path",
+            "sftp_host_key",
+        ],
+    }
+    destination_fields = destination_fields_by_target.get(download_target)
+    if destination_fields is not None and block.get("prompt") is not None:
+        args[0] = args[0].with_changes(keyword=cst.Name("navigation_goal"))
+
+    if destination_fields is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("download_target"),
+                value=_value(download_target),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        for key in [*destination_fields, "prompt", "path", "continue_on_empty"]:
+            if block.get(key) is not None:
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name(key),
+                        value=_value(block.get(key, "")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
         args=args,
@@ -2132,6 +2176,15 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         "azure_blob_container_name",
         "google_credential_id",
         "google_drive_folder_id",
+        "sftp_host",
+        "sftp_port",
+        "sftp_username",
+        "sftp_password",
+        "sftp_private_key",
+        "sftp_private_key_passphrase",
+        "sftp_remote_path",
+        "sftp_host_key",
+        "prompt",
         "path",
     ]:
         if block.get(key) is not None:

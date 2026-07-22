@@ -11,7 +11,9 @@ class ArtifactType(StrEnum):
     RECORDING = "recording"
     AUDIO = "audio"
     SESSION_REPLAY = "session_replay"
+    EVAL_SCORE = "eval_score"
     BROWSER_CONSOLE_LOG = "browser_console_log"
+    BROWSER_SESSION_ACTION_LOG = "browser_session_action_log"
 
     SKYVERN_LOG = "skyvern_log"
     SKYVERN_LOG_RAW = "skyvern_log_raw"
@@ -104,6 +106,13 @@ class Artifact(BaseModel):
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
+
+
+class ArtifactSignedUrl(BaseModel):
+    artifact_id: str
+    signed_url: str
+    expires_at: int | None = None
+    """Unix seconds when signed_url stops working; None when the backing store controls expiry."""
 
 
 class LogEntityType(StrEnum):

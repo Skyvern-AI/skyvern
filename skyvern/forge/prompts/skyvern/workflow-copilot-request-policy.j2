@@ -1,5 +1,36 @@
+{% if terminal_action_reconciliation %}
+TERMINAL ACTION RECONCILIATION MODE
+
+The primary RequestPolicy is credential-bearing but omitted a non-method-mandated terminal_action. Return only JSON in
+this exact shape:
+{"version":"1","criterion_id":"c0","terminal_action_family":"request"}
+
+- criterion_id must select exactly one existing criterion ID from PRIMARY COMPLETION CRITERIA, or be null to abstain.
+- terminal_action_family must be request|application|form|order when criterion_id is non-null, or null when abstaining.
+- Select a criterion only when the latest request requires authentication followed by creating or submitting that
+  criterion's request, application, or form outcome, or placing an order.
+- Abstain when the requested end state is successful authentication itself, including MFA, or when no single existing
+  criterion unambiguously represents the post-login terminal action.
+- Preserve criterion identity: do not invent, remove, duplicate, paraphrase, or re-order criteria. Do not select a
+  method-mandated criterion. The server changes only the selected criterion's kind and terminal_action_family.
+
+Credential input kind: {{ reconciliation_credential_input_kind }}
+Latest user message:
+```{{ user_message }}```
+PRIMARY COMPLETION CRITERIA:
+```{{ reconciliation_criteria }}```
+{% else %}
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; login_intent; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+
+terminal_action priority:
+- Separate authentication from the requested end state before writing completion_criteria. Authentication is a prefix
+  when the credentialed request continues to create or submit a request, application, or form, or to place an order.
+- In that case, include the post-login end state exactly once as kind=terminal_action with the matching family. Do not
+  replace that post-login end state with successful authentication. Example: "sign in and place an order" produces an
+  order terminal_action criterion, not a sign-in criterion.
+- Emit no terminal_action for a pure-login or MFA request whose only requested end state is authentication. Do not
+  invent a post-login action that the user did not request.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
@@ -20,6 +51,12 @@ credential_input_kind:
 - placeholder: the user asks to add credential/password/username fields but explicitly says there are no real credentials yet.
 - none: the request mentions a login workflow but does not provide, request, or refer to any credential material.
 
+login_intent:
+- true when the latest request explicitly asks the workflow to authenticate — sign in, log in, authenticate, or get past a login gate — as part of reaching the goal. "Log in and place an order" and a pure "log into <site>" are both true.
+- false for an ordinary task with no authentication step, for a message that is essentially just a URL or a URL paired only with task language such as "scrape", "extract", "fill the form", "navigate to", or "go to", and for session-reuse phrasing such as "I'm already signed in" or "use my current browser session".
+- false on a first-touch task phrase that merely implies an eventual login without explicitly asking to sign in or authenticate, for example "check my account balance" or "download my invoices". Let task or URL clarification happen first.
+- Independent of credential_input_kind: decide it from whether authentication is required, not from whether the user supplied credential material. It is true for an explicit login request that names a saved credential and true for one that names none.
+
 requires_user_clarification:
 - true only when the user refers to credentials but does not provide enough information to identify a saved credential or login page.
 - false for normal build/test/verify requests with no credential reference, for explicit credential IDs/names/URLs, for placeholders, and for skip_test requests.
@@ -30,11 +67,15 @@ completion_contract:
 - Set to null when the user does not provide an explicit completion condition.
 
 completion_criteria:
-- An array of the END-STATE OUTCOMES that must be true for the user's goal to be done. Each item is {outcome, contingent_on, contingent_antecedent_output_path, deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}.
+- An array of the END-STATE OUTCOMES that must be true for the user's goal to be done. Each item is {outcome, contingent_on, contingent_antecedent_output_path, deliverable_kind, deliverable_confirmation_criterion_id, implicit, method_mandated, level, output_path, expected_output_value, expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}.
+- Each item may additionally carry request_slot_source_id and request_slot_source_quote under the fresh contract described below. Do not emit request_slot_datum_binding; a separate typed producer owns that binding contract.
+- When a criterion represents a request-owned output member, set request_slot_source_id and request_slot_source_quote to the exact source ID and smallest unique exact quote from REQUEST SLOT SOURCES below. The server verifies source identity and exact-span uniqueness, and the typed request-slot producer owns its final identity, path, plane, and pinability. Do not infer or emit pinability here.
+- Set request_slot_source_id and request_slot_source_quote to null for criteria that are not request-owned output members. Never invent, normalize, rename, or paraphrase a source quote.
 - outcome: a short statement of an end state the workflow must achieve (an END, not a step). Extract the goal as outcomes the user wants to be true, not the recipe they describe.
 - contingent_on: null for ordinary criteria. Use a short antecedent string only when this criterion should be graded only if that antecedent happens, for example {"contingent_on": "the provider site blocks online submission", "contingent_antecedent_output_path": "output.blocker", "outcome": "the blocker is reported to the user"}. The antecedent goes in contingent_on; the consequent to grade goes in outcome. Do not encode if/then criteria only in prose.
 - contingent_antecedent_output_path: null unless the antecedent is represented by a structured run output field. The only valid form is output.<field> (for example output.blocker). Do not emit transcript paths, selectors, regexes, JSONPath, screenshots, nested paths, or prose conditions here.
 - deliverable_kind: null unless this criterion's requested output is satisfied by execution-owned browser-download registration rather than a user-authored extraction field. The only supported non-null value is "registered_download".
+- deliverable_confirmation_criterion_id: null unless this is a plain run-plane outcome whose separate observation may abstain only when the execution-owned registered download is independently confirmed. The only supported non-null value is __copilot_registered_download__downloaded_files_non_empty. Never set it merely because another outcome downloads a file; unrelated required outcomes must still be evidenced independently.
 - expected_output_value: null unless this criterion requires an exact structured output value the user explicitly provided. Put that value here as data; never hide it in outcome prose. For a goal-judgment field whose expected answer is a boolean (e.g. selected_highest_priority), provide the JSON true or false here.
 - expected_output_shape: null unless this criterion requires a generated/provider structured output value whose exact value is not known before the run. Use only one of: reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, goal_judgment_boolean. goal_judgment_boolean declares that the field is an artifact-computed true/false judgment; the typed boolean expected_output_value is the deterministic backstop. Do not use this as a non-empty-value proxy; leave null when the field's shape is not one of those declared types.
 - judgment_predicate: null unless expected_output_shape=goal_judgment_boolean and requested_output_evidence_source=independent_run_evidence. Use only the closed-vocabulary value login_gate_blocks_target, and only when the requested judgment is whether login gating blocks the target path.
@@ -44,6 +85,7 @@ completion_criteria:
 - Example: if the user asks to return the selected or highest-priority document name, emit the criterion with output_path=output.document_name and requested_output_evidence_source=independent_run_evidence.
 - kind=outcome|terminal_action|validation_classification. Use validation_classification only when the user's no-side-effect goal is itself a judgment/classification returned by the workflow, such as whether a path is login-gated. Use terminal_action only when the criterion's end state is a terminal action in the external site for one of the supported families below. Use outcome for all other outcomes.
 - terminal_action_family=request|application|form|order|null. Set the matching family when kind=terminal_action; set null otherwise.
+- When a credentialed goal requires the workflow to authenticate and then create or submit a request, application, or form, or place an order, emit that post-login end state as kind=terminal_action with the matching terminal_action_family. Authentication is only the prefix: credential fill and login submit do not satisfy the terminal action. Do not emit terminal_action for a pure-login goal whose requested end state is successful authentication itself.
 - classification_output_key: null unless kind=validation_classification. Set it to the exact top-level block output field/key that will carry the classification scalar. Do not use JSONPath, regex, transcript paths, screenshots, prose conditions, or nested paths.
 - expected_classification: null unless kind=validation_classification. Set it to the exact expected classification target as a boolean or canonical enum/string value. Do not hide this target in outcome prose.
 - For validation-only utility/path checks whose goal is to classify whether the reachable path is login-only/login-gated, prefer kind=validation_classification with classification_output_key=login_only and expected_classification=true. Do not represent that classification target as a requested-output criterion such as output.login_only.
@@ -103,8 +145,11 @@ Latest assistant turn (slot-purpose anchor):
 ```{{ latest_assistant_turn }}```
 Retained recent history:
 ```{{ retained_history }}```
+REQUEST SLOT SOURCES (authoritative user text anchors; server-owned slot identity and pinability are resolved separately):
+```{{ request_slot_sources }}```
 Current workflow YAML:
 ```{{ workflow_yaml }}```
 {% if active_completion_criteria %}ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):
 ```{{ active_completion_criteria }}```
 {% endif %}Global context: ```{{ global_llm_context }}```
+{% endif %}

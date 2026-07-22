@@ -27,10 +27,12 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     _canonical_block_config,
 )
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    resolve_browser_state_for_context,
 )
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
@@ -264,7 +266,7 @@ def _stale_block_metadata_message(items: list[dict[str, Any]]) -> str:
         details.append(f"(and {len(items) - _STALE_BLOCK_METADATA_MESSAGE_LIMIT} more)")
     joined = "; ".join(details)
     return (
-        "Workflow validation failed: corrected block metadata still appears stale. "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}corrected block metadata still appears stale. "
         "When changing a user's requested subject, URL, or action, rename affected block labels and titles "
         "to match the revised goal, and update next_block_label, block_labels, and Jinja references accordingly. "
         f"Stale metadata: {joined}"
@@ -961,7 +963,7 @@ def _frontier_run_size_error(
     suggested = labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS]
     remaining = labels_to_execute[_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:]
     return (
-        "Workflow validation failed: this browser test frontier is too long for a multi-stage "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}this browser test frontier is too long for a multi-stage "
         "page-changing workflow. Keep the same complete workflow YAML, but shrink only the "
         f"block_labels argument to the next 1-2 unverified labels: {suggested!r}. "
         "If a prior run already advanced the browser, inspect that reached page "
@@ -1192,10 +1194,7 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
 
     current_page_url: str | None = None
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if browser_state is not None:
             page = await browser_state.get_working_page()
             # Playwright Page.url is exposed as a dynamic property at this boundary.

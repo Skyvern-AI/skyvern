@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
+from skyvern.exceptions import ScrapingFailed
 from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.webeye.scraper.scraper import build_scraping_failed_reason
 
 
 class NoProxyAvailable(Exception):
@@ -15,6 +19,41 @@ class UnknownErrorWhileCreatingBrowserContext(Exception):
 
 class ProxyErrorOccurred(Exception):
     pass
+
+    def test_get_outbound_ip_failed_exception_is_proxy_not_browser(self) -> None:
+        """GetOutboundIPFailed should be PROXY_ERROR, not BROWSER_ERROR."""
+
+        class GetOutboundIPFailed(Exception):
+            pass
+
+        result = classify_from_failure_reason(
+            "Failed to create browser context for dynamic-browser (GetOutboundIPFailed). "
+            "Failed to get outbound ip (proxy_network=joinmassive-isp-dedicated): "
+            "https://checkip.amazonaws.com=ProxyError",
+            exception=GetOutboundIPFailed(),
+        )
+        assert result is not None
+        assert result[0]["category"] == "PROXY_ERROR"
+        categories = [r["category"] for r in result]
+        assert "BROWSER_ERROR" not in categories
+
+    def test_get_outbound_ip_failed_reason_without_exception(self) -> None:
+        """GetOutboundIPFailed in failure_reason text alone should yield PROXY_ERROR.
+
+        The workflow run failure path calls classify_from_failure_reason without exception=,
+        so the proxy classification must be driven by the failure_reason text.
+        """
+        reason = (
+            "goto_url block failed. failure reason: Failed to create browser context for dynamic-browser "
+            "(GetOutboundIPFailed). Failed to get outbound ip (proxy_network=joinmassive-isp-dedicated): "
+            "https://checkip.amazonaws.com=ProxyError, https://ipinfo.io/ip=ProxyError"
+        )
+        result = classify_from_failure_reason(reason, fallback_to_unknown=True)
+        assert result is not None
+        assert result[0]["category"] == "PROXY_ERROR"
+        categories = [r["category"] for r in result]
+        assert "UNKNOWN" not in categories
+        assert "BROWSER_ERROR" not in categories
 
 
 class BrowserCrashError(Exception):
@@ -171,6 +210,17 @@ def test_access_denied_with_auth_context_is_not_antibot() -> None:
         assert "ANTI_BOT_DETECTION" not in categories, reason
 
 
+def test_antibot_category_is_marked_keyword_only() -> None:
+    categories = classify_from_failure_reason("Cloudflare turnstile challenge blocked the page after a timeout")
+
+    assert categories is not None
+    antibot = next(category for category in categories if category["category"] == "ANTI_BOT_DETECTION")
+    assert antibot["evidence_source"] == "keyword_only"
+    assert all(
+        "evidence_source" not in category for category in categories if category["category"] != "ANTI_BOT_DETECTION"
+    )
+
+
 def test_broad_blocked_and_forbidden_do_not_match_antibot() -> None:
     for reason in ["UI element blocked by overlay", "403 Forbidden from auth endpoint"]:
         result = classify_from_failure_reason(reason)
@@ -248,3 +298,26 @@ def test_inactivity_timeout_is_not_infrastructure() -> None:
 
     assert "INFRASTRUCTURE_ERROR" not in categories
     assert "PAGE_LOAD_TIMEOUT" in categories
+
+
+@pytest.mark.asyncio
+async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    timeout_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=True)
+    assert "timeout" in timeout_reason.lower()
+    # A page-analysis timeout is wrapped in ScrapingFailed; its reason must still rank
+    # PAGE_LOAD_TIMEOUT above DATA_EXTRACTION_FAILURE so it stays distinguishable.
+    categories = _categories_for(timeout_reason, ScrapingFailed(reason=timeout_reason))
+    assert categories[0] == "PAGE_LOAD_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_non_timeout_scraping_reason_stays_data_extraction() -> None:
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    generic_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=False)
+    assert "timeout" not in generic_reason.lower()
+    assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]

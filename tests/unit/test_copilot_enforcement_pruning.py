@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agents import RunConfig
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -29,7 +30,12 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_html
+from skyvern.forge.sdk.copilot.config import (
+    SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+)
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
@@ -40,18 +46,25 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _maybe_synthesized_block_offer_msg,
     _needs_suspicious_success_nudge,
     _prune_input_list,
+    _requested_output_paths_for_ctx,
     _should_block_mutating_tool_after_synthesized_offer,
     _should_force_advisory_run_dispatch,
     _should_force_synthesized_block_persistence,
     _summarize_tool_output,
     _uncovered_output_reject_admits_evaluate,
+    arm_credential_scout_reopen,
     consume_uncovered_output_reopen_event,
+    mint_scout_observation_contract_for_ctx,
+    pre_run_gated_outputs_without_path,
     record_scouted_output_coverage,
+    requested_scalar_output_extraction_plan,
     run_with_enforcement,
     synthesized_block_persistence_signal,
+    synthesized_goal_completion_landing_pending,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
+    synthesized_trajectory_reaches_goal,
     uncovered_output_reject_scout_steer_signal,
     uncovered_requested_output_paths,
 )
@@ -64,8 +77,10 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
     OutputContractAdvisoryState,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.runtime import NeverCapturedObligation
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
 from skyvern.forge.sdk.copilot.tools import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
@@ -74,8 +89,14 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_run_blocks_result,
     _record_workflow_update_result,
 )
+from skyvern.forge.sdk.copilot.tools.scouting import (
+    _MAX_SCOUTED_INTERACTIONS,
+    _capped_with_eviction_accounting,
+    _record_scout_page_observation,
+)
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, current_turn_owner
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit.conftest import make_copilot_context
 
@@ -98,6 +119,8 @@ class _Ctx:
         self.observation_after_navigate = False
         self.navigate_enforcement_done = False
         self.update_workflow_called = False
+        self.persisted_draft_browser_calls = None
+        self.scouted_spine_checkpoint_fired = False
         self.test_after_update_done = False
         self.post_update_nudge_count = 0
         self.coverage_nudge_count = 0
@@ -120,15 +143,33 @@ class _Ctx:
         self.last_code_authoring_repair_context = None
         self.synthesized_block_reopened_after_failed_run = False
         self.synthesized_block_reopened_for_output_coverage = False
+        self.synthesized_block_reopened_for_credential_scout = False
+        self.synthesized_block_reopened_for_capture_obligation = False
+        self.never_captured_obligation = None
+        self.credential_scout_rescout_context_key = None
+        self.synthesized_goal_complete_landed = False
+        self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
+        self.scout_observed_terminal_criterion_ids: set[str] = set()
+        self.scout_observation_contract: object | None = None
+        self.flow_evidence: list[dict[str, object]] = []
+        self.copilot_config: CopilotConfig | None = None
         self.uncovered_output_rescout_context_key = None
         self.uncovered_output_rescout_steer_key = None
         self.latest_recorded_build_test_outcome = None
         self.last_run_blocks_workflow_run_id = None
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
+        self.author_time_gate_log_only_ids: frozenset[str] = frozenset()
         self.author_time_gate_ablation_events = []
         self.request_policy = None
+        self.blocker_signal = None
+        self.blocker_signal_claimant = None
+        self.turn_halt = None
+        self.turn_ownership = None
+        self.gate_precedence_conflict_events: list[object] = []
+        self.output_contract_actuation_by_signature: dict[str, object] = {}
+        self.output_contract_actuation_count_by_signature: dict[str, int] = {}
 
 
 class TestSynthesizedOfferPersistenceGate:
@@ -367,6 +408,34 @@ class TestSynthesizedOfferPersistenceGate:
         click_signal = synthesized_block_persistence_signal(ctx, "click")
         assert isinstance(click_signal, CopilotToolBlockerSignal)
         assert click_signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_actuation_obligation_fill_admission_registers_precedence_claim(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="form-submit",
+                    outcome="form fields are filled",
+                    kind="terminal_action",
+                    terminal_action_family="form",
+                )
+            ],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.ACTUATION_OBLIGATION_FILL in ctx.turn_ownership.claims
+        assert current_turn_owner(ctx) is None
 
     def test_actuation_obligation_admits_required_fill_tool_for_method_mandated_run_contract(self) -> None:
         ctx = _Ctx()
@@ -636,6 +705,38 @@ class TestSynthesizedOfferPersistenceGate:
 
         assert synthesized_block_persistence_signal(ctx, "click") is None
 
+    def test_never_captured_obligation_admits_only_its_expected_scout_tool(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_id = "turn-a"
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.synthesized_block_offered_goal_complete = True
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "#existing"}]
+        ctx.never_captured_obligation = NeverCapturedObligation(
+            identity_digest="identity",
+            turn_id=ctx.turn_id,
+            draft_fingerprint="draft",
+            block_label="submit",
+            site="whole_trajectory",
+            method="click",
+            normalized_receiver="page.locator('#submit')",
+            call_shape_digest="shape",
+            expected_tool_name="click",
+            armed_after_trajectory_index=0,
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#submit"}) is None
+        assert isinstance(
+            synthesized_block_persistence_signal(ctx, "click", {"selector": "#other"}),
+            CopilotToolBlockerSignal,
+        )
+        assert isinstance(synthesized_block_persistence_signal(ctx, "type_text"), CopilotToolBlockerSignal)
+
     def test_unresolved_recorded_outcome_blocks_page_mutating_tool_until_update_and_run_blocks(self) -> None:
         ctx = _Ctx()
         ctx.turn_intent = TurnIntent(
@@ -765,6 +866,35 @@ class TestSynthesizedOfferPersistenceGate:
         assert ctx.synthesized_block_offered_goal_complete is True
         assert _should_force_synthesized_block_persistence(ctx) is True
         assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_unlanded_goal_completion_forces_persistence_after_first_authoring_call(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.impose_synthesized_code_block = True
+        ctx.update_workflow_called = True
+
+        assert synthesized_goal_completion_landing_pending(ctx) is True
+        assert synthesized_persistence_reopened(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_landed_goal_completion_stops_forcing_on_identical_resubmission(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.impose_synthesized_code_block = True
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+
+        assert synthesized_goal_completion_landing_pending(ctx) is False
+        assert synthesized_persistence_reopened(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
 
     def test_failed_verified_run_with_new_commit_reopens_synthesized_persistence_gate(self) -> None:
         previous_trajectory = [
@@ -2187,8 +2317,67 @@ class TestGoalLikelyNeedsMoreBlocks:
         assert self._check(123, 1) is False  # type: ignore[arg-type]
 
 
+LISTING_DETAIL_URL = "http://localhost:8901/record/1457803926"
+
+# Generic multi-field detail DOM: exercises the contract's label/header binding vs the
+# coverage-token channel. No specific vertical or PII (see CLAUDE.md OSS-sync rules).
+LISTING_DETAIL_HTML = """
+<html><head><title>Regional Records Directory</title></head><body>
+<div class="layout">
+  <div class="panel">
+    <h1>Search Results</h1>
+    <p class="muted">Showing 1 result in <strong>Example Region</strong>.</p>
+    <div class="result-card" id="recordCard">
+      <div>
+        <div class="rc-name">Northgate Unit 7</div>
+        <div class="muted">Facility</div>
+        <div>Northgate Holdings, LLC</div>
+        <div class="muted">general listing</div>
+        <div class="small">100 Example Ave # 200, Example City, EX 00001</div>
+        <div class="small muted">12.34 units away &middot; <a class="link">1-800-555-0102</a></div>
+        <div id="recordDetails">
+          <div class="kv"><div class="k">Reference Number</div><div>1457803926</div></div>
+          <div class="kv"><div class="k">Region</div><div>North</div></div>
+          <div class="kv"><div class="k">Category</div><div>Standard</div></div>
+          <div class="kv"><div class="k">Tier</div><div>Two</div></div>
+          <div class="kv"><div class="k">Effective date</div><div>01/01/2024</div></div>
+          <h3>Locations</h3>
+          <p class="muted small">Approval status per location for Northgate Holdings, LLC.</p>
+          <table>
+            <thead><tr><th>Site</th><th>Address</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>Northgate Holdings, LLC</td><td>100 Example Ave # 200, Example City, EX 00001</td><td><span class="status-ok">Approved</span></td></tr>
+              <tr><td>Northgate Holdings, LLC</td><td>240 Sample Blvd, Example City, EX 00002</td><td><span class="status-ok">Approved</span></td></tr>
+              <tr><td>Southgate Group</td><td>512 Test St, Other City, EX 00003</td><td><span class="status-no">Not Approved</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="rc-flags"></div>
+    </div>
+  </div>
+  <div class="panel filter-side">
+    <h2>Filter Options</h2>
+    <div class="fld"><label for="refInput">Search by Name, Group, or Reference Number</label><input id="refInput" type="text"/></div>
+    <div class="fld"><label>Reference Number</label><input type="text" value="1457803926"/></div>
+  </div>
+</div>
+</body></html>
+"""
+
+
 def _criterion(output_path: str, outcome: str) -> CompletionCriterion:
     return CompletionCriterion(id=output_path, outcome=outcome, output_path=output_path)
+
+
+def _registered_download_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id="output.statement_pdf",
+        outcome="the statement PDF is downloaded",
+        output_path="output.statement_pdf",
+        deliverable_kind="registered_download",
+        requested_output_evidence_source="registered_artifact_content",
+    )
 
 
 def _turn_state(*criteria: CompletionCriterion) -> SimpleNamespace:
@@ -2252,6 +2441,49 @@ class TestScoutOutputCoverageGate:
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
         return ctx
 
+    @staticmethod
+    def _attach_document_plan(ctx: _Ctx, *, step: int) -> None:
+        ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"document name": "output.document_name"})
+        ctx.flow_evidence = [
+            {
+                "step": step,
+                "reached_via": "interaction",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "source_tool": "scout_interaction",
+                    "interaction_tool": "click",
+                    "interaction_selector": "button[data-action='search']",
+                    "inspection_warnings": [],
+                    "result_containers_truncated": False,
+                    "key_value_relations_truncated": False,
+                    "key_value_relations": [
+                        {
+                            "key_text": "Document Name",
+                            "container_selector": ".document-kv",
+                            "container_match_count": 1,
+                            "container_position": 0,
+                            "value_child_index": 1,
+                            "direct_child_count": 2,
+                            "visible": True,
+                            "value_visible": True,
+                        }
+                    ],
+                    "result_containers": [],
+                },
+            }
+        ]
+
+    def test_post_turn_offer_compiles_plan_recipe(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "Document Name"))
+        self._attach_document_plan(ctx, step=6)
+        ctx.synthesized_block_offered = False
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        assert 'page.locator(".document-kv").nth(0)' in str(message["content"])
+        assert 'return {"output": {"document_name": _extraction_value_0}}' in str(message["content"])
+
     def test_empty_output_set_falls_through_to_shape_heuristic(self) -> None:
         ctx = self._authoring_ctx()
         assert uncovered_requested_output_paths(ctx) == set()
@@ -2267,6 +2499,118 @@ class TestScoutOutputCoverageGate:
         ctx = self._authoring_ctx(registered)
         assert uncovered_requested_output_paths(ctx) == set()
         assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_independent_run_evidence_is_exempt_while_runtime_output_stays_gated(self) -> None:
+        independent = CompletionCriterion(
+            id="output.login_gate_present",
+            outcome="whether a login gate blocked the target is recorded",
+            output_path="output.login_gate_present",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_independent_run_evidence_is_exempt_from_repair_context(self) -> None:
+        independent = CompletionCriterion(
+            id="output.login_gate_blocks_target",
+            outcome="the login-gate judgment is independently observed after the run",
+            output_path="output.login_gate_blocks_target",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["login_gate_blocks_target", "document_name"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    @pytest.mark.parametrize(
+        "evidence_source",
+        ["registered_output_parameter", "registered_artifact_content"],
+    )
+    def test_registered_post_run_evidence_remains_uncovered_from_repair_context(
+        self,
+        evidence_source: str,
+    ) -> None:
+        registered = CompletionCriterion(
+            id="output.confirmation_number",
+            outcome="the confirmation number is registered after the run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source=evidence_source,
+        )
+        ctx = self._authoring_ctx(registered)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["confirmation_number"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.confirmation_number"}
+
+    @pytest.mark.parametrize(
+        "evidence_source",
+        ["registered_output_parameter", "registered_artifact_content"],
+    )
+    def test_registered_post_run_evidence_stays_gated_when_independent_evidence_uses_same_repair_path(
+        self,
+        evidence_source: str,
+    ) -> None:
+        independent = CompletionCriterion(
+            id="independent_confirmation_number",
+            outcome="the confirmation number is confirmed by an independent run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        registered = CompletionCriterion(
+            id="registered_confirmation_number",
+            outcome="the confirmation number is registered after the run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source=evidence_source,
+        )
+        ctx = self._authoring_ctx(independent, registered)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["confirmation_number"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.confirmation_number"}
+
+    def test_runtime_output_stays_gated_when_independent_evidence_uses_same_path(self) -> None:
+        independent = CompletionCriterion(
+            id="independent_document_name",
+            outcome="the document name is confirmed by an independent run",
+            output_path="output.document_name",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_pathless_post_run_criterion_does_not_erase_repair_output_field(self) -> None:
+        independent = CompletionCriterion(
+            id="c_independent",
+            outcome="the judgment is independently observed after the run",
+            output_path=None,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        ctx = self._authoring_ctx(independent)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["field"],
+        )
+
+        assert _requested_output_paths_for_ctx(ctx) == {"output.field"}
 
     def test_runtime_output_stays_gated_alongside_exempt_source(self) -> None:
         registered = CompletionCriterion(
@@ -2289,7 +2633,14 @@ class TestScoutOutputCoverageGate:
         assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
         assert synthesized_block_persistence_signal(ctx, "click") is None
 
-    def test_value_bearing_container_covers_path_and_force_fires(self) -> None:
+    def test_uncovered_output_leaves_the_trajectory_goal_reaching(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_reaches_goal(ctx) is True
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+
+    def test_value_bearing_container_coverage_without_plan_does_not_force(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
         page_evidence = {
             "result_containers": [
@@ -2300,8 +2651,278 @@ class TestScoutOutputCoverageGate:
         assert ctx.scouted_output_covered_paths == {"output.document_name"}
         assert uncovered_requested_output_paths(ctx) == set()
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
-        assert synthesized_trajectory_is_goal_complete(ctx) is True
-        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+
+    @staticmethod
+    def _kv_page(*, key_text: str, url: str, value_prose: str) -> dict[str, object]:
+        return {
+            "current_url": url,
+            "inspection_warnings": [],
+            "result_containers_truncated": False,
+            "key_value_relations_truncated": False,
+            "key_value_relations": [
+                {
+                    "key_text": key_text,
+                    "container_selector": ".kv",
+                    "container_match_count": 1,
+                    "container_position": 0,
+                    "value_child_index": 1,
+                    "direct_child_count": 2,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "result_containers": [{"selector": "#detail", "text_excerpt": value_prose}],
+        }
+
+    def test_contract_credits_output_path_without_lexical_overlap(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.overall_credentialing_result", "Overall Credentialing Result"))
+        page = self._kv_page(
+            key_text="Overall Credentialing Result",
+            url="https://example.com/provider",
+            value_prose="Status: Credentialed",
+        )
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            page,
+            url="https://example.com/provider",
+        )
+        assert contract is not None
+
+        record_scouted_output_coverage(ctx, page)
+        assert ctx.scouted_output_covered_paths == set()
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page, contract=contract)
+        assert ctx.scouted_output_covered_paths == {"output.overall_credentialing_result"}
+        assert uncovered_requested_output_paths(ctx) == set()
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert credited["value_grounded_paths"] == ["output.overall_credentialing_result"]
+
+    @staticmethod
+    def _shape_registry_config() -> CopilotConfig:
+        return CopilotConfig(
+            requested_output_shape_expectations={
+                "widget_id": ShapeExpectation(ValueShape.NUMERIC_ID, ValueCardinality.SCALAR, id_digit_length=8),
+                "depot": ShapeExpectation(ValueShape.POSTAL_ADDRESS, ValueCardinality.COLUMN),
+                "phase": ShapeExpectation(ValueShape.CATEGORICAL_TOKEN, ValueCardinality.COLUMN),
+            }
+        )
+
+    @staticmethod
+    def _shape_scout_page() -> dict[str, object]:
+        def _row(row_index: int, depot: str, phase: str) -> dict[str, object]:
+            return {
+                "row_index": row_index,
+                "visible": True,
+                "has_row_header": False,
+                "cells": [
+                    {"column_index": 0, "visible": True, "has_text": True, "text": depot},
+                    {"column_index": 1, "visible": True, "has_text": True, "text": phase},
+                ],
+            }
+
+        return {
+            "current_url": "https://example.com/sites",
+            "source_tool": "scout_interaction",
+            "interaction_selector": "#reveal",
+            "inspection_warnings": [],
+            "result_containers_truncated": False,
+            "key_value_relations_truncated": False,
+            "key_value_relations": [
+                {
+                    "key_text": "Ref Code",
+                    "value_text": "12345678",
+                    "container_selector": ".kv",
+                    "container_match_count": 1,
+                    "container_position": 0,
+                    "value_child_index": 1,
+                    "direct_child_count": 2,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": "#sites",
+                    "selector_match_count": 1,
+                    "visible": True,
+                    "span_free": True,
+                    "nested_table_free": True,
+                    "headers": [
+                        {"text": "Loc", "column_index": 0},
+                        {"text": "Stage", "column_index": 1},
+                    ],
+                    "row_selector": "#sites tbody tr",
+                    "row_count": 3,
+                    "rows_truncated": False,
+                    "sample_rows": ["r0", "r1", "r2"],
+                    "rows": [
+                        _row(0, "12 Peak Way Reno NV 89501", "Complete"),
+                        _row(1, "8 Oak Loop Boston MA", "Complete"),
+                        _row(2, "40 Fir Trail Fremont CA", "Pending"),
+                    ],
+                }
+            ],
+        }
+
+    def test_shape_channel_credits_value_grounded_and_drains_derived_parent(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        ctx.copilot_config = self._shape_registry_config()
+        page = self._shape_scout_page()
+
+        no_registry_ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        assert mint_scout_observation_contract_for_ctx(no_registry_ctx, page, url=page["current_url"]) is None
+
+        contract = mint_scout_observation_contract_for_ctx(ctx, page, url=page["current_url"])
+        assert contract is not None
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page, contract=contract)
+        assert ctx.scouted_output_covered_paths == {
+            "output.widget_id",
+            "output.sites",
+            "output.sites[].depot",
+            "output.sites[].phase",
+        }
+        assert uncovered_requested_output_paths(ctx) == set()
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert any(path == "output.sites" for path in credited["value_grounded_paths"])
+
+    def test_inspect_sourced_packet_shape_grounds_value_regardless_of_interaction(self) -> None:
+        page = self._shape_scout_page()
+        page["source_tool"] = "inspect_page_for_composition"
+        page.pop("interaction_selector", None)
+
+        # First-load capture (no prior interaction) grounds value by shape via witnessed content.
+        landing_ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        landing_ctx.copilot_config = self._shape_registry_config()
+        landing_ctx.scout_trajectory = []
+        landing_contract = mint_scout_observation_contract_for_ctx(landing_ctx, page, url=page["current_url"])
+        assert landing_contract is not None
+        with capture_logs() as landing_logs:
+            record_scouted_output_coverage(landing_ctx, page, contract=landing_contract)
+        landing_credited = next(
+            entry for entry in landing_logs if entry["event"] == "copilot_scouted_output_coverage_credited"
+        )
+        assert landing_credited["provenance"] == "value_grounded"
+
+        ctx = self._authoring_ctx(
+            _criterion("output.widget_id", "the eight digit widget reference"),
+            _criterion("output.sites", "the list of build sites"),
+            _criterion("output.sites[].depot", "each depot postal location"),
+            _criterion("output.sites[].phase", "each build stage token"),
+        )
+        ctx.copilot_config = self._shape_registry_config()
+        contract = mint_scout_observation_contract_for_ctx(ctx, page, url=page["current_url"])
+        assert contract is not None
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page, contract=contract)
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert any(path == "output.sites" for path in credited["value_grounded_paths"])
+
+    def test_two_partial_contracts_accumulate_coverage(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.overall_credentialing_result", "Overall Credentialing Result"),
+            _criterion("output.npi", "NPI"),
+        )
+        first = self._kv_page(
+            key_text="Overall Credentialing Result", url="https://example.com/p1", value_prose="Credentialed"
+        )
+        second = self._kv_page(key_text="NPI", url="https://example.com/p2", value_prose="1234567890")
+
+        first_contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            first,
+            url="https://example.com/p1",
+        )
+        record_scouted_output_coverage(ctx, first, contract=first_contract)
+        assert ctx.scouted_output_covered_paths == {"output.overall_credentialing_result"}
+
+        second_contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            second,
+            url="https://example.com/p2",
+        )
+        record_scouted_output_coverage(ctx, second, contract=second_contract)
+        assert ctx.scouted_output_covered_paths == {"output.overall_credentialing_result", "output.npi"}
+        assert uncovered_requested_output_paths(ctx) == set()
+
+    def test_realistic_multifield_dom_contract_binds_and_credits_value_grounded(self) -> None:
+        page_evidence = parse_composition_html(
+            LISTING_DETAIL_HTML,
+            inspected_url=LISTING_DETAIL_URL,
+            current_url=LISTING_DETAIL_URL,
+        )
+        ref_relations = [
+            relation for relation in page_evidence["key_value_relations"] if relation["key_text"] == "Reference Number"
+        ]
+        assert len(ref_relations) == 1
+
+        criteria = (
+            _criterion("output.reference_number", "Reference Number"),
+            _criterion("output.row_statuses", "Status"),
+        )
+
+        ctx = self._authoring_ctx(*criteria)
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            page_evidence,
+            url=LISTING_DETAIL_URL,
+        )
+        assert contract is not None
+        bindings_by_path = {binding.output_path: binding for binding in contract.bindings}
+        # The contract binds the reference-number KV and the status column by label/header match,
+        # crediting them as value_grounded from the realistic multi-field capture.
+        assert set(bindings_by_path) == {"output.reference_number", "output.row_statuses"}
+        assert bindings_by_path["output.reference_number"].kind == "key_value"
+        assert bindings_by_path["output.row_statuses"].kind == "table_column"
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(ctx, page_evidence, contract=contract)
+        assert {"output.reference_number", "output.row_statuses"} <= ctx.scouted_output_covered_paths
+        assert uncovered_requested_output_paths(ctx) == set()
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert set(credited["value_grounded_paths"]) >= {"output.reference_number", "output.row_statuses"}
+
+    def test_include_lexical_false_credits_contract_only(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "Document Name"))
+        page = self._kv_page(
+            key_text="Document Name", url="https://example.com/doc", value_prose="Document Name Resale Certificate"
+        )
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx,
+            page,
+            url="https://example.com/doc",
+        )
+        assert contract is not None
+
+        record_scouted_output_coverage(ctx, page, include_lexical=False)
+        assert ctx.scouted_output_covered_paths == set()
+
+        record_scouted_output_coverage(ctx, page, contract=contract, include_lexical=False)
+        assert ctx.scouted_output_covered_paths == {"output.document_name"}
 
     def test_empty_shell_selector_tokens_do_not_credit(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
@@ -2330,6 +2951,17 @@ class TestScoutOutputCoverageGate:
         ctx.reached_download_target = _download_target()
         assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
 
+    def test_registered_download_request_not_goal_complete_until_download_reached(self) -> None:
+        # Post-run registered-download evidence is absent from the pre-run requested-output gate, so a
+        # durable-entry+commit prefix (sign-in) would read goal-complete and land the mechanism-F latch
+        # mid-scout — locking out imposition of the real download spine once the scout reaches it.
+        ctx = self._authoring_ctx(_registered_download_criterion())
+        assert uncovered_requested_output_paths(ctx) == set()
+        assert ctx.reached_download_target is None
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        ctx.reached_download_target = _download_target()
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
     def test_unreachable_output_never_completes_on_long_trajectory(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
         ctx.scout_trajectory = _entry_commit_trajectory() * 12
@@ -2343,12 +2975,12 @@ class TestScoutOutputCoverageGate:
         ctx.completion_criteria_turn_state = SimpleNamespace(decision=None)
         assert uncovered_requested_output_paths(ctx) == set()
 
-    def test_all_generic_token_path_is_exempt_and_falls_through_to_shape(self) -> None:
+    def test_all_generic_token_path_still_requires_producer_plan(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.data", "the data is captured"))
         assert uncovered_requested_output_paths(ctx) == set()
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
-        assert synthesized_trajectory_is_goal_complete(ctx) is True
-        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
 
     def test_generic_path_exemption_keeps_specific_path_gating(self) -> None:
         ctx = self._authoring_ctx(
@@ -2479,6 +3111,22 @@ class TestScoutOutputCoverageGate:
         )
         assert event.log_only is True
 
+    def test_steer_yields_to_live_ladder_and_one_shot_key_survives(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        consume_uncovered_output_reopen_event(ctx)
+        ctx.output_contract_actuation_by_signature = {"sig_a": OutputContractAdvisoryState.GRANTED}
+        ctx.output_contract_actuation_count_by_signature = {}
+
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is None
+        assert ctx.uncovered_output_rescout_steer_key is None
+
+        ctx.output_contract_actuation_by_signature = {"sig_a": OutputContractAdvisoryState.CONSUMED}
+        steer = uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks")
+        assert isinstance(steer, CopilotToolBlockerSignal)
+        assert ctx.uncovered_output_rescout_steer_key is not None
+
     def test_steer_inert_without_reopen_latch(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
         ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
@@ -2540,7 +3188,7 @@ class TestScoutOutputCoverageGate:
         assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is False
         assert consume_uncovered_output_reopen_event(ctx) is False
 
-    def test_coverage_reopen_refreshes_synthesized_offer_after_authoring(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_coverage_reopen_without_plan_does_not_refresh_offer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
             lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
@@ -2549,20 +3197,188 @@ class TestScoutOutputCoverageGate:
         ctx.update_workflow_called = True
         assert _maybe_synthesized_block_offer_msg(ctx) is None
         ctx.synthesized_block_reopened_for_output_coverage = True
-        assert _maybe_synthesized_block_offer_msg(ctx) is not None
+        assert _maybe_synthesized_block_offer_msg(ctx) is None
 
     def test_post_hook_failure_rolls_back_coverage_credit(self) -> None:
         assert "scouted_output_covered_paths" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
         assert "synthesized_block_reopened_for_output_coverage" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        assert "synthesized_business_required_parameter_keys" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
         ctx = _Ctx()
         ctx.scouted_output_covered_paths = {"output.document_name"}
+        ctx.synthesized_business_required_parameter_keys = {"service_address"}
         ctx.synthesized_block_reopened_for_output_coverage = False
         snapshot = _snapshot_post_hook_context(ctx)
         ctx.scouted_output_covered_paths.add("output.leaked")
+        ctx.synthesized_business_required_parameter_keys.add("leaked_input")
         ctx.synthesized_block_reopened_for_output_coverage = True
         _restore_post_hook_context(ctx, snapshot)
         assert ctx.scouted_output_covered_paths == {"output.document_name"}
+        assert ctx.synthesized_business_required_parameter_keys == {"service_address"}
         assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+    def test_post_hook_failure_rolls_back_capture_obligation_credit(self) -> None:
+        assert "never_captured_obligation" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        assert "synthesized_block_reopened_for_capture_obligation" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        ctx = _Ctx()
+        armed = NeverCapturedObligation(
+            identity_digest="identity",
+            turn_id="turn-a",
+            draft_fingerprint="draft",
+            block_label="submit",
+            site="whole_trajectory",
+            method="click",
+            normalized_receiver="page.locator('#submit')",
+            call_shape_digest="shape",
+            expected_tool_name="click",
+            armed_after_trajectory_index=0,
+        )
+        ctx.never_captured_obligation = armed
+        snapshot = _snapshot_post_hook_context(ctx)
+        ctx.never_captured_obligation = NeverCapturedObligation(
+            **{
+                **armed.__dict__,
+                "captured_trajectory_index": 1,
+                "state": "captured",
+            }
+        )
+        ctx.synthesized_block_reopened_for_capture_obligation = True
+
+        _restore_post_hook_context(ctx, snapshot)
+
+        assert ctx.never_captured_obligation == armed
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+
+    def test_post_hook_failure_rolls_back_scout_observation_contract(self) -> None:
+        assert "scout_observation_contract" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS
+        ctx = _Ctx()
+        ctx.scout_observation_contract = None
+        snapshot = _snapshot_post_hook_context(ctx)
+        ctx.scout_observation_contract = object()
+        _restore_post_hook_context(ctx, snapshot)
+        assert ctx.scout_observation_contract is None
+
+    def test_both_surfaces_grounded_still_blocks_mutating_tool(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.visitors", "Visitors"),
+            _criterion("output.signups", "Signups"),
+        )
+        surface_one = self._kv_page(
+            key_text="Visitors",
+            url="https://analytics.example.com/dashboard",
+            value_prose="Visitors 1,234 recorded this week",
+        )
+        first_contract = mint_scout_observation_contract_for_ctx(
+            ctx, surface_one, url="https://analytics.example.com/dashboard"
+        )
+        record_scouted_output_coverage(ctx, surface_one, contract=first_contract)
+
+        surface_two = self._kv_page(
+            key_text="Signups",
+            url="https://analytics.example.com/query",
+            value_prose="Signups 987 total this week",
+        )
+        second_contract = mint_scout_observation_contract_for_ctx(
+            ctx, surface_two, url="https://analytics.example.com/query"
+        )
+        record_scouted_output_coverage(ctx, surface_two, contract=second_contract)
+
+        assert ctx.scouted_output_covered_paths == {"output.visitors", "output.signups"}
+        assert uncovered_requested_output_paths(ctx) == set()
+
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is True
+        signal = synthesized_block_persistence_signal(ctx, "click")
+        assert signal is not None
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_rekeyed_requested_output_compiles_the_offer_recipe_named_from_its_label(self) -> None:
+        # Without the rekey fallback no label reaches the plan, so the offer is skipped and the
+        # schema is left to the agent to invent.
+        rekeyed = CompletionCriterion(
+            id="slot0",
+            outcome="Document Name",
+            output_path=None,
+            requested_output_evidence_source="runtime_output",
+            requested_output_floor_rekeyed=True,
+            floor_rekeyed_from_path="output.request_slot_abc_00",
+        )
+        ctx = self._authoring_ctx(rekeyed)
+        self._attach_document_plan(ctx, step=6)
+        ctx.synthesized_block_offered = False
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        content = str(message["content"])
+        assert 'return {"output": {"document_name": _extraction_value_0}}' in content
+        assert "request_slot_abc_00" not in content
+
+    def test_requested_output_without_a_label_leaves_the_ask_legitimate(self) -> None:
+        # An underivable field yields no plan, so a clarification about it stays legitimate.
+        unlabelled = CompletionCriterion(
+            id="slot0",
+            outcome="",
+            output_path=None,
+            requested_output_evidence_source="runtime_output",
+            requested_output_floor_rekeyed=True,
+            floor_rekeyed_from_path="output.request_slot_abc_00",
+        )
+        ctx = self._authoring_ctx(unlabelled)
+        self._attach_document_plan(ctx, step=6)
+
+        assert requested_scalar_output_extraction_plan(ctx) is None
+
+    def test_floor_rekeyed_runtime_output_stays_owed_until_grounded(self) -> None:
+        # The rekey clears output_path but keeps floor_rekeyed_from_path; keyed only on the former,
+        # both outputs vanish from the requested set and the blocker forecloses scouting.
+        rekeyed = [
+            CompletionCriterion(
+                id=f"slot{index}",
+                outcome=outcome,
+                output_path=None,
+                requested_output_evidence_source="runtime_output",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path=f"output.request_slot_b97f_{index:02d}",
+            )
+            for index, outcome in enumerate(["number of website visitors", "number of new signups"])
+        ]
+        ctx = self._authoring_ctx(*rekeyed)
+
+        # Provenance stands in for the cleared path, so both stay owed and neither is flagged.
+        assert uncovered_requested_output_paths(ctx) == {
+            "output.request_slot_b97f_00",
+            "output.request_slot_b97f_01",
+        }
+        assert pre_run_gated_outputs_without_path(ctx) == ()
+
+        surface_one = self._kv_page(
+            key_text="Website visitors",
+            url="https://analytics.example.com/web-analytics",
+            value_prose="Website visitors 9,420 recorded for the past 7 days",
+        )
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx, surface_one, url="https://analytics.example.com/web-analytics"
+        )
+        record_scouted_output_coverage(ctx, surface_one, contract=contract)
+
+        # Coverage keys on the outcome text, since the digest leaf carries no groundable tokens.
+        assert uncovered_requested_output_paths(ctx) == {"output.request_slot_b97f_01"}
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_pathless_runtime_output_criterion_reaching_enforcement_is_flagged(self) -> None:
+        # A runtime-output criterion reaching enforcement with no identity is surfaced, not dropped.
+        pathless = CompletionCriterion(
+            id="c0",
+            outcome="number of new signups is extracted for the past 7 days",
+            output_path=None,
+            requested_output_evidence_source="runtime_output",
+        )
+        flagged = pre_run_gated_outputs_without_path(self._authoring_ctx(pathless))
+        assert [criterion.id for criterion in flagged] == ["c0"]
+
+        with_path = _criterion("output.new_signups", "number of new signups is extracted")
+        assert pre_run_gated_outputs_without_path(self._authoring_ctx(with_path)) == ()
 
 
 class TestAdvisoryRunDispatchForceLane:
@@ -2638,3 +3454,553 @@ class TestAdvisoryRunDispatchForceLane:
         assert ctx.turn_halt is None
         assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
         assert _should_force_advisory_run_dispatch(ctx) is True
+
+
+class TestCredentialFlowGoalComplete:
+    _LOGIN_URL = "https://portal.example.test/login"
+    _PASSWORD_URL = "https://portal.example.test/password"
+
+    @staticmethod
+    def _username_fill(source_url: str = "https://portal.example.test/login") -> dict[str, object]:
+        return {
+            "tool_name": "fill_credential_field",
+            "credential_id": "cred_1",
+            "credential_field": "username",
+            "selector": "#user",
+            "source_url": source_url,
+        }
+
+    @staticmethod
+    def _password_fill(source_url: str = "https://portal.example.test/password") -> dict[str, object]:
+        return {
+            "tool_name": "fill_credential_field",
+            "credential_id": "cred_1",
+            "credential_field": "password",
+            "selector": "#pass",
+            "source_url": source_url,
+        }
+
+    @staticmethod
+    def _submit(source_url: str, accessible_name: str) -> dict[str, object]:
+        return {
+            "tool_name": "click",
+            "selector": "button[type='submit']",
+            "accessible_name": accessible_name,
+            "source_url": source_url,
+        }
+
+    def _two_screen_first_page(self) -> list[dict[str, object]]:
+        return [self._username_fill(), self._submit(self._LOGIN_URL, "Continue")]
+
+    def _two_screen_full_login(self) -> list[dict[str, object]]:
+        return [*self._two_screen_first_page(), self._password_fill(), self._submit(self._PASSWORD_URL, "Sign in")]
+
+    def _ctx_with_inventory(
+        self,
+        trajectory: list[dict[str, object]],
+        *,
+        inventory: dict[str, frozenset[str]] | None = None,
+        observed_at_index: int | None = None,
+        observed_password_control: bool = False,
+    ) -> _Ctx:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        for position, item in enumerate(trajectory):
+            item.setdefault("trajectory_index", position)
+        ctx.scout_trajectory = trajectory
+        ctx.scouted_credential_field_inventory_by_credential_id = inventory or {}
+        ctx.last_scout_observation_trajectory_index = observed_at_index
+        ctx.last_scout_observation_has_password_control = observed_password_control
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(trajectory)
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        return ctx
+
+    def test_half_login_with_unobserved_second_screen_is_incomplete(self) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_first_page(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_full_login_with_post_fill_submit_is_complete(self) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_full_login(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_login_only_is_incomplete_when_runtime_outputs_were_floor_rekeyed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_full_login(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.completion_criteria_turn_state = _turn_state(
+            CompletionCriterion(
+                id="request-id",
+                outcome="the request id is output",
+                level="run",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path="output.request_id",
+            )
+        )
+
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#gasCreate"}) is None
+        ctx.synthesized_block_offered = False
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.locator('#login').click()"),
+        )
+        assert _maybe_synthesized_block_offer_msg(ctx) is None
+
+    def test_floor_rekeyed_runtime_output_requires_coverage_after_post_login_business_commit(self) -> None:
+        trajectory = [
+            *self._two_screen_full_login(),
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='gasCreate']",
+                "accessible_name": "Create QuickConnect",
+                "source_url": "https://portal.example.test/home",
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#gasAddress",
+                "typed_value": "77 Gaslight Way",
+                "source_url": "https://portal.example.test/quickconnect",
+            },
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='gasSubmit']",
+                "accessible_name": "Submit",
+                "source_url": "https://portal.example.test/quickconnect",
+            },
+        ]
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.completion_criteria_turn_state = _turn_state(
+            CompletionCriterion(
+                id="request-id",
+                outcome="the request id is output",
+                level="run",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path="output.request_id",
+            )
+        )
+
+        assert synthesized_trajectory_reaches_goal(ctx) is True
+        assert uncovered_requested_output_paths(ctx) == {"output.request_id"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+        ctx.scouted_output_covered_paths.add("output.request_id")
+        ctx.flow_evidence = [
+            {
+                "step": len(trajectory),
+                "reached_via": "interaction",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "source_tool": "scout_interaction",
+                    "interaction_tool": "click",
+                    "interaction_selector": "button[data-action='gasSubmit']",
+                    "inspection_warnings": [],
+                    "result_containers_truncated": False,
+                    "key_value_relations_truncated": False,
+                    "key_value_relations": [
+                        {
+                            "key_text": "the request id is output",
+                            "container_selector": ".request-id-kv",
+                            "container_match_count": 1,
+                            "container_position": 0,
+                            "value_child_index": 1,
+                            "direct_child_count": 2,
+                            "visible": True,
+                            "value_visible": True,
+                        }
+                    ],
+                    "result_containers": [],
+                },
+            }
+        ]
+
+        assert uncovered_requested_output_paths(ctx) == set()
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_floor_rekeyed_runtime_output_rejects_create_then_submit_without_business_fill(self) -> None:
+        trajectory = [
+            *self._two_screen_full_login(),
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='gasCreate']",
+                "accessible_name": "Create QuickConnect",
+                "source_url": "https://portal.example.test/home",
+            },
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='gasSubmit']",
+                "accessible_name": "Submit",
+                "source_url": "https://portal.example.test/quickconnect",
+            },
+        ]
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.completion_criteria_turn_state = _turn_state(
+            CompletionCriterion(
+                id="request-id",
+                outcome="the request id is output",
+                level="run",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path="output.request_id",
+            )
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="submit-request",
+                    outcome="the QuickConnect request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    level="run",
+                )
+            ]
+        )
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = len(trajectory)
+        ctx.synthesized_block_offered_goal_complete = True
+
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_request_terminal_action_does_not_offer_on_create_then_table_navigation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trajectory = [
+            *self._two_screen_full_login(),
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='gasCreate']",
+                "accessible_name": "Create QuickConnect",
+                "source_url": "https://portal.example.test/home",
+            },
+            {
+                "tool_name": "click",
+                "selector": "button[data-action='gasTable']",
+                "accessible_name": "My QuickConnects",
+                "source_url": "https://portal.example.test/quickconnect",
+            },
+            {
+                "tool_name": "click",
+                "selector": "a[data-action='quickconnects']",
+                "accessible_name": "QuickConnects",
+                "source_url": "https://portal.example.test/quickconnect/table",
+            },
+        ]
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.completion_criteria_turn_state = None
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="submit-request",
+                    outcome="the QuickConnect request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    level="run",
+                )
+            ]
+        )
+        ctx.synthesized_block_offered = False
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.locator('#gasTable').click()"),
+        )
+        assert _maybe_synthesized_block_offer_msg(ctx) is None
+
+    def test_username_only_flow_completes_after_no_password_control_observation(self) -> None:
+        trajectory = self._two_screen_first_page()
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+            observed_at_index=len(trajectory) - 1,
+            observed_password_control=False,
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+
+    def test_observed_password_screen_keeps_flow_incomplete(self) -> None:
+        trajectory = self._two_screen_first_page()
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+            observed_at_index=len(trajectory) - 1,
+            observed_password_control=True,
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_observation_before_submit_does_not_drop_password_requirement(self) -> None:
+        trajectory = self._two_screen_first_page()
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+            observed_at_index=0,
+            observed_password_control=False,
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_unmatched_incidental_click_before_observation_keeps_password_demand(self) -> None:
+        trajectory = [
+            self._username_fill(),
+            {
+                "tool_name": "click",
+                "selector": "#cookie-accept",
+                "accessible_name": "Accept",
+                "source_url": "https://consent.example.test/banner",
+            },
+            self._submit(self._LOGIN_URL, "Continue"),
+        ]
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={"cred_1": frozenset({"username", "password"})},
+            observed_at_index=1,
+            observed_password_control=False,
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_non_dict_trajectory_entry_does_not_release_demand_early(self) -> None:
+        trajectory: list[Any] = [{**self._username_fill(), "trajectory_index": 0}, "scout-note"]
+        ctx = self._ctx_with_inventory(
+            [self._username_fill()],
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.scout_trajectory = trajectory
+        _record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#user", "type": "text"}]}]})
+        trajectory.append({**self._submit(self._LOGIN_URL, "Continue"), "trajectory_index": 2})
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_observation_after_submit_with_non_dict_entry_releases_demand(self) -> None:
+        trajectory: list[Any] = [
+            {**self._username_fill(), "trajectory_index": 0},
+            "scout-note",
+            {**self._submit(self._LOGIN_URL, "Continue"), "trajectory_index": 2},
+        ]
+        ctx = self._ctx_with_inventory(
+            [self._username_fill()],
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.scout_trajectory = trajectory
+        _record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#user", "type": "text"}]}]})
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_eviction_does_not_reorder_observation_past_submit(self) -> None:
+        fill_index = _MAX_SCOUTED_INTERACTIONS - 1
+        trajectory: list[dict[str, object]] = [
+            {
+                "tool_name": "click",
+                "selector": f"#step-{index}",
+                "source_url": "https://portal.example.test/browse",
+                "trajectory_index": index,
+            }
+            for index in range(fill_index)
+        ]
+        trajectory.append({**self._username_fill(), "trajectory_index": fill_index})
+        ctx = self._ctx_with_inventory([], inventory={"cred_1": frozenset({"username", "password"})})
+        ctx.scout_trajectory = trajectory
+        _record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#user", "type": "text"}]}]})
+        trajectory = list(trajectory)
+        trajectory.append({**self._submit(self._LOGIN_URL, "Continue"), "trajectory_index": fill_index + 1})
+        ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
+        assert len(ctx.scout_trajectory) == _MAX_SCOUTED_INTERACTIONS
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_password_only_reauth_completes(self) -> None:
+        ctx = self._ctx_with_inventory(
+            [self._password_fill(), self._submit(self._PASSWORD_URL, "Sign in")],
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_username_only_credential_without_password_completes(self) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_first_page(),
+            inventory={"cred_1": frozenset({"username"})},
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_legacy_session_without_inventory_degrades_to_filled_fields(self) -> None:
+        ctx = self._ctx_with_inventory(self._two_screen_first_page(), inventory={})
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_totp_only_continuation_falls_through_to_shape_heuristic(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "totp",
+                "selector": "#totp",
+                "source_url": self._PASSWORD_URL,
+            },
+            self._submit(self._PASSWORD_URL, "Verify"),
+        ]
+        ctx = self._ctx_with_inventory(trajectory, inventory={"cred_1": frozenset({"username", "password"})})
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_filled_password_without_post_fill_submit_is_incomplete(self) -> None:
+        ctx = self._ctx_with_inventory(
+            [self._username_fill(), self._submit(self._LOGIN_URL, "Continue"), self._password_fill()],
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_mixed_credentials_incomplete_until_both_flows_finish(self) -> None:
+        second_fill = {
+            "tool_name": "fill_credential_field",
+            "credential_id": "cred_2",
+            "credential_field": "username",
+            "selector": "#user2",
+            "source_url": self._PASSWORD_URL,
+        }
+        trajectory = [*self._two_screen_full_login(), second_fill, self._submit(self._PASSWORD_URL, "Next")]
+        ctx = self._ctx_with_inventory(
+            trajectory,
+            inventory={
+                "cred_1": frozenset({"username", "password"}),
+                "cred_2": frozenset({"username", "password"}),
+            },
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_download_target_does_not_bypass_credential_flow(self) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_first_page(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector="a.report",
+            affordance_text="Report",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_mutating_tools_admitted_while_credential_flow_incomplete(self) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_first_page(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+
+    def test_mutating_tools_blocked_again_once_flow_completes(self) -> None:
+        ctx = self._ctx_with_inventory(
+            self._two_screen_full_login(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is True
+        assert synthesized_block_persistence_signal(ctx, "click") is not None
+
+
+class TestCredentialScoutReopen:
+    def _offered_complete_ctx(self) -> _Ctx:
+        helper = TestCredentialFlowGoalComplete()
+        return helper._ctx_with_inventory(
+            helper._two_screen_full_login(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+
+    def test_arm_is_one_shot_per_identity_digest(self) -> None:
+        ctx = make_copilot_context()
+        assert arm_credential_scout_reopen(ctx, "identity-1") is True
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+        assert synthesized_persistence_reopened(ctx) is True
+
+        ctx.synthesized_block_reopened_for_credential_scout = False
+        assert arm_credential_scout_reopen(ctx, "identity-1") is False
+        assert ctx.synthesized_block_reopened_for_credential_scout is False
+        assert synthesized_persistence_reopened(ctx) is False
+
+        assert arm_credential_scout_reopen(ctx, "identity-2") is True
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+
+    def test_reopen_admits_evaluate_while_offer_is_goal_complete(self) -> None:
+        ctx = self._offered_complete_ctx()
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+        ctx.synthesized_block_reopened_for_credential_scout = True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_reopen_admission_registers_precedence_claim(self) -> None:
+        ctx = self._offered_complete_ctx()
+        ctx.synthesized_block_reopened_for_credential_scout = True
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.CREDENTIAL_SCOUT_REOPEN in ctx.turn_ownership.claims
+        assert current_turn_owner(ctx) is None
+
+    def test_reopen_reopens_offer_refresh_window(self) -> None:
+        ctx = self._offered_complete_ctx()
+        ctx.update_workflow_called = True
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        ctx.synthesized_block_reopened_for_credential_scout = True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+
+
+class TestNeverCapturedObligationAdmission:
+    def _offered_complete_ctx(self) -> _Ctx:
+        helper = TestCredentialFlowGoalComplete()
+        ctx = helper._ctx_with_inventory(
+            helper._two_screen_full_login(),
+            inventory={"cred_1": frozenset({"username", "password"})},
+        )
+        ctx.turn_id = "turn-capture"
+        ctx.never_captured_obligation = NeverCapturedObligation(
+            identity_digest="capture-identity",
+            turn_id=ctx.turn_id,
+            draft_fingerprint="draft",
+            block_label="submit",
+            site="whole_trajectory",
+            method="click",
+            normalized_receiver="page.locator('#gasSubmit')",
+            call_shape_digest="shape",
+            expected_tool_name="click",
+            armed_after_trajectory_index=0,
+        )
+        return ctx
+
+    def test_exact_target_admission_registers_precedence_claim(self) -> None:
+        ctx = self._offered_complete_ctx()
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#gasSubmit"}) is None
+
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.CAPTURE_OBLIGATION_REOPEN in ctx.turn_ownership.claims
+        assert current_turn_owner(ctx) is None
+
+    def test_same_tool_for_different_target_remains_blocked(self) -> None:
+        ctx = self._offered_complete_ctx()
+
+        signal = synthesized_block_persistence_signal(ctx, "click", {"selector": "#unrelated"})
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert ctx.turn_ownership is None

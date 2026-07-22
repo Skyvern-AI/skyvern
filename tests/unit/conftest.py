@@ -4,6 +4,7 @@
 import itertools
 import logging
 import shutil
+import sys
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,21 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
+from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
+
+
+@pytest.fixture
+def fingerprint_secret_key(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Pin ``SECRET_KEY`` so ``diagnostic_fingerprint`` produces stable, keyed output in tests.
+
+    Patches the shared ``settings`` singleton, so it is seen wherever the helper reads it.
+    """
+    from skyvern.config import settings
+
+    monkeypatch.setattr(settings, "SECRET_KEY", FINGERPRINT_TEST_SECRET_KEY)
+    return FINGERPRINT_TEST_SECRET_KEY
+
 
 # Wire structlog through stdlib so caplog can capture log records in tests.
 structlog.configure(
@@ -55,6 +70,20 @@ structlog.configure(
 def setup_forge_stub_app():
     start_forge_stub_app()
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_collapse_xp_assignment_memo():
+    # The collapse umbrella memo is process-global by design; without clearing it,
+    # an assignment memoized by one test leaks into any later test reusing the same task id.
+    def _clear() -> None:
+        handler_module = sys.modules.get("skyvern.webeye.actions.handler")
+        if handler_module is not None:
+            handler_module._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+
+    _clear()
+    yield
+    _clear()
 
 
 # -- shared copilot agent-template rendering helper --
@@ -188,3 +217,43 @@ async def sqlite_engine_factory(
 @pytest_asyncio.fixture
 async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
     return sqlite_engine_factory()
+
+
+def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object] | None = None) -> MagicMock:
+    # SkyvernElement double for handle_input_text_action tests. attrs=None makes every get_attr return
+    # None (plain search-bar case); pass a dict to drive specific attrs (e.g. a combobox's role /
+    # aria-autocomplete / aria-invalid).
+    el = MagicMock()
+    el.get_id.return_value = element_id
+    el.get_tag_name.return_value = "input"
+    el.get_frame.return_value = MagicMock()
+    locator = MagicMock()
+    locator.focus = AsyncMock()
+    el.get_locator.return_value = locator
+    el.is_disabled = AsyncMock(return_value=False)
+    el.get_selectable = AsyncMock(return_value=False)
+    el.has_hidden_attr = AsyncMock(return_value=False)
+    el.is_readonly = AsyncMock(return_value=False)
+    el.has_attr = AsyncMock(return_value=False)
+    el.is_spinbtn_input = AsyncMock(return_value=False)
+    el.is_editable = AsyncMock(return_value=True)
+    el.supports_text_input = AsyncMock(return_value=True)
+    el.is_visible = AsyncMock(return_value=True)
+    el.is_raw_input = AsyncMock(return_value=False)
+    el.is_auto_completion_input = AsyncMock(return_value=False)
+    el.find_blocking_element = AsyncMock(return_value=(None, False))
+    el.get_element_handler = AsyncMock(return_value=MagicMock())
+    el.input_sequentially = AsyncMock()
+    el.input_clear = AsyncMock()
+    el.scroll_into_view = AsyncMock()
+    el.press_key = AsyncMock()
+    el.blur = AsyncMock()
+    if attrs is None:
+        el.get_attr = AsyncMock(return_value=None)
+    else:
+
+        def _get_attr(name: str, *args: object, **kwargs: object) -> object:
+            return attrs.get(name)
+
+        el.get_attr = AsyncMock(side_effect=_get_attr)
+    return el

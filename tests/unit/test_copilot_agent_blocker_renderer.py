@@ -12,8 +12,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
     _build_goal_satisfied_exit_result,
     _build_output_policy_blocked_result,
-    _build_turn_halt_exit_result,
-    _build_wip_exit_result,
+)
+from skyvern.forge.sdk.copilot.agent import _build_turn_halt_exit_result as _real_build_turn_halt_exit_result
+from skyvern.forge.sdk.copilot.agent import _build_wip_exit_result as _real_build_wip_exit_result
+from skyvern.forge.sdk.copilot.agent import (
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
     _verified_workflow_success_reply,
@@ -24,9 +26,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BlockerKind,
     CopilotToolBlockerSignal,
     RecoveryHint,
+    build_definition_contract_unsatisfied_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, DeliveredUnverifiedPublicOutputs
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_STEER_REASON_CODE,
     CopilotOutputKind,
@@ -36,6 +40,8 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from tests.unit.conftest import make_copilot_context as _ctx
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
@@ -48,6 +54,25 @@ _LEAK_TOKENS_FULL = _LEAK_DENY_TOKENS
 # automatically rather than silently passing with stale values.
 _ALL_BLOCKER_KINDS: tuple[BlockerKind, ...] = get_args(BlockerKind)
 _ALL_RECOVERY_HINTS: tuple[RecoveryHint, ...] = get_args(RecoveryHint)
+
+
+def _mark_public_outputs(ctx: CopilotContext) -> None:
+    if ctx.delivered_unverified_observed_outputs and not isinstance(
+        ctx.delivered_unverified_observed_outputs, DeliveredUnverifiedPublicOutputs
+    ):
+        ctx.delivered_unverified_observed_outputs = DeliveredUnverifiedPublicOutputs(
+            ctx.delivered_unverified_observed_outputs
+        )
+
+
+def _build_wip_exit_result(ctx: CopilotContext, *args: Any, **kwargs: Any) -> AgentResult:
+    _mark_public_outputs(ctx)
+    return _real_build_wip_exit_result(ctx, *args, **kwargs)
+
+
+def _build_turn_halt_exit_result(ctx: CopilotContext, *args: Any, **kwargs: Any) -> AgentResult:
+    _mark_public_outputs(ctx)
+    return _real_build_turn_halt_exit_result(ctx, *args, **kwargs)
 
 
 def _signal(
@@ -526,6 +551,21 @@ def test_turn_halt_exit_keeps_halt_signal_when_context_signal_is_cleared() -> No
     assert result.user_response == signal.user_facing_reason
 
 
+def test_definition_contract_halt_renders_sorted_parameter_names_without_internal_machinery() -> None:
+    ctx = _ctx()
+    signal = build_definition_contract_unsatisfied_blocker_signal(
+        unresolved_parameter_keys=["service_address", "business_name", "contact_email"]
+    )
+    halt = TurnHalt(kind=TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == signal.user_facing_reason
+    assert result.user_response.index("business_name") < result.user_response.index("contact_email")
+    assert result.user_response.index("contact_email") < result.user_response.index("service_address")
+    assert "update_and_run_blocks" not in result.user_response
+
+
 def test_turn_halt_exit_renders_code_authoring_churn_reason() -> None:
     ctx = _ctx()
     signal = _signal(
@@ -855,7 +895,311 @@ def test_delivered_unverified_exit_renders_observed_output_as_unvalidated() -> N
     assert "document_name: Resale Demand Package" in result.user_response
     assert "not independently verified" in result.user_response
     assert result.proposal_disposition == "review_untested"
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["deliveredUnverifiedObservedOutputs"]["document_name"] == "Resale Demand Package"
     assert result.workflow_yaml == ctx.last_workflow_yaml
+
+
+def test_delivered_unverified_exit_precedes_distinct_last_good_workflow_fallback() -> None:
+    ctx = _ctx()
+    ctx.last_good_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_good_workflow_yaml = "workflow_definition:\n  blocks:\n    - label: tested-prior\n"
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks:\n    - label: delivered-current\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {"result": {"confirmation": "confirm-current"}}
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested prior workflow",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert 'result["confirmation"]: confirm-current' in result.user_response
+    assert "tested prior workflow" not in result.user_response
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.workflow_yaml == ctx.last_workflow_yaml
+    assert result.proposal_disposition == "review_untested"
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["deliveredUnverifiedObservedOutputs"]["result"] == {
+        "confirmation": "confirm-current"
+    }
+
+
+def test_delivered_unverified_halt_without_workflow_renders_observed_output() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_fallback"
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {
+        "result": {"account": "acct-fallback", "confirmation": "confirm-fallback", "amount": 0}
+    }
+
+    result = _build_turn_halt_exit_result(
+        ctx,
+        global_llm_context=None,
+        halt=TurnHalt(kind=TurnHaltKind.DELIVERED_UNVERIFIED),
+    )
+
+    assert 'result["amount"]: 0' in result.user_response
+    assert 'result["account"]: acct-fallback' in result.user_response
+    assert 'result["confirmation"]: confirm-fallback' in result.user_response
+    assert "not independently verified" in result.user_response
+    assert result.updated_workflow is None
+    assert result.narrative_payload is not None
+    observed_outputs = result.narrative_payload["deliveredUnverifiedObservedOutputs"]
+    assert observed_outputs["result"] == ctx.delivered_unverified_observed_outputs["result"]
+
+
+def test_delivered_unverified_exit_prioritizes_nested_scalars_and_accounts_for_omissions() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {
+        "result": {
+            "evidence": "e" * 240,
+            "account": "acct-314159",
+            "confirmation": "confirm-271828",
+            "amount": 0,
+            **{f"long_{index}": str(index) * 240 for index in range(64)},
+        }
+    }
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert 'result["amount"]: 0' in result.user_response
+    assert 'result["account"]: acct-314159' in result.user_response
+    assert 'result["confirmation"]: confirm-271828' in result.user_response
+    assert 'result["evidence"]: ' in result.user_response
+    assert "..." in result.user_response
+    assert "more fields available in structured output" in result.user_response
+    assert result.user_response.index('result["amount"]') < result.user_response.index('result["evidence"]')
+    assert "not independently verified" in result.user_response
+    assert result.proposal_disposition == "review_untested"
+    assert result.narrative_payload is not None
+    observed_outputs = result.narrative_payload["deliveredUnverifiedObservedOutputs"]
+    assert observed_outputs["result"]["account"] == "acct-314159"
+    assert observed_outputs["result"]["confirmation"] == "confirm-271828"
+    assert observed_outputs["result"]["amount"] == 0
+    assert observed_outputs["result"]["evidence"] == "e" * 240
+    assert observed_outputs["$skyvernOutput"]["omitted"]["node"] >= 1
+
+
+def test_delivered_unverified_exit_uses_collision_safe_paths() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {
+        "result.value": "top-level",
+        "result": {"value": "nested", "items": [{"value": True}]},
+    }
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert "result.value: top-level" in result.user_response
+    assert 'result["value"]: nested' in result.user_response
+    assert 'result["items"][0]["value"]: true' in result.user_response
+
+
+def test_delivered_unverified_exit_preserves_sanitized_key_collisions() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.secret_scrub_values.extend(["registered-secret-a", "registered-secret-b"])
+    ctx.delivered_unverified_observed_outputs = {
+        "result": {
+            "field-registered-secret-a": "first-captured-value",
+            "field-registered-secret-b": "second-captured-value",
+        }
+    }
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert "first-captured-value" in result.user_response
+    assert "second-captured-value" in result.user_response
+    assert result.narrative_payload is not None
+    observed_result = result.narrative_payload["deliveredUnverifiedObservedOutputs"]["result"]
+    assert list(observed_result) == ["field-[REDACTED_SECRET]", "field-[REDACTED_SECRET] [2]"]
+    assert list(observed_result.values()) == ["first-captured-value", "second-captured-value"]
+    assert len(observed_result) == 2
+
+
+@pytest.mark.parametrize("has_workflow", [True, False], ids=["with-workflow", "without-workflow"])
+def test_delivered_unverified_exit_omits_depth_over_budget_without_recursion(has_workflow: bool) -> None:
+    ctx = _ctx()
+    if has_workflow:
+        ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+        ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    else:
+        ctx.last_run_blocks_workflow_run_id = "wr_deep_fallback"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    deeply_nested: dict[str, Any] = {"leaf": "deep-captured-value"}
+    for index in range(1_101):
+        deeply_nested = {f"level_{index}": deeply_nested}
+    ctx.delivered_unverified_observed_outputs = {"result": deeply_nested}
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert result.user_response
+    assert "not independently verified" in result.user_response
+    assert result.narrative_payload is not None
+    observed_outputs = result.narrative_payload["deliveredUnverifiedObservedOutputs"]
+    assert observed_outputs["$skyvernOutput"]["omitted"]["depth"] >= 1
+    assert "deep-captured-value" not in str(observed_outputs)
+
+
+def test_delivered_unverified_exit_sanitizes_both_output_surfaces() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.secret_scrub_values.append("registered-secret-value")
+    deeply_nested: dict[str, Any] = {"password": "deep-must-not-persist"}
+    for index in range(24):
+        deeply_nested = {f"level_{index}": deeply_nested}
+    ctx.delivered_unverified_observed_outputs = {
+        "result": {
+            "empty": "",
+            "password": "must-not-persist",
+            "registered": "prefix registered-secret-value suffix",
+            "raw": "api_key=sk-1234567890abcdefghijkl",
+            "internal": "run wr_internal_123 with update_workflow",
+            "deep": deeply_nested,
+            "api_key=sk-raw-secret-key-1234567890": "safe-value",
+            7: "non-string-key-value",
+        }
+    }
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert 'result["empty"]: ""' in result.user_response
+    assert 'result["password"]: ****' in result.user_response
+    assert "registered-secret-value" not in result.user_response
+    assert "sk-1234567890abcdefghijkl" not in result.user_response
+    assert "wr_internal_123" not in result.user_response
+    assert "update_workflow" not in result.user_response
+    assert "deep-must-not-persist" not in result.user_response
+    assert "sk-raw-secret-key-1234567890" not in result.user_response
+    assert "non-string-key-value" not in result.user_response
+    assert result.narrative_payload is not None
+    assert "must-not-persist" not in str(result.narrative_payload)
+    assert "registered-secret-value" not in str(result.narrative_payload)
+    assert "sk-1234567890abcdefghijkl" not in str(result.narrative_payload)
+    assert "wr_internal_123" not in str(result.narrative_payload)
+    assert "update_workflow" not in str(result.narrative_payload)
+    assert "deep-must-not-persist" not in str(result.narrative_payload)
+    assert "sk-raw-secret-key-1234567890" not in str(result.narrative_payload)
+    assert "non-string-key-value" not in str(result.narrative_payload)
+
+
+@pytest.mark.parametrize("has_workflow", [True, False], ids=["with-workflow", "without-workflow"])
+def test_delivered_unverified_exit_threads_one_snapshot_to_prose_and_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    has_workflow: bool,
+) -> None:
+    ctx = _ctx()
+    if has_workflow:
+        ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+        ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    else:
+        ctx.last_run_blocks_workflow_run_id = "wr_single_snapshot_fallback"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {"result": {"amount": 0}}
+    sanitize = agent_module._delivered_unverified_observed_outputs
+    make_agent_result = agent_module._make_agent_result
+    delivered_unverified_reply = agent_module._delivered_unverified_reply
+    calls = 0
+    prose_snapshot: dict[str, Any] | None = None
+    payload_snapshot: dict[str, Any] | None = None
+
+    def count_sanitization(context: CopilotContext) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return sanitize(context)
+
+    def capture_prose_snapshot(context: CopilotContext, snapshot: dict[str, Any]) -> str | None:
+        nonlocal prose_snapshot
+        prose_snapshot = snapshot
+        return delivered_unverified_reply(context, snapshot)
+
+    def capture_payload_snapshot(*args: Any, **kwargs: Any) -> AgentResult:
+        nonlocal payload_snapshot
+        payload_snapshot = kwargs.get("_delivered_unverified_snapshot")
+        return make_agent_result(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module, "_delivered_unverified_observed_outputs", count_sanitization)
+    monkeypatch.setattr(agent_module, "_delivered_unverified_reply", capture_prose_snapshot)
+    monkeypatch.setattr(agent_module, "_make_agent_result", capture_payload_snapshot)
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert calls == 1
+    assert prose_snapshot is payload_snapshot
+    assert 'result["amount"]: 0' in result.user_response
+    assert result.proposal_disposition == "review_untested"
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["deliveredUnverifiedObservedOutputs"]["result"] == {"amount": 0}
 
 
 def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:
@@ -875,3 +1219,211 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
     assert overridden.user_response == challenge_text
     assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
     assert overridden.proposal_disposition != "review_tested"
+
+
+def _churn_render_signal() -> CopilotToolBlockerSignal:
+    return _signal(
+        kind="loop_detected",
+        user_facing="I kept rewriting the generated code, but the safety checks rejected each version.",
+        internal_reason_code="code_authoring_guardrail_churn",
+    )
+
+
+def test_shim_denies_churn_render_while_ladder_owns_and_records_conflict() -> None:
+    ctx = _ctx()
+    signal = _churn_render_signal()
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, signal)
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    original = _agent_result("Model reply describing progress.")
+
+    result = _finalize_result_with_blocker_override(ctx, original)
+
+    assert result is original
+    assert any(
+        event.site == "final_reply_render"
+        and event.fingerprint == "output_contract_actuation>code_authoring_guardrail_churn"
+        for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_shim_renders_churn_after_ladder_resolves() -> None:
+    ctx = _ctx()
+    signal = _churn_render_signal()
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, signal)
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
+    original = _agent_result("Model reply describing progress.")
+
+    result = _finalize_result_with_blocker_override(ctx, original)
+
+    assert result is not original
+    assert signal.user_facing_reason in result.user_response
+
+
+def test_credential_priority_churn_still_renders_when_no_ladder_owns() -> None:
+    ctx = _ctx()
+    signal = _signal(
+        kind="loop_detected",
+        user_facing=CREDENTIAL_SCOUT_VERIFY_REPLY,
+        internal_reason_code="credential_priority_authoring_churn",
+    )
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, signal)
+
+    result = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert CREDENTIAL_SCOUT_VERIFY_REPLY in result.user_response
+
+
+def test_output_policy_blocked_result_surfaces_draft_when_blocker_render_denied() -> None:
+    ctx = _ctx()
+    fake_workflow: Any = object()
+    ctx.last_workflow = fake_workflow
+    ctx.last_workflow_yaml = "title: X\nworkflow_definition:\n  blocks: []\n"
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, _churn_render_signal())
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert result.updated_workflow is fake_workflow
+    assert any(event.site == "final_reply_render" for event in ctx.gate_precedence_conflict_events)
+
+
+def test_reconcile_turn_end_replaces_result_with_stalled_terminal() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    ctx.output_contract_pending_run_evidence["sig_a"] = ["output.confirmation_number"]
+    original = _agent_result("Model reply describing progress.")
+
+    result = agent_module._reconcile_turn_end_ownership(ctx, original)
+
+    assert result is not original
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind is TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert "I couldn't shape this workflow" in result.user_response
+
+
+def test_reconcile_turn_end_noop_without_live_grant() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
+    original = _agent_result()
+
+    assert agent_module._reconcile_turn_end_ownership(ctx, original) is original
+
+
+def test_reconcile_turn_end_failure_never_masks_original_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    def _boom(_: Any) -> None:
+        raise RuntimeError("reconcile failure")
+
+    monkeypatch.setattr(agent_module, "expire_output_contract_ladder_at_turn_end", _boom)
+    original = _agent_result()
+
+    assert agent_module._reconcile_turn_end_ownership(ctx, original) is original
+
+
+def _stalled_chat_request() -> WorkflowCopilotChatRequest:
+    return WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_xyz",
+        workflow_id="w_001",
+        workflow_copilot_chat_id="chat_abc",
+        message="build the workflow",
+        workflow_yaml="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_end_obligation_transforms_returned_result_on_normal_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[CopilotContext] = []
+
+    async def stub_impl(*, ctx_sink: list[CopilotContext], **_: Any) -> AgentResult:
+        ctx = _ctx()
+        ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+        ctx_sink.append(ctx)
+        captured.append(ctx)
+        return _agent_result("Model reply describing progress.")
+
+    monkeypatch.setattr(agent_module, "_run_copilot_turn_impl", stub_impl)
+
+    result = await agent_module.run_copilot_agent(
+        stream=object(),
+        organization_id="o_test",
+        chat_request=_stalled_chat_request(),
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=None,
+    )
+
+    ctx = captured[0]
+    assert ctx.turn_halt is not None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert "I couldn't shape this workflow" in result.user_response
+
+
+@pytest.mark.asyncio
+async def test_turn_end_obligation_preserves_error_terminal_and_expires_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[CopilotContext] = []
+
+    async def stub_impl(*, ctx_sink: list[CopilotContext], **_: Any) -> AgentResult:
+        ctx = _ctx()
+        ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+        ctx_sink.append(ctx)
+        captured.append(ctx)
+        raise RuntimeError("mid-turn failure")
+
+    monkeypatch.setattr(agent_module, "_run_copilot_turn_impl", stub_impl)
+
+    result = await agent_module.run_copilot_agent(
+        stream=object(),
+        organization_id="o_test",
+        chat_request=_stalled_chat_request(),
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=None,
+    )
+
+    ctx = captured[0]
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert "I couldn't shape this workflow" not in result.user_response
+
+
+def test_reconcile_turn_end_keeps_ask_question_result_and_expires_grant() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    original = AgentResult(
+        user_response="Which site should this run against?",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="ASK_QUESTION",
+    )
+
+    result = agent_module._reconcile_turn_end_ownership(ctx, original)
+
+    assert result is original
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+
+
+def test_reconcile_turn_end_keeps_cancelled_result_and_expires_grant() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    original = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        cancelled=True,
+    )
+
+    result = agent_module._reconcile_turn_end_ownership(ctx, original)
+
+    assert result is original
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED

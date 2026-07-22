@@ -5,12 +5,28 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import structlog
 from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 
 from skyvern import analytics
 
+LOG = structlog.get_logger(__name__)
+
 MCPServerMode = Literal["embedded", "local_cli", "cloud_hosted"]
+
+UNKNOWN_MCP_CLIENT = "unknown"
+
+_MAX_CLIENT_INFO_CHARS = 200
+
+
+def _sanitize_client_info_value(value: str) -> str:
+    # Bound before escaping so a huge client-controlled string does not
+    # allocate an arbitrarily large intermediate during `.replace()`.
+    sanitized = value[: _MAX_CLIENT_INFO_CHARS * 2].replace("\r", "\\r").replace("\n", "\\n")
+    if len(sanitized) <= _MAX_CLIENT_INFO_CHARS:
+        return sanitized
+    return f"{sanitized[:_MAX_CLIENT_INFO_CHARS]}... [truncated]"
 
 
 @dataclass(frozen=True)
@@ -77,6 +93,30 @@ def _resolve_client_id(context: MiddlewareContext[Any]) -> str | None:
     return None
 
 
+def _client_info_fields(client_info: Any) -> tuple[str, str] | None:
+    name = getattr(client_info, "name", None)
+    if not isinstance(name, str) or not name:
+        return None
+    version = getattr(client_info, "version", None)
+    if not isinstance(version, str) or not version:
+        version = UNKNOWN_MCP_CLIENT
+    return _sanitize_client_info_value(name), _sanitize_client_info_value(version)
+
+
+def _resolve_client_info(context: MiddlewareContext[Any]) -> tuple[str, str]:
+    """clientInfo from the initialize message, else the session's stored client params.
+
+    Clients may omit or malform clientInfo — fall back to "unknown", never raise.
+    """
+    params = getattr(context.message, "params", None)
+    fields = _client_info_fields(getattr(params, "clientInfo", None))
+    if fields is None and context.fastmcp_context is not None:
+        with suppress(RuntimeError):
+            client_params = getattr(context.fastmcp_context.session, "client_params", None)
+            fields = _client_info_fields(getattr(client_params, "clientInfo", None))
+    return fields or (UNKNOWN_MCP_CLIENT, UNKNOWN_MCP_CLIENT)
+
+
 def _content_text_bytes(content_block: Any) -> int:
     text = getattr(content_block, "text", None)
     if not isinstance(text, str):
@@ -99,6 +139,7 @@ def _capture_mcp_event(
     request = _resolve_http_request()
     organization_id = _resolve_organization_id(request)
     distinct_id, distinct_id_source = _resolve_distinct_id(organization_id)
+    client_name, client_version = _resolve_client_info(context)
 
     data: dict[str, Any] = {
         **analytics.analytics_metadata(),
@@ -114,6 +155,8 @@ def _capture_mcp_event(
         "request_id": _resolve_request_id(context),
         "session_id": _resolve_session_id(context),
         "client_id": _resolve_client_id(context),
+        "client_name": client_name,
+        "client_version": client_version,
     }
 
     if tool_name is not None:
@@ -136,17 +179,25 @@ def _capture_mcp_event(
     )
 
 
+def _extract_ok(payload: Any) -> bool | None:
+    if isinstance(payload, dict):
+        candidate = payload.get("ok")
+        if isinstance(candidate, bool):
+            return candidate
+    return None
+
+
 def _resolve_tool_call_ok(result: Any) -> bool:
     is_error = getattr(result, "is_error", None)
     if not isinstance(is_error, bool):
         is_error = False
 
-    data = getattr(result, "data", None)
-    result_ok = None
-    if isinstance(data, dict):
-        candidate = data.get("ok")
-        if isinstance(candidate, bool):
-            result_ok = candidate
+    # A FastMCP ToolResult exposes the tool's dict via `structured_content`, not
+    # `data`, so a tool (or the argument-validation middleware) reporting failure
+    # with `ok=False` must be read there too, or the failure is miscounted as ok.
+    result_ok = _extract_ok(getattr(result, "data", None))
+    if result_ok is None:
+        result_ok = _extract_ok(getattr(result, "structured_content", None))
 
     if result_ok is None:
         return not is_error
@@ -165,6 +216,16 @@ class MCPTelemetryMiddleware(Middleware):
             _capture_mcp_event("mcp_request", operation="initialize", context=context, ok=False, error=exc)
             raise
 
+        with suppress(Exception):
+            client_name, client_version = _resolve_client_info(context)
+            LOG.info(
+                "mcp_session_initialized",
+                mcp_client_name=client_name,
+                mcp_client_version=client_version,
+                session_id=_resolve_session_id(context),
+                runtime_mode=_runtime_config.server_mode,
+                transport=_runtime_config.transport,
+            )
         _capture_mcp_event("mcp_request", operation="initialize", context=context, ok=True)
         return result
 

@@ -5,6 +5,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -15,6 +16,7 @@ from skyvern.cli.core.session_ops import (
     do_session_create,
     do_session_list,
 )
+from skyvern.cli.core.trajectory_store import delete_session_trajectories
 from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import proxy_location_to_request
 
@@ -101,6 +103,11 @@ async def skyvern_browser_session_create(
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
 ) -> dict[str, Any]:
     """Create a new browser session to start interacting with websites. Cloud session results include app_url to watch the run live. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
+
+    This tool CREATES a new session and returns its id; it takes no session_id, url, steps, or selector.
+    To load a URL, run a sequence of steps, or act on an EXISTING session, first create the session, then
+    call skyvern_navigate(url=..., session_id=...), skyvern_execute(steps=[...], session_id=...), or the
+    click/type tools with that session_id.
 
     Use local=true for a local Chromium instance.
     The session persists across tool calls until explicitly closed.
@@ -301,6 +308,7 @@ async def skyvern_browser_session_close(
     Closes the specified session or the current active session.
     """
     current = get_current_session()
+    await drain_action_log_events()
 
     with Timer() as timer:
         try:
@@ -317,6 +325,7 @@ async def skyvern_browser_session_close(
                 try:
                     result = await do_session_close(skyvern, session_id)
                     clear_session_ref_map(session_id=session_id)
+                    delete_session_trajectories(session_id)
                 except Exception as e:
                     close_error = e
 
@@ -381,7 +390,8 @@ async def skyvern_browser_session_close(
 
 
 async def skyvern_browser_session_list() -> dict[str, Any]:
-    """List all active browser sessions. Use to find available sessions to connect to."""
+    """List all active browser sessions. Use to find available sessions to connect to. Returns every
+    active session in one call — it takes no arguments and does not paginate (no page/page_size)."""
     with Timer() as timer:
         try:
             skyvern = get_skyvern()

@@ -1,9 +1,10 @@
 import { artifactApiClient } from "@/api/AxiosClient";
+import { getWithMintRetry } from "@/api/artifactUrls";
 import { ArtifactApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useQueries } from "@tanstack/react-query";
-import axios from "axios";
 
 // https://stackoverflow.com/a/60338028
 function format(html: string) {
@@ -53,6 +54,7 @@ type Props = {
 };
 
 function Artifact({ type, artifacts }: Props) {
+  const credentialGetter = useCredentialGetter();
   const total = artifacts.length;
   const archivedCount = artifacts.filter((a) => a.archived).length;
   const allArchived = total > 0 && archivedCount === total;
@@ -60,7 +62,11 @@ function Artifact({ type, artifacts }: Props) {
 
   function fetchArtifact(artifact: ArtifactApiResponse) {
     if (artifact.signed_url) {
-      return axios.get(artifact.signed_url).then((response) => response.data);
+      return getWithMintRetry(
+        artifact.signed_url,
+        artifact.artifact_id,
+        credentialGetter,
+      );
     }
     if (artifact.uri.startsWith("file://")) {
       const endpoint = getEndpoint(type);

@@ -169,15 +169,21 @@ def make_completion_criterion(
     output_path: str | None = None,
     contingent_on: str | None = None,
     contingent_antecedent_output_path: str | None = None,
+    antecedent_family: str | None = None,
     kind: str = "outcome",
     terminal_action_family: str | None = None,
     deliverable_kind: str | None = None,
+    deliverable_confirmation_criterion_id: str | None = None,
     expected_output_value: str | None = None,
     expected_output_shape: str | None = None,
     requested_output_evidence_source: str = "runtime_output",
+    requested_output_path_mint_source: str | None = None,
     classification_output_key: str | None = None,
     expected_classification: str | bool | None = None,
     requested_output_corroborator: bool = False,
+    mint_degrade: str | None = None,
+    requested_output_floor_rekeyed: bool = False,
+    floor_rekeyed_from_path: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -187,13 +193,19 @@ def make_completion_criterion(
         output_path=output_path,
         contingent_on=contingent_on,
         contingent_antecedent_output_path=contingent_antecedent_output_path,
+        antecedent_family=antecedent_family,  # type: ignore[arg-type]
         kind=kind,  # type: ignore[arg-type]
         terminal_action_family=terminal_action_family,  # type: ignore[arg-type]
         deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
+        deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
         expected_output_value=expected_output_value,
         expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
         requested_output_evidence_source=requested_output_evidence_source,  # type: ignore[arg-type]
+        requested_output_path_mint_source=requested_output_path_mint_source,  # type: ignore[arg-type]
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
         requested_output_corroborator=requested_output_corroborator,
+        mint_degrade=mint_degrade,  # type: ignore[arg-type]
+        requested_output_floor_rekeyed=requested_output_floor_rekeyed,
+        floor_rekeyed_from_path=floor_rekeyed_from_path,
     )

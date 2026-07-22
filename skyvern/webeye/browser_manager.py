@@ -48,7 +48,16 @@ class BrowserManager(Protocol):
         self,
         script_id: str | None = None,
         browser_session_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BrowserState: ...
+
+    async def cleanup_for_script(
+        self,
+        script_id: str,
+        close_browser_on_completion: bool = True,
+        browser_session_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> BrowserState | None: ...
 
     def evict_page(self, page_id: str) -> None: ...
 

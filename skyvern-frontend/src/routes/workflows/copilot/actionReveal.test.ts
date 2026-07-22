@@ -62,4 +62,19 @@ describe("revealedCountAt", () => {
   it("reveals nothing for negative elapsed", () => {
     expect(revealedCountAt(offsets, -50)).toBe(0);
   });
+
+  it("never un-reveals a shown row when the action list grows under live polling", () => {
+    // Live polling appends actions to a block whose reveal anchor stays fixed.
+    // buildRevealOffsets recomputes from the full (grown) list and may rescale
+    // to the 6s cap, shrinking every offset — which can only reveal MORE at a
+    // fixed elapsed, never fewer. Guards against a growing set flickering rows
+    // back to hidden.
+    const base = [900, 900, 900];
+    const grown = [900, 900, 900, 900, 900, 900, 900, 900]; // total > 6s cap -> rescaled
+    for (let elapsed = 0; elapsed <= 8000; elapsed += 137) {
+      const before = revealedCountAt(buildRevealOffsets(base), elapsed);
+      const after = revealedCountAt(buildRevealOffsets(grown), elapsed);
+      expect(after).toBeGreaterThanOrEqual(before);
+    }
+  });
 });

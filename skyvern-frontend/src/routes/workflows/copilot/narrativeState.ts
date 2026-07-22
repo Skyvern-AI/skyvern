@@ -20,8 +20,9 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
 
-// A code block's recorded actions, fetched once from the run timeline after
-// a run_outcome frame arrives (block_progress carries no action detail).
+// A block's recorded actions, fetched from the run timeline while the test run
+// is live (polled from the first frame that carries the run id) and again at
+// adjudication. block_progress carries no action detail, only the run id.
 export interface RecordedActionSummary {
   actionId: string;
   label: string;
@@ -42,6 +43,15 @@ export interface CopilotBlockActionsEvent {
   receivedAtMs: number;
 }
 
+// Client-synthesized event marking that the drafting silence (no frames
+// while the LLM writes code) has lasted long enough to assume Draft has
+// started. Idempotent in the reducer so a re-armed timer or StrictMode
+// double-fire is a no-op.
+export interface CopilotPhaseHintEvent {
+  type: "client_phase_hint";
+  hintedAtMs: number;
+}
+
 // Discriminated union of every event the reducer below consumes. The bubble
 // derives all of its rendering from these payloads.
 export type NarrativeEvent =
@@ -56,7 +66,8 @@ export type NarrativeEvent =
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
-  | CopilotBlockActionsEvent;
+  | CopilotBlockActionsEvent
+  | CopilotPhaseHintEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
 // failed-style states (failed, terminated, timed_out, canceled) under one
@@ -94,8 +105,8 @@ export interface BlockState {
   // ``done · 0:14``-style elapsed pill in the card.
   startedAt: string | null;
   endedAt: string | null;
-  // Recorded actions fetched post-run for progressive reveal. Undefined
-  // until the one-shot fetch resolves; set at most once (idempotent).
+  // Recorded actions for progressive reveal. Undefined until the first fetch
+  // resolves; grows by actionId as live polls return more (idempotent merge).
   recordedActions?: RecordedActionSummary[];
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
@@ -117,6 +128,9 @@ export interface ActivityEntry {
   success?: boolean;
   // Stable per-event id used as React key.
   id: string;
+  // Consecutive same-tool retries folded into this row by
+  // condenseActivityEntries. Unset outside that transform.
+  attempts?: number;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -163,6 +177,42 @@ export interface TurnNarrativeState {
   // Activity events fired BEFORE any block started running this turn
   // (design phase + pre-execution tool calls), rendered inside the Design card.
   designActivity: ActivityEntry[];
+  // Client-only phase-progress state (never persisted): epoch ms of the most
+  // recent tool_call/tool_result/narration, and when the 8s drafting-gap
+  // heuristic fired. Grafted across the terminal payload swap by turnId so a
+  // cancel-mid-silence doesn't visually un-check the Draft phase.
+  lastActivityAtMs: number | null;
+  draftingSignaledAt: number | null;
+  // Count of AUTHORING_TOOLS tool_calls this turn, kept outside designActivity
+  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap. Drives the
+  // redraft-iteration label ("Draft v2 — revising…") and Draft re-activation.
+  authoringCount: number;
+  // Monotonic count of tool_call events this turn — the only frame kind
+  // that's unambiguous evidence of new agent-initiated work (tool_result is
+  // always a trailing echo; narration can be scheduled as post-hoc
+  // reporting independent of new work — see the reducer cases). Never
+  // capped (unlike designActivity.length, which plateaus once
+  // MAX_DESIGN_ACTIVITY_ENTRIES is full).
+  activitySeq: number;
+  // Snapshot of the most recent run_outcome verdict plus the activity
+  // sequence number at the moment it arrived, so a later activity frame
+  // proves the loop kept going (a redraft), not just a slow give-up
+  // response. Not grafted across terminal — cancel-mid-redraft marks Test
+  // stopped rather than Draft (accepted).
+  lastRunOutcome: {
+    verdict: BlockOutcome;
+    displayReason: string | null;
+    activitySeqAtVerdict: number;
+  } | null;
+  // Terminal-mode credential ask, from the credentialPrompt narrative signal.
+  // reason is kept as a raw string — the card tolerates unknown tokens.
+  credentialPrompt: { reason: string } | null;
+  // Resolved pause outcome, from the credentialPause narrative signal.
+  // "declined" means the pause engaged but never sent a frame, so no card.
+  credentialPause: {
+    outcome: "connected" | "skipped" | "timeout" | "declined";
+    credentialId: string | null;
+  } | null;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -185,6 +235,13 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
+  lastActivityAtMs: null,
+  draftingSignaledAt: null,
+  authoringCount: 0,
+  activitySeq: 0,
+  lastRunOutcome: null,
+  credentialPrompt: null,
+  credentialPause: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -213,6 +270,47 @@ export function parseResponseKind(value: unknown): TurnResponseKind | null {
     ? value
     : null;
 }
+
+export function parseCredentialPrompt(
+  value: unknown,
+): TurnNarrativeState["credentialPrompt"] {
+  if (!value || typeof value !== "object") return null;
+  const reason = (value as Record<string, unknown>).reason;
+  return typeof reason === "string" && reason.length > 0 ? { reason } : null;
+}
+
+export function parseCredentialPause(
+  value: unknown,
+): TurnNarrativeState["credentialPause"] {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const outcome = o.outcome;
+  if (
+    outcome !== "connected" &&
+    outcome !== "skipped" &&
+    outcome !== "timeout" &&
+    outcome !== "declined"
+  ) {
+    return null;
+  }
+  return {
+    outcome,
+    credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+  };
+}
+
+// Tool calls that write the workflow definition. update_workflow only
+// validates/saves the draft; update_and_run_blocks also runs it, so it's
+// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
+// activity lands in the Test phase bucket, not Draft — see copilotPhases.ts).
+export const AUTHORING_TOOLS = new Set([
+  "update_workflow",
+  "update_and_run_blocks",
+]);
+export const RUN_TOOLS = new Set([
+  "update_and_run_blocks",
+  "run_blocks_and_collect_debug",
+]);
 
 // Tool names we never surface in the user-facing activity log. Internal
 // observation/maintenance tools are not interesting context for the user.
@@ -290,6 +388,129 @@ function buildActivityFromNarration(
   };
 }
 
+// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention —
+// also used by copilotPhases.ts's hasPendingToolCall.
+export function toolCallIdOf(entry: ActivityEntry): string | undefined {
+  return entry.kind === "tool_call" || entry.kind === "tool_result"
+    ? entry.id.slice(3)
+    : undefined;
+}
+
+// Folds each tool_call/tool_result pair into one row (pending while
+// unresolved, replaced by its result once it lands) so a single tool
+// invocation never renders as two chatter lines, then folds a run of
+// same-tool retries into the last attempt's row with an attempt count —
+// only the terminal outcome of a retry chain ever shows red, intermediate
+// failed attempts stay quiet.
+//
+// Chronology, not just row count: a call is only replaced IN PLACE when
+// nothing else streamed while it was pending. If a narration arrived first
+// (the narrator can emit mid-flight progress on a slow call), replacing in
+// place would render the result ahead of a narration that genuinely came
+// earlier — so the stale pending row is dropped instead and the result
+// lands at its own later, true position.
+//
+// The retry fold below deliberately ignores narration rows entirely for
+// adjacency (tracks the last TOOL row, not literal array adjacency).
+// Array position alone can't reliably tell "narration mid-flight during
+// this attempt" from "narration genuinely between two attempts" once a
+// retry's own narration is involved — a mid-flight narration during
+// attempt 2 lands in the exact same ordered position as one that arrived
+// between attempt 1 and attempt 2. Since there's no per-entry signal to
+// disambiguate the two, narration never breaks a retry fold, full stop.
+// Folding itself follows the same drop-and-reinsert rule as pairing above:
+// the earlier attempt's row is removed rather than overwritten in place,
+// so a narration that streamed before the later attempt's result still
+// reads as arriving before it, not after.
+//
+// Known tradeoff: toolName is the only correlation signal available here
+// (no argument/target identity on the wire), so two independent same-tool
+// calls where only the first fails will also fold into one falsely-labeled
+// "retry" row. Accepted for this content-classification pass.
+//
+// A tool without a dedicated backend summary falls back to a bare "OK"
+// (summarize_tool_result in output_utils.py). That used to sit right below
+// its own "<tool name> · calling…" row, so the tool name was still visible
+// above it; condensing removes that row, leaving an unlabeled "OK" with no
+// context. Substitute the humanized tool name only for that exact literal
+// — a real backend summary always passes through untouched.
+const UNMAPPED_TOOL_RESULT_FALLBACK = "OK";
+
+function withHumanizedFallback(entry: ActivityEntry): ActivityEntry {
+  if (
+    entry.kind !== "tool_result" ||
+    entry.text !== UNMAPPED_TOOL_RESULT_FALLBACK
+  ) {
+    return entry;
+  }
+  return {
+    ...entry,
+    text: entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName),
+  };
+}
+
+export function condenseActivityEntries(
+  entries: ActivityEntry[],
+): ActivityEntry[] {
+  const callIndexById = new Map<string, number>();
+  const paired: (ActivityEntry | null)[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "tool_call") {
+      const id = toolCallIdOf(entry);
+      const idx = paired.push(entry) - 1;
+      if (id !== undefined) callIndexById.set(id, idx);
+      continue;
+    }
+    if (entry.kind === "tool_result") {
+      const id = toolCallIdOf(entry);
+      const idx = id !== undefined ? callIndexById.get(id) : undefined;
+      if (idx !== undefined) {
+        callIndexById.delete(id!);
+        if (idx === paired.length - 1) {
+          paired[idx] = entry;
+        } else {
+          paired[idx] = null;
+          paired.push(entry);
+        }
+      } else {
+        // Its tool_call was evicted past the activity cap — keep the
+        // result visible rather than silently dropping it.
+        paired.push(entry);
+      }
+      continue;
+    }
+    paired.push(entry);
+  }
+  const ordered = paired.filter((e): e is ActivityEntry => e !== null);
+
+  const condensed: (ActivityEntry | null)[] = [];
+  let lastToolIdx = -1;
+  for (const entry of ordered) {
+    const prevTool = lastToolIdx >= 0 ? condensed[lastToolIdx] : undefined;
+    if (
+      prevTool &&
+      entry.toolName !== undefined &&
+      prevTool.toolName === entry.toolName &&
+      prevTool.success === false
+    ) {
+      condensed[lastToolIdx] = null;
+      lastToolIdx =
+        condensed.push({
+          ...entry,
+          attempts: (prevTool.attempts ?? 1) + 1,
+        }) - 1;
+      continue;
+    }
+    const idx = condensed.push(entry) - 1;
+    if (entry.toolName !== undefined) {
+      lastToolIdx = idx;
+    }
+  }
+  return condensed
+    .filter((e): e is ActivityEntry => e !== null)
+    .map(withHumanizedFallback);
+}
+
 function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   const next = [...arr, entry];
   return next.length > cap ? next.slice(next.length - cap) : next;
@@ -357,6 +578,7 @@ export function isBlockOk(
 export function applyNarrativeEvent(
   prev: TurnNarrativeState,
   event: NarrativeEvent,
+  nowMs: number = Date.now(),
 ): TurnNarrativeState {
   switch (event.type) {
     case "turn_start":
@@ -481,63 +703,138 @@ export function applyNarrativeEvent(
             }
           : b,
       );
-      return { ...prev, blocks };
+      return {
+        ...prev,
+        blocks,
+        // Last-write-wins: an "evaluating" hold overwrites a stale failed
+        // verdict from a prior run cycle within the same turn.
+        lastRunOutcome: {
+          verdict: event.verdict,
+          displayReason: event.display_reason ?? null,
+          activitySeqAtVerdict: prev.activitySeq,
+        },
+      };
     }
 
     case "client_block_actions": {
-      // Idempotent merge: a block's recordedActions is set at most once, so
-      // a duplicate fetch response (or a re-dispatched event) is a no-op.
-      // Stagger each matched block's reveal start past the running total of
-      // its predecessors' own schedules, so a multi-block run replays in
-      // execution order instead of all at once.
+      // Idempotent grow-merge: live polling re-fetches the same run repeatedly
+      // and returns a growing action set. First sighting seeds the reveal
+      // anchor (recordedActionsAt), staggered past preceding blocks' schedules
+      // so a multi-block run replays in execution order. Later fetches append
+      // only actions we haven't seen (keyed by actionId) and keep the anchor
+      // fixed, so already-revealed rows never restart or duplicate.
+      // ponytail: an existing action's fields (duration/summary) are frozen at
+      // first sighting; if code-block streaming (null-then-backfill) makes that
+      // visibly wrong, re-merge matched actionIds instead of skipping them.
       let carry = 0;
       let changed = false;
       const blocks = prev.blocks.map((b) => {
-        if (b.recordedActions !== undefined) return b;
         const match = event.blocks.find(
           (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
         );
         if (!match || match.actions.length === 0) return b;
+        const existing = b.recordedActions;
+        if (existing === undefined) {
+          changed = true;
+          const recordedActionsAt = event.receivedAtMs + carry;
+          const offsets = buildRevealOffsets(
+            match.actions.map((a) => a.durationMs),
+          );
+          carry += offsets[offsets.length - 1] ?? 0;
+          return { ...b, recordedActions: match.actions, recordedActionsAt };
+        }
+        const known = new Set(existing.map((a) => a.actionId));
+        const additions = match.actions.filter((a) => !known.has(a.actionId));
+        if (additions.length === 0) return b;
         changed = true;
-        const recordedActionsAt = event.receivedAtMs + carry;
-        const durations = match.actions.map((a) => a.durationMs);
-        const offsets = buildRevealOffsets(durations);
-        carry += offsets[offsets.length - 1] ?? 0;
-        return { ...b, recordedActions: match.actions, recordedActionsAt };
+        return { ...b, recordedActions: [...existing, ...additions] };
       });
       return changed ? { ...prev, blocks } : prev;
     }
 
     case "tool_call": {
       const entry = buildActivityFromToolCall(event);
-      if (!entry) return prev;
+      const authoringCount =
+        prev.authoringCount + (AUTHORING_TOOLS.has(event.tool_name) ? 1 : 0);
+      const activitySeq = prev.activitySeq + 1;
+      if (!entry) {
+        return {
+          ...prev,
+          lastActivityAtMs: nowMs,
+          authoringCount,
+          activitySeq,
+        };
+      }
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
         entry,
       );
-      return { ...prev, blocks, designActivity };
+      return {
+        ...prev,
+        blocks,
+        designActivity,
+        lastActivityAtMs: nowMs,
+        authoringCount,
+        activitySeq,
+      };
     }
 
     case "tool_result": {
+      // Deliberately does NOT bump activitySeq: a failed run's own
+      // update_and_run_blocks call always emits its trailing tool_result
+      // right after the run_outcome verdict it produced — counting that
+      // guaranteed echo would make redrafting fire on every failed verdict
+      // before the agent has done any new work. Only tool_call/narration
+      // (agent-initiated steps) count as evidence the loop continued.
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return prev;
+      if (!entry) return { ...prev, lastActivityAtMs: nowMs };
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
         entry,
       );
-      return { ...prev, blocks, designActivity };
+      return {
+        ...prev,
+        blocks,
+        designActivity,
+        lastActivityAtMs: nowMs,
+      };
     }
 
     case "narration": {
+      // Also does NOT bump activitySeq: the narrator can schedule a
+      // "reporting on what just happened" narration right after a failed
+      // run's own tool_result (streaming_adapter.py schedule_narration),
+      // independent of whether the agent is actually going to revise —
+      // only a genuinely new tool_call is unambiguous evidence of that.
       const entry = buildActivityFromNarration(event);
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
         entry,
       );
-      return { ...prev, blocks, designActivity };
+      return {
+        ...prev,
+        blocks,
+        designActivity,
+        lastActivityAtMs: nowMs,
+      };
+    }
+
+    case "client_phase_hint": {
+      // No-op once drafting is already signaled or the turn has moved past
+      // pure exploration — idempotent by construction so a re-armed timer or
+      // a StrictMode double-fire never overwrites an earlier timestamp.
+      if (
+        prev.draftingSignaledAt !== null ||
+        prev.draft !== null ||
+        prev.designEnded ||
+        prev.blocks.some((b) => b.state !== "drafted")
+      ) {
+        return prev;
+      }
+      return { ...prev, draftingSignaledAt: event.hintedAtMs };
     }
 
     case "response": {
@@ -565,6 +862,13 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
+          // Graft across the terminal replacement so a cancel mid-silence
+          // doesn't visually un-check the Draft phase (hydrated payloads
+          // never carry this client-only field). authoringCount/lastRunOutcome
+          // are intentionally NOT grafted — a stubs-only terminal checklist is
+          // correct there.
+          draftingSignaledAt:
+            hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -818,6 +1122,8 @@ export function hydrateNarrativeFromPayload(
         : null,
     endedAt:
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
+    credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
+    credentialPause: parseCredentialPause(payload.credentialPause),
   };
 }
 
@@ -932,8 +1238,17 @@ function adjudicatedSummaryParts(
     hasDrafts: boolean;
     hasCleanCompletedBuild: boolean;
   },
+  uxV1 = false,
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
+  // Disposition-first (rule A): a pending draft review outranks why the turn
+  // ended, regardless of responseKind (including non-build/clarify turns).
+  if (uxV1 && flags.needsUntestedProposalReview) {
+    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
+  }
+  if (uxV1 && flags.needsTestedProposalReview) {
+    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
+  }
   if (turn.responseKind !== "build") {
     return {
       headline:
@@ -941,7 +1256,9 @@ function adjudicatedSummaryParts(
           ? "Declined"
           : turn.responseKind === "diagnose"
             ? "Answered"
-            : "Question",
+            : uxV1
+              ? "Needs your input"
+              : "Question",
       accent: "qa",
       glyph: "✦",
     };
@@ -982,7 +1299,11 @@ function adjudicatedSummaryParts(
   return { headline: "Completed the run", accent: "ok", glyph: "✓" };
 }
 
-export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
+export function computeTurnSummary(
+  turn: TurnNarrativeState,
+  opts: { uxV1?: boolean } = {},
+): TurnSummary {
+  const uxV1 = opts.uxV1 ?? false;
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const isFail =
     turn.terminal === "error" || rollupBlocks.some((b) => b.state === "failed");
@@ -1014,13 +1335,17 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const adjudicated =
     isStoppedWithDraft || isFail
       ? null
-      : adjudicatedSummaryParts(turn, {
-          needsUntestedProposalReview,
-          needsTestedProposalReview,
-          hasEdited,
-          hasDrafts,
-          hasCleanCompletedBuild,
-        });
+      : adjudicatedSummaryParts(
+          turn,
+          {
+            needsUntestedProposalReview,
+            needsTestedProposalReview,
+            hasEdited,
+            hasDrafts,
+            hasCleanCompletedBuild,
+          },
+          uxV1,
+        );
 
   const headline = adjudicated
     ? adjudicated.headline
@@ -1028,23 +1353,41 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
       ? "Stopped with a draft"
       : isFail
         ? "Run halted"
-        : needsInput
-          ? "Question"
-          : needsUntestedProposalReview
+        : uxV1
+          ? needsUntestedProposalReview
             ? "Draft needs review"
             : needsTestedProposalReview
               ? "Workflow ready for review"
-              : isQA
-                ? mode === "refuse"
-                  ? "Declined"
-                  : mode === "clarify"
-                    ? "Question"
-                    : "Answered"
-                : hasEdited
-                  ? "Applied edits and re-tested"
-                  : hasDrafts
-                    ? "Built and tested the workflow"
-                    : "Completed the run";
+              : needsInput
+                ? "Needs your input"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Needs your input"
+                      : "Answered"
+                  : hasEdited
+                    ? "Applied edits and re-tested"
+                    : hasDrafts
+                      ? "Built and tested the workflow"
+                      : "Completed the run"
+          : needsInput
+            ? "Question"
+            : needsUntestedProposalReview
+              ? "Draft needs review"
+              : needsTestedProposalReview
+                ? "Workflow ready for review"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Question"
+                      : "Answered"
+                  : hasEdited
+                    ? "Applied edits and re-tested"
+                    : hasDrafts
+                      ? "Built and tested the workflow"
+                      : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);

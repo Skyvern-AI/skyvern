@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import typing as t
 import weakref
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource,
@@ -283,6 +286,36 @@ class TestExfiltrationChannelEvents:
         assert len(events) == 1
 
     @pytest.mark.asyncio
+    async def test_stop_survives_closed_page_during_undecorate(self) -> None:
+        """SKY-12366: a closed browser target must not crash channel teardown.
+
+        In production the browser target churns mid-recording (take-control toggles,
+        navigations, bot-detection pages), so when stop() calls undecorate() on a page
+        whose target is already gone, page.add_init_script raises TargetClosedError.
+        That must be swallowed: otherwise it propagates out of stop() -> handle_data ->
+        the message-channel loop and tears down the whole recording pipeline, which is
+        what dropped users' clicks/typing and produced empty workflows.
+        """
+        channel, _ = _make_channel()
+
+        closed_page = _make_page(url="https://example.com")
+        closed_page.add_init_script = AsyncMock(
+            side_effect=TargetClosedError("Page.add_init_script: Target page, context or browser has been closed")
+        )
+
+        browser_context = MagicMock()
+        browser_context.pages = [closed_page]
+        channel.browser_context = browser_context
+
+        # Must not raise: TargetClosedError from undecorate() would otherwise escape
+        # stop() -> handle_data -> the message-channel loop.
+        result = await channel.stop()
+
+        assert result is channel
+        # The undecorate path genuinely ran and hit the closed-target error.
+        closed_page.add_init_script.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_exfiltrate_rearms_existing_page_without_duplicate_listeners(self) -> None:
         channel, _ = _make_channel()
         page = _make_page()
@@ -470,3 +503,252 @@ class TestNavigationReExfiltration:
         on_event.assert_called_once()
         channel.exfiltrate.assert_not_called()
         channel.adorn.assert_not_called()
+
+
+class _FakeCdpSession:
+    def __init__(self) -> None:
+        self.detached = False
+
+    async def send(self, method: str, params: dict | None = None) -> None:
+        return None
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class _FakePwPage:
+    def __init__(self, context: _FakeContext) -> None:
+        self.url = "https://example.com"
+        self.context = context
+
+    async def add_init_script(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    async def evaluate(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def on(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def remove_listener(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.pages: list[_FakePwPage] = [_FakePwPage(self)]
+
+    async def new_cdp_session(self, page: object) -> _FakeCdpSession:
+        return _FakeCdpSession()
+
+
+class _FakePwBrowser:
+    """A stand-in for a Playwright Browser obtained via connect_over_cdp."""
+
+    def __init__(self, *, fire_disconnect_on_close: bool) -> None:
+        self._connected = True
+        self._fire_disconnect_on_close = fire_disconnect_on_close
+        self.handlers: dict[str, t.Callable[[], None]] = {}
+        self.context = _FakeContext()
+        self.contexts = [self.context]
+        self.close_calls = 0
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def on(self, event: str, callback: t.Callable[[], None]) -> None:
+        self.handlers[event] = callback
+
+    async def new_browser_cdp_session(self) -> _FakeCdpSession:
+        return _FakeCdpSession()
+
+    async def new_context(self) -> _FakeContext:
+        return self.context
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self._connected = False
+        # Real playwright fires "disconnected" when a connected browser is closed;
+        # this reproduces that so the reconnect-guard can be exercised end-to-end.
+        if self._fire_disconnect_on_close:
+            handler = self.handlers.get("disconnected")
+            if handler is not None:
+                handler()
+
+
+class _FakePw:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+class _FakePwManager:
+    def __init__(self, on_start: t.Callable[[], _FakePw]) -> None:
+        self._on_start = on_start
+
+    async def start(self) -> _FakePw:
+        return self._on_start()
+
+
+def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close: bool = False) -> SimpleNamespace:
+    """Replace the Playwright driver + CDP connect helper with counting fakes.
+
+    `start_calls` counts local Playwright driver spawns, so a reconnect (which starts
+    a fresh driver) is observable without launching a real Node subprocess.
+    """
+    import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
+
+    state = SimpleNamespace(start_calls=0, pws=[], browsers=[])
+
+    def _make_pw() -> _FakePw:
+        state.start_calls += 1
+        pw = _FakePw()
+        state.pws.append(pw)
+        return pw
+
+    def _fake_async_playwright() -> _FakePwManager:
+        return _FakePwManager(_make_pw)
+
+    async def _fake_connect(pw: object, url: str, headers: dict | None = None) -> _FakePwBrowser:
+        browser = _FakePwBrowser(fire_disconnect_on_close=fire_disconnect_on_close)
+        state.browsers.append(browser)
+        return browser
+
+    monkeypatch.setattr(cdp_mod, "async_playwright", _fake_async_playwright)
+    monkeypatch.setattr(cdp_mod, "connect_over_cdp_with_diagnostics", _fake_connect)
+    return state
+
+
+class TestExfiltrationChannelLifecycle:
+    def test_js_asset_cache_is_keyed_by_file_not_instance(self) -> None:
+        from skyvern.forge.sdk.routes.streaming.channels.cdp import _load_js_asset
+
+        _load_js_asset.cache_clear()
+
+        channel_a, _ = _make_channel()
+        channel_b, _ = _make_channel()
+
+        assert channel_a.js("exfiltrate") == channel_b.js("exfiltrate")
+        # Two instances, one asset -> a single cache entry keyed by file name, not one
+        # entry per (self, file_name) as the old bound-method lru_cache produced.
+        assert _load_js_asset.cache_info().currsize == 1
+
+        channel_a.js("adorn")
+        assert _load_js_asset.cache_info().currsize == 2
+
+    def test_using_js_does_not_pin_channel_instance(self) -> None:
+        # A cycle-free vnc stand-in so the channel is reclaimed by refcounting the
+        # moment the JS cache stops pinning it (a MagicMock carries internal cycles).
+        vnc_channel = SimpleNamespace(identity={"client_id": "c"}, browser_session=None, x_api_key=None)
+        channel = ExfiltrationChannel(on_event=lambda _events: None, vnc_channel=vnc_channel)  # type: ignore[arg-type]
+
+        channel.js("exfiltrate")
+        ref = weakref.ref(channel)
+
+        del channel
+        gc.collect()
+
+        assert ref() is None
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_playwright_driver(self) -> None:
+        channel, _ = _make_channel()
+        browser = _FakePwBrowser(fire_disconnect_on_close=False)
+        pw = _FakePw()
+        channel.browser = browser  # type: ignore[assignment]
+        channel.pw = pw  # type: ignore[assignment]
+        channel.browser_context = browser.context  # type: ignore[assignment]
+        channel.page = browser.context.pages[0]  # type: ignore[assignment]
+
+        await channel.stop()
+
+        assert browser.close_calls == 1
+        assert pw.stopped is True
+        assert channel.browser is None
+        assert channel.pw is None
+
+    @pytest.mark.asyncio
+    async def test_repeated_stop_is_idempotent(self) -> None:
+        channel, _ = _make_channel()
+        browser = _FakePwBrowser(fire_disconnect_on_close=False)
+        pw = _FakePw()
+        channel.browser = browser  # type: ignore[assignment]
+        channel.pw = pw  # type: ignore[assignment]
+        channel.browser_context = browser.context  # type: ignore[assignment]
+        channel.page = browser.context.pages[0]  # type: ignore[assignment]
+
+        await channel.stop()
+        await channel.stop()
+
+        assert browser.close_calls == 1
+        assert pw.stopped is True
+        assert channel.browser is None
+        assert channel.pw is None
+
+    @pytest.mark.asyncio
+    async def test_intentional_stop_does_not_reconnect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=True)
+        channel, _ = _make_channel()
+
+        await channel.connect()
+        assert state.start_calls == 1
+
+        await channel.stop()
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        # The browser's "disconnected" event fires during the intentional close, but
+        # the guard must keep it from spawning a replacement driver.
+        assert state.start_calls == 1
+        assert state.browsers[0].close_calls >= 1
+        assert state.pws[0].stopped is True
+
+    @pytest.mark.asyncio
+    async def test_connect_is_suppressed_after_intentional_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A reconnect task scheduled by a genuine mid-recording disconnect, arriving just
+        # after teardown, must not resurrect the driver once the channel is marked closing.
+        state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=False)
+        channel, _ = _make_channel()
+
+        await channel.connect()
+        assert state.start_calls == 1
+
+        channel._closing = True
+        await channel.close()
+        await channel.connect()
+
+        assert state.start_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_unexpected_disconnect_reconnects_when_not_closing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=False)
+        channel, _ = _make_channel()
+
+        await channel.connect()
+        assert state.start_calls == 1
+        on_close = state.browsers[0].handlers["disconnected"]
+
+        # An unexpected drop (channel not intentionally closed) must still reconnect.
+        on_close()
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if state.start_calls >= 2:
+                break
+
+        assert state.start_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_adorn_loads_asset_through_shared_cache(self) -> None:
+        from skyvern.forge.sdk.routes.streaming.channels.cdp import _load_js_asset
+
+        _load_js_asset.cache_clear()
+        channel, _ = _make_channel()
+        page = _make_page()
+
+        await channel.adorn(page)
+
+        page.evaluate.assert_awaited()
+        page.add_init_script.assert_awaited()
+        assert _load_js_asset.cache_info().currsize == 1

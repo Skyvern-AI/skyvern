@@ -6,20 +6,23 @@ from typing import Any
 
 import pytest
 
-from skyvern.forge.agent_functions import CopilotAliasResolution
+from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
     _inspect_page_for_composition_impl,
+    _rank_discovery_entrypoint_candidates,
     _resolve_discovery_entry_url,
-    discovery,
 )
+from skyvern.forge.sdk.copilot.tools.discovery import _discovery_build_result
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
     def __init__(self, server: object) -> None:
+        self.turn_origin = TurnOrigin.interactive
         self.discovery_mcp_server = server
         self.discovery_started_monotonic = None
         self.discovery_step_count = 0
@@ -271,40 +274,22 @@ class _TargetThenCurrentPageServer:
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
-class _AliasAgentFunction:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
-
-    def resolve_copilot_entrypoint_alias(
-        self,
-        *,
-        site_or_url: str,
-        normalized_alias: str,
-    ) -> CopilotAliasResolution | None:
-        self.calls.append((site_or_url, normalized_alias))
-        if normalized_alias == "publicalias":
-            return CopilotAliasResolution(url="https://public-alias.test/start")
-        return None
-
-
 @pytest.mark.parametrize(
-    "site_or_url",
+    ("site_or_url", "expected"),
     [
-        "public-alias",
-        "public alias",
-        "PUBLIC_ALIAS",
+        ("https://example.com/login", ("https://example.com/login", "url")),
+        ("HTTP://example.com/login", ("HTTP://example.com/login", "url")),
+        ("example.com", ("https://example.com", "domain")),
+        ("example.com/login?x=y", ("https://example.com/login?x=y", "domain")),
+        ("example", (None, "bare_word")),
+        ("example search portal", (None, "unresolved")),
     ],
 )
-def test_resolve_discovery_entry_url_uses_configured_alias_hook(
-    monkeypatch: pytest.MonkeyPatch,
+def test_resolve_discovery_entry_url_classifies_without_guessing(
     site_or_url: str,
+    expected: tuple[str | None, str],
 ) -> None:
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", _AliasAgentFunction())
-
-    assert _resolve_discovery_entry_url(site_or_url) == (
-        "https://public-alias.test/start",
-        "canonical_alias",
-    )
+    assert _resolve_discovery_entry_url(site_or_url) == expected
 
 
 @pytest.mark.parametrize(
@@ -317,35 +302,114 @@ def test_resolve_discovery_entry_url_uses_configured_alias_hook(
     ],
 )
 def test_resolve_discovery_entry_url_preserves_url_and_domain_inputs(
-    monkeypatch: pytest.MonkeyPatch,
     site_or_url: str,
     expected: tuple[str, str],
 ) -> None:
-    agent_function = _AliasAgentFunction()
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
-
     assert _resolve_discovery_entry_url(site_or_url) == expected
-    assert agent_function.calls == []
 
 
-def test_resolve_discovery_entry_url_unknown_bare_word_still_falls_back_to_www(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_function = _AliasAgentFunction()
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+def test_legacy_url_domain_result_envelope_has_no_bare_word_contract_version() -> None:
+    result = _discovery_build_result(
+        candidate_url="https://example.com/",
+        candidate_form_fields=[],
+        evidence_trail=[],
+        confidence=0.6,
+        failure_reason=None,
+    )
 
-    assert _resolve_discovery_entry_url("example") == ("https://www.example.com", "word")
-    assert agent_function.calls == [("example", "example")]
+    assert result == {
+        "ok": True,
+        "data": {
+            "candidate_url": "https://example.com/",
+            "candidate_form_fields": [],
+            "evidence_trail": [],
+            "confidence": 0.6,
+            "failure_reason": None,
+        },
+        "error": None,
+    }
 
 
-def test_resolve_discovery_entry_url_unknown_spaced_phrase_remains_unresolved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_function = _AliasAgentFunction()
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+def test_rank_discovery_entrypoint_candidates_accepts_provider_association_with_different_entity_label() -> None:
+    candidates = [
+        CopilotEntrypointCandidate(
+            url="https://irrelevant.example/news",
+            source_rank=1,
+            association=CopilotSiteOriginAssociation(
+                requested_name="public alias",
+                entity_id="Q1",
+                entity_label="Unrelated result",
+                official_site_url="https://irrelevant.example/news",
+                origin="https://irrelevant.example",
+                source="provider_official_site",
+                provider_relation_type="label",
+                provider_relation_text="public alias",
+            ),
+        ),
+        CopilotEntrypointCandidate(
+            url="https://attacker.example/start",
+            source_rank=2,
+            association=CopilotSiteOriginAssociation(
+                requested_name="public alias",
+                entity_id="Q2",
+                entity_label="Public Alias",
+                official_site_url="https://public-alias.test/start",
+                origin="https://public-alias.test",
+                source="provider_official_site",
+                provider_relation_type="alias",
+                provider_relation_text="public alias",
+            ),
+        ),
+        CopilotEntrypointCandidate(
+            url="https://public-alias.test/start",
+            source_rank=3,
+            association=CopilotSiteOriginAssociation(
+                requested_name="public alias",
+                entity_id="Q3",
+                entity_label="Public Alias",
+                official_site_url="https://public-alias.test/start",
+                origin="https://public-alias.test",
+                source="provider_official_site",
+                provider_relation_type="alias",
+                provider_relation_text="public alias",
+            ),
+        ),
+    ]
 
-    assert _resolve_discovery_entry_url("example search portal") == (None, "unresolved")
-    assert agent_function.calls == [("example search portal", "examplesearchportal")]
+    assert _rank_discovery_entrypoint_candidates("public alias", candidates) == [candidates[0], candidates[2]]
+
+
+def test_rank_discovery_entrypoint_candidates_keeps_unassociated_licensee_enforced() -> None:
+    licensor = CopilotEntrypointCandidate(
+        url="https://licensor.example/",
+        source_rank=1,
+        association=CopilotSiteOriginAssociation(
+            requested_name="Public Alias",
+            entity_id="Q1",
+            entity_label="Public Alias",
+            official_site_url="https://licensor.example/",
+            origin="https://licensor.example",
+            source="provider_official_site",
+            provider_relation_type="label",
+            provider_relation_text="Other Licensor",
+        ),
+    )
+    licensee = CopilotEntrypointCandidate(
+        url="https://licensee.example/",
+        source_rank=2,
+        association=CopilotSiteOriginAssociation(
+            requested_name="Public Alias",
+            entity_id="Q2",
+            entity_label="Unrelated Licensee",
+            official_site_url="https://licensee.example/",
+            origin="https://licensee.example",
+            source="provider_official_site",
+            provider_relation_type="alias",
+            provider_relation_text="Other Licensee",
+        ),
+    )
+
+    assert _rank_discovery_entrypoint_candidates("public alias", [licensor, licensee]) == []
 
 
 @pytest.mark.asyncio

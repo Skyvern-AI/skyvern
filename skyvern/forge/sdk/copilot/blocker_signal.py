@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
@@ -17,7 +17,10 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant
 
 BlockerKind = Literal[
     "authority_denied",
@@ -164,18 +167,33 @@ def build_output_source_unobservable_blocker_signal(
             "visits, so there is nothing for the workflow to read them from. I've kept the draft; "
             "tell me where those values appear and I'll wire them up."
         )
+    elif reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE:
+        user_facing = (
+            "I rewrote this workflow several times to return the value(s) you asked for"
+            f"{f' ({path_text})' if path_text else ''}, but each version left those outputs "
+            "undeclared or unreturned, so the workflow can't reliably hand them back. I've kept "
+            "the draft; tell me where each of those values appears and I'll declare and return them."
+        )
     else:
         user_facing = (
             "I couldn't shape this workflow so it reliably returns the values you asked for"
             f"{f' ({path_text})' if path_text else ''}. I've kept the current draft; let me know "
             "where those values show up and I'll try a different structure."
         )
-    agent_steer = (
-        "STOP: the requested output contract has no observable extraction source in the current "
-        f"trajectory for required path(s) [{path_text or '(unknown)'}]. This is not repairable by "
-        "re-authoring the same draft. Report the missing source to the user and ask where the "
-        "values appear. The prior draft is preserved; do not rerun the blocks."
-    )
+    if reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE:
+        agent_steer = (
+            "STOP: the output contract kept failing its declaration/return coverage across repeated "
+            f"re-authored candidates for required path(s) [{path_text or '(unknown)'}]. This is not "
+            "repairable by re-authoring the same draft. Report the missing output declarations to the "
+            "user and ask where the values appear. The prior draft is preserved; do not rerun the blocks."
+        )
+    else:
+        agent_steer = (
+            "STOP: the requested output contract has no observable extraction source in the current "
+            f"trajectory for required path(s) [{path_text or '(unknown)'}]. This is not repairable by "
+            "re-authoring the same draft. Report the missing source to the user and ask where the "
+            "values appear. The prior draft is preserved; do not rerun the blocks."
+        )
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=agent_steer,
@@ -190,6 +208,39 @@ def build_output_source_unobservable_blocker_signal(
             "canonical_required_child_paths": paths,
             "block_label": block_label,
         },
+    )
+
+
+def build_definition_contract_unsatisfied_blocker_signal(
+    *, unresolved_parameter_keys: Iterable[str], grounding_unresolved: bool = False
+) -> CopilotToolBlockerSignal:
+    parameter_keys = sorted({str(key).strip() for key in unresolved_parameter_keys if str(key).strip()})
+    if parameter_keys:
+        key_text = ", ".join(f"`{key}`" for key in parameter_keys)
+        user_facing = (
+            f"I kept the workflow draft, but I could not safely connect the current page fields to these reusable "
+            f"inputs: {key_text}. No workflow run was started."
+            if grounding_unresolved
+            else f"I kept the workflow draft, but it cannot run because these reusable inputs are not used: "
+            f"{key_text}. Connect each input to the workflow before trying again."
+        )
+    else:
+        user_facing = (
+            "I kept the workflow draft, but it does not yet satisfy the required workflow definition. "
+            "Complete the missing definition requirements before trying again."
+        )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            "The exact candidate failed its definition contract before execution. Preserve the draft, stop this "
+            "turn, and explain the unresolved reusable inputs without dispatching the candidate."
+        ),
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
+        extra={"unresolved_parameter_keys": parameter_keys, "grounding_unresolved": grounding_unresolved},
     )
 
 
@@ -240,6 +291,9 @@ class _LoopEvidenceCtx(Protocol):
 
 class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
     blocker_signal: CopilotToolBlockerSignal | None
+    # Owned here at the stash choke-point: cleared whenever the held signal changes identity,
+    # re-assigned only by an owned precedence claim in turn_ownership.
+    blocker_signal_claimant: TurnClaimant | None
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None
     tool_blocker_signals: list[CopilotToolBlockerSignal]
 
@@ -337,10 +391,41 @@ _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budg
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
 UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
-_RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
+RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
+DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE = "definition_contract_unsatisfied"
+SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
+OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE = "output_contract_reject_budget_exhausted"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
-    {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
+    {
+        OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+        OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
+    }
 )
+
+# A held blocker whose reason code is in this set must win both the rendered reply and the typed
+# halt kind over a later non-terminal trip (e.g. the code-authoring churn backstop).
+GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
+    {
+        ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        "tool_error_run_output_terminal_blocker",
+        "tool_error_post_budget_challenge_blocker",
+        "tool_error_challenge_gated_submit_disabled",
+        "probable_site_block_stop",
+        SCHEMA_INCOMPATIBILITY_REASON_CODE,
+        OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+        OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
+        "advisory_dispatch_stalled",
+        DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
+        "repair_ceiling_reached",
+    }
+)
+
+
+def blocker_signal_is_genuinely_terminal(signal: CopilotToolBlockerSignal | None) -> bool:
+    return signal is not None and signal.internal_reason_code in GENUINELY_TERMINAL_BLOCKER_REASON_CODES
 
 
 def _should_stash_over_existing(
@@ -365,13 +450,13 @@ def _should_stash_over_existing(
     ):
         return True
     if (
-        incoming.internal_reason_code == _RECORDED_OUTCOME_GROUNDING_REASON_CODE
+        incoming.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
         and existing.blocker_kind == "tool_error"
         and not existing.renders_final_reply
     ):
         return True
     if (
-        existing.internal_reason_code == _RECORDED_OUTCOME_GROUNDING_REASON_CODE
+        existing.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
         and not existing.renders_final_reply
         and incoming.renders_final_reply
     ):
@@ -399,12 +484,14 @@ def maybe_clear_blocker_signal_on_tool_success(ctx: _BlockerSignalCtx, succeeded
     signal = getattr(ctx, "blocker_signal", None)
     if isinstance(signal, CopilotToolBlockerSignal) and _tool_success_clears_signal(signal, succeeded_tool_name):
         ctx.blocker_signal = None
+        ctx.blocker_signal_claimant = None
 
 
 def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
     signal = getattr(ctx, "blocker_signal", None)
     if isinstance(signal, CopilotToolBlockerSignal) and signal.internal_reason_code in internal_reason_codes:
         ctx.blocker_signal = None
+        ctx.blocker_signal_claimant = None
 
 
 def clear_tool_blocker_signals_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
@@ -439,6 +526,7 @@ def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSigna
     stashed = _should_stash_over_existing(existing, signal)
     if stashed:
         ctx.blocker_signal = signal
+        ctx.blocker_signal_claimant = None
     extra: dict[str, Any] = {"stashed": stashed}
     if not stashed and isinstance(existing, CopilotToolBlockerSignal):
         extra["existing_reason_code"] = existing.internal_reason_code
@@ -697,4 +785,5 @@ def refresh_held_loop_blocker_evidence(ctx: _BlockerSignalCtx) -> None:
     except ValueError:
         return
     ctx.blocker_signal = refreshed
+    ctx.blocker_signal_claimant = None
     LOG.info("copilot loop blocker signal evidence refreshed", **to_trace_data(refreshed))

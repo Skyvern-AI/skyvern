@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, extract_filename, is_download_response
+from skyvern.webeye.cdp_download_interceptor import (
+    CDPDownloadInterceptor,
+    _is_stale_interception_error,
+    extract_filename,
+    is_download_response,
+)
 
 
 class TestIsDownloadResponse:
@@ -707,6 +712,90 @@ class TestCDPDownloadInterceptorProxyAuth:
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
 
 
+class TestStaleInterceptionRace:
+    """Fetch.continueRequest/continueResponse can fail with 'Invalid InterceptionId' when the
+    interception is resolved/cancelled or its target detaches before our async handler responds.
+    That is a benign race (SKY-11964), not an error-level failure, and retrying it is futile."""
+
+    _MOD = "skyvern.webeye.cdp_download_interceptor"
+
+    def _make_interceptor(self) -> CDPDownloadInterceptor:
+        return CDPDownloadInterceptor(output_dir="/tmp/test_downloads")
+
+    def _make_cdp_session(self) -> MagicMock:
+        session = MagicMock()
+        session.send = AsyncMock()
+        return session
+
+    @staticmethod
+    def _response_event() -> dict:
+        return {
+            "requestId": "req-1",
+            "request": {"url": "https://example.com/analytics/collect"},
+            "resourceType": "XHR",
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "content-type", "value": "text/plain"}],
+        }
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            pytest.param("Protocol error (Fetch.continueResponse): Invalid InterceptionId", True, id="invalid_id"),
+            pytest.param("Protocol error (Fetch.continueRequest): Invalid InterceptionId", True, id="invalid_id_req"),
+            pytest.param("Target page, context or browser has been closed", True, id="target_closed"),
+            pytest.param("Session closed. Most likely the page has been closed.", True, id="session_closed"),
+            pytest.param("Protocol error (Fetch.continueResponse): Some other CDP failure", False, id="other_cdp"),
+            pytest.param("Connection reset by peer", False, id="generic"),
+        ],
+    )
+    def test_is_stale_interception_error(self, message: str, expected: bool) -> None:
+        assert _is_stale_interception_error(Exception(message)) is expected
+
+    @pytest.mark.asyncio
+    async def test_stale_continue_response_not_retried_or_error_logged(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): Invalid InterceptionId")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Only the original continueResponse — no futile recovery retry against a dead interception.
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_stale_response_error_still_retries_and_logs(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): boom")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Original continueResponse + one recovery attempt; real failures still surface as errors.
+        assert cdp_session.send.call_count == 2
+        mock_log.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_request_stage_error_not_logged_as_error(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueRequest): Invalid InterceptionId")
+        event = {
+            "requestId": "req-2",
+            "request": {"url": "https://example.com/page"},
+            "resourceType": "Document",
+            # No responseStatusCode — Request-stage event
+        }
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(event, cdp_session)
+
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+
 class TestBlobDownloadCapture:
     """Browser-initiated blob: URL downloads (e.g. a page that builds the file client-side and
     triggers a blob download) must be read back via SkyvernFrame and saved, not dropped."""
@@ -822,3 +911,275 @@ class TestBlobDownloadCapture:
 
         read.assert_not_awaited()
         assert list(tmp_path.iterdir()) == []
+
+
+class TestDirectHttpDownloadAuthAndHtmlGuard:
+    """_download_url_directly falls back from the cookie-sharing Playwright APIRequestContext to a
+    raw urllib fetch. That fallback must (1) still carry the browser session's cookies, and (2) not
+    silently save an HTML login/session-gate page under a binary filename.
+
+    Regression: a session-gated download endpoint fetched without cookies returns its HTML login
+    page (HTTP 200); the old fallback issued a cookieless request and saved that HTML as e.g. a
+    .zip while reporting the download as successful.
+    """
+
+    _URLOPEN = "urllib.request.urlopen"
+
+    @staticmethod
+    def _fake_urlopen(body: bytes, content_type: str) -> MagicMock:
+        class _Resp:
+            headers = {"content-type": content_type}
+
+            def read(self) -> bytes:
+                return body
+
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        return MagicMock(return_value=_Resp())
+
+    @staticmethod
+    def _context_forcing_urllib(cookies: list[dict]) -> MagicMock:
+        """Browser context whose APIRequestContext returns proxy-407 (non-OK), forcing the urllib
+        fallback, and whose cookies() returns the given session cookies."""
+        ctx = MagicMock()
+        non_ok = MagicMock()
+        non_ok.ok = False
+        non_ok.status = 407
+        ctx.request.get = AsyncMock(return_value=non_ok)
+        ctx.cookies = AsyncMock(return_value=cookies)
+        return ctx
+
+    _LOGIN_HTML = (
+        b'\n<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">\n'
+        b"<html><head><title>Login</title></head>"
+        b"<body><form method='post' action='./Login.aspx'></form></body></html>"
+    )
+
+    @pytest.mark.asyncio
+    async def test_urllib_fallback_forwards_browser_cookies(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib(
+            [{"name": "ASP.NET_SessionId", "value": "sess123"}, {"name": "auth", "value": "tok"}]
+        )
+        zip_bytes = b"PK\x03\x04 real zip payload"
+        urlopen = self._fake_urlopen(zip_bytes, "application/zip")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        sent_request = urlopen.call_args.args[0]
+        assert sent_request.get_header("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
+        # The cookie must be an unredirected header so urllib does not replay it across a cross-host
+        # redirect (session-cookie leak): urllib copies req.headers on redirect, not unredirected_hdrs.
+        assert "Cookie" not in sent_request.headers
+        assert sent_request.unredirected_hdrs.get("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["statement.zip"]
+        assert saved[0].read_bytes() == zip_bytes
+
+    @pytest.mark.asyncio
+    async def test_cookie_header_skips_control_char_values(self, tmp_path: Path) -> None:
+        # A stored cookie value with CR/LF must not inject extra directives into the Cookie line.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib(
+            [{"name": "good", "value": "ok"}, {"name": "bad", "value": "x\r\nSet-Cookie: evil=1"}]
+        )
+        urlopen = self._fake_urlopen(b"PK\x03\x04 zip payload", "application/zip")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        assert urlopen.call_args.args[0].get_header("Cookie") == "good=ok"
+
+    @pytest.mark.asyncio
+    async def test_html_login_page_for_binary_filename_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_html_login_page_for_encoded_binary_filename_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement%2Ezip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_html_payload_for_encoded_html_filename_is_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(b"<!DOCTYPE html><html><body>report</body></html>", "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/report", "report%2Ehtml")
+
+        assert [path.name for path in tmp_path.iterdir()] == ["report.html"]
+
+    @pytest.mark.asyncio
+    async def test_html_payload_for_double_encoded_binary_filename_is_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly(
+                "https://site.example/download?f=statement%252Ezip", "statement%252Ezip"
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_html_body_without_html_content_type_still_rejected(self, tmp_path: Path) -> None:
+        # Some servers mislabel the login page's content-type; sniff the body markup too.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "application/octet-stream")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(b"<!-- generated --><!DOCTYPE html><html><body>login</body></html>", id="comment"),
+            pytest.param(b'<?xml version="1.0"?><html><body>login</body></html>', id="xml-declaration"),
+            pytest.param(b"<head><title>Login</title></head><body>login</body>", id="omitted-html-root"),
+            pytest.param(b"<head\n><title>Login</title></head><body>login</body>", id="tag-newline"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_html_body_with_legal_leading_markup_is_rejected(self, tmp_path: Path, body: bytes) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(body, "application/octet-stream")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download", "statement.zip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_real_binary_payload_is_saved(self, tmp_path: Path) -> None:
+        # Guard must not over-reject genuine binary downloads.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        pdf = b"%PDF-1.7 real invoice bytes"
+        urlopen = self._fake_urlopen(pdf, "application/pdf")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?i=1", "invoice.pdf")
+
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["invoice.pdf"]
+        assert saved[0].read_bytes() == pdf
+
+    @pytest.mark.asyncio
+    async def test_html_payload_for_html_filename_is_saved(self, tmp_path: Path) -> None:
+        # An HTML document downloaded under an .html name is honest, not a masquerade — keep it.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(b"<!DOCTYPE html><html><body>report</body></html>", "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/report", "report.html")
+
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["report.html"]
+
+    @pytest.mark.asyncio
+    async def test_http_browser_download_routes_through_direct_download(self, tmp_path: Path) -> None:
+        # Real wiring: an http(s) browser download goes through _download_url_directly, which
+        # forwards cookies and rejects the HTML login masquerade.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([{"name": "sid", "value": "x"}])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._handle_browser_download(
+                {
+                    "url": "https://site.example/download?f=report.zip",
+                    "suggestedFilename": "report.zip",
+                }
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        assert urlopen.call_args.args[0].get_header("Cookie") == "sid=x"
+
+    @pytest.mark.asyncio
+    async def test_nameless_binary_content_type_html_body_not_saved(self, tmp_path: Path) -> None:
+        # No filename extension but a binary content-type + HTML body is still a masquerade.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "application/octet-stream")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download", "")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_nameless_html_content_type_is_saved(self, tmp_path: Path) -> None:
+        # A nameless download that is honestly HTML (html content-type, no binary claim) is kept.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/page", "")
+
+        assert len(list(tmp_path.iterdir())) == 1
+
+    @pytest.mark.asyncio
+    async def test_extensionless_named_html_login_page_is_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download", "statement")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_binary_payload_mislabeled_as_html_is_saved(self, tmp_path: Path) -> None:
+        # A real binary payload a server mislabels as text/html must be saved, not discarded:
+        # the body is the ground truth, so a non-HTML body is never treated as a masquerade.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        zip_bytes = b"PK\x03\x04 genuine archive, not html"
+        urlopen = self._fake_urlopen(zip_bytes, "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["statement.zip"]
+        assert saved[0].read_bytes() == zip_bytes
+
+    @pytest.mark.asyncio
+    async def test_nameless_no_content_type_html_is_saved(self, tmp_path: Path) -> None:
+        # Nameless download with no content-type and an HTML body makes no binary claim, so it is
+        # saved as-is (intentional "no claim, no mismatch"), not rejected.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/page", "")
+
+        assert len(list(tmp_path.iterdir())) == 1

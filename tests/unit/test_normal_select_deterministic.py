@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.webeye.actions import handler
@@ -66,19 +67,23 @@ def _locator(
     *,
     selected_label: str | None = None,
     selected_index: int | None = None,
+    evaluate_side_effect: BaseException | None = None,
 ) -> MagicMock:
     locator = MagicMock()
     locator.click = AsyncMock()
     locator.select_option = AsyncMock()
     locator.input_value = AsyncMock(return_value=selected_value)
-    locator.evaluate = AsyncMock(
-        return_value=_selected_option_readback(
-            options,
-            selected_value,
-            selected_label=selected_label,
-            selected_index=selected_index,
+    if evaluate_side_effect is not None:
+        locator.evaluate = AsyncMock(side_effect=evaluate_side_effect)
+    else:
+        locator.evaluate = AsyncMock(
+            return_value=_selected_option_readback(
+                options,
+                selected_value,
+                selected_label=selected_label,
+                selected_index=selected_index,
+            )
         )
-    )
     return locator
 
 
@@ -93,8 +98,12 @@ async def _run_normal_select(
     selected_label: str | None = None,
     selected_index: int | None = None,
     llm_response: dict | None = None,
+    evaluate_side_effect: BaseException | None = None,
 ) -> tuple[list, MagicMock, AsyncMock]:
-    provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=feature_enabled))
+    provider = SimpleNamespace(
+        is_feature_enabled_cached=AsyncMock(return_value=feature_enabled),
+        resolve_feature_enabled_unrecorded=AsyncMock(return_value=feature_enabled),
+    )
     normal_select_llm = AsyncMock(return_value=llm_response or {"value": "fallback", "index": None})
 
     monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
@@ -103,7 +112,13 @@ async def _run_normal_select(
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", MagicMock(return_value="prompt"))
     monkeypatch.setattr(handler.skyvern_context, "ensure_context", MagicMock(return_value=SimpleNamespace(tz_info=UTC)))
 
-    locator = _locator(options, selected_value, selected_label=selected_label, selected_index=selected_index)
+    locator = _locator(
+        options,
+        selected_value,
+        selected_label=selected_label,
+        selected_index=selected_index,
+        evaluate_side_effect=evaluate_side_effect,
+    )
     result = await handler.normal_select(
         action=action,
         skyvern_element=_FakeSelectElement(options, locator, selected_attr),  # type: ignore[arg-type]
@@ -257,7 +272,7 @@ async def test_normal_select_unsafe_match_falls_back_to_llm(
 
 
 @pytest.mark.asyncio
-async def test_normal_select_readback_failure_falls_back_to_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_normal_select_readback_value_mismatch_falls_back_to_llm(monkeypatch: pytest.MonkeyPatch) -> None:
     action = _select_action("United States")
     result, locator, normal_select_llm = await _run_normal_select(
         monkeypatch,
@@ -279,6 +294,116 @@ async def test_normal_select_readback_failure_falls_back_to_llm(monkeypatch: pyt
             call(value="US", timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS),
         ]
     )
+    normal_select_llm.assert_awaited_once()
+
+
+@pytest.mark.parametrize("scraped_label", [" United States", "United States "])
+@pytest.mark.asyncio
+async def test_normal_select_edge_whitespace_label_verifies_without_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    scraped_label: str,
+) -> None:
+    """Read-back trims the label but the scraped option text does not (domUtils.removeMultipleSpaces
+    collapses runs without trimming), so an edge-space-only difference must not read as a mismatch."""
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=True,
+        action=_select_action("United States"),
+        options=[
+            {"optionIndex": 0, "text": "Canada", "value": "CA"},
+            {"optionIndex": 1, "text": scraped_label, "value": "US"},
+        ],
+        selected_value="US",
+        selected_label="United States",
+        selected_index=1,
+    )
+
+    assert handler._normal_select_successful(result)
+    normal_select_llm.assert_not_awaited()
+    locator.select_option.assert_awaited_once_with(
+        value="US",
+        timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS,
+    )
+
+
+@pytest.mark.parametrize("scraped_value", [" US", "US "])
+@pytest.mark.asyncio
+async def test_normal_select_edge_whitespace_value_verifies_without_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    scraped_value: str,
+) -> None:
+    """domUtils.removeMultipleSpaces() leaves option.value untrimmed too, so the value arm needs the
+    same normalization as the label arm."""
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=True,
+        action=_select_action("United States"),
+        options=[
+            {"optionIndex": 0, "text": "Canada", "value": "CA"},
+            {"optionIndex": 1, "text": "United States", "value": scraped_value},
+        ],
+        selected_value="US",
+        selected_label="United States",
+        selected_index=1,
+    )
+
+    assert handler._normal_select_successful(result)
+    normal_select_llm.assert_not_awaited()
+    locator.select_option.assert_awaited_once_with(
+        value=scraped_value,
+        timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS,
+    )
+
+
+@pytest.mark.asyncio
+async def test_normal_select_readback_timeout_keeps_success_and_skips_stale_locator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """select_option already committed the value; a select-triggered rerender detaches the element so
+    the read-back times out. That must not spend the Playwright default 30s, and must not drive the LLM
+    fallback through the now-stale locator."""
+    action = _select_action("United States")
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=True,
+        action=action,
+        options=[
+            {"optionIndex": 0, "text": "Canada", "value": "CA"},
+            {"optionIndex": 1, "text": "United States", "value": "US"},
+        ],
+        selected_value="US",
+        evaluate_side_effect=PlaywrightTimeoutError("Timeout 30000ms exceeded waiting for locator"),
+        llm_response={"value": "US", "index": None},
+    )
+
+    assert handler._normal_select_successful(result)
+    normal_select_llm.assert_not_awaited()
+    assert not action.has_mini_agent
+    locator.select_option.assert_awaited_once_with(
+        value="US",
+        timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS,
+    )
+    assert locator.evaluate.await_args.kwargs["timeout"] == handler.settings.BROWSER_ACTION_TIMEOUT_MS
+
+
+@pytest.mark.asyncio
+async def test_normal_select_readback_index_mismatch_falls_back_to_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    action = _select_action("United States")
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=True,
+        action=action,
+        options=[
+            {"optionIndex": 0, "text": "Canada", "value": "CA"},
+            {"optionIndex": 1, "text": "United States", "value": "US"},
+        ],
+        selected_value="US",
+        selected_index=0,
+        llm_response={"value": "US", "index": None},
+    )
+
+    assert handler._normal_select_successful(result)
+    assert action.has_mini_agent is True
     normal_select_llm.assert_awaited_once()
 
 

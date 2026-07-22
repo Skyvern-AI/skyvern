@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import copy
 import csv
+import hashlib
 import html
 import json
 import keyword
@@ -13,7 +14,9 @@ import os
 import re
 import shutil
 import smtplib
+import socket
 import textwrap
+import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
@@ -98,17 +101,22 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
+from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult, run_self_heal_recovery
+from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -146,6 +154,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
     RecordingPage,
+    json_safe_recorder_output,
     user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
@@ -158,19 +167,26 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    SENSITIVE_DESTINATION_FIELDS,
+    decrypt_secret_field_value,
+    is_encrypted_secret,
+)
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
     BlockStatus,
     BlockType,
+    FileDownloadTarget,
     FileStorageType,
     FileType,
     FileUploadDestination,
 )
 from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
+from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
@@ -870,7 +886,8 @@ class Block(BaseModel, abc.ABC):
         description = None
         try:
             block_data = self.model_dump(
-                exclude={
+                exclude=SENSITIVE_DESTINATION_FIELDS
+                | {
                     "workflow_run_block_id",
                     "organization_id",
                     "task_id",
@@ -1107,6 +1124,12 @@ class BaseTaskBlock(Block):
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
+            LOG.info(
+                "download_suffix_rendered",
+                block_label=self.label,
+                current_index=workflow_run_context.get_block_metadata(self.label).get("current_index"),
+                download_suffix_fp=diagnostic_fingerprint(self.download_suffix),
+            )
 
         if self.navigation_goal:
             self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
@@ -3713,11 +3736,20 @@ class CodeBlock(Block):
         }
 
     def generate_async_user_function(
-        self, code: str, page: Page | RecordingPage, parameters: dict[str, Any] | None = None
+        self,
+        code: str,
+        page: Page | RecordingPage,
+        parameters: dict[str, Any] | None = None,
+        *,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
         self.is_safe_code(code)
+        code_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        code_len = len(code)
         code = textwrap.indent(textwrap.dedent(code), "    ")
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
@@ -3739,6 +3771,19 @@ async def wrapper({default_args}):
         safe_vars["__param_defaults"] = parameter_defaults
         # Compile under a recognizable filename so tracebacks map back to user code lines.
         compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        inline_exec_context = skyvern_context.current()
+        LOG.info(
+            "codeblock.inline_exec_entered",
+            code_sha256=code_sha256,
+            code_len=code_len,
+            in_process=True,
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            trace_id=inline_exec_context.request_id if inline_exec_context else None,
+        )
         exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
         if not parameter_defaults:
@@ -4033,6 +4078,35 @@ async def wrapper({default_args}):
                 return line_url
         return ""
 
+    def _matched_step_index_for_failing_line(self, failing_line: int | None) -> int | None:
+        if failing_line is None:
+            return None
+        matched_step = self._match_step_for_failing_line(failing_line)
+        if matched_step is None:
+            return None
+        steps = self.steps or []
+        for idx, step in enumerate(steps):
+            if step is matched_step:
+                return idx
+        return None
+
+    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
+        safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
+        matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
+        if matched_step is None or not matched_step.description:
+            return safe_main
+        steps = self.steps or []
+        matched_index = next((idx for idx, step in enumerate(steps) if step is matched_step), None)
+        if matched_index is None:
+            matched_index = len(steps) - 1
+        descriptions = [matched_step.description] + [
+            step.description for step in steps[matched_index + 1 :] if step.description
+        ]
+        safe_mini = "\nThen: ".join(
+            workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+        )
+        return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4164,27 +4238,10 @@ async def wrapper({default_args}):
         escalation_step: Step | None = None
         recovery_block_id: str | None = None
         try:
-            # block.prompt is the operative goal; a confidently-matched step only narrows it. The match
-            # is advisory (spans are display-oriented and render-shifted), so any miss heals on the prompt.
-            safe_main = workflow_run_context.mask_secrets_in_data(self.prompt)
-            matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
-            if matched_step is not None and matched_step.description:
-                # The heal owns the failing step plus every subsequent authored step — a
-                # step-only goal would complete the block while trailing steps ran by no one.
-                steps = self.steps or []
-                # Identity scan, not .index(): value equality would match an earlier duplicate step.
-                matched_index = next((i for i, step in enumerate(steps) if step is matched_step), None)
-                if matched_index is None:
-                    matched_index = len(steps) - 1  # defensive; matched_step always comes from self.steps
-                descriptions = [matched_step.description] + [
-                    step.description for step in steps[matched_index + 1 :] if step.description
-                ]
-                safe_mini = "\nThen: ".join(
-                    workflow_run_context.mask_secrets_in_data(description) for description in descriptions
-                )
-                navigation_goal = compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
-            else:
-                navigation_goal = safe_main
+            navigation_goal = self._compose_heal_goal(
+                workflow_run_context=workflow_run_context,
+                failing_line=failing_line,
+            )
 
             workflow_system_prompt = (
                 None
@@ -4390,6 +4447,117 @@ async def wrapper({default_args}):
             skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
         )
 
+    @staticmethod
+    def _workflow_definition_hash(workflow_definition: Any) -> str:
+        if hasattr(workflow_definition, "model_dump"):
+            payload = workflow_definition.model_dump(mode="json")
+        else:
+            payload = workflow_definition
+        normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    async def _self_heal_mutation_guard_snapshot(
+        self,
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> tuple[int, str]:
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if workflow is None:
+            raise RuntimeError("workflow_not_found_for_self_heal_guard")
+        versions = await app.DATABASE.workflows.get_workflow_versions_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        return len(versions), self._workflow_definition_hash(workflow.workflow_definition)
+
+    @staticmethod
+    def _output_obligation_for_heal_result(result: BlockResult | None) -> OutputObligation:
+        if result is None or not result.success:
+            return OutputObligation.none
+        if result.output_parameter_value is not None:
+            return OutputObligation.observed
+        return OutputObligation.vestigial
+
+    @staticmethod
+    def _heal_parameter_binding_keys(workflow_run_context: WorkflowRunContext) -> list[str]:
+        # Episode metadata is best-effort; it must never fail the heal path.
+        try:
+            return sorted(str(key) for key in workflow_run_context.parameters.keys())
+        except Exception:
+            return []
+
+    async def _write_heal_episode_safe(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        block_label: str,
+        engine: str,
+        status: Literal["fired_completed", "fired_failed", "fired_unverified", "skipped"],
+        skip_reason: HealSkipReason | None,
+        parameter_binding_keys: list[str],
+        exception_class: str | None,
+        failing_line: int | None,
+        matched_step_index: int | None,
+        failure_message: str | None,
+        wall_clock_ms: int | None,
+        action_count: int | None,
+        output_obligation: OutputObligation,
+    ) -> None:
+        LOG.info(
+            "self-heal episode",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=block_label,
+            engine=engine,
+            status=status,
+            skip_reason=skip_reason.value if skip_reason is not None else None,
+            origin=TurnOrigin.runtime_self_heal.value,
+        )
+        try:
+            await app.DATABASE.self_heal.create_heal_episode(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=block_label,
+                engine=engine,
+                status=HealStatus(status),
+                skip_reason=skip_reason,
+                snapshot_available=False,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=failure_message,
+                wall_clock_ms=wall_clock_ms,
+                action_count=action_count,
+                output_obligation=output_obligation,
+            )
+        except Exception:
+            LOG.warning(
+                "self-heal episode persistence failed; continuing",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=block_label,
+                engine=engine,
+                status=status,
+                exc_info=True,
+            )
+
     async def _resolve_failure_with_heal(
         self,
         *,
@@ -4406,13 +4574,60 @@ async def wrapper({default_args}):
         browser_state: BrowserState | None = None,
         page: Page | None = None,
     ) -> BlockResult:
-        healed: BlockResult | None = None
-        if classification.healable:
-            live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(
-                workflow_run_id=workflow_run_id
+        async def _finalize_heal_result(result: BlockResult | None) -> BlockResult:
+            if result is not None:
+                output_obligation = self._output_obligation_for_heal_result(result)
+                # Record output before finalizing so a failed write fails closed, never leaving a
+                # completed block without the output downstream consumers require.
+                if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
+                    await self.record_output_parameter_value(
+                        workflow_run_context,
+                        workflow_run_id,
+                        result.output_parameter_value,
+                    )
+                await recorder.finalize(success=result.success)
+                return result
+            await recorder.finalize(success=False)
+            return await build_failure_result()
+
+        if not classification.healable:
+            return await _finalize_heal_result(None)
+        if not await self._self_heal_enabled(workflow_run_context):
+            return await _finalize_heal_result(None)
+        if not organization_id:
+            return await _finalize_heal_result(None)
+
+        workflow_permanent_id = workflow_run_context.workflow_permanent_id
+        workflow_id = workflow_run_context.workflow_id
+        exception_for_heal = exception or RuntimeError("CodeBlock failed")
+        exception_class = type(exception_for_heal).__name__
+        matched_step_index = self._matched_step_index_for_failing_line(failing_line)
+        parameter_binding_keys = self._heal_parameter_binding_keys(workflow_run_context)
+        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+
+        async def _record_harness_skip(skip_reason: HealSkipReason, failure_message: str | None = None) -> None:
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="skipped",
+                skip_reason=skip_reason,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=failure_message,
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
             )
-            exception_for_heal = exception or RuntimeError("CodeBlock failed")
-            healed = await self._attempt_self_heal(
+
+        async def _run_floor_recovery() -> BlockResult | None:
+            floor_result = await self._attempt_self_heal(
                 exception=exception_for_heal,
                 failing_line=failing_line,
                 recording_page=recorder.recording_page,
@@ -4426,26 +4641,252 @@ async def wrapper({default_args}):
                 page=page,
                 record_output_parameter=False,
             )
-        if healed is not None:
-            output_obligation = OutputObligation.none
-            if healed.success:
-                output_obligation = (
-                    OutputObligation.observed
-                    if healed.output_parameter_value is not None
-                    else OutputObligation.vestigial
+            floor_output_obligation = self._output_obligation_for_heal_result(floor_result)
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="floor",
+                status="fired_completed" if floor_result is not None and floor_result.success else "fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=floor_result.failure_reason if floor_result is not None else "floor_no_result",
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=floor_output_obligation,
+            )
+            return floor_result
+
+        api_key = await app.AGENT_FUNCTION.resolve_self_heal_api_key(organization_id)
+        if not api_key:
+            await _record_harness_skip(
+                HealSkipReason.credential_unavailable, failure_message="self_heal_api_key_missing"
+            )
+            return await _finalize_heal_result(await _run_floor_recovery())
+
+        browser_context = (
+            getattr(live_browser_state, "browser_context", None) if live_browser_state is not None else None
+        )
+        if live_browser_state is None or not _browser_context_is_attachable(browser_context):
+            await _record_harness_skip(HealSkipReason.adoption_failed, failure_message="self_heal_browser_unavailable")
+            return await _finalize_heal_result(await _run_floor_recovery())
+        # Reserve cap only once harness preconditions are satisfied so transient infra skips
+        # do not consume slots; cap limits harness attempts, not floor fallback attempts.
+        cap_reserved = await check_and_increment_self_heal_cap(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if cap_reserved is None:
+            await _record_harness_skip(HealSkipReason.capped, failure_message="self_heal_daily_cap_exceeded")
+            return await _finalize_heal_result(await _run_floor_recovery())
+
+        recovery: SelfHealRecoveryResult | None = None
+        try:
+            before_snapshot = await self._self_heal_mutation_guard_snapshot(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            recovery = await run_self_heal_recovery(
+                block=self,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_state=live_browser_state,
+                failing_line=failing_line,
+                api_key=api_key,
+                max_actions=settings.SELF_HEAL_MAX_ACTIONS,
+                wall_clock_budget_seconds=settings.SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS,
+            )
+            after_snapshot = await self._self_heal_mutation_guard_snapshot(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            if before_snapshot != after_snapshot:
+                raise RuntimeError("workflow_mutated_during_runtime_self_heal")
+
+            if recovery.success:
+                # Compute the obligation from a non-persisted result: an unverified or
+                # fail-closed outcome must never leave the block row marked completed, so the
+                # block row is written only on the verified path below.
+                harness_result = await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=None,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=None,
+                    organization_id=organization_id,
                 )
-            # Record output before finalizing so a failed write fails closed, never leaving a
-            # completed block without the output downstream consumers require.
-            if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
-                await self.record_output_parameter_value(
-                    workflow_run_context,
-                    workflow_run_id,
-                    healed.output_parameter_value,
+                harness_output_obligation = self._output_obligation_for_heal_result(harness_result)
+                if not recovery.verified:
+                    await self._write_heal_episode_safe(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        block_label=self.label,
+                        engine="harness",
+                        status="fired_unverified",
+                        skip_reason=None,
+                        parameter_binding_keys=parameter_binding_keys,
+                        exception_class=exception_class,
+                        failing_line=failing_line,
+                        matched_step_index=matched_step_index,
+                        failure_message=recovery.failure_note,
+                        wall_clock_ms=recovery.wall_clock_ms,
+                        action_count=recovery.action_count,
+                        output_obligation=harness_output_obligation,
+                    )
+                    # Fail closed when an unverified harness run already mutated controls:
+                    # rerunning floor could duplicate side effects (submit/send/delete).
+                    if recovery.performed_mutation:
+                        LOG.info(
+                            "Runtime self-heal unverified after mutating actions; suppressing floor fallback",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                            organization_id=organization_id,
+                            block_label=self.label,
+                            origin=TurnOrigin.runtime_self_heal.value,
+                        )
+                        return await _finalize_heal_result(None)
+                    return await _finalize_heal_result(await _run_floor_recovery())
+                # Verified: only now write status=completed to the block row.
+                harness_result = await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=None,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
-            await recorder.finalize(success=healed.success)
-            return healed
-        await recorder.finalize(success=False)
-        return await build_failure_result()
+                await self._write_heal_episode_safe(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                    engine="harness",
+                    status="fired_completed",
+                    skip_reason=None,
+                    parameter_binding_keys=parameter_binding_keys,
+                    exception_class=exception_class,
+                    failing_line=failing_line,
+                    matched_step_index=matched_step_index,
+                    failure_message=None,
+                    wall_clock_ms=recovery.wall_clock_ms,
+                    action_count=recovery.action_count,
+                    output_obligation=harness_output_obligation,
+                )
+                return await _finalize_heal_result(harness_result)
+
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=recovery.failure_note,
+                wall_clock_ms=recovery.wall_clock_ms,
+                action_count=recovery.action_count,
+                output_obligation=OutputObligation.none,
+            )
+            # A failed harness turn that already mutated controls must not hand off to floor:
+            # rerunning could duplicate the side effect (submit/send/delete).
+            if recovery.performed_mutation:
+                LOG.info(
+                    "Runtime self-heal failed after mutating actions; suppressing floor fallback",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    origin=TurnOrigin.runtime_self_heal.value,
+                )
+                return await _finalize_heal_result(None)
+            return await _finalize_heal_result(await _run_floor_recovery())
+        except HealAdoptionFailed as exc:
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=str(exc),
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
+            )
+            return await _finalize_heal_result(await _run_floor_recovery())
+        except Exception as exc:
+            LOG.error(
+                "Runtime self-heal harness recovery failed",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                block_label=self.label,
+                origin=TurnOrigin.runtime_self_heal.value,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=type(exc).__name__,
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
+            )
+            # If the harness already mutated a control before the error (e.g. the workflow-mutation
+            # guard tripped after a click), a floor rerun could duplicate the side effect.
+            if recovery is not None and recovery.performed_mutation:
+                LOG.info(
+                    "Runtime self-heal errored after mutating actions; suppressing floor fallback",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    origin=TurnOrigin.runtime_self_heal.value,
+                )
+                return await _finalize_heal_result(None)
+            return await _finalize_heal_result(await _run_floor_recovery())
 
     async def execute(
         self,
@@ -4599,9 +5040,9 @@ async def wrapper({default_args}):
             block_label=self.label,
         )
 
-        # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
-        # the standard action/artifact timeline and the agent can later take over on failure.
-        # Promptless blocks have no task and persist neither actions nor screenshots.
+        # Every code block gets a container task v1 + step so its recorded calls render through
+        # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
+        # task also seats a later agent takeover on failure.
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,
@@ -4696,7 +5137,22 @@ async def wrapper({default_args}):
                         secure_code_block_result.block_result.output_parameter_value,
                     )
                     return secure_code_block_result.block_result
-            user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
+                LOG.warning(
+                    "codeblock.secure_runner_downgrade",
+                    selection_reason="override_returned_none",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                )
+            user_function = self.generate_async_user_function(
+                self.code,
+                recording_page,
+                parameter_values,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
@@ -4737,6 +5193,8 @@ async def wrapper({default_args}):
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
                     Action(
+                        # Synthesized outside the recorder, so it needs its own stable id for the upsert path.
+                        action_id=generate_action_id(),
                         action_type=ActionType.NULL_ACTION,
                         status=ActionStatus.failed,
                         action_order=len(recorded),
@@ -4784,6 +5242,10 @@ async def wrapper({default_args}):
             # Safety net for paths the except arms miss (CancelledError, link_block failure).
             await recorder.finalize(success=False)
 
+        # A leaked recorder proxy (RecordingLocator/Page/Keyboard) is not JSON serializable and
+        # would either crash registration or, via the default= fallback, replace the value with a
+        # useless placeholder — normalize the wrapper family to its selector/marker first.
+        result = json_safe_recorder_output(result)
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
         )
@@ -5565,12 +6027,11 @@ class UploadToS3Block(Block):
         )
 
 
-class FileUploadBlock(Block):
-    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
-    # Parameter 1 of Literal[...] cannot be of type "Any"
-    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+class UnsupportedStorageTypeError(Exception):
+    pass
 
-    storage_type: FileStorageType = FileStorageType.S3
+
+class FileDestinationBlock(Block):
     s3_bucket: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
@@ -5580,6 +6041,18 @@ class FileUploadBlock(Block):
     azure_blob_container_name: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
     continue_on_empty: bool = Field(
         default=False,
@@ -5590,15 +6063,14 @@ class FileUploadBlock(Block):
         ),
     )
 
-    def get_all_parameters(
-        self,
-        workflow_run_id: str,
-    ) -> list[PARAMETER_TYPE]:
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+    def _get_destination_parameters(self, workflow_run_context: WorkflowRunContext) -> list[PARAMETER_TYPE]:
         parameters = []
 
         if self.path and workflow_run_context.has_parameter(self.path):
             parameters.append(workflow_run_context.get_parameter(self.path))
+
+        if self.prompt and workflow_run_context.has_parameter(self.prompt):
+            parameters.append(workflow_run_context.get_parameter(self.prompt))
 
         if self.s3_bucket and workflow_run_context.has_parameter(self.s3_bucket):
             parameters.append(workflow_run_context.get_parameter(self.s3_bucket))
@@ -5624,11 +6096,37 @@ class FileUploadBlock(Block):
         if self.google_drive_folder_id and workflow_run_context.has_parameter(self.google_drive_folder_id):
             parameters.append(workflow_run_context.get_parameter(self.google_drive_folder_id))
 
+        if self.sftp_host and workflow_run_context.has_parameter(self.sftp_host):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_host))
+
+        if self.sftp_username and workflow_run_context.has_parameter(self.sftp_username):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_username))
+
+        if self.sftp_password and workflow_run_context.has_parameter(self.sftp_password):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_password))
+
+        if self.sftp_private_key and workflow_run_context.has_parameter(self.sftp_private_key):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_private_key))
+
+        if self.sftp_private_key_passphrase and workflow_run_context.has_parameter(self.sftp_private_key_passphrase):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_private_key_passphrase))
+
+        if self.sftp_remote_path and workflow_run_context.has_parameter(self.sftp_remote_path):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_remote_path))
+
+        if self.sftp_host_key and workflow_run_context.has_parameter(self.sftp_host_key):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_host_key))
+
         return parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+    def _format_destination_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+
+        if self.prompt:
+            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
+                self.prompt, workflow_run_context
+            )
 
         if self.s3_bucket:
             self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
@@ -5662,6 +6160,67 @@ class FileUploadBlock(Block):
             self.google_drive_folder_id = self.format_block_parameter_template_from_workflow_run_context(
                 self.google_drive_folder_id, workflow_run_context
             )
+        if self.sftp_host:
+            self.sftp_host = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_host, workflow_run_context
+            )
+        if self.sftp_username:
+            self.sftp_username = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_username, workflow_run_context
+            )
+        if self.sftp_password:
+            self.sftp_password = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_password, workflow_run_context
+            )
+        if self.sftp_private_key:
+            self.sftp_private_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_private_key, workflow_run_context
+            )
+        if self.sftp_private_key_passphrase:
+            self.sftp_private_key_passphrase = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_private_key_passphrase, workflow_run_context
+            )
+        if self.sftp_remote_path:
+            self.sftp_remote_path = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_remote_path, workflow_run_context
+            )
+        if self.sftp_host_key:
+            self.sftp_host_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_host_key, workflow_run_context
+            )
+
+    def _validate_destination_fields(self, storage_type: FileStorageType) -> list[str]:
+        missing_parameters = []
+        if storage_type == FileStorageType.S3:
+            if not self.s3_bucket:
+                missing_parameters.append("s3_bucket")
+            if not self.aws_access_key_id:
+                missing_parameters.append("aws_access_key_id")
+            if not self.aws_secret_access_key:
+                missing_parameters.append("aws_secret_access_key")
+        elif storage_type == FileStorageType.AZURE:
+            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
+                missing_parameters.append("azure_storage_account_name")
+            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
+                missing_parameters.append("azure_storage_account_key")
+            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
+                missing_parameters.append("azure_blob_container_name")
+        elif storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not self.google_credential_id:
+                missing_parameters.append("google_credential_id")
+            if not self.google_drive_folder_id:
+                missing_parameters.append("google_drive_folder_id")
+        elif storage_type == FileStorageType.SFTP:
+            if not self.sftp_host:
+                missing_parameters.append("sftp_host")
+            if not self.sftp_username:
+                missing_parameters.append("sftp_username")
+            if not self.sftp_password and not self.sftp_private_key:
+                missing_parameters.append("sftp_password or sftp_private_key")
+        else:
+            raise UnsupportedStorageTypeError(storage_type)
+
+        return missing_parameters
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
@@ -5681,8 +6240,21 @@ class FileUploadBlock(Block):
         folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
         return folder_path + "/" + blob_name
 
-    def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
+    @staticmethod
+    def _validate_azure_storage_account_name(azure_storage_account_name: str) -> None:
+        if re.fullmatch(r"[a-z0-9]{3,24}", azure_storage_account_name) is None:
+            raise AzureConfigurationError("Azure Storage account name must match ^[a-z0-9]{3,24}$")
+
+    def _get_azure_blob_uri(
+        self,
+        workflow_run_id: str,
+        blob_name: str,
+        azure_storage_account_name: str,
+    ) -> str:
+        self._validate_azure_storage_account_name(azure_storage_account_name)
+        return (
+            f"https://{azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
+        )
 
     def _build_s3_destination(
         self,
@@ -5715,7 +6287,7 @@ class FileUploadBlock(Block):
         azure_storage_account_key: str,
     ) -> FileUploadDestination:
         blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
-        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
+        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name, azure_storage_account_name)
         sdk_uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
         return FileUploadDestination(
             storage_type=FileStorageType.AZURE,
@@ -5740,6 +6312,217 @@ class FileUploadBlock(Block):
             google_access_token=access_token,
             google_drive_folder_id=folder_id,
         )
+
+    def _build_sftp_destination(
+        self,
+        *,
+        file_path: str,
+        host: str,
+        port: int,
+        username: str,
+        password: str | None,
+        private_key: str | None,
+        private_key_passphrase: str | None,
+        remote_path: str | None,
+        host_key: str | None,
+    ) -> FileUploadDestination:
+        filename = Path(file_path).name
+        remote_target = sftp_service.build_remote_target(remote_path, filename)
+        remote_uri = f"sftp://{host}:{port}/{remote_target.lstrip('/')}"
+        return FileUploadDestination(
+            storage_type=FileStorageType.SFTP,
+            customer_uri=remote_uri,
+            sdk_uri=remote_uri,
+            sftp_host=host,
+            sftp_port=port,
+            sftp_username=username,
+            sftp_password=password,
+            sftp_private_key=private_key,
+            sftp_private_key_passphrase=private_key_passphrase,
+            sftp_remote_path=remote_path,
+            sftp_host_key=host_key,
+        )
+
+    @staticmethod
+    async def _resolve_sensitive_destination_credential(
+        workflow_run_context: WorkflowRunContext,
+        value: str | None,
+        field_name: str,
+    ) -> str | None:
+        if not value:
+            return None
+        if is_encrypted_secret(value):
+            return await decrypt_secret_field_value(
+                value,
+                organization_id=workflow_run_context.organization_id,
+                field_name=field_name,
+            )
+        resolved_value = workflow_run_context.get_original_secret_value_or_none(value)
+        if resolved_value is not None:
+            return resolved_value
+        return value
+
+    async def _dispatch_files_to_storage(
+        self,
+        *,
+        storage_type: FileStorageType,
+        files_to_upload: list[str],
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+    ) -> list[str]:
+        uploaded_uris: list[str] = []
+        if not files_to_upload:
+            return uploaded_uris
+        if storage_type == FileStorageType.S3:
+            actual_aws_secret_access_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.aws_secret_access_key,
+                "aws_secret_access_key",
+            )
+            actual_aws_access_key_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id) or self.aws_access_key_id
+            )
+            if (
+                not isinstance(actual_aws_access_key_id, str)
+                or not actual_aws_access_key_id.strip()
+                or not isinstance(actual_aws_secret_access_key, str)
+                or not actual_aws_secret_access_key.strip()
+            ):
+                raise ValueError("S3 is not configured: resolved AWS credentials are empty")
+            for file_path in files_to_upload:
+                destination = self._build_s3_destination(
+                    workflow_run_id=workflow_run_id,
+                    file_path=file_path,
+                    aws_access_key_id=actual_aws_access_key_id,
+                    aws_secret_access_key=actual_aws_secret_access_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to S3 customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.AZURE:
+            actual_azure_storage_account_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.azure_storage_account_key,
+                "azure_storage_account_key",
+            )
+            resolved_azure_storage_account_name = workflow_run_context.get_original_secret_value_or_none(
+                self.azure_storage_account_name
+            )
+            actual_azure_storage_account_name = (
+                self.azure_storage_account_name
+                if resolved_azure_storage_account_name is None
+                else resolved_azure_storage_account_name
+            )
+            if (
+                not isinstance(actual_azure_storage_account_name, str)
+                or not actual_azure_storage_account_name.strip()
+                or not isinstance(actual_azure_storage_account_key, str)
+                or not actual_azure_storage_account_key.strip()
+            ):
+                raise AzureConfigurationError("Azure Storage is not configured")
+            self._validate_azure_storage_account_name(actual_azure_storage_account_name)
+
+            for file_path in files_to_upload:
+                LOG.info("Uploading file to Azure Blob Storage customer storage", file_path=file_path)
+                destination = self._build_azure_destination(
+                    workflow_run_id=workflow_run_id,
+                    file_path=file_path,
+                    azure_storage_account_name=actual_azure_storage_account_name,
+                    azure_storage_account_key=actual_azure_storage_account_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to Azure Blob Storage customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.GOOGLE_DRIVE:
+            org_id = organization_id or workflow_run_context.organization_id
+            if not org_id:
+                raise ValueError("organization_id is required for Google Drive uploads")
+            google_credential_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
+                or self.google_credential_id
+            )
+            if not google_credential_id:
+                raise ValueError("Google credential id is required")
+
+            google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+                organization_id=org_id,
+                credential_id=google_credential_id,
+                required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+            )
+            if not google_credentials or not google_credentials.token:
+                raise ValueError("Google Drive credential is not connected or is missing required scopes")
+
+            folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
+            for file_path in files_to_upload:
+                LOG.info("Uploading file to Google Drive customer storage", file_path=file_path)
+                destination = self._build_google_drive_destination(
+                    access_token=google_credentials.token,
+                    folder_id=folder_id,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=org_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to Google Drive customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.SFTP:
+            actual_sftp_password = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_password,
+                "sftp_password",
+            )
+            actual_sftp_private_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_private_key,
+                "sftp_private_key",
+            )
+            actual_sftp_passphrase = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_private_key_passphrase,
+                "sftp_private_key_passphrase",
+            )
+            actual_sftp_username = (
+                workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
+            )
+            sftp_port = 22 if self.sftp_port is None else self.sftp_port
+            for file_path in files_to_upload:
+                destination = self._build_sftp_destination(
+                    file_path=file_path,
+                    host=self.sftp_host or "",
+                    port=sftp_port,
+                    username=actual_sftp_username or "",
+                    password=actual_sftp_password,
+                    private_key=actual_sftp_private_key,
+                    private_key_passphrase=actual_sftp_passphrase,
+                    remote_path=self.sftp_remote_path,
+                    host_key=self.sftp_host_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to SFTP customer storage", file_path=self.path)
+        else:
+            raise ValueError(f"Unsupported storage type: {storage_type}")
+
+        return uploaded_uris
 
     @staticmethod
     def _candidate_download_signal_run_ids(
@@ -5778,6 +6561,123 @@ class FileUploadBlock(Block):
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
         return files_to_upload
+
+    async def _select_files_to_upload_with_prompt(
+        self,
+        *,
+        prompt: str,
+        files_to_upload: list[str],
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> tuple[list[str], str]:
+        candidate_paths_by_exact_name: dict[str, str] = {}
+        candidate_paths_by_normalized_name: dict[str, str] = {}
+        colliding_normalized_names: set[str] = set()
+        candidate_file_names: list[str] = []
+        for candidate_file_path in files_to_upload:
+            candidate_name = Path(candidate_file_path).name
+            candidate_paths_by_exact_name[candidate_name] = candidate_file_path
+            candidate_file_names.append(candidate_name[:300])
+
+            normalized_name = unicodedata.normalize("NFC", candidate_name)
+            if normalized_name in colliding_normalized_names:
+                continue
+            existing_path = candidate_paths_by_normalized_name.get(normalized_name)
+            if existing_path is not None and existing_path != candidate_file_path:
+                # Distinct files that normalize to the same basename are only safe to resolve by exact spelling.
+                colliding_normalized_names.add(normalized_name)
+                candidate_paths_by_normalized_name.pop(normalized_name)
+            else:
+                candidate_paths_by_normalized_name[normalized_name] = candidate_file_path
+
+        llm_prompt = prompt_engine.load_prompt(
+            "file-upload-select-files",
+            user_instructions=prompt,
+            candidate_file_names=candidate_file_names,
+        )
+        llm_key = self.override_llm_key_for_organization(organization_id)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+
+        workflow_run_block = None
+        try:
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                workflow_run_block_id, organization_id
+            )
+        except Exception as e:
+            LOG.error(
+                "Failed to fetch workflow_run_block for FileUploadBlock selection artifacts",
+                block_label=self.label,
+                workflow_run_block_id=workflow_run_block_id,
+                error=e,
+            )
+
+        llm_response = await llm_api_handler(
+            prompt=llm_prompt,
+            prompt_name="file-upload-select-files",
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            force_dict=False,
+        )
+
+        if workflow_run_block:
+            try:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                    workflow_run_block=workflow_run_block,
+                    artifacts=[
+                        (ArtifactType.LLM_PROMPT, llm_prompt.encode("utf-8")),
+                        (ArtifactType.LLM_RESPONSE, json.dumps(llm_response).encode("utf-8")),
+                    ],
+                )
+            except Exception as e:
+                LOG.error(
+                    "Failed to save FileUploadBlock selection artifacts",
+                    block_label=self.label,
+                    workflow_run_block_id=workflow_run_block_id,
+                    error=e,
+                )
+
+        if not isinstance(llm_response, dict):
+            raise ValueError("File upload selection LLM response must be a JSON object")
+        reasoning = llm_response.get("reasoning")
+        if not isinstance(reasoning, str):
+            raise ValueError("File upload selection LLM response reasoning must be a string")
+
+        selected_names = llm_response.get("files_to_upload")
+        if not isinstance(selected_names, list) or not all(isinstance(name, str) for name in selected_names):
+            raise ValueError("File upload selection LLM response files_to_upload must be a list of strings")
+
+        selected_paths: list[str] = []
+        seen_paths: set[str] = set()
+        unmatched_names: list[str] = []
+        for selected_name in selected_names:
+            resolved_candidate_path = candidate_paths_by_exact_name.get(selected_name)
+            if resolved_candidate_path is None:
+                normalized_name = unicodedata.normalize("NFC", selected_name)
+                if normalized_name not in colliding_normalized_names:
+                    resolved_candidate_path = candidate_paths_by_normalized_name.get(normalized_name)
+            if resolved_candidate_path is None:
+                unmatched_names.append(selected_name)
+                continue
+            if resolved_candidate_path in seen_paths:
+                continue
+            seen_paths.add(resolved_candidate_path)
+            selected_paths.append(resolved_candidate_path)
+
+        # Any selected name outside the candidate list means the response cannot be trusted; fail closed.
+        if unmatched_names:
+            LOG.warning(
+                "FileUploadBlock prompt selected names that are not candidates",
+                block_label=self.label,
+                workflow_run_block_id=workflow_run_block_id,
+                unmatched_name_count=len(unmatched_names),
+                unmatched_names=[name[:100] for name in unmatched_names[:3]],
+            )
+            raise ValueError(
+                f"File upload selection returned {len(unmatched_names)} name(s) that are not candidate files"
+            )
+
+        return selected_paths, reasoning
 
     def _get_files_in_alternate_candidate_download_dirs(
         self,
@@ -5929,6 +6829,24 @@ class FileUploadBlock(Block):
 
         return registered_downloaded_files
 
+
+class FileUploadBlock(FileDestinationBlock):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self._get_destination_parameters(self.get_workflow_run_context(workflow_run_id))
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self._format_destination_template_parameters(workflow_run_context)
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -5941,27 +6859,9 @@ class FileUploadBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
         # data validate before uploading
-        missing_parameters = []
-        if self.storage_type == FileStorageType.S3:
-            if not self.s3_bucket:
-                missing_parameters.append("s3_bucket")
-            if not self.aws_access_key_id:
-                missing_parameters.append("aws_access_key_id")
-            if not self.aws_secret_access_key:
-                missing_parameters.append("aws_secret_access_key")
-        elif self.storage_type == FileStorageType.AZURE:
-            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
-                missing_parameters.append("azure_storage_account_name")
-            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
-                missing_parameters.append("azure_storage_account_key")
-            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
-                missing_parameters.append("azure_blob_container_name")
-        elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
-            if not self.google_credential_id:
-                missing_parameters.append("google_credential_id")
-            if not self.google_drive_folder_id:
-                missing_parameters.append("google_drive_folder_id")
-        else:
+        try:
+            missing_parameters = self._validate_destination_fields(self.storage_type)
+        except UnsupportedStorageTypeError:
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Unsupported storage type: {self.storage_type}",
@@ -6003,7 +6903,7 @@ class FileUploadBlock(Block):
             files_to_upload = []
             max_file_count = (
                 MAX_UPLOAD_FILE_COUNT
-                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE}
+                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
                 else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
             )
             files_to_upload = self._get_files_to_upload_from_download_dir(
@@ -6084,95 +6984,50 @@ class FileUploadBlock(Block):
                     organization_id=organization_id,
                 )
 
-            if self.storage_type == FileStorageType.S3:
-                actual_aws_access_key_id = (
-                    workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id)
-                    or self.aws_access_key_id
+            if files_to_upload and self.prompt and self.prompt.strip():
+                candidate_count = len(files_to_upload)
+                files_to_upload, selection_reasoning = await self._select_files_to_upload_with_prompt(
+                    prompt=self.prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
-                actual_aws_secret_access_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
-                    or self.aws_secret_access_key
+                selected_count = len(files_to_upload)
+                LOG.info(
+                    "FileUploadBlock prompt selection completed",
+                    block_label=self.label,
+                    candidate_count=candidate_count,
+                    selected_count=selected_count,
                 )
-                for file_path in files_to_upload:
-                    destination = self._build_s3_destination(
+
+                if not files_to_upload:
+                    LOG.warning(
+                        "FileUploadBlock prompt selected no files; treating as no-op",
+                        block_label=self.label,
                         workflow_run_id=workflow_run_id,
-                        file_path=file_path,
-                        aws_access_key_id=actual_aws_access_key_id,
-                        aws_secret_access_key=actual_aws_secret_access_key,
+                        workflow_run_block_id=workflow_run_block_id,
+                        candidate_count=candidate_count,
+                        selected_count=selected_count,
+                        reasoning=selection_reasoning,
                     )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
+                    return await self.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value=uploaded_uris,
+                        status=BlockStatus.completed,
+                        workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
-                        run_id=workflow_run_id,
                     )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to S3", file_path=self.path)
-            elif self.storage_type == FileStorageType.AZURE:
-                actual_azure_storage_account_name = (
-                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_name)
-                    or self.azure_storage_account_name
-                )
-                actual_azure_storage_account_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
-                    or self.azure_storage_account_key
-                )
-                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
-                    raise AzureConfigurationError("Azure Storage is not configured")
 
-                for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock Uploading file to Azure Blob Storage", file_path=file_path)
-                    destination = self._build_azure_destination(
-                        workflow_run_id=workflow_run_id,
-                        file_path=file_path,
-                        azure_storage_account_name=actual_azure_storage_account_name,
-                        azure_storage_account_key=actual_azure_storage_account_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
-            elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
-                org_id = organization_id or workflow_run_context.organization_id
-                if not org_id:
-                    raise ValueError("organization_id is required for Google Drive uploads")
-                google_credential_id = (
-                    workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
-                    or self.google_credential_id
-                )
-                if not google_credential_id:
-                    raise ValueError("Google credential id is required")
-
-                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                    organization_id=org_id,
-                    credential_id=google_credential_id,
-                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
-                )
-                if not google_credentials or not google_credentials.token:
-                    raise ValueError("Google Drive credential is not connected or is missing required scopes")
-
-                folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
-                for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock Uploading file to Google Drive", file_path=file_path)
-                    destination = self._build_google_drive_destination(
-                        access_token=google_credentials.token,
-                        folder_id=folder_id,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=org_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
-            else:
-                # This case should ideally be caught by the initial validation
-                raise ValueError(f"Unsupported storage type: {self.storage_type}")
+            uploaded_uris = await self._dispatch_files_to_storage(
+                storage_type=self.storage_type,
+                files_to_upload=files_to_upload,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+            )
 
         except Exception as e:
             LOG.exception("FileUploadBlock Failed to upload file", file_path=self.path, storage_type=self.storage_type)
@@ -8232,10 +9087,246 @@ class LoginBlock(BaseTaskBlock):
     skip_saved_profile: bool = False
 
 
-class FileDownloadBlock(BaseTaskBlock):
+class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
+    download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        parameters = super().get_all_parameters(workflow_run_id)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        existing_keys = {p.key for p in parameters}
+        for destination_param in self._get_destination_parameters(workflow_run_context):
+            if destination_param.key not in existing_keys:
+                parameters.append(destination_param)
+                existing_keys.add(destination_param.key)
+        return parameters
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        download_files_path = ""
+        baseline_unknown = False
+        pre_names: set[str] = set()
+        pre_hashes: dict[str, str] = {}
+        pre_mtimes: dict[str, int] = {}
+        colliding_normalized_names: set[str] = set()
+        if self.download_target != FileDownloadTarget.WEBSITE:
+            # Fail fast on a misconfigured destination before running the (expensive) browser
+            # download, so a missing required field does not waste a download that cannot be delivered.
+            early_storage_type = FileStorageType(self.download_target.value)
+            early_context = self.get_workflow_run_context(workflow_run_id)
+            try:
+                early_missing_parameters = self._validate_destination_fields(early_storage_type)
+            except UnsupportedStorageTypeError as e:
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to send downloaded file(s) to {early_storage_type}: {e}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            if early_missing_parameters:
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        f"Required block values are missing in the FileDownloadBlock (label: {self.label}): "
+                        f"{', '.join(early_missing_parameters)}"
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            context = skyvern_context.current()
+            run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+            download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
+            try:
+                pre_download_filenames = os.listdir(download_files_path)
+            except FileNotFoundError:
+                pre_download_filenames = []
+            except OSError:
+                baseline_unknown = True
+                pre_download_filenames = []
+            for filename in pre_download_filenames:
+                local_file = os.path.join(download_files_path, filename)
+                if not os.path.isfile(local_file):
+                    continue
+                normalized_filename = unicodedata.normalize("NFC", filename)
+                if normalized_filename in pre_names:
+                    colliding_normalized_names.add(normalized_filename)
+                pre_names.add(normalized_filename)
+                try:
+                    pre_hashes[normalized_filename] = calculate_sha256_for_file(local_file)
+                    pre_mtimes[filename] = os.stat(local_file).st_mtime_ns
+                except OSError:
+                    continue
+            if baseline_unknown:
+                # Fail fast before the download: the baseline scan failed, so delivery would be
+                # refused anyway (to avoid leaking earlier files) — do not download customer data.
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        "Could not establish the pre-download baseline; refusing to deliver files to "
+                        f"{early_storage_type} to avoid leaking earlier files."
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+        result = await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+        if self.download_target == FileDownloadTarget.WEBSITE:
+            return result
+        if not result.success:
+            return result
+
+        storage_type = FileStorageType(self.download_target.value)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            self._format_destination_template_parameters(workflow_run_context)
+            max_file_count = (
+                MAX_UPLOAD_FILE_COUNT
+                if storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
+                else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            )
+            try:
+                post_download_filenames = os.listdir(download_files_path)
+            except FileNotFoundError:
+                post_download_filenames = []
+            except OSError as e:
+                # Symmetric with the pre-download baseline: a real post-download scan failure (not a
+                # missing directory) must fail closed rather than report success without delivering.
+                raise RuntimeError("Could not scan the download directory after the download completed") from e
+
+            files_to_upload: list[str] = []
+            for filename in post_download_filenames:
+                local_file = os.path.join(download_files_path, filename)
+                try:
+                    if not os.path.isfile(local_file):
+                        if os.path.isdir(local_file):
+                            LOG.warning("FileDownloadBlock skipping directory", file=filename)
+                        continue
+                    normalized_filename = unicodedata.normalize("NFC", filename)
+                except OSError:
+                    continue
+
+                if normalized_filename in colliding_normalized_names:
+                    # Multiple byte-distinct directory entries normalized to this name at baseline,
+                    # so neither content hash nor write time can be attributed to a single entry;
+                    # fail closed rather than risk delivering an earlier block's file.
+                    continue
+
+                if normalized_filename not in pre_names:
+                    files_to_upload.append(local_file)
+                    continue
+                if normalized_filename not in pre_hashes:
+                    continue
+                try:
+                    current_hash = calculate_sha256_for_file(local_file)
+                except OSError:
+                    continue
+                if current_hash != pre_hashes[normalized_filename]:
+                    files_to_upload.append(local_file)
+                    continue
+                # Identical content means hashing cannot distinguish a genuine re-download
+                # from an earlier block's leftover; fall back to write time, keyed by the raw
+                # directory-entry name so Unicode-normalization-equivalent names never share a
+                # baseline. Deliver only if this block rewrote this exact entry in its own window.
+                baseline_mtime_ns = pre_mtimes.get(filename)
+                if baseline_mtime_ns is None:
+                    continue
+                try:
+                    current_mtime_ns = os.stat(local_file).st_mtime_ns
+                except OSError:
+                    continue
+                if current_mtime_ns > baseline_mtime_ns:
+                    files_to_upload.append(local_file)
+
+            if not files_to_upload:
+                return result
+
+            if len(files_to_upload) > max_file_count:
+                raise ValueError(f"Too many scoped downloaded files to upload. Max: {max_file_count}")
+
+            if files_to_upload and self.prompt and self.prompt.strip():
+                candidate_count = len(files_to_upload)
+                files_to_upload, selection_reasoning = await self._select_files_to_upload_with_prompt(
+                    prompt=self.prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                selected_count = len(files_to_upload)
+                LOG.info(
+                    "FileDownloadBlock prompt selection completed",
+                    block_label=self.label,
+                    candidate_count=candidate_count,
+                    selected_count=selected_count,
+                )
+
+                if not files_to_upload:
+                    LOG.warning(
+                        "FileDownloadBlock prompt selected no files; treating as no-op",
+                        block_label=self.label,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        candidate_count=candidate_count,
+                        selected_count=selected_count,
+                        reasoning=selection_reasoning,
+                    )
+                    return result
+
+            uploaded_uris = await self._dispatch_files_to_storage(
+                storage_type=storage_type,
+                files_to_upload=files_to_upload,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+            )
+        except Exception as e:
+            LOG.exception(
+                "FileDownloadBlock failed to send downloaded file(s)",
+                block_label=self.label,
+                storage_type=storage_type,
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to send downloaded file(s) to {storage_type}: {e}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        LOG.info(
+            "FileDownloadBlock sent downloaded file(s) to customer storage",
+            block_label=self.label,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            storage_type=storage_type,
+            uploaded_file_count=len(uploaded_uris),
+        )
+        return result
 
 
 class UrlBlock(BaseTaskBlock):
@@ -11118,6 +12209,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 # Late import: google_sheets_blocks imports Block from this module, so top-level import would cycle.
+from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E402
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
@@ -11152,6 +12244,7 @@ BlockSubclasses = Union[
     PrintPageBlock,
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,
+    EmailInboxBlock,
     GoogleSheetsWriteBlock,
     PdfFillBlock,
     SplitPdfBlock,

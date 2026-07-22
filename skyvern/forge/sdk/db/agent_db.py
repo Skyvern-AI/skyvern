@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.db.repositories.debug import DebugRepository
 from skyvern.forge.sdk.db.repositories.folders import FoldersRepository
 from skyvern.forge.sdk.db.repositories.google_oauth import GoogleOAuthRepository
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import MicrosoftOAuthRepository
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
@@ -385,6 +386,7 @@ class AgentDB(BaseAlchemyDB):
         self.tags = TagsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(
             self.Session,
             debug_enabled,

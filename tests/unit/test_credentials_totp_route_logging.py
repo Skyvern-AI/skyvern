@@ -75,6 +75,7 @@ async def test_send_totp_code_parse_failure_log_redacts_identifier_and_content(
 
     error_log = next((r for r in logs if r.get("event") == "Failed to parse otp login"), None)
     assert error_log is not None
+    assert error_log["organization_id"] == "o_test"
     assert error_log["totp_identifier"] == "[REDACTED_OTP_IDENTIFIER]"
     assert error_log["content_length"] == len(raw_content)
     assert "content" not in error_log
@@ -102,8 +103,10 @@ async def test_send_totp_code_parser_exception_log_redacts_raw_exception_context
                 curr_org=SimpleNamespace(organization_id="o_test"),
             )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Failed to parse otp login"
+    # A raised parser is a backend/dependency failure, not bad caller input, so the
+    # endpoint returns a retryable 502 with a static detail that never echoes the payload.
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "OTP extraction is temporarily unavailable. Please retry in a few minutes."
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
     assert raw_identifier not in str(exc_info.value)
@@ -113,8 +116,39 @@ async def test_send_totp_code_parser_exception_log_redacts_raw_exception_context
 
     error_log = next((r for r in logs if r.get("event") == "Failed to parse otp login"), None)
     assert error_log is not None
+    assert error_log["organization_id"] == "o_test"
     assert error_log["totp_identifier"] == "[REDACTED_OTP_IDENTIFIER]"
     assert error_log["content_length"] == len(raw_content)
     assert error_log["exception_type"] == "RuntimeError"
     assert "content" not in error_log
     _assert_raw_values_not_logged(logs, raw_identifier, raw_content, "246810")
+
+
+@pytest.mark.asyncio
+async def test_send_totp_code_off_schema_llm_response_yields_400_not_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.services import otp_service
+
+    raw_identifier = "qa-email-otp@example.test"
+    raw_content = "Long email body requesting OTP 424242 for qa-email-otp@example.test."
+    create_otp_code = AsyncMock()
+    monkeypatch.setattr(credentials.app, "DATABASE", _database_with_otp_create(create_otp_code))
+
+    async def off_schema_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"otp_type": "totp", "otp_value": "424242"}
+
+    monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+    monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", off_schema_handler, raising=False)
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(HTTPException) as exc_info:
+            await credentials.send_totp_code(
+                TOTPCodeCreate(totp_identifier=raw_identifier, content=raw_content),
+                curr_org=SimpleNamespace(organization_id="o_test"),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Failed to parse otp login"
+    create_otp_code.assert_not_awaited()
+    _assert_raw_values_not_logged(logs, raw_identifier, raw_content, "424242")

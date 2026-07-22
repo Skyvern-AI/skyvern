@@ -6,47 +6,680 @@ OSS-synced: only example.* / RFC-2606 placeholder targets.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import keyword
 import sys
 import textwrap
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
 
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    _SELECTION_MATCH_BASES,
+    AuthoringParameterBindingCandidate,
+    AuthoringParameterFieldBinding,
+    AuthoringParameterTerminalBinding,
+    authored_selection_parameter_bindings,
+    authored_selector_parameter_bindings,
+    authoring_parameter_binding_directive_consumed,
+    build_authoring_parameter_binding_directive,
+    build_authoring_parameter_binding_snapshot,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
     _ENTRY_RESUME_AFTER_AUTH_VAR,
     _ENTRY_REUSED_VAR,
+    _ENTRY_TARGET_VAR,
     _INDENT,
     _MAX_STEPS,
     _READONLY_DEFERRED_VAR,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    INPUT_TEMPLATED_PROVENANCE_SOURCE,
+    LOCATOR_WITNESS_PARAM_SOURCE,
+    SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
+    SCOUTED_SPINE_TRUNCATED_REASON_CODE,
+    TRUNCATED_FINDING,
+    UNFORGIVEN_DROP_FINDING,
+    UNRECORDED_INDEX_FINDING,
+    ProducedStaticReturnEnvelope,
+    SynthesisDiagnostics,
     _get_by_role_expr,
     _get_by_role_expr_strict,
+    _is_submit_interaction,
+    build_input_templated_locator,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
+    credential_scout_gap,
+    input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
+    obligation_finding_reason_code,
+    produce_covered_static_return_envelope,
     render_synthesized_offer_text,
+    spine_partition_findings,
     synthesize_code_block,
+    synthesize_code_block_with_extraction,
+    synthesize_extraction_suffix,
+    templated_selection_locator_binding,
+    uncovered_required_emitted_interactions,
+    witness_prelude_lines,
 )
 from skyvern.forge.sdk.copilot.context import (
     FillCarry,
     StructuredContext,
     _fill_carry_from_scout_trajectory,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    LiveReadBinding,
+    LiveReadKind,
+    RequestedOutputExtractionPlan,
+    RevealAnchor,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
-from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
+from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction, _with_trajectory_anchor
 from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 
 
+@pytest.fixture(autouse=True)
+def _stub_mypy_for_static_policy_cases(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if "real_mypy" in request.fixturenames:
+        return
+    fake_mypy = ModuleType("mypy")
+    fake_mypy.__dict__["api"] = SimpleNamespace(run=lambda _args: ("", "", 0))
+    monkeypatch.setitem(sys.modules, "mypy", fake_mypy)
+
+
+@pytest.fixture
+def real_mypy() -> None:
+    return None
+
+
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
     return {"tool_name": tool_name, **fields}
+
+
+def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    assert result.code.count(fill) == 1
+    assert result.code.index(fill) < result.code.index('page.locator("#submit").click()')
+    assert result.parameters == [{"key": "search_location"}]
+    assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+def test_authoring_parameter_snapshot_recovers_missing_fill_before_enter() -> None:
+    trajectory = [
+        _interaction(
+            "press_key",
+            selector="#location",
+            key="Enter",
+            source_url="https://example.com/form",
+            trajectory_index=0,
+        )
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="press_key",
+            trajectory_index=0,
+            selector="#location",
+            key="Enter",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    press = 'page.locator("#location").press("Enter")'
+    assert result.code.count(fill) == 1
+    assert result.code.index(fill) < result.code.index(press)
+    assert result.parameters == [{"key": "search_location"}]
+
+
+def test_authoring_parameter_directive_consumption_requires_structural_and_final_code_evidence() -> None:
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=0,
+                match_basis="exact_authored_selector",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=1,
+            selector="#submit",
+        ),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[
+            AuthoringParameterBindingCandidate(
+                declared_key="search_location",
+                field_selector="#location",
+            )
+        ],
+    )
+    code = 'await page.locator("#location").fill(str(search_location))'
+
+    assert authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code=code,
+        parameter_keys=["search_location"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive.model_copy(update={"structural_key": "stale"}),
+        snapshot,
+        code=code,
+        parameter_keys=["search_location"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#other").fill(str(search_location))',
+        parameter_keys=["search_location"],
+    )
+
+
+def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_changes() -> None:
+    trajectory = [_interaction("press_key", selector="#location", key="Tab", source_url="https://example.com/form")]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="press_key",
+            trajectory_index=0,
+            selector="#location",
+            key="Enter",
+        ),
+    )
+
+    assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
+
+
+def _templated_selection_click(selector: str, key: str, value: str, index: int) -> dict[str, Any]:
+    interaction = _interaction(
+        "click", selector=selector, source_url="https://example.com/list", trajectory_index=index
+    )
+    interaction["input_correspondences"] = input_correspondences_for_interaction(interaction, {key: value})
+    return interaction
+
+
+def test_authored_selection_bindings_recognizes_templated_click_and_select_option() -> None:
+    code = (
+        'await page.locator(f"[data-account=\\"{account_number}\\"]").click()\n'
+        'await page.locator("#plan").select_option(str(plan_tier))\n'
+    )
+    bindings = authored_selection_parameter_bindings(code, {"account_number", "plan_tier"})
+    assert bindings is not None
+    assert bindings.get("#plan") == {"plan_tier"}
+    assert {key for keys in bindings.values() for key in keys} == {"account_number", "plan_tier"}
+    assert authored_selector_parameter_bindings(code, {"account_number", "plan_tier"}) == {}
+
+
+def test_authored_selection_bindings_ignores_literal_only_click() -> None:
+    code = 'await page.locator("#row-account-AC12345").click()\n'
+    assert authored_selection_parameter_bindings(code, {"account_number"}) == {}
+
+
+def test_authoring_parameter_directive_consumed_via_templated_click() -> None:
+    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
+    key, join = templated_selection_locator_binding(click)
+    assert key == "account_number"
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="account_number",
+                field_selector=join,
+                field_trajectory_index=0,
+                match_basis="scouted_selection_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
+        ),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[AuthoringParameterBindingCandidate(declared_key="account_number", field_selector=join)],
+    )
+    consumed_code = 'await page.locator(f"[data-account=\\"{account_number}\\"]").click()'
+    assert authoring_parameter_binding_directive_consumed(
+        directive, snapshot, code=consumed_code, parameter_keys=["account_number"]
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#row-account-AC12345").click()',
+        parameter_keys=["account_number"],
+    )
+
+
+def test_authoring_parameter_directive_consumed_via_select_option_value_argument() -> None:
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="plan_tier",
+                field_selector="#plan",
+                field_trajectory_index=0,
+                match_basis="scouted_option_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
+    )
+    directive = build_authoring_parameter_binding_directive(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        candidates=[AuthoringParameterBindingCandidate(declared_key="plan_tier", field_selector="#plan")],
+    )
+    assert authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#plan").select_option(str(plan_tier))',
+        parameter_keys=["plan_tier"],
+    )
+    assert not authoring_parameter_binding_directive_consumed(
+        directive,
+        snapshot,
+        code='await page.locator("#plan").select_option("premium")',
+        parameter_keys=["plan_tier"],
+    )
+
+
+def test_selection_snapshot_click_binding_references_declared_key() -> None:
+    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
+    _key, join = templated_selection_locator_binding(click)
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="account_number",
+                field_selector=join,
+                field_trajectory_index=0,
+                match_basis="scouted_selection_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
+        ),
+    )
+    result = synthesize_code_block([click], strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert 'page.locator(f"[data-account=\\"{account_number}\\"]").click()' in result.code
+    assert ".fill(" not in result.code
+
+
+def test_selection_snapshot_select_option_binds_value_argument() -> None:
+    select = _interaction(
+        "select_option", selector="#plan", value="premium", source_url="https://example.com/list", trajectory_index=0
+    )
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="plan_tier",
+                field_selector="#plan",
+                field_trajectory_index=0,
+                match_basis="scouted_option_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
+    )
+    result = synthesize_code_block([select], strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert 'page.locator("#plan").select_option(str(plan_tier))' in result.code
+    assert '"premium"' not in result.code
+    assert result.parameters == [{"key": "plan_tier"}]
+
+
+def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(tool_name="click", trajectory_index=9, selector="#submit"),
+    )
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+    assert result is not None
+    assert ".select_option(" not in result.code
+    assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
+
+
+def test_rekeyed_outputs_with_alike_labels_return_under_distinct_keys() -> None:
+    # Labels are not guaranteed distinct, so alike-slugging labels must not collapse onto one key.
+    plan = RequestedOutputExtractionPlan(
+        requested_output_paths=("output.request_slot_aaa_00", "output.request_slot_aaa_01"),
+        observation_step=3,
+        observation_identity="observation-identity",
+        reveal=RevealAnchor(selector="#show"),
+        live_reads=(
+            LiveReadBinding(
+                output_path="output.request_slot_aaa_00",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=0,
+                child_index=1,
+                child_count=2,
+                relation_label="Visitors",
+            ),
+            LiveReadBinding(
+                output_path="output.request_slot_aaa_01",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=1,
+                child_index=1,
+                child_count=2,
+                relation_label="visitors",
+            ),
+        ),
+        identity="plan-identity",
+    )
+
+    suffix = synthesize_extraction_suffix(plan)
+
+    assert suffix is not None
+    assert '"visitors": _extraction_value_0' in suffix.code
+    assert '"visitors_2": _extraction_value_1' in suffix.code
+    assert "request_slot_aaa" not in suffix.code
+
+
+def _extraction_plan() -> RequestedOutputExtractionPlan:
+    return RequestedOutputExtractionPlan(
+        requested_output_paths=(
+            "output.records[].detail",
+            "output.records[].state",
+            "output.record_id",
+            "output.overall_state",
+        ),
+        observation_step=9,
+        observation_identity="observation-identity",
+        reveal=RevealAnchor(selector="#show-details"),
+        live_reads=(
+            LiveReadBinding(
+                output_path="output.record_id",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=0,
+                child_index=1,
+                child_count=2,
+                relation_label="Record Identifier",
+            ),
+            LiveReadBinding(
+                output_path="output.records[].detail",
+                kind=LiveReadKind.TABLE_COLUMN,
+                selector="#records",
+                selector_count=1,
+                selector_index=0,
+                row_selector="#records > tbody > tr",
+                row_count=3,
+                column_index=1,
+                headers=("Record", "Detail", "State"),
+                row_cell_counts=(3, 3, 3),
+                row_identities=("One Detail State", "Two Detail State", "Three Detail State"),
+            ),
+            LiveReadBinding(
+                output_path="output.records[].state",
+                kind=LiveReadKind.TABLE_COLUMN,
+                selector="#records",
+                selector_count=1,
+                selector_index=0,
+                row_selector="#records > tbody > tr",
+                row_count=3,
+                column_index=2,
+                headers=("Record", "Detail", "State"),
+                row_cell_counts=(3, 3, 3),
+                row_identities=("One Detail State", "Two Detail State", "Three Detail State"),
+            ),
+            LiveReadBinding(
+                output_path="output.overall_state",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=1,
+                child_index=1,
+                child_count=2,
+                relation_label="Overall State",
+            ),
+        ),
+        identity="plan-identity",
+    )
+
+
+def test_extraction_suffix_compiles_direct_guarded_live_reads() -> None:
+    suffix = synthesize_extraction_suffix(_extraction_plan())
+
+    assert suffix is not None
+    assert 'page.locator(".kv").nth(0).locator(":scope > *").nth(1).inner_text()' in suffix.code
+    assert 'page.locator("#records > tbody > tr").count() != 3' in suffix.code
+    assert "for _extraction_index" not in suffix.code
+    assert 'page.locator("#records > tbody > tr").nth(2)' in suffix.code
+    assert '"overall_state": _extraction_value_1' in suffix.code
+    assert '"detail"' in suffix.code
+    assert '"state"' in suffix.code
+
+
+class _RecipeLocator:
+    def __init__(self, page: _RecipePage, selector: str, indices: tuple[int, ...] = ()) -> None:
+        self.page = page
+        self.selector = selector
+        self.indices = indices
+
+    def nth(self, index: int) -> _RecipeLocator:
+        return _RecipeLocator(self.page, self.selector, (*self.indices, index))
+
+    def locator(self, selector: str) -> _RecipeLocator:
+        return _RecipeLocator(self.page, f"{self.selector}|{selector}", self.indices)
+
+    async def count(self) -> int:
+        return self.page.counts[(self.selector, self.indices)]
+
+    async def is_visible(self) -> bool:
+        return self.page.visibility.get((self.selector, self.indices), True)
+
+    async def inner_text(self) -> str:
+        return self.page.text[(self.selector, self.indices)]
+
+
+class _RecipePage:
+    def __init__(self) -> None:
+        self.visibility: dict[tuple[str, tuple[int, ...]], bool] = {}
+        self.counts: dict[tuple[str, tuple[int, ...]], int] = {
+            (".kv", ()): 2,
+            (".kv|:scope > *", (0,)): 2,
+            (".kv|:scope > *", (1,)): 2,
+            ("#records", ()): 1,
+            ("#records|:scope > thead > tr > th", (0,)): 3,
+            ("#records|[colspan], [rowspan]", (0,)): 0,
+            ("#records > tbody > tr", ()): 3,
+            ("#records|:scope table", (0,)): 0,
+        }
+        self.text: dict[tuple[str, tuple[int, ...]], str] = {
+            (".kv|:scope > *", (0, 0)): "Record Identifier",
+            (".kv|:scope > *", (0, 1)): "record-123",
+            (".kv|:scope > *", (1, 0)): "Overall State",
+            (".kv|:scope > *", (1, 1)): "Ready",
+        }
+        for index, header in enumerate(("Record", "Detail", "State")):
+            self.text[("#records|:scope > thead > tr > th", (0, index))] = header
+        for row, identity in enumerate(("One Detail State", "Two Detail State", "Three Detail State")):
+            self.counts[("#records > tbody > tr|:scope > th, :scope > td", (row,))] = 3
+            self.counts[("#records > tbody > tr|:scope > th", (row,))] = 0
+            self.text[("#records > tbody > tr", (row,))] = identity
+            self.text[("#records > tbody > tr|:scope > th, :scope > td", (row, 1))] = f"Detail {row}"
+            self.text[("#records > tbody > tr|:scope > th, :scope > td", (row, 2))] = "Ready"
+
+    def locator(self, selector: str) -> _RecipeLocator:
+        return _RecipeLocator(self, selector)
+
+
+async def _execute_recipe(page: _RecipePage) -> dict[str, object]:
+    suffix = synthesize_extraction_suffix(_extraction_plan())
+    assert suffix is not None
+    namespace: dict[str, object] = {}
+    exec("async def recipe(page):\n" + textwrap.indent(suffix.code, "    "), namespace)
+    recipe = namespace["recipe"]
+    assert callable(recipe)
+    return await recipe(page)
+
+
+@pytest.mark.asyncio
+async def test_generated_recipe_executes_and_fails_closed_on_runtime_drift() -> None:
+    page = _RecipePage()
+    result = await _execute_recipe(page)
+    assert result["output"]["record_id"] == "record-123"
+    assert len(result["output"]["records"]) == 3
+
+    page.counts[(".kv", ())] = 3
+    with pytest.raises(ValueError, match="scalar selector cardinality"):
+        await _execute_recipe(page)
+
+    page.counts[(".kv", ())] = 2
+    page.visibility[("#records > tbody > tr|:scope > th, :scope > td", (1, 2))] = False
+    with pytest.raises(ValueError, match="cell is no longer visible"):
+        await _execute_recipe(page)
+
+
+def _produce_table_envelope() -> ProducedStaticReturnEnvelope | None:
+    return produce_covered_static_return_envelope(
+        "x = 1",
+        plan=_extraction_plan(),
+        scalar_required_paths=set(_extraction_plan().requested_output_paths),
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+
+
+async def _execute_envelope(page: _RecipePage, envelope: ProducedStaticReturnEnvelope | None) -> dict[str, object]:
+    assert envelope is not None
+    namespace: dict[str, object] = {}
+    exec("async def recipe(page):\n" + textwrap.indent(envelope.code, "    "), namespace)
+    recipe = namespace["recipe"]
+    assert callable(recipe)
+    return await recipe(page)
+
+
+@pytest.mark.asyncio
+async def test_produced_envelope_executes_table_and_scalar_reads() -> None:
+    result = await _execute_envelope(_RecipePage(), _produce_table_envelope())
+    assert result["output"]["record_id"] == "record-123"
+    assert result["output"]["overall_state"] == "Ready"
+    assert len(result["output"]["records"]) == 3
+    assert result["output"]["records"][0]["detail"] == "Detail 0"
+    assert result["output"]["records"][2]["state"] == "Ready"
+
+
+@pytest.mark.asyncio
+async def test_produced_envelope_guard_raises_on_empty_cell() -> None:
+    page = _RecipePage()
+    page.text[("#records > tbody > tr|:scope > th, :scope > td", (0, 1))] = ""
+    with pytest.raises(ValueError, match="table cell value is empty"):
+        await _execute_envelope(page, _produce_table_envelope())
+
+
+def test_suffix_omits_empty_cell_guard() -> None:
+    suffix = synthesize_extraction_suffix(_extraction_plan())
+    assert suffix is not None
+    assert "table cell value is empty" not in suffix.code
+    assert "scalar value is empty" not in suffix.code
+
+
+def test_plan_compiler_requires_exact_reveal_and_is_idempotent() -> None:
+    trajectory = [
+        _interaction(
+            "click",
+            selector="#show-details",
+            role="button",
+            accessible_name="Show details",
+            source_url="https://example.com/records",
+        )
+    ]
+
+    first = synthesize_code_block_with_extraction(trajectory, _extraction_plan())
+    second = synthesize_code_block_with_extraction(trajectory, _extraction_plan())
+
+    assert first is not None
+    assert second is not None
+    assert first.code == second.code
+    assert first.code.count(".click()") == 1
+    assert first.extraction_plan_identity == "plan-identity"
+    assert first.extraction_fingerprint == second.extraction_fingerprint
+    assert synthesize_code_block_with_extraction([], _extraction_plan()) is None
 
 
 class TestLocatorSynthesis:
@@ -211,6 +844,56 @@ class TestLocatorSynthesis:
         assert result is not None
         assert ".first" not in result.code
         assert 'await page.locator("button").click()' not in result.code
+        dropped = [
+            d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
+        ]
+        assert dropped
+
+    def test_attribute_selector_emitted_verbatim_when_not_scout_ambiguous(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="button[data-action='orderDocuments']",
+                source_url="https://example.com/portal",
+                role="button",
+                accessible_name="Order Documents",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "button[data-action='orderDocuments']" in result.code
+
+    def test_strict_reanchors_scout_ambiguous_attribute_selector(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="button[data-action='orderDocuments']",
+                source_url="https://example.com/portal",
+                role="button",
+                accessible_name="Order Documents",
+                ambiguous=True,
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "data-action" not in result.code
+        assert 'await page.get_by_role("button", name="Order Documents", exact=True).click()' in result.code
+
+    def test_strict_drops_scout_ambiguous_attribute_selector_without_role_name(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="button[data-action='businessToggle']",
+                source_url="https://example.com/portal",
+                ambiguous=True,
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "data-action" not in result.code
         dropped = [
             d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
         ]
@@ -719,6 +1402,123 @@ class TestActionSynthesis:
         assert forbidden_snippet not in result.code
         ast.parse("async def _block(page):\n" + result.code)
 
+    def test_terminal_anonymous_structural_click_after_required_is_emitted_as_required(self) -> None:
+        terminal_selector = (
+            'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]/*[name()="div"][2]/*[name()="button"][2]'
+        )
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+            _interaction(
+                "click",
+                selector="button.primary",
+                source_url="https://example.com/find",
+                role="button",
+                accessible_name="Search",
+            ),
+            _interaction(
+                "click",
+                selector=terminal_selector,
+                source_url="https://example.com/results",
+                role="button",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert "button:has-text('Accept')" not in result.code
+        assert "_scout_optional_dismissal" not in result.code
+        terminal_records = [
+            record for record in result.diagnostics.emitted_interactions if record.get("trajectory_index") == 2
+        ]
+        assert len(terminal_records) == 1
+        assert not terminal_records[0].get("lane")
+        assert terminal_records[0]["method"] == "click"
+        assert terminal_records[0]["selector"] == terminal_selector
+
+    def test_terminal_dismissal_click_before_empty_key_press_is_still_reclassified_required(self) -> None:
+        # A trailing empty-key press_key is dropped (missing_key) and emits nothing, so it must not steal the
+        # terminal index from the anonymous-structural dismissal click before it and defeat the reclassify.
+        terminal_selector = (
+            'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]/*[name()="div"][2]/*[name()="button"][2]'
+        )
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+            _interaction(
+                "click",
+                selector=terminal_selector,
+                source_url="https://example.com/results",
+                role="button",
+            ),
+            _interaction("press_key", key="", source_url="https://example.com/results"),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert "_scout_optional_dismissal" not in result.code
+        terminal_records = [
+            record for record in result.diagnostics.emitted_interactions if record.get("trajectory_index") == 1
+        ]
+        assert len(terminal_records) == 1
+        assert not terminal_records[0].get("lane")
+        assert terminal_records[0]["method"] == "click"
+        assert terminal_records[0]["selector"] == terminal_selector
+
+    def test_terminal_structural_click_without_prior_required_stays_in_lane(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector=".btns button:nth-of-type(2)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert '_scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")' in result.code
+        assert 'await page.locator(".btns button:nth-of-type(2)").click()' not in result.code
+
+    def test_terminal_text_matched_dismissal_after_required_stays_in_lane(self) -> None:
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+            _interaction(
+                "click",
+                selector="button:not(.decline)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert "_scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in result.code
+        assert 'await page.locator("button:not(.decline)").click()' not in result.code
+
     def test_optional_dismissal_with_durable_target_is_offerable(self) -> None:
         trajectory = [
             _interaction(
@@ -1145,7 +1945,6 @@ class TestStepEmission:
     def test_skipped_interactions_emit_no_step(self) -> None:
         trajectory = [
             _interaction("click", selector="#go", source_url="https://example.com/"),
-            _interaction("hover", selector="#menu"),
             _interaction("select_option", selector="#size"),
             _interaction("click"),
             _interaction("press_key", key=""),
@@ -1153,6 +1952,39 @@ class TestStepEmission:
         block = synthesize_code_block(trajectory)
         assert block is not None
         assert [s["action_type"] for s in block.steps] == ["goto_url", "click"]
+
+    def test_hover_emits_step_in_non_strict_mode(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com/"),
+            _interaction("hover", selector="#menu"),
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "click", "hover"]
+        assert 'await page.locator("#menu").hover()' in block.code
+
+    def test_hover_stays_unsupported_in_strict_mode(self) -> None:
+        block = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/"),
+                _interaction("hover", selector="#menu"),
+            ],
+            strict_selectors=True,
+        )
+        assert block is not None
+        assert {"trajectory_index": 1, "tool_name": "hover", "reason_code": "unsupported_tool"} in (
+            block.diagnostics.dropped_interactions
+        )
+
+    def test_wait_emits_timeout_step(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com/"),
+            {"tool_name": "wait", "duration_ms": 6000},
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "click", "wait"]
+        assert "await page.wait_for_timeout(6000)" in block.code
 
     def test_no_entry_url_means_no_goto_step(self) -> None:
         block = synthesize_code_block([_interaction("press_key", key="Enter")])
@@ -2069,7 +2901,32 @@ class TestCredentialFillSynthesis:
         assert _code_block_safety_errors(workflow_yaml, None) == []
 
 
-def test_code_block_preflight_restores_recursion_limit() -> None:
+@pytest.mark.parametrize(
+    ("code", "expected_codes"),
+    [
+        pytest.param(
+            "await page.locator('button[type=submit]').first.click(timeout=5000)\n",
+            (),
+            id="valid-locator-click",
+        ),
+        pytest.param(
+            "await page.locator('button[type=submit]').first().click(timeout=5000)\n",
+            ("PLAYWRIGHT_API_MISMATCH",),
+            id="locator-property-called-as-method",
+        ),
+    ],
+)
+def test_code_block_preflight_real_mypy_contract_matrix(
+    real_mypy: None,
+    code: str,
+    expected_codes: tuple[str, ...],
+) -> None:
+    diagnostics = preflight_code_block(code)
+
+    assert [diagnostic.code for diagnostic in diagnostics] == list(expected_codes)
+
+
+def test_code_block_preflight_restores_recursion_limit(real_mypy: None) -> None:
     before = sys.getrecursionlimit()
     preflight_code_block("await page.locator('button[type=submit]').first.click(timeout=5000)\n")
 
@@ -2572,3 +3429,816 @@ class TestReadonlyControlStateCarry:
         persisted = StructuredContext(fill_carry=carry).to_json_str()
         assert '"control_readonly": true' in persisted
         assert '"control_value_satisfied": false' in persisted
+
+
+class TestEmittedInteractionPartition:
+    def _mixed_trajectory(self) -> list[dict[str, Any]]:
+        return [
+            {"tool_name": "click", "selector": "#open", "source_url": "https://example.com/start"},
+            {
+                "tool_name": "type_text",
+                "selector": "#name",
+                "typed_value": "Ada",
+                "role": "textbox",
+                "accessible_name": "Name",
+            },
+            {"tool_name": "hover", "selector": "#menu"},
+            {"tool_name": "select_option", "selector": "#state"},
+            {
+                "tool_name": "type_text",
+                "selector": "#locked",
+                "typed_value": "fixed",
+                "control_readonly": True,
+                "control_value_satisfied": True,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#accept",
+                "role": "button",
+                "accessible_name": "Accept all cookies",
+            },
+            {"tool_name": "press_key", "selector": "#name", "key": "Enter"},
+        ]
+
+    def test_every_retained_index_in_exactly_one_partition(self) -> None:
+        trajectory = self._mixed_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.truncated is False
+        emitted = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        dropped = {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+        forgiven = {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        assert emitted | dropped | forgiven == set(range(len(trajectory)))
+        assert emitted & dropped == set()
+        assert emitted & forgiven == set()
+        assert dropped & forgiven == set()
+
+    def test_emitted_records_carry_method_selector_and_lane_flags(self) -> None:
+        trajectory = self._mixed_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[0]["method"] == "click"
+        assert by_index[0]["selector"] == "#open"
+        assert "lane" not in by_index[0]
+        assert by_index[1]["method"] == "fill"
+        assert by_index[4]["method"] == "input_value"
+        assert by_index[4]["lane"] == "readonly_skip"
+        assert by_index[5]["method"] == "click"
+        assert by_index[5]["lane"] == "optional_dismissal"
+        assert by_index[6]["method"] == "press"
+        dropped_reasons = {
+            record["trajectory_index"]: record["reason_code"] for record in result.diagnostics.dropped_interactions
+        }
+        assert dropped_reasons[2] == "unsupported_tool"
+        assert dropped_reasons[3] == "missing_value"
+
+    def test_every_emitted_record_carries_verbatim_call_source(self) -> None:
+        trajectory = self._mixed_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert result.diagnostics.emitted_interactions
+        for record in result.diagnostics.emitted_interactions:
+            call_source = str(record.get("call_source") or "")
+            assert call_source.strip()
+            for line in call_source.splitlines():
+                assert line.strip() in result.code
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert 'await page.locator("#open").click()' in by_index[0]["call_source"]
+
+    def test_entry_replay_prefix_indices_are_forgiven_not_lost(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "button", "source_url": "https://example.com/start"},
+            {"tool_name": "click", "selector": "#promo"},
+            {
+                "tool_name": "type_text",
+                "selector": "#name",
+                "typed_value": "Ada",
+                "role": "textbox",
+                "accessible_name": "Name",
+            },
+            {"tool_name": "click", "selector": "#submit"},
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        emitted = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        dropped = {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+        forgiven = {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        assert emitted | dropped | forgiven == set(range(len(trajectory)))
+        assert emitted == {2, 3}
+        assert dropped == {0}
+        assert diagnostics.forgiven_interactions == [
+            {"trajectory_index": 1, "tool_name": "click", "lane": "entry_replay_prefix"}
+        ]
+
+
+def _covering_draft_calls(diagnostics: SynthesisDiagnostics) -> list[tuple[str, str]]:
+    return [
+        (str(record.get("method") or ""), str(record.get("locator") or ""))
+        for record in diagnostics.emitted_interactions
+        if not str(record.get("lane") or "")
+    ]
+
+
+class TestSpinePartitionFindings:
+    def _spine_trajectory(self) -> list[dict[str, Any]]:
+        return [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+
+    def test_retained_manifest_covers_every_partition_index(self) -> None:
+        result = synthesize_code_block(self._spine_trajectory(), strict_selectors=True)
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.retained_trajectory_indices == list(range(2))
+        recorded = (
+            {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+            | {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+            | {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        )
+        assert set(diagnostics.retained_trajectory_indices) == recorded
+
+    def test_covered_draft_has_no_findings(self) -> None:
+        result = synthesize_code_block(self._spine_trajectory(), strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
+
+    def test_unforgiven_drop_is_a_typed_finding(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "press_key", "key": ""},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
+        kinds = {finding.kind for finding in findings}
+        assert UNFORGIVEN_DROP_FINDING in kinds
+        drop_finding = next(finding for finding in findings if finding.kind == UNFORGIVEN_DROP_FINDING)
+        assert obligation_finding_reason_code(drop_finding) == SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+
+    def test_entry_opener_drop_is_forgiven_not_flagged(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "button",
+                "role": "button",
+                "accessible_name": "Open menu",
+                "source_url": "https://example.com/records",
+            },
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
+        assert all(finding.kind != UNFORGIVEN_DROP_FINDING for finding in findings)
+
+    def test_truncation_leaves_post_break_indices_in_manifest_only(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": f"#stage-{index}", "source_url": "https://example.com/records"}
+            for index in range(_MAX_STEPS + 3)
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.truncated is True
+        assert diagnostics.retained_trajectory_indices == list(range(len(trajectory)))
+        recorded = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        post_break = set(diagnostics.retained_trajectory_indices) - recorded
+        assert post_break
+        findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
+        kinds = {finding.kind for finding in findings}
+        assert TRUNCATED_FINDING in kinds
+        assert UNRECORDED_INDEX_FINDING in kinds
+        truncated_finding = next(finding for finding in findings if finding.kind == TRUNCATED_FINDING)
+        assert obligation_finding_reason_code(truncated_finding) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
+
+
+_STRUCTURAL_BUTTON_XPATH = 'xpath=/*[name()="body"][1]/*[name()="button"][3]'
+
+
+class TestTerminalDismissalReclassification:
+    def test_anonymous_structural_terminal_click_after_required_work_is_required(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": _STRUCTURAL_BUTTON_XPATH},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "_scout_optional_dismissal" not in result.code
+        assert "button:has-text('Accept')" not in result.code
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert not str(by_index[1].get("lane") or "")
+
+    def test_named_terminal_dismissal_keeps_the_optional_lane(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {
+                "tool_name": "click",
+                "selector": _STRUCTURAL_BUTTON_XPATH,
+                "role": "button",
+                "accessible_name": "Accept all cookies",
+            },
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "_scout_optional_dismissal" in result.code
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[1].get("lane") == "optional_dismissal"
+
+    def test_dismissal_only_single_step_keeps_the_optional_lane(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": _STRUCTURAL_BUTTON_XPATH, "source_url": "https://example.com/records"},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "_scout_optional_dismissal" in result.code
+
+
+class TestUncoveredRequiredEmittedInteractions:
+    def _emitted(self) -> list[dict[str, Any]]:
+        return [
+            {"method": "click", "locator": 'page.locator("#a")', "selector": "#a"},
+            {"method": "fill", "locator": 'page.locator("#b")', "selector": "#b"},
+            {"method": "click", "locator": 'page.locator("#c")', "selector": "#c"},
+        ]
+
+    def test_verbatim_in_order_resubmission_clears(self) -> None:
+        draft_calls = [
+            ("click", 'page.locator("#a")'),
+            ("fill", 'page.locator("#b")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        assert uncovered_required_emitted_interactions(self._emitted(), draft_calls) == []
+
+    def test_reordered_but_complete_draft_reports_under_build(self) -> None:
+        draft_calls = [
+            ("fill", 'page.locator("#b")'),
+            ("click", 'page.locator("#a")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        uncovered = uncovered_required_emitted_interactions(self._emitted(), draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["#b", "#c"]
+
+    def test_first_miss_over_reports_later_rungs_as_missing(self) -> None:
+        draft_calls = [
+            ("click", 'page.locator("#a")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        uncovered = uncovered_required_emitted_interactions(self._emitted(), draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["#b", "#c"]
+
+    def test_shared_name_literal_on_different_element_does_not_cover(self) -> None:
+        emitted = [
+            {"method": "click", "locator": 'page.get_by_role("button", name="Submit")', "selector": "Submit"},
+        ]
+        draft_calls = [("click", 'page.get_by_role("link", name="Submit")')]
+
+        uncovered = uncovered_required_emitted_interactions(emitted, draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["Submit"]
+
+    def test_bare_locator_call_with_exact_full_selector_covers(self) -> None:
+        emitted = [
+            {"method": "click", "locator": 'page.locator("#a").first', "selector": "#a"},
+        ]
+        draft_calls = [("click", 'page.locator("#a")')]
+
+        assert uncovered_required_emitted_interactions(emitted, draft_calls) == []
+
+    def test_receiver_quoting_selector_among_other_literals_does_not_cover(self) -> None:
+        emitted = [
+            {"method": "click", "locator": 'page.locator("#a")', "selector": "#a"},
+        ]
+        draft_calls = [("click", 'page.locator("#wrapper").locator("#a", has_text="Go")')]
+
+        uncovered = uncovered_required_emitted_interactions(emitted, draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["#a"]
+
+    def test_lane_flagged_records_are_not_required(self) -> None:
+        emitted = self._emitted()
+        emitted[1]["lane"] = "optional_dismissal"
+        draft_calls = [
+            ("click", 'page.locator("#a")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        assert uncovered_required_emitted_interactions(emitted, draft_calls) == []
+
+
+_BILLS_URL = "https://example.com/bills"
+_STATEMENT_URL = "https://example.com/bills/statement"
+
+
+def _anchored_trajectory() -> list[dict[str, Any]]:
+    return [
+        _interaction("type_text", selector="#account", source_url=_BILLS_URL, typed_value="A-1", trajectory_index=0),
+        _interaction("click", selector="#statement-row", source_url=_BILLS_URL, trajectory_index=1),
+        _interaction("click", selector="#view-printable", source_url=_STATEMENT_URL, trajectory_index=2),
+    ]
+
+
+class TestDownloadTerminalSequencing:
+    def test_post_capture_navigation_is_dropped_and_terminal_is_last(self) -> None:
+        result = synthesize_code_block(
+            _anchored_trajectory(),
+            reached_download_target=_download_target(trajectory_anchor=1),
+        )
+
+        assert result is not None
+        assert '"#view-printable"' not in result.code
+        assert '"#statement-row"' in result.code
+        assert result.code.index("async with page.expect_download()") > result.code.index('"#statement-row"')
+        assert '"downloaded_file_name"' in result.code
+        assert result.diagnostics.download_terminal_anchor == 1
+        assert result.diagnostics.download_terminal_dropped_trailing == 1
+        assert [record["selector"] for record in result.diagnostics.emitted_interactions] == [
+            "#account",
+            "#statement-row",
+        ]
+
+    def test_unanchored_target_keeps_the_whole_trajectory(self) -> None:
+        result = synthesize_code_block(
+            _anchored_trajectory(),
+            reached_download_target=_download_target(),
+        )
+
+        assert result is not None
+        assert '"#view-printable"' in result.code
+        assert result.diagnostics.download_terminal_dropped_trailing == 0
+
+    def test_anchor_at_the_last_interaction_is_byte_identical_to_unanchored(self) -> None:
+        anchored = synthesize_code_block(
+            _anchored_trajectory(),
+            reached_download_target=_download_target(trajectory_anchor=2),
+        )
+        unanchored = synthesize_code_block(
+            _anchored_trajectory(),
+            reached_download_target=_download_target(),
+        )
+
+        assert anchored is not None and unanchored is not None
+        assert anchored.code == unanchored.code
+        assert anchored.diagnostics.download_terminal_dropped_trailing == 0
+
+    def test_anchor_survives_trajectory_eviction(self) -> None:
+        evicted = [
+            _interaction("click", selector="#statement-row", source_url=_BILLS_URL, trajectory_index=5),
+            _interaction("click", selector="#view-printable", source_url=_STATEMENT_URL, trajectory_index=6),
+        ]
+
+        result = synthesize_code_block(evicted, reached_download_target=_download_target(trajectory_anchor=5))
+
+        assert result is not None
+        assert '"#view-printable"' not in result.code
+        assert result.diagnostics.download_terminal_dropped_trailing == 1
+
+    def test_registered_target_is_never_sequenced(self) -> None:
+        result = synthesize_code_block(
+            _anchored_trajectory(),
+            reached_download_target=_download_target(
+                already_registered=True, download_kind="registered", selector="", trajectory_anchor=1
+            ),
+        )
+
+        assert result is not None
+        assert '"#view-printable"' in result.code
+        assert "expect_download" not in result.code
+
+    def test_extraction_suffix_composes_after_the_sequenced_terminal(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#show-details", source_url=_BILLS_URL, trajectory_index=0),
+            _interaction("click", selector="#view-printable", source_url=_STATEMENT_URL, trajectory_index=1),
+        ]
+
+        result = synthesize_code_block_with_extraction(
+            trajectory,
+            _extraction_plan(),
+            reached_download_target=_download_target(trajectory_anchor=0),
+        )
+
+        assert result is not None
+        assert '"#view-printable"' not in result.interaction_code
+        assert "async with page.expect_download()" in result.interaction_code
+        assert result.extraction_code
+        assert result.code.startswith(result.interaction_code)
+
+    def test_capture_stamps_the_latest_trajectory_index(self) -> None:
+        ctx = SimpleNamespace(scout_trajectory=_anchored_trajectory()[:2])
+
+        stamped = _with_trajectory_anchor(ctx, _download_target())  # type: ignore[arg-type]
+
+        assert stamped.trajectory_anchor == 1
+        assert (
+            _with_trajectory_anchor(SimpleNamespace(scout_trajectory=[]), _download_target()).trajectory_anchor is None
+        )  # type: ignore[arg-type]
+
+
+_STATEMENT_SELECTOR = "a[href='/statements/100245_2026-05.pdf']"
+_DECLARED = {"account_number": "100245", "billing_period": "May 2026"}
+
+
+def _witnessed_click(*, selector: str = _STATEMENT_SELECTOR, accessible_name: str = "Download May") -> dict[str, Any]:
+    interaction: dict[str, Any] = {
+        "tool_name": "click",
+        "selector": selector,
+        "accessible_name": accessible_name,
+        "role": "link",
+        "source_url": "https://example.com/statements",
+    }
+    correspondences = input_correspondences_for_interaction(interaction, _DECLARED)
+    if correspondences:
+        interaction["input_correspondences"] = correspondences
+    return interaction
+
+
+def test_input_correspondence_selector_identity_and_month() -> None:
+    correspondences = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED
+    )
+    by_key = {c["input_key"]: c for c in correspondences}
+    assert by_key["account_number"] == {
+        "input_key": "account_number",
+        "matched_literal": "100245",
+        "parameter_value": "100245",
+        "surface": "selector",
+        "transform": "identity",
+        "position": 20,
+    }
+    assert by_key["billing_period"]["matched_literal"] == "2026-05"
+    assert by_key["billing_period"]["parameter_value"] == "May 2026"
+    assert by_key["billing_period"]["transform"] == "month_name_to_iso"
+
+
+def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
+    # "Widget" also occurs as a non-boundary substring inside "Widgetry"; the hole must template the
+    # boundary-validated standalone span, not the first find() hit.
+    selector = 'a[aria-label="Widgetry Widget"]'
+    holes = input_correspondences_for_interaction({"tool_name": "click", "selector": selector}, {"gadget": "Widget"})
+    assert [h["position"] for h in holes] == [23]
+    expr = build_input_templated_locator(surface="selector", selector=selector, role="", name="", holes=holes)
+    assert expr is not None
+    assert "Widgetry {gadget}" in expr
+    assert "{gadget}ry" not in expr
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"account_number": "24"},
+        {"account_number": "10 0245"},
+        {"account_number": "100245 "},
+        {"class": "100245"},
+        {"page": "100245"},
+        {"re": "100245"},
+        {"_scout_month_to_iso": "100245"},
+        {"account_number": "100245'] , [href"},
+    ],
+)
+def test_input_correspondence_rejects_unsafe_or_unnamed(declared: dict[str, str]) -> None:
+    assert (
+        input_correspondences_for_interaction({"tool_name": "click", "selector": _STATEMENT_SELECTOR}, declared) == []
+    )
+
+
+def test_input_correspondence_ignores_non_click() -> None:
+    assert (
+        input_correspondences_for_interaction({"tool_name": "type_text", "selector": _STATEMENT_SELECTOR}, _DECLARED)
+        == []
+    )
+
+
+def test_input_correspondence_requires_quoted_segment() -> None:
+    # `100245` appears only in an unquoted structural position, never inside a quoted attribute value.
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": "div.row-100245 > a"}, {"account_number": "100245"}
+        )
+        == []
+    )
+
+
+def test_input_correspondence_rejects_second_occurrence() -> None:
+    selector = "a[href='/x/100245'][data-id='100245']"
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": selector}, {"account_number": "100245"}
+        )
+        == []
+    )
+
+
+def test_synthesize_templated_selector_identical_across_modes() -> None:
+    trajectory = [_witnessed_click()]
+    non_strict = synthesize_code_block(list(trajectory), strict_selectors=False)
+    strict = synthesize_code_block(list(trajectory), strict_selectors=True)
+    assert non_strict is not None and strict is not None
+    templated = "page.locator(f\"a[href='/statements/{account_number}_{_scout_month_to_iso(billing_period)}.pdf']\")"
+    assert f"await {templated}.click()" in non_strict.code
+    assert f"await {templated}.click()" in strict.code
+
+
+def test_synthesize_mints_one_witness_row_per_key() -> None:
+    trajectory = [_witnessed_click(), _witnessed_click(selector=_STATEMENT_SELECTOR, accessible_name="View May")]
+    synthesized = synthesize_code_block(trajectory)
+    assert synthesized is not None
+    witness_rows = [p for p in synthesized.parameters if p.get("source") == LOCATOR_WITNESS_PARAM_SOURCE]
+    assert sorted((row["key"], row["default_value"]) for row in witness_rows) == [
+        ("account_number", "100245"),
+        ("billing_period", "May 2026"),
+    ]
+
+
+def test_synthesize_prelude_before_entry_and_preflight_clean() -> None:
+    synthesized = synthesize_code_block([_witnessed_click()])
+    assert synthesized is not None
+    code_lines = synthesized.code.splitlines()
+    guard_line = next(i for i, line in enumerate(code_lines) if "invalid value for grounded parameter" in line)
+    entry_line = next(i for i, line in enumerate(code_lines) if "_scout_entry_target =" in line)
+    assert guard_line < entry_line
+    diagnostics = preflight_code_block(synthesized.code, parameter_keys=["account_number", "billing_period"])
+    assert not any(diagnostic.code == "SANDBOX_UNRESOLVED_NAME" for diagnostic in diagnostics)
+
+
+def test_templated_locator_reads_declared_input_at_runtime() -> None:
+    plan_holes = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED
+    )
+    expr = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=plan_holes
+    )
+    assert expr is not None
+
+    class _Page:
+        def locator(self, value: str) -> str:
+            return value
+
+    source_lines = ["def _block(page, account_number, billing_period):"]
+    source_lines.extend(witness_prelude_lines(["account_number", "billing_period"], include_month_helper=True))
+    source_lines.append(f"    return {expr}")
+    namespace: dict[str, Any] = {"Exception": Exception}
+    exec("\n".join(source_lines), namespace)
+    block = namespace["_block"]
+    assert block(_Page(), "100248", "June 2026") == "a[href='/statements/100248_2026-06.pdf']"
+    with pytest.raises(Exception):
+        block(_Page(), "100245'] , x[href='", "May 2026")
+    with pytest.raises(Exception):
+        block(_Page(), "100245", "Notamonth 2026")
+
+
+def test_build_input_templated_locator_recompute_and_tamper() -> None:
+    holes = input_correspondences_for_interaction({"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED)
+    expr = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=holes
+    )
+    recomputed = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=holes
+    )
+    assert expr == recomputed
+    reordered = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=list(reversed(holes))
+    )
+    assert reordered != expr
+
+
+def test_synthesize_unwitnessed_selector_byte_identical() -> None:
+    plain = {
+        "tool_name": "click",
+        "selector": _STATEMENT_SELECTOR,
+        "accessible_name": "Download",
+        "source_url": "https://example.com/s",
+    }
+    baseline = synthesize_code_block([dict(plain)])
+    assert baseline is not None
+    assert INPUT_TEMPLATED_PROVENANCE_SOURCE not in baseline.code
+    assert all(p.get("source") != LOCATOR_WITNESS_PARAM_SOURCE for p in baseline.parameters)
+    assert "_scout_month_to_iso" not in baseline.code
+
+
+def test_synthesize_input_purity() -> None:
+    trajectory = [_witnessed_click()]
+    snapshot = json.loads(json.dumps(trajectory))
+    synthesize_code_block(list(trajectory), strict_selectors=False)
+    synthesize_code_block(list(trajectory), strict_selectors=True)
+    assert trajectory == snapshot
+
+
+def _credential_fill(**overrides: Any) -> dict[str, Any]:
+    fields = {
+        "selector": "#username",
+        "source_url": "https://example.com/login",
+        "credential_id": "cred_1",
+        "credential_name": "portal",
+        "credential_field": "username",
+        "typed_length": 8,
+    }
+    fields.update(overrides)
+    return _interaction(CREDENTIAL_FILL_TOOL_NAME, **fields)
+
+
+class _FakeLocator:
+    def __init__(self, page: _FakePage, selector: str) -> None:
+        self._page = page
+        self._selector = selector
+
+    async def count(self) -> int:
+        return self._page.counts.get(self._selector, 0)
+
+    async def wait_for(self, *, state: str, timeout: float | None = None) -> None:
+        if self._page.counts.get(self._selector, 0) < 1:
+            raise TimeoutError(f"{self._selector} not visible")
+
+    async def fill(self, value: object) -> None:
+        if self._page.counts.get(self._selector, 0) != 1:
+            raise AssertionError(
+                f"strict-mode fill on {self._selector} with count {self._page.counts.get(self._selector, 0)}"
+            )
+        self._page.filled.append(self._selector)
+
+    async def click(self) -> None:
+        self._page.clicked.append(self._selector)
+
+    async def press(self, key: str) -> None:
+        self._page.pressed.append((self._selector, key))
+
+
+class _FakePage:
+    def __init__(self, counts: dict[str, int]) -> None:
+        self.counts = counts
+        self.filled: list[str] = []
+        self.clicked: list[str] = []
+        self.pressed: list[tuple[str, str]] = []
+        self.goto_calls: list[str] = []
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(self, selector)
+
+    async def goto(self, url: str, *, wait_until: str | None = None) -> None:
+        self.goto_calls.append(url)
+
+    async def wait_for_load_state(self, state: str) -> None:
+        return None
+
+
+def _run_synthesized_block(code: str, page: _FakePage, portal: object) -> None:
+    namespace: dict[str, Any] = {}
+    exec("async def _block(page, portal):\n" + code, namespace)
+    asyncio.run(namespace["_block"](page, portal))
+
+
+class TestLoginOnlyPresenceGuardSynthesis:
+    def _login_only_trajectory(self, *, submit: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            _credential_fill(selector="#username", credential_field="username"),
+            _credential_fill(selector="#password", credential_field="password"),
+            submit,
+        ]
+
+    def test_click_submit_wraps_whole_prefix_in_count_guard(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" in result.code
+        guard_line = next(i for i, ln in enumerate(result.code.splitlines()) if ".count() == 1:" in ln)
+        body = result.code.splitlines()[guard_line + 1 : guard_line + 5]
+        assert any(".fill(portal.username)" in ln for ln in body)
+        assert any(".fill(portal.password)" in ln for ln in body)
+        assert any('page.locator("#login-btn").click()' in ln for ln in body)
+        assert all(ln.startswith(_INDENT * 2) for ln in body)
+
+    def test_enter_submit_is_recognized_and_guarded(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("press_key", selector="#password", key="Enter", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" in result.code
+        assert '        await page.locator("#password").press("Enter")' in result.code
+
+    def test_present_state_runs_full_login(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({"#username": 1, "#password": 1, "#login-btn": 1})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == ["#username", "#password"]
+        assert page.clicked == ["#login-btn"]
+
+    def test_absent_state_skips_login_without_timeout(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == []
+        assert page.clicked == []
+        assert page.goto_calls == ["https://example.com/login"]
+
+    def test_multiple_match_state_does_not_strict_mode_fail(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({"#username": 2, "#password": 2, "#login-btn": 2})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == []
+        assert page.clicked == []
+
+
+class TestSharedSubmitPredicate:
+    def test_click_and_enter_are_submits_but_tab_is_not(self) -> None:
+        assert _is_submit_interaction({"tool_name": "click"}) is True
+        assert _is_submit_interaction({"tool_name": "press_key", "key": "Enter"}) is True
+        assert _is_submit_interaction({"tool_name": "press_key", "key": "Tab"}) is False
+        assert _is_submit_interaction({"tool_name": "type_text"}) is False
+
+    def test_tab_only_post_fill_reports_missing_submit(self) -> None:
+        trajectory = [
+            _credential_fill(selector="#username", credential_field="username"),
+            _interaction("press_key", selector="#username", key="Tab", source_url="https://example.com/login"),
+        ]
+        gap = credential_scout_gap(trajectory, [(frozenset({"cred_1"}), frozenset({"username"}))], requires_submit=True)
+        assert gap.missing_submit is True
+
+    def test_enter_post_fill_satisfies_submit(self) -> None:
+        trajectory = [
+            _credential_fill(selector="#username", credential_field="username"),
+            _interaction("press_key", selector="#username", key="Enter", source_url="https://example.com/login"),
+        ]
+        gap = credential_scout_gap(trajectory, [(frozenset({"cred_1"}), frozenset({"username"}))], requires_submit=True)
+        assert gap.missing_submit is False
+
+
+_LOGIN_HOST = "https://authenticationtest.com/login"
+_INLINE_SECRET_SENTINEL = "Hunter2Portal!"
+
+
+def test_credential_fill_trajectory_binds_param_access_and_omits_literals() -> None:
+    trajectory = [
+        _credential_fill(
+            selector="#username", credential_id="cred_x", credential_field="username", source_url=_LOGIN_HOST
+        ),
+        _credential_fill(
+            selector="#password", credential_id="cred_x", credential_field="password", source_url=_LOGIN_HOST
+        ),
+        _interaction("click", selector="button[type=submit]", source_url=_LOGIN_HOST),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
+    credential_key = credential_param["key"]
+    assert f"{credential_key}.username" in result.code
+    assert f"{credential_key}.password" in result.code
+    assert _INLINE_SECRET_SENTINEL not in result.code
+
+
+def test_type_text_secret_bypass_is_not_carried_into_synthesized_block() -> None:
+    trajectory = [
+        _credential_fill(
+            selector="#username", credential_id="cred_x", credential_field="username", source_url=_LOGIN_HOST
+        ),
+        _interaction(
+            "type_text",
+            selector="#password",
+            source_url=_LOGIN_HOST,
+            typed_value="",
+            raw_typed_value=_INLINE_SECRET_SENTINEL,
+            typed_length=len(_INLINE_SECRET_SENTINEL),
+            role="textbox",
+        ),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert _INLINE_SECRET_SENTINEL not in result.code
+    credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
+    assert f"{credential_param['key']}.username" in result.code

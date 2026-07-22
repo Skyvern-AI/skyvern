@@ -96,6 +96,7 @@ export const workflowBlockTitle: {
   http_request: "HTTP Request",
   print_page: "Print Page",
   workflow_trigger: "Agent Trigger",
+  email_inbox: "Email Inbox",
   google_sheets_read: "Google Sheets Read",
   google_sheets_write: "Google Sheets Write",
   pdf_fill: "PDF Fill",

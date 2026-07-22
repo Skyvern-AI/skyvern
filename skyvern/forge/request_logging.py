@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import typing
 
@@ -27,6 +28,10 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/credentials/totp",
     "POST /api/v1/totp",
     "GET /v1/credentials/totp",
+    "PUT /v1/google/oauth/config",
+    "PUT /api/v1/google/oauth/config",
+    "POST /v1/google/oauth/callback",
+    "POST /api/v1/google/oauth/callback",
 }
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -35,6 +40,14 @@ _BINARY_PLACEHOLDER = "<binary>"
 _REDACTED = "****"
 _LOGGABLE_CONTENT_TYPES = {"text/", "application/json"}
 _STREAMING_CONTENT_TYPE = "text/event-stream"
+# Matches a signed artifact-content URL (absolute or path-relative) anywhere in a
+# string and captures everything up to — but excluding — its query, so re.sub can
+# drop the capability params (expiry/kid/sig) while leaving surrounding text and
+# non-artifact URLs untouched. Query runs to the next whitespace/quote/angle bracket.
+_ARTIFACT_CONTENT_URL_QUERY_RE = re.compile(
+    r"((?:[a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s\"'<>]+)?/v1/artifacts/[^/\s\"'<>]+/content/?)\?[^\s\"'<>]*"
+)
+_ACTION_LOG_ENDPOINT_RE = re.compile(r"^/v1/browser_sessions/[^/]+/action_logs/?$")
 
 # Exact field names that are always redacted.  Use a set for O(1) lookup
 # instead of regex substring matching to avoid false positives like
@@ -79,7 +92,9 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
 
 
 def _is_sensitive_endpoint(request: Request) -> bool:
-    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS
+    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS or (
+        request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None
+    )
 
 
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
@@ -93,6 +108,7 @@ def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> s
         text = body.decode("utf-8", errors="replace")
     except Exception:
         return _BINARY_PLACEHOLDER
+    text = _redact_loggable_body(text)
     if len(text) > _MAX_BODY_LENGTH:
         return text[:_MAX_BODY_LENGTH] + "...[truncated]"
     return text
@@ -102,13 +118,19 @@ def _is_sensitive_key(key: str) -> bool:
     return key.lower() in _SENSITIVE_FIELDS
 
 
-def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
-    """Redact dict values whose *key name* exactly matches a known sensitive field.
+def _strip_artifact_url_query(value: str) -> str:
+    return _ARTIFACT_CONTENT_URL_QUERY_RE.sub(r"\1", value)
 
-    Uses exact-match (case-insensitive) rather than substring/regex to avoid
-    false positives on fields like ``credential_id``, ``author``, or
+
+def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
+    """Redact sensitive fields and strip capability queries from artifact URLs.
+
+    Field names use exact-match (case-insensitive) rather than substring/regex
+    to avoid false positives on fields like ``credential_id``, ``author``, or
     ``page_token`` which contain sensitive substrings but are not secrets.
     """
+    if isinstance(obj, str):
+        return _strip_artifact_url_query(obj)
     if _depth > 20:
         # Stop recursing but still redact sensitive keys at this level
         if isinstance(obj, dict):
@@ -121,6 +143,15 @@ def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
     if isinstance(obj, list):
         return [redact_sensitive_fields(item, _depth + 1) for item in obj]
     return obj
+
+
+def _redact_loggable_body(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return _strip_artifact_url_query(text)
+    redacted = redact_sensitive_fields(parsed)
+    return json.dumps(redacted) if redacted != parsed else text
 
 
 def _is_loggable_content_type(content_type: str | None) -> bool:
@@ -138,12 +169,7 @@ def _sanitize_response_body(request: Request, body_str: str | None, content_type
         return ""
     if not _is_loggable_content_type(content_type):
         return _BINARY_PLACEHOLDER
-    try:
-        parsed = json.loads(body_str)
-        redacted = redact_sensitive_fields(parsed)
-        text = json.dumps(redacted)
-    except (json.JSONDecodeError, TypeError):
-        text = body_str
+    text = _redact_loggable_body(body_str)
     if len(text) > _MAX_BODY_LENGTH:
         return text[:_MAX_BODY_LENGTH] + "...[truncated]"
     return text

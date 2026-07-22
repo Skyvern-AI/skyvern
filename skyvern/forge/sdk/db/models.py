@@ -42,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
+    generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -699,6 +700,13 @@ class WorkflowRunModel(Base):
             "queued_at",
             postgresql_where=text("status IN ('queued', 'running', 'paused') AND browser_session_id IS NULL"),
         ),
+        Index(
+            "ix_workflow_runs_retried_from_workflow_run_id",
+            "retried_from_workflow_run_id",
+            unique=True,
+            postgresql_where=text("retried_from_workflow_run_id IS NOT NULL"),
+            sqlite_where=text("retried_from_workflow_run_id IS NOT NULL"),
+        ),
     )
 
     workflow_run_id = Column(String, primary_key=True, default=generate_workflow_run_id)
@@ -729,6 +737,8 @@ class WorkflowRunModel(Base):
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
+    retried_from_workflow_run_id = Column(String, nullable=True)
+    fallback_attempt = Column(Integer, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
@@ -747,6 +757,7 @@ class WorkflowRunModel(Base):
 
     credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     cached_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
+    topup_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -906,6 +917,8 @@ class CredentialParameterModel(Base):
     credential_id = Column(String, nullable=False)
     credential_ids = Column(JSON, nullable=True)
     selection_strategy = Column(String, nullable=True)
+    fallback_credential_ids = Column(JSON, nullable=True)
+    fallback_trigger = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1294,6 +1307,12 @@ class PersistentBrowserSessionModel(Base):
     timeout_minutes = Column(Integer, nullable=True)
     ip_address = Column(String, nullable=True)
     ecs_task_arn = Column(String, nullable=True)
+    # Server-side CDP routing. browser_address stays the client-facing proxy URL; these name the
+    # upstream the proxy dials and the adapter that dials it. Never a credential — connect-time
+    # credentials come from env — and never returned to clients (BrowserSessionResponse.
+    # from_browser_session allowlists the client-facing fields).
+    upstream_cdp_url = Column(String, nullable=True)
+    browser_vendor = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
@@ -1754,8 +1773,9 @@ class HealEpisodeModel(Base):
     __tablename__ = "heal_episodes"
     __table_args__ = (
         Index("he_org_wpid_index", "organization_id", "workflow_permanent_id", "created_at"),
+        Index("he_org_wpid_block_label_index", "organization_id", "workflow_permanent_id", "block_label", "created_at"),
         Index("he_org_created_at_index", "organization_id", "created_at"),
-        Index("he_org_wrid_index", "organization_id", "workflow_run_id"),
+        Index("he_org_wrid_created_at_index", "organization_id", "workflow_run_id", "created_at"),
     )
 
     heal_episode_id = Column(String, primary_key=True, default=generate_heal_episode_id)
@@ -1857,6 +1877,44 @@ class GoogleOAuthCredentialModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     credential_name = Column(String, nullable=False, default="Default")
     provider = Column(String, nullable=False, default="google")
+    state = Column(String, nullable=False, default="pending_consent", index=True)
+    scopes_requested = Column(JSON, nullable=False, default=list)
+    scopes_granted = Column(JSON, nullable=False, default=list)
+    encrypted_refresh_token = Column(String, nullable=True)
+    encrypted_method = Column(String, nullable=True)
+    consent_nonce = Column(String, nullable=True)
+    consent_redirect_uri = Column(String, nullable=True)
+    consent_code_verifier = Column(String, nullable=True)
+    consent_app_origin = Column(String, nullable=True)
+    consent_expires_at = Column(DateTime, nullable=True)
+    client_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class MicrosoftOAuthCredentialModel(Base):
+    __tablename__ = "microsoft_oauth_credentials"
+    __table_args__ = (
+        Index(
+            "ux_microsoft_oauth_credentials_consent_nonce",
+            "consent_nonce",
+            unique=True,
+            postgresql_where=text("consent_nonce IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "state IN ('pending_consent', 'active', 'revoked', 'error')",
+            name="ck_microsoft_oauth_credentials_state",
+        ),
+    )
+
+    id = Column(String, primary_key=True, default=generate_microsoft_oauth_credential_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
+    credential_name = Column(String, nullable=False, default="Default")
     state = Column(String, nullable=False, default="pending_consent", index=True)
     scopes_requested = Column(JSON, nullable=False, default=list)
     scopes_granted = Column(JSON, nullable=False, default=list)

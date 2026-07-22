@@ -53,7 +53,7 @@ class CodeBlockActionRecording:
         self._screenshot_tasks: list[asyncio.Task[None]] = []
         self._recording_enabled = False
         self._finalized = False
-        self.recording_page = RecordingPage(page, on_action=self._screenshot_sink)
+        self.recording_page = RecordingPage(page, on_action=self._recorded_action_sink)
 
     @property
     def task(self) -> Task | None:
@@ -66,9 +66,7 @@ class CodeBlockActionRecording:
         return self.recording_page.last_recorded_exception()
 
     async def create_task_and_step(self) -> None:
-        """Create the task/step that can anchor recorded actions for prompt-bearing blocks."""
-        if not self._code_block.prompt:
-            return
+        """Create the container task/step that anchors recorded actions (promptless blocks included)."""
         try:
             self._task, self._step = await app.agent.create_task_and_step_from_code_block(
                 code_block=self._code_block,
@@ -102,7 +100,9 @@ class CodeBlockActionRecording:
             )
             await self.finalize(success=False)
 
-    async def _screenshot_sink(self, action: Action) -> None:
+    async def _recorded_action_sink(self, action: Action) -> None:
+        # Fires as each action completes: capture its screenshot, then stream the row so consumers
+        # (run timeline, copilot narration) see it mid-block instead of only at block end.
         if not self._recording_enabled:
             return
         # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
@@ -121,49 +121,61 @@ class CodeBlockActionRecording:
                 workflow_run_block_id=self._workflow_run_block_id,
                 exc_info=True,
             )
+        else:
+
+            async def _upload() -> None:
+                try:
+                    action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                        workflow_run_block=run_block,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        data=screenshot,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Code block screenshot upload failed",
+                        workflow_run_block_id=self._workflow_run_block_id,
+                        exc_info=True,
+                    )
+
+            self._screenshot_tasks.append(asyncio.create_task(_upload()))
+
+        # Streamed row carries no screenshot yet (upload deferred); the end-of-block batch upserts it in.
+        await self._persist_action(action)
+
+    async def _persist_action(self, action: Action) -> None:
+        # Best-effort like the screenshot sink: recording must never change block outcome. Both the streamed
+        # write and the end-of-block batch route through here and upsert on action_id, so they converge on
+        # one row instead of double-inserting.
+        if not self._recording_enabled or self._task is None or self._step is None:
             return
-
-        async def _upload() -> None:
-            try:
-                action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                    workflow_run_block=run_block,
-                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                    data=screenshot,
-                )
-            except Exception:
-                LOG.warning(
-                    "Code block screenshot upload failed",
-                    workflow_run_block_id=self._workflow_run_block_id,
-                    exc_info=True,
-                )
-
-        self._screenshot_tasks.append(asyncio.create_task(_upload()))
+        try:
+            masked = self._workflow_run_context.mask_secrets_in_data([action.model_dump(mode="json")])[0]
+            persisted = recorded_action_from_payload(masked)
+            persisted.task_id = self._task.task_id
+            persisted.step_id = self._step.step_id
+            persisted.step_order = self._step.order
+            persisted.organization_id = self._organization_id
+            await app.DATABASE.workflow_params.upsert_recorded_action(persisted)
+        except Exception:
+            LOG.warning(
+                "Failed to persist recorded code block action",
+                workflow_run_block_id=self._workflow_run_block_id,
+                action_order=action.action_order,
+                exc_info=True,
+            )
 
     async def _drain_screenshots(self) -> None:
         if self._screenshot_tasks:
             await asyncio.gather(*self._screenshot_tasks, return_exceptions=True)
 
     async def persist(self, recorded: list[Action]) -> None:
-        # Best-effort like the screenshot sink: recording must never change block outcome. Drain first so
-        # each action's screenshot_artifact_id is set on the in-memory row before it is dumped.
+        # Drain first so each action's screenshot_artifact_id is set on the in-memory row before its final
+        # upsert backfills the screenshot the streamed write couldn't include.
         await self._drain_screenshots()
         if not recorded or not self._recording_enabled or self._task is None or self._step is None:
             return
-        try:
-            masked = self._workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
-            for raw in masked:
-                action = recorded_action_from_payload(raw)
-                action.task_id = self._task.task_id
-                action.step_id = self._step.step_id
-                action.step_order = self._step.order
-                action.organization_id = self._organization_id
-                await app.DATABASE.workflow_params.create_action(action)
-        except Exception:
-            LOG.warning(
-                "Failed to persist recorded code block actions",
-                workflow_run_block_id=self._workflow_run_block_id,
-                exc_info=True,
-            )
+        for action in recorded:
+            await self._persist_action(action)
 
     async def finalize(self, success: bool) -> None:
         # Finalize both task and step on every exit path (incl. CancelledError via a finally); idempotent.
@@ -189,5 +201,18 @@ class CodeBlockActionRecording:
             LOG.warning(
                 "Failed to finalize code block task status",
                 workflow_run_block_id=self._workflow_run_block_id,
+                exc_info=True,
+            )
+        if not success or self._step is None:
+            return
+        # Billing counts the action rows persist() wrote, so this must stay after persist on every
+        # success path; best-effort like the rest of recording — never change the block outcome.
+        try:
+            await app.AGENT_FUNCTION.post_code_block_execution(self._task, self._step)
+        except Exception:
+            LOG.warning(
+                "Code block billing hook failed",
+                workflow_run_block_id=self._workflow_run_block_id,
+                task_id=self._task.task_id,
                 exc_info=True,
             )

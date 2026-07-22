@@ -3,18 +3,26 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Callable, Literal
+from uuid import uuid4
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
+from skyvern.cli.core.action_log import enqueue_action_event
 from skyvern.cli.core.browser_ops import (
     _ALLOWED_EXECUTE_TOOLS,
     MAX_EXECUTE_STEPS,
+    CustomSelectClassifyError,
+    CustomSelectMatchError,
+    CustomSelectOpenError,
+    CustomSelectPasswordError,
     ExecuteStep,
+    ObserveFrameError,
     ToolStepError,
     do_act,
     do_execute,
@@ -26,7 +34,9 @@ from skyvern.cli.core.browser_ops import (
     do_navigate,
     do_observe,
     do_screenshot,
+    do_select_option,
     parse_extract_schema,
+    ref_map_from_elements,
     ref_to_selector,
     select_native_option_if_targeted,
     serialize_elements,
@@ -42,11 +52,17 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.cli.core.session_manager import is_stateless_http_mode
+from skyvern.cli.core.trajectory_store import append_trajectory_entry
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
+from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
     DIRECT_TARGET_DESCRIPTION,
+    BrowserContext,
     ErrorCode,
     Timer,
     make_error,
@@ -68,6 +84,7 @@ from ._localhost import is_localhost_url
 from ._session import (
     BrowserNotAvailableError,
     clear_session_ref_map,
+    current_api_key_hash,
     get_current_session,
     get_page,
     get_session_ref,
@@ -86,10 +103,112 @@ _ERROR_MESSAGE_MAX_CHARS = 500
 _ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
 
 
+def _trajectory_source_url(page: Any) -> str | None:
+    try:
+        source_url = page.url
+        return source_url if isinstance(source_url, str) else None
+    except Exception:
+        LOG.debug("Failed to capture trajectory source URL", exc_info=True)
+        return None
+
+
+def _replayable_select_value(value: str | None) -> bool:
+    # Synthesis strips select values before emitting, so only exact, non-empty, non-secret values round-trip.
+    return value is not None and value != "" and value == value.strip() and not typed_text_looks_secret(value)
+
+
+def _replayable_press_key(key: str) -> bool:
+    return len(key.rsplit("+", 1)[-1]) > 1
+
+
+def _record_trajectory_entry(
+    ctx: Any,
+    *,
+    tool_name: str,
+    source_url: str | None,
+    selector: str | None = None,
+    typed_text: str | None = None,
+    value: str | None = None,
+    key: str | None = None,
+) -> None:
+    try:
+        if ctx.mode != "cloud_session" or not ctx.session_id:
+            return
+        projected = project_action_event(
+            event_id=uuid4(),
+            tool=tool_name,
+            selector=selector,
+            typed_text=typed_text,
+            value=value,
+            key=key,
+            source_url=source_url,
+            occurred_at=datetime.now(timezone.utc),
+            timing_ms={},
+            outcome=ActionLogOutcome.SUCCESS,
+            index=0,
+            replay_compatible=True,
+        )
+        entry: dict[str, Any] = {
+            "tool_name": tool_name,
+            "selector": selector,
+            "source_url": projected.source_url,
+            "value": value,
+            "key": key,
+        }
+        if tool_name == "type_text":
+            entry["typed_length"] = len(typed_text or "")
+            entry["typed_value"] = projected.value
+        append_trajectory_entry(
+            api_key_hash=current_api_key_hash(),
+            session_id=ctx.session_id,
+            entry={name: field for name, field in entry.items() if field is not None and field != ""},
+        )
+    except Exception:
+        LOG.warning("Failed to record browser trajectory entry", tool_name=tool_name, exc_info=True)
+
+
+def _action_result_factory(
+    *,
+    ctx: BrowserContext,
+    page: Any,
+    selector: str | None = None,
+    typed_text: str | None = None,
+    value: str | None = None,
+    key: str | None = None,
+) -> Callable[..., dict[str, Any]]:
+    def action_result(action: str, **kwargs: Any) -> dict[str, Any]:
+        result = make_result(action, **kwargs)
+        try:
+            error = kwargs.get("error")
+            error_code = error.get("code") if isinstance(error, dict) and isinstance(error.get("code"), str) else None
+            timing_ms = kwargs.get("timing_ms")
+            enqueue_action_event(
+                ctx,
+                tool=action,
+                selector=selector,
+                typed_text=typed_text,
+                value=value,
+                key=key,
+                source_url=_trajectory_source_url(page),
+                timing_ms=timing_ms if isinstance(timing_ms, dict) else {},
+                ok=kwargs.get("ok", True) is True,
+                error_code=error_code,
+            )
+        except Exception as exc:
+            LOG.debug("Action-log observer dropped event", tool=action, exception_type=type(exc).__name__)
+        return result
+
+    return action_result
+
+
 def _blank_to_none(value: str | None) -> str | None:
     """Treat a blank/whitespace string as omitted: MCP clients serialize an omitted optional
     selector/intent as "", and a "" target would route a deterministic action onto nothing."""
     return value if value is None or value.strip() else None
+
+
+def _add_timing_prefix(timing_ms: dict[str, int], elapsed_ms: int) -> dict[str, int]:
+    return {name: elapsed_ms + duration for name, duration in timing_ms.items()}
 
 
 def _truncate_error_message(message: str) -> str:
@@ -128,7 +247,7 @@ def _exception_message(exc: Exception) -> str:
     # get_user_facing_exception_message's "Unexpected error: {exception}" fallback in
     # skyvern/exceptions.py) — never surface them. 4xx bodies are the API's intended
     # client-facing feedback (typed BadRequest/NotFound/UnprocessableEntity errors).
-    surface_body = not (isinstance(status_code, int) and status_code >= 500)
+    surface_body = status_code is None or (isinstance(status_code, int) and 400 <= status_code < 500)
     body_message = _message_from_error_body(getattr(exc, "body", None)) if surface_body else None
     if body_message:
         return f"HTTP {status_code}: {body_message}" if status_code is not None else body_message
@@ -154,8 +273,19 @@ async def _direct_failure_result(
     selector: str,
     exc: Exception,
     timeout_ms: int,
+    *,
+    typed_text: str | None = None,
+    value: str | None = None,
+    key: str | None = None,
 ) -> dict[str, Any]:
-    return make_result(
+    return _action_result_factory(
+        ctx=ctx,
+        page=page,
+        selector=selector,
+        typed_text=typed_text,
+        value=value,
+        key=key,
+    )(
         action,
         ok=False,
         browser_context=ctx,
@@ -232,8 +362,10 @@ async def skyvern_navigate(
     except BrowserNotAvailableError:
         return make_result("skyvern_navigate", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     if _must_reject_localhost_url(ctx, url):
-        return make_result(
+        return action_result(
             "skyvern_navigate",
             ok=False,
             browser_context=ctx,
@@ -257,7 +389,7 @@ async def skyvern_navigate(
             result = await do_navigate(page, url, timeout=timeout, wait_until=wait_until)
             timer.mark("sdk")
         except GuardError as e:
-            return make_result(
+            return action_result(
                 "skyvern_navigate",
                 ok=False,
                 browser_context=ctx,
@@ -265,7 +397,7 @@ async def skyvern_navigate(
                 error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_navigate",
                 ok=False,
                 browser_context=ctx,
@@ -279,10 +411,10 @@ async def skyvern_navigate(
             # second bump can invalidate its snapshot of the old document.
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
-    return make_result(
+    return action_result(
         "skyvern_navigate",
         browser_context=ctx,
-        data={"url": result.url, "title": result.title, "sdk_equivalent": f'await page.goto("{url}")'},
+        data={"url": result.url, "title": result.title, "sdk_equivalent": f"await page.goto({url!r})"},
         timing_ms=timer.timing_ms,
     )
 
@@ -336,6 +468,9 @@ async def skyvern_click(
     except BrowserNotAvailableError:
         return make_result("skyvern_click", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+    source_url = _trajectory_source_url(page)
+
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
@@ -365,12 +500,14 @@ async def skyvern_click(
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
-                resolved = await page.click(selector=selector, _skip_element_prep=skip_element_prep, **kwargs)
+                if isinstance(page, SkyvernPage):
+                    kwargs["_skip_element_prep"] = skip_element_prep
+                resolved = await page.click(selector=selector, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
                 return await _direct_failure_result("skyvern_click", ctx, timer, page, selector, e, action_timeout)
-            return make_result(
+            return action_result(
                 "skyvern_click",
                 ok=False,
                 browser_context=ctx,
@@ -385,7 +522,7 @@ async def skyvern_click(
             code = ErrorCode.AI_FALLBACK_FAILED if used_ai_path else ErrorCode.ACTION_FAILED
             if direct_action and selector is not None and is_pointer_interception_error(e):
                 return await _direct_failure_result("skyvern_click", ctx, timer, page, selector, e, action_timeout)
-            return make_result(
+            return action_result(
                 "skyvern_click",
                 ok=False,
                 browser_context=ctx,
@@ -419,27 +556,46 @@ async def skyvern_click(
     if native_option_selection is not None:
         if native_option_selection.selected_by == "label":
             data["sdk_equivalent"] = (
-                f'await page.select_option("{native_option_selection.select_selector}", '
-                f'label="{native_option_selection.label}")'
+                f"await page.select_option({native_option_selection.select_selector!r}, "
+                f"label={native_option_selection.label!r})"
             )
         elif native_option_selection.selected_by == "index":
             data["sdk_equivalent"] = (
-                f'await page.select_option("{native_option_selection.select_selector}", '
+                f"await page.select_option({native_option_selection.select_selector!r}, "
                 f"index={native_option_selection.index})"
             )
         else:
             data["sdk_equivalent"] = (
-                f'await page.select_option("{native_option_selection.select_selector}", '
-                f'value="{native_option_selection.value}")'
+                f"await page.select_option({native_option_selection.select_selector!r}, "
+                f"value={native_option_selection.value!r})"
             )
     elif resolved_sel and intent:
-        data["sdk_equivalent"] = f'await page.click("{resolved_sel}", prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.click({resolved_sel!r}, prompt={intent!r})"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.click(prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.click(prompt={intent!r})"
     elif selector:
-        data["sdk_equivalent"] = f'await page.click("{selector}")'
+        data["sdk_equivalent"] = f"await page.click({selector!r})"
 
-    return make_result(
+    if native_option_selection is not None:
+        # Synthesis replays select_option by value only; index/label selections are not replayable.
+        if native_option_selection.selected_by == "value" and _replayable_select_value(native_option_selection.value):
+            _record_trajectory_entry(
+                ctx,
+                tool_name="select_option",
+                selector=native_option_selection.select_selector,
+                source_url=source_url,
+                value=native_option_selection.value,
+            )
+    elif button in (None, "left") and click_count in (None, 1):
+        replayable_selector = resolved if used_ai_path else resolved or selector
+        if replayable_selector:
+            _record_trajectory_entry(
+                ctx,
+                tool_name="click",
+                selector=replayable_selector,
+                source_url=source_url,
+            )
+    return action_result(
         "skyvern_click",
         browser_context=ctx,
         data=data,
@@ -492,6 +648,8 @@ async def skyvern_drag(
     except BrowserNotAvailableError:
         return make_result("skyvern_drag", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=source_selector)
+
     use_selectors = source_selector and target_selector and not source_intent and not target_intent
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=bool(use_selectors))
 
@@ -511,43 +669,49 @@ async def skyvern_drag(
         except PlaywrightTimeoutError as e:
             if use_selectors:
                 assert source_selector is not None
-                return make_result(
+                return action_result(
                     "skyvern_drag",
                     ok=False,
                     browser_context=ctx,
                     timing_ms=timer.timing_ms,
                     error=await _drag_failure_error(page, source_selector, target_selector, e, action_timeout),
                 )
-            return make_result(
+            return action_result(
                 "skyvern_drag",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SELECTOR_NOT_FOUND,
-                    str(e),
+                    _exception_message(e),
                     "Verify source and target selectors match elements on the page",
+                    details=_exception_details(e),
                 ),
             )
         except Exception as e:
             if use_selectors and is_pointer_interception_error(e):
                 assert source_selector is not None
-                return make_result(
+                return action_result(
                     "skyvern_drag",
                     ok=False,
                     browser_context=ctx,
                     timing_ms=timer.timing_ms,
                     error=await _drag_failure_error(page, source_selector, target_selector, e, action_timeout),
                 )
-            return make_result(
+            return action_result(
                 "skyvern_drag",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The drag operation failed"),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED,
+                    _exception_message(e),
+                    "The drag operation failed",
+                    details=_exception_details(e),
+                ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_drag",
         browser_context=ctx,
         data={
@@ -649,6 +813,8 @@ async def skyvern_file_upload(
     except BrowserNotAvailableError:
         return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+
     with Timer() as timer:
         try:
             if has_urls:
@@ -686,7 +852,7 @@ async def skyvern_file_upload(
                 return await _direct_failure_result(
                     "skyvern_file_upload", ctx, timer, page, selector, e, action_timeout
                 )
-            return make_result(
+            return action_result(
                 "skyvern_file_upload",
                 ok=False,
                 browser_context=ctx,
@@ -703,7 +869,7 @@ async def skyvern_file_upload(
                 return await _direct_failure_result(
                     "skyvern_file_upload", ctx, timer, page, selector, e, action_timeout
                 )
-            return make_result(
+            return action_result(
                 "skyvern_file_upload",
                 ok=False,
                 browser_context=ctx,
@@ -711,7 +877,7 @@ async def skyvern_file_upload(
                 error=make_error(code, _exception_message(e), "File upload failed", details=_exception_details(e)),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_file_upload",
         browser_context=ctx,
         data={"files_count": len(file_paths), "file_paths": file_paths},
@@ -751,6 +917,8 @@ async def skyvern_hover(
     except BrowserNotAvailableError:
         return make_result("skyvern_hover", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+
     with Timer() as timer:
         try:
             if ai_mode is not None:
@@ -763,7 +931,7 @@ async def skyvern_hover(
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
                 return await _direct_failure_result("skyvern_hover", ctx, timer, page, selector, e, action_timeout)
-            return make_result(
+            return action_result(
                 "skyvern_hover",
                 ok=False,
                 browser_context=ctx,
@@ -778,7 +946,7 @@ async def skyvern_hover(
             code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
             if direct_action and selector is not None and is_pointer_interception_error(e):
                 return await _direct_failure_result("skyvern_hover", ctx, timer, page, selector, e, action_timeout)
-            return make_result(
+            return action_result(
                 "skyvern_hover",
                 ok=False,
                 browser_context=ctx,
@@ -793,13 +961,13 @@ async def skyvern_hover(
 
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
     if selector and intent:
-        data["sdk_equivalent"] = f'await page.locator("{selector}", prompt="{intent}").hover()'
+        data["sdk_equivalent"] = f"await page.locator({selector!r}, prompt={intent!r}).hover()"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.locator(prompt="{intent}").hover()'
+        data["sdk_equivalent"] = f"await page.locator(prompt={intent!r}).hover()"
     elif selector:
-        data["sdk_equivalent"] = f'await page.locator("{selector}").hover()'
+        data["sdk_equivalent"] = f"await page.locator({selector!r}).hover()"
 
-    return make_result(
+    return action_result(
         "skyvern_hover",
         browser_context=ctx,
         data=data,
@@ -858,6 +1026,9 @@ async def skyvern_type(
     except BrowserNotAvailableError:
         return make_result("skyvern_type", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, typed_text=text)
+    source_url = _trajectory_source_url(page)
+
     # DOM-level guard: check if the target element is a password field
     if selector:
         try:
@@ -871,7 +1042,7 @@ async def skyvern_type(
             LOG.debug("DOM password check failed for selector %r: %s", selector, exc)
             is_password_field = False
         if is_password_field:
-            return make_result(
+            return action_result(
                 "skyvern_type",
                 ok=False,
                 error=make_error(
@@ -899,7 +1070,10 @@ async def skyvern_type(
                     await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=action_timeout)  # type: ignore[arg-type]
                 else:
                     assert selector is not None
-                    await page.fill(selector, text, timeout=action_timeout, _skip_element_prep=skip_element_prep)
+                    fill_kwargs: dict[str, Any] = {"timeout": action_timeout}
+                    if isinstance(page, SkyvernPage):
+                        fill_kwargs["_skip_element_prep"] = skip_element_prep
+                    await page.fill(selector, text, **fill_kwargs)
             else:
                 kwargs: dict[str, Any] = {"timeout": action_timeout}
                 if delay is not None:
@@ -911,12 +1085,16 @@ async def skyvern_type(
                     await loc.type(text, **kwargs)
                 else:
                     assert selector is not None
-                    await page.type(selector, text, _skip_element_prep=skip_element_prep, **kwargs)
+                    if isinstance(page, SkyvernPage):
+                        kwargs["_skip_element_prep"] = skip_element_prep
+                    await page.type(selector, text, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
-                return await _direct_failure_result("skyvern_type", ctx, timer, page, selector, e, action_timeout)
-            return make_result(
+                return await _direct_failure_result(
+                    "skyvern_type", ctx, timer, page, selector, e, action_timeout, typed_text=text
+                )
+            return action_result(
                 "skyvern_type",
                 ok=False,
                 browser_context=ctx,
@@ -930,8 +1108,10 @@ async def skyvern_type(
         except Exception as e:
             code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
             if direct_action and selector is not None and is_pointer_interception_error(e):
-                return await _direct_failure_result("skyvern_type", ctx, timer, page, selector, e, action_timeout)
-            return make_result(
+                return await _direct_failure_result(
+                    "skyvern_type", ctx, timer, page, selector, e, action_timeout, typed_text=text
+                )
+            return action_result(
                 "skyvern_type",
                 ok=False,
                 browser_context=ctx,
@@ -950,12 +1130,20 @@ async def skyvern_type(
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode, "text_length": len(text)}
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts
     if selector and intent:
-        data["sdk_equivalent"] = f'await page.fill("{selector}", "{text}", prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r}, prompt={intent!r})"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.fill(prompt="{intent}", value="{text}")'
+        data["sdk_equivalent"] = f"await page.fill(prompt={intent!r}, value={text!r})"
     elif selector:
-        data["sdk_equivalent"] = f'await page.fill("{selector}", "{text}")'
-    return make_result(
+        data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r})"
+    if clear and selector is not None and (ai_mode is None or deterministic):
+        _record_trajectory_entry(
+            ctx,
+            tool_name="type_text",
+            selector=selector,
+            source_url=source_url,
+            typed_text=text,
+        )
+    return action_result(
         "skyvern_type",
         browser_context=ctx,
         data=data,
@@ -981,12 +1169,14 @@ async def skyvern_screenshot(
     except BrowserNotAvailableError:
         return make_result("skyvern_screenshot", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+
     with Timer() as timer:
         try:
             result = await do_screenshot(page, full_page=full_page, selector=selector)
             timer.mark("sdk")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_screenshot",
                 ok=False,
                 browser_context=ctx,
@@ -996,7 +1186,7 @@ async def skyvern_screenshot(
 
     if inline:
         data_b64 = base64.b64encode(result.data).decode("utf-8")
-        return make_result(
+        return action_result(
             "skyvern_screenshot",
             browser_context=ctx,
             data={
@@ -1020,7 +1210,7 @@ async def skyvern_screenshot(
         session_id=ctx.session_id,
     )
 
-    return make_result(
+    return action_result(
         "skyvern_screenshot",
         browser_context=ctx,
         data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')"},
@@ -1055,6 +1245,8 @@ async def skyvern_scroll(
     except BrowserNotAvailableError:
         return make_result("skyvern_scroll", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+
     if intent:
         ai_mode = "fallback" if selector else "proactive"
         with Timer() as timer:
@@ -1064,7 +1256,7 @@ async def skyvern_scroll(
                 timer.mark("sdk")
             except Exception as e:
                 code = ErrorCode.AI_FALLBACK_FAILED if ai_mode == "fallback" else ErrorCode.ACTION_FAILED
-                return make_result(
+                return action_result(
                     "skyvern_scroll",
                     ok=False,
                     browser_context=ctx,
@@ -1077,7 +1269,7 @@ async def skyvern_scroll(
                     ),
                 )
 
-        return make_result(
+        return action_result(
             "skyvern_scroll",
             browser_context=ctx,
             data={
@@ -1085,9 +1277,9 @@ async def skyvern_scroll(
                 "intent": intent,
                 "ai_mode": ai_mode,
                 "sdk_equivalent": (
-                    f'await page.locator("{selector}", prompt="{intent}").scroll_into_view_if_needed()'
+                    f"await page.locator({selector!r}, prompt={intent!r}).scroll_into_view_if_needed()"
                     if selector
-                    else f'await page.locator(prompt="{intent}").scroll_into_view_if_needed()'
+                    else f"await page.locator(prompt={intent!r}).scroll_into_view_if_needed()"
                 ),
             },
             timing_ms=timer.timing_ms,
@@ -1110,7 +1302,7 @@ async def skyvern_scroll(
                 await page.evaluate(f"window.scrollBy({dx}, {dy})")
             timer.mark("sdk")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_scroll",
                 ok=False,
                 browser_context=ctx,
@@ -1118,7 +1310,7 @@ async def skyvern_scroll(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Scroll action failed"),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_scroll",
         browser_context=ctx,
         data={
@@ -1148,6 +1340,9 @@ async def skyvern_select_option(
     """Select an option from a dropdown menu. Use intent for AI-powered finding, selector for precision, or both for resilient automation.
 
     For free-text input fields, use skyvern_type instead. For non-dropdown buttons or links, use skyvern_click.
+    Targeting a plain text input types the value while probing for suggestions and fails closed if none appear;
+    hybrid calls restore the original value before the AI fallback runs, direct calls leave the typed value.
+    The deterministic attempt and each SDK fallback stage get their own timeout budget rather than one shared deadline.
     """
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
@@ -1163,14 +1358,181 @@ async def skyvern_select_option(
             ),
         )
 
+    # Credential-intent guard (parity with skyvern_type/skyvern_act): a password/credential
+    # intent must not reach the AI fallback, even with no selector or a stale one.
+    try:
+        if intent is not None:
+            check_password_prompt(intent)
+    except GuardError as e:
+        return make_result(
+            "skyvern_select_option",
+            ok=False,
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_select_option", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, value=value)
+    source_url = _trajectory_source_url(page)
+
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+
+    # Credential safety runs OUTSIDE the custom-select gate and the kill switch: a password
+    # target must never be filled or have its value forwarded to the AI-fallback LLM payload.
+    # When the target type cannot be determined, fail closed for the value-bearing AI path.
+    password_target: bool | None = False
+    if selector is not None:
+        scope: Any = getattr(page, "_locator_scope", None) or getattr(page, "page", page)
+        try:
+            password_target = bool(
+                await scope.locator(selector).first.evaluate(
+                    "el => el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'",
+                    timeout=min(action_timeout, 1000),
+                )
+            )
+        except Exception:
+            password_target = None
+    if password_target or (password_target is None and ai_mode is not None and not deterministic):
+        return action_result(
+            "skyvern_select_option",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot select an option on a password field",
+                CREDENTIAL_HINT,
+            ),
+        )
+
+    # Operational kill switch: restores the exact pre-custom-select behavior
+    # (native <select> only, no classification probe) without a code rollback.
+    custom_select_disabled = os.environ.get("SKYVERN_DISABLE_CUSTOM_SELECT", "").strip().lower() in ("1", "true", "yes")
+    custom_attempt_ms = 0
+    if selector is not None and not custom_select_disabled:
+        custom_selection = None
+        custom_fallback_attempted = False
+        with Timer() as custom_timer:
+            try:
+                custom_selection = await do_select_option(
+                    getattr(page, "_locator_scope", None) or getattr(page, "page", page),
+                    selector,
+                    value,
+                    by_label=by_label,
+                    timeout=action_timeout,
+                    restore_value_on_failure=ai_mode == "fallback" and not deterministic,
+                    fail_closed_on_unknown=ai_mode is not None and not deterministic,
+                )
+                if custom_selection is not None:
+                    custom_timer.mark("sdk")
+            except CustomSelectPasswordError:
+                # Terminal for every call shape (direct AND hybrid): a password value must
+                # never reach the native SDK fill or the AI-fallback LLM payload.
+                return action_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=custom_timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.INVALID_INPUT,
+                        "Cannot select an option on a password field",
+                        CREDENTIAL_HINT,
+                    ),
+                )
+            except CustomSelectClassifyError:
+                # Target detached/navigated mid-probe (TOCTOU after the boundary check). Fail
+                # closed for the value-bearing AI path; a direct call defers to the native
+                # SDK, which cannot forward the value to an LLM.
+                if ai_mode is not None and not deterministic:
+                    return action_result(
+                        "skyvern_select_option",
+                        ok=False,
+                        browser_context=ctx,
+                        timing_ms=custom_timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.INVALID_INPUT,
+                            "Could not verify the target before AI selection",
+                            "Re-observe the element and retry with a stable selector",
+                        ),
+                    )
+            except CustomSelectMatchError as e:
+                if deterministic or ai_mode != "fallback":
+                    observed = ", ".join(e.observed_options) or "none"
+                    return action_result(
+                        "skyvern_select_option",
+                        ok=False,
+                        browser_context=ctx,
+                        timing_ms=custom_timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.ACTION_FAILED,
+                            f"No unambiguous option matched {e.requested_option!r}",
+                            f"Retry with one of the observed options: {observed}",
+                            details={
+                                "element_state": "no_unambiguous_match",
+                                "selector": e.selector,
+                                "requested_option": e.requested_option,
+                                "observed_options": e.observed_options,
+                            },
+                        ),
+                    )
+                custom_fallback_attempted = True
+            except CustomSelectOpenError as e:
+                # The widget never opened (click intercepted, fill timeout) — nothing was
+                # acted on, so hybrid calls may still recover through the AI fallback.
+                if deterministic or ai_mode != "fallback":
+                    return action_result(
+                        "skyvern_select_option",
+                        ok=False,
+                        browser_context=ctx,
+                        timing_ms=custom_timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.ACTION_FAILED,
+                            _exception_message(e),
+                            "Could not open the dropdown to inspect its options",
+                            details=_exception_details(e),
+                        ),
+                    )
+                custom_fallback_attempted = True
+            except Exception as e:
+                # Post-option-click failures (an option was clicked but did not verifiably
+                # commit) leave the widget in an unknown state — replaying through the AI
+                # fallback could double-act, so these are terminal even for hybrid calls.
+                # Only the pre-option branches above may fall through.
+                return action_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=custom_timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.ACTION_FAILED,
+                        _exception_message(e),
+                        "The custom dropdown selection could not be verified",
+                        details=_exception_details(e),
+                    ),
+                )
+        if custom_fallback_attempted:
+            custom_attempt_ms = custom_timer.timing_ms.get("total", 0)
+        if custom_selection is not None:
+            return action_result(
+                "skyvern_select_option",
+                browser_context=ctx,
+                data={
+                    "selector": selector,
+                    "intent": intent,
+                    "ai_mode": ai_mode,
+                    "value": value,
+                    "selected_option": {"label": custom_selection},
+                    "sdk_equivalent": (
+                        f"# No single SDK method -- open/filter {selector!r}, "
+                        f"then click exact observed option {custom_selection!r}"
+                    ),
+                },
+                timing_ms=custom_timer.timing_ms,
+            )
 
     with Timer() as timer:
         try:
@@ -1197,10 +1559,24 @@ async def skyvern_select_option(
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
                 return await _direct_failure_result(
-                    "skyvern_select_option", ctx, timer, page, selector, e, action_timeout
+                    "skyvern_select_option", ctx, timer, page, selector, e, action_timeout, value=value
                 )
             code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
-            return make_result(
+            if custom_attempt_ms:
+                timer.mark("total")
+                return action_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
+                    error=make_error(
+                        code,
+                        _exception_message(e),
+                        "Check selector and available options",
+                        details=_exception_details(e),
+                    ),
+                )
+            return action_result(
                 "skyvern_select_option",
                 ok=False,
                 browser_context=ctx,
@@ -1216,9 +1592,23 @@ async def skyvern_select_option(
             code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
             if direct_action and selector is not None and is_pointer_interception_error(e):
                 return await _direct_failure_result(
-                    "skyvern_select_option", ctx, timer, page, selector, e, action_timeout
+                    "skyvern_select_option", ctx, timer, page, selector, e, action_timeout, value=value
                 )
-            return make_result(
+            if custom_attempt_ms:
+                timer.mark("total")
+                return action_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
+                    error=make_error(
+                        code,
+                        _exception_message(e),
+                        "Check selector and available options",
+                        details=_exception_details(e),
+                    ),
+                )
+            return action_result(
                 "skyvern_select_option",
                 ok=False,
                 browser_context=ctx,
@@ -1237,12 +1627,27 @@ async def skyvern_select_option(
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode, "value": value}
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts
     if selector and intent:
-        data["sdk_equivalent"] = f'await page.select_option("{selector}", value="{value}", prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.select_option({selector!r}, value={value!r}, prompt={intent!r})"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.select_option(prompt="{intent}", value="{value}")'
+        data["sdk_equivalent"] = f"await page.select_option(prompt={intent!r}, value={value!r})"
     elif selector:
-        data["sdk_equivalent"] = f'await page.select_option("{selector}", value="{value}")'
-    return make_result(
+        data["sdk_equivalent"] = f"await page.select_option({selector!r}, value={value!r})"
+    if selector is not None and not by_label and (ai_mode is None or deterministic) and _replayable_select_value(value):
+        _record_trajectory_entry(
+            ctx,
+            tool_name="select_option",
+            selector=selector,
+            source_url=source_url,
+            value=value,
+        )
+    if custom_attempt_ms:
+        return action_result(
+            "skyvern_select_option",
+            browser_context=ctx,
+            data=data,
+            timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
+        )
+    return action_result(
         "skyvern_select_option",
         browser_context=ctx,
         data=data,
@@ -1268,10 +1673,15 @@ async def skyvern_press_key(
     Use `intent` or `selector` to focus a specific element before pressing.
     Without either, presses the key on the currently focused element.
     """
+    selector = _blank_to_none(selector)
+    intent = _blank_to_none(intent)
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_press_key", ok=False, error=no_browser_error())
+
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, key=key)
+    source_url = _trajectory_source_url(page)
 
     ai_mode = _resolve_ai_mode(selector, intent)[0] if (intent or selector) else None
     direct_action = is_direct_action(selector, ai_mode)
@@ -1293,26 +1703,39 @@ async def skyvern_press_key(
             if direct_action and selector is not None:
                 if isinstance(e, PlaywrightTimeoutError) or is_pointer_interception_error(e):
                     return await _direct_failure_result(
-                        "skyvern_press_key", ctx, timer, page, selector, e, action_timeout
+                        "skyvern_press_key", ctx, timer, page, selector, e, action_timeout, key=key
                     )
-            return make_result(
+            return action_result(
                 "skyvern_press_key",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check key name is valid"),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED,
+                    _exception_message(e),
+                    "Check key name is valid",
+                    details=_exception_details(e),
+                ),
             )
 
     if selector and intent:
-        sdk_eq = f'await page.locator("{selector}", prompt="{intent}").press("{key}")'
+        sdk_eq = f"await page.locator({selector!r}, prompt={intent!r}).press({key!r})"
     elif intent:
-        sdk_eq = f'await page.locator(prompt="{intent}").press("{key}")'
+        sdk_eq = f"await page.locator(prompt={intent!r}).press({key!r})"
     elif selector:
-        sdk_eq = f'await page.locator("{selector}").press("{key}")'
+        sdk_eq = f"await page.locator({selector!r}).press({key!r})"
     else:
-        sdk_eq = f'await page.keyboard.press("{key}")'
+        sdk_eq = f"await page.keyboard.press({key!r})"
 
-    return make_result(
+    if intent is None and _replayable_press_key(key):
+        _record_trajectory_entry(
+            ctx,
+            tool_name="press_key",
+            key=key,
+            selector=selector,
+            source_url=source_url,
+        )
+    return action_result(
         "skyvern_press_key",
         browser_context=ctx,
         data={
@@ -1370,6 +1793,8 @@ async def skyvern_wait(
     except BrowserNotAvailableError:
         return make_result("skyvern_wait", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+
     with Timer() as timer:
         try:
             if time_ms is not None:
@@ -1390,8 +1815,12 @@ async def skyvern_wait(
                         break
                     if loop.time() >= deadline:
                         code = ErrorCode.SDK_ERROR if last_error else ErrorCode.TIMEOUT
-                        msg = str(last_error) if last_error else f"Condition not met within {timeout}ms: {intent}"
-                        return make_result(
+                        msg = (
+                            _exception_message(last_error)
+                            if last_error
+                            else f"Condition not met within {timeout}ms: {intent}"
+                        )
+                        return action_result(
                             "skyvern_wait",
                             ok=False,
                             browser_context=ctx,
@@ -1400,6 +1829,7 @@ async def skyvern_wait(
                                 code,
                                 msg,
                                 "Increase timeout or check that the condition can be satisfied",
+                                details=_exception_details(last_error) if last_error else None,
                             ),
                         )
                     await page.wait_for_timeout(poll_interval_ms)
@@ -1409,22 +1839,27 @@ async def skyvern_wait(
                 waited_for = "selector"
             timer.mark("sdk")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_wait",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.TIMEOUT, str(e), "Condition was not met within timeout"),
+                error=make_error(
+                    ErrorCode.TIMEOUT,
+                    _exception_message(e),
+                    "Condition was not met within timeout",
+                    details=_exception_details(e),
+                ),
             )
 
     sdk_eq = ""
     if waited_for == "time":
         sdk_eq = f"await page.wait_for_timeout({time_ms})"
     elif waited_for == "intent":
-        sdk_eq = f'await page.validate("{intent}")'
+        sdk_eq = f"await page.validate({intent!r})"
     elif waited_for == "selector":
-        sdk_eq = f'await page.wait_for_selector("{selector}")'
-    return make_result(
+        sdk_eq = f"await page.wait_for_selector({selector!r})"
+    return action_result(
         "skyvern_wait",
         browser_context=ctx,
         data={"waited_for": waited_for, "sdk_equivalent": sdk_eq},
@@ -1475,12 +1910,14 @@ async def skyvern_evaluate(
     except BrowserNotAvailableError:
         return make_result("skyvern_evaluate", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     with Timer() as timer:
         try:
             result = await page.evaluate(js)
             timer.mark("sdk")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_evaluate",
                 ok=False,
                 browser_context=ctx,
@@ -1488,10 +1925,10 @@ async def skyvern_evaluate(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check JavaScript syntax"),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_evaluate",
         browser_context=ctx,
-        data={"result": result, "sdk_equivalent": f'await page.evaluate("{expression[:80]}")'},
+        data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
         timing_ms=timer.timing_ms,
     )
 
@@ -1524,12 +1961,14 @@ async def skyvern_extract(
     except BrowserNotAvailableError:
         return make_result("skyvern_extract", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     with Timer() as timer:
         try:
             result = await do_extract(page, prompt, schema=parsed_schema, skip_refresh=True)
             timer.mark("sdk")
         except GuardError as e:
-            return make_result(
+            return action_result(
                 "skyvern_extract",
                 ok=False,
                 browser_context=ctx,
@@ -1537,7 +1976,7 @@ async def skyvern_extract(
                 error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_extract",
                 ok=False,
                 browser_context=ctx,
@@ -1550,12 +1989,12 @@ async def skyvern_extract(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_extract",
         browser_context=ctx,
         data={
             "extracted": result.extracted,
-            "sdk_equivalent": f'await page.extract(prompt="{prompt}")',
+            "sdk_equivalent": f"await page.extract(prompt={prompt!r})",
         },
         timing_ms=timer.timing_ms,
     )
@@ -1574,12 +2013,14 @@ async def skyvern_validate(
     except BrowserNotAvailableError:
         return make_result("skyvern_validate", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     with Timer() as timer:
         try:
             valid = await page.validate(prompt)
             timer.mark("sdk")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_validate",
                 ok=False,
                 browser_context=ctx,
@@ -1592,10 +2033,10 @@ async def skyvern_validate(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_validate",
         browser_context=ctx,
-        data={"prompt": prompt, "valid": valid, "sdk_equivalent": f'await page.validate("{prompt}")'},
+        data={"prompt": prompt, "valid": valid, "sdk_equivalent": f"await page.validate({prompt!r})"},
         timing_ms=timer.timing_ms,
     )
 
@@ -1607,7 +2048,7 @@ async def skyvern_act(
 ) -> dict[str, Any]:
     """Perform actions on a page by describing what to do in plain English. No screenshots in reasoning — uses economy a11y tree.
     Chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
-    For visually complex targets, use skyvern_observe + skyvern_click with refs. NEVER include passwords — use skyvern_login.
+    For visually complex targets, use skyvern_observe + skyvern_execute with refs on stdio; on hosted stateless HTTP prefer selector or intent. NEVER include passwords — use skyvern_login.
     """
     try:
         check_password_prompt(prompt)
@@ -1623,12 +2064,14 @@ async def skyvern_act(
     except BrowserNotAvailableError:
         return make_result("skyvern_act", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     with Timer() as timer:
         try:
             result = await do_act(page, prompt, skip_refresh=True, use_economy_tree=True)
             timer.mark("sdk")
         except GuardError as e:
-            return make_result(
+            return action_result(
                 "skyvern_act",
                 ok=False,
                 browser_context=ctx,
@@ -1636,7 +2079,7 @@ async def skyvern_act(
                 error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_act",
                 ok=False,
                 browser_context=ctx,
@@ -1649,13 +2092,13 @@ async def skyvern_act(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_act",
         browser_context=ctx,
         data={
             "prompt": result.prompt,
             "completed": result.completed,
-            "sdk_equivalent": f'await page.act("{prompt}")',
+            "sdk_equivalent": f"await page.act({prompt!r})",
         },
         timing_ms=timer.timing_ms,
     )
@@ -1677,7 +2120,7 @@ async def skyvern_run_task(
     ] = 180,
 ) -> dict[str, Any]:
     """Run a one-off autonomous trial via the highest-cost AI path. Not for production or reusable automations.
-    Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute. Always uses engine 2.0.
+    Prefer direct tools (click/type/select via selector) and skyvern_observe + skyvern_execute. Always uses engine 2.0.
     """
     # Block password/credential actions — redirect to skyvern_login
     if PASSWORD_PATTERN.search(prompt):
@@ -1696,8 +2139,10 @@ async def skyvern_run_task(
     except BrowserNotAvailableError:
         return make_result("skyvern_run_task", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     if _must_reject_localhost_url(ctx, url):
-        return make_result(
+        return action_result(
             "skyvern_run_task",
             ok=False,
             browser_context=ctx,
@@ -1715,7 +2160,7 @@ async def skyvern_run_task(
         try:
             parsed_schema = json.loads(data_extraction_schema)
         except (json.JSONDecodeError, TypeError) as e:
-            return make_result(
+            return action_result(
                 "skyvern_run_task",
                 ok=False,
                 browser_context=ctx,
@@ -1737,7 +2182,7 @@ async def skyvern_run_task(
             )
             timer.mark("sdk")
         except asyncio.TimeoutError:
-            return make_result(
+            return action_result(
                 "skyvern_run_task",
                 ok=False,
                 browser_context=ctx,
@@ -1749,7 +2194,7 @@ async def skyvern_run_task(
                 ),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_run_task",
                 ok=False,
                 browser_context=ctx,
@@ -1762,7 +2207,7 @@ async def skyvern_run_task(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_run_task",
         browser_context=ctx,
         data={
@@ -1772,7 +2217,7 @@ async def skyvern_run_task(
             "failure_reason": response.failure_reason,
             "recording_url": response.recording_url,
             "app_url": response.app_url,
-            "sdk_equivalent": f'await page.agent.run_task(prompt="{prompt}")',
+            "sdk_equivalent": f"await page.agent.run_task(prompt={prompt!r})",
         },
         timing_ms=timer.timing_ms,
     )
@@ -1852,6 +2297,8 @@ async def skyvern_login(
     except BrowserNotAvailableError:
         return make_result("skyvern_login", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     # Common kwargs shared across all credential types
     _common_kwargs: dict[str, Any] = {"url": url, "prompt": prompt, "timeout": timeout_seconds}
     if totp_identifier is not None:
@@ -1899,7 +2346,7 @@ async def skyvern_login(
                 )
             timer.mark("sdk")
         except asyncio.TimeoutError:
-            return make_result(
+            return action_result(
                 "skyvern_login",
                 ok=False,
                 browser_context=ctx,
@@ -1913,7 +2360,7 @@ async def skyvern_login(
                 ),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_login",
                 ok=False,
                 browser_context=ctx,
@@ -1926,7 +2373,7 @@ async def skyvern_login(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_login",
         browser_context=ctx,
         data={
@@ -1977,6 +2424,8 @@ async def skyvern_frame_switch(
     except BrowserNotAvailableError:
         return make_result("skyvern_frame_switch", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
+
     with Timer() as timer:
         try:
             result = await do_frame_switch(page, selector=selector, name=name, index=index)
@@ -1987,7 +2436,7 @@ async def skyvern_frame_switch(
             state._working_frame = page._working_frame
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
         except ValueError as e:
-            return make_result(
+            return action_result(
                 "skyvern_frame_switch",
                 ok=False,
                 browser_context=ctx,
@@ -1995,7 +2444,7 @@ async def skyvern_frame_switch(
                 error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use skyvern_frame_list to find valid frames"),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_frame_switch",
                 ok=False,
                 browser_context=ctx,
@@ -2003,7 +2452,7 @@ async def skyvern_frame_switch(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "The iframe may not be loaded yet — try waiting"),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_frame_switch",
         browser_context=ctx,
         data={
@@ -2011,9 +2460,9 @@ async def skyvern_frame_switch(
             "frame_url": result.url,
             "switched_by": "selector" if selector else ("name" if name else "index"),
             "sdk_equivalent": (
-                f'await page.frame_switch(selector="{selector}")'
+                f"await page.frame_switch(selector={selector!r})"
                 if selector
-                else f'await page.frame_switch(name="{name}")'
+                else f"await page.frame_switch(name={name!r})"
                 if name
                 else f"await page.frame_switch(index={index})"
             ),
@@ -2036,6 +2485,8 @@ async def skyvern_frame_main(
     except BrowserNotAvailableError:
         return make_result("skyvern_frame_main", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     do_frame_main(page)
 
     # Clear frame on session state
@@ -2043,7 +2494,7 @@ async def skyvern_frame_main(
     state._working_frame = None
     clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
-    return make_result(
+    return action_result(
         "skyvern_frame_main",
         browser_context=ctx,
         data={"status": "switched_to_main_frame", "sdk_equivalent": "page.frame_main()"},
@@ -2064,12 +2515,14 @@ async def skyvern_frame_list(
     except BrowserNotAvailableError:
         return make_result("skyvern_frame_list", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     with Timer() as timer:
         try:
             frames = await do_frame_list(page)
             timer.mark("sdk")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_frame_list",
                 ok=False,
                 browser_context=ctx,
@@ -2077,7 +2530,7 @@ async def skyvern_frame_list(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Ensure a page is loaded first"),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_frame_list",
         browser_context=ctx,
         data={
@@ -2109,12 +2562,14 @@ async def skyvern_find(
     except BrowserNotAvailableError:
         return make_result("skyvern_find", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=value if by == "css" else None)
+
     with Timer() as timer:
         try:
             result = await do_find(page, by=by, value=value)
             timer.mark("find")
         except GuardError as e:
-            return make_result(
+            return action_result(
                 "skyvern_find",
                 ok=False,
                 browser_context=ctx,
@@ -2122,7 +2577,7 @@ async def skyvern_find(
                 error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
             )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_find",
                 ok=False,
                 browser_context=ctx,
@@ -2130,7 +2585,7 @@ async def skyvern_find(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check the locator type and value"),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_find",
         browser_context=ctx,
         data={
@@ -2167,13 +2622,15 @@ async def skyvern_clipboard_read(
     except BrowserNotAvailableError:
         return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     with Timer() as timer:
         try:
             await _ensure_clipboard_permissions(page)
             text = await page.evaluate("() => navigator.clipboard.readText()")
             timer.mark("clipboard_read")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_clipboard_read",
                 ok=False,
                 browser_context=ctx,
@@ -2183,7 +2640,7 @@ async def skyvern_clipboard_read(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_clipboard_read",
         browser_context=ctx,
         data={"text": text},
@@ -2207,13 +2664,15 @@ async def skyvern_clipboard_write(
     except BrowserNotAvailableError:
         return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page, typed_text=text)
+
     with Timer() as timer:
         try:
             await _ensure_clipboard_permissions(page)
             await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
             timer.mark("clipboard_write")
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_clipboard_write",
                 ok=False,
                 browser_context=ctx,
@@ -2223,7 +2682,7 @@ async def skyvern_clipboard_write(
                 ),
             )
 
-    return make_result(
+    return action_result(
         "skyvern_clipboard_write",
         browser_context=ctx,
         data={"written": True, "length": len(text)},
@@ -2234,6 +2693,17 @@ async def skyvern_clipboard_write(
 # ---------------------------------------------------------------------------
 # Observe — scoped accessibility tree snapshot
 # ---------------------------------------------------------------------------
+
+
+def _observe_frame_error(error: ObserveFrameError) -> dict[str, Any]:
+    frame_id = error.frame_name or error.frame_url or "<unnamed>"
+    return make_error(
+        ErrorCode.ACTION_FAILED,
+        f"Failed to observe frame {frame_id!r}",
+        "Use skyvern_frame_list to verify the frame, skyvern_frame_main to leave it, "
+        "or switch again before retrying selector-based click/type tools",
+        details={"frame_name": error.frame_name, "frame_url": error.frame_url},
+    )
 
 
 async def skyvern_observe(
@@ -2256,12 +2726,21 @@ async def skyvern_observe(
         int,
         Field(description="Max elements to return. Default 50.", ge=1, le=200),
     ] = 50,
+    include_values: Annotated[
+        bool,
+        Field(
+            description="Include current values for non-password inputs. "
+            "Password values are never returned. Default false."
+        ),
+    ] = False,
 ) -> dict[str, Any]:
-    """Snapshot interactive elements with refs reusable in this browser session until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe)."""
+    """Snapshot interactive elements. On stdio, refs persist across calls until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe). In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, using refs from an inline observe in one skyvern_execute batch only when predictable in advance. Input values are omitted by default; set include_values=True to return non-password values. Password values are never returned."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_observe", ok=False, error=no_browser_error())
+
+    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
     observe_page_key = page_ref_key(page)
     generation = session_ref_generation(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
@@ -2273,10 +2752,20 @@ async def skyvern_observe(
                 selector=selector,
                 interactive_only=interactive_only,
                 max_elements=max_elements,
+                include_values=include_values,
             )
             timer.mark("sdk")
+        except ObserveFrameError as e:
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+            return action_result(
+                "skyvern_observe",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=_observe_frame_error(e),
+            )
         except Exception as e:
-            return make_result(
+            return action_result(
                 "skyvern_observe",
                 ok=False,
                 browser_context=ctx,
@@ -2286,7 +2775,7 @@ async def skyvern_observe(
 
     elements = serialize_elements(result.elements)
     replace_session_ref_map(
-        {element["ref"]: element for element in elements},
+        ref_map_from_elements(elements),
         session_id=ctx.session_id,
         cdp_url=ctx.cdp_url,
         generation=generation,
@@ -2297,11 +2786,14 @@ async def skyvern_observe(
         f"{f' (of {result.total_on_page} total on page)' if result.total_on_page > result.element_count else ''}. "
         "Use these refs in skyvern_execute steps, e.g.: "
         '{tool: "click", params: {ref: "e0"}}. '
-        "Refs remain valid across calls in this browser session until the next skyvern_observe, "
+        "On stdio, refs remain valid across calls until the next skyvern_observe, "
         "skyvern_navigate, same-tab navigation, or tab/frame switch. Same-document DOM changes can also "
-        "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures."
+        "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures. "
+        "In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, "
+        "using refs from an inline observe in one skyvern_execute batch only when predictable in advance. "
+        "Input values are omitted unless include_values=true; password values are never returned."
     )
-    return make_result(
+    return action_result(
         "skyvern_observe",
         browser_context=ctx,
         data={
@@ -2355,8 +2847,8 @@ async def _dispatch_step(
     ref_map: dict[str, dict[str, Any]],
     session_id: str | None,
     cdp_url: str | None,
-    page_key: tuple[int, int | None, str] | None = None,
-    on_observe_page: Callable[[tuple[int, int | None, str]], None] | None = None,
+    page_key: tuple[int, int | None, str, str | None] | None = None,
+    on_observe_page: Callable[[tuple[int, int | None, str, str | None]], None] | None = None,
 ) -> dict[str, Any] | None:
     """Route a step to the appropriate handler, resolving refs to selectors."""
     params = dict(step.params)
@@ -2371,7 +2863,10 @@ async def _dispatch_step(
         if elem is None:
             elem = get_session_ref(ref, session_id=session_id, cdp_url=cdp_url, page_key=current_key)
         if elem is None:
-            raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
+            message = f"Unknown ref '{ref}' — call observe first or check ref exists"
+            if is_stateless_http_mode():
+                message += ". In stateless HTTP mode refs from prior requests do not resolve — use selector or intent params instead."
+            raise ValueError(message)
         params["selector"] = ref_to_selector(elem)
 
     # Observe is handled inline (not an existing MCP tool)
@@ -2381,9 +2876,13 @@ async def _dispatch_step(
         page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
         if on_observe_page is not None:
             on_observe_page(page_ref_key(page))
-        accepted = {"selector", "interactive_only", "max_elements"}
+        accepted = {"selector", "interactive_only", "max_elements", "include_values"}
         filtered = {k: v for k, v in params.items() if k in accepted}
-        result = await _do_observe(page, **filtered)
+        try:
+            result = await _do_observe(page, **filtered)
+        except ObserveFrameError as e:
+            clear_session_ref_map(session_id=session_id, cdp_url=cdp_url)
+            raise ToolStepError(_observe_frame_error(e)) from e
         return {
             "elements": serialize_elements(result.elements),
             "element_count": result.element_count,
@@ -2420,10 +2919,11 @@ async def skyvern_execute(
         Field(
             description=(
                 "Array of {tool, params} step objects to execute sequentially. "
-                "Within params, refs from skyvern_observe are direct targets across calls in the same browser session. "
-                "The next skyvern_observe or page/document context change invalidates them; they can occasionally "
-                "expire early. Same-document DOM changes can also invalidate ordinal refs; on 'Unknown ref' or "
-                "unexpected failures, re-observe. "
+                "Within params, refs from skyvern_observe are direct targets across calls on stdio transports until "
+                "the next skyvern_observe, navigation, or page/document context change; they can occasionally expire "
+                "early. In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, "
+                "using observe+ref steps in a single batch only when refs are predictable in advance. Same-document DOM "
+                "changes can also invalidate ordinal refs; on 'Unknown ref' or unexpected failures, re-observe. "
                 f"{DIRECT_TARGET_DESCRIPTION}"
             )
         ),
@@ -2435,7 +2935,7 @@ async def skyvern_execute(
         Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
     ] = True,
 ) -> dict[str, Any]:
-    """Execute browser operations using current-session refs until the next observe or page/document context change.
+    """Execute browser operations. On stdio, refs persist across calls until the next observe, navigation, or page/document context change. In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, using observe+ref steps in one batch only when refs are predictable in advance.
     Allowed tools: navigate, click, type, press_key, select_option, hover, scroll, wait, observe, screenshot, evaluate."""
     if not steps:
         return make_result(
@@ -2491,14 +2991,16 @@ async def skyvern_execute(
     except BrowserNotAvailableError:
         return make_result("skyvern_execute", ok=False, error=no_browser_error())
 
+    action_result = _action_result_factory(ctx=ctx, page=page)
+
     batch_page_key = page_ref_key(page)
 
     # Generation captured before each observe dispatch so a snapshot that raced
     # a concurrent navigation/context switch is discarded, not committed.
     observe_generation: dict[str, int] = {}
-    observe_page_key: tuple[int, int | None, str] | None = None
+    observe_page_key: tuple[int, int | None, str, str | None] | None = None
 
-    def capture_observe_page_key(page_key: tuple[int, int | None, str]) -> None:
+    def capture_observe_page_key(page_key: tuple[int, int | None, str, str | None]) -> None:
         nonlocal observe_page_key
         observe_page_key = page_key
 
@@ -2547,7 +3049,7 @@ async def skyvern_execute(
             entry["error"] = sr.error
         step_results.append(entry)
 
-    return make_result(
+    return action_result(
         "skyvern_execute",
         ok=result.error_step is None,
         data={

@@ -4,6 +4,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .credit_card_billing_address import CreditCardBillingAddress
 
 
 class NonEmptyCreditCardCredential(UniversalBaseModel):
@@ -39,6 +40,26 @@ class NonEmptyCreditCardCredential(UniversalBaseModel):
     card_holder_name: str = pydantic.Field()
     """
     The name of the card holder (must not be empty)
+    """
+
+    billing_address: typing.Optional[CreditCardBillingAddress] = pydantic.Field(default=None)
+    """
+    Optional billing address associated with the card
+    """
+
+    billing_email: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional billing email address
+    """
+
+    billing_phone: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional billing phone number
+    """
+
+    metadata: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
+    """
+    Optional additional credit card metadata fields
     """
 
     if IS_PYDANTIC_V2:

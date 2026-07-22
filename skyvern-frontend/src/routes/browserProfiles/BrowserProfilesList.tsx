@@ -395,7 +395,9 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
               {deleteDialog.targets.length === 1
                 ? "browser profile"
                 : "browser profiles"}
-              ? This action cannot be undone.
+              ? Linked credentials are unlinked automatically; any workflows
+              pinned to these profiles will need repointing. This action cannot
+              be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

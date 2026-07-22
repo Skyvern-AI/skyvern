@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
@@ -215,11 +216,12 @@ class TaskV2Request(BaseModel):
     totp_identifier: str | None = None
     proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
+    generate_script: bool | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
     model: dict[str, Any] | None = None
-    max_screenshot_scrolls: int | None = None
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None

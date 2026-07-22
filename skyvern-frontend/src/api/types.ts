@@ -12,8 +12,10 @@ export type DownloadedFileInfo = {
 export const ArtifactType = {
   Recording: "recording",
   SessionReplay: "session_replay",
+  Screenshot: "screenshot",
   ActionScreenshot: "screenshot_action",
   LLMScreenshot: "screenshot_llm",
+  EvalScore: "eval_score",
   LLMResponseRaw: "llm_response",
   LLMResponseParsed: "llm_response_parsed",
   VisibleElementsTree: "visible_elements_tree",
@@ -378,6 +380,27 @@ export interface GoogleOAuthCredentialListResponse {
   credentials: GoogleOAuthCredential[];
 }
 
+export interface GoogleOAuthClientConfigSafe {
+  client_id: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+  client_secret_configured: boolean;
+  configured: boolean;
+  source: string;
+  encryption_enabled: boolean;
+}
+
+export interface GoogleOAuthClientConfigResponse {
+  config: GoogleOAuthClientConfigSafe;
+}
+
+export interface UpdateGoogleOAuthClientConfigRequest {
+  client_id: string;
+  client_secret?: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+}
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
@@ -391,6 +414,45 @@ export interface GoogleOAuthAuthorizeResponse {
 }
 
 export interface CreateGoogleOAuthCallbackRequest {
+  code: string;
+  state: string;
+}
+
+export interface MicrosoftOAuthCredential {
+  id: string;
+  organization_id: string;
+  credential_name: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface MicrosoftOAuthCredentialResponse {
+  credential: MicrosoftOAuthCredential;
+  app_origin?: string | null;
+}
+
+export interface MicrosoftOAuthCredentialListResponse {
+  credentials: MicrosoftOAuthCredential[];
+}
+
+export interface CreateMicrosoftOAuthAuthorizeRequest {
+  redirect_uri: string;
+  credential_name?: string;
+  scope_profile?: "outlook_mail";
+  app_origin?: string;
+}
+
+export interface MicrosoftOAuthAuthorizeResponse {
+  authorize_url: string;
+  state: string;
+}
+
+export interface CreateMicrosoftOAuthCallbackRequest {
   code: string;
   state: string;
 }
@@ -611,7 +673,7 @@ export type Action = {
   screenshotArtifactId?: string | null;
 };
 
-export type EvalKind = "workflow" | "task";
+export type EvalKind = "workflow" | "task" | "browser_session";
 
 export interface Eval {
   kind: EvalKind;
@@ -633,7 +695,65 @@ export interface EvalTask extends Eval {
   url: string | null;
 }
 
-export type EvalApiResponse = EvalWorkflow[] | EvalTask[];
+export interface EvalBrowserSession extends Eval {
+  kind: "browser_session";
+  session_id: string;
+  arm?: string | null;
+  difficulty?: "easy" | "medium" | "hard" | null;
+  model?: string | null;
+  task_id?: string | null;
+  task_title?: string | null;
+  perfect?: boolean | null;
+  rubric_avg?: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_s?: number | null;
+}
+
+export type EvalApiResponse = Array<
+  EvalWorkflow | EvalTask | EvalBrowserSession
+>;
+
+export interface EvalModelSummary {
+  model: string | null;
+  total: number;
+  perfect_count: number;
+  graded_count: number;
+  pass_rate: number | null;
+  rubric_avg: number | null;
+  duration_avg_s: number | null;
+  last_started_at: string | null;
+}
+
+export interface EvalSummaryResponse {
+  models: EvalModelSummary[];
+  total_runs: number;
+}
+
+export interface RuntimeCostTierMetrics {
+  steps: number | null;
+  duration_min: number | null;
+  tokens: number | null;
+  cost: number | null;
+}
+
+export interface RuntimeCostModelSummary {
+  model: string;
+  runs: number;
+  steps: number | null;
+  duration_min: number | null;
+  tokens: number | null;
+  output_tokens: number | null;
+  cost: number | null;
+  token_coverage: number;
+  tiers: Partial<Record<"easy" | "medium" | "hard", RuntimeCostTierMetrics>>;
+}
+
+export interface RuntimeCostSummaryResponse {
+  task_set_size: number;
+  captured_at: string | null;
+  models: RuntimeCostModelSummary[];
+}
 
 export type DebugSessionApiResponse = {
   debug_session_id: string;
@@ -670,6 +790,7 @@ export type WorkflowRunApiResponse = {
   workflow_permanent_id: string;
   workflow_run_id: string;
   workflow_title: string | null;
+  retried_from_workflow_run_id?: string | null;
 };
 
 export const TaskRunType = {
@@ -736,6 +857,8 @@ export type WorkflowRunStatusApiResponse = {
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
+  retried_from_workflow_run_id?: string | null;
+  retried_by_workflow_run_id?: string | null;
 };
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -775,6 +898,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
+  retried_from_workflow_run_id?: string | null;
+  retried_by_workflow_run_id?: string | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -846,9 +971,28 @@ export type BrowserProfileApiResponse = {
   proxy_session_id?: string | null;
   is_managed?: boolean;
   workflow_permanent_id?: string | null;
+  // Batched by the list endpoint so rows show the credential-login role without a per-row usage fetch.
+  linked_credential_name?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+};
+
+export type BrowserProfileUsageWorkflow = {
+  workflow_permanent_id: string;
+  title: string;
+  via: "browser_profile_id" | "seed_browser_profile_id";
+};
+
+export type BrowserProfileUsageCredential = {
+  credential_id: string;
+  name: string;
+};
+
+export type BrowserProfileUsage = {
+  workflows: Array<BrowserProfileUsageWorkflow>;
+  credentials: Array<BrowserProfileUsageCredential>;
+  recent_seeded_run_count: number;
 };
 
 export type PasswordCredentialApiResponse = {

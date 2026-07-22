@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 
 import structlog
 from agents.agent import AgentBase
@@ -20,7 +23,10 @@ from mcp.types import (
     ListPromptsResult,
     TextContent,
 )
+from playwright.async_api import Browser, BrowserContext
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.blocker_signal import (
     build_loop_blocker_signal,
     loop_blocker_evidence_from_ctx,
@@ -44,10 +50,13 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
+    resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
+from skyvern.webeye.browser_state import BrowserState
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -59,9 +68,13 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_browser_interaction_observation",
     "scouted_interactions",
     "scout_trajectory",
+    "never_captured_obligation",
+    "synthesized_block_reopened_for_capture_obligation",
     "pending_scout_source_url",
     "pending_scout_typed_value",
     "pending_scout_role_name",
+    "pending_scout_ambiguous",
+    "pending_scout_reanchor",
     "post_budget_page_inspection_required",
     "post_budget_page_inspection_url",
     "post_budget_page_inspection_run_id",
@@ -71,13 +84,20 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "code_only_target_page_evidence_seen",
     "last_evaluate_actionable_signature",
     "last_evaluate_actionable_url",
+    "last_scout_observation_trajectory_index",
+    "last_scout_observation_has_password_control",
     "latest_evaluate_result_composition_steer",
+    "latest_evaluate_result_composition_signature",
     "last_auto_acted_signature",
     "reached_download_target",
     "synthesized_block_offered",
     "synthesized_block_offered_trajectory_len",
     "synthesized_block_offered_goal_complete",
+    "synthesized_business_required_parameter_keys",
     "scouted_output_covered_paths",
+    "scout_observed_terminal_criterion_ids",
+    "scout_observation_contract",
+    "requested_output_extraction_candidate",
     "synthesized_block_reopened_for_output_coverage",
     "uncovered_output_rescout_context_key",
     "uncovered_output_rescout_steer_key",
@@ -135,7 +155,7 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS = frozenset(
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
     return payload
 
@@ -148,7 +168,7 @@ def _stash_and_emit_current_page_terminal_challenge_blocker(ctx: Any, tool_name:
     )
     if signal is None:
         return None
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_current_page_terminal_challenge")
     return payload
 
@@ -205,6 +225,58 @@ def _copilot_to_call_tool_result(
     return CallToolResult(content=content, isError=is_error)
 
 
+def _evidence_candidate_url_origin(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return None
+    return f"https://{parsed.hostname.lower()}{port}"
+
+
+@asynccontextmanager
+async def _service_worker_blocked_context(
+    browser_state: BrowserState,
+    *,
+    organization_id: str,
+) -> AsyncIterator[BrowserContext]:
+    original_context = browser_state.browser_context
+    if original_context is None:
+        raise RuntimeError("Evidence-candidate browser does not support an isolated context")
+    original_page = await browser_state.get_working_page()
+    browser = original_context.browser
+    fallback_browser: Browser | None = None
+    if browser is None:
+        fallback_browser = await browser_state.pw.chromium.launch()
+        browser = fallback_browser
+    candidate_context: BrowserContext | None = None
+    try:
+        candidate_context = await browser.new_context(service_workers="block")
+        await app.AGENT_FUNCTION.setup_browser_context_extensions(
+            candidate_context,
+            organization_id=organization_id,
+            copilot_candidate_network_guard=True,
+        )
+        candidate_page = await candidate_context.new_page()
+        browser_state.browser_context = candidate_context
+        await browser_state.set_active_page(candidate_page)
+        yield candidate_context
+    finally:
+        try:
+            if candidate_context is not None:
+                browser_state.browser_context = original_context
+                if original_page is None:
+                    await browser_state.set_working_page(None)
+                else:
+                    await browser_state.set_active_page(original_page)
+                await candidate_context.close()
+        finally:
+            if fallback_browser is not None:
+                await fallback_browser.close()
+
+
 class SkyvernOverlayMCPServer(MCPServer):
     """MCP server that wraps a FastMCP transport with schema overlays and
     copilot-specific dispatch logic (loop detection, browser injection, hooks).
@@ -228,6 +300,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._client: Client | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_raw_tools: list[MCPTool] | None = None
+        self._evidence_candidate_origin: str | None = None
+        self._evidence_candidate_guarded_hops: list[CopilotCandidateNetworkHop] | None = None
 
     @property
     def name(self) -> str:
@@ -247,6 +321,80 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._client = None
         self._exit_stack = None
         self._cached_raw_tools = None
+
+    @asynccontextmanager
+    async def evidence_candidate_navigation_guard(
+        self,
+        expected_origin: str,
+    ) -> AsyncIterator[list[CopilotCandidateNetworkHop]]:
+        if self._evidence_candidate_origin is not None:
+            raise RuntimeError("Evidence-candidate navigation guard is already active")
+        normalized_origin = _evidence_candidate_url_origin(expected_origin)
+        if normalized_origin != expected_origin:
+            raise ValueError("Evidence-candidate origin must be an exact HTTPS origin")
+        ctx = self._context_provider()
+        session_error = await ensure_browser_session(ctx)
+        if session_error is not None:
+            raise RuntimeError(str(session_error.get("error", "Evidence-candidate browser session unavailable")))
+        try:
+            browser_state = await resolve_browser_state_for_context(ctx)
+            if browser_state is None:
+                raise RuntimeError("Evidence-candidate navigation guard requires a browser context")
+            async with _service_worker_blocked_context(
+                browser_state,
+                organization_id=ctx.organization_id,
+            ) as browser_context:
+                cookies = await browser_context.cookies()
+                if (
+                    cookies
+                    or browser_context.service_workers
+                    or any(page.url not in {"", "about:blank"} for page in browser_context.pages)
+                ):
+                    raise RuntimeError("Evidence-candidate navigation guard requires a pristine browser context")
+                async with app.AGENT_FUNCTION.copilot_candidate_network_guard(
+                    browser_context, expected_origin=normalized_origin
+                ) as guarded_hops:
+                    self._evidence_candidate_origin = normalized_origin
+                    self._evidence_candidate_guarded_hops = guarded_hops
+                    try:
+                        yield guarded_hops
+                    finally:
+                        await app.AGENT_FUNCTION.wait_for_copilot_candidate_network_idle(browser_context)
+        finally:
+            self._evidence_candidate_origin = None
+            self._evidence_candidate_guarded_hops = None
+
+    async def _drain_evidence_candidate_response_tasks(self) -> None:
+        if self._evidence_candidate_origin is None:
+            return
+        browser_state = await resolve_browser_state_for_context(self._context_provider())
+        browser_context = browser_state.browser_context if browser_state is not None else None
+        if browser_context is None:
+            raise RuntimeError("Evidence-candidate browser context became unavailable")
+        await app.AGENT_FUNCTION.wait_for_copilot_candidate_network_idle(browser_context)
+
+    async def evidence_candidate_browser_url(self) -> str:
+        if self._evidence_candidate_origin is None:
+            raise RuntimeError("Evidence-candidate navigation guard is not active")
+        browser_state = await resolve_browser_state_for_context(self._context_provider())
+        page = await browser_state.get_working_page() if browser_state is not None else None
+        if page is None:
+            raise RuntimeError("Evidence-candidate working page is unavailable")
+        browser_url = page.url
+        last_enforced_url = next(
+            (
+                hop["url"]
+                for hop in reversed(self._evidence_candidate_guarded_hops or [])
+                if hop["resource_type"] == "document"
+            ),
+            None,
+        )
+        if (
+            _evidence_candidate_url_origin(browser_url) != self._evidence_candidate_origin
+            or browser_url != last_enforced_url
+        ):
+            raise RuntimeError("candidate_browser_url_not_peer_verified")
+        return browser_url
 
     async def list_tools(
         self,
@@ -320,7 +468,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
                 return _copilot_to_call_tool_result({"ok": False, "error": terminal_challenge_payload})
 
-        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name)
+        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name, arguments)
         if persistence_signal is not None:
             LOG.warning(
                 "Synthesized block persistence required before MCP tool",
@@ -331,7 +479,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     None,
                 ),
             )
-            payload = stash_blocker_signal(copilot_ctx, persistence_signal)
+            payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
             result = {"ok": False, "error": payload}
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result)
@@ -346,7 +494,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
-        loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
+        loop_error = detect_tool_loop(tracker, tool_name, arguments) if isinstance(tracker, list) else None
         if loop_error:
             LOG.warning(
                 "Tool loop detected, skipping execution",
@@ -450,6 +598,9 @@ class SkyvernOverlayMCPServer(MCPServer):
         try:
             async with mcp_browser_context(ctx):
                 raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+            if self._evidence_candidate_origin is not None:
+                await asyncio.sleep(0)
+                await self._drain_evidence_candidate_response_tasks()
         except Exception as exc:
             LOG.warning(
                 "Internal MCP tool call failed",

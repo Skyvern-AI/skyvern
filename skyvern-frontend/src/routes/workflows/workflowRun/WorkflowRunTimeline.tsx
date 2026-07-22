@@ -1,9 +1,22 @@
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
-import { DotFilledIcon } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useRef } from "react";
+import { DotFilledIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
@@ -40,6 +53,9 @@ type Props = {
   workflowRunId?: string;
   // Studio owns live-status in its own header; let it hide this duplicate badge.
   hideLiveBadge?: boolean;
+  // Opt-in label search + jump-to-block; off by default so the legacy run
+  // view renders no search UI and stays unchanged.
+  enableSearch?: boolean;
   onLiveStreamSelected: () => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
@@ -86,11 +102,130 @@ function buildBlockOrderIndex(
   return new Map(blocks.map((block, index) => [block.id, index + 1]));
 }
 
+type TimelineSearchTarget = {
+  block: WorkflowRunBlock;
+  label: string;
+  order: number | null;
+};
+
+// Top-level rows only: flattenTimelineChronologically hoists conditional
+// branches here, but loop/task_v2 children stay nested with no row to scroll to.
+function collectTimelineSearchTargets(
+  items: Array<WorkflowRunTimelineItem>,
+  blockOrder: ReadonlyMap<string, number>,
+): Array<TimelineSearchTarget> {
+  const targets: Array<TimelineSearchTarget> = [];
+  for (const item of items) {
+    if (!isBlockItem(item)) {
+      continue;
+    }
+    const label = item.block.label;
+    if (!label || label.trim() === "") {
+      continue;
+    }
+    targets.push({
+      block: item.block,
+      label,
+      order: blockOrder.get(item.block.workflow_run_block_id) ?? null,
+    });
+  }
+  return targets;
+}
+
+function filterTimelineSearchTargets(
+  targets: Array<TimelineSearchTarget>,
+  query: string,
+): Array<TimelineSearchTarget> {
+  const needle = query.trim().toLowerCase();
+  if (needle === "") {
+    return targets;
+  }
+  return targets.filter((target) =>
+    target.label.toLowerCase().includes(needle),
+  );
+}
+
+function TimelineBlockSearch({
+  targets,
+  onJump,
+}: {
+  targets: Array<TimelineSearchTarget>;
+  onJump: (target: TimelineSearchTarget) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const results = filterTimelineSearchTargets(targets, query);
+  const closeAndReset = () => {
+    setOpen(false);
+    setQuery("");
+  };
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => (next ? setOpen(true) : closeAndReset())}
+    >
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label="Search blocks"
+          className="ml-auto inline-flex shrink-0 cursor-pointer items-center rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200"
+        >
+          <MagnifyingGlassIcon className="size-3.5" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" sideOffset={6} className="w-64 p-0">
+        <Command
+          shouldFilter={false}
+          onKeyDown={(event) => {
+            // Keep Escape local: Studio may mount the editor canvas beside the
+            // run view, whose window Escape handler would clear its selection.
+            if (event.key === "Escape") {
+              event.stopPropagation();
+              closeAndReset();
+            }
+          }}
+        >
+          <CommandInput
+            placeholder="Search blocks…"
+            value={query}
+            onValueChange={setQuery}
+          />
+          <CommandList>
+            <CommandEmpty>No blocks found.</CommandEmpty>
+            {results.length > 0 ? (
+              <CommandGroup>
+                {results.map((target) => (
+                  <CommandItem
+                    key={target.block.workflow_run_block_id}
+                    value={target.block.workflow_run_block_id}
+                    onSelect={() => {
+                      onJump(target);
+                      closeAndReset();
+                    }}
+                  >
+                    {target.order !== null ? (
+                      <span className="mr-2 shrink-0 text-muted-foreground">
+                        #{target.order}
+                      </span>
+                    ) : null}
+                    <span className="truncate">{target.label}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ) : null}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
   workflowRunId,
   hideLiveBadge = false,
+  enableSearch = false,
   onLiveStreamSelected,
   onActionItemSelected,
   onBlockItemSelected,
@@ -110,6 +245,35 @@ function WorkflowRunTimeline({
     () => buildBlockOrderIndex(workflowRunTimeline ?? []),
     [workflowRunTimeline],
   );
+  const searchTargets = useMemo(
+    () =>
+      enableSearch
+        ? collectTimelineSearchTargets(displayTimeline, blockOrder)
+        : [],
+    [enableSearch, displayTimeline, blockOrder],
+  );
+  const blockElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const registerBlockElement = (id: string, el: HTMLDivElement | null) => {
+    if (el) {
+      blockElementsRef.current.set(id, el);
+    } else {
+      blockElementsRef.current.delete(id);
+    }
+  };
+  const jumpToBlock = (target: TimelineSearchTarget) => {
+    onBlockItemSelected(target.block);
+    const el = blockElementsRef.current.get(target.block.workflow_run_block_id);
+    if (!el) {
+      return;
+    }
+    const reduceMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  };
   const codeStepsByLabel = useMemo(
     () =>
       buildCodeStepsByLabel(
@@ -225,28 +389,30 @@ function WorkflowRunTimeline({
   const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
 
   return (
-    <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
-      <div className="flex shrink-0 items-center gap-2 border-b border-slate-700 px-3 py-2 text-xs">
-        <span className="font-medium text-slate-200">Timeline</span>
+    <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 text-xs">
+        <span className="font-medium text-foreground dark:text-slate-200">
+          Timeline
+        </span>
         {totalBlocks > 0 && (
           <span
-            className="text-slate-500"
+            className="text-muted-foreground dark:text-slate-500"
             title="Top-level blocks completed out of the total defined for this workflow"
           >
             · {completedBlocks}/{totalBlocks} blocks
           </span>
         )}
         {numberOfActions > 0 && (
-          <span className="text-slate-500">
+          <span className="text-muted-foreground dark:text-slate-500">
             · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
           </span>
         )}
-        <span className="text-slate-500">
+        <span className="text-muted-foreground dark:text-slate-500">
           · {workflowRun.total_steps ?? 0}{" "}
           {(workflowRun.total_steps ?? 0) === 1 ? "step" : "steps"}
         </span>
         <span
-          className="text-slate-500"
+          className="text-muted-foreground dark:text-slate-500"
           title="Credits consumed by this run (live + cached)"
         >
           ·{" "}
@@ -272,12 +438,15 @@ function WorkflowRunTimeline({
             <span>Live</span>
           </button>
         )}
+        {enableSearch && (
+          <TimelineBlockSearch targets={searchTargets} onJump={jumpToBlock} />
+        )}
       </div>
       <ScrollArea className="min-h-0 flex-1">
         <ScrollAreaViewport className="h-full max-h-full [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="p-2">
             {workflowRunIsNotFinalized && workflowRunTimeline.length === 0 && (
-              <div className="flex items-center justify-center py-8 text-sm text-slate-400">
+              <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
                 Formulating actions...
               </div>
             )}
@@ -299,6 +468,15 @@ function WorkflowRunTimeline({
                 return (
                   <div
                     key={timelineItem.block.workflow_run_block_id}
+                    ref={
+                      enableSearch
+                        ? (el) =>
+                            registerBlockElement(
+                              timelineItem.block.workflow_run_block_id,
+                              el,
+                            )
+                        : undefined
+                    }
                     className={cn({
                       "duration-300 animate-in fade-in slide-in-from-top-3":
                         isNew,

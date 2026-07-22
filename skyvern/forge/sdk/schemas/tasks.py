@@ -18,6 +18,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_na
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
@@ -120,7 +121,7 @@ class TaskBase(BaseModel):
         description="Whether to include the action history when verifying the task is complete",
         examples=[True, False],
     )
-    max_screenshot_scrolls: int | None = Field(
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
         examples=[10],
@@ -207,6 +208,11 @@ class PromptedTaskRequest(TaskRequest):
     publish_workflow: bool | None = Field(
         default=False,
         description="Whether to publish the workflow created from the prompt.",
+        examples=[True, False],
+    )
+    generate_script: bool | None = Field(
+        default=None,
+        description="Whether to generate scripts for runs of the workflow created from the prompt.",
         examples=[True, False],
     )
     run_with: str | None = Field(

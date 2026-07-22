@@ -364,18 +364,18 @@ function WorkflowSettingsEditorBody({
                   className="nopan text-xs"
                   data-testid="browser-profile-key-template"
                 />
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-muted-foreground">
                   Use + to insert an input like {"{{ credential_id }}"}. Leave
                   empty to use one saved profile for this agent.
                 </p>
                 {!data.runSequentially && data.browserProfileKey && (
-                  <p className="text-xs text-amber-300">
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
                     Overlapping runs with the same rendered key can overwrite
                     the same saved profile.
                   </p>
                 )}
                 {data.browserProfileId && (
-                  <p className="text-xs text-amber-300">
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
                     Starting Browser Profile bypasses saved-session loading and
                     write-back. Leave it empty when separating saved profiles.
                   </p>

@@ -72,6 +72,11 @@ class PersistentBrowserSession(BaseModel):
     runnable_id: str | None = None
     browser_address: str | None = None
     ip_address: str | None = None
+    # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address
+    # remains the client-facing proxy URL. These must never reach a client or a log —
+    # BrowserSessionResponse.from_browser_session is the allowlist that enforces the former.
+    upstream_cdp_url: str | None = None
+    browser_vendor: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
     proxy_location: ProxyLocationInput = None

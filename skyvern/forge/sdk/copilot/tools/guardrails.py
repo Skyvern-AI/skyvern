@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -8,14 +9,22 @@ from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGua
 
 from skyvern.forge.sdk.copilot.blocker_signal import BlockerKind, CopilotToolBlockerSignal, RecoveryHint
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    record_build_test_outcome,
+    recorded_outcome_from_author_time_reject,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     turn_has_scout_interaction,
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.credential_literal_rebind import rebind_scouted_credential_literals
+from skyvern.forge.sdk.copilot.enforcement import _record_code_authoring_guardrail_reject
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
+    OutputPolicyReason,
+    OutputPolicyVerdict,
     evaluate_output_policy,
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
@@ -30,6 +39,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentMode,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
@@ -84,16 +94,81 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
     )
     LOG.info("copilot output policy tool guardrail verdict", **trace_data)
     if not verdict.allowed:
+        rebound_yaml = _rebound_credential_yaml(tool_context, workflow_yaml, verdict, tool_arguments)
+        if rebound_yaml is not None:
+            rebound_trace = {**trace_data, "allowed": True, "credential_literals_rebound": True}
+            LOG.info("copilot output policy rebound scouted credential literals", **rebound_trace)
+            return ToolGuardrailFunctionOutput.allow(output_info=rebound_trace)
         error = format_output_policy_tool_error(verdict)
         tool_name = getattr(tool_context, "tool_name", None)
+        copilot_ctx = getattr(tool_context, "context", None)
         if isinstance(tool_name, str) and tool_name:
             record_consecutive_tool_result_boundary_for_ctx(
-                getattr(tool_context, "context", None),
+                copilot_ctx,
                 tool_name,
                 {"ok": False, "error": error},
+                arguments=tool_arguments,
             )
+            _record_output_policy_guardrail_churn(copilot_ctx, tool_name, workflow_yaml, verdict)
         return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
     return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
+
+
+def _rebound_credential_yaml(
+    tool_context: Any,
+    workflow_yaml: str | None,
+    verdict: OutputPolicyVerdict,
+    tool_arguments: dict[str, Any],
+) -> str | None:
+    """Rebind scouted credential literals so a leak the seam can repair never becomes a reject.
+
+    Returns the rebound YAML only when it independently clears the output policy, so the
+    raw_secret_leak clamp still fails closed on anything the deterministic rebind cannot fix.
+    """
+    if OutputPolicyReason.RAW_SECRET_LEAK not in verdict.reason_codes:
+        return None
+    ctx = getattr(tool_context, "context", None)
+    if not isinstance(ctx, AgentContext):
+        return None
+    result = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
+    if not result.changed:
+        return None
+    recheck = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        workflow_yaml=result.workflow_yaml,
+        tool_arguments={**tool_arguments, "workflow_yaml": result.workflow_yaml},
+    )
+    if not recheck.allowed:
+        return None
+    tool_arguments["workflow_yaml"] = result.workflow_yaml
+    try:
+        tool_context.tool_arguments = json.dumps(tool_arguments)
+    except (AttributeError, TypeError, ValueError):
+        LOG.warning("copilot rebound credential yaml could not be written back to tool arguments")
+        return None
+    return result.workflow_yaml
+
+
+def _record_output_policy_guardrail_churn(
+    ctx: object, tool_name: str, workflow_yaml: str | None, verdict: OutputPolicyVerdict
+) -> None:
+    if not isinstance(ctx, AgentContext):
+        return
+    structural_payload = {
+        "surface": "output_policy_tool_input",
+        "tool": tool_name,
+        "reason_codes": sorted(reason.value for reason in verdict.reason_codes),
+        "workflow_yaml_hash": hashlib.sha256((workflow_yaml or "").encode("utf-8")).hexdigest(),
+    }
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_author_time_reject(
+            reason_code="output_policy_reject",
+            attempted_tool=tool_name,
+            structural_payload=structural_payload,
+        ),
+    )
+    _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
 
 
 _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
@@ -636,6 +711,22 @@ def _authority_tool_error(
     *,
     ignore_request_policy_error: bool = False,
 ) -> str | None:
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        return _emit_tool_blocker_signal(
+            ctx,
+            _build_turn_intent_signal(
+                tool_name=tool_name,
+                classifier_mode="runtime_self_heal",
+                reason_code="runtime_self_heal_native_tool_blocked",
+                agent_steering_text=(
+                    "Runtime self-heal allows browser MCP tools only; do not call native copilot tools."
+                ),
+                user_facing_reason="Runtime self-heal cannot use this tool.",
+                recovery_hint="stop",
+                blocker_kind="tool_error",
+                renders_final_reply=False,
+            ),
+        )
     # Request-policy precedes turn-intent unless explicitly ignored.
     turn_intent_signal = _turn_intent_tool_error(ctx, tool_name)
     request_policy_signal = _request_policy_tool_error(ctx, tool_name)

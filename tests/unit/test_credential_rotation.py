@@ -232,7 +232,7 @@ async def test_run_credential_override_rejects_credentials_outside_rotation_pool
     service = WorkflowService()
     workflow = _setup_workflow_with_rotating_credential()
 
-    with pytest.raises(SkyvernHTTPException, match="configured rotation credentials"):
+    with pytest.raises(SkyvernHTTPException, match="configured rotation or fallback credentials"):
         await service._apply_run_credential_parameter_overrides(
             workflow=workflow,
             workflow_run=_setup_workflow_run(),
@@ -289,6 +289,96 @@ async def test_select_rotating_credentials_keeps_override_and_selects_remaining(
         credential_ids=["cred_c", "cred_d"],
         selection_strategy=None,
     )
+
+
+def _fallback_only_credential_parameter() -> CredentialParameter:
+    now = datetime.now(timezone.utc)
+    return CredentialParameter(
+        key="login_cred",
+        credential_parameter_id="cp_login",
+        workflow_id="wf_test",
+        credential_id="cred_primary",
+        credential_ids=None,
+        fallback_credential_ids=["cred_fb1", "cred_fb2"],
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_select_render_includes_fallback_only_primary_credential() -> None:
+    # A login credential with fallbacks but no rotation pool serializes as a block-scoped
+    # CredentialParameter (credential_ids empty). Its primary must still reach the profile-key render
+    # values, or a browser_profile_key referencing this parameter fails setup on the initial run.
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential(browser_profile_key="{{ login_cred }}")
+    workflow.workflow_definition.parameters = [_fallback_only_credential_parameter()]
+    select_mock = AsyncMock()
+
+    with patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock):
+        selections = await service._select_rotating_credential_parameters_for_render(
+            workflow=workflow,
+            workflow_run=_setup_workflow_run(),
+            organization_id="org_test",
+        )
+
+    assert selections == {"login_cred": "cred_primary"}
+    select_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_select_render_resolves_indirect_fallback_primary_from_parameter_values() -> None:
+    # A fallback-only credential_id can indirectly reference another workflow parameter carrying the
+    # real credential value (mirrors WorkflowRunContext.resolve_credential_parameter_id). The render
+    # must resolve it, or a browser_profile_key would collapse distinct accounts onto one profile.
+    now = datetime.now(timezone.utc)
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential(browser_profile_key="{{ login_cred }}")
+    workflow.workflow_definition.parameters = [
+        CredentialParameter(
+            key="login_cred",
+            credential_parameter_id="cp_login",
+            workflow_id="wf_test",
+            credential_id="account_param",
+            credential_ids=None,
+            fallback_credential_ids=["cred_fb1"],
+            created_at=now,
+            modified_at=now,
+        )
+    ]
+    select_mock = AsyncMock()
+
+    with patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock):
+        selections = await service._select_rotating_credential_parameters_for_render(
+            workflow=workflow,
+            workflow_run=_setup_workflow_run(),
+            organization_id="org_test",
+            parameter_values={"account_param": "cred_runtime"},
+        )
+
+    assert selections == {"login_cred": "cred_runtime"}
+    select_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_select_render_fallback_override_takes_precedence_over_primary() -> None:
+    # On a fallback retry the chosen fallback arrives as a credential_parameter_override and must win
+    # over the primary.
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential(browser_profile_key="{{ login_cred }}")
+    workflow.workflow_definition.parameters = [_fallback_only_credential_parameter()]
+    select_mock = AsyncMock()
+
+    with patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock):
+        selections = await service._select_rotating_credential_parameters_for_render(
+            workflow=workflow,
+            workflow_run=_setup_workflow_run(),
+            organization_id="org_test",
+            credential_parameter_overrides={"login_cred": "cred_fb1"},
+        )
+
+    assert selections == {"login_cred": "cred_fb1"}
+    select_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

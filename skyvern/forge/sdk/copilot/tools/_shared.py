@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -10,8 +9,7 @@ from urllib.parse import urlparse
 import structlog
 import yaml
 
-from skyvern.forge import app
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
 )
@@ -26,12 +24,16 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_structured
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS, _elapsed_run_seconds
+from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
+from skyvern.forge.sdk.copilot.task_output_envelope import (
+    _TASK_ENVELOPE_BLOCK_TYPES,
+    _TASK_OUTPUT_PAYLOAD_FIELDS,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
-from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskV2Block
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -56,32 +58,6 @@ _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
 # contains one of these, an unmet outcome criterion means the build is still
 # incomplete (no confirmation step yet), not a completed run that failed the goal.
 _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
-
-
-def _task_output_envelope_block_types() -> frozenset[str]:
-    # Almost every envelope block extends BaseTaskBlock; TaskV2Block subclasses Block
-    # directly but emits the same TaskOutput envelope, so seed the walk with both roots.
-    block_types: set[str] = set()
-    pending: list[type[Block]] = [BaseTaskBlock, TaskV2Block]
-    while pending:
-        cls = pending.pop()
-        pending.extend(cls.__subclasses__())
-        field = cls.model_fields.get("block_type")
-        default = field.default if field is not None else None
-        if isinstance(default, BlockType):
-            block_types.add(default.value.upper())
-    return frozenset(block_types)
-
-
-# Block types whose ``block.output`` is a ``TaskOutput.from_task()`` envelope
-# (schemas/tasks.py:TaskOutput) rather than the raw payload; the meaningful-data
-# check slices these to ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so always-populated
-# envelope metadata (task_id, status, artifact IDs) can't read a reach-state task
-# (login, navigation) that produced no content as meaningful. Envelope shape is
-# orthogonal to data production, so a raw-value block (CODE, TEXT_PROMPT) whose
-# value happens to carry a ``task_id`` is excluded here and passes through unsliced.
-# Derived from the envelope block roots so a newly added task-backed block can't fall out of sync.
-_TASK_ENVELOPE_BLOCK_TYPES: frozenset[str] = _task_output_envelope_block_types()
 
 
 # Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
@@ -184,16 +160,6 @@ def _is_meaningful_extracted_data(extracted: Any) -> bool:
     return True
 
 
-# Payload fields inside a ``TaskOutput.from_task()`` envelope
-# (schemas/tasks.py:TaskOutput). Only these carry "did the block produce
-# something useful?" signal; the rest (task_id, status, artifact IDs, etc.)
-# are always populated on a completed run and would short-circuit
-# _is_meaningful_extracted_data to True even when nothing useful was produced.
-_TASK_OUTPUT_PAYLOAD_FIELDS: tuple[str, ...] = (
-    "extracted_information",
-    "downloaded_files",
-    "downloaded_file_urls",
-)
 _TASK_OUTPUT_PARAMETER_SUFFIX = "_output"
 
 
@@ -302,7 +268,7 @@ def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
     started_at = getattr(ctx, "copilot_run_start_monotonic", None)
     if not isinstance(started_at, int | float):
         return None
-    return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
+    return TOTAL_TIMEOUT_SECONDS - _elapsed_run_seconds(ctx, float(started_at))
 
 
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
@@ -320,7 +286,7 @@ def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
 
 
 def _emit_tool_blocker_signal(ctx: AgentContext, signal: CopilotToolBlockerSignal) -> str:
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="tool_blocker_signal")
     return payload
 
@@ -487,10 +453,7 @@ async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None
     if not session_id:
         return "", ""
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
             return "", ""
         page = await browser_state.get_or_create_page()

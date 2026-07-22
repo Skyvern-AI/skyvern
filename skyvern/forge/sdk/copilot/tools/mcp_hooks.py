@@ -46,6 +46,7 @@ from .scouting import (
     _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
     _actionable_targets_for_result,
     _attach_scout_page_summary,
+    _capture_scout_ambiguity,
     _capture_scout_role_name,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
@@ -54,6 +55,7 @@ from .scouting import (
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_reached_download_target,
+    _prenav_ambiguity_for_selector,
     _prenav_role_name_for_selector,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
@@ -301,6 +303,7 @@ async def _click_pre_hook(
     # cannot leave a prior click's stash for this click's post-hook to consume.
     ctx.pending_scout_role_name = None
     ctx.pending_scout_click_selector = None
+    ctx.pending_scout_ambiguous = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -324,6 +327,7 @@ async def _click_pre_hook(
             ),
         }
     await _capture_scout_role_name(ctx, selector)
+    await _capture_scout_ambiguity(ctx, selector)
     return None
 
 
@@ -359,8 +363,13 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
     await _capture_scout_source_url(ctx)
-    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
+    result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
+    if result is None:
+        await _capture_scout_ambiguity(ctx, params.get("selector", ""))
+    return result
 
 
 async def _press_key_pre_hook(
@@ -412,6 +421,36 @@ async def _screenshot_post_hook(
     return result
 
 
+async def _maybe_replay_captured_never_captured_obligation(result: dict[str, Any], ctx: AgentContext) -> None:
+    """Complete the capture/reconciliation handshake without another model-authored update call."""
+    try:
+        from .workflow_update import _replay_captured_never_captured_obligation
+
+        replay = await _replay_captured_never_captured_obligation(ctx)
+    except Exception:
+        # The browser action already succeeded. Preserve its capture so the turn can
+        # retry reconciliation instead of converting a save failure into capture loss.
+        LOG.warning("copilot_never_captured_obligation_replay_failed", exc_info=True)
+        return
+    if replay is None:
+        return
+    result_data = result.get("data")
+    if not isinstance(result_data, dict):
+        result_data = {}
+        result["data"] = result_data
+    replay_data = replay.get("data")
+    reconciliation: dict[str, Any] = {"ok": replay.get("ok") is True}
+    if replay.get("ok") is True:
+        message = replay_data.get("message") if isinstance(replay_data, dict) else None
+        reconciliation["message"] = message or "Workflow reconciled after capturing the missing browser action."
+    else:
+        if replay.get("user_facing_summary"):
+            reconciliation["user_facing_summary"] = replay["user_facing_summary"]
+        if replay.get("error"):
+            reconciliation["error"] = replay["error"]
+    result_data["workflow_reconciliation"] = reconciliation
+
+
 async def _click_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -423,6 +462,10 @@ async def _click_post_hook(
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
     ctx.pending_scout_role_name = None
+    pending_ambiguous = ctx.pending_scout_ambiguous
+    ctx.pending_scout_ambiguous = None
+    pending_reanchor = ctx.pending_scout_reanchor
+    ctx.pending_scout_reanchor = None
     attempted_selector = ctx.pending_scout_click_selector
     ctx.pending_scout_click_selector = None
     if result.get("ok") and result.get("data"):
@@ -439,6 +482,9 @@ async def _click_post_hook(
         role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
         if navigated and not (role and accessible_name):
             role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
+        if ambiguous:
+            role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
         result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
         _record_scouted_interaction(
             ctx,
@@ -447,6 +493,7 @@ async def _click_post_hook(
             source_url=source_url,
             role=role,
             accessible_name=accessible_name,
+            ambiguous=ambiguous,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="click", selector=selector, source_url=source_url, url=url
@@ -463,6 +510,7 @@ async def _click_post_hook(
         await _attach_reperception_targets_on_non_advancing_click(result, raw, ctx, attempted_selector)
     except Exception:
         LOG.warning("copilot_click_reperception_attach_failed", exc_info=True)
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
@@ -780,6 +828,7 @@ async def _type_text_post_hook(
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
@@ -788,6 +837,7 @@ async def _evaluate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    ctx.scout_observation_contract = None
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
         _reset_evaluate_tracker(ctx)
@@ -851,6 +901,10 @@ async def _select_option_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_ambiguous = ctx.pending_scout_ambiguous
+    ctx.pending_scout_ambiguous = None
+    pending_reanchor = ctx.pending_scout_reanchor
+    ctx.pending_scout_reanchor = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = _selector_from_tool_data(data)
@@ -862,6 +916,9 @@ async def _select_option_post_hook(
             "url": url,
         }
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
+        if ambiguous:
+            role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
@@ -870,6 +927,7 @@ async def _select_option_post_hook(
             value=data.get("value", ""),
             role=role,
             accessible_name=accessible_name,
+            ambiguous=ambiguous,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=selector, source_url=source_url, url=url
@@ -879,6 +937,7 @@ async def _select_option_post_hook(
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
@@ -906,6 +965,7 @@ async def _press_key_post_hook(
             source_url=source_url,
             key=data.get("key", ""),
         )
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 

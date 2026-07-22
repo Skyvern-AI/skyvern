@@ -16,6 +16,7 @@ Known limitations:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import structlog
@@ -39,6 +40,16 @@ from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
+
+# Shape of a Skyvern registry alias (e.g. AZURE_OPENAI_GPT5_6_SOL, VERTEX_GEMINI_2.5_PRO, or a
+# single-token key like OLLAMA, or a hyphenated one like OPENAI_GPT-4O-2024-08-06): all-caps
+# alphanumeric segments, optionally joined by "-"/"_"/".", no provider prefix. Real litellm
+# model strings (gpt-4o, azure/gpt-4.1) never match — they are lowercase and/or provider-
+# prefixed. Used to fail fast when the copilot is pointed at an alias whose config isn't
+# registered here, rather than letting get_config synthesize a provider-less model that 400s
+# inside the Agents SDK with "LLM Provider NOT provided". Scoped to this copilot path so the
+# self-hosted LLM_KEY synth fallback in get_config stays intact. SKY-12322.
+_REGISTRY_STYLE_ALIAS = re.compile(r"[A-Z0-9]+(?:[-_.][A-Z0-9]+)*")
 
 # Keys in litellm_params that are routed elsewhere (top-level kwargs to
 # LitellmModel or the dedicated ModelSettings.extra_headers slot), so they
@@ -170,7 +181,25 @@ def resolve_model_config(
         and not LLMConfigRegistry.is_registered(llm_key)
     ):
         llm_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
+
     config = LLMConfigRegistry.get_config(llm_key)
+
+    # get_config synthesizes a config whose model_name IS the llm_key when the key isn't
+    # registered. For a registry-style alias (its ENABLE_* flag/credentials unset here) that
+    # synthesized model has no provider prefix and 400s inside the Agents SDK with "LLM Provider
+    # NOT provided", so fail fast. A registered config or a raw self-hosted model string has
+    # model_name != the alias (or isn't registry-style), so the self-hosted synth path and all
+    # normal resolutions are untouched. SKY-12322.
+    if (
+        not LLMConfigRegistry.is_registered(llm_key)
+        and isinstance(config, LLMConfig)
+        and config.model_name == llm_key
+        and _REGISTRY_STYLE_ALIAS.fullmatch(llm_key)
+    ):
+        raise InvalidLLMConfigError(
+            f"copilot llm_key '{llm_key}' looks like a Skyvern LLM registry alias but is not "
+            f"registered in this environment; its ENABLE_* flag or provider credentials are likely unset."
+        )
 
     if isinstance(config, LLMRouterConfig):
         config = _degrade_router_to_direct(llm_key, config)

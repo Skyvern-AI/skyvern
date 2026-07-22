@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import case, desc, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, case, desc, func, or_, select
+from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
@@ -18,11 +18,19 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_browser_profile_id
 from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
+    CredentialModel,
     PersistentBrowserSessionModel,
+    WorkflowModel,
+    WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
 from skyvern.forge.sdk.db.utils import serialize_proxy_location
-from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
+from skyvern.forge.sdk.schemas.browser_profiles import (
+    BrowserProfile,
+    BrowserProfileUsage,
+    BrowserProfileUsageCredential,
+    BrowserProfileUsageWorkflow,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
     PersistentBrowserSession,
@@ -189,14 +197,138 @@ class BrowserSessionsRepository(BaseRepository):
                 .offset(db_page * page_size)
             )
             browser_profiles = await session.scalars(query)
-            return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
+            profiles = [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
+
+            # One batched reverse-lookup for the whole page so the UI can render the credential-login role
+            # without a per-row usage fetch (which fanned out one 3-table join per row on every list load).
+            if profiles:
+                credential_rows = await session.execute(
+                    select(CredentialModel.browser_profile_id, CredentialModel.name).where(
+                        CredentialModel.browser_profile_id.in_([p.browser_profile_id for p in profiles]),
+                        CredentialModel.organization_id == organization_id,
+                        CredentialModel.deleted_at.is_(None),
+                    )
+                )
+                name_by_profile: dict[str, str] = {}
+                for browser_profile_id, name in credential_rows.all():
+                    name_by_profile.setdefault(browser_profile_id, name)
+                for profile in profiles:
+                    profile.linked_credential_name = name_by_profile.get(profile.browser_profile_id)
+
+            return profiles
+
+    @read_retry()
+    @db_operation("get_browser_profile_usage")
+    async def get_browser_profile_usage(
+        self,
+        profile_id: str,
+        organization_id: str,
+        recent_window_days: int = 30,
+    ) -> BrowserProfileUsage:
+        """Who depends on this profile: workflows that pin it, credentials that link it, and how many
+        runs it has seeded lately. Powers the Refresh/Delete used-by confirmation and the list-row badges."""
+        async with self.Session() as session:
+            latest_versions = (
+                select(
+                    WorkflowModel.workflow_permanent_id.label("wpid"),
+                    func.max(WorkflowModel.version).label("max_version"),
+                )
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.deleted_at.is_(None),
+                )
+                .group_by(WorkflowModel.workflow_permanent_id)
+                .subquery()
+            )
+            workflows_query = (
+                select(WorkflowModel.workflow_permanent_id, WorkflowModel.title)
+                .join(
+                    latest_versions,
+                    and_(
+                        WorkflowModel.workflow_permanent_id == latest_versions.c.wpid,
+                        WorkflowModel.version == latest_versions.c.max_version,
+                    ),
+                )
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.browser_profile_id == profile_id,
+                )
+            )
+            workflow_rows = (await session.execute(workflows_query)).all()
+            workflows = [
+                BrowserProfileUsageWorkflow(workflow_permanent_id=wpid, title=title, via="browser_profile_id")
+                for wpid, title in workflow_rows
+            ]
+            # SKY-12643 adds workflows.seed_browser_profile_id (the both-checked quadrant). Until it merges
+            # that column doesn't exist, so only browser_profile_id usage is reported; drop this guard and
+            # add the via="seed_browser_profile_id" branch once 12643 lands (STOP-signal-3 integrate step).
+            if hasattr(WorkflowModel, "seed_browser_profile_id"):
+                seed_query = (
+                    select(WorkflowModel.workflow_permanent_id, WorkflowModel.title)
+                    .join(
+                        latest_versions,
+                        and_(
+                            WorkflowModel.workflow_permanent_id == latest_versions.c.wpid,
+                            WorkflowModel.version == latest_versions.c.max_version,
+                        ),
+                    )
+                    .where(
+                        WorkflowModel.organization_id == organization_id,
+                        WorkflowModel.seed_browser_profile_id == profile_id,
+                    )
+                )
+                # A workflow can hold the same profile in both columns (lossless both-set encoding), so emit
+                # a per-role entry for each rather than deduping the seed relationship away.
+                for wpid, title in (await session.execute(seed_query)).all():
+                    workflows.append(
+                        BrowserProfileUsageWorkflow(
+                            workflow_permanent_id=wpid, title=title, via="seed_browser_profile_id"
+                        )
+                    )
+
+            credential_rows = (
+                await session.execute(
+                    select(CredentialModel.credential_id, CredentialModel.name).where(
+                        CredentialModel.browser_profile_id == profile_id,
+                        CredentialModel.organization_id == organization_id,
+                        CredentialModel.deleted_at.is_(None),
+                    )
+                )
+            ).all()
+            credentials = [
+                BrowserProfileUsageCredential(credential_id=credential_id, name=name)
+                for credential_id, name in credential_rows
+            ]
+
+            recent_cutoff = naive_utc_now() - timedelta(days=recent_window_days)
+            recent_seeded_run_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .where(
+                        WorkflowRunModel.browser_profile_id == profile_id,
+                        WorkflowRunModel.organization_id == organization_id,
+                        WorkflowRunModel.created_at >= recent_cutoff,
+                    )
+                )
+            ).scalar_one()
+
+            return BrowserProfileUsage(
+                workflows=workflows,
+                credentials=credentials,
+                recent_seeded_run_count=recent_seeded_run_count,
+            )
 
     @db_operation("delete_browser_profile")
     async def delete_browser_profile(
         self,
         profile_id: str,
         organization_id: str,
-    ) -> None:
+    ) -> list[str]:
+        """Soft-delete a profile and detach any credentials linking it in ONE transaction, so a mid-failure
+        can't leave the profile deleted with a credential still holding the dangling bp_ id (which a retry
+        would never re-clear, since the second delete 404s on the already-deleted profile). Returns the
+        credential ids that were detached."""
         async with self.Session() as session:
             query = (
                 select(BrowserProfileModel)
@@ -208,7 +340,20 @@ class BrowserSessionsRepository(BaseRepository):
             if not browser_profile:
                 raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
             browser_profile.deleted_at = naive_utc_now()
+
+            linked_credentials = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(browser_profile_id=profile_id, organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                )
+            ).all()
+            cleared_credential_ids = [credential.credential_id for credential in linked_credentials]
+            for credential in linked_credentials:
+                credential.browser_profile_id = None
+
             await session.commit()
+            return cleared_credential_ids
 
     @db_operation("hard_delete_browser_profile")
     async def hard_delete_browser_profile(
@@ -333,6 +478,27 @@ class BrowserSessionsRepository(BaseRepository):
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
 
+    @db_operation("get_persistent_browser_sessions_history_count")
+    async def get_persistent_browser_sessions_history_count(
+        self,
+        organization_id: str,
+        lookback_hours: int = 24 * 7,
+    ) -> int:
+        """Count persistent browser sessions in an organization's history window.
+
+        Mirrors the filters of :meth:`get_persistent_browser_sessions_history` so the
+        total matches what the paginated read returns.
+        """
+        async with self.Session() as session:
+            count_query = (
+                select(func.count())
+                .select_from(PersistentBrowserSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
+            )
+            return (await session.execute(count_query)).scalar_one()
+
     @read_retry()
     @db_operation("get_persistent_browser_session_by_runnable_id", log_errors=False)
     async def get_persistent_browser_session_by_runnable_id(
@@ -370,6 +536,44 @@ class BrowserSessionsRepository(BaseRepository):
                 if organization_id is None:
                     raise ValueError("organization_id is required outside local development")
                 query = query.filter_by(organization_id=organization_id)
+            persistent_browser_session = (await session.scalars(query)).first()
+            if persistent_browser_session:
+                return PersistentBrowserSession.model_validate(persistent_browser_session)
+            return None
+
+    @db_operation("create_imported_persistent_browser_session")
+    async def create_imported_persistent_browser_session(
+        self,
+        *,
+        session_id: str,
+        organization_id: str,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
+    ) -> PersistentBrowserSession:
+        """Create an inert, already-completed session row for externally recorded runs."""
+        async with self.Session() as session:
+            browser_session = PersistentBrowserSessionModel(
+                persistent_browser_session_id=session_id,
+                organization_id=organization_id,
+                status="completed",
+                started_at=to_naive_utc(started_at) if started_at else None,
+                completed_at=to_naive_utc(completed_at) if completed_at else naive_utc_now(),
+            )
+            session.add(browser_session)
+            await session.commit()
+            await session.refresh(browser_session)
+            return PersistentBrowserSession.model_validate(browser_session)
+
+    @db_operation("get_persistent_browser_session_unscoped")
+    async def get_persistent_browser_session_unscoped(self, session_id: str) -> PersistentBrowserSession | None:
+        """Primary-key read without organization scoping, for trusted internal session
+        resolution (e.g. the CDP proxy) that learns the owning organization from the row."""
+        async with self.Session() as session:
+            query = (
+                select(PersistentBrowserSessionModel)
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(deleted_at=None)
+            )
             persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session:
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -491,8 +695,15 @@ class BrowserSessionsRepository(BaseRepository):
         ip_address: str | None,
         ecs_task_arn: str | None,
         organization_id: str | None = None,
+        upstream_cdp_url: str | None = None,
+        browser_vendor: str | None = None,
     ) -> None:
-        """Set the browser address for a persistent browser session."""
+        """Set the browser address for a persistent browser session.
+
+        browser_address is the client-facing (proxied) URL; upstream_cdp_url is the endpoint the
+        CDP proxy dials and must never be handed to a client or carry a credential — connect-time
+        credentials are injected from env at dial time.
+        """
         async with self.Session() as session:
             persistent_browser_session = (
                 await session.scalars(
@@ -511,7 +722,17 @@ class BrowserSessionsRepository(BaseRepository):
                     persistent_browser_session.ip_address = ip_address
                 if ecs_task_arn:
                     persistent_browser_session.ecs_task_arn = ecs_task_arn
-                await session.commit()
+                if upstream_cdp_url:
+                    persistent_browser_session.upstream_cdp_url = upstream_cdp_url
+                if browser_vendor:
+                    persistent_browser_session.browser_vendor = browser_vendor
+                try:
+                    await session.commit()
+                except StatementError as exc:
+                    # A failed statement renders its bound parameters — including upstream_cdp_url —
+                    # into the text that callers log. The type and statement still identify the fault.
+                    exc.hide_parameters = True
+                    raise
                 await session.refresh(persistent_browser_session)
             else:
                 raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")

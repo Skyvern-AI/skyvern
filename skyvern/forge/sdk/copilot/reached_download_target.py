@@ -58,6 +58,10 @@ REGISTERED_DOWNLOAD_OUTPUT_KEYS: tuple[str, ...] = (
     "downloaded_file_artifact_ids",
 )
 
+REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS: frozenset[str] = frozenset(
+    f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
+)
+
 # The keys whose typed-affordance hints flow through the scout navTargets capture.
 NAV_TARGET_DOWNLOAD_KIND_KEY = "download_kind"
 
@@ -74,6 +78,9 @@ class ReachedDownloadTarget:
     download_kind: DownloadKind
     source_step: str
     already_registered: bool
+    # Stored ``trajectory_index`` of the last scouted interaction at the moment the affordance was
+    # observed; the synthesizer sequences the download terminal here instead of after the whole trajectory.
+    trajectory_anchor: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

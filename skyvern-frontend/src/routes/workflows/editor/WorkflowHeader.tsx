@@ -228,7 +228,10 @@ function EditorActionToolbar() {
         iconOnly
       />
       <EditorOverflowMenu />
-      <div className="mx-1 h-6 w-px bg-slate-700" aria-hidden="true" />
+      <div
+        className="mx-1 h-6 w-px bg-muted dark:bg-slate-700"
+        aria-hidden="true"
+      />
       <PanelToggleButton content="parameters" label="Inputs" />
       <RunButton />
     </div>

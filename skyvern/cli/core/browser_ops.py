@@ -6,6 +6,7 @@ Session resolution and output formatting are caller responsibilities.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -15,10 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+import structlog
+
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import GuardError
+
+LOG = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -560,18 +565,22 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
-_PASSWORD_NAME_RE = re.compile(
-    r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\btoken\b|\bcredential\b|\bpwd\b|\bpasswd\b|\bpin\b",
-    re.IGNORECASE,
-)
-
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
+_DOMUTILS_INTERACTABILITY_READY_JS = r"""
+() => typeof isInteractable === "function" && typeof getHoverStylesMap === "function" && typeof buildTreeFromBody === "function"
+"""
+
+# getHoverStylesMap() can await cross-origin stylesheet fetches with no abort signal; bound the
+# scan so main-page observe falls back to a11y and selected-frame observe raises a typed error.
+_DOM_SCAN_TIMEOUT_SECONDS = 30.0
+
 _OBSERVE_INTERACTABLES_JS = r"""
-(scopeSelector) => {
+async ({ scopeSelector, includeValues }) => {
   const root = scopeSelector ? document.querySelector(scopeSelector) : document.body;
   if (!root) return [];
+  let hoverStylesMap;
 
   const esc = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"));
   const classes = (element) => (element.className || "").toString();
@@ -604,6 +613,8 @@ _OBSERVE_INTERACTABLES_JS = r"""
         .trim();
       if (labelsText) return labelsText;
     }
+    // Deliberate: unlabeled non-password inputs may surface their value as the accessible
+    // name (identification fallback), independent of includeValues; passwords never do.
     return (element.innerText || element.textContent || element.getAttribute("placeholder") || (isPassword(element) ? "" : element.value) || "")
       .replace(/\s+/g, " ")
       .trim();
@@ -625,12 +636,6 @@ _OBSERVE_INTERACTABLES_JS = r"""
     }
     return parts.join(" > ");
   };
-  const visible = (element) => {
-    if (element.tagName.toLowerCase() === "option") return element.parentElement ? visible(element.parentElement) : false;
-    const style = window.getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    return !element.hidden && element.getAttribute("aria-hidden") !== "true" && style?.display !== "none" && style?.visibility !== "hidden" && style?.visibility !== "collapse" && rect.width > 0 && rect.height > 0;
-  };
   const explicitRole = (element) => (element.getAttribute("role") || "").toLowerCase();
   const nativeRole = (element) => {
     const tag = element.tagName.toLowerCase();
@@ -642,7 +647,6 @@ _OBSERVE_INTERACTABLES_JS = r"""
     if (tag !== "input") return "";
     return { checkbox: "checkbox", radio: "radio", range: "slider", search: "searchbox" }[type] || "textbox";
   };
-  const widgetRoles = new Set(["button", "checkbox", "combobox", "link", "listbox", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "radio", "searchbox", "slider", "spinbutton", "switch", "tab", "textbox", "treeitem"]);
   const pointer = (element) => window.getComputedStyle(element)?.cursor === "pointer";
   const staticClick = (element) => element.hasAttribute("onclick") || typeof element.onclick === "function" || element.hasAttribute("jsaction");
   const frameworkClick = (element) => {
@@ -652,10 +656,6 @@ _OBSERVE_INTERACTABLES_JS = r"""
     } catch (_) {
       return false;
     }
-  };
-  const knownClass = (element) => {
-    const className = classes(element);
-    return className.includes("dropdown-item") || className.includes("ui-menu-item") || className.includes("pac-item") || className.includes("rddlItem") || className === "option";
   };
   const ancestorMatching = (element, predicate) => {
     for (let current = element.parentElement, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
@@ -675,27 +675,48 @@ _OBSERVE_INTERACTABLES_JS = r"""
   });
   const optionLike = (element) => Boolean(text(element) && optionContainer(element) && interactiveAncestor(element));
   const roleFor = (element) => explicitRole(element) || nativeRole(element) || (optionLike(element) ? "option" : "button");
-  const candidate = (element) => {
-    if (!visible(element) || (window.getComputedStyle(element)?.pointerEvents === "none" && !element.disabled)) return false;
-    const tag = element.tagName.toLowerCase();
-    return Boolean(nativeRole(element) || widgetRoles.has(explicitRole(element)) || staticClick(element) || frameworkClick(element) || knownClass(element) || pointer(element) || (tag === "div" && element.getAttribute("tabindex") === "0") || optionLike(element));
-  };
+  // The bare-option overlay must never resurface an element the production predicate rejected
+  // for being invisible, hidden, or inert — a hidden input surfaced here would leak its value
+  // through the name fallback.
+  const overlayEligible = (element) =>
+    isElementVisible(element) &&
+    !isHidden(element) &&
+    !isScriptOrStyle(element) &&
+    !(getElementComputedStyle(element)?.pointerEvents === "none" && !element.disabled && !isHoverOnlyElement(element));
+  // Overlay: bare options inside an interactive option container are driver-discoverable even
+  // though the production predicate ignores them. "Bare" is strict: anything with a native or
+  // explicit role (or a frame-family tag) gets production's FULL verdict, including its later
+  // vetoes (disabled-select options, frame exclusions) — the overlay never overrides those.
+  const overlayVetoedTags = new Set(["html", "iframe", "frame", "frameset"]);
+  const bareElement = (element) => !overlayVetoedTags.has(element.tagName.toLowerCase()) && !nativeRole(element) && !explicitRole(element);
+  const candidate = (element) => isInteractable(element, hoverStylesMap) || (bareElement(element) && overlayEligible(element) && optionLike(element));
 
-  return Array.from(root.querySelectorAll("*"))
-    .filter(candidate)
-    .map((element) => {
-      const tag = element.tagName.toLowerCase();
-      const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
-      if (isPassword(element)) {
-        item.value = "";
-        item.is_password = true;
-      } else if (["input", "textarea", "select", "option"].includes(tag)) {
-        item.value = element.value || element.getAttribute("value") || "";
-      }
-      if (tag === "select") item.options = Array.from(element.options).map((option) => text(option));
-      return item;
-    })
-    .filter((item) => item.name || item.role);
+  // A later production scrape must compute hover styles at ITS OWN time: cache ownership is
+  // snapshotted in the same evaluation and restored in finally (identity-guarded). Ceiling:
+  // two FIRST-TIME builds interleaving is last-writer-wins inside getHoverStylesMap, so the
+  // loser costs one spare recompute — never a stale cache.
+  const hadHoverCache = Boolean(window.globalHoverStylesMap);
+  try {
+    hoverStylesMap = await getHoverStylesMap();
+    // querySelectorAll excludes the root itself — a scoped observe must still surface the scoped element.
+    // The scan deliberately stays light-DOM-only; shadow roots are not traversed.
+    return (scopeSelector ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*")))
+      .filter(candidate)
+      .map((element) => {
+        const tag = element.tagName.toLowerCase();
+        const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
+        if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
+          item.value = element.value || element.getAttribute("value") || "";
+        }
+        if (tag === "select") item.options = Array.from(element.options).map((option) => text(option));
+        return item;
+      })
+      .filter((item) => item.name || item.role);
+  } finally {
+    if (!hadHoverCache && window.globalHoverStylesMap === hoverStylesMap) {
+      window.globalHoverStylesMap = undefined;
+    }
+  }
 }
 """
 
@@ -844,6 +865,16 @@ class ObservedElement:
     needs_disambiguation: bool = False
 
 
+class ObserveFrameError(RuntimeError):
+    """Failure to evaluate an observe snapshot inside the selected frame."""
+
+    def __init__(self, frame_name: str, frame_url: str, cause: Exception) -> None:
+        self.frame_name = frame_name
+        self.frame_url = frame_url
+        frame_id = frame_name or frame_url or "<unnamed>"
+        super().__init__(f"Failed to evaluate observe in frame {frame_id!r}: {cause}")
+
+
 @dataclass
 class ObserveResult:
     url: str
@@ -859,17 +890,13 @@ def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
         return []
     result: list[dict[str, Any]] = []
     if node.get("role") and node["role"] != "WebArea":
+        # a11y snapshots carry current input values; drop them at capture so the guarded
+        # DOM scan (includeValues gate in _OBSERVE_INTERACTABLES_JS) is the only value source.
+        node.pop("value", None)
         result.append(node)
     for child in node.get("children", []):
         result.extend(_flatten_a11y_tree(child))
     return result
-
-
-def _is_password_field(role: str, name: str) -> bool:
-    """DESIGN-2: Detect password-type fields for value redaction."""
-    if _PASSWORD_NAME_RE.search(name):
-        return True
-    return role == "textbox" and "password" in name.lower()
 
 
 def _extract_options(node: dict[str, Any]) -> list[str] | None:
@@ -881,13 +908,30 @@ def _extract_options(node: dict[str, Any]) -> list[str] | None:
     return opts if opts else None
 
 
-async def _get_dom_observe_elements(page: Any, selector: str | None = None) -> list[dict[str, Any]]:
+async def _get_dom_observe_elements(
+    page: Any,
+    selector: str | None = None,
+    include_values: bool = False,
+    *,
+    frame_name: str | None = None,
+    frame_url: str | None = None,
+) -> list[dict[str, Any]]:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
+        if frame_name is not None:
+            raise ObserveFrameError(frame_name, frame_url or "", RuntimeError("frame does not support evaluate"))
         return []
     try:
-        result = await evaluate(_OBSERVE_INTERACTABLES_JS, selector)
-    except Exception:
+        async with asyncio.timeout(_DOM_SCAN_TIMEOUT_SECONDS):
+            if await evaluate(_DOMUTILS_INTERACTABILITY_READY_JS) is not True:
+                await evaluate(JS_FUNCTION_DEFS)
+            result = await evaluate(
+                _OBSERVE_INTERACTABLES_JS,
+                {"scopeSelector": selector, "includeValues": include_values},
+            )
+    except Exception as exc:
+        if frame_name is not None:
+            raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
         return []
     if not isinstance(result, list):
         return []
@@ -935,10 +979,8 @@ def _merge_dom_observe_elements(
                     and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
                 ):
                     existing["selector"] = dom_selector
-                    if dom_element.get("value") is not None and existing.get("value") is None:
-                        existing["value"] = dom_element.get("value")
-                    if dom_element.get("is_password"):
-                        existing["is_password"] = True
+                    if dom_element.get("value") is not None:
+                        existing["value"] = dom_element["value"]
                     if dom_element.get("options") and not existing.get("children"):
                         existing["options"] = dom_element.get("options")
                     matched_existing = True
@@ -950,31 +992,6 @@ def _merge_dom_observe_elements(
             if dom_selector:
                 selector_seen.add(dom_selector)
 
-    # Any accessible name the DOM identifies as a password field redacts EVERY element
-    # sharing that (role, name, tag) key — a duplicate accessible name must not let an
-    # unflagged a11y value slip through.
-    password_keys = {
-        _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
-        for dom_element in dom_elements
-        if dom_element.get("is_password")
-    }
-    if password_keys:
-        # Keys present among the ORIGINAL a11y elements (NOT the appended DOM elements — an
-        # appended DOM password would otherwise "match" itself and defeat the fail-closed check).
-        a11y_password_keys = {
-            _key(e.get("role", ""), e.get("name", ""), _ROLE_TO_TAG.get(e.get("role", ""), "")) for e in a11y_elements
-        }
-        for element in merged:
-            role = element.get("role", "")
-            if _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, "")) in password_keys:
-                element["is_password"] = True
-        if password_keys - a11y_password_keys:
-            # Fail closed: a DOM password field could not be mapped to any original a11y element
-            # (unlabeled or divergent accessible name). Redact every a11y textbox value so a
-            # password can never leak through an unmatched pairing.
-            for element in merged:
-                if element.get("role") == "textbox" and element.get("value"):
-                    element["is_password"] = True
     return merged
 
 
@@ -983,19 +1000,57 @@ async def do_observe(
     selector: str | None = None,
     interactive_only: bool = True,
     max_elements: int = 50,
+    include_values: bool = False,
 ) -> ObserveResult:
     """Capture interactive elements with stable refs for batch operations."""
-    accessibility = getattr(page, "accessibility", None)
-    if selector and accessibility is not None:
-        element_handle = await page.locator(selector).first.element_handle()
-        snapshot = await accessibility.snapshot(root=element_handle)
-    elif accessibility is not None:
-        snapshot = await accessibility.snapshot()
-    else:
+    # Execute-step params arrive as untyped JSON; a string like "false" must not
+    # enable value capture — the opt-in counts only as a literal boolean True.
+    include_values = include_values is True
+    working_frame = getattr(page, "_working_frame", None)
+    if working_frame is not None:
+        # A popup or tab change can make get_page() resolve a different page than the
+        # one the selected frame belongs to — observing that frame would report the
+        # wrong document as if it were the active page.
+        owner = getattr(working_frame, "page", None)
+        raw_page = getattr(page, "page", page)
+        if owner is not None and owner is not raw_page:
+            raise ObserveFrameError(
+                working_frame.name,
+                working_frame.url,
+                RuntimeError("frame belongs to a different page or tab"),
+            )
+        try:
+            detached = working_frame.is_detached()
+        except AttributeError:
+            detached = False
+        if detached:
+            raise ObserveFrameError(
+                working_frame.name,
+                working_frame.url,
+                RuntimeError("frame is detached"),
+            )
+    observe_target = working_frame if working_frame is not None else page
+    if working_frame is not None:
+        # Legacy page accessibility iframe roots are unreliable; DOM-only avoids cross-document merges.
         snapshot = None
+    else:
+        accessibility = getattr(page, "accessibility", None)
+        if selector and accessibility is not None:
+            element_handle = await page.locator(selector).first.element_handle()
+            snapshot = await accessibility.snapshot(root=element_handle)
+        elif accessibility is not None:
+            snapshot = await accessibility.snapshot()
+        else:
+            snapshot = None
 
     all_elements = _flatten_a11y_tree(snapshot)
-    dom_elements = await _get_dom_observe_elements(page, selector)
+    dom_elements = await _get_dom_observe_elements(
+        observe_target,
+        selector,
+        include_values,
+        frame_name=working_frame.name if working_frame is not None else None,
+        frame_url=working_frame.url if working_frame is not None else None,
+    )
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
@@ -1030,11 +1085,6 @@ async def do_observe(
     for i, elem in enumerate(capped):
         role = elem.get("role", "")
         name = elem.get("name", "")
-        value = elem.get("value")
-
-        # DESIGN-2: Redact password field values — by DOM input type (is_password) or name.
-        if elem.get("is_password") or (value and _is_password_field(role, name)):
-            value = "***"
 
         key = (role, name)
         match_index = elem.get("_match_index", 0)
@@ -1046,16 +1096,24 @@ async def do_observe(
                 name=name,
                 tag=elem.get("tag") or _ROLE_TO_TAG.get(role, ""),
                 selector=elem.get("selector"),
-                value=value,
+                value=elem.get("value"),
                 options=elem.get("options") or _extract_options(elem),
                 match_index=match_index,
                 needs_disambiguation=full_group_size[key] > 1,
             )
         )
 
+    if working_frame is not None:
+        try:
+            title = await working_frame.title()
+        except Exception as exc:
+            raise ObserveFrameError(working_frame.name, working_frame.url, exc) from exc
+    else:
+        title = await page.title()
+
     return ObserveResult(
-        url=page.url,
-        title=await page.title(),
+        url=working_frame.url if working_frame is not None else page.url,
+        title=title,
         elements=observed,
         element_count=len(observed),
         total_on_page=total,
@@ -1079,6 +1137,11 @@ def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
             fields["match_index"] = e.match_index
         result.append({k: v for k, v in fields.items() if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")})
     return result
+
+
+def ref_map_from_elements(elements: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Ref-map/registry entries persist across calls — they hold ref-resolution fields, never input values."""
+    return {element["ref"]: {k: v for k, v in element.items() if k != "value"} for element in elements}
 
 
 def ref_to_selector(elem: dict[str, Any]) -> str:
@@ -1193,7 +1256,7 @@ async def do_execute(
             # If session publication rejects the snapshot (a concurrent navigation
             # invalidated it), the batch must not act on it either.
             if step.tool == "observe" and result and "elements" in result:
-                new_map = {elem["ref"]: elem for elem in result["elements"]}
+                new_map = ref_map_from_elements(result["elements"])
                 if on_ref_map_update is None or on_ref_map_update(new_map):
                     ref_map = new_map
                 else:
@@ -1206,6 +1269,10 @@ async def do_execute(
             wall_ms = int((time.monotonic() - t0) * 1000)
             error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
             results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
+            if step.tool == "observe":
+                # A failed observe means the document may have been replaced; refs from
+                # an earlier observe in this batch must not survive it.
+                ref_map = {}
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:
@@ -1217,3 +1284,503 @@ async def do_execute(
         results=results,
         error_step=next((r.step for r in results if not r.ok), None),
     )
+
+
+_DOM_FALLBACK_OPTION_WAIT_MS = 3000
+_CUSTOM_SELECT_KEY_EVENT_RETRY_MS = 1000
+
+_CUSTOM_SELECT_TARGET_JS = r"""
+(element) => {
+  const tag = element.tagName.toLowerCase();
+  const type = tag === "input" ? (element.type || "").toLowerCase() : "";
+  const isPassword = tag === "input" && type === "password";
+  const haspopupValue = element.getAttribute("aria-haspopup");
+  const optionish = Boolean(element.querySelector('[role="option"], [role="listbox"], [data-value]'));
+  const related = Boolean(`${element.getAttribute("aria-controls") || ""} ${element.getAttribute("aria-owns") || ""}`.trim());
+  const tabindex = element.hasAttribute("tabindex") && Number(element.getAttribute("tabindex")) >= 0;
+  const editable = (["input", "textarea"].includes(tag) || element.isContentEditable) &&
+    !isPassword && !element.readOnly && !element.disabled &&
+    (element.getAttribute("aria-readonly") || "").toLowerCase() !== "true";
+  const ownedIds = `${element.getAttribute("aria-controls") || ""} ${element.getAttribute("aria-owns") || ""}`.trim().split(/\s+/).filter(Boolean);
+  return {tag, type, isPassword, role: (element.getAttribute("role") || "").toLowerCase(),
+    haspopup: haspopupValue !== null && !["", "false"].includes(haspopupValue.toLowerCase()), editable,
+    optionish, related, selectlike: tabindex && (optionish || related),
+    ownedSelectors: ownedIds.map((id) => "#" + CSS.escape(id))};
+}
+"""
+
+_CUSTOM_SELECT_IS_OBSERVED_JS = r"""
+(element, observedSelectors) => observedSelectors.some((selector) => document.querySelector(selector) === element)
+"""
+
+_CUSTOM_SELECT_SCOPED_OPTIONS_JS = r"""
+(element, target) => {
+  const optionSelectors = target.optionSelectors || [];
+  const options = optionSelectors.map((selector) => [selector, document.querySelector(selector)]).filter((entry) => entry[1]);
+  const ownedIds = `${element.getAttribute("aria-controls") || ""} ${element.getAttribute("aria-owns") || ""}`.trim().split(/\s+/).filter(Boolean);
+  const owned = ownedIds.map((id) => document.getElementById(id)).filter(Boolean);
+  let scoped = [];
+  if (ownedIds.length) {
+    // Declared ownership is exclusive even before the owned root mounts: the poll loop
+    // retries until it appears; falling back earlier could click an unrelated widget.
+    scoped = options.filter((entry) => owned.some((root) => root.contains(entry[1])));
+  } else if (target.bareInput) {
+    const before = new Set(target.beforeOptionSelectors || []);
+    const widgetSelector = 'input, textarea, select, button, [role="combobox"], [role="listbox"], [role="textbox"], [aria-haspopup], [tabindex]:not([role="option"]), [contenteditable]:not([contenteditable="false"])';
+    let ownContainer = null;
+    for (let parent = element.parentElement, depth = 0; parent && depth < 4; parent = parent.parentElement, depth += 1) {
+      const hasOtherWidget = Array.from(parent.querySelectorAll(widgetSelector)).some((node) => node !== element);
+      if (hasOtherWidget) break;
+      ownContainer = parent;
+    }
+    scoped = options.filter((entry) => !before.has(entry[0]) || Boolean(ownContainer && ownContainer.contains(entry[1])));
+  } else {
+    scoped = options.filter((entry) => element.contains(entry[1]));
+  }
+  if (!ownedIds.length && !target.bareInput && !scoped.length) {
+    for (let parent = element.parentElement, depth = 0; parent && depth < 4; parent = parent.parentElement, depth += 1) {
+      scoped = options.filter((entry) => parent.contains(entry[1]));
+      if (scoped.length) break; }
+  }
+  // The DOM scan can mark the control itself, its display text, and option containers as
+  // role=option. Real options are leaf candidates; when container candidates exist, only
+  // leaves inside a container count — that excludes display children of the control.
+  const containers = scoped.filter((entry) => entry[1] !== element && scoped.some((other) => other[1] !== entry[1] && entry[1].contains(other[1])));
+  let leaves = scoped.filter((entry) => entry[1] !== element && !scoped.some((other) => other[1] !== entry[1] && entry[1].contains(other[1])));
+  if (containers.length) leaves = leaves.filter((entry) => containers.some((root) => root[1].contains(entry[1])));
+  const describe = (entry) => ({selector: entry[0],
+    label: (entry[1].innerText || entry[1].textContent || entry[1].getAttribute("aria-label") || "").replace(/\s+/g, " ").trim(),
+    value: entry[1].value || entry[1].getAttribute("value") || entry[1].getAttribute("data-value") || ""});
+  return leaves.map(describe);
+}
+"""
+
+_CUSTOM_SELECT_COMMIT_JS = r"""
+(element, target) => {
+  const option = document.querySelector(target.matched);
+  const optionNodes = target.options.map((selector) => document.querySelector(selector)).filter(Boolean);
+  const clone = element.cloneNode(true);
+  const cloneFor = (node) => {
+    const path = [];
+    for (let current = node; current && current !== element; current = current.parentElement) {
+      const parent = current.parentElement;
+      if (!parent) return null;
+      path.unshift(Array.prototype.indexOf.call(parent.children, current));
+    }
+    let current = clone;
+    for (const index of path) current = current && current.children[index];
+    return current;
+  };
+  const optionClones = optionNodes.filter((node) => element.contains(node)).map(cloneFor).filter(Boolean);
+  optionClones.forEach((node) => node.remove());
+  const text = (clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim();
+  const ownedIds = `${element.getAttribute("aria-controls") || ""} ${element.getAttribute("aria-owns") || ""}`.trim().split(/\s+/).filter(Boolean);
+  const roots = [element.parentElement, ...ownedIds.map((id) => document.getElementById(id))].filter(Boolean);
+  const seen = new Set();
+  const nodeKey = (node) => {
+    if (node.id) return `#${node.id}`;
+    if (node.tagName.toLowerCase() === "input" && node.type === "hidden" && node.name) {
+      return `input:hidden:${node.name}`;
+    }
+    return null;
+  };
+  const channelCandidates = [];
+  roots.forEach((root) => [root, ...root.querySelectorAll("*")].forEach((node) => {
+    if (seen.has(node) || optionNodes.some((optionNode) => optionNode === node || optionNode.contains(node))) return;
+    seen.add(node);
+    const key = nodeKey(node);
+    if (!key) return;
+    if (node.tagName.toLowerCase() === "input" && node.type === "hidden") {
+      channelCandidates.push({key: `${key}:value`, value: node.value || ""});
+    }
+    if (node.hasAttribute("data-value")) {
+      channelCandidates.push({key: `${key}:data-value`, value: node.getAttribute("data-value") || ""});
+    }
+  }));
+  const keyCounts = channelCandidates.reduce((counts, channel) => {
+    counts.set(channel.key, (counts.get(channel.key) || 0) + 1);
+    return counts;
+  }, new Map());
+  const containerChannels = channelCandidates.filter((channel) => keyCounts.get(channel.key) === 1);
+  return {
+    text, value: element.value || element.getAttribute("value") || "",
+    dataValue: element.getAttribute("data-value") || "", containerChannels,
+    channelValues: channelCandidates.map((channel) => channel.value),
+    expanded: element.getAttribute("aria-expanded"), optionVisible: Boolean(option && option.getClientRects().length),
+    optionPresent: Boolean(option),
+    optionSelected: Boolean(option && (option.selected || option.getAttribute("aria-selected") === "true"))};
+}
+"""
+
+
+class CustomSelectOpenError(RuntimeError):
+    """Opening the widget (the initial click/fill) failed before any option was acted on."""
+
+
+class CustomSelectRestoreError(RuntimeError):
+    """The custom-select value could not be restored, so another action path is unsafe."""
+
+
+class CustomSelectPasswordError(RuntimeError):
+    """The target is a password input — a terminal, no-fallback rejection so the secret
+    value never reaches the native fill or the AI-fallback LLM payload."""
+
+
+class CustomSelectClassifyError(RuntimeError):
+    """The target could not be classified (detached/navigated mid-probe). The caller must
+    fail closed before any value-bearing AI fallback rather than treat it as native deferral."""
+
+
+class CustomSelectMatchError(RuntimeError):
+    def __init__(self, selector: str, requested_option: str, observed_options: list[str]) -> None:
+        super().__init__(f"No unambiguous match for {requested_option!r}")
+        self.selector = selector
+        self.requested_option = requested_option
+        self.observed_options = observed_options
+
+
+def _normalized_option(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _custom_select_commit_channels(snapshot: dict[str, Any]) -> dict[str, str]:
+    return {
+        str(channel["key"]): _normalized_option(channel.get("value"))
+        for channel in snapshot.get("containerChannels") or []
+        if isinstance(channel, dict) and channel.get("key")
+    }
+
+
+async def _custom_select_dom_elements(page: Any, scan_selectors: list[str] | None) -> list[dict[str, Any]]:
+    if not scan_selectors:
+        return await _get_dom_observe_elements(page)
+    elements: dict[str, dict[str, Any]] = {}
+    for scan_selector in scan_selectors:
+        for element in await _get_dom_observe_elements(page, scan_selector):
+            selector = str(element.get("selector") or "")
+            if selector:
+                elements[selector] = element
+    return list(elements.values())
+
+
+async def _restore_custom_select_value(control: Any, original_value: str | None, timeout: int) -> None:
+    if original_value is None:
+        raise CustomSelectRestoreError("Could not restore original value before fallback")
+    try:
+        await control.fill(original_value, timeout=timeout)
+        restored_value = await control.evaluate(
+            "element => element.value ?? element.textContent ?? ''",
+            timeout=timeout,
+        )
+    except Exception as e:
+        raise CustomSelectRestoreError("Could not restore original value before fallback") from e
+    if str(restored_value) != original_value:
+        raise CustomSelectRestoreError("Could not verify restored original value before fallback")
+
+
+async def _scoped_custom_options(
+    page: Any,
+    control: Any,
+    dom_elements: list[dict[str, Any]] | None = None,
+    *,
+    before_option_selectors: set[str] | None = None,
+    bare_input: bool = False,
+    scan_selectors: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    if dom_elements is None:
+        dom_elements = await _custom_select_dom_elements(page, scan_selectors)
+    options = [element for element in dom_elements if element.get("role") == "option" and element.get("selector")]
+    selectors = [str(element["selector"]) for element in options]
+    scoped = await control.evaluate(
+        _CUSTOM_SELECT_SCOPED_OPTIONS_JS,
+        {
+            "optionSelectors": selectors,
+            "beforeOptionSelectors": list(before_option_selectors or ()),
+            "bareInput": bare_input,
+        },
+    )
+    if not isinstance(scoped, list):
+        return []
+    by_selector = {str(element["selector"]): element for element in options}
+    enriched = []
+    for entry in scoped:
+        element = by_selector.get(str(entry.get("selector") or "")) if isinstance(entry, dict) else None
+        if element is not None:
+            enriched.append({**element, "label": str(entry.get("label") or ""), "value": str(entry.get("value") or "")})
+    return enriched
+
+
+_LIVE_PASSWORD_JS = (
+    "(s) => { const el = document.querySelector(s); "
+    "return !!el && el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'; }"
+)
+
+
+async def _assert_live_target_not_password(page: Any, selector: str) -> None:
+    """Re-check the LIVE element immediately before writing to it — guards a TOCTOU swap to a
+    password input between classification and the fill. Unknown state fails closed."""
+    try:
+        is_password = bool(await page.evaluate(_LIVE_PASSWORD_JS, selector))
+    except Exception as e:
+        raise CustomSelectClassifyError(selector) from e
+    if is_password:
+        raise CustomSelectPasswordError(selector)
+
+
+async def do_select_option(
+    page: Any,
+    selector: str,
+    value: str,
+    *,
+    by_label: bool = False,
+    timeout: int = 30000,
+    restore_value_on_failure: bool = False,
+    fail_closed_on_unknown: bool = False,
+) -> str | None:
+    """Deterministic custom-select pipeline: classify the control, open (click) or
+    filter (fill) it, scope scan-observed options to it, click the unique match, then
+    verify a committed-state transition. Returns None to defer to the native path."""
+    probe_timeout = min(timeout, _NATIVE_OPTION_PROBE_TIMEOUT_MS)
+    try:
+        control = page.locator(selector).first
+        target = await control.evaluate(_CUSTOM_SELECT_TARGET_JS, timeout=probe_timeout)
+    except Exception as e:
+        LOG.debug("custom-select classification probe failed", selector=selector, exc_info=True)
+        # Unknown classification: the caller decides (native deferral for direct calls,
+        # fail-closed before value-bearing AI fallback) — never silently defer to the LLM.
+        raise CustomSelectClassifyError(selector) from e
+
+    if target.get("isPassword") or (
+        isinstance(target, dict)
+        and target.get("tag") == "input"
+        and str(target.get("type") or "").casefold() == "password"
+    ):
+        # Terminal, no fallback: never fill a password field and never let its value reach
+        # the native SDK / AI-fallback LLM payload via a hybrid selector+intent call.
+        raise CustomSelectPasswordError(selector)
+    if not isinstance(target, dict) or target.get("tag") == "select":
+        return None
+    bare_typeahead = bool(target.get("tag") == "input" and target.get("editable") and not target.get("related"))
+    dom_fallback = target.get("role") not in {"combobox", "listbox"} and not target.get("haspopup")
+    if dom_fallback or bare_typeahead:
+        dom_elements = await _get_dom_observe_elements(page)
+    else:
+        dom_elements = []
+    before_option_selectors = {
+        str(element["selector"])
+        for element in dom_elements
+        if bare_typeahead and element.get("role") == "option" and element.get("selector")
+    }
+    if dom_fallback:
+        observed_selectors = [str(element["selector"]) for element in dom_elements if element.get("selector")]
+        try:
+            observed = await control.evaluate(_CUSTOM_SELECT_IS_OBSERVED_JS, observed_selectors, timeout=probe_timeout)
+        except Exception as e:
+            if fail_closed_on_unknown:
+                raise CustomSelectClassifyError(selector) from e
+            return None
+        if not observed:
+            return None
+        scan_observed_shape = observed and (target.get("optionish") or target.get("related"))
+        bare_typeahead = bool(bare_typeahead and observed)
+        if not target.get("selectlike") and not scan_observed_shape and not bare_typeahead:
+            return None
+
+    started_at = time.monotonic()
+    deadline = started_at + timeout / 1000
+    # Deliberately overrides larger caller timeouts: dom-fallback ticks re-scan the page,
+    # and a control this ambiguous should fail fast to the native path, not poll for minutes.
+    option_deadline = min(deadline, started_at + _DOM_FALLBACK_OPTION_WAIT_MS / 1000) if dom_fallback else deadline
+    original_value: str | None = None
+    if target.get("editable"):
+        if restore_value_on_failure:
+            try:
+                original_value = str(
+                    await control.evaluate(
+                        "element => element.value ?? element.textContent ?? ''", timeout=probe_timeout
+                    )
+                )
+            except Exception:
+                original_value = None
+    if target.get("editable"):
+        await _assert_live_target_not_password(page, selector)
+    try:
+        if target.get("editable"):
+            await control.fill(value, timeout=timeout)
+        else:
+            await control.click(timeout=timeout)
+    except Exception as e:
+        if target.get("editable") and restore_value_on_failure:
+            await _restore_custom_select_value(control, original_value, probe_timeout)
+        raise CustomSelectOpenError(str(e) or type(e).__name__) from e
+
+    requested = _normalized_option(value)
+    options: list[dict[str, Any]] = []
+    observed_options: list[str] = []
+    matches: list[dict[str, Any]] = []
+    commit_target: dict[str, Any] = {}
+    before_commit: dict[str, Any] | None = None
+    last_click_error: Exception | None = None
+    # Owned roots are exclusive scope, so the per-tick re-scan can walk just those
+    # subtrees instead of the whole document (full-page walks get expensive on real pages).
+    raw_scan_selectors = target.get("ownedSelectors")
+    scan_selectors = (
+        [str(scan_selector) for scan_selector in raw_scan_selectors if str(scan_selector)]
+        if isinstance(raw_scan_selectors, list)
+        else None
+    )
+    key_event_retry_at = min(option_deadline, started_at + _CUSTOM_SELECT_KEY_EVENT_RETRY_MS / 1000)
+    used_key_event_retry = False
+    saw_scoped_options = False
+    poll_delay = 0.1
+    # Each tick re-scans fresh: the pre-open/pre-fill scan can only see the collapsed
+    # control's display text (not the real options), and matching that display against
+    # the requested value clicks a no-op display node instead of a real option.
+    while (now := time.monotonic()) < option_deadline:
+        options = await _scoped_custom_options(
+            page,
+            control,
+            before_option_selectors=before_option_selectors,
+            bare_input=bare_typeahead,
+            scan_selectors=scan_selectors,
+        )
+        saw_scoped_options = saw_scoped_options or bool(options)
+        observed_options = _extract_options({"children": options}) or observed_options
+        matches = []
+        for option in options:
+            candidates = {
+                _normalized_option(option.get("name")),
+                _normalized_option(option.get("label")),
+            } - {""}
+            if not by_label:
+                candidates.add(_normalized_option(option.get("value")))
+            if requested in candidates:
+                matches.append(option)
+        if len(matches) == 1:
+            matched_selector = str(matches[0]["selector"])
+            commit_target = {
+                "matched": matched_selector,
+                "options": [str(option["selector"]) for option in options],
+            }
+            try:
+                before_commit = await control.evaluate(_CUSTOM_SELECT_COMMIT_JS, commit_target, timeout=probe_timeout)
+            except Exception:
+                matches = []
+            else:
+                try:
+                    await page.locator(matched_selector).first.click(timeout=probe_timeout)
+                except Exception as e:
+                    last_click_error = e
+                    matches = []
+                else:
+                    last_click_error = None
+                    break
+        if target.get("editable") and not used_key_event_retry and not saw_scoped_options and now >= key_event_retry_at:
+            retry_dom_elements = await _custom_select_dom_elements(page, scan_selectors)
+            if bare_typeahead:
+                before_option_selectors = {
+                    str(element["selector"])
+                    for element in retry_dom_elements
+                    if element.get("role") == "option" and element.get("selector")
+                }
+            await _assert_live_target_not_password(page, selector)
+            try:
+                await control.fill("", timeout=timeout)
+                await control.press_sequentially(value, timeout=timeout)
+            except Exception as e:
+                if restore_value_on_failure:
+                    await _restore_custom_select_value(control, original_value, probe_timeout)
+                raise CustomSelectOpenError(str(e) or type(e).__name__) from e
+            used_key_event_retry = True
+            poll_delay = 0.1
+            continue
+        await asyncio.sleep(poll_delay)
+        poll_delay = min(poll_delay * 1.5, 0.5)
+
+    if len(matches) != 1:
+        if last_click_error is not None:
+            raise RuntimeError(str(last_click_error)) from last_click_error
+        # Pre-option-click failure: no option was acted on, so a caller that will retry
+        # through another path (AI fallback) can safely see the pre-fill value again.
+        # Post-option failures above leave the widget alone — replaying them is unsafe.
+        if target.get("editable") and restore_value_on_failure:
+            await _restore_custom_select_value(control, original_value, probe_timeout)
+        if dom_fallback and not bare_typeahead and not observed_options:
+            return None
+        raise CustomSelectMatchError(selector, value, observed_options)
+
+    matched = matches[0]
+    matched_label = str(matched.get("name") or matched.get("label") or value)
+    matched_value = str(matched.get("value") or "")
+    expected_values = {requested, _normalized_option(matched_value)} - {""}
+    display_labels = {
+        _normalized_option(matched.get("name")),
+        _normalized_option(matched.get("label")),
+    } - {""}
+    # For any editable target the helper's own fill() wrote the control value, so it is
+    # not commit evidence — only the specific data-value, option state, and display text count.
+    # Only explicitly attributable selection channels (element value / data-value / hidden
+    # inputs) count — never arbitrary data-* like data-loading.
+    editable_target = bool(target.get("editable"))
+    before = before_commit if isinstance(before_commit, dict) else {}
+
+    def _stable_values(snapshot: dict[str, Any]) -> set[str]:
+        values = {_normalized_option(snapshot.get("dataValue"))}
+        if not editable_target:
+            values.add(_normalized_option(snapshot.get("value")))
+        return values - {""}
+
+    before_stable_values = _stable_values(before)
+    before_channels = _custom_select_commit_channels(before)
+    before_channel_values = {_normalized_option(v) for v in (before.get("channelValues") or [])} - {""}
+    before_text = _normalized_option(before.get("text"))
+    while time.monotonic() < deadline:
+        committed = await control.evaluate(_CUSTOM_SELECT_COMMIT_JS, commit_target, timeout=probe_timeout)
+        if isinstance(committed, dict):
+            committed_stable_values = _stable_values(committed)
+            committed_channels = _custom_select_commit_channels(committed)
+            text = _normalized_option(committed.get("text"))
+            value_transition = bool(expected_values.intersection(committed_stable_values - before_stable_values))
+            # A container channel proves commit when it newly carries the requested value.
+            # Same-key change → compare against that key's own before value. New key (possible
+            # sibling-removal key shift) → require the value to be absent from all before
+            # channels so an unchanged input cannot masquerade as newly added.
+            container_transition = editable_target and any(
+                value
+                and value in expected_values
+                and value != before_channels.get(key)
+                and (key in before_channels or value not in before_channel_values)
+                for key, value in committed_channels.items()
+            )
+            # Deselection veto: only when the matched option is STILL PRESENT and its selected
+            # state flips true->false. An unmounted option (widget closed on commit) is NOT a
+            # deselection signal and must fall through to the positive-evidence checks.
+            selected_to_unselected = bool(
+                before.get("optionSelected") and committed.get("optionPresent") and not committed.get("optionSelected")
+            )
+            if selected_to_unselected:
+                break
+            selected_transition = not before.get("optionSelected") and bool(committed.get("optionSelected"))
+            stable_idempotent = bool(
+                expected_values.intersection(before_stable_values).intersection(committed_stable_values)
+            ) or bool(before.get("optionSelected") and committed.get("optionSelected"))
+            text_transition = any(
+                not (before_text == label or re.search(rf"(?<!\w){re.escape(label)}(?!\w)", before_text))
+                and (text == label or re.search(rf"(?<!\w){re.escape(label)}(?!\w)", text))
+                for label in display_labels
+            )
+            if value_transition or container_transition or selected_transition or text_transition or stable_idempotent:
+                return matched_label
+            attributable_list_close = bool(
+                editable_target
+                and not before_channels
+                and not committed_channels
+                and before.get("optionVisible")
+                and not committed.get("optionVisible")
+            )
+            if attributable_list_close:
+                return matched_label
+        await asyncio.sleep(poll_delay)
+        poll_delay = min(poll_delay * 1.5, 0.5)
+
+    raise RuntimeError(f"Custom select did not commit {matched_label!r}")

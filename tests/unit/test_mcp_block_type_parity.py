@@ -95,20 +95,9 @@ class BlockDriftEntry:
 # the vendored Fern SDK. Run `fern generate` using the Skyvern Cloud-only
 # runbook to resync, then remove the entry here.
 _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
-    BlockDriftEntry(
-        block_type="pdf_fill",
-        ticket="SKY-10944",
-        owner="@suchintan",
-        added_at=date(2026, 6, 11),
-        notes="Fern SDK regen happens via CI post-deploy",
-    ),
-    BlockDriftEntry(
-        block_type="split_pdf",
-        ticket="SKY-12071",
-        owner="@suchintan",
-        added_at=date(2026, 7, 8),
-        notes="Fern SDK regen happens via CI post-deploy",
-    ),
+    # Empty: pdf_fill (SKY-10944), split_pdf (SKY-12071), and email_inbox
+    # (SKY-12068) were resolved by the Fern SDK regen in the 1.0.47 bump — all
+    # three now appear in both WorkflowDefinition(Yaml)BlocksItem unions.
 )
 
 

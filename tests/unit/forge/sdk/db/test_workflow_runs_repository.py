@@ -12,11 +12,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
-from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel, WorkflowRunModel
+from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel, TaskRunModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 
 
@@ -114,6 +115,26 @@ def _workflow_run_model(
         created_at=queued_at,
         modified_at=queued_at,
         queued_at=queued_at,
+    )
+
+
+def _task_run_model(
+    *,
+    run_id: str,
+    created_at: datetime,
+    workflow_permanent_id: str | None,
+    task_run_type: str = RunType.workflow_run.value,
+    status: str = WorkflowRunStatus.completed.value,
+) -> TaskRunModel:
+    return TaskRunModel(
+        task_run_id=f"tr_{run_id}",
+        organization_id="org_test",
+        task_run_type=task_run_type,
+        run_id=run_id,
+        status=status,
+        workflow_permanent_id=workflow_permanent_id,
+        created_at=created_at,
+        modified_at=created_at,
     )
 
 
@@ -363,6 +384,329 @@ async def test_get_all_runs_v2_status_filter_uses_coalesced_effective_status() -
     where_clause = _where_clause_sql(captured["query"]).lower()
     assert "coalesce(workflow_runs.status, task_runs.status) is not null" in where_clause
     assert "task_runs.status is not null" not in where_clause
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_run_type_filter_applies_task_run_type_predicate() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", run_type=["task_v1", "task_v2"])
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "task_runs.task_run_type IN ('task_v1', 'task_v2')" in where_clause
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_run_type_filter_gates_workflow_run_search_fallback() -> None:
+    """The search fallback query only ever yields workflow_run rows, so it must be
+    skipped when the run_type filter excludes workflow_run and kept when it doesn't."""
+    captured_queries: list[Any] = []
+
+    async def _execute(query):
+        captured_queries.append(query)
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="wr_abc123", run_type=["task_v1"])
+    assert len(captured_queries) == 1
+
+    captured_queries.clear()
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="wr_abc123", run_type=["task_v1", "workflow_run"])
+    assert len(captured_queries) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_filters_by_one_workflow_and_excludes_null_wpid_tasks(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_agent_a",
+                    workflow_permanent_id="wpid_a",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_agent_b",
+                    workflow_permanent_id="wpid_b",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_agent_a",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_a",
+                ),
+                _task_run_model(
+                    run_id="wr_agent_b",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_b",
+                ),
+                _task_run_model(
+                    run_id="tsk_standalone",
+                    created_at=created_at,
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v1.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        workflow_permanent_ids=["wpid_a"],
+    )
+
+    assert {row["run_id"] for row in rows} == {"wr_agent_a"}
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_uses_or_semantics(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _task_run_model(run_id="wr_agent_a", created_at=created_at, workflow_permanent_id="wpid_a"),
+                _task_run_model(run_id="wr_agent_b", created_at=created_at, workflow_permanent_id="wpid_b"),
+                _task_run_model(run_id="wr_agent_c", created_at=created_at, workflow_permanent_id="wpid_c"),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        workflow_permanent_ids=["wpid_a", "wpid_b"],
+    )
+
+    assert {row["run_id"] for row in rows} == {"wr_agent_a", "wr_agent_b"}
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_composes_with_status(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_agent_a_completed",
+                    workflow_permanent_id="wpid_a",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_agent_a_failed",
+                    workflow_permanent_id="wpid_a",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.failed.value,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_agent_b_completed",
+                    workflow_permanent_id="wpid_b",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_agent_a_completed",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_a",
+                ),
+                _task_run_model(
+                    run_id="wr_agent_a_failed",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_a",
+                    status=WorkflowRunStatus.failed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_agent_b_completed",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_b",
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        status=[WorkflowRunStatus.completed.value],
+        workflow_permanent_ids=["wpid_a"],
+    )
+
+    assert {row["run_id"] for row in rows} == {"wr_agent_a_completed"}
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_applies_to_search_fallback(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_orphan_target",
+                workflow_permanent_id="wpid_target",
+                queued_at=created_at,
+                status=WorkflowRunStatus.completed.value,
+            )
+        )
+        await session.commit()
+
+    excluded_rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        search_key="orphan_target",
+        workflow_permanent_ids=["wpid_other"],
+    )
+    included_rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        search_key="orphan_target",
+        workflow_permanent_ids=["wpid_target"],
+    )
+
+    assert "wr_orphan_target" not in {row["run_id"] for row in excluded_rows}
+    assert "wr_orphan_target" in {row["run_id"] for row in included_rows}
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_merges_orphan_runs_by_created_at(sqlite_db: AgentDB) -> None:
+    newest = datetime(2026, 7, 20, 12, 3, tzinfo=timezone.utc)
+    middle = datetime(2026, 7, 20, 12, 2, tzinfo=timezone.utc)
+    oldest = datetime(2026, 7, 20, 12, 1, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_backed_newest",
+                    workflow_permanent_id="wpid_target",
+                    queued_at=newest,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_backed_newest",
+                    created_at=newest,
+                    workflow_permanent_id="wpid_target",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_orphan_middle",
+                    workflow_permanent_id="wpid_target",
+                    queued_at=middle,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_backed_oldest",
+                    workflow_permanent_id="wpid_target",
+                    queued_at=oldest,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_backed_oldest",
+                    created_at=oldest,
+                    workflow_permanent_id="wpid_target",
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        workflow_permanent_ids=["wpid_target"],
+    )
+
+    assert [row["run_id"] for row in rows] == ["wr_backed_newest", "wr_orphan_middle", "wr_backed_oldest"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_skips_orphan_fallback_for_task_run_type(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_orphan_target",
+                workflow_permanent_id="wpid_target",
+                queued_at=created_at,
+                status=WorkflowRunStatus.completed.value,
+            )
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        workflow_permanent_ids=["wpid_target"],
+        run_type=[RunType.task_v1.value],
+    )
+
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_does_not_search_filter_orphan_fallback(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_unrelated_orphan",
+                workflow_permanent_id="wpid_target",
+                queued_at=created_at,
+                status=WorkflowRunStatus.completed.value,
+            )
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        workflow_permanent_ids=["wpid_target"],
+    )
+
+    assert [row["run_id"] for row in rows] == ["wr_unrelated_orphan"]
+    assert rows[0]["title"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_workflow_filter_uses_joined_wpid_for_legacy_task_rows(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_legacy",
+                    workflow_permanent_id="wpid_legacy",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_legacy",
+                    created_at=created_at,
+                    workflow_permanent_id=None,
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        workflow_permanent_ids=["wpid_legacy"],
+    )
+
+    assert {row["run_id"] for row in rows} == {"wr_legacy"}
+    assert rows[0]["workflow_permanent_id"] == "wpid_legacy"
 
 
 @pytest.mark.asyncio

@@ -471,6 +471,52 @@ class TestParseOtpLogin:
         assert parser["otp_value_found"] is True
         assert parser["otp_length"] == len(raw)
 
+    @pytest.mark.asyncio
+    async def test_off_schema_response_returns_none_without_leaking_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.services import otp_service
+
+        raw_content = "Long email body requesting OTP 424242 to finish sign in."
+        off_schema_resp = {"otp_type": "totp", "otp_value": "424242"}
+
+        async def fake_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return off_schema_resp
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", fake_handler, raising=False)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await parse_otp_login(content=raw_content, organization_id="o_test")
+
+        assert result is None
+
+        warning = next((r for r in logs if r.get("exception_type") == "ValidationError"), None)
+        assert warning is not None
+        assert warning["organization_id"] == "o_test"
+        assert "content" not in warning
+        assert "resp" not in warning
+        for record in logs:
+            assert raw_content not in repr(record)
+            assert "424242" not in repr(record)
+            for value in record.values():
+                assert raw_content not in str(value)
+                assert "424242" not in str(value)
+
+    @pytest.mark.asyncio
+    async def test_backend_provider_error_propagates_not_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+        from skyvern.services import otp_service
+
+        async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise LLMProviderError("gemini-2.5-flash")
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", failing_handler, raising=False)
+
+        with pytest.raises(LLMProviderError):
+            await parse_otp_login(content="raw email body that exceeds ten chars", organization_id="o_test")
+
 
 class TestPollOtpValueRetry:
     """poll_otp_value retries fetch failures across the full wall-clock timeout window."""

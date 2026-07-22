@@ -64,6 +64,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   http_request: "http_request",
   pdf_fill: "pdfFill",
   split_pdf: "splitPdf",
+  email_inbox: "emailInbox",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
 };
@@ -390,7 +391,7 @@ function WorkflowComparisonPanel({
           <button
             type="button"
             onClick={() => onCopilotReviewClose("close")}
-            className="absolute right-4 top-4 rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-slate-200"
+            className="absolute right-4 top-4 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-slate-700 dark:hover:text-slate-200"
             title="Close (Esc)"
           >
             <Cross2Icon className="h-5 w-5" />

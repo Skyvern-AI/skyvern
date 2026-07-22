@@ -2,8 +2,9 @@ function normalizeUtcTimestamp(time: string): string {
   // Adjust the fractional seconds to milliseconds (3 digits)
   time = time.replace(/\.(\d{3})\d*/, ".$1");
 
-  // Append 'Z' to indicate UTC time if not already present
-  if (!time.endsWith("Z")) {
+  // Timezone-less timestamps are UTC (the backend serializes naive UTC
+  // datetimes); append 'Z' unless an offset is already present.
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(time)) {
     time += "Z";
   }
 
@@ -133,6 +134,19 @@ function formatExecutionTime(
   return `${seconds}s`;
 }
 
+function formatDurationSeconds(seconds: number | null | undefined): string {
+  if (seconds == null || seconds < 0 || !Number.isFinite(seconds)) {
+    return "—";
+  }
+
+  const total = Math.round(seconds);
+  if (total < 60) {
+    return `${total}s`;
+  }
+
+  return `${Math.floor(total / 60)}m ${total % 60}s`;
+}
+
 export {
   normalizeUtcTimestamp,
   basicLocalTimeFormat,
@@ -142,4 +156,5 @@ export {
   localTimeFormatWithShortDate,
   formatTimeRemaining,
   formatExecutionTime,
+  formatDurationSeconds,
 };

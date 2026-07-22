@@ -12,18 +12,33 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable, Mapping
+from typing import Iterable, Iterator, Mapping
+
+from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
+from jinja2.exceptions import SecurityError
+from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
+from skyvern.forge.sdk.workflow.models._jinja import _json_finalize, _json_type_filter
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.utils.templating import get_missing_variables
 
 SANDBOX_UNRESOLVED_NAME_REASON_CODE = "SANDBOX_UNRESOLVED_NAME"
+RENDER_TEMPLATE_SYNTAX_REASON_CODE = "RENDER_TEMPLATE_SYNTAX"
+RENDER_UNDEFINED_NAME_REASON_CODE = "RENDER_UNDEFINED_NAME"
 
 
 @dataclass(frozen=True)
 class CodeBlockPreflightDiagnostic:
     code: str
     message: str
+
+
+@dataclass(frozen=True)
+class CodeBlockRenderDiagnostic:
+    code: str
+    message: str
+    failing_expression: str
 
 
 @dataclass(frozen=True)
@@ -35,6 +50,139 @@ class CodeBlockSandboxNameDiagnostic:
     parameter_keys: tuple[str, ...]
     allowed_global_names: tuple[str, ...]
     allowed_helper_surface: dict[str, tuple[str, ...]]
+
+
+# Mirrors the runtime's strict-mode template formatter (jinja_json_finalize_strict_env)
+# regardless of the WORKFLOW_TEMPLATING_STRICTNESS deployment setting.
+_render_check_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)
+_render_check_env.filters["json"] = _json_type_filter
+
+_RENDER_SYSTEM_BINDING_NAMES = (
+    "workflow_title",
+    "workflow_id",
+    "workflow_permanent_id",
+    "workflow_run_id",
+    "current_date",
+    "browser_session_id",
+    "workflow_run_outputs",
+    "workflow_run_summary",
+)
+
+# The runtime injects these only inside a for-loop iteration, so bind them only
+# when the source actually opens a loop. ponytail: loop-presence heuristic, not
+# true per-scope tracking — a reference after the loop closes still passes.
+_RENDER_LOOP_BINDING_NAMES = (
+    "current_index",
+    "current_item",
+    "current_value",
+)
+
+_JINJA_EXPRESSION_RE = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+_JINJA_STATEMENT_RE = re.compile(r"\{%.*?%\}", re.DOTALL)
+_JINJA_FOR_STATEMENT_RE = re.compile(r"\{%-?\s*for\s", re.DOTALL)
+
+
+class _PermissiveRenderBinding:
+    def __getattr__(self, name: str) -> _PermissiveRenderBinding:
+        return self
+
+    def __getitem__(self, key: object) -> _PermissiveRenderBinding:
+        return self
+
+    # Without __iter__, __getitem__ triggers Python's legacy iteration protocol,
+    # which never raises IndexError here and spins {% for %} loops forever.
+    def __iter__(self) -> Iterator[_PermissiveRenderBinding]:
+        return iter((self,))
+
+    def __str__(self) -> str:
+        return "value"
+
+
+def _first_template_expression_for(code: str, root: str) -> str:
+    root_re = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(root)}(?![A-Za-z0-9_])")
+    for pattern in (_JINJA_EXPRESSION_RE, _JINJA_STATEMENT_RE):
+        for match in pattern.finditer(code):
+            if root_re.search(match.group(0)):
+                return match.group(0)
+    return f"{{{{ {root} }}}}"
+
+
+def _top_level_form_suggestion(expression: str, root: str) -> str:
+    inner = expression.strip().strip("{}%").strip()
+    if not inner.startswith(f"{root}."):
+        return ""
+    remainder = inner[len(root) + 1 :]
+    match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", remainder)
+    if match is None:
+        return ""
+    return f"{{{{ {match.group(0)} }}}}"
+
+
+def code_block_render_diagnostic(code: str, bound_names: Iterable[str]) -> CodeBlockRenderDiagnostic | None:
+    """Dry-render the code block through the runtime's strict Jinja semantics with every
+    runtime-provided name bound to a permissive sentinel; only genuinely unrenderable
+    templates (undefined names, syntax errors, sandbox violations) produce a diagnostic."""
+    if "{{" not in code and "{%" not in code:
+        return None
+    try:
+        template = _render_check_env.from_string(code)
+    except TemplateSyntaxError as exc:
+        source_lines = code.splitlines()
+        line = source_lines[exc.lineno - 1].strip() if exc.lineno and exc.lineno <= len(source_lines) else ""
+        detail = f" Offending line: `{line}`." if line else ""
+        return CodeBlockRenderDiagnostic(
+            code=RENDER_TEMPLATE_SYNTAX_REASON_CODE,
+            message=f"Jinja template syntax error on line {exc.lineno}: {exc.message}.{detail}",
+            failing_expression=line,
+        )
+    bindings: dict[str, object] = {name: _PermissiveRenderBinding() for name in bound_names}
+    system_names: tuple[str, ...] = _RENDER_SYSTEM_BINDING_NAMES
+    if _JINJA_FOR_STATEMENT_RE.search(code):
+        system_names = system_names + _RENDER_LOOP_BINDING_NAMES
+    for name in system_names:
+        bindings.setdefault(name, _PermissiveRenderBinding())
+    missing: set[str] = set()
+    try:
+        missing = get_missing_variables(code, bindings)
+    except (UndefinedError, SecurityError) as exc:
+        return CodeBlockRenderDiagnostic(
+            code=RENDER_UNDEFINED_NAME_REASON_CODE,
+            message=f"A Jinja expression in this code block cannot render at runtime: {exc}.",
+            failing_expression="",
+        )
+    except Exception:
+        missing = set()
+    if missing:
+        root = sorted(missing)[0].split("[")[0].split(".")[0]
+        expression = _first_template_expression_for(code, root)
+        suggestion = _top_level_form_suggestion(expression, root)
+        guidance = (
+            f" Declared inputs are injected as top-level names; write `{suggestion}` instead."
+            if suggestion
+            else (
+                " Only declared parameter keys, block labels, `<label>_output` values, and workflow "
+                "system names (e.g. `current_date`) are available as top-level template names."
+            )
+        )
+        return CodeBlockRenderDiagnostic(
+            code=RENDER_UNDEFINED_NAME_REASON_CODE,
+            message=(
+                f"The expression `{expression}` cannot render at runtime: "
+                f"`{root}` is not a defined template name.{guidance}"
+            ),
+            failing_expression=expression,
+        )
+    try:
+        template.render(bindings)
+    except (UndefinedError, SecurityError) as exc:
+        return CodeBlockRenderDiagnostic(
+            code=RENDER_UNDEFINED_NAME_REASON_CODE,
+            message=f"A Jinja expression in this code block cannot render at runtime: {exc}.",
+            failing_expression="",
+        )
+    except Exception:
+        return None
+    return None
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")

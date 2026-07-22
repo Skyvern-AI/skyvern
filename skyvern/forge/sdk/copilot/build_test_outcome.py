@@ -12,6 +12,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -21,7 +22,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
+from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
+    ScoutObservationContract,
+    scout_observation_contract_valid,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeReasonCode
 
 LOG = structlog.get_logger()
@@ -40,6 +45,7 @@ BuildTestOutcomeReasonCode = Literal[
     "sandbox_unresolved_name",
     "synthesized_parameter_binding_ambiguous",
     "code_safety_reject",
+    "code_block_unrenderable",
     "credential_scout_reject",
     "schema_incompatibility",
     "verified_success",
@@ -48,6 +54,7 @@ BuildTestOutcomeReasonCode = Literal[
     "terminal_challenge_blocker",
     "blocker_reported",
     "failed_run",
+    "run_completed_unevaluated",
     "suspicious_success",
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
@@ -55,6 +62,7 @@ BuildTestOutcomeReasonCode = Literal[
     "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
+    "definition_contract_unsatisfied",
     "fallback_floor_turn_unsatisfiable",
     "output_source_unobservable",
     "actuation_exhausted",
@@ -339,6 +347,7 @@ def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontie
         "sandbox_unresolved_name",
         "synthesized_parameter_binding_ambiguous",
         "required_input_unbound",
+        "definition_contract_unsatisfied",
     }:
         return "amend_in_place"
     if outcome.reason_code in {"outcome_not_demonstrated", "no_meaningful_output", "runtime_missing_output_dependency"}:
@@ -437,6 +446,7 @@ def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGr
     )
     if workflow_run_id is None:
         ctx.composition_page_evidence = None  # type: ignore[attr-defined]
+        ctx.scout_observation_contract = None  # type: ignore[attr-defined]
     ctx.recorded_outcome_grounding_requirement = requirement  # type: ignore[attr-defined]
     LOG.info(
         "copilot recorded outcome grounding armed",
@@ -459,10 +469,15 @@ def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
     requirement = getattr(ctx, "recorded_outcome_grounding_requirement", None)
     if not isinstance(requirement, RecordedOutcomeGroundingRequirement) or requirement.satisfied:
         return False
+    if requirement.phase == "author_time_reject":
+        return True
     if isinstance(requirement.workflow_run_id, str) and requirement.workflow_run_id:
         return True
     evidence = getattr(ctx, "composition_page_evidence", None)
     if isinstance(evidence, dict) and _evidence_current_url(evidence):
+        return True
+    contract = getattr(ctx, "scout_observation_contract", None)
+    if scout_observation_contract_valid(contract):
         return True
     observed_urls = getattr(ctx, "observed_browser_urls", None)
     return isinstance(observed_urls, list) and any(isinstance(url, str) and url.strip() for url in observed_urls)
@@ -473,9 +488,12 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     if not isinstance(requirement, RecordedOutcomeGroundingRequirement):
         return False
     evidence = getattr(ctx, "composition_page_evidence", None)
+    contract = getattr(ctx, "scout_observation_contract", None)
     payload = _grounding_payload_from_evidence(requirement, evidence)
     if payload is None:
-        _log_grounding_rejection(requirement, evidence)
+        payload = _grounding_payload_from_scout_contract(requirement, contract)
+    if payload is None:
+        _log_grounding_rejection(requirement, evidence, contract)
         return False
     satisfied_requirement = requirement.model_copy(update={"satisfied": True, "payload": payload})
     ctx.recorded_outcome_grounding_requirement = satisfied_requirement  # type: ignore[attr-defined]
@@ -491,11 +509,15 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     return True
 
 
-def _log_grounding_rejection(requirement: RecordedOutcomeGroundingRequirement, evidence: object) -> None:
+def _log_grounding_rejection(
+    requirement: RecordedOutcomeGroundingRequirement,
+    evidence: object,
+    contract: object = None,
+) -> None:
     evidence_dict = evidence if isinstance(evidence, dict) else {}
     LOG.info(
         "copilot recorded outcome grounding rejected",
-        reject_reason=_grounding_reject_reason(requirement, evidence),
+        reject_reason=_grounding_reject_reason(requirement, evidence, contract),
         structural_key=requirement.structural_key,
         requirement_workflow_run_id=requirement.workflow_run_id,
         evidence_workflow_run_id=evidence_dict.get("workflow_run_id"),
@@ -508,16 +530,64 @@ def _log_grounding_rejection(requirement: RecordedOutcomeGroundingRequirement, e
 def _grounding_reject_reason(
     requirement: RecordedOutcomeGroundingRequirement,
     evidence: object,
+    contract: object = None,
 ) -> Literal["not_inspect_source", "degraded_page", "run_id_mismatch", "no_url"]:
-    if not isinstance(evidence, dict) or evidence.get("source_tool") != _INSPECT_PAGE_SOURCE_TOOL:
+    if isinstance(evidence, dict) and evidence.get("source_tool") == _INSPECT_PAGE_SOURCE_TOOL:
+        if _evidence_current_url(evidence) is None:
+            return "no_url"
+        run_id = requirement.workflow_run_id
+        if isinstance(run_id, str) and run_id:
+            if evidence.get("observed_after_workflow_run") is not True or evidence.get("workflow_run_id") != run_id:
+                return "run_id_mismatch"
+        return "degraded_page"
+    if isinstance(contract, ScoutObservationContract):
+        return _scout_contract_reject_reason(requirement, contract)
+    return "not_inspect_source"
+
+
+def _scout_contract_reject_reason(
+    requirement: RecordedOutcomeGroundingRequirement,
+    contract: ScoutObservationContract,
+) -> Literal["not_inspect_source", "degraded_page", "run_id_mismatch", "no_url"]:
+    if not scout_observation_contract_valid(contract):
         return "not_inspect_source"
-    if _evidence_current_url(evidence) is None:
+    if not contract.source_url.strip():
         return "no_url"
     run_id = requirement.workflow_run_id
     if isinstance(run_id, str) and run_id:
-        if evidence.get("observed_after_workflow_run") is not True or evidence.get("workflow_run_id") != run_id:
+        if not contract.observed_after_workflow_run or contract.workflow_run_id != run_id:
             return "run_id_mismatch"
     return "degraded_page"
+
+
+def _grounding_payload_from_scout_contract(
+    requirement: RecordedOutcomeGroundingRequirement,
+    contract: object,
+) -> RecordedOutcomeGroundingPayload | None:
+    if not isinstance(contract, ScoutObservationContract) or not scout_observation_contract_valid(contract):
+        return None
+    run_id = requirement.workflow_run_id
+    if isinstance(run_id, str) and run_id:
+        if not contract.observed_after_workflow_run or contract.workflow_run_id != run_id:
+            return None
+    capture_degraded = not contract.has_bounded_page_schema
+    diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = (
+        "capture_degraded" if capture_degraded else "none"
+    )
+    return RecordedOutcomeGroundingPayload(
+        repeated_structural_key=requirement.structural_key,
+        source_tool=contract.source_tool,
+        observed_after_workflow_run=contract.observed_after_workflow_run,
+        workflow_run_id=contract.workflow_run_id,
+        capture_degraded=capture_degraded,
+        target_url=requirement.required_target_url,
+        source_url=contract.source_url,
+        requirement_workflow_run_id=requirement.workflow_run_id,
+        payload_workflow_run_id=contract.workflow_run_id,
+        diagnostic_reason=diagnostic_reason,
+        current_origin=_origin(contract.source_url),
+        current_url_present=True,
+    )
 
 
 def _grounding_payload_from_evidence(
@@ -1040,7 +1110,7 @@ def recorded_outcome_from_run_blocks_result(
         )
     run_status = _safe_str(data.get("overall_status"))
     failure_type = _safe_str(data.get("failure_type"))
-    failure_categories = _failure_category_refs(data.get("failure_categories"))
+    failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
     runtime_failure_identity = _runtime_failure_identity(failed_block)
     if referenced_unbound_keys:
@@ -1070,7 +1140,11 @@ def recorded_outcome_from_run_blocks_result(
     verdict: BuildTestOutcomeVerdict = "repairable_failure" if bool(result.get("ok")) is False else "progress_observed"
     if not structural_identity and not page_refs and not output_refs:
         verdict = "not_authoritative"
-    reason_code = "runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run"
+    reason_code = (
+        "runtime_block_failure"
+        if failed_block is not None or not bool(result.get("ok"))
+        else "run_completed_unevaluated"
+    )
     has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
     if (
         verdict == "repairable_failure"
@@ -1486,6 +1560,8 @@ def _run_outcome_reason_code(recorded_run_outcome: RecordedRunOutcome) -> BuildT
         return reason_code
     if recorded_run_outcome.verdict == "demonstrated":
         return "verified_success"
+    if recorded_run_outcome.verdict == "not_evaluated":
+        return "run_completed_unevaluated"
     return "failed_run"
 
 
@@ -1709,6 +1785,17 @@ def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
     if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
         return ""
     return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
+
+
+def registered_output_payload_binds_output_path(
+    payloads: Sequence[Mapping[str, object]],
+    output_path: str,
+) -> bool:
+    for item in payloads:
+        value, present = _registered_output_value_for_path(item, output_path)
+        if present and not _is_empty_output_value(value):
+            return True
+    return False
 
 
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:

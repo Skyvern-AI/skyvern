@@ -165,7 +165,11 @@ function chatUi() {
 async function renderChat() {
   const view = render(chatUi());
   await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
+    expect(
+      screen.getByPlaceholderText(
+        /Message Skyvern Copilot|Ask Copilot to build/,
+      ),
+    ).toBeTruthy(),
   );
   return view;
 }
@@ -182,6 +186,19 @@ const runOutcomeFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
   workflow_run_block_ids: ["wrb_1"],
   block_labels: ["block_1"],
   verdict: "evaluating",
+  iteration: 0,
+  timestamp: "2026-06-10T00:00:00Z",
+  ...overrides,
+});
+
+const blockProgressFrame = (
+  overrides: Partial<Record<string, unknown>> = {},
+) => ({
+  type: "block_progress",
+  workflow_run_block_id: "wrb_1",
+  block_label: "block_1",
+  block_type: "code",
+  status: "running",
   iteration: 0,
   timestamp: "2026-06-10T00:00:00Z",
   ...overrides,
@@ -213,13 +230,15 @@ afterEach(() => {
   cleanup();
 });
 
-describe("WorkflowCopilotChat — recorded-action fetch wiring", () => {
-  it("fetches the run timeline exactly once when a run_outcome frame arrives", async () => {
+describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
+  it("starts a live poll from the first block_progress that carries a run id", async () => {
     await renderChat();
     await submit("build a workflow");
 
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "" } });
-    streamCalls[0]!.onMessage(runOutcomeFrame());
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ workflow_run_id: "wr_1", status: "running" }),
+    );
 
     await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
     expect(timelineGet.mock.calls[0]![0]).toBe(
@@ -227,22 +246,81 @@ describe("WorkflowCopilotChat — recorded-action fetch wiring", () => {
     );
   });
 
-  it("does not re-fetch for a second run_outcome frame carrying the same run id", async () => {
-    await renderChat();
-    await submit("build a workflow");
+  it("polls the timeline repeatedly while the run stays live", async () => {
+    // Call through so React/testing-library timers keep working; we only need
+    // to capture the registered callback to drive it deterministically.
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    try {
+      await renderChat();
+      await submit("build a workflow");
 
-    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "evaluating" }));
-    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      streamCalls[0]!.onMessage(
+        blockProgressFrame({ workflow_run_id: "wr_1" }),
+      );
+      // Immediate fetch on the first sighting.
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 2500);
 
-    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
-    // Give any accidental second fetch a chance to fire before asserting.
-    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      // Drive the registered interval callback: each tick re-fetches (the
+      // reducer merges by actionId, so repeated fetches never duplicate rows).
+      const tick = setIntervalSpy.mock.calls.find((c) => c[1] === 2500)![0] as (
+        ...args: unknown[]
+      ) => void;
+      tick();
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(2));
+      tick();
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(3));
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
-  it("never fetches when the run_outcome frame carries an empty workflow_run_id", async () => {
+  it("converges with a final fetch and stops polling on a terminal run_outcome", async () => {
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval");
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    try {
+      await renderChat();
+      await submit("build a workflow");
+
+      streamCalls[0]!.onMessage(
+        blockProgressFrame({ workflow_run_id: "wr_1" }),
+      );
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      const idx = setIntervalSpy.mock.calls.findIndex((c) => c[1] === 2500);
+      const intervalId = setIntervalSpy.mock.results[idx]!.value;
+
+      // Terminal verdict: one convergent fetch, then the interval is cleared.
+      streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(2));
+      expect(clearIntervalSpy).toHaveBeenCalledWith(intervalId);
+    } finally {
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+    }
+  });
+
+  it("falls back to run_outcome(evaluating) when block_progress carries no run id", async () => {
     await renderChat();
     await submit("build a workflow");
 
+    // Old backend: block_progress has no run id, so no poll can start yet.
+    streamCalls[0]!.onMessage(blockProgressFrame({ status: "running" }));
+    streamCalls[0]!.onMessage(blockProgressFrame({ status: "completed" }));
+    expect(timelineGet).not.toHaveBeenCalled();
+
+    // The run id first arrives on run_outcome — the poll starts there.
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "evaluating" }));
+    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+    expect(timelineGet.mock.calls[0]![0]).toBe(
+      "/workflows/wpid_1/runs/wr_1/timeline",
+    );
+  });
+
+  it("never fetches when frames carry an empty workflow_run_id", async () => {
+    await renderChat();
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "" }));
     streamCalls[0]!.onMessage(runOutcomeFrame({ workflow_run_id: "" }));
 
     expect(timelineGet).not.toHaveBeenCalled();
@@ -253,8 +331,16 @@ describe("WorkflowCopilotChat — recorded-action fetch wiring", () => {
     await renderChat();
     await submit("build a workflow");
 
-    streamCalls[0]!.onMessage(runOutcomeFrame());
+    // Cover every entry point: the early poll start, the evaluating fallback,
+    // and the terminal convergence fetch must all stay inert flag-off.
+    streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "evaluating" }));
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
 
+    // The terminal fetch is async (awaits getClient), so flush pending
+    // microtasks before asserting it never fired — a synchronous assert would
+    // pass even if the guard were missing.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(timelineGet).not.toHaveBeenCalled();
   });
 
@@ -426,7 +512,9 @@ describe("WorkflowCopilotChat — recorded-action fetch wiring", () => {
     fireEvent.click(
       within(statusRegion).getByRole("button", { expanded: false }),
     );
-    fireEvent.click(within(statusRegion).getByText("block_1"));
+    // uxV1 is on by default in this file, so the row's primary text is the
+    // humanized label ("block_1" -> "Block 1"), not the raw block label.
+    fireEvent.click(within(statusRegion).getByText("Block 1"));
 
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
   });

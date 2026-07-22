@@ -22,3 +22,25 @@ async def test_browser_session_response_supports_vnc_when_browser_address_is_set
     response = await BrowserSessionResponse.from_browser_session(session)
 
     assert response.vnc_streaming_supported is True
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_never_exposes_upstream_routing_fields() -> None:
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="running",
+        browser_address="wss://proxy.example/pbs_123/token/devtools/browser/test",
+        upstream_cdp_url="ws://10.0.0.7:9222/devtools/browser/test",
+        browser_vendor="websocket",
+        created_at=now,
+        modified_at=now,
+    )
+
+    response = await BrowserSessionResponse.from_browser_session(session)
+
+    serialized = response.model_dump_json()
+    for leaked in ("10.0.0.7", "upstream_cdp_url", "browser_vendor"):
+        assert leaked not in serialized
+    assert response.browser_address == "wss://proxy.example/pbs_123/token/devtools/browser/test"

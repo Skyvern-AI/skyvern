@@ -14,6 +14,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_prof
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -444,6 +445,7 @@ class BlockType(StrEnum):
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
+    EMAIL_INBOX = "email_inbox"
 
 
 class AIFallbackMode(StrEnum):
@@ -506,6 +508,15 @@ class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
     GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
+
+
+class FileDownloadTarget(StrEnum):
+    WEBSITE = "website"
+    S3 = "s3"
+    AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
 
 
 class FileUploadDestination(BaseModel):
@@ -533,6 +544,14 @@ class FileUploadDestination(BaseModel):
 
     google_access_token: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -599,6 +618,8 @@ class CredentialParameterYAML(ParameterYAML):
     credential_id: str
     credential_ids: list[str] | None = None
     selection_strategy: str | None = None
+    fallback_credential_ids: list[str] | None = None
+    fallback_trigger: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -916,6 +937,18 @@ class FileUploadBlockYAML(BlockYAML):
     azure_folder_path: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
 
 
@@ -1039,6 +1072,7 @@ class LoginBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
     skip_saved_profile: bool = False
 
 
@@ -1064,6 +1098,27 @@ class HumanInteractionBlockYAML(BlockYAML):
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
+    download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_blob_container_name: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    path: str | None = None
+    prompt: str | None = None
+    continue_on_empty: bool = False
     navigation_goal: str
     url: str | None = None
     title: str = ""
@@ -1244,6 +1299,20 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class EmailInboxBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
+    email_client: Literal["gmail", "outlook"]
+    credential_id: str | None = None
+    folder: str | None = None
+    prompt: str | None = None
+    sender: str | None = None
+    subject: str | None = None
+    newer_than_days: int | None = None
+    max_results: int = 25
+    include_body: bool = True
+    parameter_keys: list[str] | None = None
+
+
 class GoogleSheetsWriteBlockYAML(BlockYAML):
     block_type: Literal[BlockType.GOOGLE_SHEETS_WRITE] = BlockType.GOOGLE_SHEETS_WRITE  # type: ignore
     spreadsheet_url: str
@@ -1300,6 +1369,7 @@ BLOCK_YAML_SUBCLASSES = (
     | SplitPdfBlockYAML
     | WorkflowTriggerBlockYAML
     | GoogleSheetsReadBlockYAML
+    | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
@@ -1366,7 +1436,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
-    max_screenshot_scrolls: int | None = None
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None

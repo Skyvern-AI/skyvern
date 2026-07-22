@@ -209,9 +209,9 @@
               "developers/self-hosted/docker",
               "developers/self-hosted/llm-configuration",
               "developers/self-hosted/browser",
-              "developers/self-hosted/proxy",
               "developers/self-hosted/kubernetes",
               "developers/self-hosted/storage",
+              "developers/self-hosted/google-integrations",
               "integrations/local-llms"
             ]
           }

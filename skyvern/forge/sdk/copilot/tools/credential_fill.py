@@ -160,6 +160,11 @@ async def _resolve_credential_fill_value(
         register_secret_scrub_value(copilot_ctx, value)
     if not value:
         return None, "", f"Credential `{credential_id}` has no `{field}` value."
+    copilot_ctx.scouted_credential_field_inventory_by_credential_id[credential_id] = frozenset(
+        field_name
+        for field_name, field_value in (("username", credential.username), ("password", credential.password))
+        if field_value
+    )
     return value, credential_item.name, None
 
 

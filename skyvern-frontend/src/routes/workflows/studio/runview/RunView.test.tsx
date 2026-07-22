@@ -11,10 +11,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneViewToggles } from "./RunPaneHeader";
 import { RunView } from "./RunView";
 
@@ -44,6 +46,11 @@ vi.mock("../../workflowRun/WorkflowRunCode", () => ({
 }));
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: () => null,
+}));
+vi.mock("@/routes/tasks/components/tagging/RunTagsEditor", () => ({
+  RunTagsEditor: ({ workflowRunId }: { workflowRunId: string }) => (
+    <div data-testid="run-tags-editor" data-workflow-run-id={workflowRunId} />
+  ),
 }));
 // Radix ScrollArea needs ResizeObserver, which jsdom doesn't provide.
 vi.mock("@/components/ui/scroll-area", () => ({
@@ -223,6 +230,7 @@ function LocationSpy() {
 function renderRunView(
   props: Partial<Parameters<typeof RunView>[0]> = {},
   initialEntry = "/",
+  compact = false,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -234,9 +242,12 @@ function renderRunView(
       <MemoryRouter initialEntries={[initialEntry]}>
         {/* The toggles live in the pane header (StudioShell); render them
             alongside the body, under a TooltipProvider, the way the shell
-            composes them. */}
+            composes them. Only headerExtras (the toggles) sit under the
+            compact context in production (StudioShell.tsx), not the body. */}
         <TooltipProvider delayDuration={0}>
-          <RunPaneViewToggles />
+          <StudioPaneCompactContext.Provider value={compact}>
+            <RunPaneViewToggles />
+          </StudioPaneCompactContext.Provider>
           <RunView workflowRunId="wr_1" {...props} />
         </TooltipProvider>
         <LocationSpy />
@@ -260,6 +271,13 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
+  test("does not render run tags in Studio Overview", () => {
+    seedCompletedRun();
+    const { queryByTestId } = renderRunView();
+
+    expect(queryByTestId("run-tags-editor")).toBeNull();
+  });
+
   test("defaults to the Timeline view with the timeline and step detail", () => {
     seedForLoopRun();
     const { container } = renderRunView();
@@ -268,6 +286,8 @@ describe("RunView view toggles", () => {
     expect(scope.getByRole("group", { name: "Run view" })).not.toBeNull();
     // The timeline tree is visible by default (loop row present).
     expect(scope.queryAllByText("checkout-loop").length).toBeGreaterThan(0);
+    // Studio opts into label search (legacy run view does not).
+    expect(scope.getByRole("button", { name: "Search blocks" })).not.toBeNull();
   });
 
   test("the Timeline view leads with the summary meta line", () => {
@@ -338,6 +358,33 @@ describe("RunView view toggles", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
+  });
+
+  test("definition block prompts count as run inputs", () => {
+    seedCompletedRun({
+      workflow: {
+        workflow_definition: {
+          blocks: [
+            {
+              block_type: "navigation",
+              label: "navigation block",
+              navigation_goal: "Navigate to the next synthetic step",
+            },
+          ],
+          finally_block_label: null,
+        },
+      },
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+
+    expect(scope.queryByText("navigation block")).not.toBeNull();
+    expect(
+      scope.queryByText("Navigate to the next synthetic step"),
+    ).not.toBeNull();
+    expect(scope.queryByText("No inputs for this run")).toBeNull();
   });
 });
 
@@ -508,6 +555,24 @@ describe("RunView failure banner", () => {
 
     expect(scope.queryByText("canceled by user")).toBeNull();
   });
+
+  test("hides the run failure banner outside the Timeline view", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Login page rejected the credentials",
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    // Visible on the default Timeline view.
+    expect(
+      scope.getByText("Login page rejected the credentials"),
+    ).not.toBeNull();
+
+    // Switching to another tab hides the run-level failure banner.
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+    expect(scope.queryByText("Login page rejected the credentials")).toBeNull();
+  });
 });
 
 describe("RunView live affordances", () => {
@@ -565,6 +630,64 @@ describe("RunView iteration selection", () => {
   }, 20_000);
 });
 
+describe("RunView timeline → editor jump", () => {
+  function seedRunWithBlock(label: string) {
+    mocks.timeline = [
+      buildBlockItem(buildBlock({ workflow_run_block_id: "wrb_jump", label })),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  function registerHandle() {
+    const focusBlock = vi.fn();
+    useWorkflowBlockSearchStore.getState().registerHandle({
+      getTargets: () => [
+        { nodeId: "node-jump", label: "jump-target-block", blockType: null },
+      ],
+      focusBlock,
+    });
+    return focusBlock;
+  }
+
+  function clickBlock(container: HTMLElement) {
+    const [blockButton] = within(container).getAllByText("jump-target-block");
+    if (!blockButton) {
+      throw new Error("timeline block did not render");
+    }
+    fireEvent.click(blockButton);
+  }
+
+  afterEach(() => {
+    useWorkflowBlockSearchStore.getState().registerHandle(null);
+  });
+
+  test("clicking a timeline block jumps the editor when the editor pane is open", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=editor,overview");
+    clickBlock(container);
+
+    expect(focusBlock).toHaveBeenCalledWith("node-jump");
+  });
+
+  test("clicking a timeline block does not jump when the editor pane is closed", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=overview");
+    clickBlock(container);
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
+});
+
 describe("RunView output signals", () => {
   test("surfaces run errors, error codes, and rich downloaded files", () => {
     seedCompletedRun({
@@ -605,6 +728,23 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("confidence_float")).toBeNull();
     expect(scope.getByText("Downloaded files")).not.toBeNull();
     expect(scope.getByText("report.pdf")).not.toBeNull();
+  });
+
+  test("surfaces the full run outputs below extracted information", () => {
+    seedCompletedRun({
+      outputs: {
+        extracted_information: { answer: 42 },
+        additional_output: "full-run-only",
+      },
+    });
+
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+
+    expect(scope.getByText("Extracted information")).not.toBeNull();
+    expect(scope.getByText("Run outputs")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
@@ -16,6 +17,14 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_EVIDENCE_SOURCE_KEY,
+    CONSENT_OBSTRUCTION_KIND,
+    ChallengeEvidenceSource,
+    interactive_challenge_controls,
+    vision_challenge_carrier,
+)
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.reached_download_target import (
     NAV_TARGET_DOWNLOAD_KIND_KEY,
     classify_download_affordance,
@@ -46,6 +55,10 @@ _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "recor
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
 _MAX_RESULT_CONTAINERS = 8
+_MAX_KEY_VALUE_RELATIONS = 24
+_MAX_REVEAL_KEY_VALUE_RELATIONS = 8
+_MAX_TABLE_HEADERS = 12
+_MAX_RESULT_SAMPLE_ROWS = 5
 _MAX_NAVIGATION_TARGETS = 20
 _MAX_SELECT_OPTIONS = 30
 _MAX_CHALLENGE_CONTROLS = 8
@@ -127,20 +140,6 @@ def _challenge_kind(indicators: list[str]) -> str:
     return "unknown" if indicators else "none"
 
 
-# Tags that carry challenge-vendor markup without rendering a widget. A passive
-# script/meta tag ships on every page behind some CDNs, so it can trigger the
-# visual fallback but never assert human verification by itself.
-_PASSIVE_CHALLENGE_TAGS: frozenset[str] = frozenset({"script", "noscript", "style", "link", "meta"})
-
-
-def interactive_challenge_controls(challenge_controls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    return [
-        control
-        for control in challenge_controls or []
-        if isinstance(control, dict) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
-    ]
-
-
 def _challenge_state(
     indicators: list[str],
     *,
@@ -154,7 +153,7 @@ def _challenge_state(
     # asserting human verification requires a rendered challenge control or a
     # later vision confirmation.
     semantic_challenge = bool(interactive_challenge_controls(challenge_controls))
-    return {
+    state = {
         "detected": detected,
         "kind": _challenge_kind(indicators),
         "source": source if detected else "",
@@ -164,6 +163,9 @@ def _challenge_state(
         "gates_submit_controls": bool(semantic_challenge and gated_controls),
         "gated_submit_controls": gated_controls[:5] if detected else [],
     }
+    if semantic_challenge:
+        state[CHALLENGE_EVIDENCE_SOURCE_KEY] = ChallengeEvidenceSource.CHALLENGE_STATE.value
+    return state
 
 
 def _control_disabled(node: Any) -> bool:
@@ -201,14 +203,16 @@ def _evidence_metadata(
     *,
     forms: list[dict[str, Any]] | None = None,
     challenge_controls: list[dict[str, Any]] | None = None,
+    reveal_relations_truncated: bool = False,
 ) -> dict[str, Any]:
     gated_controls = _gated_submit_controls(forms or [])
+    inspection_warnings = ["reveal_relations_truncated"] if reveal_relations_truncated else []
     return {
         "evidence_sources": [DOM_EVIDENCE_SOURCE],
         "screenshot_used": False,
         "visual_evidence_summary": "",
         "visual_evidence_omissions": [],
-        "inspection_warnings": [],
+        "inspection_warnings": inspection_warnings,
         "challenge_state": _challenge_state(
             indicators or [],
             gated_submit_controls=gated_controls,
@@ -260,11 +264,6 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
 
-# The vision classifier's typed non-challenge obstruction kind: a consent dialog
-# is dismissed, not solved, so it must never promote challenge state.
-CONSENT_OBSTRUCTION_KIND = "cookie_consent"
-
-
 def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
     if visual_summary.get("challenge_detected") is not True:
         return False
@@ -313,6 +312,8 @@ def merge_visual_composition_evidence(
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
         challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
+        if vision_challenge_carrier(visual_summary):
+            challenge_state.setdefault(CHALLENGE_EVIDENCE_SOURCE_KEY, ChallengeEvidenceSource.VISION.value)
         if challenge_confirmed:
             challenge_state["detected"] = True
             challenge_state["requires_human_verification"] = True
@@ -599,7 +600,7 @@ def _post_run_observed_url_goto_error(
 
     labels = ", ".join(block["label"] for block in offending[:5])
     return (
-        "Workflow validation failed: the draft is trying to persist a post-run browser URL as a new goto_url "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}the draft is trying to persist a post-run browser URL as a new goto_url "
         "block after an incomplete or budgeted run. That URL may encode record-specific, result-page, or "
         "session state. Keep the reusable entrypoint and verified upstream blocks, then either extract from "
         "the observed current page, split or replace the budgeted frontier into smaller reusable UI actions, "
@@ -646,6 +647,43 @@ def has_actionable_steer_content(evidence: dict[str, Any]) -> bool:
         return True
     clickable_controls = evidence.get("clickable_controls")
     return isinstance(clickable_controls, list) and bool(clickable_controls)
+
+
+def has_witnessed_value_content(evidence: dict[str, Any]) -> bool:
+    """True when the capture carries binder-consumable rendered value content under the mint's own
+    witnesses: a key_value_relations entry with non-empty value_text, or a result_containers sample-row
+    cell with text. Truncated or warned captures void the matching channel, mirroring the mint."""
+    warnings = evidence.get("inspection_warnings")
+    if isinstance(warnings, list) and warnings:
+        return False
+    if evidence.get("key_value_relations_truncated") is not True:
+        relations = evidence.get("key_value_relations")
+        if isinstance(relations, list):
+            for relation in relations:
+                if not isinstance(relation, dict):
+                    continue
+                value_text = relation.get("value_text")
+                if isinstance(value_text, str) and value_text.strip():
+                    return True
+    if evidence.get("result_containers_truncated") is not True:
+        containers = evidence.get("result_containers")
+        if isinstance(containers, list):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                rows = container.get("rows")
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    cells = row.get("cells")
+                    if not isinstance(cells, list):
+                        continue
+                    for cell in cells:
+                        if isinstance(cell, dict) and cell.get("has_text") is True:
+                            return True
+    return False
 
 
 def _is_scout_interaction_evidence(evidence: dict[str, Any]) -> bool:
@@ -1075,14 +1113,14 @@ def composition_page_evidence_error(
             )
             if string_step is not None:
                 return (
-                    "Workflow validation failed: a block_observation_refs entry uses observation_step "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block_observation_refs entry uses observation_step "
                     f"{string_step!r} as a string. Pass the integer observation_step returned by "
                     "inspect_page_for_composition or evaluate for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             if _required_observation_ref_missing(block, block_observation_refs):
                 return (
-                    "Workflow validation failed: a click-reached block requires a block_observation_refs entry. "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a click-reached block requires a block_observation_refs entry. "
                     "Pass an interaction- or post_run-reached observation_step for click-reached blocks before "
                     "composing them. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
@@ -1090,7 +1128,7 @@ def composition_page_evidence_error(
             if wrong_reached_via is not None:
                 step, reached_via = wrong_reached_via
                 return (
-                    "Workflow validation failed: a block references observation_step "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{step}, but that observed page was reached via {reached_via!r}. "
                     "Pass an interaction- or post_run-reached observation_step for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
@@ -1103,14 +1141,14 @@ def composition_page_evidence_error(
                     else "that observation step was not found in flow evidence"
                 )
                 return (
-                    "Workflow validation failed: a block references observation_step "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{missing_step}, but {missing_reason}. "
                     "Inspect or evaluate the reached page again and pass the new observation_step in "
                     "block_observation_refs before composing page-dependent blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             return (
-                "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
+                f"{INTERNAL_VALIDATION_FAILURE_PREFIX}page-dependent build blocks need observed page evidence before they are "
                 f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
                 "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
                 f"Offending blocks: {_format_page_block_findings([block])}"
@@ -1131,6 +1169,9 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "forms": [],
         "navigation_targets": [],
         "result_containers": [],
+        "result_containers_truncated": False,
+        "key_value_relations": [],
+        "key_value_relations_truncated": False,
         **_clickable_controls_channel([]),
         "visible_text_excerpt": "",
         "anti_bot_indicators": [],
@@ -1372,7 +1413,7 @@ def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dic
     for node in candidates:
         if len(controls) >= _MAX_CLICKABLE_CONTROLS:
             break
-        tag_name = str(getattr(node, "name", "") or "").lower()
+        tag_name = str(node.name or "").lower()
         if tag_name in {"script", "style", "noscript"}:
             continue
         if hasattr(node, "find_parent") and node.find_parent("form") is not None:
@@ -1471,14 +1512,134 @@ def _result_row_text_is_content(text: str) -> bool:
     return bool(normalized) and not any(pattern in normalized for pattern in _EMPTY_RESULT_TEXT_PATTERNS)
 
 
-def _result_container_entry(node: Any) -> dict[str, Any]:
-    tag_name = str(getattr(node, "name", "") or "").lower()
+def _selector_match_count(soup: Any, selector: str) -> int:
+    try:
+        return len(soup.select(selector))
+    except Exception:
+        return 0
+
+
+def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool, bool]:
+    relations: list[dict[str, Any]] = []
+    truncated = False
+    for node in soup.find_all(True):
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        children = [child for child in node.find_all(recursive=False) if child.name]
+        if len(children) != 2:
+            continue
+        if children[0].find(True) is not None:
+            continue
+        key_text = _schema_text(_node_text(children[0]), 120)
+        value_text = _schema_text(_node_text(children[1]), 240)
+        if not key_text or not value_text or key_text == value_text:
+            continue
+        if len(relations) >= _MAX_KEY_VALUE_RELATIONS:
+            truncated = True
+            break
+        selector = _selector_for(node)[:160]
+        match_count = _selector_match_count(soup, selector)
+        if match_count <= 0:
+            continue
+        matches = soup.select(selector)
+        try:
+            position = matches.index(node)
+        except ValueError:
+            continue
+        relations.append(
+            {
+                "key_text": key_text,
+                "value_text": value_text,
+                "container_selector": selector,
+                "container_match_count": match_count,
+                "container_position": position,
+                "value_child_index": 1,
+                "direct_child_count": len(children),
+                "visible": True,
+                "value_visible": True,
+            }
+        )
+    reveal_truncated = _append_reveal_shape_relations(soup, relations)
+    return relations, truncated, reveal_truncated
+
+
+def _matches_result_hint_token(node: Any) -> bool:
+    node_id = str(node.get("id") or "") if hasattr(node, "get") else ""
+    raw = f"{node_id} {' '.join(_classes_for(node))}".lower()
+    return any(token in _RESULT_CONTAINER_HINTS for token in re.split(r"[^a-z0-9]+", raw) if token)
+
+
+def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -> bool:
+    reveal_count = 0
+    reveal_truncated = False
+    for node in soup.find_all(True):
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        if not _matches_result_hint_token(node):
+            continue
+        children = [child for child in node.find_all(recursive=False) if child.name]
+        if len(children) < 3 or len(children) > 6:
+            continue
+        if any(child.find(True) is not None for child in children):
+            continue
+        heading = children[0]
+        if str(getattr(heading, "name", "") or "").lower() not in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            continue
+        key_text = _schema_text(_node_text(heading), 240)
+        if not key_text or len(key_text) > 120:
+            continue
+        selector = _selector_for(node)[:160]
+        match_count = _selector_match_count(soup, selector)
+        if match_count <= 0:
+            continue
+        try:
+            position = soup.select(selector).index(node)
+        except ValueError:
+            continue
+        value_leaves: list[tuple[int, str]] = []
+        for index in range(1, len(children)):
+            value_text = _schema_text(_node_text(children[index]), 240)
+            if not value_text or key_text == value_text:
+                continue
+            value_leaves.append((index, value_text))
+        reveal_key_text = key_text if len(value_leaves) == 1 else ""
+        capped = False
+        for index, value_text in value_leaves:
+            if len(relations) >= _MAX_KEY_VALUE_RELATIONS or reveal_count >= _MAX_REVEAL_KEY_VALUE_RELATIONS:
+                reveal_truncated = True
+                capped = True
+                break
+            relations.append(
+                {
+                    "key_text": reveal_key_text,
+                    "value_text": value_text,
+                    "container_selector": selector,
+                    "container_match_count": match_count,
+                    "container_position": position,
+                    "value_child_index": index,
+                    "direct_child_count": len(children),
+                    "visible": True,
+                    "value_visible": True,
+                }
+            )
+            reveal_count += 1
+        if capped:
+            break
+    return reveal_truncated
+
+
+def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
+    tag_name = str(node.name or "").lower()
     node_id = str(node.get("id") or "")
     selector = _selector_for(node)[:160]
     entry: dict[str, Any] = {
         "tag": tag_name,
         "id": node_id[:120],
         "selector": selector,
+        "selector_match_count": _selector_match_count(soup, selector),
+        "visible": True,
     }
     if tag_name == "table":
         entry["row_selector"] = f"{selector} tbody tr"
@@ -1492,10 +1653,37 @@ def _result_container_entry(node: Any) -> dict[str, Any]:
         data_rows = [row for row in node.select("tbody tr") if row.find("td") is not None]
         if not data_rows:
             data_rows = [row for row in node.select("tr") if row.find("td") is not None]
+        headers = [
+            {"text": _schema_text(_node_text(header), 120), "column_index": index}
+            for index, header in enumerate(node.select("thead th")[:_MAX_TABLE_HEADERS])
+            if _schema_text(_node_text(header), 120)
+        ]
+        if headers:
+            entry["headers"] = headers
+        entry["row_count"] = len(data_rows)
+        entry["rows_truncated"] = len(data_rows) > _MAX_RESULT_SAMPLE_ROWS
+        entry["span_free"] = node.select_one("th[colspan], th[rowspan], td[colspan], td[rowspan]") is None
+        entry["nested_table_free"] = node.find("table") is None
+        entry["rows"] = [
+            {
+                "row_index": row_index,
+                "visible": True,
+                "has_row_header": row.select_one(":scope > th") is not None,
+                "cells": [
+                    {
+                        "column_index": column_index,
+                        "visible": True,
+                        "has_text": bool(_node_text(_cell)),
+                        "text": _schema_text(_node_text(_cell), 120),
+                    }
+                    for column_index, _cell in enumerate(row.select(":scope > td")[:_MAX_TABLE_HEADERS])
+                ],
+            }
+            for row_index, row in enumerate(data_rows[:_MAX_RESULT_SAMPLE_ROWS])
+        ]
         sample_rows = [_schema_text(_node_text(row), 240) for row in data_rows]
         sample_rows = [row for row in sample_rows if _result_row_text_is_content(row)][:5]
         if sample_rows:
-            entry["row_count"] = len(sample_rows)
             entry["sample_rows"] = sample_rows
     else:
         text_excerpt = _schema_text(_node_text(node), 240)
@@ -1546,6 +1734,10 @@ def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
             )
         ).lower()
         if not any(pattern in identity for pattern in _ANTI_BOT_PATTERNS):
+            continue
+        # A widget inside a hidden ancestor (solved/stale challenge markup) may
+        # trigger the visual fallback but must not read as a rendered control.
+        if _is_hidden_modal_candidate(node):
             continue
         selector = _selector_for(node)[:160]
         if selector in seen_selectors:
@@ -1814,16 +2006,21 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         navigation_targets.append(nav_entry)
 
     result_containers: list[dict[str, Any]] = []
+    result_containers_truncated = False
     for node in all_nodes:
-        if len(result_containers) >= _MAX_RESULT_CONTAINERS:
-            break
         tag_name = str(getattr(node, "name", "") or "").lower()
         node_id = str(node.get("id") or "")
         class_value = node.get("class") or []
         class_text = " ".join(class_value) if isinstance(class_value, list) else str(class_value)
         result_identity = f"{node_id} {class_text}".lower()
         if tag_name == "table" or any(hint in result_identity for hint in _RESULT_CONTAINER_HINTS):
-            result_containers.append(_result_container_entry(node))
+            if len(result_containers) >= _MAX_RESULT_CONTAINERS:
+                result_containers_truncated = True
+                break
+            result_containers.append(_result_container_entry(node, soup=soup))
+
+    key_value_relations, key_value_relations_truncated, reveal_relations_truncated = _key_value_relations(soup)
+    reveal_relations_truncated = reveal_relations_truncated and not key_value_relations_truncated
 
     used_selectors: set[str] = set()
     for form in forms:
@@ -1858,6 +2055,9 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        "result_containers_truncated": result_containers_truncated,
+        "key_value_relations": key_value_relations,
+        "key_value_relations_truncated": key_value_relations_truncated,
         **_clickable_controls_channel(clickable_controls),
         "visible_text_excerpt": _schema_text(visible_text, _MAX_VISIBLE_TEXT_EXCERPT_CHARS),
         "anti_bot_indicators": anti_bot_indicators,
@@ -1870,7 +2070,12 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
+        **_evidence_metadata(
+            anti_bot_indicators,
+            forms=forms,
+            challenge_controls=challenge_controls,
+            reveal_relations_truncated=reveal_relations_truncated,
+        ),
     }
 
 
@@ -1996,15 +2201,72 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
             "tag": tag_name,
             "id": _structured_str(node.get("id"))[:120],
             "selector": selector,
+            "selector_match_count": node.get("selector_match_count")
+            if isinstance(node.get("selector_match_count"), int)
+            else 0,
+            "visible": node.get("visible") is True,
         }
+        headers: list[dict[str, Any]] = []
+        raw_headers = node.get("headers")
+        if isinstance(raw_headers, list):
+            for header in raw_headers[:_MAX_TABLE_HEADERS]:
+                if not isinstance(header, dict):
+                    continue
+                text = _schema_text(_structured_str(header.get("text")), 120)
+                column_index = header.get("column_index")
+                if not text or not isinstance(column_index, int) or isinstance(column_index, bool) or column_index < 0:
+                    continue
+                headers.append({"text": text, "column_index": column_index})
+        if headers:
+            entry["headers"] = headers
+        row_count = node.get("row_count")
+        if isinstance(row_count, int) and not isinstance(row_count, bool) and row_count >= 0:
+            entry["row_count"] = row_count
+        entry["rows_truncated"] = node.get("rows_truncated") is True
+        entry["span_free"] = node.get("span_free") is True
+        entry["nested_table_free"] = node.get("nested_table_free") is True
+        rows: list[dict[str, Any]] = []
+        raw_rows = node.get("rows")
+        if isinstance(raw_rows, list):
+            for raw_row in raw_rows[:_MAX_RESULT_SAMPLE_ROWS]:
+                if not isinstance(raw_row, dict):
+                    continue
+                row_index = raw_row.get("row_index")
+                if not isinstance(row_index, int) or isinstance(row_index, bool) or row_index < 0:
+                    continue
+                cells: list[dict[str, Any]] = []
+                raw_cells = raw_row.get("cells")
+                if isinstance(raw_cells, list):
+                    for raw_cell in raw_cells[:_MAX_TABLE_HEADERS]:
+                        if not isinstance(raw_cell, dict):
+                            continue
+                        column_index = raw_cell.get("column_index")
+                        if not isinstance(column_index, int) or isinstance(column_index, bool) or column_index < 0:
+                            continue
+                        cells.append(
+                            {
+                                "column_index": column_index,
+                                "visible": raw_cell.get("visible") is True,
+                                "has_text": raw_cell.get("has_text") is True,
+                                "text": _schema_text(_structured_str(raw_cell.get("text")), 120),
+                            }
+                        )
+                rows.append(
+                    {
+                        "row_index": row_index,
+                        "visible": raw_row.get("visible") is True,
+                        "has_row_header": raw_row.get("has_row_header") is True,
+                        "cells": cells,
+                    }
+                )
+        entry["rows"] = rows
         sample_rows = [
             _schema_text(_structured_str(row), 240)
             for row in (node.get("sample_rows") or [])
             if isinstance(row, str) and _result_row_text_is_content(row)
         ][:5]
         if sample_rows:
-            row_count = node.get("row_count")
-            entry["row_count"] = row_count if isinstance(row_count, int) and row_count > 0 else len(sample_rows)
+            entry.setdefault("row_count", len(sample_rows))
             entry["sample_rows"] = sample_rows
         text_excerpt = _schema_text(
             _structured_str(
@@ -2015,7 +2277,8 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
         if text_excerpt:
             entry["text_excerpt"] = text_excerpt
         if tag_name == "table" or node.get("is_table") is True:
-            entry["row_selector"] = f"{selector} tbody tr"
+            reported_row_selector = _structured_str(node.get("row_selector"))[:240]
+            entry["row_selector"] = reported_row_selector or f"{selector} tbody tr"
             entry["expand_toggle_candidates"] = [
                 f"{selector} tbody tr [aria-expanded]",
                 f'{selector} tbody tr [role="button"]',
@@ -2025,6 +2288,55 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
             ]
         containers.append(entry)
     return containers
+
+
+def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
+    relations: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return relations
+    for item in value[:_MAX_KEY_VALUE_RELATIONS]:
+        if not isinstance(item, dict):
+            continue
+        key_text = _schema_text(_structured_str(item.get("key_text")), 120)
+        selector = _structured_str(item.get("container_selector"))[:160]
+        match_count = item.get("container_match_count")
+        position = item.get("container_position")
+        child_index = item.get("value_child_index")
+        child_count = item.get("direct_child_count")
+        value_text = _schema_text(_structured_str(item.get("value_text")), 240)
+        if not selector or (not key_text and not value_text):
+            continue
+        if (
+            not isinstance(match_count, int)
+            or isinstance(match_count, bool)
+            or match_count < 0
+            or not isinstance(position, int)
+            or isinstance(position, bool)
+            or position < 0
+            or not isinstance(child_index, int)
+            or isinstance(child_index, bool)
+            or child_index < 0
+            or not isinstance(child_count, int)
+            or isinstance(child_count, bool)
+            or child_count <= child_index
+        ):
+            continue
+        if match_count <= position:
+            continue
+        relations.append(
+            {
+                "key_text": key_text,
+                "value_text": value_text,
+                "container_selector": selector,
+                "container_match_count": match_count,
+                "container_position": position,
+                "value_child_index": child_index,
+                "direct_child_count": child_count,
+                "visible": item.get("visible") is True,
+                "value_visible": item.get("value_visible") is True,
+            }
+        )
+    return relations
 
 
 def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
@@ -2148,6 +2460,10 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
     forms = forms[:_MAX_FORMS]
     navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
     result_containers = _structured_result_containers(data.get("result_containers"))
+    key_value_relations = _structured_key_value_relations(data.get("key_value_relations"))
+    reveal_relations_truncated = (
+        data.get("reveal_relations_truncated") is True and data.get("key_value_relations_truncated") is not True
+    )
     clickable_controls = _structured_clickable_controls(data.get("clickable_controls"))
     challenge_controls = _structured_challenge_controls(data.get("challenge_controls"))
     modal_overlays = _structured_modal_overlays(data.get("modal_overlays"))
@@ -2180,6 +2496,9 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        "result_containers_truncated": data.get("result_containers_truncated") is True,
+        "key_value_relations": key_value_relations,
+        "key_value_relations_truncated": data.get("key_value_relations_truncated") is True,
         **_clickable_controls_channel(clickable_controls),
         "visible_text_excerpt": visible_text,
         "anti_bot_indicators": anti_bot_indicators,
@@ -2192,5 +2511,10 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
+        **_evidence_metadata(
+            anti_bot_indicators,
+            forms=forms,
+            challenge_controls=challenge_controls,
+            reveal_relations_truncated=reveal_relations_truncated,
+        ),
     }

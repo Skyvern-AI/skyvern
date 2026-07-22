@@ -7,10 +7,12 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 import httpx
 import structlog
 
+from skyvern.exceptions import InvalidUrl
 from skyvern.forge import app
 
 LOG = structlog.get_logger()
@@ -88,6 +90,13 @@ async def deliver_webhook_with_retries(
     max_attempts: int = WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     base_delay_seconds: float = WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
 ) -> httpx.Response:
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        # Reject scheme-less/host-less targets before the outbound call so the
+        # failure is classified as invalid input rather than a raw
+        # httpx.UnsupportedProtocol from the transport.
+        raise InvalidUrl(url)
+
     last_response: httpx.Response | None = None
     last_exc: Exception | None = None
 

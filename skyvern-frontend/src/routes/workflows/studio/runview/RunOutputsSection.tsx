@@ -4,9 +4,12 @@ import {
   FileIcon,
 } from "@radix-ui/react-icons";
 
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 
 import { OverviewCodeBlock } from "./OverviewCodeBlock";
+import { OverviewField } from "./OverviewField";
+import { RunFieldValue } from "./RunFieldValue";
 
 export type RunOutputFile = { url: string; filename: string };
 export type RunOutputError = Record<string, unknown>;
@@ -14,6 +17,7 @@ export type RunOutputError = Record<string, unknown>;
 type RunOutputsSectionProps = {
   workflowRunId: string;
   workflowTitle?: string | null;
+  outputs: Record<string, unknown> | null;
   extractedInformation: Record<string, unknown> | null;
   files: RunOutputFile[];
   errors: RunOutputError[];
@@ -158,6 +162,7 @@ function RunErrorsPanel({ errors }: { errors: RunOutputError[] }) {
 export function RunOutputsSection({
   workflowRunId,
   workflowTitle,
+  outputs,
   extractedInformation,
   files,
   errors,
@@ -180,7 +185,16 @@ export function RunOutputsSection({
     return null;
   }
 
-  const extractedJson = JSON.stringify(extractedInformation ?? {});
+  // extracted_information has its own dedicated section above, so drop it from the
+  // per-block field list to avoid rendering it twice.
+  const outputFields = outputs
+    ? Object.entries(outputs).filter(([key]) => key !== "extracted_information")
+    : [];
+  // Gate the block on real per-field content or a persisted summary: an outputs
+  // bag holding only extracted_information yields no fields, and that content
+  // already renders in its dedicated section above — so an empty header +
+  // Summarize button would otherwise render over nothing.
+  const hasAgentRunOutputs = outputFields.length > 0 || summary !== null;
 
   return (
     <div className="flex flex-col gap-5">
@@ -208,13 +222,25 @@ export function RunOutputsSection({
       ) : null}
       {hasExtracted ? (
         <div className="flex flex-col gap-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            Extracted information
+          </span>
+          <OverviewCodeBlock
+            value={JSON.stringify(extractedInformation, null, 2)}
+            maxHeight="320px"
+          />
+        </div>
+      ) : null}
+      {hasAgentRunOutputs ? (
+        <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-muted-foreground">
-              Extracted information
+              Run outputs
             </span>
             <SummarizeOutput
+              key={`run:${workflowRunId}`}
               contextKey={`run:${workflowRunId}`}
-              outputJson={extractedJson}
+              outputJson={JSON.stringify(outputs)}
               workflowTitle={workflowTitle}
               hasSummary={summary !== null}
               onSummary={onSummary}
@@ -229,10 +255,15 @@ export function RunOutputsSection({
               {summary}
             </div>
           ) : null}
-          <OverviewCodeBlock
-            value={JSON.stringify(extractedInformation, null, 2)}
-            maxHeight="320px"
-          />
+          {outputFields.length > 0 ? (
+            <div className="flex flex-col gap-4">
+              {outputFields.map(([key, value]) => (
+                <OverviewField key={key} label={key}>
+                  <RunFieldValue value={value} label={key} />
+                </OverviewField>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {files.length > 0 ? (
@@ -242,7 +273,7 @@ export function RunOutputsSection({
           </span>
           <div className="flex flex-col gap-1">
             {files.map((file) => (
-              <a
+              <ArtifactDownloadLink
                 key={file.url}
                 href={file.url}
                 title={file.url}
@@ -252,7 +283,7 @@ export function RunOutputsSection({
                 <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate">{file.filename}</span>
                 <DownloadIcon className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
-              </a>
+              </ArtifactDownloadLink>
             ))}
           </div>
         </div>

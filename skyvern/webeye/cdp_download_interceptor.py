@@ -129,6 +129,23 @@ _FILENAME_PATH_SEPARATOR_RE = re.compile(r"[\\/]+")
 _FILENAME_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
+# Substrings that identify a CDP interception which was already resolved/cancelled, or whose
+# target/frame detached, before our async handler could respond — a benign race between
+# Fetch.requestPaused firing and us sending continue/fulfill (common for telemetry requests
+# cancelled by navigation). Retrying is futile; these must not surface as error-level failures.
+# Matched case-insensitively against the raised error message.
+_STALE_INTERCEPTION_ERROR_SUBSTRINGS = (
+    "invalid interceptionid",
+    "target closed",
+    "session closed",
+    "has been closed",
+)
+
+
+def _is_stale_interception_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(substr in message for substr in _STALE_INTERCEPTION_ERROR_SUBSTRINGS)
+
 
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
     """Convert CDP header list [{name, value}] to a lowercase-keyed dict (last value wins)."""
@@ -155,6 +172,60 @@ def _normalized_content_type(content_type: str) -> str:
 
 def _download_extension_for_content_type(content_type: str) -> str:
     return DOWNLOAD_EXTENSION_BY_MIME_TYPE.get(_normalized_content_type(content_type), "")
+
+
+_HTML_FILENAME_EXTENSIONS = frozenset({".html", ".htm", ".xhtml"})
+_HTML_START_TAG_RE = re.compile(rb"^<(?:html|head|body)(?:[\t\n\f\r ]|>)")
+
+
+def _body_starts_with_html(data: bytes) -> bool:
+    head = data[:4096].removeprefix(b"\xef\xbb\xbf").lstrip().lower()
+    while True:
+        if head.startswith(b"<!--"):
+            marker_end = head.find(b"-->")
+            if marker_end < 0:
+                return False
+            head = head[marker_end + 3 :].lstrip()
+            continue
+        if head.startswith(b"<?"):
+            marker_end = head.find(b"?>")
+            if marker_end < 0:
+                return False
+            head = head[marker_end + 2 :].lstrip()
+            continue
+        break
+    head = head[:64]
+    return head.startswith(b"<!doctype html") or bool(_HTML_START_TAG_RE.match(head))
+
+
+def _has_control_chars(text: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
+def _payload_is_html_login_masquerade(data: bytes, content_type: str, filename: str) -> bool:
+    """True when a download's bytes are an HTML document but the download does not claim to be HTML.
+
+    A session-gated download endpoint fetched without the browser's auth cookies answers with its
+    HTML login/session-gate page (HTTP 200) instead of the file. Saving that under the requested
+    binary name (e.g. ``*.zip``) yields a "successful" but corrupt download, so callers reject it.
+    A genuine binary payload or an honest ``.html`` download is left untouched.
+    """
+    # The body is the ground truth: sniff it rather than trusting Content-Type, so a real binary
+    # a server mislabels as text/html is not wrongly discarded.
+    if not _body_starts_with_html(data):
+        return False
+    suffix = Path(filename).suffix.lower()
+    if suffix in _HTML_FILENAME_EXTENSIONS:
+        return False
+    if suffix:
+        return True
+    if filename:
+        return True
+    # Nameless download: an HTML body only masquerades if the Content-Type still claims a
+    # non-HTML (binary) type. A nameless HTML-or-typeless response makes no binary claim, so
+    # saving the HTML is honest, not corrupt.
+    normalized_ct = _normalized_content_type(content_type)
+    return bool(normalized_ct) and "html" not in normalized_ct
 
 
 def normalize_download_filename(filename: str, content_type: str = "") -> str:
@@ -479,6 +550,28 @@ class CDPDownloadInterceptor:
         except Exception:
             LOG.warning("Error handling browser download event", exc_info=True)
 
+    async def _cookie_header_for_url(self, url: str) -> str:
+        """Build a Cookie header from the browser context's cookies applicable to ``url``.
+
+        The urllib fallback in ``_download_url_directly`` does not share the BrowserContext, so
+        without this it fetches unauthenticated and a session-gated endpoint answers with its
+        login page. Best-effort: returns "" if there is no context or cookies can't be read.
+        """
+        if self._browser_context is None:
+            return ""
+        try:
+            cookies = await self._browser_context.cookies(url)
+        except Exception as e:
+            LOG.debug("Could not read browser cookies for download fallback", url=url, error=str(e))
+            return ""
+        parts: list[str] = []
+        for cookie in cookies:
+            name, value = cookie.get("name") or "", cookie.get("value") or ""
+            # Skip control chars (CR/LF/NUL/DEL) so a stored value can't inject into the header line.
+            if name and not _has_control_chars(name) and not _has_control_chars(value):
+                parts.append(f"{name}={value}")
+        return "; ".join(parts)
+
     async def _download_url_directly(self, url: str, suggested_filename: str) -> None:
         """Download a URL directly via HTTP and save to the output directory.
 
@@ -512,10 +605,22 @@ class CDPDownloadInterceptor:
             except Exception as e:
                 LOG.debug("Playwright APIRequestContext download failed, trying urllib", url=url, error=str(e))
 
-        # Fallback: direct HTTP via urllib (works for pre-signed URLs)
+        # Fallback: direct HTTP via urllib (works for pre-signed URLs). This does not share the
+        # BrowserContext, so it must carry the session cookies itself — otherwise a session-gated
+        # endpoint answers an unauthenticated request with its login page (saved as a corrupt file).
         if data is None:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                cookie_header = await self._cookie_header_for_url(url)
+                if cookie_header:
+                    # Unredirected header: urllib's HTTPRedirectHandler copies req.headers but not
+                    # unredirected_hdrs across redirects, so the cookie reaches only the original host
+                    # and is never replayed to another domain (cross-host session-cookie leak).
+                    # Trade-off: a same-host redirect also drops the cookie; if that final hop is
+                    # session-gated it returns a login page, which the HTML-masquerade guard below
+                    # rejects instead of saving a corrupt file. Per-hop cookie replay is intentionally
+                    # not implemented — cross-host safety outweighs that narrow convenience.
+                    req.add_unredirected_header("Cookie", cookie_header)
                 ssl_ctx = ssl.create_default_context()
 
                 def _fetch() -> tuple[bytes, str]:
@@ -538,6 +643,19 @@ class CDPDownloadInterceptor:
                 url=url,
                 size=len(data),
                 max_size=MAX_FILE_SIZE_BYTES,
+            )
+            return
+
+        normalized_filename = normalize_download_filename(suggested_filename, content_type)
+        if _payload_is_html_login_masquerade(data, content_type, normalized_filename):
+            LOG.error(
+                "Direct download returned an HTML page for a non-HTML file; not saving "
+                "(likely an unauthenticated fetch landing on a login/session-gate page)",
+                url=url,
+                suggested_filename=normalized_filename,
+                content_type=content_type,
+                size=len(data),
+                method=method,
             )
             return
 
@@ -755,6 +873,18 @@ class CDPDownloadInterceptor:
             else:
                 await self._continue_response(cdp_session, request_id)
         except Exception as e:
+            if _is_stale_interception_error(e):
+                # The interception was resolved/cancelled or its target detached before we
+                # responded (SKY-11964). Retrying continue/fulfill would fail identically, so
+                # drop it quietly — real download flows aren't stalled by a request that no
+                # longer exists.
+                LOG.debug(
+                    "CDP interception went stale before response (benign race)",
+                    request_id=request_id,
+                    url=url,
+                    error=str(e),
+                )
+                return
             LOG.error(
                 "Error handling CDP request",
                 request_id=request_id,
@@ -875,8 +1005,17 @@ class CDPDownloadInterceptor:
         try:
             await self._fulfill_with_body(cdp_session, request_id, response_status, raw_response_headers, data)
         except Exception as e:
-            LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
-            # Can't continue response after body extraction, just log the error
+            # The file is already saved to disk at this point; only the browser-side replay failed.
+            # A stale interception here (target navigated/closed) is a benign race, not an error.
+            if _is_stale_interception_error(e):
+                LOG.debug(
+                    "fulfillRequest hit stale interception after download (benign race)",
+                    filename=filename,
+                    url=url,
+                    error=str(e),
+                )
+            else:
+                LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
 
     async def _fulfill_with_body(
         self,

@@ -12,10 +12,12 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
+import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
@@ -26,10 +28,12 @@ import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
   formatElapsed,
+  runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
 import { toReadableSearch } from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
+import { collectBlockPrompts } from "./blockPrompts";
 import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
@@ -40,6 +44,7 @@ import {
 } from "./RunOutputsSection";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunSummaryStrip } from "./RunSummaryStrip";
+import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -283,6 +288,9 @@ export function RunView({
   const runInputs = useMemo(() => {
     const definitionParameters =
       workflowRun?.workflow?.workflow_definition?.parameters;
+    const blockPrompts = collectBlockPrompts(
+      workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+    );
     const runParameters =
       (workflowRun?.parameters as Record<string, unknown> | undefined) ?? {};
     const parameters = getOrderedRunParameters(
@@ -305,7 +313,7 @@ export function RunView({
     pushMeta("Browser session", workflowRun?.browser_session_id);
     pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
-    return { parameters, meta };
+    return { parameters, blockPrompts, meta };
   }, [workflowRun]);
 
   // Task 2.0 runs carry their output (and any webhook failure) on task_v2,
@@ -317,14 +325,10 @@ export function RunView({
     null;
 
   const hasInputs =
-    runInputs.parameters.length > 0 || runInputs.meta.length > 0;
-  const hasOutputs =
-    runErrors.length > 0 ||
-    (extractedInformation != null &&
-      Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0 ||
-    observerOutput != null ||
-    webhookFailureReason != null;
+    runInputs.parameters.length > 0 ||
+    runInputs.blockPrompts.length > 0 ||
+    runInputs.meta.length > 0;
+  const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
@@ -341,7 +345,6 @@ export function RunView({
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
         />
-
         {provisioning ? (
           <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-slate-elevation2 px-3 py-1.5 text-xs text-muted-foreground">
             <ClockIcon className="h-3.5 w-3.5 shrink-0" />
@@ -349,7 +352,7 @@ export function RunView({
           </div>
         ) : null}
 
-        {failed && !failureDismissed ? (
+        {failed && !failureDismissed && view === "timeline" ? (
           <div className="shrink-0 rounded-lg border border-destructive/40 bg-slate-elevation1 p-4">
             <div className="flex items-start gap-2 text-sm font-semibold text-foreground">
               <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
@@ -396,48 +399,68 @@ export function RunView({
         {view === "timeline" ? (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
             <RunSummaryStrip workflowRun={workflowRun} elapsed={elapsed} />
-            <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
-              <div className="min-h-0 overflow-hidden">
-                <WorkflowRunTimeline
-                  workflowRunId={workflowRunId}
-                  hideLiveBadge
-                  activeItem={activeItem}
-                  activeIteration={activeIteration}
-                  onActionItemSelected={(item) => {
-                    pinFrame(item.action.action_id);
-                  }}
-                  onBlockItemSelected={(block) => {
-                    pinFrame(block.workflow_run_block_id);
-                  }}
-                  onThoughtItemSelected={(thought) => {
-                    pinFrame(thought.thought_id);
-                  }}
-                  onLiveStreamSelected={() => {
-                    pinFrame("stream");
-                  }}
-                  onIterationSelected={(loopBlock, iterationIndex) => {
-                    pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
-                  }}
-                />
-              </div>
-              <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
-                <WorkflowRunBlockDetail
-                  activeItem={activeItem}
-                  activeIteration={activeIteration}
-                  timeline={timeline ?? []}
-                  timelineReady={Boolean(timeline)}
-                  showDownloadedFiles
-                  workflowRunId={workflowRunId}
-                  onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
-                />
-              </div>
-            </div>
+            <ResizableTimelineSplit
+              className="flex-1"
+              top={
+                <div className="min-h-0 overflow-hidden">
+                  <WorkflowRunTimeline
+                    workflowRunId={workflowRunId}
+                    hideLiveBadge
+                    enableSearch
+                    activeItem={activeItem}
+                    activeIteration={activeIteration}
+                    onActionItemSelected={(item) => {
+                      pinFrame(item.action.action_id);
+                    }}
+                    onBlockItemSelected={(block) => {
+                      pinFrame(block.workflow_run_block_id);
+                      const handle =
+                        useWorkflowBlockSearchStore.getState().handle;
+                      if (!handle) {
+                        return;
+                      }
+                      const nodeId = resolveTimelineBlockJumpNodeId({
+                        editorOpen: studioPanes.includes("editor"),
+                        targets: handle.getTargets(),
+                        label: block.label,
+                      });
+                      if (nodeId) {
+                        handle.focusBlock(nodeId);
+                      }
+                    }}
+                    onThoughtItemSelected={(thought) => {
+                      pinFrame(thought.thought_id);
+                    }}
+                    onLiveStreamSelected={() => {
+                      pinFrame("stream");
+                    }}
+                    onIterationSelected={(loopBlock, iterationIndex) => {
+                      pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
+                    }}
+                  />
+                </div>
+              }
+              bottom={
+                <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
+                  <WorkflowRunBlockDetail
+                    activeItem={activeItem}
+                    activeIteration={activeIteration}
+                    timeline={timeline ?? []}
+                    timelineReady={Boolean(timeline)}
+                    showDownloadedFiles
+                    workflowRunId={workflowRunId}
+                    onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
+                  />
+                </div>
+              }
+            />
           </div>
         ) : view === "inputs" ? (
           <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">
             {hasInputs ? (
               <RunInputsSection
                 parameters={runInputs.parameters}
+                blockPrompts={runInputs.blockPrompts}
                 meta={runInputs.meta}
               />
             ) : (
@@ -452,6 +475,7 @@ export function RunView({
               <RunOutputsSection
                 workflowRunId={workflowRun.workflow_run_id}
                 workflowTitle={workflowRun.workflow?.title}
+                outputs={workflowRun.outputs}
                 extractedInformation={extractedInformation}
                 files={downloadedFiles}
                 errors={runErrors}

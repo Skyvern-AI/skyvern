@@ -23,6 +23,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
@@ -60,6 +61,7 @@ class RealBrowserState(BrowserState):
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
         release_driver_on_close: bool = False,
+        engine_selection: BrowserEngineSelection | None = None,
     ):
         self.__page = page
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
@@ -78,6 +80,10 @@ class RealBrowserState(BrowserState):
         # this state and must be released on close even when the remote
         # browser is left running.
         self.release_driver_on_close = release_driver_on_close
+        # The engine this state's driver was created with, pinned for the state's lifetime so
+        # reconnect starts the same engine and error classification stays this run's identity. None
+        # for states built outside the per-run seam (legacy/direct construction).
+        self.engine_selection = engine_selection
         # One-shot callbacks fired first inside ``close()``. Cleared after
         # firing so re-entry into ``close()`` is safe.
         self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
@@ -461,7 +467,12 @@ class RealBrowserState(BrowserState):
         stale_pw = self.pw
         self.browser_context = None
         await self.set_working_page(None)
-        self.pw = await async_playwright().start()
+        # Reconnect on the SAME engine this state was pinned to at creation; never silently switch
+        # engines underneath a live run. States built outside the per-run seam keep the stock driver.
+        if self.engine_selection is not None:
+            self.pw = await self.engine_selection.start_driver()
+        else:
+            self.pw = await async_playwright().start()
         try:
             await self.check_and_fix_state(
                 proxy_location=proxy_location,

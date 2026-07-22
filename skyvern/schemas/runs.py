@@ -18,6 +18,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -169,7 +170,7 @@ class TaskRunRequest(BaseModel):
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
-    max_screenshot_scrolls: int | None = Field(
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
@@ -191,9 +192,16 @@ class TaskRunRequest(BaseModel):
             return None
         return normalize_run_with(v)
 
-    @field_validator("url", "webhook_url", "totp_url")
+    @field_validator("url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_task_url(cls, url: str | None) -> str | None:
+        if not url:
+            return url
+        return validate_url(url)
+
+    @field_validator("webhook_url", "totp_url")
+    @classmethod
+    def validate_callback_urls(cls, url: str | None) -> str | None:
         """
         Validates that URLs provided to Skyvern are properly formatted.
 
@@ -260,7 +268,7 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a browser profile to reuse for this workflow run",
     )
-    max_screenshot_scrolls: int | None = Field(
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
@@ -398,7 +406,17 @@ class BaseRunResponse(BaseModel):
     )
     status: RunStatus = Field(
         description="Current status of the run",
-        examples=["created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled"],
+        examples=[
+            "created",
+            "queued",
+            "running",
+            "paused",
+            "timed_out",
+            "failed",
+            "terminated",
+            "completed",
+            "canceled",
+        ],
     )
     output: dict | list | str | None = Field(
         default=None,

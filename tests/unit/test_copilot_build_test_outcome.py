@@ -72,6 +72,46 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
     assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
 
 
+def _failed_run_result_with_categories(categories: list[dict]) -> dict:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "failure_categories": categories,
+            "blocks": [
+                {"label": "search", "status": "failed", "failure_reason": "Timeout waiting for #results"},
+            ],
+        },
+    }
+
+
+def test_structural_identity_ignores_keyword_only_anti_bot_categories() -> None:
+    element_only = recorded_outcome_from_run_blocks_result(
+        _failed_run_result_with_categories([{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}])
+    )
+    with_keyword_stamp = recorded_outcome_from_run_blocks_result(
+        _failed_run_result_with_categories(
+            [
+                {"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8},
+                {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.7, "evidence_source": "keyword_only"},
+            ]
+        )
+    )
+    with_carrier = recorded_outcome_from_run_blocks_result(
+        _failed_run_result_with_categories(
+            [
+                {"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8},
+                {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "challenge_state"},
+            ]
+        )
+    )
+
+    assert element_only is not None and with_keyword_stamp is not None and with_carrier is not None
+    assert with_keyword_stamp.structural_failure_identity == element_only.structural_failure_identity
+    assert with_carrier.structural_failure_identity != element_only.structural_failure_identity
+
+
 def test_structural_key_ignores_display_prose_and_workflow_run_id() -> None:
     first = RecordedBuildTestOutcome(
         phase="persisted_block_run",
@@ -194,6 +234,37 @@ def test_hollow_outcome_carries_observed_value_excerpt_off_the_structural_key() 
     assert "100245" in confirmation.observed_page_value_excerpt
     assert confirmation.structural_key == other.structural_key
     assert "WTR-1842-DEMO" not in str(confirmation.structural_key_payload)
+
+
+def test_hollow_outcome_reason_code_unchanged_with_value_carrying_relation() -> None:
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#view-statement",
+        current_url="https://portal.example.com/statement",
+        source_url="https://portal.example.com/statement",
+        page_evidence={
+            "page_title": "Statement",
+            "forms": [],
+            "key_value_relations": [
+                {
+                    "key_text": "March 2026 statement",
+                    "value_text": "Amount due: $3,927.75",
+                    "container_selector": "#result",
+                    "value_child_index": 1,
+                    "direct_child_count": 3,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "key_value_relations_truncated": False,
+        },
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+
+    assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+    assert outcome.is_authoritative is True
+    assert "$3,927.75" not in str(outcome.structural_key_payload)
 
 
 def test_hollow_outcome_value_excerpt_falls_back_to_legacy_text_keys() -> None:
@@ -774,8 +845,89 @@ def test_not_evaluated_recorded_outcome_is_not_authoritative_repair_failure() ->
 
     assert outcome is not None
     assert outcome.verdict == "not_authoritative"
-    assert outcome.reason_code == "failed_run"
+    assert outcome.reason_code == "run_completed_unevaluated"
     assert outcome.is_authoritative is False
+
+
+def test_completed_run_with_registered_outputs_is_not_classified_as_failed_run() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_completed",
+            "overall_status": "completed",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+            "registered_output_parameter_values": [
+                {"output_parameter_id": "op_1", "value": {"output": {"top_entry": "First listed entry"}}}
+            ],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_completed"),
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code != "failed_run"
+    assert outcome.reason_code == "run_completed_unevaluated"
+
+
+def test_failed_run_classification_preserved_for_not_ok_run() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_not_ok",
+            "overall_status": "failed",
+            "failure_type": "block_failure",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.reason_code == "runtime_block_failure"
+    assert outcome.verdict == "repairable_failure"
+
+
+def test_failed_run_classification_preserved_for_failed_block() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_failed_block",
+            "overall_status": "completed",
+            "failure_type": "block_failure",
+            "blocks": [{"label": "collect_top_entry", "status": "failed", "failure_reason": "selector not found"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.reason_code == "runtime_block_failure"
+
+
+def test_judge_evaluated_non_satisfaction_keeps_failure_classification() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_judged",
+            "overall_status": "completed",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_judged",
+        ),
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
 
 
 def test_outcome_not_demonstrated_does_not_mark_presence_only_abstention_as_missing_output() -> None:

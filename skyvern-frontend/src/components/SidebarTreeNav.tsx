@@ -1,10 +1,12 @@
 import { Link, useLocation } from "react-router-dom";
 import { ChevronDownIcon } from "@radix-ui/react-icons";
 import {
+  forwardRef,
   useCallback,
   useEffect,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ReactNode,
 } from "react";
 
@@ -32,10 +34,15 @@ type SidebarNavItem = {
   label: string;
   to: string;
   icon: ReactNode;
+  external?: boolean;
   badge?: string;
   defaultOpen?: boolean | (() => boolean);
   initialVisibleChildren?: number;
   children?: Array<SidebarNavChild>;
+};
+
+type SidebarNavLinkProps = Omit<ComponentPropsWithoutRef<"a">, "href"> & {
+  item: SidebarNavItem;
 };
 
 type Props = {
@@ -45,6 +52,24 @@ type Props = {
 
 const OPEN_GROUPS_STORAGE_KEY = "skyvern-sidebar-open-groups";
 const EXPANDED_CHILDREN_STORAGE_KEY = "skyvern-sidebar-expanded-children";
+
+const SidebarNavLink = forwardRef<HTMLAnchorElement, SidebarNavLinkProps>(
+  function SidebarNavLink({ item, ...props }, ref) {
+    if (item.external) {
+      return (
+        <a
+          ref={ref}
+          {...props}
+          href={item.to}
+          target="_blank"
+          rel="noopener noreferrer"
+        />
+      );
+    }
+
+    return <Link ref={ref} to={item.to} {...props} />;
+  },
+);
 
 function readStoredRecord(key: string) {
   try {
@@ -182,8 +207,8 @@ function CollapsedNavItem({
   return (
     <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
       <DropdownMenuTrigger asChild>
-        <Link
-          to={item.to}
+        <SidebarNavLink
+          item={item}
           title={item.label}
           className={triggerClassName}
           onClick={() => {
@@ -194,7 +219,7 @@ function CollapsedNavItem({
           onMouseLeave={() => scheduleHover(false, FLYOUT_CLOSE_DELAY_MS)}
         >
           <span className={iconClassName}>{item.icon}</span>
-        </Link>
+        </SidebarNavLink>
       </DropdownMenuTrigger>
       <DropdownMenuContent
         side="right"
@@ -204,8 +229,8 @@ function CollapsedNavItem({
         className="min-w-48 border-neutral-200 bg-white p-1 text-neutral-900 dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100"
       >
         <DropdownMenuItem asChild>
-          <Link
-            to={item.to}
+          <SidebarNavLink
+            item={item}
             className={cn(menuChildItemClassName, "font-semibold")}
           >
             <span className="flex size-3.5 shrink-0 items-center justify-center text-neutral-500 dark:text-neutral-400">
@@ -217,7 +242,7 @@ function CollapsedNavItem({
                 {item.badge}
               </span>
             ) : null}
-          </Link>
+          </SidebarNavLink>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         {(item.children ?? []).map((child) => {
@@ -442,8 +467,8 @@ function SidebarTreeNav({ items, collapsed: collapsedOverride }: Props) {
                 menuChildItemClassName={menuChildItemClassName}
               />
             ) : (
-              <Link
-                to={item.to}
+              <SidebarNavLink
+                item={item}
                 title={collapsed ? item.label : undefined}
                 className={topLevelClassName}
               >
@@ -451,7 +476,7 @@ function SidebarTreeNav({ items, collapsed: collapsedOverride }: Props) {
                 {!collapsed && (
                   <span className="min-w-0 flex-1 truncate">{item.label}</span>
                 )}
-              </Link>
+              </SidebarNavLink>
             )}
 
             {!collapsed && hasChildren && open ? (

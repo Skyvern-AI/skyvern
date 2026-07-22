@@ -52,6 +52,8 @@ import { PrintPageNode } from "./PrintPageNode/types";
 import { PrintPageNode as PrintPageNodeComponent } from "./PrintPageNode/PrintPageNode";
 import { WorkflowTriggerNode } from "./WorkflowTriggerNode/types";
 import { WorkflowTriggerNode as WorkflowTriggerNodeComponent } from "./WorkflowTriggerNode/WorkflowTriggerNode";
+import { EmailInboxNode } from "./EmailInboxNode/types";
+import { EmailInboxNode as EmailInboxNodeComponent } from "./EmailInboxNode/EmailInboxNode";
 import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
 import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
 import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
@@ -91,6 +93,7 @@ export type WorkflowBlockNode =
   | HttpRequestNode
   | PrintPageNode
   | WorkflowTriggerNode
+  | EmailInboxNode
   | GoogleSheetsReadNode
   | GoogleSheetsWriteNode
   | PdfFillNode
@@ -154,6 +157,7 @@ export const nodeTypes = {
   http_request: wrapBlock(HttpRequestNodeComponent),
   printPage: wrapBlock(PrintPageNodeComponent),
   workflowTrigger: wrapBlock(WorkflowTriggerNodeComponent),
+  emailInbox: wrapBlock(EmailInboxNodeComponent),
   googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
   googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
   pdfFill: wrapBlock(PdfFillNodeComponent),

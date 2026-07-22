@@ -1,7 +1,11 @@
 """Tests for inter_action_delay in the wait config experiment framework."""
 
+import pytest
+
+from skyvern.experimentation import wait_utils
 from skyvern.experimentation.wait_config import WAIT_VARIANTS, WaitConfig
 from skyvern.experimentation.wait_utils import get_wait_time
+from skyvern.forge import app
 
 
 def test_inter_action_delay_in_all_variants() -> None:
@@ -44,3 +48,31 @@ def test_wait_config_global_multiplier() -> None:
 def test_wait_config_default_fallback() -> None:
     result = get_wait_time(None, "inter_action_delay", default=0.5)
     assert result == 0.5
+
+
+@pytest.mark.asyncio
+async def test_wait_config_is_none_when_killswitch_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Patch the seam on the live app.AGENT_FUNCTION instance so this pins wait_utils'
+    # branch on it, independent of which AgentFunction (or test stub) the app holds.
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_wait_time_optimization_enabled", lambda: False, raising=False)
+
+    async def _must_not_run(cache_key: str, organization_id: str) -> None:
+        raise AssertionError("experiment lookup must not run when the killswitch is off")
+
+    monkeypatch.setattr(wait_utils, "get_wait_config_from_experiment", _must_not_run)
+    assert await wait_utils.get_or_create_wait_config("tsk_kill_1", None, "org_1") is None
+
+
+@pytest.mark.asyncio
+async def test_wait_config_lookup_runs_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_wait_time_optimization_enabled", lambda: True, raising=False)
+    calls: list[str] = []
+
+    async def _fake_lookup(cache_key: str, organization_id: str) -> None:
+        calls.append(cache_key)
+        return None
+
+    monkeypatch.setattr(wait_utils, "get_wait_config_from_experiment", _fake_lookup)
+    wait_utils._wait_config_cache.clear()
+    await wait_utils.get_or_create_wait_config("tsk_enabled_1", None, "org_1")
+    assert calls == ["tsk_enabled_1"]

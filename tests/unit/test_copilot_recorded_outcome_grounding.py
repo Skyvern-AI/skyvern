@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import _recorded_build_test_outcome_prompt
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -27,6 +30,10 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.enforcement import MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.result_evidence import (
+    ScoutObservationContract,
+    mint_scout_observation_contract,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.run_execution import _update_repair_loop_state
@@ -157,6 +164,43 @@ def _contract() -> DiagnosisRepairContract:
         repair_decision=RepairDecision(next_action=RepairNextAction.REPAIR),
         verification_result=VerificationResult(run_status="failed"),
     )
+
+
+def _scout_contract(
+    *,
+    has_bounded_page_schema: bool = True,
+    workflow_run_id: str | None = None,
+    observed_after_workflow_run: bool = False,
+) -> ScoutObservationContract:
+    page = {
+        "current_url": "https://example.com/results",
+        "inspection_warnings": [],
+        "result_containers_truncated": False,
+        "key_value_relations_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "NPI",
+                "container_selector": ".kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "result_containers": [],
+    }
+    contract = mint_scout_observation_contract(
+        page,
+        labels_by_path={"output.npi": ("NPI",)},
+        url="https://example.com/results",
+        has_bounded_page_schema=has_bounded_page_schema,
+        workflow_run_id=workflow_run_id,
+        observed_after_workflow_run=observed_after_workflow_run,
+    )
+    assert contract is not None
+    return contract
 
 
 def _bounded_inspect_evidence(**updates: object) -> dict[str, object]:
@@ -591,6 +635,40 @@ def test_grounding_abstains_for_non_authoritative_or_missing_current_url_and_rec
     )
 
 
+def test_author_time_churn_without_cached_url_requires_current_page_regrounding() -> None:
+    ctx = _ctx(_outcome(phase="author_time_reject", workflow_run_id=None))
+    ctx.observed_browser_urls = []
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    error = _tool_loop_error(ctx, "update_workflow", {"workflow_yaml": "workflow_definition: {blocks: []}"})
+
+    assert error is not None
+    assert ctx.blocker_signal.internal_reason_code == "recorded_outcome_grounding_required"
+
+
+@pytest.mark.asyncio
+async def test_update_and_run_entrypoint_regrounds_before_third_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx(_outcome(phase="author_time_reject", workflow_run_id=None))
+    ctx.observed_browser_urls = []
+    arm_recorded_outcome_grounding_requirement(ctx)
+    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        tools_module,
+        "_metadata_contract_run_preflight_reject",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("third preflight reject")),
+    )
+
+    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+        json.dumps({"workflow_yaml": "workflow_definition: {blocks: []}", "block_labels": []}),
+    )
+
+    assert json.loads(result)["ok"] is False
+    assert ctx.blocker_signal.internal_reason_code == "recorded_outcome_grounding_required"
+    assert len(ctx.recorded_build_test_outcome_history) == 2
+
+
 def test_no_run_grounding_requires_fresh_post_arm_inspect_evidence() -> None:
     outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
     ctx = _ctx(outcome)
@@ -692,6 +770,19 @@ def test_satisfy_binds_typed_constraint_with_frontier_facet_and_owning_blocks() 
     assert "frontier_facet: selector_frontier" in prompt
 
 
+def test_definition_contract_unsatisfied_binds_amend_in_place_frontier() -> None:
+    outcome = _outcome(reason_code="definition_contract_unsatisfied")
+    ctx = _ctx(outcome)
+    ctx.workflow_yaml = _OWNING_BLOCK_WORKFLOW
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = _bounded_inspect_evidence()
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+    constraint = ctx.recorded_outcome_binding_constraint
+    assert isinstance(constraint, RecordedOutcomeBindingConstraint)
+    assert constraint.frontier_facet == "amend_in_place"
+
+
 def test_degraded_capture_binds_uncrossable_constraint() -> None:
     ctx = _binding_ctx()
     arm_recorded_outcome_grounding_requirement(ctx)
@@ -767,6 +858,11 @@ def test_convergence_reject_uncrossable_frontier_commits_early_terminal() -> Non
         blocker_signal=None,
         turn_halt=None,
         consecutive_non_converging_repair_count=2,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
     )
 
     decision = _recorded_outcome_convergence_reject(
@@ -920,6 +1016,11 @@ def test_early_terminal_renders_typed_final_reply_and_preserves_draft() -> None:
         blocker_signal=None,
         turn_halt=None,
         consecutive_non_converging_repair_count=3,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
     )
 
     _commit_recorded_outcome_early_terminal(ctx)
@@ -959,3 +1060,73 @@ def test_update_repair_loop_state_clears_stale_requirement_when_outcome_not_auth
 
     assert ctx.recorded_outcome_grounding_requirement is None
     assert ctx.recorded_outcome_binding_constraint is None
+
+
+def test_scout_contract_grounds_no_run_requirement_after_composition_miss() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    ctx.scout_observation_contract = _scout_contract()
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+    payload = ctx.recorded_outcome_grounding_requirement.payload
+    assert payload is not None
+    assert payload.source_tool == "evaluate"
+    assert payload.capture_degraded is False
+    assert "source_tool: evaluate" in _recorded_build_test_outcome_prompt(ctx)
+
+
+def test_degraded_scout_contract_admitted_with_capture_degraded_recorded() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    ctx.scout_observation_contract = _scout_contract(has_bounded_page_schema=False)
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+    payload = ctx.recorded_outcome_grounding_requirement.payload
+    assert payload is not None
+    assert payload.capture_degraded is True
+    assert payload.diagnostic_reason == "capture_degraded"
+
+
+def test_arming_no_run_requirement_clears_prior_scout_contract() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    ctx.scout_observation_contract = _scout_contract()
+
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    assert ctx.scout_observation_contract is None
+    ctx.composition_page_evidence = None
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+
+def test_run_required_requirement_rejects_unstamped_scout_contract() -> None:
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    ctx.scout_observation_contract = _scout_contract()
+
+    with capture_logs() as logs:
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
+    assert event["reject_reason"] == "run_id_mismatch"
+
+
+def test_tampered_scout_contract_rejected_by_grounding_lane() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    contract = _scout_contract()
+    ctx.scout_observation_contract = replace(contract, source_url="https://evil.example.com/injected")
+
+    with capture_logs() as logs:
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
+    assert event["reject_reason"] == "not_inspect_source"
