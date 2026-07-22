@@ -4823,12 +4823,17 @@ async def handle_select_option_action(
     is_open = False
     suggested_value: str | None = None
     results: list[ActionResult] = []
+    input_or_select_context: InputOrSelectContext | None = None
 
     try:
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
         await skyvern_element.scroll_into_view()
 
         await skyvern_element.click(page=page, dom=dom, timeout=timeout)
+        # The click opens the widget: mark it open now (not only on the incremental path below) so the
+        # finally cleanup dismisses it on every exit — including an emerging-path optional miss that
+        # returns ActionAbort before reaching the incremental branch.
+        is_open = True
         # wait for options to load
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.open")
 
@@ -4879,7 +4884,6 @@ async def handle_select_option_action(
             )
             return results
 
-        is_open = True
         # TODO: support sequetially select from dropdown by value, just support single select now
         result = await sequentially_select_from_dropdown(
             action=action,
@@ -4905,6 +4909,28 @@ async def handle_select_option_action(
             return results
         suggested_value = result.value
 
+    except NoAvailableOptionFoundForCustomSelection as e:
+        # Skip only a field known to be optional whose widget was left untouched. Requiredness is
+        # LLM-populated and may be None (undetermined) — fail closed there. Also fail closed when an
+        # earlier cascade level already committed a click (e.widget_mutated): a partially-selected
+        # widget must surface the typed OPTION_NOT_AVAILABLE failure/retry, not a clean skip.
+        if (
+            input_or_select_context is not None
+            and input_or_select_context.is_required is False
+            and not e.widget_mutated
+        ):
+            LOG.info(
+                "Optional custom-select found no matching option; recording an optional miss and skipping the step",
+                target_value=action.option.label or action.option.value,
+            )
+            results.append(ActionAbort())
+            return results
+        LOG.warning(
+            "Custom-select found no matching option for a required, unknown-requiredness, or partially-mutated field",
+            exc_info=True,
+        )
+        results.append(ActionFailure(exception=e))
+        return results
     except SkyvernException as e:
         # Expected selection outcomes on non-standard dropdowns (no matching option,
         # no incremental elements); recorded as ActionFailure like any other miss.
@@ -6844,22 +6870,30 @@ async def sequentially_select_from_dropdown(
 
     check_filter_funcs: list[CheckFilterOutElementIDFunc] = [check_existed_but_not_option_element_in_dom_factory(dom)]
     for i in range(max_depth):
-        single_select_result = await select_from_dropdown(
-            context=input_or_select_context,
-            page=page,
-            skyvern_element=skyvern_element,
-            skyvern_frame=skyvern_frame,
-            incremental_scraped=incremental_scraped,
-            check_filter_funcs=check_filter_funcs,
-            step=step,
-            task=task,
-            dropdown_menu_element=dropdown_menu_element,
-            select_history=select_history,
-            force_select=force_select,
-            target_value=target_value,
-            entry_action_type=entry_action_type,
-            selection_group_id=selection_group_id,
-        )
+        try:
+            single_select_result = await select_from_dropdown(
+                context=input_or_select_context,
+                page=page,
+                skyvern_element=skyvern_element,
+                skyvern_frame=skyvern_frame,
+                incremental_scraped=incremental_scraped,
+                check_filter_funcs=check_filter_funcs,
+                step=step,
+                task=task,
+                dropdown_menu_element=dropdown_menu_element,
+                select_history=select_history,
+                force_select=force_select,
+                target_value=target_value,
+                entry_action_type=entry_action_type,
+                selection_group_id=selection_group_id,
+            )
+        except NoAvailableOptionFoundForCustomSelection as e:
+            # The loop only advances past a level whose click succeeded (is_done() gates on
+            # ActionSuccess), so any prior history here means an earlier cascade level already
+            # mutated the widget — mark it so the caller can't report this miss as a clean skip.
+            if any(isinstance(prior.action_result, ActionSuccess) for prior in select_history):
+                e.widget_mutated = True
+            raise
         assert single_select_result is not None
         select_history.append(single_select_result)
         values.append(single_select_result.value)
@@ -7505,6 +7539,7 @@ async def _select_deterministic_custom_option(
     entry_action_type: str = "select_option",
     selection_group_id: str | None = None,
     select_depth: int = 0,
+    on_click_attempted: Callable[[], None] | None = None,
 ) -> tuple[ActionResult, str | None] | None:
     started_at = time.monotonic()
     selection_group_id = selection_group_id or str(uuid.uuid4())
@@ -7646,6 +7681,8 @@ async def _select_deterministic_custom_option(
 
         await selected_element.scroll_into_view()
         click_attempted = True
+        if on_click_attempted is not None:
+            on_click_attempted()
         await selected_element.click(page=page)
         verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
@@ -7740,15 +7777,18 @@ def _no_match_exception_for_dropdown(
     target_value: str | None,
     observed_options: list[str],
     transient_fallback_element_id: str | None,
+    widget_mutated: bool = False,
 ) -> Exception:
     """Return the right no-match exception: transient when the dropdown opened with zero options, permanent otherwise."""
     if not observed_options and transient_fallback_element_id is not None:
         return NoIncrementalElementFoundForCustomSelection(element_id=transient_fallback_element_id)
-    return NoAvailableOptionFoundForCustomSelection(
+    exc = NoAvailableOptionFoundForCustomSelection(
         reason=reasoning,
         target_value=target_value or None,
         observed_options=observed_options,
     )
+    exc.widget_mutated = widget_mutated
+    return exc
 
 
 def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
@@ -7853,6 +7893,12 @@ async def select_from_emerging_elements(
     async def get_readback_scope_element() -> SkyvernElement | None:
         return await dom_after_open.get_skyvern_element_by_id(current_element_id)
 
+    widget_mutated = False
+
+    def _mark_widget_mutated() -> None:
+        nonlocal widget_mutated
+        widget_mutated = True
+
     deterministic_result = await _select_deterministic_custom_option(
         target_value=options.target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(shadow_candidate_elements),
@@ -7865,6 +7911,7 @@ async def select_from_emerging_elements(
         entry_action_type=entry_action_type,
         selection_group_id=selection_group_id,
         select_depth=0,
+        on_click_attempted=_mark_widget_mutated,
     )
     if deterministic_result is not None:
         action_result, _matched_label = deterministic_result
@@ -7914,6 +7961,7 @@ async def select_from_emerging_elements(
             target_value=options.target_value,
             observed_options=_collect_option_texts(new_element_subtrees),
             transient_fallback_element_id=None,
+            widget_mutated=widget_mutated,
         )
     action_type = ActionType(raw_action_type)
 
@@ -8023,6 +8071,12 @@ async def select_from_dropdown(
     incremental_scraped.set_element_tree_trimmed(trimmed_element_tree)
     html = incremental_scraped.build_element_tree(html_need_skyvern_attrs=True)
 
+    widget_mutated = False
+
+    def _mark_widget_mutated() -> None:
+        nonlocal widget_mutated
+        widget_mutated = True
+
     deterministic_result = await _select_deterministic_custom_option(
         target_value=target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(trimmed_element_tree),
@@ -8035,6 +8089,7 @@ async def select_from_dropdown(
         entry_action_type=entry_action_type,
         selection_group_id=selection_group_id or str(uuid.uuid4()),
         select_depth=len(select_history),
+        on_click_attempted=_mark_widget_mutated,
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
@@ -8095,6 +8150,7 @@ async def select_from_dropdown(
             target_value=target_value,
             observed_options=_collect_option_texts(trimmed_element_tree),
             transient_fallback_element_id=skyvern_element.get_id(),
+            widget_mutated=widget_mutated,
         )
     single_select_result.action_type = ActionType(raw_action_type)
     action_type = single_select_result.action_type

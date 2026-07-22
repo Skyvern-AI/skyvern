@@ -1025,6 +1025,9 @@ class NoAvailableOptionFoundForCustomSelection(SkyvernException):
         self.observed_options_count = observed_count
         self.observed_options_excerpt = observed_excerpt
         self.reason = reason
+        # Set True when an earlier level of a cascading select already committed a click before this
+        # miss, so the widget is partially mutated and the miss must not be reported as a clean skip.
+        self.widget_mutated = False
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
