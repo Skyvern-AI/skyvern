@@ -41,20 +41,26 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
+    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
     blocker_signal_is_genuinely_terminal,
     build_definition_contract_unsatisfied_blocker_signal,
+    build_metadata_reject_same_key_terminal_signal,
     build_output_source_unobservable_blocker_signal,
     clear_terminal_evidence_on_workflow_edit,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
+    MetadataRejectFamily,
+    MetadataRejectLadderDecision,
+    MetadataRejectLadderInput,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
     RecordedOutcomeGroundingRequirement,
     _stable_hash,
+    adjudicate_metadata_reject_ladder,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
@@ -197,6 +203,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     AgentContext,
     AuthorTimeGateAblationPayload,
+    CodeArtifactMetadataValue,
     NeverCapturedObligation,
     NeverCapturedReplayPayload,
     RejectedCodeArtifactMetadataCapture,
@@ -1319,21 +1326,42 @@ def _record_author_time_reject_outcome(
     block_labels: list[str] | None = None,
     missing_requested_output_facts: list[dict[str, object]] | None = None,
 ) -> None:
+    record_build_test_outcome(
+        ctx,
+        _build_author_time_reject_outcome(
+            ctx,
+            reason_code=reason_code,
+            summary=summary,
+            structural_payload=structural_payload,
+            authored_structure_signature=authored_structure_signature,
+            block_labels=block_labels,
+            missing_requested_output_facts=missing_requested_output_facts,
+        ),
+    )
+
+
+def _build_author_time_reject_outcome(
+    ctx: AgentContext,
+    *,
+    reason_code: BuildTestOutcomeReasonCode,
+    summary: str,
+    structural_payload: Mapping[str, object] | None = None,
+    authored_structure_signature: str | None = None,
+    block_labels: list[str] | None = None,
+    missing_requested_output_facts: list[dict[str, object]] | None = None,
+) -> RecordedBuildTestOutcome:
     prior_outcome = ctx.latest_recorded_build_test_outcome
     observed_page_value_excerpt = (
         prior_outcome.observed_page_value_excerpt if isinstance(prior_outcome, RecordedBuildTestOutcome) else ""
     )
-    record_build_test_outcome(
-        ctx,
-        recorded_outcome_from_author_time_reject(
-            reason_code=reason_code,
-            block_labels=block_labels or [],
-            structural_payload=structural_payload,
-            authored_structure_signature=authored_structure_signature,
-            observed_evidence_summary=summary,
-            observed_page_value_excerpt=observed_page_value_excerpt,
-            missing_requested_output_facts=missing_requested_output_facts or [],
-        ),
+    return recorded_outcome_from_author_time_reject(
+        reason_code=reason_code,
+        block_labels=block_labels or [],
+        structural_payload=structural_payload,
+        authored_structure_signature=authored_structure_signature,
+        observed_evidence_summary=summary,
+        observed_page_value_excerpt=observed_page_value_excerpt,
+        missing_requested_output_facts=missing_requested_output_facts or [],
     )
 
 
@@ -4542,9 +4570,7 @@ def _adjudicate_metadata_reject_ladder(
     missing_labels: list[str],
     required_paths: set[str],
 ) -> dict[str, Any] | None:
-    """Route the metadata-less reject through the shared actuation ladder in steer-only mode so a
-    repeated identical structural key escalates the convergence directive instead of re-issuing the
-    same steer, never minting an advisory run or a terminal at this seam."""
+    """Adjudicate an enforcing metadata reject without coupling it to unrelated outcome state."""
     if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
         return None
     signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
@@ -4554,39 +4580,156 @@ def _adjudicate_metadata_reject_ladder(
     missing_fields_by_label = _metadata_missing_required_fields_by_label(
         raw_metadata, labels=missing_labels, missing_labels=missing_labels
     )
-    seam_fingerprint = _metadata_reject_seam_fingerprint(workflow_yaml, signature, missing_fields_by_label)
-    escalate = _prior_output_contract_directive_unconsumed(ctx, signature, seam_fingerprint)
-    evaluation = _OutputContractEvaluation(
-        block_label=block_label,
-        artifact_id="",
-        required_paths=required_paths,
-        observation_paths=required_paths,
-        declaration_paths=set(),
-        source="missing_code_artifact_metadata",
-        reason_code="metadata_reject",
-        missing_metadata_paths=[],
-        missing_schema_paths=[],
-        missing_return_paths=[],
-        shape_violations=[],
-        canonical_signature=signature,
-        payload={"reason_code": "metadata_reject"},
-        repair_context=None,
-    )
-    actuation = _adjudicate_output_contract_ladder_after_reject(
-        ctx,
-        evaluation,
+    reject_payload = _code_artifact_metadata_reject_payload(
         workflow_yaml=workflow_yaml,
-        current_fingerprint=seam_fingerprint,
-        steer_only=True,
+        raw_metadata=raw_metadata,
+        offending_labels=[],
+        missing_labels=missing_labels,
+        violation_categories=["missing_code_artifact_metadata"],
     )
-    if actuation is None or actuation.kind != OutputContractActuationKind.STRUCTURE_DIRECTIVE:
+    latest_outcome = ctx.latest_recorded_build_test_outcome
+    candidate_outcome = (
+        latest_outcome
+        if isinstance(latest_outcome, RecordedBuildTestOutcome)
+        and latest_outcome.phase == "author_time_reject"
+        and latest_outcome.reason_code == "metadata_reject"
+        else _build_author_time_reject_outcome(
+            ctx,
+            reason_code="metadata_reject",
+            summary="Submitted workflow is missing required code artifact metadata.",
+            structural_payload=reject_payload,
+            block_labels=missing_labels,
+            missing_requested_output_facts=_missing_requested_output_facts(
+                required_paths,
+                reason_code=_required_child_output_paths_for_authoring(ctx)[2],
+            ),
+        )
+    )
+    seam_fingerprint = _metadata_reject_seam_fingerprint(workflow_yaml, signature, missing_fields_by_label)
+    if ctx.metadata_reject_ladder_state is None and _prior_output_contract_directive_unconsumed(
+        ctx,
+        signature,
+        seam_fingerprint,
+    ):
+        structural_key = candidate_outcome.structural_key
+        if structural_key is not None:
+            ctx.metadata_reject_ladder_state = adjudicate_metadata_reject_ladder(
+                None,
+                MetadataRejectLadderInput(
+                    reject_family="missing_code_artifact_metadata",
+                    structural_key=structural_key,
+                    missing_fields_by_label=missing_fields_by_label,
+                ),
+            ).state
+    decision = _metadata_reject_ladder_decision(
+        ctx,
+        candidate_outcome=candidate_outcome,
+        reject_family="missing_code_artifact_metadata",
+        missing_fields_by_label=missing_fields_by_label,
+    )
+    if decision is None:
         return None
+    if decision.action == "terminal":
+        return _metadata_reject_terminal_data(decision)
+    assert decision.rung is not None
+    _record_armed_directive_fingerprint(ctx, signature, seam_fingerprint)
     return _emit_metadata_convergence_directive(
         signature=signature,
         block_label=block_label,
         missing_fields_by_label=missing_fields_by_label,
         required_paths=required_paths,
-        escalate=escalate,
+        escalate=decision.rung == 2,
+    )
+
+
+def _metadata_reject_ladder_decision(
+    ctx: AgentContext,
+    *,
+    candidate_outcome: RecordedBuildTestOutcome,
+    reject_family: MetadataRejectFamily,
+    missing_fields_by_label: dict[str, list[str]],
+) -> MetadataRejectLadderDecision | None:
+    structural_key = candidate_outcome.structural_key
+    if structural_key is None or not missing_fields_by_label:
+        return None
+    prior_state = ctx.metadata_reject_ladder_state
+    latest_outcome = ctx.latest_recorded_build_test_outcome
+    if (
+        prior_state is not None
+        and isinstance(latest_outcome, RecordedBuildTestOutcome)
+        and latest_outcome.phase == "author_time_reject"
+        and (
+            latest_outcome.reason_code != "metadata_reject"
+            or latest_outcome.structural_key != prior_state.structural_key
+        )
+    ):
+        _reset_metadata_reject_ladder_state(
+            ctx,
+            superseding_reject_family=latest_outcome.reason_code,
+        )
+        prior_state = None
+    decision = adjudicate_metadata_reject_ladder(
+        prior_state,
+        MetadataRejectLadderInput(
+            reject_family=reject_family,
+            structural_key=structural_key,
+            missing_fields_by_label=missing_fields_by_label,
+        ),
+    )
+    ctx.metadata_reject_ladder_state = decision.state
+    if decision.state.streak_count >= 2:
+        LOG.info(
+            "copilot_metadata_reject_same_key_detected",
+            reject_family=reject_family,
+            structural_key=structural_key,
+            gate_id=decision.gate_id,
+            streak_count=decision.state.streak_count,
+            missing_fields_by_label=decision.missing_fields_by_label,
+        )
+    if decision.action == "terminal":
+        signal = build_metadata_reject_same_key_terminal_signal(
+            structural_key=structural_key,
+            reject_family=reject_family,
+            missing_fields_by_label=decision.missing_fields_by_label,
+        )
+        claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, signal)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
+        LOG.info(
+            "copilot_metadata_reject_same_key_terminal_selected",
+            reject_family=reject_family,
+            structural_key=structural_key,
+            gate_id=decision.gate_id,
+            streak_count=decision.state.streak_count,
+            missing_fields_by_label=decision.missing_fields_by_label,
+        )
+    return decision
+
+
+def _reset_metadata_reject_ladder_state(ctx: AgentContext, *, superseding_reject_family: str) -> None:
+    prior_state = ctx.metadata_reject_ladder_state
+    if prior_state is None:
+        return
+    ctx.metadata_reject_ladder_state = None
+    LOG.info(
+        "copilot_metadata_reject_streak_reset",
+        prior_reject_family=prior_state.reject_family,
+        prior_structural_key=prior_state.structural_key,
+        prior_streak_count=prior_state.streak_count,
+        superseding_reject_family=superseding_reject_family,
+    )
+
+
+def _metadata_reject_terminal_data(decision: MetadataRejectLadderDecision) -> dict[str, CodeArtifactMetadataValue]:
+    return cast(
+        dict[str, CodeArtifactMetadataValue],
+        {
+            "reason_code": METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
+            "reject_family": decision.state.reject_family,
+            "structural_key": decision.state.structural_key,
+            "gate_id": decision.gate_id,
+            "missing_fields_by_label": decision.missing_fields_by_label,
+            "preserves_workflow_draft": True,
+        },
     )
 
 
@@ -4599,6 +4742,10 @@ def _synthesized_metadata_reject_directive(
     required_paths: set[str],
 ) -> dict[str, Any] | None:
     if len(label_candidates) != 1:
+        _reset_metadata_reject_ladder_state(
+            ctx,
+            superseding_reject_family="recorded_outcome_metadata_reject",
+        )
         return None
     label = label_candidates[0]
     full_required_fields = {"declared_goal", *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS, "evidence_refs_or_observation_refs"}
@@ -4606,6 +4753,10 @@ def _synthesized_metadata_reject_directive(
         raw_metadata, labels=[label], missing_labels=[]
     )
     if set(missing_fields_by_label.get(label) or []) != full_required_fields:
+        _reset_metadata_reject_ladder_state(
+            ctx,
+            superseding_reject_family="recorded_outcome_metadata_reject",
+        )
         return None
     return _adjudicate_metadata_reject_ladder(
         ctx,
@@ -6645,6 +6796,14 @@ def _metadata_contract_run_preflight_reject(
         ctx.last_code_authoring_repair_context = evaluation.repair_context
     if _metadata_preflight_reject_yields_to_ladder(ctx):
         return None
+    if payload.get("reason_code") == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE:
+        assert ctx.blocker_signal is not None
+        return {
+            "ok": False,
+            "error": ctx.blocker_signal.user_facing_reason,
+            "user_facing_summary": ctx.blocker_signal.user_facing_reason,
+            "data": payload,
+        }
     if "value_bearing_convergence_directive" in payload:
         return _output_contract_reject_result(
             evaluation,
@@ -6664,6 +6823,74 @@ def _metadata_contract_run_preflight_reject(
         ),
         "user_facing_summary": _compiled_authoring_user_summary(),
         "data": payload,
+    }
+
+
+def metadata_same_key_terminal_preflight(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> dict[str, CodeArtifactMetadataValue] | None:
+    prior_state = ctx.metadata_reject_ladder_state
+    if (
+        prior_state is None
+        or prior_state.streak_count < 2
+        or copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID)
+    ):
+        return None
+    missing_error = _missing_code_artifact_metadata_error(workflow_yaml, ctx, raw_code_artifact_metadata)
+    if missing_error is None:
+        return None
+    missing_labels = _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_code_artifact_metadata)
+    if len(missing_labels) != 1:
+        return None
+    required_paths, _, coverage_reason_code = _required_child_output_paths_for_authoring(ctx)
+    reject_payload = _code_artifact_metadata_reject_payload(
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_code_artifact_metadata,
+        offending_labels=[],
+        missing_labels=missing_labels,
+        violation_categories=["missing_code_artifact_metadata"],
+    )
+    candidate_outcome = _build_author_time_reject_outcome(
+        ctx,
+        reason_code="metadata_reject",
+        summary=missing_error,
+        structural_payload=reject_payload,
+        block_labels=missing_labels,
+        missing_requested_output_facts=_missing_requested_output_facts(
+            required_paths,
+            reason_code=coverage_reason_code,
+        ),
+    )
+    structural_key = candidate_outcome.structural_key
+    missing_fields_by_label = _metadata_missing_required_fields_by_label(
+        raw_code_artifact_metadata,
+        labels=missing_labels,
+        missing_labels=missing_labels,
+    )
+    if (
+        structural_key is None
+        or prior_state.reject_family != "missing_code_artifact_metadata"
+        or prior_state.structural_key != structural_key
+        or prior_state.gate_id != "code_artifact_metadata"
+        or prior_state.missing_fields_by_label != missing_fields_by_label
+    ):
+        return None
+    decision = _metadata_reject_ladder_decision(
+        ctx,
+        candidate_outcome=candidate_outcome,
+        reject_family="missing_code_artifact_metadata",
+        missing_fields_by_label=missing_fields_by_label,
+    )
+    if decision is None or decision.action != "terminal":
+        return None
+    assert ctx.blocker_signal is not None
+    return {
+        "ok": False,
+        "error": ctx.blocker_signal.user_facing_reason,
+        "user_facing_summary": ctx.blocker_signal.user_facing_reason,
+        "data": _metadata_reject_terminal_data(decision),
     }
 
 
@@ -13156,30 +13383,57 @@ async def _update_workflow(
             source=output_path_coverage_source,
             reason_code=output_path_coverage_reason_code,
         )
+        metadata_reject_payload = _code_artifact_metadata_reject_payload(
+            workflow_yaml=workflow_yaml,
+            raw_metadata=params.get("code_artifact_metadata"),
+            offending_labels=[],
+            missing_labels=missing_labels,
+            violation_categories=["missing_code_artifact_metadata"],
+        )
+        candidate_outcome = _build_author_time_reject_outcome(
+            ctx,
+            reason_code="metadata_reject",
+            summary=missing_metadata_error,
+            structural_payload=metadata_reject_payload,
+            block_labels=missing_labels,
+            missing_requested_output_facts=missing_metadata_output_facts,
+        )
+        missing_fields_by_label = _metadata_missing_required_fields_by_label(
+            params.get("code_artifact_metadata"),
+            labels=missing_labels,
+            missing_labels=missing_labels,
+        )
+        if len(missing_labels) != 1:
+            _reset_metadata_reject_ladder_state(
+                ctx,
+                superseding_reject_family="multi_label_missing_code_artifact_metadata",
+            )
+        metadata_ladder_decision = (
+            None
+            if len(missing_labels) != 1
+            or copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID)
+            else _metadata_reject_ladder_decision(
+                ctx,
+                candidate_outcome=candidate_outcome,
+                reject_family="missing_code_artifact_metadata",
+                missing_fields_by_label=missing_fields_by_label,
+            )
+        )
+        if metadata_ladder_decision is not None and metadata_ladder_decision.action == "terminal":
+            assert ctx.blocker_signal is not None
+            return reject(
+                error=ctx.blocker_signal.user_facing_reason,
+                user_facing_summary=ctx.blocker_signal.user_facing_reason,
+                data=_metadata_reject_terminal_data(metadata_ladder_decision),
+                repair_context=metadata_repair_context,
+                record_repair_context_outcome=False,
+            )
         missing_metadata_reject_count = _record_output_contract_family_reject(
             ctx,
             required_child_output_paths,
             reject_family=_MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY,
         )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary=missing_metadata_error,
-            structural_payload=_output_contract_author_time_structural_payload(
-                ctx,
-                required_child_output_paths,
-                block_label=missing_labels[0] if len(missing_labels) == 1 else "",
-            )
-            or _code_artifact_metadata_reject_payload(
-                workflow_yaml=workflow_yaml,
-                raw_metadata=params.get("code_artifact_metadata"),
-                offending_labels=[],
-                missing_labels=missing_labels,
-                violation_categories=["missing_code_artifact_metadata"],
-            ),
-            block_labels=missing_labels,
-            missing_requested_output_facts=missing_metadata_output_facts,
-        )
+        record_build_test_outcome(ctx, candidate_outcome)
         _capture_rejected_code_artifact_metadata(ctx)
         credential_scout_errors = (
             []
@@ -13200,12 +13454,29 @@ async def _update_workflow(
             _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
         elif missing_metadata_reject_count < 1 and not budget_terminal:
             _record_code_authoring_guardrail_reject(ctx)
-        metadata_convergence_directive = _adjudicate_metadata_reject_ladder(
-            ctx,
-            workflow_yaml=workflow_yaml,
-            raw_metadata=params.get("code_artifact_metadata"),
-            missing_labels=missing_labels,
-            required_paths=required_child_output_paths,
+        metadata_signature = _output_contract_signature(ctx=ctx, required_paths=required_child_output_paths)
+        if metadata_ladder_decision is not None and metadata_ladder_decision.rung is not None:
+            _record_armed_directive_fingerprint(
+                ctx,
+                metadata_signature,
+                _metadata_reject_seam_fingerprint(
+                    workflow_yaml,
+                    metadata_signature,
+                    missing_fields_by_label,
+                ),
+            )
+        metadata_convergence_directive = (
+            _emit_metadata_convergence_directive(
+                signature=metadata_signature,
+                block_label=missing_labels[0],
+                missing_fields_by_label=missing_fields_by_label,
+                required_paths=required_child_output_paths,
+                escalate=metadata_ladder_decision.rung == 2,
+            )
+            if metadata_ladder_decision is not None
+            and metadata_ladder_decision.rung is not None
+            and len(missing_labels) == 1
+            else None
         )
         metadata_reject_data = _code_repair_progress_data(
             metadata_repair_context,
@@ -13257,6 +13528,10 @@ async def _update_workflow(
     ):
         code_artifact_metadata_error = None
     if code_artifact_metadata_error is not None:
+        _reset_metadata_reject_ladder_state(
+            ctx,
+            superseding_reject_family=_METADATA_NORMALIZATION_REJECT_FAMILY,
+        )
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
         normalization_reject_count = _record_output_contract_family_reject(
             ctx,
@@ -13570,6 +13845,17 @@ async def _update_workflow(
             label_candidates=output_empty_labels,
             required_paths=unresolved_recorded_output_paths,
         )
+        if (
+            metadata_convergence_directive is not None
+            and metadata_convergence_directive.get("reason_code") == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        ):
+            assert ctx.blocker_signal is not None
+            return reject(
+                error=ctx.blocker_signal.user_facing_reason,
+                user_facing_summary=ctx.blocker_signal.user_facing_reason,
+                data=metadata_convergence_directive,
+                record_repair_context_outcome=False,
+            )
         if metadata_convergence_directive is not None:
             reject_data["metadata_convergence_directive"] = metadata_convergence_directive
         return reject(
@@ -13636,6 +13922,17 @@ async def _update_workflow(
             label_candidates=block_labels,
             required_paths=set(missing_output_paths),
         )
+        if (
+            metadata_convergence_directive is not None
+            and metadata_convergence_directive.get("reason_code") == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        ):
+            assert ctx.blocker_signal is not None
+            return reject(
+                error=ctx.blocker_signal.user_facing_reason,
+                user_facing_summary=ctx.blocker_signal.user_facing_reason,
+                data=metadata_convergence_directive,
+                record_repair_context_outcome=False,
+            )
         if metadata_convergence_directive is not None:
             reject_data["metadata_convergence_directive"] = metadata_convergence_directive
         return reject(
@@ -13750,6 +14047,7 @@ async def _update_workflow(
         ctx.persisted_draft_browser_calls = _workflow_yaml_browser_call_pairs(workflow_yaml)
         ctx.code_authoring_guardrail_reject_count = 0
         ctx.last_code_authoring_reject_was_credential_priority = False
+        ctx.metadata_reject_ladder_state = None
         _clear_code_authoring_repair_context(ctx)
         _clear_held_churn_signals(ctx)
         accepted_metadata = getattr(ctx, "code_artifact_metadata", None)

@@ -3,9 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    MetadataRejectLadderInput,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
     _binding_frontier_facet,
+    adjudicate_metadata_reject_ladder,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
@@ -23,6 +25,49 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, LoadedResultCompositionTarget
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+
+def _metadata_reject_ladder_input(*, structural_key: str = "reject-key") -> MetadataRejectLadderInput:
+    return MetadataRejectLadderInput(
+        reject_family="missing_code_artifact_metadata",
+        structural_key=structural_key,
+        gate_id="code_artifact_metadata",
+        missing_fields_by_label={
+            "extract_record": ["declared_goal", "claimed_outcomes", "evidence_refs_or_observation_refs"]
+        },
+    )
+
+
+def test_metadata_reject_ladder_reaches_exact_field_terminal_on_third_same_key() -> None:
+    reject = _metadata_reject_ladder_input()
+
+    first = adjudicate_metadata_reject_ladder(None, reject)
+    second = adjudicate_metadata_reject_ladder(first.state, reject)
+    third = adjudicate_metadata_reject_ladder(second.state, reject)
+
+    assert first.action == "rung_1"
+    assert first.rung == 1
+    assert second.action == "rung_2"
+    assert second.rung == 2
+    assert second.missing_fields_by_label == reject.missing_fields_by_label
+    assert third.action == "terminal"
+    assert third.rung is None
+    assert third.gate_id == "code_artifact_metadata"
+    assert third.missing_fields_by_label == reject.missing_fields_by_label
+    assert third.state.streak_count == 3
+
+
+def test_metadata_reject_ladder_changed_structural_key_starts_new_streak() -> None:
+    first = adjudicate_metadata_reject_ladder(None, _metadata_reject_ladder_input())
+    second = adjudicate_metadata_reject_ladder(
+        first.state,
+        _metadata_reject_ladder_input(structural_key="changed-key"),
+    )
+
+    assert second.action == "rung_1"
+    assert second.rung == 1
+    assert second.state.structural_key == "changed-key"
+    assert second.state.streak_count == 1
 
 
 def test_structural_key_changes_when_page_or_result_structure_changes() -> None:
@@ -1353,3 +1398,4 @@ def test_persisted_run_prose_only_failure_is_not_authoritative() -> None:
 
     assert outcome is None or outcome.is_authoritative is False
     assert outcome is None or outcome.structural_key is None
+    (adjudicate_metadata_reject_ladder,)

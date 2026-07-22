@@ -260,6 +260,7 @@ from .workflow_update import _update_workflow as _update_workflow
 from .workflow_update import (
     consume_output_contract_advisory_grant_for_run_result as consume_output_contract_advisory_grant_for_run_result,
 )
+from .workflow_update import metadata_same_key_terminal_preflight as metadata_same_key_terminal_preflight
 
 LOG = structlog.get_logger()
 
@@ -667,6 +668,21 @@ async def update_and_run_blocks_tool(
     if scaffold_applied:
         serialized_code_artifact_metadata = scaffolded_code_artifact_metadata
         arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
+
+    metadata_same_key_terminal = metadata_same_key_terminal_preflight(
+        copilot_ctx,
+        workflow_yaml,
+        serialized_code_artifact_metadata,
+    )
+    if metadata_same_key_terminal is not None:
+        record_tool_step_result_for_ctx(
+            copilot_ctx,
+            "update_and_run_blocks",
+            arguments,
+            metadata_same_key_terminal,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", metadata_same_key_terminal)
+        return json.dumps(sanitized)
 
     if recorded_outcome_grounding_requires_current_page(copilot_ctx):
         loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)

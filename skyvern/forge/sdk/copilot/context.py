@@ -118,6 +118,7 @@ class TurnNarrativePayload(TypedDict):
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
+        MetadataRejectLadderState,
         RecordedBuildTestOutcome,
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
@@ -855,6 +856,7 @@ class CopilotContext(AgentContext):
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    metadata_reject_ladder_state: MetadataRejectLadderState | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None

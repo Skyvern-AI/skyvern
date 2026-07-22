@@ -6,12 +6,14 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
+    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     BlockerKind,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
     build_llm_tool_error_payload,
     build_loop_blocker_signal,
+    build_metadata_reject_same_key_terminal_signal,
     clear_blocker_signal_for_reason_codes,
     maybe_clear_blocker_signal_on_tool_success,
     refresh_held_loop_blocker_evidence,
@@ -83,6 +85,38 @@ def test_to_trace_data_namespaces_extra_so_it_cannot_shadow_explicit_fields() ->
     trace = to_trace_data(signal)
     assert trace["blocker_kind"] == "authority_denied"
     assert trace["extra"] == {"blocker_kind": "evil", "custom_metric": 7}
+
+
+def test_metadata_same_key_terminal_names_gate_and_exact_missing_fields() -> None:
+    missing_fields = {"extract_record": ["declared_goal", "claimed_outcomes", "evidence_refs_or_observation_refs"]}
+
+    signal = build_metadata_reject_same_key_terminal_signal(
+        structural_key="same-key",
+        reject_family="missing_code_artifact_metadata",
+        missing_fields_by_label=missing_fields,
+    )
+
+    assert signal.internal_reason_code == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+    assert signal.preserves_workflow_draft is True
+    assert signal.renders_final_reply is True
+    assert "code_artifact_metadata" in signal.user_facing_reason
+    assert '"extract_record"' in signal.user_facing_reason
+    assert signal.extra["gate_id"] == "code_artifact_metadata"
+    assert signal.extra["missing_fields_by_label"] == missing_fields
+
+
+def test_metadata_same_key_terminal_degrades_leaky_label_in_user_facing_reason() -> None:
+    missing_fields = {"safe_reason_code": ["declared_goal"]}
+
+    signal = build_metadata_reject_same_key_terminal_signal(
+        structural_key="same-key",
+        reject_family="missing_code_artifact_metadata",
+        missing_fields_by_label=missing_fields,
+    )
+
+    assert "safe_reason_code" not in signal.user_facing_reason
+    assert signal.extra["missing_fields_by_label"] == missing_fields
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool=signal.blocked_tool)
 
 
 @pytest.mark.parametrize("token", _LEAK_DENY_TOKENS)

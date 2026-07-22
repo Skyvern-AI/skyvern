@@ -21,6 +21,7 @@ import pytest
 import yaml
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
+    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
     build_definition_contract_unsatisfied_blocker_signal,
@@ -13590,6 +13592,206 @@ class TestMetadataLessRejectArming:
         assert len(rung_two_emits) == 1 and rung_two_emits[0]["rung"] == 2
 
     @pytest.mark.asyncio
+    async def test_third_same_key_is_typed_terminal_without_recording_third_reject(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        first = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        record_build_test_outcome(
+            ctx,
+            RecordedBuildTestOutcome(
+                phase="scout_evaluate",
+                attempted_tool="evaluate",
+                verdict="progress_observed",
+                reason_code="loaded_result_targets_observed",
+                structural_failure_identity="scout:interleaved",
+            ),
+        )
+        second = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        metadata_rejects_before_terminal = sum(
+            row.get("reason_code") == "metadata_reject" for row in ctx.recorded_build_test_outcome_history
+        )
+
+        with capture_logs() as logs:
+            third = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+
+        assert first["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert second["data"]["metadata_convergence_directive"]["rung"] == 2
+        assert third["data"]["reason_code"] == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        assert third["data"]["gate_id"] == "code_artifact_metadata"
+        assert (
+            third["data"]["missing_fields_by_label"]
+            == second["data"]["metadata_convergence_directive"]["missing_fields_by_label"]
+        )
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind is TurnHaltKind.METADATA_REJECT_SAME_KEY
+        assert (
+            sum(row.get("reason_code") == "metadata_reject" for row in ctx.recorded_build_test_outcome_history)
+            == metadata_rejects_before_terminal
+        )
+        terminal_logs = [log for log in logs if log["event"] == "copilot_metadata_reject_same_key_terminal_selected"]
+        assert len(terminal_logs) == 1
+        assert terminal_logs[0]["missing_fields_by_label"] == third["data"]["missing_fields_by_label"]
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_native_preflight_terminals_on_third_same_key(self) -> None:
+        ctx = _code_only_ctx()
+        tool_ctx = SimpleNamespace(context=ctx, tool_name="update_and_run_blocks")
+        arguments = json.dumps(
+            {
+                "workflow_yaml": _metadata_less_output_yaml(),
+                "block_labels": ["extract_provider"],
+                "code_artifact_metadata": [],
+            }
+        )
+
+        first = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+        second = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+        third = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+
+        assert first["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert second["data"]["metadata_convergence_directive"]["rung"] == 2
+        assert "code_artifact_metadata" in third["error"]
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind is TurnHaltKind.METADATA_REJECT_SAME_KEY
+        assert ctx.turn_halt.blocker_signal is not None
+        assert ctx.turn_halt.blocker_signal.internal_reason_code == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        assert (
+            ctx.turn_halt.blocker_signal.extra["missing_fields_by_label"]
+            == second["data"]["metadata_convergence_directive"]["missing_fields_by_label"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_metadata_ladder_defers_run_backed_repair_ceiling(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.recorded_persisted_block_run_workflow_run_id = "wr_prior"
+        ctx.consecutive_non_converging_repair_count = settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL - 1
+        tool_ctx = SimpleNamespace(context=ctx, tool_name="update_and_run_blocks")
+        arguments = json.dumps(
+            {
+                "workflow_yaml": _metadata_less_output_yaml(),
+                "block_labels": ["extract_provider"],
+                "code_artifact_metadata": [],
+            }
+        )
+
+        first = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+        second = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+        third = json.loads(await tools_module.update_and_run_blocks_tool.on_invoke_tool(tool_ctx, arguments))
+
+        assert first["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert second["data"]["metadata_convergence_directive"]["rung"] == 2
+        assert third["data"]["reason_code"] == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind is TurnHaltKind.METADATA_REJECT_SAME_KEY
+
+    @pytest.mark.asyncio
+    async def test_metadata_ladder_does_not_defer_ceiling_for_unrelated_latest_repair(self) -> None:
+        ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        for rung in (1, 2):
+            rejected = await _update_workflow(
+                {"workflow_yaml": yaml_text},
+                ctx,
+                allow_missing_credentials=True,
+            )
+            assert rejected["data"]["metadata_convergence_directive"]["rung"] == rung
+        assert run_execution_module._metadata_reject_ladder_defers_repair_ceiling(ctx, count=8) is True
+
+        record_build_test_outcome(
+            ctx,
+            RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="run_blocks",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                structural_failure_identity="runtime:unrelated",
+            ),
+        )
+
+        assert run_execution_module._metadata_reject_ladder_defers_repair_ceiling(ctx, count=9) is False
+
+    def test_metadata_ladder_does_not_defer_ceiling_for_legacy_context(self) -> None:
+        legacy_ctx: Any = SimpleNamespace()
+
+        assert run_execution_module._metadata_reject_ladder_defers_repair_ceiling(legacy_ctx, count=8) is False
+
+    @pytest.mark.asyncio
+    async def test_changed_metadata_key_reenables_run_backed_repair_ceiling(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.recorded_persisted_block_run_workflow_run_id = "wr_prior"
+        ctx.consecutive_non_converging_repair_count = settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL - 1
+        tool_ctx = SimpleNamespace(context=ctx, tool_name="update_and_run_blocks")
+
+        first = json.loads(
+            await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                tool_ctx,
+                json.dumps(
+                    {
+                        "workflow_yaml": _metadata_less_output_yaml(),
+                        "block_labels": ["extract_provider"],
+                        "code_artifact_metadata": [],
+                    }
+                ),
+            )
+        )
+        changed = json.loads(
+            await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                tool_ctx,
+                json.dumps(
+                    {
+                        "workflow_yaml": _metadata_less_page_read_yaml(),
+                        "block_labels": ["extract_provider"],
+                        "code_artifact_metadata": [],
+                    }
+                ),
+            )
+        )
+
+        assert first["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert changed["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind is TurnHaltKind.REPAIR_CEILING_REACHED
+
+    @pytest.mark.asyncio
+    async def test_accepted_persist_resets_metadata_ladder_and_generic_churn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        rejected = await _update_workflow(
+            {"workflow_yaml": _metadata_less_output_yaml()},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert rejected["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert ctx.metadata_reject_ladder_state is not None
+        assert ctx.code_authoring_guardrail_reject_count == 1
+
+        accepted = await _update_workflow(
+            {
+                "workflow_yaml": _SAFE_EXTRACTION_CODE_YAML,
+                "code_artifact_metadata": [_terminal_metadata("search_registry", "search the registry")],
+            },
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert accepted["ok"] is True
+        assert ctx.metadata_reject_ladder_state is None
+        assert ctx.code_authoring_guardrail_reject_count == 0
+        restarted = await _update_workflow(
+            {"workflow_yaml": _metadata_less_output_yaml()},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert restarted["data"]["metadata_convergence_directive"]["rung"] == 1
+
+    @pytest.mark.asyncio
     async def test_structural_progress_resets_to_rung_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
@@ -13604,19 +13806,120 @@ class TestMetadataLessRejectArming:
         assert progressed["data"]["metadata_convergence_directive"]["rung"] == 1
 
     @pytest.mark.asyncio
-    async def test_log_only_mode_leaves_seam_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_intervening_normalization_reject_breaks_missing_metadata_streak(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _stub_successful_update(monkeypatch)
-        monkeypatch.setattr(
-            workflow_update_module, "copilot_author_time_gate_log_only_enabled", lambda *_args, **_kwargs: True
-        )
         ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        for rung in (1, 2):
+            rejected = await _update_workflow(
+                {"workflow_yaml": yaml_text},
+                ctx,
+                allow_missing_credentials=True,
+            )
+            assert rejected["data"]["metadata_convergence_directive"]["rung"] == rung
+
+        malformed_metadata = {
+            "block_label": "extract_provider",
+            "artifact_id": "code_artifact:extract_provider",
+            "declared_goal": "extract the provider",
+            "claimed_outcomes": [
+                {
+                    "id": "claim:provider",
+                    "scope": "outcome",
+                    "text": "provider extracted",
+                    "status": "satisfied",
+                    "depends_on": ["dependency:page"],
+                    "covered_criteria": ["criterion:provider"],
+                    "goal_value_paths": ["provider"],
+                }
+            ],
+            "page_dependencies": [{"id": "dependency:page", "scope": "page", "status": "satisfied"}],
+            "completion_criteria": [{"id": "criterion:provider", "text": "provider extracted", "level": "terminal"}],
+            "terminal_verifier_expectations": [
+                {
+                    "id": "expectation:provider",
+                    "text": "provider extracted",
+                    "criteria_ids": ["criterion:provider"],
+                    "goal_value_paths": ["provider"],
+                }
+            ],
+            "observation_refs": [
+                {
+                    "observation_ref": "obs:page",
+                    "dependency_id": "dependency:page",
+                    "status": "satisfied",
+                    "source_tool": "scout_interaction",
+                }
+            ],
+        }
+        intervening = await _update_workflow(
+            {"workflow_yaml": yaml_text, "code_artifact_metadata": [malformed_metadata]},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert intervening["ok"] is False
+        assert "metadata_convergence_directive" not in intervening["data"]
+
+        restarted = await _update_workflow(
+            {"workflow_yaml": yaml_text},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert restarted["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert ctx.turn_halt is None
+
+    @pytest.mark.asyncio
+    async def test_intervening_non_metadata_author_reject_breaks_streak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        yaml_text = _metadata_less_output_yaml()
+        for rung in (1, 2):
+            rejected = await _update_workflow(
+                {"workflow_yaml": yaml_text},
+                ctx,
+                allow_missing_credentials=True,
+            )
+            assert rejected["data"]["metadata_convergence_directive"]["rung"] == rung
+
+        record_build_test_outcome(
+            ctx,
+            recorded_outcome_from_author_time_reject(
+                reason_code="code_safety_reject",
+                structural_payload={"reason_code": "code_safety_reject", "surface": "page.request"},
+            ),
+        )
+        restarted = await _update_workflow(
+            {"workflow_yaml": yaml_text},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert restarted["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert ctx.turn_halt is None
+
+    @pytest.mark.asyncio
+    async def test_log_only_mode_persists_draft_and_leaves_ladder_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.author_time_gate_log_only_ids = {workflow_update_module._OUTPUT_CONTRACT_ABLATION_GATE_ID}
         with capture_logs() as logs:
             result = await _update_workflow(
-                {"workflow_yaml": _metadata_less_output_yaml()}, ctx, allow_missing_credentials=True
+                {"workflow_yaml": _metadata_less_output_yaml()},
+                ctx,
+                allow_missing_credentials=True,
+                allow_static_output_uncertainty=True,
             )
-        assert result["ok"] is False
-        assert "metadata_convergence_directive" not in result["data"]
+        assert result["ok"] is True
+        assert ctx.latest_recorded_build_test_outcome is None
+        assert ctx.metadata_reject_ladder_state is None
         assert not ctx.output_contract_armed_directive_fingerprint_by_signature
+        event = ctx.author_time_gate_ablation_events[-1]
+        assert event.gate_id == workflow_update_module._OUTPUT_CONTRACT_ABLATION_GATE_ID
+        assert event.reason_code == "missing_code_artifact_metadata"
+        assert event.log_only is True
         assert [log for log in logs if log["event"] == _METADATA_LESS_DIRECTIVE_EVENT] == []
 
     @pytest.mark.asyncio
@@ -13629,24 +13932,24 @@ class TestMetadataLessRejectArming:
         assert result["ok"] is False
         assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
         assert "metadata_convergence_directive" not in result["data"]
+        assert ctx.metadata_reject_ladder_state is None
 
     @pytest.mark.asyncio
-    async def test_churn_stash_fires_at_cap_with_arming_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_same_key_terminal_preempts_generic_churn_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
         yaml_text = _metadata_less_output_yaml()
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
+        for rung in (1, 2):
             result = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
             assert result["ok"] is False
-            assert result["data"]["metadata_convergence_directive"]["rung"] in (1, 2)
-            assert ctx.code_authoring_guardrail_reject_count == index + 1
+            assert result["data"]["metadata_convergence_directive"]["rung"] == rung
             assert ctx.blocker_signal is None
-        final = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
-        assert final["ok"] is False
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+        terminal = await _update_workflow({"workflow_yaml": yaml_text}, ctx, allow_missing_credentials=True)
+        assert terminal["ok"] is False
+        assert terminal["data"]["reason_code"] == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        assert ctx.code_authoring_guardrail_reject_count < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+        assert ctx.blocker_signal.internal_reason_code == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
 
     @pytest.mark.asyncio
     async def test_seam_replay_emits_once_then_escalates(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -13687,6 +13990,55 @@ class TestMetadataLessRejectArming:
         escalated = second["data"]["metadata_convergence_directive"]
         assert escalated["rung"] == 2
         assert _RECORDED_METADATA_REJECT_BLOCK_LABEL in escalated["metadata_fill_in_skeleton"]
+
+    @pytest.mark.asyncio
+    async def test_recorded_reject_identity_defers_ceiling_and_terminals_on_third(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_missing_code_artifact_metadata_error",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_evaluate_output_contract_for_code_block",
+            lambda *_args, **_kwargs: None,
+        )
+        ctx = _code_only_ctx()
+        ctx.recorded_persisted_block_run_workflow_run_id = "wr_prior"
+        yaml_text = _recorded_metadata_reject_yaml()
+        recorded_run_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            structural_failure_identity="completion:missing-provider",
+            missing_requested_output_facts=[
+                {"output_path": "provider", "output_root": "provider", "value_status": "no_typed_value"}
+            ],
+        )
+        results = []
+        for _ in range(3):
+            record_build_test_outcome(ctx, recorded_run_outcome)
+            results.append(
+                await _update_workflow(
+                    {"workflow_yaml": yaml_text},
+                    ctx,
+                    allow_missing_credentials=True,
+                )
+            )
+
+        assert results[0]["data"]["metadata_convergence_directive"]["rung"] == 1
+        assert results[1]["data"]["metadata_convergence_directive"]["rung"] == 2
+        assert ctx.metadata_reject_ladder_state is not None
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.structural_key == ctx.metadata_reject_ladder_state.structural_key
+        assert run_execution_module._metadata_reject_ladder_defers_repair_ceiling(ctx, count=9) is True
+        assert results[2]["data"]["reason_code"] == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind is TurnHaltKind.METADATA_REJECT_SAME_KEY
 
 
 class TestWholeTrajectoryImposition:
