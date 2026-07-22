@@ -3191,7 +3191,7 @@ async def handle_click_action(
         )
         if child is not None:
             skyvern_element = child
-        else:
+        elif not await SkyvernElement.wait_until_enabled(skyvern_element):
             LOG.warning(
                 "Try to click on a disabled element",
                 action_type=action.action_type,
@@ -3778,7 +3778,7 @@ async def handle_input_text_action(
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
-    if await skyvern_element.is_disabled(dynamic=True):
+    if not await SkyvernElement.wait_until_enabled(skyvern_element):
         LOG.warning(
             "Try to input text on a disabled element",
             action_type=action.action_type,
@@ -4525,7 +4525,7 @@ async def handle_upload_file_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
-    if await skyvern_element.is_disabled(dynamic=True):
+    if not await SkyvernElement.wait_until_enabled(skyvern_element):
         LOG.warning(
             "Try to upload file on a disabled element",
             action_type=action.action_type,
@@ -4673,6 +4673,13 @@ async def handle_select_option_action(
     # Sometimes our custom select logic could fail, and leaving the dropdown being opened.
     # Confirm if the select action is on the custom option element
     if await skyvern_element.is_custom_option():
+        if not await SkyvernElement.wait_until_enabled(skyvern_element):
+            LOG.warning(
+                "Try to select on a disabled custom option",
+                action_type=action.action_type,
+                element_id=skyvern_element.get_id(),
+            )
+            return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
         click_action = ClickAction(element_id=action.element_id)
         action.set_has_mini_agent()
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
@@ -4715,7 +4722,7 @@ async def handle_select_option_action(
             skyvern_element = selectable_child
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
-    if await skyvern_element.is_disabled(dynamic=True):
+    if not await SkyvernElement.wait_until_enabled(skyvern_element):
         LOG.warning(
             "Try to select on a disabled element",
             action_type=action.action_type,

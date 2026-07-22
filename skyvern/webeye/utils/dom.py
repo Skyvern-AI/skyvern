@@ -359,6 +359,18 @@ class SkyvernElement:
             or style_disabled
         )
 
+    async def wait_until_enabled(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout / 1000
+
+        while await self.is_disabled(dynamic=True):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.1, remaining))
+
+        return True
+
     async def is_readonly(self, dynamic: bool = False) -> bool:
         # if attr not exist, return None
         # if attr is like 'readonly', return empty string or True
@@ -1160,7 +1172,7 @@ class SkyvernElement:
         incremental_page: IncrementalScrapePage | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        if await self.is_disabled(dynamic=True):
+        if not await self.wait_until_enabled(timeout=timeout):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
         try:
