@@ -138,6 +138,7 @@ from .discovery import _discovery_detect_anti_bot as _discovery_detect_anti_bot
 from .discovery import _discovery_detect_login_wall as _discovery_detect_login_wall
 from .discovery import _discovery_resolve_href as _discovery_resolve_href
 from .discovery import _discovery_walk as _discovery_walk
+from .discovery import _rank_discovery_entrypoint_candidates as _rank_discovery_entrypoint_candidates
 from .discovery import _resolve_discovery_entry_url as _resolve_discovery_entry_url
 from .frontier import _CANONICAL_WORKFLOW_SETTING_FIELDS as _CANONICAL_WORKFLOW_SETTING_FIELDS
 from .frontier import _JINJA_LITERAL_ROOTS as _JINJA_LITERAL_ROOTS
@@ -874,14 +875,18 @@ async def discover_workflow_entrypoint_tool(
     Use this BEFORE writing blocks when the user named a website (with a URL,
     a bare domain, or a single brand word) but no specific page. Accepts:
     a URL with or without scheme (``example.com/login`` is fine), a bare
-    domain (``example.com``), or a single brand word. Configured aliases resolve
-    first; other single brand words resolve as ``https://www.<word>.com``.
-    English phrases ("the X website") return
+    domain (``example.com``), or a single brand word. A brand word is resolved
+    only from an exact provider-backed official-site association that safely
+    navigates over public-network HTTPS to the associated origin. Results use
+    ``contract_version=discover_workflow_entrypoint_v3``. English phrases
+    ("the X website") return
     ``failure_reason=could_not_resolve_site_name`` — ASK_QUESTION for a URL.
 
     Returns ``candidate_url`` plus a short ``evidence_trail`` and any
-    ``candidate_form_fields``. Use ``candidate_url`` as the ``url`` value
-    on a ``goto_url`` block. Do NOT paste the evidence into workflow YAML.
+    ``candidate_form_fields``. Evidence-backed brand results also include
+    bounded ``candidate_provenance`` and ``navigation_evidence``. Use
+    ``candidate_url`` as the ``url`` value on a ``goto_url`` block. Do NOT
+    paste the evidence into workflow YAML.
 
     Budget: one successful call per turn, three per chat, eight page hops,
     sixty seconds. On any ``failure_reason``, ASK_QUESTION for a URL — do not
