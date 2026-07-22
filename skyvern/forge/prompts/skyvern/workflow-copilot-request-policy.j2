@@ -53,8 +53,9 @@ credential_input_kind:
 
 login_intent:
 - true when the latest request explicitly asks the workflow to authenticate — sign in, log in, authenticate, or get past a login gate — as part of reaching the goal. "Log in and place an order" and a pure "log into <site>" are both true.
+- true when the latest request asks the workflow to take an action only a signed-in user can perform against a concrete target — for example upvote or vote on a post, submit a post, comment or reply, like or react, follow an account, save or bookmark an item, or apply to a specific listing — even when it never says "sign in" or "log in". These interactions require an authenticated identity, so treat them as login intent; this takes precedence over the URL-with-task-language rule below. The concrete target is the specific post, item, listing, or URL already named in the request or workflow.
 - false for an ordinary task with no authentication step, for a message that is essentially just a URL or a URL paired only with task language such as "scrape", "extract", "fill the form", "navigate to", or "go to", and for session-reuse phrasing such as "I'm already signed in" or "use my current browser session".
-- false on a first-touch task phrase that merely implies an eventual login without explicitly asking to sign in or authenticate, for example "check my account balance" or "download my invoices". Let task or URL clarification happen first.
+- false on a passive first-touch read that merely implies an eventual login without explicitly asking to sign in or authenticate, for example "check my account balance" or "download my invoices". Let task or URL clarification happen first.
 - Independent of credential_input_kind: decide it from whether authentication is required, not from whether the user supplied credential material. It is true for an explicit login request that names a saved credential and true for one that names none.
 
 requires_user_clarification:
