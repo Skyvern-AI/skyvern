@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.context import CredentialCheck, StructuredContext
+from skyvern.forge.sdk.copilot.context import (
+    CredentialCheck,
+    StructuredContext,
+    record_approved_credentials_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
@@ -17,6 +21,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_request_policy,
     credential_prompt_reason,
 )
+from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
 
 
 def _yaml(body: str) -> str:
@@ -457,6 +462,7 @@ async def _build_with_forced_classifier(
     get_credentials: AsyncMock | None = None,
     get_credentials_by_ids: AsyncMock | None = None,
     workflow_yaml: str = "",
+    global_llm_context: str = "",
 ) -> RequestPolicy:
     load_mock = get_credentials or AsyncMock(return_value=org_credentials)
     by_ids_mock = get_credentials_by_ids or AsyncMock(return_value=[])
@@ -472,7 +478,7 @@ async def _build_with_forced_classifier(
             user_message=user_message,
             workflow_yaml=workflow_yaml,
             chat_history=[],
-            global_llm_context="",
+            global_llm_context=global_llm_context,
             organization_id="o_test",
             handler=None,
         )
@@ -880,3 +886,121 @@ async def test_a_pasted_secret_under_login_intent_keeps_the_raw_secret_refusal()
 def test_login_credentials_unresolved_surfaces_a_prompt_but_grants_no_deferred_draft_authority() -> None:
     assert "login_credentials_unresolved" in CREDENTIAL_PROMPT_CLARIFICATION_REASONS
     assert "login_credentials_unresolved" not in CREDENTIAL_DEFERRED_DRAFT_REASONS
+
+
+async def _resolve_named_credential_turn(credential: SimpleNamespace) -> RequestPolicy:
+    return await _build_with_forced_classifier(
+        user_message=f"Sign in with the saved credential named {credential.name}.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="credential_name",
+            credential_refs=[credential.name],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+
+@pytest.mark.asyncio
+async def test_prior_approved_credential_carried_into_confirmation_turn() -> None:
+    credential = _cred("mock-portal-login", "cred_portal", tested_url="http://localhost:8951/x")
+    turn_one = await _resolve_named_credential_turn(credential)
+    assert [c.credential_id for c in turn_one.resolved_credentials] == ["cred_portal"]
+
+    recorded = record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=turn_one), None)
+
+    turn_two = await _build_with_forced_classifier(
+        user_message="yes",
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[],
+        get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        global_llm_context=recorded,
+    )
+
+    assert turn_two.credential_input_kind == "none"
+    assert "cred_portal" in {c.credential_id for c in turn_two.resolved_credentials}
+    assert _credential_run_approval_error(["cred_portal"], turn_two) is None
+
+
+@pytest.mark.asyncio
+async def test_carried_credential_metadata_matches_turn_one_resolution() -> None:
+    credential = _cred("mock-portal-login", "cred_portal", tested_url="http://localhost:8951/x")
+    turn_one = await _resolve_named_credential_turn(credential)
+    recorded = record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=turn_one), None)
+
+    turn_two = await _build_with_forced_classifier(
+        user_message="yes",
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[],
+        get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        global_llm_context=recorded,
+    )
+
+    carried = next(c for c in turn_two.resolved_credentials if c.credential_id == "cred_portal")
+    assert carried.tested_url == "http://localhost:8951/x"
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_prior_approved_credential_drops_out_of_carry() -> None:
+    credential = _cred("mock-portal-login", "cred_portal")
+    turn_one = await _resolve_named_credential_turn(credential)
+    recorded = record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=turn_one), None)
+
+    turn_two = await _build_with_forced_classifier(
+        user_message="yes",
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[],
+        get_credentials_by_ids=AsyncMock(return_value=[]),
+        global_llm_context=recorded,
+    )
+
+    assert turn_two.resolved_credentials == []
+    assert _credential_run_approval_error(["cred_portal"], turn_two) is not None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_named_credential_still_blocks_despite_carried_state() -> None:
+    approved = _cred("mock-portal-login", "cred_portal")
+    recorded = record_approved_credentials_in_global_llm_context(
+        SimpleNamespace(request_policy=RequestPolicy(resolved_credentials=[approved])), None
+    )
+    duplicates = [_cred("payroll", "cred_payroll_a"), _cred("payroll", "cred_payroll_b")]
+
+    turn_two = await _build_with_forced_classifier(
+        user_message="use my payroll login",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="credential_name",
+            credential_refs=["payroll"],
+            classifier_status="success",
+        ),
+        org_credentials=duplicates,
+        get_credentials_by_ids=AsyncMock(return_value=[approved]),
+        global_llm_context=recorded,
+    )
+
+    assert turn_two.requires_user_clarification is True
+    assert turn_two.clarification_reason == "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_carried_credential_satisfies_the_login_reachability_ask() -> None:
+    # The carry must be seeded before _login_credentials_unresolved runs; seeding after it
+    # would re-ask for a credential approved on an earlier turn (SKY-12812 via SKY-12760's ask).
+    credential = _cred("mock-portal-login", "cred_portal", tested_url="https://portal.example.com/login")
+    turn_one = await _resolve_named_credential_turn(credential)
+    recorded = record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=turn_one), None)
+
+    turn_two = await _build_with_forced_classifier(
+        user_message="Log in to https://portal.example.com/login and download this month's invoices.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[],
+        get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        global_llm_context=recorded,
+    )
+
+    assert turn_two.clarification_reason != "login_credentials_unresolved"
+    assert "cred_portal" in {c.credential_id for c in turn_two.resolved_credentials}

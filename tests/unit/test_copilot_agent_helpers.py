@@ -100,6 +100,7 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _completion_verification_criteria,
     _maybe_run_completion_verification,
 )
+from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -5410,6 +5411,15 @@ workflow_definition:
         )
 
         assert ids == ["cred_valid"]
+
+    def test_carried_credential_does_not_approve_a_never_named_id(self) -> None:
+        policy = RequestPolicy(resolved_credentials=[SimpleNamespace(credential_id="cred_A")])
+
+        assert _credential_run_approval_error(["cred_A"], policy) is None
+        error = _credential_run_approval_error(["cred_X"], policy)
+        assert error is not None
+        assert "unapproved_credential_reference" in error
+        assert "cred_X" in error
 
     @pytest.mark.asyncio
     async def test_missing_tool_credential_reference_returns_blocking_error(self, monkeypatch) -> None:

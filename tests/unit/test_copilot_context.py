@@ -10,13 +10,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.copilot.context import (
+    ApprovedCredential,
     FillCarry,
     LoadedResultTargetContext,
     ObservedPage,
     StructuredContext,
     _fill_carry_from_scout_trajectory,
     _merge_observed_acted_pages,
+    adopt_model_authored_context,
     finalize_discovery_counter_in_global_llm_context,
+    record_approved_credentials_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
@@ -662,3 +665,88 @@ class TestCopilotContext:
         assert ctx.last_failure_signature is None
         assert ctx.repeated_failure_streak_count == 0
         assert ctx.repeated_failure_nudge_emitted_at_streak == 0
+
+
+def _policy_ctx(resolved: list[SimpleNamespace], credential_input_kind: str = "credential_name") -> SimpleNamespace:
+    return SimpleNamespace(
+        request_policy=SimpleNamespace(resolved_credentials=resolved, credential_input_kind=credential_input_kind)
+    )
+
+
+def test_record_approved_credentials_persists_resolved_ids() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    records = StructuredContext.from_json_str(raw).approved_credentials
+    assert records == [ApprovedCredential(credential_id="cred_portal")]
+
+
+def test_record_approved_credentials_is_idempotent_across_turns() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    first = record_approved_credentials_in_global_llm_context(ctx, None)
+    second = record_approved_credentials_in_global_llm_context(ctx, first)
+
+    ids = [record.credential_id for record in StructuredContext.from_json_str(second).approved_credentials]
+    assert ids == ["cred_portal"]
+
+
+def test_record_approved_credentials_caps_at_twenty() -> None:
+    prior = StructuredContext(
+        approved_credentials=[ApprovedCredential(credential_id=f"cred_{i}") for i in range(20)]
+    ).to_json_str()
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_new", name="")])
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, prior)
+
+    records = StructuredContext.from_json_str(raw).approved_credentials
+    assert len(records) == 20
+    assert records[-1].credential_id == "cred_new"
+    assert "cred_0" not in {record.credential_id for record in records}
+
+
+def test_record_approved_credentials_survive_prompt_sanitization() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    recorded = record_approved_credentials_in_global_llm_context(ctx, None)
+    sanitized = sanitize_global_llm_context_for_prompt(recorded)
+
+    ids = [record.credential_id for record in StructuredContext.from_json_str(sanitized).approved_credentials]
+    assert ids == ["cred_portal"]
+
+
+def test_record_approved_credentials_no_ops_without_resolved() -> None:
+    assert record_approved_credentials_in_global_llm_context(_policy_ctx([]), None) is None
+    assert record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=None), "prior") == "prior"
+
+
+def test_model_authored_context_cannot_introduce_approved_credentials() -> None:
+    # Org membership is not evidence the user named a credential: an entry the model
+    # supplies must not survive into the recorded set, or the next turn would promote
+    # it into resolved_credentials and clear the unapproved-credential gate.
+    trusted = StructuredContext(approved_credentials=[ApprovedCredential(credential_id="cred_named")]).to_json_str()
+    model_authored = {
+        "user_goal": "log in",
+        "approved_credentials": [{"credential_id": "cred_never_named"}],
+    }
+
+    adopted = adopt_model_authored_context(trusted, model_authored)
+
+    assert [r.credential_id for r in adopted.approved_credentials] == ["cred_named"]
+    assert adopted.user_goal == "log in"
+
+
+def test_model_authored_context_cannot_drop_a_server_recorded_approval() -> None:
+    trusted = StructuredContext(approved_credentials=[ApprovedCredential(credential_id="cred_named")]).to_json_str()
+
+    adopted = adopt_model_authored_context(trusted, {"user_goal": "x", "approved_credentials": []})
+
+    assert [r.credential_id for r in adopted.approved_credentials] == ["cred_named"]
+
+
+def test_model_authored_free_text_context_is_preserved_without_approvals() -> None:
+    adopted = adopt_model_authored_context(None, "just some prose the model emitted")
+
+    assert adopted.user_goal == "just some prose the model emitted"
+    assert adopted.approved_credentials == []
