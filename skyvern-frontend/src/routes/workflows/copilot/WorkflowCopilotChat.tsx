@@ -74,7 +74,7 @@ import {
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
-import { NarrativeView } from "./NarrativeView";
+import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
@@ -1952,6 +1952,14 @@ export function WorkflowCopilotChat({
       }
       setIsLoading(true);
       inFlightRef.current = true;
+      if (copilotUxV1Enabled) {
+        // Clear the prior turn's lingering narrative so the instant-ack placeholder's
+        // turnId===null gate holds on every send, and the first frame hands off cleanly.
+        // Reset the ref too (it lags setNarrative by a passive effect) so a late
+        // prior-turn recorded-actions fetch can't rebase onto the stale narrative.
+        narrativeRef.current = EMPTY_NARRATIVE;
+        setNarrative(EMPTY_NARRATIVE);
+      }
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -3291,6 +3299,19 @@ export function WorkflowCopilotChat({
                 />
               );
             })}
+            {/*
+            Instant-ack placeholder: fills the send→first-frame gap. isLoading +
+            turnId===null is the whole gate — mutually exclusive with the live
+            bubble below (turnId!==null), so the first frame swaps them in one
+            render. The send-time reset (see handleSend) keeps turnId null on
+            every send, including queued-then-drained follow-ups.
+          */}
+            {copilotUxV1Enabled &&
+            isLoading &&
+            !isLoadingHistory &&
+            narrative.turnId === null ? (
+              <InstantAckPlaceholder />
+            ) : null}
             {/*
             Bottom in-flight narrative bubble. Suppressed once the terminal
             RESPONSE has frozen the narrative into the latest AI message —
