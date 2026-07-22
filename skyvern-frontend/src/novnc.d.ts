@@ -43,3 +43,18 @@ declare module "@novnc/novnc/lib/rfb.js" {
     viewportChange(): void;
   }
 }
+
+declare module "@novnc/novnc/lib/input/gesturehandler.js" {
+  interface TrackedTouch {
+    id: number;
+  }
+
+  export default class GestureHandler {
+    _ignored: number[];
+    _tracked: TrackedTouch[];
+
+    attach(target: HTMLElement): void;
+    _touchStart(id: number, x: number, y: number): void;
+    _touchEnd(id: number, x: number, y: number): void;
+  }
+}
