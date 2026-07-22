@@ -3989,6 +3989,35 @@ async def _seed_discovered_credentials(
     )
 
 
+def _prior_approved_credential_ids_from_context(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
+    }
+
+
+async def _seed_prior_approved_credentials(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    prior_ids = _prior_approved_credential_ids_from_context(global_llm_context)
+    carry_ids = sorted(prior_ids - {credential.credential_id for credential in policy.resolved_credentials})
+    if not carry_ids:
+        return
+    carried = await app.DATABASE.credentials.get_credentials_by_ids(carry_ids, organization_id=organization_id)
+    if not carried:
+        return
+    policy.resolved_credentials = list(policy.resolved_credentials) + carried
+    LOG.info(
+        "request-policy prior approved credentials carried",
+        organization_id=organization_id,
+        carried_credential_ids=[credential.credential_id for credential in carried],
+        carried_count=len(carried),
+    )
+
+
 def _last_assistant_message_was_saved_credential_question(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
 ) -> bool:
@@ -4365,6 +4394,21 @@ async def build_request_policy(
                 policy,
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
+
+    # Seeded before the login-credential reachability check so a credential approved on an
+    # earlier turn counts as reachable and a confirmation-only turn does not re-ask for it.
+    try:
+        await _seed_prior_approved_credentials(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy prior approved credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
 
     if _login_credentials_unresolved(policy, user_message, workflow_yaml):
         if policy.clarification_reason == "none":

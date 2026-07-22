@@ -151,6 +151,10 @@ class CredentialCheck(BaseModel):
     found: bool = False
 
 
+class ApprovedCredential(BaseModel):
+    credential_id: str
+
+
 class ObservedPage(BaseModel):
     """Compact cross-turn record of a page the agent scouted (SKY-10562).
 
@@ -245,6 +249,7 @@ class StructuredContext(BaseModel):
     urls_visited: list[UrlVisit] = Field(default_factory=list)
     fields_filled: list[FieldFilled] = Field(default_factory=list)
     credentials_checked: list[CredentialCheck] = Field(default_factory=list)
+    approved_credentials: list[ApprovedCredential] = Field(default_factory=list)
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
     # Per-chat discovery budget. Survives turn boundaries via
@@ -586,6 +591,50 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
             field_count=len(fill_carry),
         )
     return sc.to_json_str()
+
+
+_MAX_APPROVED_CREDENTIALS = 20
+
+
+def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
+    """Persist resolved credentials as durable cross-turn approval. Records only from
+    resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
+    holds by construction.
+    """
+    policy = ctx.request_policy
+    if policy is None or not policy.resolved_credentials:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    existing_ids = {record.credential_id for record in sc.approved_credentials}
+    for credential in policy.resolved_credentials:
+        if credential.credential_id in existing_ids:
+            continue
+        sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
+        existing_ids.add(credential.credential_id)
+    if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
+        sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
+    return sc.to_json_str()
+
+
+def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
+    """Take the model's context but keep `approved_credentials` server-owned.
+
+    Approval is recorded only from server-resolved credentials; an entry the model
+    supplied would be promoted into `resolved_credentials` on the next turn and clear
+    the unapproved-credential gate for a credential the user never named. Membership
+    of the org is not evidence the user named it.
+    """
+    trusted = StructuredContext.from_json_str(trusted_raw)
+    structured = trusted
+    if isinstance(model_raw, dict):
+        try:
+            structured = StructuredContext.model_validate(model_raw)
+        except Exception:
+            structured = trusted
+    elif isinstance(model_raw, str):
+        structured = StructuredContext.from_json_str(model_raw)
+    structured.approved_credentials = list(trusted.approved_credentials)
+    return structured
 
 
 @dataclass

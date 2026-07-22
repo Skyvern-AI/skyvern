@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     ProposalDisposition,
     TurnNarrativePayload,
+    adopt_model_authored_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
@@ -1194,9 +1195,11 @@ async def copilot_call_llm(
         action_type=action_type,
     )
 
-    global_llm_context = action_data.get("global_llm_context")
-    if global_llm_context is not None:
-        global_llm_context = sanitize_global_llm_context_for_prompt(str(global_llm_context))
+    model_authored_context = action_data.get("global_llm_context")
+    if model_authored_context is not None:
+        global_llm_context = sanitize_global_llm_context_for_prompt(
+            adopt_model_authored_context(global_llm_context, model_authored_context).to_json_str()
+        )
 
     if action_type == "REPLACE_WORKFLOW":
         llm_workflow_yaml = default_data_write_continue_on_failure(

@@ -96,7 +96,9 @@ from skyvern.forge.sdk.copilot.context import (
     ResponseType,
     StructuredContext,
     TurnNarrativePayload,
+    adopt_model_authored_context,
     finalize_discovery_counter_in_global_llm_context,
+    record_approved_credentials_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
@@ -1743,7 +1745,9 @@ def _make_agent_result(
     normal translate-result, missing-SDK fallback, unexpected-error fallback).
     """
     final_context = (
-        finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+        record_approved_credentials_in_global_llm_context(
+            ctx, finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+        )
         if ctx is not None
         else global_llm_context
     )
@@ -3968,15 +3972,7 @@ async def _translate_to_agent_result(
         last_workflow = None
         last_workflow_yaml = None
 
-    llm_context_raw = action_data.get("global_llm_context")
-    structured = StructuredContext.from_json_str(global_llm_context)
-    if isinstance(llm_context_raw, dict):
-        try:
-            structured = StructuredContext.model_validate(llm_context_raw)
-        except Exception:
-            pass
-    elif isinstance(llm_context_raw, str):
-        structured = StructuredContext.from_json_str(llm_context_raw)
+    structured = adopt_model_authored_context(global_llm_context, action_data.get("global_llm_context"))
     structured.merge_turn_summary(ctx.tool_activity)
     enriched_context = structured.to_json_str()
     workflow_attempted = ctx.has_genuine_workflow_attempt()
