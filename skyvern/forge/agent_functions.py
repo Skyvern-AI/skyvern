@@ -58,7 +58,7 @@ from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
@@ -647,7 +647,9 @@ async def _convert_css_shape_to_string(
                 return None
 
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
-            screenshot = await locater.screenshot(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, animations="disabled")
+            # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below,
+            # which drops the element from future scrape passes and aborts the conversion.
+            screenshot = await take_element_screenshot(locater, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today

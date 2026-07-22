@@ -15,7 +15,7 @@ from opentelemetry import trace as otel_trace
 from PIL import Image
 from playwright._impl._errors import Error as PlaywrightError
 from playwright._impl._errors import TimeoutError
-from playwright.async_api import ElementHandle, Frame, Page
+from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
@@ -267,6 +267,28 @@ async def _current_viewpoint_screenshot_helper(
             error=str(e),
             exc_info=True,
         )
+        raise FailedToTakeScreenshot(error_message=str(e)) from e
+
+
+async def take_element_screenshot(
+    locator: Locator,
+    timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+) -> bytes:
+    try:
+        page = locator.page
+    except AssertionError as e:
+        raise FailedToTakeScreenshot(error_message="Page is unavailable") from e
+
+    if page.is_closed():
+        raise FailedToTakeScreenshot(error_message="Page is closed")
+    try:
+        return await locator.screenshot(timeout=timeout, animations="disabled")
+    except TimeoutError:
+        try:
+            return await locator.screenshot(timeout=timeout, animations="allow")
+        except PlaywrightError as retry_error:
+            raise FailedToTakeScreenshot(error_message=str(retry_error)) from retry_error
+    except PlaywrightError as e:
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
