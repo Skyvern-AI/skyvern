@@ -138,6 +138,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
@@ -699,18 +700,18 @@ async def _save_adopted_session_download(
     deferred save_as runs.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
-    try:
-        await download.save_as(download_target)
-        if download_target.exists() and download_target.stat().st_size > 0:
-            return download_target
-        download_target.unlink(missing_ok=True)
+    persisted = await _persist_captured_download(
+        download, target=download_target, timeout=BROWSER_DOWNLOAD_MAX_WAIT_TIME
+    )
+    if persisted.path is not None:
+        return persisted.path
+    if persisted.outcome == "empty":
         LOG.warning(
             "Adopted-session eager save_as produced an empty file; re-fetching download url",
             download_dir=str(download_dir),
             workflow_run_id=workflow_run_id,
         )
-    except Exception:
-        download_target.unlink(missing_ok=True)
+    else:
         LOG.warning(
             "Adopted-session eager save_as failed; re-fetching download url",
             download_dir=str(download_dir),
@@ -771,6 +772,101 @@ def _remove_download_listener(page: Page, callback: Callable[[Download], None]) 
         return
 
     LOG.warning("Page does not support removing download listeners")
+
+
+def _remove_popup_listener(page: Page, callback: Callable[[Page], None]) -> None:
+    off = getattr(page, "off", None)
+    if callable(off):
+        off("popup", callback)
+        return
+    page.remove_listener("popup", callback)
+
+
+class _CapturedDownloadPersistence(NamedTuple):
+    path: Path | None
+    outcome: str
+
+
+async def _persist_captured_download(
+    download: Download, *, target: Path | None, timeout: float, owned_dir: Path | None = None
+) -> _CapturedDownloadPersistence:
+    try:
+        async with asyncio.timeout(timeout):
+            try:
+                failure = await download.failure()
+            except TypeError:
+                failure = None
+            if failure is not None:
+                return _CapturedDownloadPersistence(None, "download_failed")
+            if target is None:
+                try:
+                    local_path_value = await download.path()
+                    if local_path_value and (local_path := Path(local_path_value)).is_file():
+                        if local_path.stat().st_size:
+                            return _CapturedDownloadPersistence(local_path, "local_path")
+                        if owned_dir is not None and local_path.parent.resolve() == owned_dir.resolve():
+                            local_path.unlink(missing_ok=True)
+                        return _CapturedDownloadPersistence(None, "empty")
+                except Exception:
+                    return _CapturedDownloadPersistence(None, "path_unavailable")
+                return _CapturedDownloadPersistence(None, "path_unavailable")
+            await download.save_as(target)
+            if target.is_file() and target.stat().st_size:
+                return _CapturedDownloadPersistence(target, "saved")
+            target.unlink(missing_ok=True)
+            return _CapturedDownloadPersistence(None, "empty")
+    except (asyncio.TimeoutError, asyncio.CancelledError) as error:
+        if target is not None:
+            target.unlink(missing_ok=True)
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        return _CapturedDownloadPersistence(None, "timeout")
+    except Exception:
+        if target is not None:
+            target.unlink(missing_ok=True)
+        return _CapturedDownloadPersistence(None, "save_failed")
+
+
+async def _finalize_download_artifacts(
+    *,
+    download_dir: Path,
+    task: Task,
+    list_files_before: list[str],
+    list_observed_download_files: Callable[[], Awaitable[list[str]]],
+) -> tuple[list[str], set[str]]:
+    await check_downloading_files_and_wait_for_download_to_complete(
+        download_dir=download_dir,
+        organization_id=task.organization_id,
+        browser_session_id=task.browser_session_id,
+        timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
+    )
+    list_files_after = await list_observed_download_files()
+    new_file_paths = set(list_files_after) - set(list_files_before)
+    paths = _deduplicate_new_downloaded_file_paths(
+        new_file_paths,
+        workflow_run_id=task.workflow_run_id,
+        observed_file_paths=set(list_files_after),
+    )
+    return [os.path.basename(path) for path in paths], new_file_paths
+
+
+async def _cleanup_captured_download_popup(
+    popup: Page, browser_state: BrowserState, page: Page, page_url_before_download: str
+) -> None:
+    cleanup = [("popup_close", popup.close())]
+    if page.url in {"about:blank", ":"} and page_url_before_download not in {"about:blank", ":"}:
+        cleanup.append(
+            ("working_page_recovery", browser_state.navigate_to_url(page=page, url=page_url_before_download))
+        )
+    results = await asyncio.gather(*(operation for _, operation in cleanup), return_exceptions=True)
+    for (operation, _), result in zip(cleanup, results, strict=True):
+        if isinstance(result, BaseException):
+            LOG.warning(
+                "Captured download popup cleanup operation failed",
+                operation=operation,
+                exception_type=type(result).__name__,
+                exc_info=(type(result), result, result.__traceback__),
+            )
 
 
 def _canonical_download_duplicate_stem(stem: str) -> str:
@@ -2117,6 +2213,8 @@ class ActionHandler:
         step: Step,
         page: Page,
         action: Action,
+        *,
+        file_download_false_click_eligible: bool = False,
     ) -> list[ActionResult]:
         # task_id, step_id auto-attached by @traced from SkyvernContext
         _action_span = otel_trace.get_current_span()
@@ -2135,15 +2233,154 @@ class ActionHandler:
         _action_span.set_attribute("triggers_download", trigger_download_action)
         _tracer = otel_trace.get_tracer("skyvern")
         if not trigger_download_action:
-            with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
-                apply_context_attrs(_hi_span)
-                results = await ActionHandler._handle_action(
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
-                    page=page,
-                    action=action,
-                )
+            observe_false_click = (
+                file_download_false_click_eligible
+                and isinstance(action, ClickAction)
+                and action.download is False
+                and browser_state is not None
+                and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0
+            )
+            if not observe_false_click:
+                with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                    apply_context_attrs(_hi_span)
+                    results = await ActionHandler._handle_action(
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                        page=page,
+                        action=action,
+                    )
+            else:
+                assert browser_state is not None
+                page_url_before_download = page.url
+                with _tracer.start_as_current_span("skyvern.agent.action.false_click_download"):
+                    false_click_download_event: asyncio.Future[tuple[Download, Page]] = (
+                        asyncio.get_running_loop().create_future()
+                    )
+                    download_callbacks: list[tuple[Page, Callable[[Download], None]]] = []
+
+                    def on_popup(download_page: Page) -> None:
+                        def capture_download(download: Download) -> None:
+                            if not false_click_download_event.done():
+                                false_click_download_event.set_result((download, download_page))
+
+                        download_page.on("download", capture_download)
+                        download_callbacks.append((download_page, capture_download))
+
+                    page.on("popup", on_popup)
+
+                    async def process_captured_download(results: list[ActionResult] | None) -> None:
+                        await asyncio.sleep(0)
+                        captured: tuple[Download, Page] | None = None
+                        if false_click_download_event.done():
+                            captured = false_click_download_event.result()
+                        elif download_callbacks:
+                            try:
+                                captured = await asyncio.wait_for(
+                                    asyncio.shield(false_click_download_event),
+                                    timeout=settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                        if captured is None:
+                            return
+
+                        false_click_download, download_popup = captured
+                        context = skyvern_context.current()
+                        run_id = resolve_run_download_id(context, task.workflow_run_id or task.task_id)
+                        download_dir = Path(get_download_dir(run_id=run_id))
+
+                        async def list_false_click_files(extra: Path | None = None) -> list[str]:
+                            files = list_files_in_directory(download_dir)
+                            if task.browser_session_id:
+                                files += await app.STORAGE.list_downloaded_files_in_browser_session(
+                                    organization_id=task.organization_id,
+                                    browser_session_id=task.browser_session_id,
+                                )
+                            if extra and extra.is_file():
+                                files.append(str(extra))
+                            return files
+
+                        browser_artifacts = getattr(browser_state, "browser_artifacts", None)
+                        remote_session_id = getattr(browser_artifacts, "remote_browser_session_id", None)
+                        remote_session = isinstance(remote_session_id, str) and bool(remote_session_id)
+                        eager_save = (
+                            getattr(browser_state, "release_driver_on_close", False) is True
+                            or remote_session
+                            or getattr(browser_artifacts, "needs_cdp_frame_publisher", False) is True
+                        )
+                        if eager_save:
+                            download_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            persisted = await _persist_captured_download(
+                                false_click_download,
+                                target=_download_target_path(download_dir, false_click_download.suggested_filename)
+                                if eager_save
+                                else None,
+                                timeout=task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME,
+                                owned_dir=download_dir,
+                            )
+                            if persisted.path is not None:
+                                observed_after_persist = await list_false_click_files()
+                                baseline = [path for path in observed_after_persist if path != str(persisted.path)]
+                                names, _ = await _finalize_download_artifacts(
+                                    download_dir=download_dir,
+                                    task=task,
+                                    list_files_before=baseline,
+                                    list_observed_download_files=lambda: list_false_click_files(persisted.path),
+                                )
+                                try:
+                                    persisted_artifact_qualified = (
+                                        persisted.path.is_file() and persisted.path.stat().st_size > 0
+                                    )
+                                except OSError:
+                                    persisted_artifact_qualified = False
+                                result = results[-1] if results else None
+                                if names and persisted_artifact_qualified and isinstance(result, ActionResult):
+                                    result.downloaded_files = action.downloaded_files = names
+                                    result.download_triggered = action.download_triggered = True
+                        finally:
+                            await _cleanup_captured_download_popup(
+                                download_popup, browser_state, page, page_url_before_download
+                            )
+
+                    try:
+                        with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                            apply_context_attrs(_hi_span)
+                            try:
+                                results = await ActionHandler._handle_action(
+                                    scraped_page=scraped_page,
+                                    task=task,
+                                    step=step,
+                                    page=page,
+                                    action=action,
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except BaseException:
+                                try:
+                                    await process_captured_download(None)
+                                except asyncio.CancelledError:
+                                    raise
+                                except BaseException:
+                                    LOG.warning(
+                                        "Captured download processing failed after action exception",
+                                        exc_info=True,
+                                    )
+                                raise
+                        await process_captured_download(results)
+                    finally:
+                        try:
+                            _remove_popup_listener(page, on_popup)
+                        except Exception:
+                            LOG.warning("Failed to remove captured download popup listener", exc_info=True)
+                        for observed_page, callback in download_callbacks:
+                            try:
+                                _remove_download_listener(observed_page, callback)
+                            except Exception:
+                                LOG.warning("Failed to remove captured download listener", exc_info=True)
+                        if not false_click_download_event.done():
+                            false_click_download_event.cancel()
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
@@ -2348,42 +2585,39 @@ class ActionHandler:
                                 and time.monotonic() - download_event_captured_at >= _download_event_grace_seconds
                             ):
                                 download_event_fallback_attempted = True
-                                download_target = _download_target_path(
-                                    download_dir, captured_download.suggested_filename
+                                persisted = await _persist_captured_download(
+                                    captured_download,
+                                    target=_download_target_path(download_dir, captured_download.suggested_filename),
+                                    timeout=task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME,
                                 )
-                                try:
-                                    await captured_download.save_as(download_target)
-                                    if download_target.exists() and download_target.stat().st_size == 0:
-                                        download_target.unlink(missing_ok=True)
-                                        LOG.warning(
-                                            "Captured download event fallback produced an empty file; marking download triggered without artifact",
-                                            download_dir=download_dir,
-                                            download_target=str(download_target),
-                                            workflow_run_id=task.workflow_run_id,
-                                        )
-                                        list_files_after = await _list_observed_download_files()
-                                        download_triggered = True
-                                        break
-
+                                if persisted.outcome == "empty":
+                                    LOG.warning(
+                                        "Captured download event fallback produced an empty file; marking download triggered without artifact",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                    list_files_after = await _list_observed_download_files()
+                                    download_triggered = True
+                                    break
+                                if persisted.path is not None:
                                     list_files_after = await _list_observed_download_files()
                                     LOG.info(
                                         "Copied captured download event to active run directory",
                                         download_dir=download_dir,
-                                        download_target=str(download_target),
+                                        download_target=str(persisted.path),
                                         workflow_run_id=task.workflow_run_id,
                                     )
                                     download_triggered = True
                                     download_event_fallback_used = True
                                     break
-                                except Exception:
-                                    LOG.warning(
-                                        "Failed to copy captured download event to active run directory",
-                                        download_dir=download_dir,
-                                        workflow_run_id=task.workflow_run_id,
-                                        exc_info=True,
-                                    )
-                                    download_event_fallback_failed = True
-                                    break
+                                LOG.warning(
+                                    "Failed to copy captured download event to active run directory",
+                                    download_dir=download_dir,
+                                    workflow_run_id=task.workflow_run_id,
+                                    outcome=persisted.outcome,
+                                )
+                                download_event_fallback_failed = True
+                                break
                             elapsed_since_action = time.monotonic() - download_wait_started_at
                             if not download_signal_observed:
                                 download_wait_matched_errors = match_user_defined_errors_from_transient_text(
@@ -2465,18 +2699,14 @@ class ActionHandler:
             results[-1].download_triggered = True
             action.download_triggered = True
 
-            await check_downloading_files_and_wait_for_download_to_complete(
+            downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
                 download_dir=download_dir,
-                organization_id=task.organization_id,
-                browser_session_id=task.browser_session_id,
-                timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
+                task=task,
+                list_files_before=list_files_before,
+                list_observed_download_files=_list_observed_download_files,
             )
-
-            # Re-scan after waiting for .crdownload files to settle. The first
-            # snapshot stops at the earliest download signal, while late browser
-            # artifacts can still appear before task cleanup persists files.
-            list_files_after = await _list_observed_download_files()
-            new_file_paths = set(list_files_after) - set(list_files_before)
+            if downloaded_file_names:
+                results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
             if xhr_fallback_moved_paths:
                 post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
                 if post_settle_extra_paths:
@@ -2489,21 +2719,6 @@ class ActionHandler:
                         post_settle_extra_file_count=len(post_settle_extra_paths),
                         post_settle_extra_files=sorted(os.path.basename(fp) for fp in post_settle_extra_paths),
                     )
-            deduplicated_paths = _deduplicate_new_downloaded_file_paths(
-                new_file_paths,
-                workflow_run_id=task.workflow_run_id,
-                observed_file_paths=set(list_files_after),
-            )
-            downloaded_file_names = [os.path.basename(fp) for fp in deduplicated_paths]
-            if downloaded_file_names:
-                results[-1].downloaded_files = downloaded_file_names
-                action.downloaded_files = downloaded_file_names
-                LOG.info(
-                    "Downloaded files captured",
-                    downloaded_files=downloaded_file_names,
-                    workflow_run_id=task.workflow_run_id,
-                )
-
             return results
         finally:
             await transient_text_observer.stop()
@@ -2530,10 +2745,6 @@ class ActionHandler:
                     # close the extra page
                     await pages_after_download[-1].close()
 
-                # After a print/download action the working page sometimes navigates to
-                # about:blank (e.g. when the browser follows a download URL that yields no
-                # renderable content). Detect this and navigate back to the original URL so
-                # subsequent steps are not stuck on a blank page.
                 blank_page_urls = {"about:blank", ":"}
                 if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
                     LOG.warning(
