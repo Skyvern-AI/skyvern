@@ -354,6 +354,7 @@ class _TerminalEvidenceResetCtx(Protocol):
     last_run_blocks_block_labels: list[str]
     last_run_outcome: RecordedRunOutcome | None
     last_run_outcome_block_labels: list[str]
+    terminal_envelope_run_outcomes: list[RecordedRunOutcome]
     last_outcome_gate_reason: str | None
     last_outcome_gate_workflow_run_id: str | None
     last_test_anti_bot: str | None
@@ -390,6 +391,7 @@ def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> 
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None
     ctx.last_run_outcome_block_labels = []
+    ctx.terminal_envelope_run_outcomes = []
     ctx.last_outcome_gate_reason = None
     ctx.last_outcome_gate_workflow_run_id = None
     ctx.last_test_anti_bot = None

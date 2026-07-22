@@ -13,7 +13,7 @@ import json
 import math
 import re
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -186,6 +186,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
+from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, reason_in_reply_shadow
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -1729,6 +1730,82 @@ def _should_use_built_unverified_completed_reply(
     )
 
 
+def _terminal_envelope_run_outcomes(ctx: CopilotContext) -> list[RecordedRunOutcome]:
+    raw = ctx.terminal_envelope_run_outcomes
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        outcomes = [outcome for outcome in raw if isinstance(outcome, RecordedRunOutcome)]
+        if outcomes:
+            return outcomes
+    recorded = ctx.last_run_outcome
+    return [recorded] if isinstance(recorded, RecordedRunOutcome) else []
+
+
+def _terminal_halt_fields(ctx: CopilotContext) -> tuple[str | None, str | None]:
+    halt = getattr(ctx, "turn_halt", None)
+    if not isinstance(halt, TurnHalt):
+        return None, None
+    blocker_reason: str | None = None
+    signal = halt.blocker_signal
+    if isinstance(signal, CopilotToolBlockerSignal):
+        blocker_reason = signal.user_facing_reason
+    return blocker_reason, halt.kind.value
+
+
+def _attempted_summary(narrative_summary: object, narrative_payload: object) -> str | None:
+    if isinstance(narrative_summary, str) and narrative_summary.strip():
+        return narrative_summary.strip()
+    if isinstance(narrative_payload, Mapping):
+        payload_summary = narrative_payload.get("narrativeSummary")
+        if isinstance(payload_summary, str) and payload_summary.strip():
+            return payload_summary.strip()
+    return None
+
+
+def _assemble_terminal_envelope_safe(
+    *,
+    response_type: str,
+    verified: bool,
+    workflow_applied: bool,
+    proposal_disposition: str | None,
+    run_outcomes: Sequence[RecordedRunOutcome],
+    blocker_reason: str | None,
+    halt_kind: str | None,
+    attempted: str | None,
+    workflow_mutated: bool,
+    turn_outcome_response_kind: str | None,
+    final_message: str,
+) -> dict[str, Any] | None:
+    try:
+        envelope = assemble_terminal_envelope(
+            response_type=response_type,
+            verified=verified,
+            workflow_applied=workflow_applied,
+            proposal_disposition=proposal_disposition,
+            run_outcomes=run_outcomes,
+            blocker_reason=blocker_reason,
+            halt_kind=halt_kind,
+            attempted=attempted,
+            workflow_mutated=workflow_mutated,
+            turn_outcome_response_kind=turn_outcome_response_kind,
+        )
+    except Exception:
+        LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
+        return None
+    if envelope is None:
+        return None
+    reason_in_reply = reason_in_reply_shadow(envelope.run_display_reason, final_message)
+    payload = envelope.model_dump(mode="json")
+    LOG.info(
+        "copilot_terminal_envelope",
+        **payload,
+        response_type=response_type,
+        envelope_response_kind=envelope.response_kind,
+        reason_in_reply=reason_in_reply,
+        finalized=False,
+    )
+    return payload
+
+
 def _make_agent_result(
     ctx: CopilotContext | None,
     *,
@@ -1795,6 +1872,25 @@ def _make_agent_result(
             payload_updates["deliveredUnverifiedObservedOutputs"] = _delivered_unverified_snapshot
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
+    terminal_envelope: dict[str, Any] | None = None
+    if ctx is not None:
+        blocker_reason, halt_kind = _terminal_halt_fields(ctx)
+        turn_outcome_response_kind = turn_outcome.response_kind.value if turn_outcome is not None else None
+        response_type_value = response_type if isinstance(response_type, str) else "REPLY"
+        terminal_envelope = _assemble_terminal_envelope_safe(
+            response_type=response_type_value,
+            verified=bool(verified_goal_claim_authorized(ctx)),
+            workflow_applied=False,
+            proposal_disposition=proposal_disposition if isinstance(proposal_disposition, str) else None,
+            run_outcomes=_terminal_envelope_run_outcomes(ctx),
+            blocker_reason=blocker_reason,
+            halt_kind=halt_kind,
+            attempted=_attempted_summary(kwargs.get("narrative_summary"), kwargs.get("narrative_payload")),
+            workflow_mutated=bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None,
+            turn_outcome_response_kind=turn_outcome_response_kind,
+            final_message=str(kwargs.get("user_response") or ""),
+        )
+    kwargs["terminal_envelope"] = terminal_envelope
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None and result.turn_outcome is not None:
         result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
