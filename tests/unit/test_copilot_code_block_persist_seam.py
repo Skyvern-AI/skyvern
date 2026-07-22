@@ -97,7 +97,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
 )
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, NeverCapturedObligation
 from skyvern.forge.sdk.copilot.tools import (
     _code_block_safety_errors,
     _detect_stale_block_metadata,
@@ -2041,6 +2041,199 @@ class TestCodeRepairProgressClassification:
         assert [event.gate_id for event in ctx.author_time_gate_ablation_events] == [
             workflow_update_module.DEFINITION_CONTRACT_UNSATISFIED_GATE_ID
         ]
+
+    @pytest.mark.asyncio
+    async def test_synthesized_business_tour_stays_rejected_when_definition_gate_is_log_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="request-id",
+                    outcome="the request id is output",
+                    level="run",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path="output.request_id",
+                ),
+                CompletionCriterion(
+                    id="submit-request",
+                    outcome="the service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    level="run",
+                ),
+            ]
+        )
+        ctx.synthesized_block_offered = True
+        ctx.spine_imposition_owned_attempt = True
+        ctx.author_time_gate_log_only_ids = {workflow_update_module.DEFINITION_CONTRACT_UNSATISFIED_GATE_ID}
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_maybe_impose_synthesized_code_block",
+            lambda *_args, **_kwargs: workflow_update_module._SynthesizedCodeImpositionResult(
+                workflow_yaml=_UNREFERENCED_DEFINITION_YAML,
+                substitutions={"submit_service_request": "synthesized"},
+            ),
+        )
+
+        result = await _update_workflow(
+            {"workflow_yaml": _UNREFERENCED_DEFINITION_YAML},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "synthesized_business_input_floor_unsatisfied"
+        assert result["data"]["unreferenced_parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+        assert ctx.workflow_yaml == ""
+        assert ctx.synthesized_block_offered is False
+        assert ctx.synthesized_block_offered_trajectory_len == 0
+        assert ctx.synthesized_block_offered_goal_complete is False
+        assert ctx.spine_imposition_owned_attempt is False
+        assert ctx.author_time_gate_ablation_events == []
+
+    @pytest.mark.asyncio
+    async def test_synthesized_business_input_floor_keeps_required_inputs_when_retry_shrinks_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="submit-request",
+                    outcome="the service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    level="run",
+                )
+            ]
+        )
+        ctx.synthesized_block_offered = True
+        ctx.spine_imposition_owned_attempt = True
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_maybe_impose_synthesized_code_block",
+            lambda *_args, **_kwargs: workflow_update_module._SynthesizedCodeImpositionResult(
+                workflow_yaml=_UNREFERENCED_DEFINITION_YAML,
+                substitutions={"submit_service_request": "synthesized"},
+            ),
+        )
+
+        first_result = await _update_workflow(
+            {"workflow_yaml": _UNREFERENCED_DEFINITION_YAML},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert first_result["ok"] is False
+        assert ctx.synthesized_business_required_parameter_keys == {
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        }
+
+        narrowed_yaml = _yaml(
+            """
+            title: Start reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [service_address]
+                code: |
+                  await page.locator("#address").fill(str(service_address))
+            """
+        )
+        ctx.synthesized_block_offered = True
+        ctx.spine_imposition_owned_attempt = True
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_maybe_impose_synthesized_code_block",
+            lambda *_args, **_kwargs: workflow_update_module._SynthesizedCodeImpositionResult(
+                workflow_yaml=narrowed_yaml,
+                substitutions={"submit_service_request": "synthesized"},
+            ),
+        )
+
+        second_result = await _update_workflow(
+            {"workflow_yaml": narrowed_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert second_result["ok"] is False
+        assert second_result["data"]["reason_code"] == "synthesized_business_input_floor_unsatisfied"
+        assert second_result["data"]["unreferenced_parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+        ]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_synthesized_business_input_floor_allows_fully_bound_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="submit-request",
+                    outcome="the service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    level="run",
+                )
+            ]
+        )
+        ctx.synthesized_block_offered = True
+        ctx.spine_imposition_owned_attempt = True
+        bound_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name, service_address]
+                code: |
+                  await page.locator("#business").fill(str(business_name))
+                  await page.locator("#address").fill(str(service_address))
+                  await page.locator("#submit").click()
+            """
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_maybe_impose_synthesized_code_block",
+            lambda *_args, **_kwargs: workflow_update_module._SynthesizedCodeImpositionResult(
+                workflow_yaml=bound_yaml,
+                substitutions={"submit_service_request": "synthesized"},
+            ),
+        )
+
+        result = await _update_workflow(
+            {"workflow_yaml": bound_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == bound_yaml
 
     @pytest.mark.asyncio
     async def test_bound_draft_run_blocks_dispatches_when_criteria_dark(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -17543,6 +17736,212 @@ class TestBrowserSurfaceRejectionProvenance:
         assert events[0]["site"] == "whole_trajectory"
         assert "#hallucinated" in events[0]["action"]
 
+    @pytest.mark.asyncio
+    async def test_never_captured_reject_reopens_once_after_matching_canonical_capture(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _imposition_split_ctx()
+        submitted_yaml = _already_split_spine_yaml(extra_sibling_code='await page.locator("#hallucinated").click()')
+
+        with capture_logs() as rejection_logs:
+            result = await _update_workflow(
+                {
+                    "workflow_yaml": submitted_yaml,
+                    "code_artifact_metadata": ctx.raw_code_artifact_metadata,
+                },
+                ctx,
+                allow_static_output_uncertainty=True,
+            )
+
+        assert result["ok"] is False
+        assert "never_captured" in result["error"]
+        obligation = ctx.never_captured_obligation
+        assert obligation is not None
+        assert obligation.method == "click"
+        assert obligation.normalized_receiver == "page.locator('#hallucinated')"
+        assert obligation.block_label.endswith("_browser_stage_extra")
+        assert obligation.state == "armed"
+        assert obligation.replay_payload.params["workflow_yaml"] == submitted_yaml
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+        armed_events = [log for log in rejection_logs if log["event"] == "copilot_never_captured_obligation_armed"]
+        assert len(armed_events) == 1
+        assert armed_events[0]["turn_id"] == ctx.turn_id
+        assert armed_events[0]["draft_fingerprint"] == obligation.draft_fingerprint
+        assert armed_events[0]["call_shape_digest"] == obligation.call_shape_digest
+        assert armed_events[0]["expected_tool_name"] == obligation.expected_tool_name
+
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="#unrelated", source_url="https://example.com/form"
+        )
+
+        assert ctx.never_captured_obligation == obligation
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+
+        replay_call: dict[str, object] = {}
+
+        async def _record_replay(
+            params: dict[str, object],
+            replay_ctx: CopilotContext,
+            *,
+            allow_missing_credentials: bool | None,
+            allow_static_output_uncertainty: bool,
+            formation_prepared: bool,
+        ) -> dict[str, object]:
+            replay_call.update(
+                params=params,
+                ctx=replay_ctx,
+                allow_missing_credentials=allow_missing_credentials,
+                allow_static_output_uncertainty=allow_static_output_uncertainty,
+                formation_prepared=formation_prepared,
+            )
+            return {"ok": True, "data": {"message": "Workflow updated successfully."}}
+
+        monkeypatch.setattr(workflow_update_module, "_update_workflow", _record_replay)
+        ctx.pending_scout_source_url = "https://example.com/form"
+        with capture_logs() as replay_logs:
+            click_result = await tools_module._click_post_hook(
+                {"ok": True, "data": {"selector": "#hallucinated"}},
+                {"browser_context": {"url": "https://example.com/form", "title": "Example"}},
+                ctx,
+            )
+
+        assert click_result["data"]["workflow_reconciliation"] == {
+            "ok": True,
+            "message": "Workflow updated successfully.",
+        }
+        assert replay_call == {
+            "params": {
+                "workflow_yaml": submitted_yaml,
+                "code_artifact_metadata": obligation.replay_payload.params["code_artifact_metadata"],
+            },
+            "ctx": ctx,
+            "allow_missing_credentials": None,
+            "allow_static_output_uncertainty": True,
+            "formation_prepared": False,
+        }
+        consumed = ctx.never_captured_obligation
+        assert consumed is not None
+        assert consumed.state == "consumed"
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+        completed_events = [log for log in replay_logs if log["event"] == "copilot_never_captured_obligation_completed"]
+        assert len(completed_events) == 1
+        assert completed_events[0]["identity_digest"] == obligation.identity_digest
+        assert completed_events[0]["turn_id"] == ctx.turn_id
+        assert completed_events[0]["workflow_permanent_id"] == ctx.workflow_permanent_id
+        assert completed_events[0]["draft_fingerprint"] == obligation.draft_fingerprint
+        assert completed_events[0]["block_label"] == obligation.block_label
+        assert completed_events[0]["site"] == obligation.site
+        assert completed_events[0]["trajectory_index"] == consumed.captured_trajectory_index
+        replay_events = [log for log in replay_logs if log["event"] == "copilot_never_captured_obligation_replayed"]
+        assert len(replay_events) == 1
+        assert replay_events[0]["identity_digest"] == obligation.identity_digest
+        assert replay_events[0]["turn_id"] == ctx.turn_id
+        assert replay_events[0]["draft_fingerprint"] == obligation.draft_fingerprint
+        assert replay_events[0]["block_label"] == obligation.block_label
+        assert replay_events[0]["site"] == obligation.site
+        assert replay_events[0]["captured_trajectory_index"] == consumed.captured_trajectory_index
+        assert replay_events[0]["obligation_state"] == "consumed"
+        assert replay_events[0]["ok"] is True
+
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="#hallucinated", source_url="https://example.com/form"
+        )
+
+        assert ctx.never_captured_obligation == consumed
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+
+    @pytest.mark.asyncio
+    async def test_replay_exception_preserves_captured_obligation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _imposition_split_ctx()
+        submitted_yaml = _already_split_spine_yaml(extra_sibling_code='await page.locator("#hallucinated").click()')
+        rejected = await _update_workflow({"workflow_yaml": submitted_yaml}, ctx)
+        assert rejected["ok"] is False
+        assert ctx.never_captured_obligation is not None
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="#hallucinated", source_url="https://example.com/form"
+        )
+        captured = ctx.never_captured_obligation
+        assert captured is not None
+        assert captured.state == "captured"
+
+        async def _raise_after_consuming(*_args: object, **_kwargs: object) -> dict[str, object]:
+            ctx.never_captured_obligation = replace(captured, state="consumed")
+            ctx.synthesized_block_reopened_for_capture_obligation = False
+            raise RuntimeError("synthetic replay failure")
+
+        monkeypatch.setattr(workflow_update_module, "_update_workflow", _raise_after_consuming)
+
+        with pytest.raises(RuntimeError, match="synthetic replay failure"):
+            await workflow_update_module._replay_captured_never_captured_obligation(ctx)
+
+        assert ctx.never_captured_obligation == captured
+        assert ctx.synthesized_block_reopened_for_capture_obligation is True
+
+    @pytest.mark.asyncio
+    async def test_captured_obligation_does_not_reopen_a_different_draft(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(
+            workflow_update_module,
+            "synthesize_code_block",
+            lambda *a, **k: _fake_spine_synthesized(diagnostics=_spine_emission_diagnostics()),
+        )
+        ctx = _imposition_split_ctx()
+        rejected_yaml = _already_split_spine_yaml(extra_sibling_code='await page.locator("#hallucinated").click()')
+        rejected = await _update_workflow({"workflow_yaml": rejected_yaml}, ctx)
+        assert rejected["ok"] is False
+        assert ctx.never_captured_obligation is not None
+
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="#hallucinated", source_url="https://example.com/form"
+        )
+        assert ctx.synthesized_block_reopened_for_capture_obligation is True
+        ctx.update_workflow_called = True
+        different_yaml = rejected_yaml.replace("title: Entry lookup", "title: Different draft")
+
+        with capture_logs() as logs:
+            await _update_workflow({"workflow_yaml": different_yaml}, ctx)
+
+        obligation = ctx.never_captured_obligation
+        assert obligation is not None
+        assert obligation.state == "consumed"
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+        events = [log for log in logs if log["event"] == "copilot_imposition_skipped_after_update"]
+        assert len(events) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sibling_code", "provenance_kind"),
+        [
+            ('await page.locator("#stage-a").click(timeout=5000)', "shape_diverged"),
+            ('do_click = page.locator("#x").click\nawait do_click()', "ambiguous"),
+            ('await page.locator("#hallucinated").type("value")', "never_captured"),
+        ],
+    )
+    async def test_fail_closed_provenance_does_not_arm_capture_obligation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sibling_code: str,
+        provenance_kind: str,
+    ) -> None:
+        monkeypatch.setattr(
+            workflow_update_module,
+            "synthesize_code_block",
+            lambda *a, **k: _fake_spine_synthesized(diagnostics=_spine_emission_diagnostics()),
+        )
+        ctx = _imposition_split_ctx()
+
+        result = await _update_workflow(
+            {"workflow_yaml": _already_split_spine_yaml(extra_sibling_code=sibling_code)},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert provenance_kind in result["error"]
+        assert ctx.never_captured_obligation is None
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+
     def test_same_receiver_divergent_call_shape_is_shape_diverged_with_nearest(self) -> None:
         validation = _gate_validation(
             'await page.locator("#stage-a").click(timeout=5000)\n', _spine_emission_diagnostics()
@@ -17801,6 +18200,82 @@ class TestScoutCaptureParityAccounting:
 
         indexes = [item["trajectory_index"] for item in ctx.scout_trajectory]
         assert indexes == list(range(2, scouting_module._MAX_SCOUTED_INTERACTIONS + 2))
+
+    def test_capture_obligation_matches_stable_index_after_trajectory_eviction(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.turn_id = "turn-eviction"
+        ctx.scouted_interactions = []
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": f"#item-{index}", "trajectory_index": index}
+            for index in range(scouting_module._MAX_SCOUTED_INTERACTIONS)
+        ]
+        ctx.never_captured_obligation = NeverCapturedObligation(
+            identity_digest="eviction-identity",
+            turn_id=ctx.turn_id,
+            draft_fingerprint="draft",
+            block_label="target",
+            site="whole_trajectory",
+            method="click",
+            normalized_receiver="page.locator('#target')",
+            call_shape_digest="shape",
+            expected_tool_name="click",
+            armed_after_trajectory_index=scouting_module._MAX_SCOUTED_INTERACTIONS - 1,
+        )
+
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="#target", source_url="https://example.com/list"
+        )
+
+        obligation = ctx.never_captured_obligation
+        assert obligation is not None
+        assert obligation.state == "captured"
+        assert obligation.captured_trajectory_index == scouting_module._MAX_SCOUTED_INTERACTIONS
+        assert ctx.synthesized_block_reopened_for_capture_obligation is True
+
+    def test_capture_obligation_rejects_same_locator_with_different_press_key(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.turn_id = "turn-key"
+        ctx.scouted_interactions = []
+        ctx.scout_trajectory = []
+        ctx.never_captured_obligation = NeverCapturedObligation(
+            identity_digest="key-identity",
+            turn_id=ctx.turn_id,
+            draft_fingerprint="draft",
+            block_label="submit",
+            site="whole_trajectory",
+            method="press",
+            normalized_receiver="page.locator('#request')",
+            call_shape_digest="shape",
+            expected_tool_name="press_key",
+            expected_argument_literal="Enter",
+            armed_after_trajectory_index=-1,
+        )
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="press_key",
+            selector="#request",
+            source_url="https://example.com/form",
+            key="Tab",
+        )
+
+        obligation = ctx.never_captured_obligation
+        assert obligation is not None
+        assert obligation.state == "armed"
+        assert ctx.synthesized_block_reopened_for_capture_obligation is False
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="press_key",
+            selector="#request",
+            source_url="https://example.com/form",
+            key="Enter",
+        )
+
+        obligation = ctx.never_captured_obligation
+        assert obligation is not None
+        assert obligation.state == "captured"
+        assert ctx.synthesized_block_reopened_for_capture_obligation is True
 
     def test_dedup_replacement_is_not_an_eviction(self) -> None:
         ctx = _code_only_ctx()
