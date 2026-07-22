@@ -3069,6 +3069,22 @@ class WorkflowService:
 
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
+        # A cached script can be superseded (e.g. a stale pin replaced by a platform static
+        # script) — drop it here so the ensure_static_script path below re-creates the pin.
+        if script and is_script_run:
+            if await app.AGENT_FUNCTION.should_replace_cached_script(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                script=script,
+            ):
+                LOG.info(
+                    "Cached script superseded; ignoring cached blocks for this run",
+                    workflow_run_id=workflow_run_id,
+                    script_id=script.script_id,
+                )
+                script = None
+                script_is_pinned = False
+
         # skyvern.setup() below creates the browser before any block runs, so resolve the
         # first block's URL here to drive proxy selection from task_url (see SKYVERN_PROXY).
         first_block_url = _resolve_first_block_url(all_blocks, workflow_run) if is_script_run else None
