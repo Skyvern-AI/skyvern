@@ -24,6 +24,7 @@ import {
   toolActivityDisplayLabel,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
+import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight";
 
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
@@ -729,6 +730,57 @@ function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
         {text}
       </span>
     </FSubRow>
+  );
+}
+
+export const COPILOT_ACK_LINES = [
+  "Reading your request…",
+  "Getting oriented…",
+  "Sketching a plan…",
+  "Lining up the steps…",
+  "Thinking it through…",
+] as const;
+
+export const ACK_ROTATE_INTERVAL_MS = 3000;
+
+// Fills the send→first-frame gap with a rotating shimmer so the build never starts on dead air.
+// The first real narrative replaces it immediately; it never persists to history.
+export function InstantAckPlaceholder() {
+  // Random start so quick repeated sends (a gap near the rotation cadence)
+  // don't always open on the same line.
+  const [index, setIndex] = useState(() =>
+    Math.floor(Math.random() * COPILOT_ACK_LINES.length),
+  );
+  useEffect(() => {
+    const id = setInterval(
+      () => setIndex((i) => (i + 1) % COPILOT_ACK_LINES.length),
+      ACK_ROTATE_INTERVAL_MS,
+    );
+    return () => clearInterval(id);
+  }, []);
+  // Shimmer paints the text with a white gradient, which vanishes on the
+  // near-white light surface — restrict it to dark, where the base
+  // text-muted-foreground stays readable on its own.
+  const isDark = useThemeAsDarkOrLight() === "dark";
+  const shimmerRef = useShimmerText<HTMLSpanElement>(isDark);
+  const line = COPILOT_ACK_LINES[index];
+  return (
+    <div className="flex items-center gap-3 px-1 py-1" role="status">
+      <span className="sr-only">Copilot is working on your request…</span>
+      <span
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/15"
+        aria-hidden="true"
+      >
+        <Spinner />
+      </span>
+      <span
+        ref={shimmerRef}
+        aria-hidden="true"
+        className="text-[12.5px] font-medium text-muted-foreground"
+      >
+        {line}
+      </span>
+    </div>
   );
 }
 

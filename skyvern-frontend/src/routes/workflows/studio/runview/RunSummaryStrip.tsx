@@ -64,8 +64,8 @@ export function RunSummaryStrip({ workflowRun }: RunSummaryStripProps) {
 
   return (
     <div className="flex shrink-0 flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <StatusBadge status={workflowRun.status} />
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 [container-name:status] [container-type:inline-size]">
+        <StatusBadge status={workflowRun.status} collapsible />
         {workflowRun.failure_category?.length ? (
           <FailureCategoryBadge
             failureCategory={workflowRun.failure_category}

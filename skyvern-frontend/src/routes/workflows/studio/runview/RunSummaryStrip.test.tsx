@@ -97,3 +97,15 @@ describe("RunSummaryStrip visible dates", () => {
     expect(screen.queryByText(/^Started /)).toBeNull();
   });
 });
+
+describe("RunSummaryStrip status badge", () => {
+  test("adopts the collapsible badge inside its own container", () => {
+    const { container } = renderStrip(makeRun({ status: Status.Completed }));
+
+    expect(
+      container.querySelector('[class*="container-name:status"]'),
+    ).not.toBeNull();
+    // aria-label is only present in the badge's collapsible mode
+    expect(container.querySelector('[aria-label="completed"]')).not.toBeNull();
+  });
+});
