@@ -26,7 +26,10 @@ import structlog
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
+    SameMonthFileMatchTransform,
     authoring_parameter_binding_fingerprint,
+    same_month_file_match_transform_fingerprint,
+    same_month_file_match_transform_is_valid,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -47,6 +50,8 @@ _MAX_STEPS = 60
 _INDENT = "    "
 _DOMCONTENTLOADED = "domcontentloaded"
 _ENTRY_TARGET_VAR = "_scout_entry_target"
+_DOWNLOAD_TARGET_VAR = "_scout_download_target"
+_SAME_MONTH_HELPER_VAR = "_scout_same_month_iso"
 _ENTRY_REUSED_VAR = "_scout_entry_reused_current_page"
 _ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
 _ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
@@ -57,6 +62,7 @@ _MONTH_HELPER_VAR = "_scout_month_to_iso"
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
+    _DOWNLOAD_TARGET_VAR,
     _ENTRY_REUSED_VAR,
     _ENTRY_RESUME_AFTER_AUTH_VAR,
     _ENTRY_RESUME_TARGET_VAR,
@@ -64,6 +70,7 @@ _INTERNAL_SCOUT_VARS = (
     _OPTIONAL_DISMISSAL_VAR,
     _READONLY_DEFERRED_VAR,
     _MONTH_HELPER_VAR,
+    _SAME_MONTH_HELPER_VAR,
 )
 
 # Base name for the download var bound by `async with page.expect_download() as <name>:`.
@@ -558,6 +565,7 @@ def _get_by_role_expr_strict(role: str, name: str) -> str:
 
 LOCATOR_WITNESS_PARAM_SOURCE = "locator_witness"
 INPUT_TEMPLATED_PROVENANCE_SOURCE = "input_templated"
+SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE = "same_month_file_match"
 _SCOUT_MONTH_HELPER_NAME = _MONTH_HELPER_VAR
 _WITNESS_MIN_VALUE_LEN = 3
 _WITNESS_SAFE_CHARSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
@@ -691,17 +699,12 @@ def _resolve_non_competing_correspondences(raw: list[dict[str, Any]]) -> list[Sc
     return result
 
 
-def input_correspondences_for_interaction(
-    interaction: Mapping[str, Any], declared_params: Mapping[str, str]
+def _input_correspondences_for_surfaces(
+    *,
+    selector: str,
+    name: str,
+    declared_params: Mapping[str, str],
 ) -> list[ScoutedInputCorrespondence]:
-    """Witness a declared parameter value observed verbatim (identity, or month-name -> ISO) inside a
-    quoted selector segment or the accessible name at click time — value containment, never label==header
-    matching. Empty unless the match is unique across both surfaces, boundary-delimited, safe-charset on
-    value and literal, whitespace-normalized, and name-safe."""
-    if str(interaction.get("tool_name") or "") != "click":
-        return []
-    selector = str(interaction.get("selector") or "").strip()
-    name = str(interaction.get("accessible_name") or "").strip()
     selector_spans = _quoted_content_spans(selector)
     name_spans = [(0, len(name))] if name else []
     raw: list[dict[str, Any]] = []
@@ -735,6 +738,33 @@ def input_correspondences_for_interaction(
                 }
             )
     return _resolve_non_competing_correspondences(raw)
+
+
+def input_correspondences_for_selector(
+    selector: str,
+    declared_params: Mapping[str, str],
+) -> list[ScoutedInputCorrespondence]:
+    return _input_correspondences_for_surfaces(
+        selector=selector.strip(),
+        name="",
+        declared_params=declared_params,
+    )
+
+
+def input_correspondences_for_interaction(
+    interaction: Mapping[str, Any], declared_params: Mapping[str, str]
+) -> list[ScoutedInputCorrespondence]:
+    """Witness a declared parameter value observed verbatim (identity, or month-name -> ISO) inside a
+    quoted selector segment or the accessible name at click time — value containment, never label==header
+    matching. Empty unless the match is unique across both surfaces, boundary-delimited, safe-charset on
+    value and literal, whitespace-normalized, and name-safe."""
+    if str(interaction.get("tool_name") or "") != "click":
+        return []
+    return _input_correspondences_for_surfaces(
+        selector=str(interaction.get("selector") or "").strip(),
+        name=str(interaction.get("accessible_name") or "").strip(),
+        declared_params=declared_params,
+    )
 
 
 def _escape_fstring_literal_segment(value: str) -> str:
@@ -947,6 +977,73 @@ def witness_prelude_lines(keys: Sequence[str], *, include_month_helper: bool) ->
     for key in keys:
         lines.extend(_witness_charset_guard_lines(key))
     return lines
+
+
+def _same_month_helper_lines() -> list[str]:
+    return [
+        f"{_INDENT}def {_SAME_MONTH_HELPER_VAR}(_start_value, _end_value):",
+        f"{_INDENT * 2}def _parse_iso_date(_value):",
+        f"{_INDENT * 3}_parts = str(_value).split({_py_str('-')})",
+        f"{_INDENT * 3}if not (len(_parts) == 3 and len(_parts[0]) == 4 and len(_parts[1]) == 2 "
+        f"and len(_parts[2]) == 2 and all(_part.isdigit() for _part in _parts)):",
+        f'{_INDENT * 4}raise Exception("invalid full date for grounded file match")',
+        f"{_INDENT * 3}_year = int(_parts[0])",
+        f"{_INDENT * 3}_month = int(_parts[1])",
+        f"{_INDENT * 3}_day = int(_parts[2])",
+        f"{_INDENT * 3}if _year < 1 or _month < 1 or _month > 12:",
+        f'{_INDENT * 4}raise Exception("invalid full date for grounded file match")',
+        f"{_INDENT * 3}_leap = _year % 4 == 0 and (_year % 100 != 0 or _year % 400 == 0)",
+        f"{_INDENT * 3}_days = (31, 29 if _leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)",
+        f"{_INDENT * 3}if _day < 1 or _day > _days[_month - 1]:",
+        f'{_INDENT * 4}raise Exception("invalid full date for grounded file match")',
+        f"{_INDENT * 3}return (_year, _month, _day)",
+        f"{_INDENT * 2}_start = _parse_iso_date(_start_value)",
+        f"{_INDENT * 2}_end = _parse_iso_date(_end_value)",
+        f"{_INDENT * 2}if _start[0] != _end[0] or _start[1] != _end[1]:",
+        f'{_INDENT * 3}raise Exception("grounded file match dates must share one calendar month")',
+        f"{_INDENT * 2}return str(_start[0]).zfill(4) + {_py_str('-')} + str(_start[1]).zfill(2)",
+    ]
+
+
+def build_same_month_file_match_locator(transform: SameMonthFileMatchTransform, selector: str) -> str | None:
+    if (
+        transform.selector != selector
+        or transform.date_format_id != "iso_date_to_year_month"
+        or not transform.holes
+        or not same_month_file_match_transform_is_valid(transform)
+    ):
+        return None
+    keys: set[str] = set()
+    cursor = 0
+    segments: list[str] = []
+    date_holes = 0
+    quoted_spans = _quoted_content_spans(selector)
+    for hole in transform.holes:
+        if (
+            hole.position < cursor
+            or not hole.matched_literal
+            or selector[hole.position : hole.position + len(hole.matched_literal)] != hole.matched_literal
+            or _boundary_delimited_positions(selector, hole.matched_literal, quoted_spans) != [hole.position]
+            or not hole.declared_keys
+            or any(not grounded_parameter_key_is_safe(key) or key in keys for key in hole.declared_keys)
+        ):
+            return None
+        keys.update(hole.declared_keys)
+        segments.append(_escape_fstring_literal_segment(selector[cursor : hole.position]))
+        if hole.format_id == "identity" and len(hole.declared_keys) == 1:
+            segments.append("{" + hole.declared_keys[0] + "}")
+        elif hole.format_id == "iso_date_to_year_month" and hole.declared_keys == transform.date_keys:
+            date_holes += 1
+            segments.append(
+                "{" + _SAME_MONTH_HELPER_VAR + "(" + transform.date_keys[0] + ", " + transform.date_keys[1] + ")}"
+            )
+        else:
+            return None
+        cursor = hole.position + len(hole.matched_literal)
+    if date_holes != 1 or set(transform.date_keys) - keys:
+        return None
+    segments.append(_escape_fstring_literal_segment(selector[cursor:]))
+    return 'page.locator(f"' + "".join(segments) + '")'
 
 
 def _locator_expr(
@@ -1359,6 +1456,7 @@ def synthesize_code_block(
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
+    file_match_transform: SameMonthFileMatchTransform | None = None,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
@@ -1394,6 +1492,40 @@ def synthesize_code_block(
         and not reached_download_target.already_registered
         and bool(reached_download_target.selector)
     )
+    file_match_locator = ""
+    file_match_keys: list[str] = []
+    if file_match_transform is not None:
+        if file_match_transform.provenance_fingerprint != same_month_file_match_transform_fingerprint(
+            file_match_transform
+        ):
+            return None
+        if not compile_download_target or reached_download_target is None:
+            LOG.info(
+                "copilot_spine_same_month_file_match_transform_dropped",
+                reason_code="download_target_unavailable",
+                selector_matches_transform=False,
+            )
+            file_match_transform = None
+        else:
+            file_match_locator = (
+                build_same_month_file_match_locator(
+                    file_match_transform,
+                    reached_download_target.selector,
+                )
+                or ""
+            )
+            if not file_match_locator:
+                LOG.info(
+                    "copilot_spine_same_month_file_match_transform_dropped",
+                    reason_code="locator_build_failed",
+                    selector_matches_transform=file_match_transform.selector == reached_download_target.selector,
+                )
+                file_match_transform = None
+        if file_match_transform is not None:
+            for file_match_hole in file_match_transform.holes:
+                for key in file_match_hole.declared_keys:
+                    if key not in file_match_keys:
+                        file_match_keys.append(key)
     if compile_download_target and reached_download_target is not None:
         trajectory, dropped_trailing = _trajectory_prefix_at_anchor(
             trajectory, reached_download_target.trajectory_anchor
@@ -1414,26 +1546,61 @@ def synthesize_code_block(
         plan = _input_templating_plan(interaction)
         if plan is None:
             continue
-        for hole in plan.holes:
-            key = str(hole.get("input_key") or "")
+        for plan_hole in plan.holes:
+            key = str(plan_hole.get("input_key") or "")
             if not key or key in minted_input_witness_keys:
                 continue
             minted_input_witness_keys.add(key)
-            parameters.append(
-                {
-                    "key": key,
-                    "default_value": str(hole.get("parameter_value") or ""),
-                    "source": LOCATOR_WITNESS_PARAM_SOURCE,
-                }
-            )
+            parameter = {"key": key, "source": LOCATOR_WITNESS_PARAM_SOURCE}
+            # A file-match witness proves usage, not a safe persisted default; the submitted declaration owns it.
+            if key not in file_match_keys:
+                parameter["default_value"] = str(plan_hole.get("parameter_value") or "")
+            parameters.append(parameter)
     for key in input_templated_keys:
         used_param_keys.add(key)
-    if input_templated_keys:
-        lines.extend(witness_prelude_lines(input_templated_keys, include_month_helper=input_templated_needs_month))
+    for key in file_match_keys:
+        used_param_keys.add(key)
+        if key not in minted_input_witness_keys:
+            parameters.append({"key": key})
+    prelude_keys = [*input_templated_keys, *(key for key in file_match_keys if key not in input_templated_keys)]
+    if prelude_keys:
+        lines.extend(witness_prelude_lines(prelude_keys, include_month_helper=input_templated_needs_month))
         LOG.info(
             "copilot_spine_input_templated_prelude",
-            witness_keys=input_templated_keys,
+            witness_keys=prelude_keys,
             month_helper=input_templated_needs_month,
+        )
+    if file_match_locator and file_match_transform is not None:
+        lines.extend(_same_month_helper_lines())
+        lines.append(f"{_INDENT}{_DOWNLOAD_TARGET_VAR} = {file_match_locator}")
+        LOG.info(
+            "copilot_spine_same_month_file_match_transform_applied",
+            provenance_source=SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE,
+            parameter_keys=list(file_match_transform.expected_declared_keys),
+        )
+        diagnostics.locator_provenance.append(
+            {
+                "trajectory_index": reached_download_target.trajectory_anchor
+                if reached_download_target is not None and reached_download_target.trajectory_anchor is not None
+                else -1,
+                "selector": reached_download_target.selector if reached_download_target is not None else "",
+                "emitted_literal": file_match_locator,
+                "source": SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE,
+                "date_keys": list(file_match_transform.date_keys),
+                "expected_declared_keys": list(file_match_transform.expected_declared_keys),
+                "provenance_fingerprint": file_match_transform.provenance_fingerprint,
+                "date_format_id": file_match_transform.date_format_id,
+                "holes": [
+                    {
+                        "declared_keys": list(hole.declared_keys),
+                        "matched_literal": hole.matched_literal,
+                        "position": hole.position,
+                        "format_id": hole.format_id,
+                        "source_values": list(hole.source_values),
+                    }
+                    for hole in file_match_transform.holes
+                ],
+            }
         )
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
@@ -1501,7 +1668,9 @@ def synthesize_code_block(
             else 0
         )
         download_entry_target = (
-            f"page.locator({_py_str(reached_download_target.selector)})"
+            _DOWNLOAD_TARGET_VAR
+            if file_match_locator
+            else f"page.locator({_py_str(reached_download_target.selector)})"
             if compile_download_target and reached_download_target is not None
             else ""
         )
@@ -1985,7 +2154,12 @@ def synthesize_code_block(
         download_obj = _unique_key(f"{download_var}_file", used_download_vars)
         download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
         lines.append(f"{_INDENT}async with page.expect_download() as {download_var}:")
-        lines.append(f"{_INDENT * 2}await page.locator({_py_str(reached_download_target.selector)}).click()")
+        download_click_target = (
+            _DOWNLOAD_TARGET_VAR
+            if file_match_locator
+            else (f"page.locator({_py_str(reached_download_target.selector)})")
+        )
+        lines.append(f"{_INDENT * 2}await {download_click_target}.click()")
         lines.append(f"{_INDENT}{download_obj} = await {download_var}.value")
         lines.append(f"{_INDENT}{download_filename} = {download_obj}.suggested_filename")
         lines.append(f"{_INDENT}await {download_obj}.path()")
@@ -2788,6 +2962,7 @@ def synthesize_code_block_with_extraction(
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
+    file_match_transform: SameMonthFileMatchTransform | None = None,
 ) -> SynthesizedCodeBlock | None:
     if not _trajectory_contains_reveal(trajectory, extraction_plan):
         return None
@@ -2796,6 +2971,7 @@ def synthesize_code_block_with_extraction(
         strict_selectors=strict_selectors,
         reached_download_target=reached_download_target,
         parameter_binding_snapshot=parameter_binding_snapshot,
+        file_match_transform=file_match_transform,
     )
     suffix = synthesize_extraction_suffix(extraction_plan)
     if interaction is None or suffix is None:

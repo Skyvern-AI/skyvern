@@ -34,10 +34,14 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingTerminalTool,
     AuthoringParameterFieldBinding,
     AuthoringParameterTerminalBinding,
+    SameMonthFileMatchFormat,
+    SameMonthFileMatchHole,
+    SameMonthFileMatchTransform,
     authored_selector_parameter_bindings,
     authoring_parameter_binding_directive_consumed,
     build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
+    derive_same_month_file_match_transform,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
@@ -88,6 +92,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     INPUT_TEMPLATED_PROVENANCE_SOURCE,
     LOCATOR_WITNESS_PARAM_SOURCE,
+    SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE,
     SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
     SCOUTED_SPINE_TRUNCATED_REASON_CODE,
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
@@ -107,10 +112,12 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     artifact_dependency_id,
     artifact_observation_ref_id,
     build_input_templated_locator,
+    build_same_month_file_match_locator,
     credential_scout_gap,
     freeze_requested_output_extraction_candidate,
     grounded_parameter_key_is_safe,
     input_correspondences_for_interaction,
+    input_correspondences_for_selector,
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
@@ -2437,6 +2444,63 @@ def _scout_trajectory_index(interaction: Mapping[str, Any], position: int) -> in
 class _AuthoringParameterBindingResolution(NamedTuple):
     snapshot: AuthoringParameterBindingSnapshot | None
     directive: AuthoringParameterBindingDirective | None
+
+
+def _same_month_file_match_transform(
+    parsed: Mapping[str, Any],
+    runtime_parameters: Mapping[str, Any] | None,
+    *,
+    candidate_keys: Sequence[str],
+    selector: str,
+) -> SameMonthFileMatchTransform | None:
+    declared_keys = _declared_string_workflow_parameter_keys(parsed)
+    if not set(candidate_keys).issubset(declared_keys):
+        return None
+    definition = parsed.get("workflow_definition")
+    rows = definition.get("parameters") if isinstance(definition, Mapping) else None
+    if not isinstance(rows, list):
+        return None
+    defaults = {
+        str(row.get("key") or "").strip(): default
+        for row in rows
+        if isinstance(row, Mapping) and (default := _string_parameter_default_value(row)) is not None
+    }
+    supplied = runtime_parameters if isinstance(runtime_parameters, Mapping) else {}
+    values: dict[str, str] = {}
+    for key in candidate_keys:
+        runtime_value = supplied.get(key)
+        value = runtime_value if isinstance(runtime_value, str) else defaults.get(key)
+        if isinstance(value, str):
+            values[key] = value
+    correspondences = input_correspondences_for_selector(selector, values)
+    return derive_same_month_file_match_transform(
+        selector=selector,
+        parameter_values=values,
+        identity_correspondences=correspondences,
+    )
+
+
+def _runtime_declared_string_parameter_values(
+    parsed: Mapping[str, Any], runtime_parameters: Mapping[str, Any] | None
+) -> dict[str, str]:
+    definition = parsed.get("workflow_definition")
+    rows = definition.get("parameters") if isinstance(definition, Mapping) else None
+    if not isinstance(rows, list):
+        return {}
+    declared_keys = _declared_string_workflow_parameter_keys(parsed)
+    supplied = runtime_parameters if isinstance(runtime_parameters, Mapping) else {}
+    values: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        key = str(row.get("key") or "").strip()
+        if key not in declared_keys:
+            continue
+        runtime_value = supplied.get(key)
+        value = runtime_value if isinstance(runtime_value, str) else _string_parameter_default_value(row)
+        if isinstance(value, str):
+            values[key] = value
+    return values
 
 
 class _SelectionBindingRecord(NamedTuple):
@@ -8577,16 +8641,70 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         return bool(role) and bool(name) and _get_by_role_expr_strict(role, name) == provenance.get("emitted_literal")
     if source == INPUT_TEMPLATED_PROVENANCE_SOURCE:
         surface = str(provenance.get("surface") or "")
-        holes = provenance.get("holes")
-        if not isinstance(holes, list) or not holes:
+        input_holes = provenance.get("holes")
+        if not isinstance(input_holes, list) or not input_holes:
             return False
         recomputed = build_input_templated_locator(
             surface=surface,
             selector=str(provenance.get("selector") or ""),
             role=str(provenance.get("role") or ""),
             name=str(provenance.get("name") or ""),
-            holes=holes,
+            holes=input_holes,
         )
+        return recomputed is not None and recomputed == provenance.get("emitted_literal")
+    if source == SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE:
+        raw_date_keys = provenance.get("date_keys")
+        raw_expected_declared_keys = provenance.get("expected_declared_keys")
+        raw_holes = provenance.get("holes")
+        date_format_id = provenance.get("date_format_id")
+        provenance_fingerprint = provenance.get("provenance_fingerprint")
+        if (
+            not isinstance(raw_date_keys, list)
+            or len(raw_date_keys) != 2
+            or any(not isinstance(key, str) for key in raw_date_keys)
+            or not isinstance(raw_expected_declared_keys, list)
+            or any(not isinstance(key, str) for key in raw_expected_declared_keys)
+            or date_format_id != "iso_date_to_year_month"
+            or not isinstance(provenance_fingerprint, str)
+            or not isinstance(raw_holes, list)
+        ):
+            return False
+        same_month_holes: list[SameMonthFileMatchHole] = []
+        for raw_hole in raw_holes:
+            if not isinstance(raw_hole, Mapping):
+                return False
+            declared_keys = raw_hole.get("declared_keys")
+            matched_literal = raw_hole.get("matched_literal")
+            position = raw_hole.get("position")
+            format_id = raw_hole.get("format_id")
+            source_values = raw_hole.get("source_values")
+            if (
+                not isinstance(declared_keys, list)
+                or any(not isinstance(key, str) for key in declared_keys)
+                or not isinstance(matched_literal, str)
+                or not isinstance(position, int)
+                or format_id not in {"identity", "iso_date_to_year_month"}
+                or not isinstance(source_values, list)
+                or any(not isinstance(value, str) for value in source_values)
+            ):
+                return False
+            same_month_holes.append(
+                SameMonthFileMatchHole(
+                    declared_keys=tuple(declared_keys),
+                    matched_literal=matched_literal,
+                    position=position,
+                    format_id=cast(SameMonthFileMatchFormat, format_id),
+                    source_values=tuple(source_values),
+                )
+            )
+        transform = SameMonthFileMatchTransform(
+            selector=str(provenance.get("selector") or ""),
+            holes=tuple(same_month_holes),
+            date_keys=(raw_date_keys[0], raw_date_keys[1]),
+            expected_declared_keys=tuple(raw_expected_declared_keys),
+            provenance_fingerprint=provenance_fingerprint,
+        )
+        recomputed = build_same_month_file_match_locator(transform, transform.selector)
         return recomputed is not None and recomputed == provenance.get("emitted_literal")
     return False
 
@@ -11356,6 +11474,18 @@ def _maybe_impose_synthesized_code_block(
         else _AuthoringParameterBindingResolution(None, None)
     )
     binding_snapshot = binding_resolution.snapshot
+    file_match_transform = (
+        _same_month_file_match_transform(
+            parsed,
+            runtime_parameters,
+            candidate_keys=sorted(_declared_string_workflow_parameter_keys(parsed)),
+            selector=ctx.reached_download_target.selector,
+        )
+        if ctx.reached_download_target is not None
+        and not ctx.reached_download_target.already_registered
+        and bool(ctx.reached_download_target.selector)
+        else None
+    )
     ctx.authoring_parameter_binding_snapshot = binding_snapshot
     if prior_directive is not None and binding_snapshot is None:
         return _SynthesizedCodeImpositionResult(
@@ -11383,6 +11513,7 @@ def _maybe_impose_synthesized_code_block(
         )
     grounding_repair_active = (
         binding_snapshot is None
+        and file_match_transform is None
         and bool(declared_keys)
         and isinstance(requirement, RecordedOutcomeGroundingRequirement)
         and requirement.satisfied
@@ -11394,7 +11525,16 @@ def _maybe_impose_synthesized_code_block(
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: current-page parameter binding is unresolved."],
         )
-    synthesis_trajectory: Sequence[Mapping[str, Any]] = scout_trajectory
+    synthesis_values = _runtime_declared_string_parameter_values(parsed, runtime_parameters)
+    synthesis_trajectory: list[Mapping[str, Any]] = []
+    for interaction in scout_trajectory:
+        enriched_interaction = dict(interaction)
+        correspondences = input_correspondences_for_interaction(interaction, synthesis_values)
+        if correspondences:
+            enriched_interaction["input_correspondences"] = correspondences
+        else:
+            enriched_interaction.pop("input_correspondences", None)
+        synthesis_trajectory.append(enriched_interaction)
 
     owns_spine = reaches_goal
     ctx.spine_imposition_owned_attempt = owns_spine
@@ -11420,6 +11560,7 @@ def _maybe_impose_synthesized_code_block(
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
             parameter_binding_snapshot=binding_snapshot,
+            file_match_transform=file_match_transform,
         )
         if extraction_plan is not None
         else synthesize_code_block(
@@ -11427,6 +11568,7 @@ def _maybe_impose_synthesized_code_block(
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
             parameter_binding_snapshot=binding_snapshot,
+            file_match_transform=file_match_transform,
         )
     )
     if synthesized is None:
