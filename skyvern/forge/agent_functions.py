@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 import asyncio
 import copy
 import hashlib
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import aiohttp
 import httpx
@@ -59,6 +61,8 @@ from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext
+
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
@@ -113,9 +117,30 @@ class TOTPVerificationResponse:
 
 
 @dataclass(frozen=True)
-class CopilotAliasResolution:
+class CopilotSiteOriginAssociation:
+    requested_name: str
+    entity_id: str
+    entity_label: str
+    official_site_url: str
+    origin: str
+    source: str
+    provider_relation_type: str
+    provider_relation_text: str
+
+
+class CopilotCandidateNetworkHop(TypedDict):
     url: str
-    kind: str = "canonical_alias"
+    resource_type: str
+    resolved_public_ips: list[str]
+    connected_peer_ip: str
+    enforcement_version: str
+
+
+@dataclass(frozen=True)
+class CopilotEntrypointCandidate:
+    url: str
+    source_rank: int
+    association: CopilotSiteOriginAssociation
 
 
 @dataclass(frozen=True)
@@ -149,7 +174,7 @@ def _remove_rect(element: dict) -> None:
         del element["rect"]
 
 
-def _should_css_shape_convert(element: Dict) -> bool:
+def _should_css_shape_convert(element: dict) -> bool:
     if "id" not in element:
         return False
 
@@ -342,7 +367,7 @@ async def _set_css_shape_cache(
         )
 
 
-def _remove_skyvern_attributes(element: Dict) -> Dict:
+def _remove_skyvern_attributes(element: dict) -> dict:
     """
     To get the original HTML element without skyvern attributes
     """
@@ -357,7 +382,7 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
             if key in USELESS_SHAPE_ATTRIBUTE:
                 del element_copied["attributes"][key]
 
-    children: List[Dict] | None = element_copied.get("children", None)
+    children: list[dict] | None = element_copied.get("children", None)
     if children is None:
         return element_copied
 
@@ -389,7 +414,7 @@ def _mark_element_as_dropped(element: dict, *, hashed_key: str | None) -> None:
 
 async def _check_svg_eligibility(
     skyvern_frame: SkyvernFrame,
-    element: Dict,
+    element: dict,
     task: Task | None = None,
     step: Step | None = None,
     always_drop: bool = False,
@@ -435,7 +460,7 @@ async def _check_svg_eligibility(
 
 
 async def _convert_svg_to_string(
-    element: Dict,
+    element: dict,
     task: Task | None = None,
     step: Step | None = None,
 ) -> None:
@@ -559,7 +584,7 @@ async def _convert_svg_to_string(
 
 async def _convert_css_shape_to_string(
     skyvern_frame: SkyvernFrame,
-    element: Dict,
+    element: dict,
     task: Task | None = None,
     step: Step | None = None,
 ) -> None:
@@ -767,7 +792,7 @@ class AgentFunction:
     async def should_use_flex_llm_routing(
         self,
         *,
-        trigger_type: "WorkflowRunTriggerType | None",
+        trigger_type: WorkflowRunTriggerType | None,
         organization: Organization,
         workflow_permanent_id: str,
         workflow_run_id: str,
@@ -797,16 +822,16 @@ class AgentFunction:
     async def should_keep_code_mode_for_workflow_run(
         self,
         *,
-        workflow: "Workflow",
-        workflow_run: "WorkflowRun",
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
     ) -> bool:
         return True
 
     async def should_upgrade_to_code_mode(
         self,
         *,
-        workflow: "Workflow",
-        workflow_run: "WorkflowRun",
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
     ) -> bool:
         return False
 
@@ -830,7 +855,7 @@ class AgentFunction:
         *,
         workflow_run_id: str,
         workflow_run_block_id: str,
-        workflow_run_context: "WorkflowRunContext",
+        workflow_run_context: WorkflowRunContext,
         organization_id: str | None,
         block_label: str | None,
         browser_session_id: str | None,
@@ -869,10 +894,10 @@ class AgentFunction:
         workflow_run_block_id: str,
         organization_id: str | None,
         browser_session_id: str | None,
-        workflow_run_context: "WorkflowRunContext",
+        workflow_run_context: WorkflowRunContext,
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
-        recording_page: "RecordingPage | None" = None,
+        recording_page: RecordingPage | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
 
@@ -891,7 +916,7 @@ class AgentFunction:
         """Base no-op (copilot runs its block test inline); overridden per deployment."""
         return False
 
-    def resolve_copilot_dispatch_trigger_type(self) -> "WorkflowRunTriggerType | None":
+    def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
 
@@ -926,7 +951,7 @@ class AgentFunction:
         """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
         return None
 
-    async def is_block_scoped_workflow_run(self, workflow_run: "WorkflowRun") -> bool:
+    async def is_block_scoped_workflow_run(self, workflow_run: WorkflowRun) -> bool:
         """Return whether this workflow run was created for scoped block execution."""
         return workflow_run.debug_session_id is not None
 
@@ -1338,7 +1363,7 @@ class AgentFunction:
         workflow_run_id: str | None = None,
         created_after: datetime | None = None,
         context: GmailOTPVerificationContext | None = None,
-    ) -> "OTPValue | None":
+    ) -> OTPValue | None:
         """Find an OTP in connected Gmail inboxes for a single polling window."""
         if "@" not in totp_identifier:
             return None
@@ -1792,13 +1817,36 @@ class AgentFunction:
         """
         return ""
 
-    def resolve_copilot_entrypoint_alias(
+    async def acquire_copilot_entrypoint_candidates(
         self,
         *,
-        site_or_url: str,
-        normalized_alias: str,
-    ) -> CopilotAliasResolution | None:
-        return None
+        site_name: str,
+    ) -> list[CopilotEntrypointCandidate]:
+        del site_name
+        return []
+
+    def copilot_candidate_network_guard(
+        self,
+        browser_context: BrowserContext,
+        *,
+        expected_origin: str,
+    ) -> AbstractAsyncContextManager[list[CopilotCandidateNetworkHop]]:
+        return self._unavailable_copilot_candidate_network_guard(browser_context, expected_origin=expected_origin)
+
+    @asynccontextmanager
+    async def _unavailable_copilot_candidate_network_guard(
+        self,
+        browser_context: BrowserContext,
+        *,
+        expected_origin: str,
+    ) -> AsyncIterator[list[CopilotCandidateNetworkHop]]:
+        del browser_context, expected_origin
+        raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
+        yield []  # pragma: no cover
+
+    async def wait_for_copilot_candidate_network_idle(self, browser_context: BrowserContext) -> None:
+        del browser_context
+        raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
@@ -1990,7 +2038,7 @@ class AgentFunction:
         self,
         organization_id: str,
         workflow_id: str,
-        status: "WorkflowRunStatus | None" = None,
+        status: WorkflowRunStatus | None = None,
     ) -> None:
         """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
         return None
