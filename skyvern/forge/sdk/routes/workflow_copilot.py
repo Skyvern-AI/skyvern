@@ -101,11 +101,13 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
+WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS = 3_000_000
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
     "audio/mpeg",
@@ -1004,6 +1006,21 @@ async def _get_debug_artifact(organization_id: str, workflow_run_id: str) -> Art
     return artifacts[0] if isinstance(artifacts, list) and artifacts else None
 
 
+async def _get_debug_html(organization_id: str, workflow_run_id: str) -> str | None:
+    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
+    if not artifact:
+        return None
+    artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+    if not artifact_bytes:
+        return None
+    # The extreme-size cap can drop middle-tree evidence; move to structure-aware
+    # selection if that trade-off causes copilot regressions.
+    return truncate_page_html_for_summary(
+        artifact_bytes.decode("utf-8"),
+        max_chars=WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS,
+    )
+
+
 async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None) -> RunInfo | None:
     if not workflow_run_id:
         return None
@@ -1016,12 +1033,7 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
 
     block = blocks[0]
 
-    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
-    if artifact:
-        artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-        html = artifact_bytes.decode("utf-8") if artifact_bytes else None
-    else:
-        html = None
+    html = await _get_debug_html(organization_id, workflow_run_id)
 
     return RunInfo(
         block_label=block.label,
@@ -1063,11 +1075,7 @@ async def _get_new_copilot_block_infos(
             )
         )
 
-    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
-    html: str | None = None
-    if artifact:
-        artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-        html = artifact_bytes.decode("utf-8") if artifact_bytes else None
+    html = await _get_debug_html(organization_id, workflow_run_id)
 
     return block_infos, html
 
