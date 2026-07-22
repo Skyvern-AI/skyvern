@@ -33,6 +33,21 @@ LOG = structlog.get_logger(__name__)
 # module is heavy) and importing it here would be circular (copilot imports mcp).
 _BLOCK_JSON_ALIASES = ("block", "block_definition", "definition", "block_yaml")
 
+# Params whose contract requires a JSON string but which are sometimes sent as
+# the already-decoded object. Keep this registry tool-specific: a dict can be a
+# legitimate value for other parameters and must not be serialized globally.
+_JSON_OBJECT_STRING_ARGUMENTS = {
+    "skyvern_extract": "schema",
+    "skyvern_run_task": "data_extraction_schema",
+}
+
+# Exact, production-observed aliases with only one plausible canonical target.
+# Unknown names are deliberately absent so the argument validator still rejects
+# hallucinated parameters and wrong-tool calls.
+_KNOWN_ARGUMENT_ALIASES = {
+    "skyvern_browser_profile_get": ("profile_id", "browser_profile_id"),
+}
+
 # Cap the string length parsed by the coercion helpers. Parameter-key lists are
 # small; this bounds work done on unbounded, attacker-controlled remote input
 # before validation (a bracket-bomb / multi-MB list string never gets parsed).
@@ -113,6 +128,12 @@ def _coerce_json_object_to_str(value: Any) -> Any:
     return value
 
 
+def _promote_known_alias(arguments: dict[str, Any], alias: str, canonical: str) -> None:
+    """Rename one exact alias only when it cannot conflict with its canonical key."""
+    if alias in arguments and canonical not in arguments:
+        arguments[canonical] = arguments.pop(alias)
+
+
 def _promote_block_json_alias(arguments: dict[str, Any]) -> None:
     """Promote a misnamed block-definition arg to ``block_json`` in place.
 
@@ -172,9 +193,16 @@ def repair_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> None:
 
     if tool_name == "skyvern_code_block_lint" and "parameter_keys" in arguments:
         arguments["parameter_keys"] = _coerce_str_to_str_list(arguments["parameter_keys"])
-    elif tool_name == "skyvern_extract" and "schema" in arguments:
-        arguments["schema"] = _coerce_json_object_to_str(arguments["schema"])
-    elif tool_name == "skyvern_block_validate":
+
+    json_object_string_argument = _JSON_OBJECT_STRING_ARGUMENTS.get(tool_name)
+    if json_object_string_argument is not None and json_object_string_argument in arguments:
+        arguments[json_object_string_argument] = _coerce_json_object_to_str(arguments[json_object_string_argument])
+
+    known_alias = _KNOWN_ARGUMENT_ALIASES.get(tool_name)
+    if known_alias is not None:
+        _promote_known_alias(arguments, *known_alias)
+
+    if tool_name == "skyvern_block_validate":
         _promote_block_json_alias(arguments)
 
 

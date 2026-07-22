@@ -14,10 +14,14 @@ succeeds and we can assert on the repaired arguments deterministically.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastmcp import Client
 
+from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.cli.mcp_tools import browser_profiles as mcp_browser_profiles
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.arg_repair import repair_tool_arguments
 
@@ -186,6 +190,65 @@ def test_extract_schema_oversized_dict_not_serialized() -> None:
     assert args["schema"] is big
 
 
+# --- mechanism (b): run_task extraction schema dict -> json string (SKY-12789) ---
+
+
+def test_run_task_data_extraction_schema_object_serialized() -> None:
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+    args = {"prompt": "extract the title", "data_extraction_schema": schema}
+    repair_tool_arguments("skyvern_run_task", args)
+    assert args["data_extraction_schema"] == json.dumps(schema)
+
+
+def test_run_task_data_extraction_schema_string_untouched() -> None:
+    args = {"prompt": "extract", "data_extraction_schema": '{"type":"object"}'}
+    repair_tool_arguments("skyvern_run_task", args)
+    assert args["data_extraction_schema"] == '{"type":"object"}'
+
+
+def test_run_task_data_extraction_schema_list_not_masked() -> None:
+    schema_list = [{"type": "object"}]
+    args = {"prompt": "extract", "data_extraction_schema": schema_list}
+    repair_tool_arguments("skyvern_run_task", args)
+    assert args["data_extraction_schema"] is schema_list
+
+
+def test_run_task_data_extraction_schema_oversized_dict_not_serialized() -> None:
+    big = {f"k{i}": "v" for i in range(20000)}
+    args = {"prompt": "extract", "data_extraction_schema": big}
+    repair_tool_arguments("skyvern_run_task", args)
+    assert args["data_extraction_schema"] is big
+
+
+# --- mechanism (c): known browser-profile ID alias (SKY-12581) ---
+
+
+def test_browser_profile_get_profile_id_alias_promoted() -> None:
+    args = {"profile_id": "bp_test"}
+    repair_tool_arguments("skyvern_browser_profile_get", args)
+    assert args == {"browser_profile_id": "bp_test"}
+
+
+def test_browser_profile_get_conflicting_alias_not_masked() -> None:
+    args = {"profile_id": "bp_alias", "browser_profile_id": "bp_canonical"}
+    repair_tool_arguments("skyvern_browser_profile_get", args)
+    assert args == {"profile_id": "bp_alias", "browser_profile_id": "bp_canonical"}
+
+
+def test_browser_profile_get_unknown_sibling_not_dropped() -> None:
+    args = {"profile_id": "bp_test", "made_up": "value"}
+    repair_tool_arguments("skyvern_browser_profile_get", args)
+    assert args == {"browser_profile_id": "bp_test", "made_up": "value"}
+
+
+def test_workflow_status_wrong_tool_key_not_coerced() -> None:
+    # workflow_run_id belongs to retry, not status. Treating it as a status alias
+    # would hide a wrong-tool selection, so it must remain unsupported.
+    args = {"workflow_run_id": "wr_test"}
+    repair_tool_arguments("skyvern_workflow_status", args)
+    assert args == {"workflow_run_id": "wr_test"}
+
+
 # --- mechanism (b): block_json alias for validate (SKY-11133) ---
 
 
@@ -301,6 +364,74 @@ async def test_block_validate_block_alias_validates_at_boundary() -> None:
 async def test_parameter_keys_string_lints_at_boundary() -> None:
     res = await _call("skyvern_code_block_lint", {"code": "value = 1\n", "parameter_keys": "['value']"})
     assert res.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_run_task_data_extraction_schema_dict_validates_at_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+    response = SimpleNamespace(
+        run_id="wr_test",
+        status="completed",
+        output={"title": "Example"},
+        failure_reason=None,
+        recording_url=None,
+        app_url=None,
+    )
+    run_task = AsyncMock(return_value=response)
+    page = SimpleNamespace(agent=SimpleNamespace(run_task=run_task))
+    context = mcp_browser.BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    res = await _call(
+        "skyvern_run_task",
+        {"prompt": "extract the title", "data_extraction_schema": schema},
+    )
+
+    assert res.is_error is False
+    assert res.structured_content["ok"] is True
+    assert run_task.await_args.kwargs["data_extraction_schema"] == schema
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_get_profile_id_alias_validates_at_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = SimpleNamespace(
+        browser_profile_id="bp_test",
+        organization_id="org_test",
+        name="Test profile",
+        description=None,
+        source_browser_type="chromium",
+        created_at=None,
+        modified_at=None,
+        deleted_at=None,
+    )
+    get_browser_profile = AsyncMock(return_value=profile)
+    sdk = SimpleNamespace(get_browser_profile=get_browser_profile)
+    monkeypatch.setattr(mcp_browser_profiles, "get_skyvern", lambda: sdk)
+
+    res = await _call("skyvern_browser_profile_get", {"profile_id": "bp_test"})
+
+    assert res.is_error is False
+    assert res.structured_content["data"]["browser_profile_id"] == "bp_test"
+    get_browser_profile.assert_awaited_once_with("bp_test")
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_get_conflicting_alias_errors_at_boundary() -> None:
+    res = await _call(
+        "skyvern_browser_profile_get",
+        {"profile_id": "bp_alias", "browser_profile_id": "bp_canonical"},
+    )
+    _assert_invalid_input(res, ["profile_id"])
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_wrong_tool_key_errors_at_boundary() -> None:
+    res = await _call("skyvern_workflow_status", {"workflow_run_id": "wr_test"})
+    _assert_invalid_input(res, ["workflow_run_id"])
 
 
 @pytest.mark.asyncio
