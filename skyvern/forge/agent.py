@@ -171,7 +171,10 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
+from skyvern.webeye.cdp_download_interceptor import (
+    download_filename_from_suffix,
+    settle_browser_downloads_for_context,
+)
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
@@ -514,7 +517,11 @@ class ForgeAgent:
             )
             list_files_after = list_files_after + browser_session_downloaded_files_after
 
-        files_to_rename = list(set(list_files_after) - set(list_files_before))
+        files_to_rename = [
+            file
+            for file in set(list_files_after) - set(list_files_before)
+            if Path(file).suffix != BROWSER_DOWNLOADING_SUFFIX
+        ]
         if not files_to_rename:
             return []
         for file in files_to_rename:
@@ -4797,7 +4804,11 @@ class ForgeAgent:
                     # Keep both finalize and save inside a single timeout budget so a hung
                     # finalize call cannot block persistence forever; accept the trade-off
                     # that a very slow finalize on many files could crowd out save.
+                    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+                    browser_context = browser_state.browser_context if browser_state is not None else None
                     async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                        async with settle_browser_downloads_for_context(browser_context):
+                            pass
                         if download_suffix and list_files_before is not None:
                             await self._finalize_downloaded_files_for_task(
                                 task,

@@ -52,7 +52,7 @@ from skyvern.webeye.cdp_connection import (
     merge_cdp_connect_headers,
     parse_default_cdp_connect_headers,
 )
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
 from skyvern.webeye.session_cookies import restore_session_cookies
 
@@ -980,16 +980,8 @@ async def _connect_to_cdp_browser(
             except Exception:
                 LOG.warning("Failed to enable CDP intercept on page", page_url=page.url, exc_info=True)
 
-        # Auto-enable interception on new pages (e.g., target="_blank" links)
-        async def _on_new_page(page: Page) -> None:
-            try:
-                await interceptor.enable_for_page(page)
-            except Exception:
-                LOG.warning("Failed to enable CDP intercept on new page", page_url=page.url, exc_info=True)
-
-        browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
+        await bind_download_interceptor_to_context(interceptor, browser_context)
         browser_context._skyvern_cdp_download_active = True  # type: ignore[attr-defined]
-        browser_context._skyvern_cdp_download_interceptor = interceptor  # type: ignore[attr-defined]
         LOG.info(
             "CDP download interceptor enabled",
             download_dir=download_dir,

@@ -11,7 +11,12 @@ import structlog
 from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_PAGE_CLOSE_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
+from skyvern.constants import (
+    BROWSER_CLOSE_TIMEOUT,
+    BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
+    BROWSER_PAGE_CLOSE_TIMEOUT,
+    NAVIGATION_MAX_RETRY_TIME,
+)
 from skyvern.exceptions import (
     EmptyBrowserContext,
     FailedToNavigateToUrl,
@@ -26,6 +31,7 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
@@ -87,6 +93,10 @@ class RealBrowserState(BrowserState):
         # One-shot callbacks fired first inside ``close()``. Cleared after
         # firing so re-entry into ``close()`` is safe.
         self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
+        # Teardown phases detached because they overran their budget. asyncio only holds tasks
+        # weakly, so a still-pending detached drain would be eligible for GC ("Task was destroyed
+        # but it is pending!"); we own it strongly here until its done-callback discards it.
+        self._detached_teardown_tasks: set[asyncio.Task[None]] = set()
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
@@ -615,32 +625,118 @@ class RealBrowserState(BrowserState):
         if release_driver is None:
             release_driver = close_browser_on_completion or self.release_driver_on_close
         LOG.info("Closing browser state", sampling=True)
-        # Only fire on-close observers on a real teardown. Shared / parent-child
-        # close calls pass ``close_browser_on_completion=False`` to leave the
-        # browser alive for another run; firing callbacks then would stop the
-        # surviving run's publisher and freeze its livestream.
+
+        # Each teardown phase runs in its OWN bounded region so a phase that hangs — a
+        # cancellation-resistant download drain, a stuck context close, a raising callback —
+        # can never consume the budget a later phase needs. In particular the paid-provider
+        # cleanup (Browser Use / Anchor / remote-CDP stop/delete) always gets its own attempt,
+        # even when interceptor disable, cookie persistence, or context close hangs or fails.
+        # Worst-case wall time is the sum of the per-phase budgets:
+        # BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT.
         if close_browser_on_completion:
-            await self._run_on_close_callbacks()
+            if self.browser_context is not None:
+                await self._run_bounded_detachable(
+                    disable_download_interceptor_for_context(self.browser_context),
+                    BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
+                    "download interceptor disable",
+                )
+            await self._run_bounded_detachable(
+                self._teardown_context(),
+                BROWSER_CLOSE_TIMEOUT,
+                "browser context teardown",
+            )
+            await self._run_browser_cleanup_bounded()
+
+        await self._stop_driver_bounded(release_driver)
+
+    async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> None:
+        # Bound a teardown phase WITHOUT relying on cancellation: a stuck download drain or a real
+        # Playwright ``context.close`` blocked by an unresolved paused request can ignore the cancel a
+        # plain ``asyncio.timeout`` delivers. We race the phase against ``timeout`` and, if it does not
+        # finish, best-effort cancel it and move on so the next phase (crucially the paid-provider
+        # cleanup) always runs. The detached phase stays explicitly owned so it is never an orphan.
+        task = asyncio.ensure_future(coro)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except BaseException:
+            # close() itself was cancelled; keep owning the phase so it is not orphaned, then re-raise.
+            task.cancel()
+            self._own_detached_task(task, description)
+            raise
+        if task not in done:
+            LOG.warning(
+                "Teardown phase exceeded its budget; detaching so later teardown still runs",
+                phase=description,
+                timeout=timeout,
+            )
+            task.cancel()
+            self._own_detached_task(task, description)
+            return
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            LOG.warning("Teardown phase failed", phase=description, error_type=type(error).__name__)
+
+    def _own_detached_task(self, task: asyncio.Task[None], description: str) -> None:
+        # A cancellation-resistant phase can outlive close(). We hold a strong reference until it
+        # finishes (asyncio holds tasks only weakly), and the done-callback retrieves its eventual
+        # exception so it is neither an orphan, a GC'd pending task, nor a source of "Task exception
+        # was never retrieved". The strong ref is discarded only after completion.
+        self._detached_teardown_tasks.add(task)
+
+        def _retrieve(finished: asyncio.Task[None]) -> None:
+            try:
+                if finished.cancelled():
+                    return
+                error = finished.exception()
+                if error is not None:
+                    LOG.debug(
+                        "Detached teardown phase raised after detach",
+                        phase=description,
+                        error_type=type(error).__name__,
+                    )
+            finally:
+                self._detached_teardown_tasks.discard(finished)
+
+        task.add_done_callback(_retrieve)
+
+    async def _teardown_context(self) -> None:
+        # Only fire on-close observers on a real teardown. Shared / parent-child close calls pass
+        # ``close_browser_on_completion=False`` to leave the browser alive for another run; firing
+        # callbacks then would stop the surviving run's publisher and freeze its livestream.
+        await self._run_on_close_callbacks()
+        if self.browser_context is None:
+            return
+        LOG.info("Closing browser context and its pages")
+        session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+        try:
+            await persist_session_cookies(self.browser_context, session_dir)
+        except Exception:
+            LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
+        try:
+            await self.browser_context.close()
+        except Exception:
+            LOG.warning("Failed to close browser context", exc_info=True)
+        LOG.info("Main browser context and all its pages are closed")
+
+    async def _run_browser_cleanup_bounded(self) -> None:
+        cleanup = self.browser_cleanup
+        if cleanup is None or self.browser_context is None:
+            return
+        # One-shot: a re-entrant close() must not stop/delete the paid provider twice.
+        self.browser_cleanup = None
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                if self.browser_context and close_browser_on_completion:
-                    LOG.info("Closing browser context and its pages")
-                    session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
-                    await persist_session_cookies(self.browser_context, session_dir)
-                    try:
-                        await self.browser_context.close()
-                    except Exception:
-                        LOG.warning("Failed to close browser context", exc_info=True)
-                    LOG.info("Main browser context and all its pages are closed")
-                    if self.browser_cleanup is not None:
-                        try:
-                            await self.browser_cleanup()
-                            LOG.info("Main browser cleanup is executed")
-                        except Exception:
-                            LOG.warning("Failed to execute browser cleanup", exc_info=True)
+                try:
+                    await cleanup()
+                    LOG.info("Main browser cleanup is executed")
+                except Exception:
+                    LOG.warning("Failed to execute browser cleanup", exc_info=True)
         except asyncio.TimeoutError:
-            LOG.error("Timeout to close browser context, going to stop playwright directly")
+            LOG.error("Timeout executing browser cleanup")
 
+    async def _stop_driver_bounded(self, release_driver: bool) -> None:
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.pw and release_driver:
