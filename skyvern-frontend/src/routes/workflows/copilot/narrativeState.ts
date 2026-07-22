@@ -1260,7 +1260,7 @@ export function formatElapsed(
 export interface TurnSummary {
   headline: string;
   stats: string[];
-  accent: "ok" | "fail" | "qa";
+  accent: "ok" | "fail" | "qa" | "warn";
   glyph: string;
   isFail: boolean;
   isQA: boolean;
@@ -1299,6 +1299,34 @@ interface AdjudicatedParts {
   glyph: string;
 }
 
+export interface NotConfirmedOutcome {
+  verdict: "not_demonstrated";
+  displayReason: string | null;
+}
+
+export function notConfirmedOutcome(
+  turn: Pick<TurnNarrativeState, "lastRunOutcome" | "blocks">,
+): NotConfirmedOutcome | null {
+  if (turn.lastRunOutcome !== null) {
+    return turn.lastRunOutcome.verdict === "not_demonstrated"
+      ? {
+          verdict: "not_demonstrated",
+          displayReason: turn.lastRunOutcome.displayReason,
+        }
+      : null;
+  }
+  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
+    const block = turn.blocks[i]!;
+    if (block.outcome === "not_demonstrated") {
+      return {
+        verdict: "not_demonstrated",
+        displayReason: block.outcomeReason ?? null,
+      };
+    }
+  }
+  return null;
+}
+
 // Headline parts from the typed terminal adjudication. Returns null when the
 // turn predates the typed signal; a build kind without a verdict also falls
 // back to the legacy inference chain so genuinely-tested historical turns
@@ -1324,15 +1352,20 @@ function adjudicatedSummaryParts(
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (turn.responseKind !== "build") {
+    if (turn.responseKind === "refuse") {
+      return { headline: "Declined", accent: "qa", glyph: "✦" };
+    }
+    if (turn.responseKind === "diagnose") {
+      return { headline: "Answered", accent: "qa", glyph: "✦" };
+    }
+    if (
+      turn.responseType !== "ASK_QUESTION" &&
+      notConfirmedOutcome(turn)?.verdict === "not_demonstrated"
+    ) {
+      return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
+    }
     return {
-      headline:
-        turn.responseKind === "refuse"
-          ? "Declined"
-          : turn.responseKind === "diagnose"
-            ? "Answered"
-            : uxV1
-              ? "Needs your input"
-              : "Question",
+      headline: uxV1 ? "Needs your input" : "Question",
       accent: "qa",
       glyph: "✦",
     };
@@ -1343,6 +1376,13 @@ function adjudicatedSummaryParts(
   }
   if (flags.needsTestedProposalReview) {
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
+  }
+  if (turn.responseType === "ASK_QUESTION") {
+    return {
+      headline: uxV1 ? "Needs your input" : "Question",
+      accent: "qa",
+      glyph: "✦",
+    };
   }
   if (!turn.verifiedSuccess) {
     if (flags.hasCleanCompletedBuild) {

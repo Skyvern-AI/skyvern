@@ -8,6 +8,7 @@ import {
   BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
+  hydrateNarrativeFromPayload,
 } from "./narrativeState";
 
 const completedBlock = (
@@ -58,6 +59,9 @@ const inFlightTurn = (): TurnNarrativeState => ({
 const HEADLINE = "Built and tested the workflow";
 const REVIEW_HEADLINE = "Draft needs review";
 const REVIEW_TESTED_HEADLINE = "Workflow ready for review";
+const LONG_OUTCOME_REASON =
+  "The verification challenge kept reappearing after submit, and each retry landed back on the same gate instead of the requested destination page.";
+const SHORT_OUTCOME_REASON = "A verification challenge prevented confirmation";
 
 afterEach(() => {
   cleanup();
@@ -177,5 +181,179 @@ describe("NarrativeView collapse default", () => {
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.queryByText("Halted")).toBeNull();
     expect(screen.getAllByText("add_to_cart")).toHaveLength(1);
+  });
+
+  it("appends a truncated not-demonstrated reason to the collapsed subtitle", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: LONG_OUTCOME_REASON,
+            activitySeqAtVerdict: 8,
+          },
+        }}
+      />,
+    );
+
+    const expectedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain(
+      `Outcome not confirmed: ${expectedPreview}`,
+    );
+    expect(head.textContent).not.toContain(LONG_OUTCOME_REASON);
+  });
+
+  it("derives the collapsed subtitle reason from hydrated not-demonstrated block outcomes", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-hydrated",
+      turnIndex: 0,
+      mode: "build",
+      responseType: "REPLY",
+      designStarted: true,
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [
+        {
+          ...completedBlock("block_1"),
+          outcome: "not_demonstrated",
+          outcomeReason: LONG_OUTCOME_REASON,
+        },
+      ],
+      terminal: "response",
+      terminalMessage: "Built it.",
+      narrativeSummary: "Built it.",
+      startedAt: "2026-05-30T00:00:00Z",
+      endedAt: "2026-05-30T00:00:12Z",
+    })!;
+    const expectedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    render(<NarrativeView turn={hydrated} />);
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain(
+      `Outcome not confirmed: ${expectedPreview}`,
+    );
+    expect(head.textContent).not.toContain(LONG_OUTCOME_REASON);
+  });
+
+  it("does not append a duplicate not-confirmed reason when closing prose already includes it", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          narrativeSummary:
+            "Could not confirm completion. Reason: a   verification challenge prevented confirmation.",
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: SHORT_OUTCOME_REASON,
+            activitySeqAtVerdict: 9,
+          },
+        }}
+      />,
+    );
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain(
+      "Reason: a   verification challenge prevented confirmation.",
+    );
+    expect(head.textContent).not.toContain(
+      `Outcome not confirmed: ${SHORT_OUTCOME_REASON}`,
+    );
+  });
+
+  it("does not append a duplicate when closing prose carries only a truncated preview of the reason", () => {
+    const truncatedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          narrativeSummary: `Could not confirm completion. Reason: ${truncatedPreview}`,
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: LONG_OUTCOME_REASON,
+            activitySeqAtVerdict: 9,
+          },
+        }}
+      />,
+    );
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain(`Reason: ${truncatedPreview}`);
+    expect(head.textContent).not.toContain("Outcome not confirmed:");
+  });
+
+  it("appends not-confirmed reason when closing prose does not include it", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          narrativeSummary: "Built it.",
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: SHORT_OUTCOME_REASON,
+            activitySeqAtVerdict: 9,
+          },
+        }}
+      />,
+    );
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain("Built it.");
+    expect(head.textContent).toContain(
+      `Outcome not confirmed: ${SHORT_OUTCOME_REASON}`,
+    );
+  });
+
+  it("uses only the not-confirmed segment when there is no closing prose", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          narrativeSummary: null,
+          terminalMessage: null,
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: SHORT_OUTCOME_REASON,
+            activitySeqAtVerdict: 9,
+          },
+        }}
+      />,
+    );
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain(
+      `Outcome not confirmed: ${SHORT_OUTCOME_REASON}`,
+    );
+    expect(head.textContent).not.toContain("Built it.");
+  });
+
+  it("does not append a not-demonstrated reason when no verdict signal is present", () => {
+    render(<NarrativeView turn={terminalBuildTurn()} />);
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).not.toContain("Outcome not confirmed:");
+    expect(head.textContent).not.toContain("verification challenge");
+  });
+
+  it("keeps hydrated turns with neither signal byte-identical to legacy subtitle behavior", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-hydrated-legacy",
+      turnIndex: 0,
+      mode: "build",
+      responseType: "REPLY",
+      designStarted: true,
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [{ ...completedBlock("block_1") }],
+      terminal: "response",
+      terminalMessage: "Built it.",
+      narrativeSummary: "Built it.",
+      startedAt: "2026-05-30T00:00:00Z",
+      endedAt: "2026-05-30T00:00:12Z",
+    })!;
+    render(<NarrativeView turn={hydrated} />);
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.textContent).toContain("Built it.");
+    expect(head.textContent).not.toContain("Outcome not confirmed:");
   });
 });

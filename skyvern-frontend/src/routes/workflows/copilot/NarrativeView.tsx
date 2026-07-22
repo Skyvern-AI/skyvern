@@ -20,6 +20,7 @@ import {
   formatElapsed,
   isBlockOk,
   latestBlocksByLabel,
+  notConfirmedOutcome,
   parseUtcIsoMs,
   toolActivityDisplayLabel,
 } from "./narrativeState";
@@ -29,6 +30,36 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
+const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+
+function normalizeOutcomeReason(
+  reason: string | null | undefined,
+): string | null {
+  const trimmed = reason?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeOutcomeReasonSearchText(
+  text: string | null | undefined,
+): string {
+  const normalized = normalizeOutcomeReason(text);
+  if (!normalized) return "";
+  return normalized
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,!?;:]+$/g, "")
+    .trim();
+}
+
+function truncateOutcomeReason(reason: string): string {
+  if (reason.length <= OUTCOME_REASON_PREVIEW_LIMIT) return reason;
+  const slice = reason.slice(0, OUTCOME_REASON_PREVIEW_LIMIT - 3).trimEnd();
+  return `${slice}...`;
+}
+
+function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
+  return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
+}
 
 interface BlockPalette {
   fg: string;
@@ -307,9 +338,16 @@ interface FBlockRunProps {
   turnEnded: boolean;
   onSelect?: (label: string) => void;
   uxV1?: boolean;
+  outcomeReasonFallback?: string | null;
 }
 
-function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
+function FBlockRun({
+  block,
+  turnEnded,
+  onSelect,
+  uxV1,
+  outcomeReasonFallback,
+}: FBlockRunProps) {
   const displayLabel = uxV1 ? humanizeBlockLabel(block.label) : block.label;
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
@@ -404,6 +442,9 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
             : isDraft
               ? "drafted"
               : "queued";
+  const collapsedOutcomeReason = isOutcomeNotShown
+    ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
+    : null;
 
   return (
     <div className="flex flex-col">
@@ -468,7 +509,10 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
           {!open && isOutcomeNotShown ? (
             <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
               Outcome not confirmed — the run finished without showing the goal
-              was met.
+              was met
+              {collapsedOutcomeReason
+                ? `: ${truncateOutcomeReason(collapsedOutcomeReason)}`
+                : "."}
             </div>
           ) : null}
         </div>
@@ -797,6 +841,7 @@ function FPhaseChecklist({
   onBlockSelect,
   uxV1,
 }: FPhaseChecklistProps) {
+  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const rows = useMemo(() => derivePhases(turn), [turn]);
   const condensedBlocks = useMemo(
     () =>
@@ -933,6 +978,7 @@ function FPhaseChecklist({
                         turnEnded={turnEnded}
                         onSelect={onBlockSelect}
                         uxV1={uxV1}
+                        outcomeReasonFallback={collapsedOutcomeReason}
                       />
                     ))}
                   </>
@@ -953,6 +999,9 @@ function FPhaseChecklist({
 function accentBg(accent: TurnSummary["accent"]): string {
   if (accent === "fail") {
     return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
+  }
+  if (accent === "warn") {
+    return "border-amber-400/60 bg-amber-500/15 text-amber-700 dark:text-amber-300";
   }
   if (accent === "qa") {
     return "border-sky-400/60 bg-sky-500/15 text-sky-700 dark:text-sky-300";
@@ -1025,6 +1074,24 @@ function RollupCard({
 }: RollupCardProps) {
   const closing =
     turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
+  const truncatedOutcomeReason = collapsedOutcomeReason
+    ? truncateOutcomeReason(collapsedOutcomeReason)
+    : null;
+  const normalizedClosing = normalizeOutcomeReasonSearchText(closing);
+  // Normalizing the truncated preview (its trailing "..." strips as punctuation)
+  // makes the containment check a prefix match, so closings carrying either the
+  // full reason or a truncated form of it both suppress the appended segment.
+  const normalizedOutcomeReason = normalizeOutcomeReasonSearchText(
+    truncatedOutcomeReason,
+  );
+  const shouldAppendOutcomeReason =
+    normalizedOutcomeReason.length > 0 &&
+    !normalizedClosing.includes(normalizedOutcomeReason);
+  const outcomeReasonSubtitle = shouldAppendOutcomeReason
+    ? `Outcome not confirmed: ${truncatedOutcomeReason!}`
+    : "";
+  const subtitle = [closing, outcomeReasonSubtitle].filter(Boolean).join(" · ");
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const completed = rollupBlocks.filter((b) => isBlockOk(b));
   const failed = rollupBlocks.filter((b) => b.state === "failed");
@@ -1038,7 +1105,7 @@ function RollupCard({
         expanded={false}
         onClick={onExpand}
         subtitle={
-          closing ? (
+          subtitle ? (
             <div
               className={`mt-0.5 text-[12.5px] leading-[1.5] ${
                 summary.isFail && !summary.isStoppedWithDraft
@@ -1046,7 +1113,7 @@ function RollupCard({
                   : "text-muted-foreground"
               }`}
             >
-              {closing}
+              {subtitle}
             </div>
           ) : null
         }
@@ -1152,6 +1219,7 @@ function DetailView({
   onBlockSelect,
   uxV1,
 }: DetailViewProps) {
+  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -1214,6 +1282,7 @@ function DetailView({
               turnEnded={turn.terminal !== null}
               onSelect={onBlockSelect}
               uxV1={uxV1}
+              outcomeReasonFallback={collapsedOutcomeReason}
             />
           ))}
         </div>

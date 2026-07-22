@@ -210,7 +210,7 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
                 "The workflow already has a target URL — scout it with the browser tools and author with update_workflow. "
                 "safe_reason_code=build_phase_discovery_disallowed_post_compose."
             ),
-            user_facing_reason="I already have a target for this workflow — I'll keep working on it instead of starting over.",
+            user_facing_reason="I kept the existing target for this workflow instead of starting over.",
             recovery_hint="retry_with_different_tool",
             cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
             internal_reason_code="build_phase_discovery_disallowed_post_compose",

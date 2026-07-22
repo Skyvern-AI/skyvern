@@ -374,3 +374,29 @@ def test_phase_blocker_signal_returns_none_when_phase_attr_missing() -> None:
         pass
 
     assert _phase_blocker_signal(_NoPhase(), "navigate_browser") is None
+
+
+def test_discovery_during_mutation_user_facing_reason_is_truthful_and_not_future_tense() -> None:
+    from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+
+    ctx = _Ctx(BuildPhase.COMPOSING)
+    signal = _phase_blocker_signal(ctx, "discover_workflow_entrypoint")
+    assert signal is not None
+    assert signal.user_facing_reason == "I kept the existing target for this workflow instead of starting over."
+
+    forbidden_phrases = [
+        "i'll keep working",
+        "i will keep working",
+        "i'll continue",
+        "i will continue",
+        "i'm still working",
+        "keep working on it",
+        "next i will",
+        "next, i will",
+        "i'll now ",
+        "i will now ",
+        "going to try again",
+    ]
+    user_facing_reason_lower = signal.user_facing_reason.lower()
+    for phrase in forbidden_phrases:
+        assert phrase not in user_facing_reason_lower
