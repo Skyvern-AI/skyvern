@@ -46,6 +46,7 @@ _JSON_OBJECT_STRING_ARGUMENTS = {
 # hallucinated parameters and wrong-tool calls.
 _KNOWN_ARGUMENT_ALIASES = {
     "skyvern_browser_profile_get": ("profile_id", "browser_profile_id"),
+    "skyvern_workflow_status": ("workflow_run_id", "run_id"),
 }
 
 # Cap the string length parsed by the coercion helpers. Parameter-key lists are

@@ -23,6 +23,7 @@ from fastmcp import Client
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import browser_profiles as mcp_browser_profiles
 from skyvern.cli.mcp_tools import mcp
+from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.cli.mcp_tools.arg_repair import repair_tool_arguments
 
 
@@ -241,12 +242,24 @@ def test_browser_profile_get_unknown_sibling_not_dropped() -> None:
     assert args == {"browser_profile_id": "bp_test", "made_up": "value"}
 
 
-def test_workflow_status_wrong_tool_key_not_coerced() -> None:
-    # workflow_run_id belongs to retry, not status. Treating it as a status alias
-    # would hide a wrong-tool selection, so it must remain unsupported.
+def test_workflow_status_workflow_run_id_alias_promoted() -> None:
+    # This exact same-tool alias was verified in a production payload: the value
+    # is a workflow-run ID, and status accepts that entity under its shorter key.
     args = {"workflow_run_id": "wr_test"}
     repair_tool_arguments("skyvern_workflow_status", args)
-    assert args == {"workflow_run_id": "wr_test"}
+    assert args == {"run_id": "wr_test"}
+
+
+def test_workflow_status_conflicting_alias_not_masked() -> None:
+    args = {"workflow_run_id": "wr_alias", "run_id": "wr_canonical"}
+    repair_tool_arguments("skyvern_workflow_status", args)
+    assert args == {"workflow_run_id": "wr_alias", "run_id": "wr_canonical"}
+
+
+def test_workflow_status_unknown_key_not_coerced() -> None:
+    args = {"workflow_id": "wpid_test"}
+    repair_tool_arguments("skyvern_workflow_status", args)
+    assert args == {"workflow_id": "wpid_test"}
 
 
 # --- mechanism (b): block_json alias for validate (SKY-11133) ---
@@ -429,9 +442,38 @@ async def test_browser_profile_get_conflicting_alias_errors_at_boundary() -> Non
 
 
 @pytest.mark.asyncio
-async def test_workflow_status_wrong_tool_key_errors_at_boundary() -> None:
+async def test_workflow_status_workflow_run_id_alias_validates_at_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_status = AsyncMock(
+        return_value={
+            "workflow_run_id": "wr_test",
+            "status": "completed",
+            "output": None,
+        }
+    )
+    monkeypatch.setattr(mcp_workflow, "get_workflow_run_status", get_status)
+
     res = await _call("skyvern_workflow_status", {"workflow_run_id": "wr_test"})
+
+    assert res.is_error is False
+    assert res.structured_content["data"]["run_id"] == "wr_test"
+    get_status.assert_awaited_once_with("wr_test", include_output_details=False)
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_conflicting_alias_errors_at_boundary() -> None:
+    res = await _call(
+        "skyvern_workflow_status",
+        {"workflow_run_id": "wr_alias", "run_id": "wr_canonical"},
+    )
     _assert_invalid_input(res, ["workflow_run_id"])
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_unknown_key_errors_at_boundary() -> None:
+    res = await _call("skyvern_workflow_status", {"workflow_id": "wpid_test"})
+    _assert_invalid_input(res, ["workflow_id"])
 
 
 @pytest.mark.asyncio
