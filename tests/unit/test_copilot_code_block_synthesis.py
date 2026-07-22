@@ -11,10 +11,12 @@ import json
 import keyword
 import sys
 import textwrap
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
@@ -26,6 +28,8 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     authoring_parameter_binding_directive_consumed,
     build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
+    derive_same_month_file_match_transform,
+    same_month_file_match_transform_fingerprint,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
@@ -80,9 +84,11 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RevealAnchor,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction, _with_trajectory_anchor
 from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
+from skyvern.forge.sdk.workflow.exceptions import CustomizedCodeException
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 
 
@@ -3125,6 +3131,358 @@ class TestDownloadRungSynthesis:
         result = synthesize_code_block([_nav_click()])
         assert result is not None
         assert "expect_download" not in result.code
+
+
+_SAME_MONTH_SELECTOR = 'a[href="/files/invoice_100245_2026-05.pdf"]'
+_SAME_MONTH_VALUES = {
+    "account_number": "100245",
+    "download_start_date": "2026-05-01",
+    "download_end_date": "2026-05-31",
+}
+
+
+def _same_month_file_match_transform(*, selector: str = _SAME_MONTH_SELECTOR, values: dict[str, str] | None = None):
+    parameter_values = values or _SAME_MONTH_VALUES
+    correspondences = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": selector}, parameter_values
+    )
+    return derive_same_month_file_match_transform(
+        selector=selector,
+        parameter_values=parameter_values,
+        identity_correspondences=correspondences,
+    )
+
+
+def test_same_month_file_match_admits_one_complete_relation() -> None:
+    transform = _same_month_file_match_transform()
+
+    assert transform is not None
+    assert transform.selector == _SAME_MONTH_SELECTOR
+    assert transform.date_format_id == "iso_date_to_year_month"
+    assert [hole.declared_keys for hole in transform.holes] == [
+        ("account_number",),
+        ("download_start_date", "download_end_date"),
+    ]
+    assert [hole.matched_literal for hole in transform.holes] == ["100245", "2026-05"]
+
+
+@pytest.mark.parametrize(
+    ("selector", "values"),
+    [
+        (
+            _SAME_MONTH_SELECTOR,
+            {**_SAME_MONTH_VALUES, "download_end_date": "2026-06-01"},
+        ),
+        (
+            _SAME_MONTH_SELECTOR,
+            {**_SAME_MONTH_VALUES, "download_start_date": "2026-02-30"},
+        ),
+        (
+            _SAME_MONTH_SELECTOR,
+            {key: value for key, value in _SAME_MONTH_VALUES.items() if key != "download_end_date"},
+        ),
+        (
+            'a[href="/files/invoice_100245.pdf"]',
+            _SAME_MONTH_VALUES,
+        ),
+        (
+            'a[href="/files/invoice_100245_2026-05_2026-05.pdf"]',
+            _SAME_MONTH_VALUES,
+        ),
+        (
+            'a[href="/files/invoice_100245_2026-05_2026-06.pdf"]',
+            {
+                "account_number": "100245",
+                "first_start": "2026-05-01",
+                "first_end": "2026-05-31",
+                "second_start": "2026-06-01",
+                "second_end": "2026-06-30",
+            },
+        ),
+    ],
+    ids=[
+        "cross-month",
+        "invalid-calendar-date",
+        "missing-date",
+        "absent-month-token",
+        "repeated-month-token",
+        "competing-date-pairs",
+    ],
+)
+def test_same_month_file_match_rejects_inadmissible_relations(selector: str, values: dict[str, str]) -> None:
+    assert _same_month_file_match_transform(selector=selector, values=values) is None
+
+
+def test_same_month_file_match_ignores_declared_keys_without_a_literal_witness() -> None:
+    transform = _same_month_file_match_transform(values={**_SAME_MONTH_VALUES, "region": "west"})
+
+    assert transform is not None
+    assert transform.expected_declared_keys == tuple(sorted(_SAME_MONTH_VALUES))
+    assert {key for hole in transform.holes for key in hole.declared_keys} == set(_SAME_MONTH_VALUES)
+
+
+def test_same_month_file_match_reuses_one_stable_download_locator() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+
+    result = synthesize_code_block(
+        [_nav_click()],
+        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
+        file_match_transform=transform,
+    )
+
+    assert result is not None
+    assert result.code.count("_scout_download_target = page.locator(") == 1
+    assert "_scout_entry_target = _scout_download_target" in result.code
+    assert "await _scout_download_target.click()" in result.code
+    assert "100245" not in result.code
+    assert "2026-05" not in result.code
+    assert "account_number" in result.code
+    assert "download_start_date" in result.code
+    assert "download_end_date" in result.code
+    assert {parameter["key"] for parameter in result.parameters} == set(_SAME_MONTH_VALUES)
+    CodeBlock.is_safe_code(
+        "async def _block(page, account_number, download_start_date, download_end_date):\n" + result.code
+    )
+
+
+def test_same_month_file_match_selector_drift_preserves_literal_fallback() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    drifted_target = _download_target(selector='a[href="/files/invoice_literal_fallback.pdf"]')
+    baseline = synthesize_code_block([_nav_click()], reached_download_target=drifted_target)
+
+    with capture_logs() as logs:
+        result = synthesize_code_block(
+            [_nav_click()],
+            reached_download_target=drifted_target,
+            file_match_transform=transform,
+        )
+
+    assert baseline is not None and result is not None
+    assert result.code == baseline.code
+    assert result.parameters == baseline.parameters
+    assert {
+        "event": "copilot_spine_same_month_file_match_transform_dropped",
+        "reason_code": "locator_build_failed",
+        "selector_matches_transform": False,
+        "log_level": "info",
+    } in logs
+
+
+def test_same_month_file_match_extraction_consumer_reuses_stable_download_locator() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    result = synthesize_code_block_with_extraction(
+        [_interaction("click", selector="#show-details", source_url=_BILLS_URL)],
+        _extraction_plan(),
+        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
+        file_match_transform=transform,
+    )
+
+    assert result is not None
+    assert result.interaction_code.count("_scout_download_target = page.locator(") == 1
+    assert "_scout_entry_target = _scout_download_target" in result.interaction_code
+    assert "await _scout_download_target.click()" in result.interaction_code
+
+
+def test_same_month_file_match_tampered_span_fails_synthesis_validation() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    first_hole = transform.holes[0]
+    tampered = replace(
+        transform,
+        holes=(replace(first_hole, position=first_hole.position + 1), *transform.holes[1:]),
+    )
+
+    assert (
+        synthesize_code_block(
+            [_nav_click()],
+            reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
+            file_match_transform=tampered,
+        )
+        is None
+    )
+
+
+def test_same_month_file_match_direct_synthesis_falls_back_for_missing_identity_hole() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    missing_identity = replace(transform, holes=tuple(hole for hole in transform.holes if hole.format_id != "identity"))
+    missing_identity = replace(
+        missing_identity,
+        provenance_fingerprint=same_month_file_match_transform_fingerprint(missing_identity),
+    )
+
+    target = _download_target(selector=_SAME_MONTH_SELECTOR)
+    baseline = synthesize_code_block([_nav_click()], reached_download_target=target)
+    result = synthesize_code_block(
+        [_nav_click()],
+        reached_download_target=target,
+        file_match_transform=missing_identity,
+    )
+
+    assert baseline is not None and result is not None
+    assert result.code == baseline.code
+
+
+def test_same_month_file_match_extraction_synthesis_falls_back_for_missing_identity_hole() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    missing_identity = replace(transform, holes=tuple(hole for hole in transform.holes if hole.format_id != "identity"))
+    missing_identity = replace(
+        missing_identity,
+        provenance_fingerprint=same_month_file_match_transform_fingerprint(missing_identity),
+    )
+
+    trajectory = [_interaction("click", selector="#show-details", source_url=_BILLS_URL)]
+    target = _download_target(selector=_SAME_MONTH_SELECTOR)
+    baseline = synthesize_code_block_with_extraction(trajectory, _extraction_plan(), reached_download_target=target)
+    result = synthesize_code_block_with_extraction(
+        trajectory,
+        _extraction_plan(),
+        reached_download_target=target,
+        file_match_transform=missing_identity,
+    )
+
+    assert baseline is not None and result is not None
+    assert result.interaction_code == baseline.interaction_code
+
+
+def test_same_month_file_match_falls_back_for_refingerprinted_identity_provenance_tamper() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    identity_hole = transform.holes[0]
+    tampered = replace(
+        transform,
+        holes=(replace(identity_hole, source_values=("different-account",)), *transform.holes[1:]),
+    )
+    tampered = replace(tampered, provenance_fingerprint=same_month_file_match_transform_fingerprint(tampered))
+
+    target = _download_target(selector=_SAME_MONTH_SELECTOR)
+    baseline = synthesize_code_block([_nav_click()], reached_download_target=target)
+    result = synthesize_code_block(
+        [_nav_click()],
+        reached_download_target=target,
+        file_match_transform=tampered,
+    )
+
+    assert baseline is not None and result is not None
+    assert result.code == baseline.code
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("2026-02-30", "2026-02-28"),
+        ("2026-05-01", "2026-06-01"),
+        ("2026/05/01", "2026-05-31"),
+    ],
+)
+def test_same_month_file_match_runtime_dates_fail_before_locator_construction(start: str, end: str) -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    result = synthesize_code_block(
+        [_nav_click()],
+        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
+        file_match_transform=transform,
+    )
+    assert result is not None
+    prefix = result.code.split("    _scout_entry_target =", 1)[0]
+
+    class _Page:
+        def __init__(self) -> None:
+            self.locators: list[str] = []
+
+        def locator(self, selector: str) -> str:
+            self.locators.append(selector)
+            return selector
+
+    namespace: dict[str, Any] = {"Exception": Exception}
+    exec(
+        "def _build(page, account_number, download_start_date, download_end_date):\n"
+        + prefix
+        + "    return _scout_download_target\n",
+        namespace,
+    )
+    page = _Page()
+    with pytest.raises(Exception):
+        namespace["_build"](page, "100248", start, end)
+    assert page.locators == []
+
+
+def test_same_month_file_match_cross_month_error_remains_operator_visible() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    result = synthesize_code_block(
+        [_nav_click()],
+        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
+        file_match_transform=transform,
+    )
+    assert result is not None
+    prefix = result.code.split("    _scout_entry_target =", 1)[0]
+
+    class _Page:
+        def locator(self, selector: str) -> str:
+            return selector
+
+    namespace: dict[str, Any] = {"Exception": Exception}
+    exec(
+        "def _build(page, account_number, download_start_date, download_end_date):\n"
+        + prefix
+        + "    return _scout_download_target\n",
+        namespace,
+    )
+    with pytest.raises(Exception) as raised:
+        namespace["_build"](_Page(), "100248", "2024-02-01", "2024-03-01")
+
+    failure_reason = CustomizedCodeException(raised.value).message
+    assert run_outcome_display_reason(failure_reason) == (
+        "Failed to execute code block. Reason: Exception: grounded file match dates must share one calendar month"
+    )
+
+
+def test_same_month_file_match_runtime_formats_calendar_valid_leap_month() -> None:
+    transform = _same_month_file_match_transform()
+    assert transform is not None
+    result = synthesize_code_block(
+        [_nav_click()],
+        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
+        file_match_transform=transform,
+    )
+    assert result is not None
+    prefix = result.code.split("    _scout_entry_target =", 1)[0]
+
+    class _Page:
+        def __init__(self) -> None:
+            self.locators: list[str] = []
+
+        def locator(self, selector: str) -> str:
+            self.locators.append(selector)
+            return selector
+
+    namespace: dict[str, Any] = {"Exception": Exception}
+    exec(
+        "def _build(page, account_number, download_start_date, download_end_date):\n"
+        + prefix
+        + "    return _scout_download_target\n",
+        namespace,
+    )
+    page = _Page()
+    assert namespace["_build"](page, "100248", "2024-02-01", "2024-02-29") == (
+        'a[href="/files/invoice_100248_2024-02.pdf"]'
+    )
+    assert page.locators == ['a[href="/files/invoice_100248_2024-02.pdf"]']
+
+
+def test_download_target_literal_fallback_is_byte_identical_without_transform() -> None:
+    target = _download_target(selector=_SAME_MONTH_SELECTOR)
+    baseline = synthesize_code_block([_nav_click()], reached_download_target=target)
+    explicit_none = synthesize_code_block([_nav_click()], reached_download_target=target, file_match_transform=None)
+
+    assert baseline is not None and explicit_none is not None
+    assert explicit_none.code == baseline.code
+    assert explicit_none.parameters == baseline.parameters
 
 
 def _readonly_type(**overrides: Any) -> dict[str, Any]:

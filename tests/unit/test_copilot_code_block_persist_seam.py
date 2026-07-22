@@ -28,8 +28,10 @@ from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingCandidate,
     AuthoringParameterBindingDirective,
     authored_selector_parameter_bindings,
+    build_authoring_parameter_binding_directive,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
@@ -521,6 +523,49 @@ def _definition_contract_ctx() -> CopilotContext:
         ]
     )
     return ctx
+
+
+def _same_month_file_match_case() -> tuple[CopilotContext, str, dict[str, str]]:
+    ctx = _definition_contract_ctx()
+    _enable_imposition(ctx)
+    source_url = "https://example.com/statements"
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#statement-row",
+            "source_url": source_url,
+            "trajectory_index": 0,
+        }
+    ]
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/invoice_100245_2026-05.pdf"]',
+        affordance_text="Download invoice",
+        download_kind="attribute",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+    submitted = _yaml(
+        """
+        title: Download reusable invoice
+        workflow_definition:
+          parameters:
+          - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "stale-account"}
+          - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-06-01"}
+          - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-06-30"}
+          blocks:
+          - block_type: code
+            label: download_invoice
+            parameter_keys: []
+            code: |
+              await page.locator("#statement-row").click()
+        """
+    )
+    values = {
+        "account_number": "100245",
+        "download_start_date": "2026-05-01",
+        "download_end_date": "2026-05-31",
+    }
+    return ctx, submitted, values
 
 
 @pytest.mark.parametrize(
@@ -1678,6 +1723,260 @@ class TestCodeRepairProgressClassification:
         assert set(block["parameter_keys"]) == {"account_number", "billing_start_date"}
         assert workflow_update_module._definition_plane_preflight_reject(ctx, ctx.workflow_yaml) is None
         assert ctx.authoring_parameter_binding_snapshot is not None
+
+    def test_same_month_file_match_runtime_values_override_defaults_and_satisfy_definition(self) -> None:
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        source_url = "https://example.com/statements"
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": source_url,
+                "trajectory_index": 0,
+            }
+        ]
+        raw_selector = 'a[href="/files/invoice_100245_2026-05.pdf"]'
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector=raw_selector,
+            affordance_text="Download invoice",
+            download_kind="attribute",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        submitted = _yaml(
+            """
+            title: Download reusable invoice
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "stale-account"}
+              - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-06-01"}
+              - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-06-30"}
+              blocks:
+              - block_type: code
+                label: download_invoice
+                parameter_keys: []
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters={
+                "account_number": "100245",
+                "download_start_date": "2026-05-01",
+                "download_end_date": "2026-05-31",
+            },
+        )
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        code = str(block["code"])
+        assert set(block["parameter_keys"]) == {
+            "account_number",
+            "download_start_date",
+            "download_end_date",
+        }
+        assert code.count("_scout_download_target = page.locator(") == 1
+        assert "_scout_entry_target = _scout_download_target" in code
+        assert "await _scout_download_target.click()" in code
+        assert "100245" not in code
+        assert "2026-05" not in code
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, result.workflow_yaml) is None
+        assert ctx.authoring_parameter_binding_snapshot is None
+
+    def test_same_month_file_match_rebinds_account_already_referenced_by_navigation(self) -> None:
+        ctx, _, values = _same_month_file_match_case()
+        source_url = "https://example.com/statements"
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": '[data-account="100245"]',
+                "source_url": source_url,
+                "trajectory_index": 0,
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Download reusable invoice
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "stale-account"}
+              - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-06-01"}
+              - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-06-30"}
+              blocks:
+              - block_type: code
+                label: download_invoice
+                parameter_keys: [account_number]
+                code: |
+                  await page.locator(f'[data-account="{account_number}"]').click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        code = str(block["code"])
+        assert set(block["parameter_keys"]) == set(values)
+        assert 'f"[data-account=\\"{account_number}\\"]"' in code
+        assert 'f"a[href=\\"/files/invoice_{account_number}_{_scout_same_month_iso(' in code
+        assert "100245" not in code
+        assert "2026-05" not in code
+        synthesized = ctx.imposition_synthesized_block
+        assert synthesized is not None
+        assert {parameter["key"] for parameter in synthesized.parameters} == set(values)
+        assert all("default_value" not in parameter for parameter in synthesized.parameters)
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, result.workflow_yaml) is None
+        assert (
+            workflow_update_module._metadata_contract_run_preflight_reject(
+                ctx,
+                result.workflow_yaml,
+                ctx.raw_code_artifact_metadata,
+                values,
+            )
+            is None
+        )
+
+    def test_same_month_file_match_rebinds_literal_when_other_block_references_all_keys(self) -> None:
+        ctx, _, values = _same_month_file_match_case()
+        submitted = _yaml(
+            """
+            title: Download reusable invoice
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "100245"}
+              - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-05-01"}
+              - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-05-31"}
+              blocks:
+              - block_type: text_prompt
+                label: prepare_invoice_request
+                parameter_keys: [account_number, download_start_date, download_end_date]
+                prompt: "Inputs: {{ parameters.account_number }}, {{ parameters.download_start_date }}, {{ parameters.download_end_date }}"
+              - block_type: code
+                label: download_invoice
+                parameter_keys: []
+                code: |
+                  await page.locator("#statement-row").click()
+                  await page.locator('a[href="/files/invoice_100245_2026-05.pdf"]').click()
+            """
+        )
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, submitted) is None
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(
+                submitted,
+                ctx,
+                runtime_parameters=values,
+            )
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "100245" not in code
+        assert "2026-05" not in code
+        assert any(
+            log.get("event") == "copilot_spine_same_month_file_match_transform_applied"
+            and log.get("provenance_source") == "same_month_file_match"
+            for log in logs
+        )
+
+    def test_same_month_file_match_rejects_stale_pending_directive_before_persistence(self) -> None:
+        ctx, submitted, values = _same_month_file_match_case()
+        keys = tuple(values)
+        directive = build_authoring_parameter_binding_directive(
+            structural_key="stale-structural-key",
+            source_origin="https://example.com",
+            candidates=[AuthoringParameterBindingCandidate(declared_key="account_number", field_selector="#account")],
+        )
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="download_invoice",
+            reason_code="synthesized_parameter_binding_ambiguous",
+            unresolved_names=list(keys),
+            parameter_keys=list(keys),
+            parameter_binding_directive=directive,
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+
+        assert result.workflow_yaml == submitted
+        assert result.violations == [
+            "Unable to impose synthesized code block: stored parameter binding directive is stale."
+        ]
+        assert result.repair_context is ctx.last_code_authoring_repair_context
+
+    def test_same_month_file_match_persistence_provenance_rejects_missing_identity_hole(self) -> None:
+        ctx, submitted, values = _same_month_file_match_case()
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+        assert result.violations == []
+        synthesized = ctx.imposition_synthesized_block
+        assert synthesized is not None
+        provenance = next(
+            record
+            for record in synthesized.diagnostics.locator_provenance
+            if record.get("source") == code_block_synthesis_module.SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE
+        )
+        tampered = dict(provenance)
+        tampered["holes"] = [hole for hole in provenance["holes"] if hole["format_id"] != "identity"]
+
+        assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+        assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+    def test_same_month_file_match_rejects_ambiguous_fresh_directive_before_persistence(self) -> None:
+        ctx, submitted, values = _same_month_file_match_case()
+        source_url = "https://example.com/statements"
+        ctx.scout_trajectory.append(
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "source_url": source_url,
+                "trajectory_index": 1,
+            }
+        )
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": source_url,
+            "forms": [
+                {
+                    "fields": [{"selector": "#account", "value": values["account_number"]}],
+                    "submit_controls": [{"selector": "#submit"}],
+                }
+            ],
+        }
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+
+        assert result.workflow_yaml == submitted
+        assert result.violations == [
+            "Unable to impose synthesized code block: current-page parameter binding is ambiguous."
+        ]
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert result.repair_context.parameter_binding_directive is not None
+        assert result.repair_context.parameter_binding_directive.source_origin == "https://example.com"
 
     def test_selection_resolution_binds_witnessed_click_value(self) -> None:
         ctx = SimpleNamespace(
