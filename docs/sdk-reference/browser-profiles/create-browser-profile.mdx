@@ -35,13 +35,19 @@ console.log(profile.browser_profile_id); // bp_abc123
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | `str` | Yes | Display name for the profile. |
+| `name` | `str` | Yes | Display name for the profile. Must be unique within the organization. |
 | `description` | `str` | No | Optional description. |
-| `workflow_run_id` | `str` | Conditional | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. Required if `browser_session_id` is not provided. |
-| `browser_session_id` | `str` | Conditional | The browser session ID to snapshot. The session must have had `generate_browser_profile` enabled or been started from a saved profile. Required if `workflow_run_id` is not provided. |
+| `workflow_run_id` | `str` | No | The workflow run ID to snapshot. The run must have used `persist_browser_session=True`. Cannot be combined with `browser_session_id`. |
+| `browser_session_id` | `str` | No | The browser session ID to snapshot. The session must have had `generate_browser_profile` enabled or been started from a saved profile. Cannot be combined with `workflow_run_id`. |
+| `proxy_location` | `ProxyLocation` | No | Optional proxy location for this profile's pinned proxy identity. |
+| `proxy_session_id` | `str` | No | Explicit sticky-session ID for this profile's pinned proxy identity. |
 | `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
 
-You must provide either `workflow_run_id` or `browser_session_id`.
+Omit both `workflow_run_id` and `browser_session_id` to create a blank profile. Provide at most one — passing both returns a validation error.
+
+<Info>
+If a profile with the same `name` already exists in the organization, the request fails with `409 Conflict`. Use a different name or delete the existing profile first.
+</Info>
 
 ### Returns `BrowserProfile`
 

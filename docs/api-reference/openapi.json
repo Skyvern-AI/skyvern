@@ -3622,6 +3622,76 @@
         ]
       }
     },
+    "/v1/browser_profiles/{profile_id}/usage": {
+      "get": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Get browser profile usage",
+        "description": "List the workflows, credentials, and recent runs that depend on a browser profile. Use this before deleting a profile to see what would be affected.",
+        "operationId": "get_browser_profile_usage_v1_browser_profiles__profile_id__usage_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved browser profile usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfileUsage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile_usage"
+      }
+    },
     "/v1/browser_sessions": {
       "post": {
         "tags": [
@@ -9660,6 +9730,18 @@
               }
             ],
             "title": "Deleted At"
+          },
+          "linked_credential_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Name",
+            "description": "Populated by the list endpoint (batched) so the UI can show the credential-login role and freshness on rows without a per-row usage fetch. `null` on single-get and for profiles with no credential links."
           }
         },
         "type": "object",
@@ -9671,6 +9753,82 @@
           "modified_at"
         ],
         "title": "BrowserProfile"
+      },
+      "BrowserProfileUsageWorkflow": {
+        "properties": {
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id",
+            "description": "Permanent ID of a workflow that references the browser profile."
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "description": "Display title of the workflow."
+          },
+          "via": {
+            "type": "string",
+            "title": "Via",
+            "description": "How the workflow is linked to the profile (for example, `browser_profile_id` or `credential`)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_permanent_id",
+          "title",
+          "via"
+        ],
+        "title": "BrowserProfileUsageWorkflow"
+      },
+      "BrowserProfileUsageCredential": {
+        "properties": {
+          "credential_id": {
+            "type": "string",
+            "title": "Credential Id",
+            "description": "ID of a credential attached to the browser profile."
+          },
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Display name of the credential."
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential_id",
+          "name"
+        ],
+        "title": "BrowserProfileUsageCredential"
+      },
+      "BrowserProfileUsage": {
+        "properties": {
+          "workflows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageWorkflow"
+            },
+            "title": "Workflows",
+            "description": "Workflows that reference the browser profile.",
+            "default": []
+          },
+          "credentials": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageCredential"
+            },
+            "title": "Credentials",
+            "description": "Credentials attached to the browser profile.",
+            "default": []
+          },
+          "recent_seeded_run_count": {
+            "type": "integer",
+            "title": "Recent Seeded Run Count",
+            "description": "Number of recent runs that were seeded from this browser profile.",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "BrowserProfileUsage"
       },
       "BrowserSessionResponse": {
         "properties": {
