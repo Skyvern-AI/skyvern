@@ -32,6 +32,12 @@ from playwright.async_api import TimeoutError as _PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from skyvern.exceptions import SkyvernException
+from skyvern.webeye.browser_errors import (
+    BrowserAutomationError,
+    BrowserEngineErrorFamilies,
+    BrowserErrorFamiliesConfigError,
+    classify_browser_error,
+)
 
 BrowserDriverStarter = Callable[[], Awaitable[Playwright]]
 BrowserEngineErrorLoader = Callable[[], "tuple[type[BaseException], type[BaseException]]"]
@@ -112,6 +118,36 @@ class BrowserEngineSelection:
     timeout_error_type: type[BaseException]
     metadata: BrowserEngineMetadata
     selection_reason: str
+    # Derived once from the two identities above (which ``select()`` loaded lazily from the driver
+    # package), never passed in: the immutable error-family binding that ``classify_error`` uses. The
+    # base+timeout pair is the stable public identity every driver exposes; richer families would be
+    # supplied here only if a package exposed additional stable public identities.
+    error_families: BrowserEngineErrorFamilies = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Invariant: the timeout identity must be the base identity or a subclass of it, so a timeout
+        # is always an engine error and classification's timeout-before-base precedence holds. A
+        # reverse hierarchy (base subclasses timeout) would classify plain base errors as timeouts and
+        # break is_engine_error/is_engine_timeout_error semantics; unrelated identities would leave a
+        # timeout outside the engine's error family. Fail loudly rather than bind a misleading engine.
+        if not issubclass(self.timeout_error_type, self.error_type):
+            raise BrowserErrorFamiliesConfigError(
+                f"timeout identity {self.timeout_error_type.__name__} must be {self.error_type.__name__} or a "
+                f"subclass of it; got an incompatible hierarchy for engine {self.name!r}"
+            )
+        # A real driver's timeout is a distinct subclass of its base error, so both identities occupy
+        # separate families. Only when an engine reports the same class for both (base is the timeout)
+        # is the base entry dropped: the class already appears in the more-specific timeout family,
+        # which classification checks first, and a native type may live in only one family.
+        base_error_types = () if self.error_type is self.timeout_error_type else (self.error_type,)
+        object.__setattr__(
+            self,
+            "error_families",
+            BrowserEngineErrorFamilies(
+                timeout_types=(self.timeout_error_type,),
+                base_error_types=base_error_types,
+            ),
+        )
 
     def is_engine_error(self, exc: BaseException) -> bool:
         """True if ``exc`` is a driver-family error from THIS run's engine (adapter-bound identity)."""
@@ -119,6 +155,13 @@ class BrowserEngineSelection:
 
     def is_engine_timeout_error(self, exc: BaseException) -> bool:
         return isinstance(exc, self.timeout_error_type)
+
+    def classify_error(self, exc: BaseException) -> BrowserAutomationError | None:
+        """Map a native error using this run's selected-engine families, returning ``None`` for
+        foreign/unknown errors; positive classifications preserve the native error as ``__cause__``.
+        Only populated families are reachable, so callers must branch on the returned taxonomy type
+        rather than assume support for any specific family."""
+        return classify_browser_error(exc, self.error_families)
 
     def ensure_supports(self, browser_source: str | None) -> None:
         """Fail closed before any provisioning if this engine cannot serve ``browser_source``.
