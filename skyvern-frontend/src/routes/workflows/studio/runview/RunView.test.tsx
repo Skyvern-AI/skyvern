@@ -24,18 +24,21 @@ const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
   codeGenerating: false,
+  isPlaceholderData: false,
 }));
 
 vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => ({
     data: mocks.workflowRun,
     isLoading: false,
+    isPlaceholderData: mocks.isPlaceholderData,
   }),
 }));
 vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({
     data: mocks.timeline,
     isLoading: false,
+    isPlaceholderData: mocks.isPlaceholderData,
   }),
 }));
 vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
@@ -272,6 +275,7 @@ afterEach(() => {
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
   mocks.codeGenerating = false;
+  mocks.isPlaceholderData = false;
 });
 beforeEach(() => {
   useRunViewStore.getState().reset();
@@ -460,6 +464,23 @@ describe("RunView cold-open selection", () => {
     renderRunView({}, "/?wr=wr_1&bl=goto-block");
 
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+  });
+
+  test("does not auto-pin from the previous run's placeholder frames on a run switch", () => {
+    // Mid-switch to wr_2: keepPreviousData still serves the OLD run's finalized
+    // data + frames, flagged placeholder. Auto-pin must wait for wr_2's real
+    // payload rather than lock this run's one-shot to the stale last frame.
+    seedTerminalRunWithActions();
+    mocks.isPlaceholderData = true;
+    const view = renderRunView({ workflowRunId: "wr_2" }, "/?wr=wr_2");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+
+    // Real data arrives (no longer placeholder): now the one-shot decides.
+    mocks.isPlaceholderData = false;
+    view.rerenderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
   });
 });
 
