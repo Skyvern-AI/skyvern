@@ -152,6 +152,7 @@ class Settings(BaseSettings):
     # Global kill-switch for select/autocomplete shadow-match observability (LLM-vs-deterministic
     # agreement logging). Not per-org; set false to silence the logs everywhere.
     SKYVERN_SELECT_SHADOW_MATCH: bool = True
+    FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS: float = Field(default=0, ge=0, le=60)
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None

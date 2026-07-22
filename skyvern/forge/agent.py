@@ -117,6 +117,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
     CodeBlock,
+    FileDownloadBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -1650,6 +1651,7 @@ class ForgeAgent:
                 detailed_agent_step_output=detailed_agent_step_output,
                 pdf_auto_download_src=pdf_auto_download_src,
                 pdf_auto_download_used_bytes=pdf_auto_download_used_bytes,
+                file_download_false_click_eligible=isinstance(task_block, FileDownloadBlock),
                 _step_span=_step_span,
                 artifact_tracker=artifact_tracker,
             )
@@ -1725,6 +1727,7 @@ class ForgeAgent:
         detailed_agent_step_output: DetailedAgentStepOutput,
         pdf_auto_download_src: str | None,
         pdf_auto_download_used_bytes: bool,
+        file_download_false_click_eligible: bool,
         _step_span: otel_trace.Span,
         artifact_tracker: _BackgroundArtifactTaskTracker,
     ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
@@ -1885,6 +1888,7 @@ class ForgeAgent:
                 step=step,
                 page=current_page,
                 action=action,
+                file_download_false_click_eligible=file_download_false_click_eligible,
             )
             await app.AGENT_FUNCTION.post_action_execution(action)
             detailed_agent_step_output.actions_and_results[action_idx] = (
