@@ -27,6 +27,7 @@ from skyvern.constants import (
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
     BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
+    BROWSER_DOWNLOADING_SUFFIX,
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
@@ -146,6 +147,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     extract_filename,
     is_download_response,
     normalize_download_filename,
+    settle_browser_downloads_for_context,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 from skyvern.webeye.scraper.scraped_page import (
@@ -2491,13 +2493,29 @@ class ActionHandler:
             if not download_event.done():
                 download_event.set_result(download)
 
-        async def _list_observed_download_files() -> list[str]:
+        def _download_signal_identity(file: str) -> str:
+            return file.removesuffix(BROWSER_DOWNLOADING_SUFFIX)
+
+        async def _list_download_signal_files() -> list[str]:
             files = list_files_in_directory(download_dir)
             if task.browser_session_id:
-                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                downloading_files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
                     organization_id=task.organization_id, browser_session_id=task.browser_session_id
                 )
-                files = files + files_in_browser_session
+                downloaded_files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                )
+                files = files + downloaded_files_in_browser_session + downloading_files_in_browser_session
+            return files
+
+        async def _list_final_download_files() -> list[str]:
+            files = [
+                file for file in list_files_in_directory(download_dir) if not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+            ]
+            if task.browser_session_id:
+                files += await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                )
             return files
 
         async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str], timeout_seconds: float) -> bool:
@@ -2537,7 +2555,10 @@ class ActionHandler:
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
-        list_files_before = await _list_observed_download_files()
+        signal_file_identities_before = {
+            _download_signal_identity(file) for file in await _list_download_signal_files()
+        }
+        list_files_before = list(signal_file_identities_before)
         LOG.info(
             "Number of files in download directory before action",
             num_downloaded_files_before=len(list_files_before),
@@ -2592,6 +2613,7 @@ class ActionHandler:
             def _remaining_download_wait_seconds() -> float:
                 return max(0.0, download_wait_deadline - time.monotonic())
 
+            _download_completion_timeout = task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
             _download_event_grace_seconds = min(
                 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, download_wait_hard_timeout_seconds
             )
@@ -2684,9 +2706,11 @@ class ActionHandler:
                                     download_triggered = True
                                     break
 
-                            list_files_after = await _list_observed_download_files()
+                            list_files_after = await _list_download_signal_files()
 
-                            if len(list_files_after) > len(list_files_before):
+                            if {
+                                _download_signal_identity(file) for file in list_files_after
+                            } - signal_file_identities_before:
                                 _record_download_signal("download_file_detected")
                                 LOG.info(
                                     "Found new files in download directory after action",
@@ -2718,11 +2742,11 @@ class ActionHandler:
                                         download_dir=download_dir,
                                         workflow_run_id=task.workflow_run_id,
                                     )
-                                    list_files_after = await _list_observed_download_files()
+                                    list_files_after = await _list_final_download_files()
                                     download_triggered = True
                                     break
                                 if persisted.path is not None:
-                                    list_files_after = await _list_observed_download_files()
+                                    list_files_after = await _list_final_download_files()
                                     LOG.info(
                                         "Copied captured download event to active run directory",
                                         download_dir=download_dir,
@@ -2841,12 +2865,14 @@ class ActionHandler:
             results[-1].download_triggered = True
             action.download_triggered = True
 
-            downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
-                download_dir=download_dir,
-                task=task,
-                list_files_before=list_files_before,
-                list_observed_download_files=_list_observed_download_files,
-            )
+            async with asyncio.timeout(_download_completion_timeout):
+                async with settle_browser_downloads_for_context(page.context):
+                    downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
+                        download_dir=download_dir,
+                        task=task,
+                        list_files_before=list_files_before,
+                        list_observed_download_files=_list_final_download_files,
+                    )
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
             if xhr_fallback_moved_paths:

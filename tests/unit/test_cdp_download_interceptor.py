@@ -1,10 +1,17 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
+import asyncio
+import gc
+import threading
+import weakref
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
+import skyvern.webeye.cdp_download_interceptor as mod
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
@@ -635,6 +642,28 @@ class TestCDPDownloadInterceptorProxyAuth:
         assert "Fetch.authRequired" not in event_names
 
     @pytest.mark.asyncio
+    async def test_page_events_do_not_use_browser_download_admission(self) -> None:
+        interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+
+        with (
+            patch.object(interceptor, "_handle_request_paused", new_callable=AsyncMock) as request_handler,
+            patch.object(interceptor, "_handle_auth_required", new_callable=AsyncMock) as auth_handler,
+        ):
+            await interceptor.enable_for_page(page)
+            listeners = {call.args[0]: call.args[1] for call in cdp_session.on.call_args_list}
+            listeners["Fetch.requestPaused"]({"requestId": "request"})
+            listeners["Fetch.authRequired"]({"requestId": "auth"})
+            await asyncio.sleep(0)
+
+        request_handler.assert_awaited_once_with({"requestId": "request"}, cdp_session)
+        auth_handler.assert_awaited_once_with({"requestId": "auth"}, cdp_session)
+        assert not interceptor._accepting_browser_downloads
+        assert interceptor._browser_download_listener is None
+
+    @pytest.mark.asyncio
     async def test_request_stage_continues_request(self) -> None:
         """Request-stage events (no responseStatusCode) should be continued with Fetch.continueRequest."""
         interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
@@ -843,8 +872,6 @@ class TestBlobDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_blob_download_threads_max_size_and_guards_oversize(self, tmp_path: Path) -> None:
-        import skyvern.webeye.cdp_download_interceptor as mod
-
         interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         read = AsyncMock(return_value=b"x" * 2048)  # exceeds the patched limit (defense-in-depth)
@@ -911,6 +938,867 @@ class TestBlobDownloadCapture:
 
         read.assert_not_awaited()
         assert list(tmp_path.iterdir()) == []
+
+
+class TestDataUrlDownloadCapture:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("url", "expected_filename", "expected_bytes"),
+        [
+            pytest.param("data:application/pdf;base64,JVBERi0xLjQK", "report.pdf", b"%PDF-1.4\n", id="base64"),
+            pytest.param("data:application/octet-stream;base64,%2Bw==", "report", b"\xfb", id="escaped_base64"),
+            pytest.param("data:text/csv,name%2Cvalue%0Aone%2C1", "report", b"name,value\none,1", id="percent_encoded"),
+            pytest.param(
+                "data:application/pdf;charset=utf-8;base64,JVBERg==",
+                "report.pdf",
+                b"%PDF",
+                id="media_type_parameter",
+            ),
+            pytest.param("data:application/x'foo*`|~;p'k*`|~=v,ok", "report", b"ok", id="rfc_token_characters"),
+        ],
+    )
+    async def test_data_url_download_saved(
+        self, tmp_path: Path, url: str, expected_filename: str, expected_bytes: bytes
+    ) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+
+        await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report"})
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == expected_filename
+        assert saved[0].read_bytes() == expected_bytes
+        assert url not in interceptor._downloaded_urls
+        assert len(interceptor._downloaded_urls) == 1
+        dedupe_key = next(iter(interceptor._downloaded_urls))
+        assert dedupe_key.startswith("data:sha256:")
+        assert len(dedupe_key) == len("data:sha256:") + 64
+
+    @pytest.mark.asyncio
+    async def test_data_url_uses_safe_generated_filename(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+
+        await interceptor._handle_browser_download(
+            {"url": "data:application/pdf;base64,JVBERg==", "suggestedFilename": "../../report.pdf"}
+        )
+
+        assert [path.name for path in tmp_path.iterdir()] == ["report.pdf"]
+        assert not (tmp_path.parent / "report.pdf").exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            pytest.param("data:application/pdf;base64,not-valid-@@", id="malformed_base64"),
+            pytest.param("data:text/plain,bad%2payload", id="malformed_percent_encoding"),
+            pytest.param("data:application/pdf;base64,", id="empty_payload"),
+            pytest.param("data:application/pdf", id="missing_comma"),
+            pytest.param("data:application/pdf;base64;charset=x,JVBERg==", id="misordered_base64_metadata"),
+            pytest.param("data:application/pdf;base64;base64,JVBERg==", id="duplicate_base64_metadata"),
+            pytest.param("data:application/pdf;invalid,JVBERg==", id="bare_metadata_token"),
+        ],
+    )
+    async def test_malformed_data_url_does_not_create_artifact(self, tmp_path: Path, url: str) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+
+        await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report.pdf"})
+
+        assert list(tmp_path.iterdir()) == []
+        assert url not in interceptor._downloaded_urls
+
+    @pytest.mark.asyncio
+    async def test_duplicate_data_url_event_is_saved_once(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
+
+        await interceptor._handle_browser_download(event)
+        await interceptor._handle_browser_download(event)
+
+        assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
+        assert (tmp_path / "note.txt").read_bytes() == b"hello"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_data_url_logs_never_include_payload(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        payload = "private-inline-payload"
+        event = {"url": f"data:text/plain,{payload}", "suggestedFilename": "note.txt"}
+
+        with capture_logs() as logs:
+            await interceptor._handle_browser_download(event)
+            await interceptor._handle_browser_download(event)
+
+        assert payload not in repr(logs)
+
+    @pytest.mark.asyncio
+    async def test_non_base64_oversize_rejected_before_percent_decode(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        with (
+            patch.object(mod, "MAX_FILE_SIZE_BYTES", 4),
+            patch.object(mod, "_percent_decode_payload", wraps=mod._percent_decode_payload) as decode,
+        ):
+            await interceptor._handle_browser_download(
+                {"url": "data:text/plain,abcde", "suggestedFilename": "large.txt"}
+            )
+
+        decode.assert_not_called()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_duplicate_is_reserved_and_failure_can_retry(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
+        started = asyncio.Event()
+        release = asyncio.Event()
+        real_to_thread = asyncio.to_thread
+
+        async def paused_to_thread(function: Any, *args: Any) -> object:
+            started.set()
+            await asyncio.wait_for(release.wait(), timeout=2)
+            return await real_to_thread(function, *args)
+
+        with patch("skyvern.webeye.cdp_download_interceptor.asyncio.to_thread", new=paused_to_thread):
+            first = asyncio.create_task(interceptor._handle_browser_download(event))
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            duplicate = asyncio.create_task(interceptor._handle_browser_download(event))
+            await asyncio.sleep(0)
+            assert not duplicate.done()
+            release.set()
+            await asyncio.gather(first, duplicate)
+
+        assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
+
+        retry_interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path / "retry"))
+        with patch.object(retry_interceptor, "_decode_data_url", side_effect=OSError("transient")):
+            await retry_interceptor._handle_browser_download(event)
+        await retry_interceptor._handle_browser_download(event)
+
+        assert (tmp_path / "retry" / "note.txt").read_bytes() == b"hello"
+        assert len(retry_interceptor._downloaded_urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_data_url_over_size_limit_does_not_create_artifact(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        url = "data:application/octet-stream;base64,eHh4eHg="
+
+        with patch.object(mod, "MAX_FILE_SIZE_BYTES", 4):
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "large.bin"})
+
+        assert list(tmp_path.iterdir()) == []
+        assert url not in interceptor._downloaded_urls
+
+    @staticmethod
+    def _paused_replace() -> tuple[threading.Event, threading.Event, Any]:
+        entered, release = threading.Event(), threading.Event()
+        real_replace = mod.os.replace
+
+        def replace(source: Path, destination: Path) -> None:
+            entered.set()
+            assert release.wait(timeout=2)
+            real_replace(source, destination)
+
+        return entered, release, patch.object(mod.os, "replace", side_effect=replace)
+
+    @pytest.mark.asyncio
+    async def test_data_url_is_atomically_published_from_incomplete_path(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        entered_replace, release_replace, replace_patch = self._paused_replace()
+        with replace_patch:
+            task = asyncio.create_task(
+                interceptor._handle_browser_download(
+                    {"url": "data:text/plain,complete", "suggestedFilename": "note.txt"}
+                )
+            )
+            assert await asyncio.to_thread(entered_replace.wait, 2)
+            visible = list(tmp_path.iterdir())
+            assert len(visible) == 1
+            assert visible[0].name.startswith("note.txt.")
+            assert visible[0].name.endswith(".crdownload")
+            assert not (tmp_path / "note.txt").exists()
+            release_replace.set()
+            await asyncio.wait_for(task, timeout=2)
+
+        assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_drains_publication_before_retry(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        event = {"url": "data:text/plain,complete", "suggestedFilename": "note.txt"}
+        entered_replace, release_replace, replace_patch = self._paused_replace()
+        with replace_patch:
+            first = asyncio.create_task(interceptor._handle_browser_download(event))
+            assert await asyncio.to_thread(entered_replace.wait, 2)
+            first.cancel()
+            retry = asyncio.create_task(interceptor._handle_browser_download(event))
+            await asyncio.sleep(0)
+            assert not retry.done()
+            visible = list(tmp_path.iterdir())
+            assert len(visible) == 1
+            assert visible[0].name.endswith(".crdownload")
+            release_replace.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(first, timeout=2)
+            await asyncio.wait_for(retry, timeout=2)
+
+        assert (tmp_path / "note.txt").read_bytes() == b"complete"
+        assert not list(tmp_path.glob("*.crdownload"))
+        assert len(interceptor._downloaded_urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_distinct_data_urls_with_same_filename_are_serialized(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        first = {"url": "data:text/plain,first", "suggestedFilename": "note.txt"}
+        second = {"url": "data:text/plain,second", "suggestedFilename": "note.txt"}
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                interceptor._handle_browser_download(first),
+                interceptor._handle_browser_download(second),
+            ),
+            timeout=2,
+        )
+
+        assert (tmp_path / "note.txt").read_bytes() in {b"first", b"second"}
+        assert len(interceptor._downloaded_urls) == 2
+        assert not list(tmp_path.glob("*.crdownload"))
+
+    @pytest.mark.asyncio
+    async def test_digest_is_off_loop_and_invalid_shape_rejected_before_digest(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        event_loop_thread = threading.get_ident()
+
+        real_identity = mod._download_identity
+        digest_threads: list[int] = []
+
+        def recording_identity(url: str) -> str:
+            digest_threads.append(threading.get_ident())
+            return real_identity(url)
+
+        with patch.object(mod, "_download_identity", side_effect=recording_identity) as identity:
+            await interceptor._handle_browser_download(
+                {"url": "data:text/plain,valid", "suggestedFilename": "valid.txt"}
+            )
+            assert digest_threads and digest_threads[0] != event_loop_thread
+
+            identity.reset_mock()
+            await interceptor._handle_browser_download(
+                {"url": "data:" + "x" * (mod._DATA_URL_MAX_METADATA_LENGTH + 1), "suggestedFilename": "bad.txt"}
+            )
+            identity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disable_drains_active_browser_download_task(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        browser_session = MagicMock()
+        browser_session.send = AsyncMock()
+        browser_session.detach = AsyncMock()
+        browser = MagicMock()
+        browser.new_browser_cdp_session = AsyncMock(return_value=browser_session)
+        browser_context = MagicMock()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def paused_handler(event: dict[str, Any]) -> None:
+            started.set()
+            await release.wait()
+
+        await interceptor.enable_browser_download_monitor(browser, browser_context)
+        download_listener = browser_session.on.call_args.args[1]
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            download_listener({"url": "data:text/plain,x"})
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            disabling = asyncio.create_task(interceptor.disable())
+            await asyncio.sleep(0)
+            assert not disabling.done()
+            release.set()
+            await asyncio.wait_for(disabling, timeout=2)
+
+        assert not interceptor._browser_download_tasks
+        assert not interceptor._accepting_browser_downloads
+        browser_session.remove_listener.assert_called_once_with("Browser.downloadWillBegin", download_listener)
+
+    @pytest.mark.asyncio
+    async def test_settle_browser_downloads_includes_event_admitted_while_draining(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        handled_urls: list[str] = []
+
+        async def paused_handler(event: dict[str, Any]) -> None:
+            if not handled_urls:
+                first_started.set()
+                await release_first.wait()
+            handled_urls.append(event["url"])
+
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            interceptor._schedule_browser_download_handler({"url": "data:text/plain,ready"})
+            await first_started.wait()
+            entered = asyncio.Event()
+
+            async def collect() -> None:
+                async with interceptor.settle_browser_downloads():
+                    entered.set()
+                    assert set(handled_urls) == {"data:text/plain,ready", "data:text/plain,late"}
+
+            collecting = asyncio.create_task(collect())
+            await asyncio.sleep(0)
+            assert not entered.is_set()
+            interceptor._schedule_browser_download_handler({"url": "data:text/plain,late"})
+            release_first.set()
+            await asyncio.wait_for(collecting, timeout=2)
+
+        assert interceptor._accepting_browser_downloads
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_settle_browser_downloads_drains_event_admitted_inside_context(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._accepting_browser_downloads = True
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+
+        async def paused_handler(event: dict[str, Any]) -> None:
+            handler_started.set()
+            await release_handler.wait()
+            (tmp_path / "late.txt").write_text(event["url"])
+
+        async def collect() -> None:
+            async with interceptor.settle_browser_downloads():
+                interceptor._schedule_browser_download_handler({"url": "data:text/plain,late"})
+                await handler_started.wait()
+
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            collecting = asyncio.create_task(collect())
+            await handler_started.wait()
+            await asyncio.sleep(0)
+            assert not collecting.done()
+            release_handler.set()
+            await asyncio.wait_for(collecting, timeout=2)
+
+        assert (tmp_path / "late.txt").read_text() == "data:text/plain,late"
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_cancelled_settle_does_not_poison_reused_interceptor(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        never_release = asyncio.Event()
+        second_handled = asyncio.Event()
+
+        async def paused_handler(event: dict[str, Any]) -> None:
+            if event["url"].endswith("first"):
+                first_started.set()
+                await never_release.wait()
+            else:
+                second_handled.set()
+
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            interceptor._schedule_browser_download_handler({"url": "data:text/plain,first"})
+            await first_started.wait()
+
+            async def settle() -> None:
+                async with interceptor.settle_browser_downloads():
+                    pass
+
+            settling = asyncio.create_task(settle())
+            await asyncio.sleep(0)
+            settling.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await settling
+
+            interceptor._schedule_browser_download_handler({"url": "data:text/plain,second"})
+            await asyncio.wait_for(second_handled.wait(), timeout=2)
+
+        assert interceptor._accepting_browser_downloads
+
+    @pytest.mark.asyncio
+    async def test_cancelled_settle_body_cancels_admitted_handler_and_remains_reusable(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        second_handled = asyncio.Event()
+
+        async def paused_handler(event: dict[str, Any]) -> None:
+            if event["url"].endswith("first"):
+                first_started.set()
+                await asyncio.Event().wait()
+            else:
+                second_handled.set()
+
+        async def settle() -> None:
+            async with interceptor.settle_browser_downloads():
+                interceptor._schedule_browser_download_handler({"url": "data:text/plain,first"})
+                await first_started.wait()
+                await asyncio.Event().wait()
+
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            settling = asyncio.create_task(settle())
+            await first_started.wait()
+            settling.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(settling, timeout=2)
+
+            assert not interceptor._browser_download_tasks
+            assert not interceptor._browser_download_monitor_lock.locked()
+            interceptor._schedule_browser_download_handler({"url": "data:text/plain,second"})
+            await asyncio.wait_for(second_handled.wait(), timeout=2)
+
+        assert interceptor._accepting_browser_downloads
+
+    def test_maximum_size_percent_encoded_payload_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = CDPDownloadInterceptor()
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 12)
+        url = "data:text/plain," + "%41" * 12
+
+        comma_index = mod._bounded_data_url_comma(url)
+        _, _, data = interceptor._decode_data_url(url, comma_index)
+
+        assert data == b"A" * 12
+
+    def test_percent_escaped_base64_payload_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = CDPDownloadInterceptor()
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 1)
+        url = "data:text/plain;base64,%51%51%3D%3D"
+
+        comma_index = mod._bounded_data_url_comma(url)
+        _, _, data = interceptor._decode_data_url(url, comma_index)
+
+        assert data == b"A"
+
+    def test_maximum_size_percent_escaped_base64_payload_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = CDPDownloadInterceptor()
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
+        url = "data:text/plain;base64," + "".join(f"%{byte:02X}" for byte in b"QUJDRA==")
+
+        comma_index = mod._bounded_data_url_comma(url)
+        _, _, data = interceptor._decode_data_url(url, comma_index)
+
+        assert data == b"ABCD"
+
+    def test_percent_escaped_base64_decoded_overflow_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = CDPDownloadInterceptor()
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
+        url = "data:text/plain;base64," + "".join(f"%{byte:02X}" for byte in b"QUJDREU=")
+
+        comma_index = mod._bounded_data_url_comma(url)
+        with pytest.raises(ValueError, match="decoded payload exceeds size limit"):
+            interceptor._decode_data_url(url, comma_index)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param("%51%51%3", id="malformed_escape"),
+            pytest.param("%51%51%40%40", id="malformed_base64"),
+        ],
+    )
+    def test_malformed_percent_escaped_base64_is_rejected(self, monkeypatch: pytest.MonkeyPatch, payload: str) -> None:
+        interceptor = CDPDownloadInterceptor()
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
+        url = f"data:text/plain;base64,{payload}"
+
+        comma_index = mod._bounded_data_url_comma(url)
+        with pytest.raises(ValueError):
+            interceptor._decode_data_url(url, comma_index)
+
+    def test_oversized_percent_escaped_base64_rejected_before_decode_allocation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
+        url = "data:text/plain;base64," + "%51" * 9
+
+        with patch.object(mod, "_percent_decoded_payload_length") as decoded_length:
+            with pytest.raises(ValueError, match="encoded payload exceeds size limit"):
+                mod._bounded_data_url_comma(url)
+
+        decoded_length.assert_not_called()
+
+    def test_oversized_percent_payload_rejected_before_decode_allocation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = CDPDownloadInterceptor()
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 12)
+        url = "data:text/plain," + "A" * 12 + "%41"
+
+        with patch.object(mod, "_percent_decode_payload") as decode:
+            comma_index = mod._bounded_data_url_comma(url)
+            with pytest.raises(ValueError, match="decoded payload exceeds size limit"):
+                interceptor._decode_data_url(url, comma_index)
+
+        decode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disable_waits_for_racing_browser_monitor_enable(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        browser_session = MagicMock()
+
+        async def suspended_send(method: str, params: dict[str, Any]) -> None:
+            send_started.set()
+            await release_send.wait()
+
+        browser_session.send = AsyncMock(side_effect=suspended_send)
+        browser_session.detach = AsyncMock()
+        browser = MagicMock()
+        browser.new_browser_cdp_session = AsyncMock(return_value=browser_session)
+
+        enabling = asyncio.create_task(interceptor.enable_browser_download_monitor(browser, MagicMock()))
+        await send_started.wait()
+        disabling = asyncio.create_task(interceptor.disable())
+        await asyncio.sleep(0)
+        assert not disabling.done()
+
+        release_send.set()
+        await asyncio.wait_for(asyncio.gather(enabling, disabling), timeout=2)
+
+        assert interceptor._browser_session is None
+        assert interceptor._browser_context is None
+        assert interceptor._browser_download_listener is None
+        assert not interceptor._accepting_browser_downloads
+        browser_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_browser_monitor_can_reenable_after_disable(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        first_session = MagicMock(send=AsyncMock(), detach=AsyncMock())
+        second_session = MagicMock(send=AsyncMock(), detach=AsyncMock())
+        browser = MagicMock()
+        browser.new_browser_cdp_session = AsyncMock(side_effect=[first_session, second_session])
+        browser_context = MagicMock()
+
+        await interceptor.enable_browser_download_monitor(browser, browser_context)
+        await interceptor.disable()
+        await interceptor.enable_browser_download_monitor(browser, browser_context)
+
+        assert interceptor._browser_session is second_session
+        assert interceptor._browser_context is browser_context
+        assert interceptor._browser_download_listener is second_session.on.call_args.args[1]
+        assert interceptor._accepting_browser_downloads
+
+        await asyncio.wait_for(interceptor.disable(), timeout=2)
+        assert not interceptor._browser_download_tasks
+        assert not interceptor._accepting_browser_downloads
+
+    @pytest.mark.asyncio
+    async def test_context_binding_owns_new_page_listener_and_tasks(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = None
+        page = MagicMock()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def paused_enable(new_page: Any) -> None:
+            assert new_page is page
+            started.set()
+            await asyncio.wait_for(release.wait(), timeout=2)
+
+        with patch.object(interceptor, "enable_for_page", side_effect=paused_enable):
+            await interceptor.bind_to_context(context)
+            page_listener = context.on.call_args.args[1]
+            page_listener(page)
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            disabling = asyncio.create_task(interceptor.disable())
+            await asyncio.sleep(0)
+            assert not disabling.done()
+            release.set()
+            await asyncio.wait_for(disabling, timeout=2)
+
+        context.remove_listener.assert_called_once_with("page", page_listener)
+        assert not interceptor._page_enable_tasks
+        assert context._skyvern_cdp_download_interceptor is None
+
+    @pytest.mark.asyncio
+    async def test_context_rebind_detaches_cancellation_resistant_disable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mod, "BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.01)
+        old_interceptor = CDPDownloadInterceptor()
+        new_interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        entered_cancel = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stuck_disable() -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                entered_cancel.set()
+                await asyncio.wait_for(release.wait(), timeout=2)
+                if context._skyvern_cdp_download_interceptor is old_interceptor:
+                    context._skyvern_cdp_download_interceptor = None
+                raise RuntimeError("disable failed after detach")
+
+        old_interceptor.disable = stuck_disable  # type: ignore[method-assign]
+        unretrieved: list[dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context_: unretrieved.append(context_))
+        with capture_logs() as logs:
+            try:
+                await asyncio.wait_for(new_interceptor.bind_to_context(context), timeout=0.5)
+                await asyncio.wait_for(entered_cancel.wait(), timeout=0.5)
+
+                assert context._skyvern_cdp_download_interceptor is new_interceptor
+                assert context.on.call_count == 1
+                assert len(mod._DETACHED_DISABLE_TASKS) == 1
+
+                release.set()
+                callback_finished = asyncio.Event()
+                next(iter(mod._DETACHED_DISABLE_TASKS)).add_done_callback(lambda _: callback_finished.set())
+                await asyncio.wait_for(callback_finished.wait(), timeout=0.5)
+                await asyncio.sleep(0)
+
+                assert mod._DETACHED_DISABLE_TASKS == set()
+                assert context._skyvern_cdp_download_interceptor is new_interceptor
+            finally:
+                loop.set_exception_handler(previous_handler)
+
+        assert not any("never retrieved" in str(item.get("message", "")) for item in unretrieved)
+        matching_logs = [
+            log for log in logs if log.get("event") == "Previous CDP download interceptor disable failed after detach"
+        ]
+        assert matching_logs == [
+            {
+                "error_type": "RuntimeError",
+                "event": "Previous CDP download interceptor disable failed after detach",
+                "log_level": "warning",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_context_rebind_awaits_fast_disable_before_binding(self) -> None:
+        old_interceptor = CDPDownloadInterceptor()
+        new_interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        disabled = False
+
+        async def fast_disable() -> None:
+            nonlocal disabled
+            disabled = True
+
+        old_interceptor.disable = fast_disable  # type: ignore[method-assign]
+        await asyncio.wait_for(new_interceptor.bind_to_context(context), timeout=0.5)
+
+        assert disabled
+        assert context._skyvern_cdp_download_interceptor is new_interceptor
+        context.on.assert_called_once()
+        assert mod._DETACHED_DISABLE_TASKS == set()
+
+    @pytest.mark.asyncio
+    async def test_context_rebind_propagates_fast_disable_failure(self) -> None:
+        old_interceptor = CDPDownloadInterceptor()
+        new_interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        old_interceptor.disable = AsyncMock(side_effect=RuntimeError("disable failed"))  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="disable failed"):
+            await asyncio.wait_for(new_interceptor.bind_to_context(context), timeout=0.5)
+
+        assert context._skyvern_cdp_download_interceptor is old_interceptor
+        context.on.assert_not_called()
+        assert mod._DETACHED_DISABLE_TASKS == set()
+
+    @pytest.mark.asyncio
+    async def test_context_rebind_cancellation_owns_old_disable_task(self) -> None:
+        old_interceptor = CDPDownloadInterceptor()
+        new_interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        started = asyncio.Event()
+        entered_cancel = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stuck_disable() -> None:
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                entered_cancel.set()
+                await asyncio.wait_for(release.wait(), timeout=2)
+
+        old_interceptor.disable = stuck_disable  # type: ignore[method-assign]
+        binding = asyncio.create_task(new_interceptor.bind_to_context(context))
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        binding.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(binding, timeout=0.5)
+
+        await asyncio.wait_for(entered_cancel.wait(), timeout=0.5)
+        assert len(mod._DETACHED_DISABLE_TASKS) == 1
+        assert context._skyvern_cdp_download_interceptor is old_interceptor
+        context.on.assert_not_called()
+
+        release.set()
+        callback_finished = asyncio.Event()
+        next(iter(mod._DETACHED_DISABLE_TASKS)).add_done_callback(lambda _: callback_finished.set())
+        await asyncio.wait_for(callback_finished.wait(), timeout=0.5)
+        await asyncio.sleep(0)
+        assert mod._DETACHED_DISABLE_TASKS == set()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_rebind_detached_disable_has_external_gc_root(self) -> None:
+        old_interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        started = asyncio.Event()
+        entered_cancel = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stuck_disable() -> None:
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                entered_cancel.set()
+                await asyncio.wait_for(release.wait(), timeout=2)
+
+        old_interceptor.disable = stuck_disable  # type: ignore[method-assign]
+        new_interceptor = CDPDownloadInterceptor()
+        new_ref = weakref.ref(new_interceptor)
+        binding = asyncio.create_task(new_interceptor.bind_to_context(context))
+        binding_ref = weakref.ref(binding)
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        binding.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(binding, timeout=0.5)
+        await asyncio.wait_for(entered_cancel.wait(), timeout=0.5)
+
+        detached_ref = weakref.ref(next(iter(mod._DETACHED_DISABLE_TASKS)))
+        del binding
+        del new_interceptor
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gc.collect()
+
+        assert new_ref() is None
+        assert binding_ref() is None
+        assert detached_ref() is not None
+        assert len(mod._DETACHED_DISABLE_TASKS) == 1
+
+        callback_finished = asyncio.Event()
+        detached_ref().add_done_callback(lambda _: callback_finished.set())  # type: ignore[union-attr]
+        release.set()
+        await asyncio.wait_for(callback_finished.wait(), timeout=0.5)
+        await asyncio.sleep(0)
+        gc.collect()
+
+        assert mod._DETACHED_DISABLE_TASKS == set()
+        assert detached_ref() is None
+
+    @pytest.mark.asyncio
+    async def test_context_binding_same_interceptor_is_idempotent(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = None
+
+        await asyncio.wait_for(interceptor.bind_to_context(context), timeout=0.5)
+        page_listener = context.on.call_args.args[1]
+        await asyncio.wait_for(interceptor.bind_to_context(context), timeout=0.5)
+        await asyncio.wait_for(interceptor.disable(), timeout=0.5)
+
+        context.on.assert_called_once_with("page", page_listener)
+        context.remove_listener.assert_called_once_with("page", page_listener)
+        assert context._skyvern_cdp_download_interceptor is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_context_rebinds_leave_only_last_listener(self) -> None:
+        old_interceptor = CDPDownloadInterceptor()
+        first_interceptor = CDPDownloadInterceptor()
+        second_interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        old_disable_started = asyncio.Event()
+        release_old_disable = asyncio.Event()
+        first_disable_started = asyncio.Event()
+        release_first_disable = asyncio.Event()
+
+        async def paused_old_disable() -> None:
+            old_disable_started.set()
+            await asyncio.wait_for(release_old_disable.wait(), timeout=2)
+
+        original_first_disable = first_interceptor.disable
+
+        async def paused_first_disable() -> None:
+            first_disable_started.set()
+            await asyncio.wait_for(release_first_disable.wait(), timeout=2)
+            await original_first_disable()
+
+        old_interceptor.disable = paused_old_disable  # type: ignore[method-assign]
+        first_interceptor.disable = paused_first_disable  # type: ignore[method-assign]
+
+        first_binding = asyncio.create_task(first_interceptor.bind_to_context(context))
+        await asyncio.wait_for(old_disable_started.wait(), timeout=0.5)
+        second_binding = asyncio.create_task(second_interceptor.bind_to_context(context))
+        await asyncio.sleep(0)
+        assert not second_binding.done()
+
+        release_old_disable.set()
+        await asyncio.wait_for(first_disable_started.wait(), timeout=0.5)
+        assert context._skyvern_cdp_download_interceptor is first_interceptor
+        first_listener = context.on.call_args_list[0].args[1]
+
+        release_first_disable.set()
+        await asyncio.wait_for(asyncio.gather(first_binding, second_binding), timeout=0.5)
+        second_listener = context.on.call_args_list[1].args[1]
+
+        assert context._skyvern_cdp_download_interceptor is second_interceptor
+        context.remove_listener.assert_called_once_with("page", first_listener)
+        assert first_interceptor._page_listener is None
+        assert not first_interceptor._accepting_pages
+        assert second_interceptor._page_listener is second_listener
+        assert second_interceptor._accepting_pages
+
+    @pytest.mark.asyncio
+    async def test_context_page_enable_failure_is_retrieved_and_logged(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = None
+
+        with (
+            patch.object(interceptor, "enable_for_page", AsyncMock(side_effect=RuntimeError("sensitive detail"))),
+            capture_logs() as logs,
+        ):
+            await interceptor.bind_to_context(context)
+            page_listener = context.on.call_args.args[1]
+            page_listener(MagicMock())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        matching_logs = [log for log in logs if log.get("event") == "Failed to enable CDP interception for page"]
+        assert matching_logs == [
+            {
+                "error_type": "RuntimeError",
+                "event": "Failed to enable CDP interception for page",
+                "log_level": "warning",
+            }
+        ]
+        assert not interceptor._page_enable_tasks
+
+    @pytest.mark.asyncio
+    async def test_disable_drains_admitted_fetch_handler(self) -> None:
+        interceptor = CDPDownloadInterceptor()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        session = MagicMock(send=AsyncMock())
+
+        async def paused_handler(event: dict[str, Any], cdp_session: Any) -> None:
+            assert cdp_session is session
+            started.set()
+            await release.wait()
+
+        with patch.object(interceptor, "_handle_request_paused", side_effect=paused_handler):
+            interceptor._on_request_paused({"requestId": "request-1"}, session)
+            await started.wait()
+            disabling = asyncio.create_task(interceptor.disable())
+            await asyncio.sleep(0)
+            assert not disabling.done()
+            release.set()
+            await asyncio.wait_for(disabling, timeout=2)
+
+        assert not interceptor._cdp_handler_tasks
 
 
 class TestDirectHttpDownloadAuthAndHtmlGuard:
@@ -1183,3 +2071,124 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             await interceptor._download_url_directly("https://site.example/page", "")
 
         assert len(list(tmp_path.iterdir())) == 1
+
+
+class TestDownloadDirRebindDedup:
+    """SKY-12769: a persistent/adopted interceptor is reused across runs via set_download_dir.
+
+    Each captured URL in _downloaded_urls corresponds to a file already written into the previous
+    _output_dir, so the dedupe set is directory-scoped. A genuine dir change must drop it, or an
+    identical download in the new run's dir is skipped and its artifact goes missing. A same-dir
+    rebind must keep it so repeated events stay idempotent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_data_url_reprocessed_after_dir_change(self, tmp_path: Path) -> None:
+        dir_a = tmp_path / "run_a"
+        dir_b = tmp_path / "run_b"
+        interceptor = CDPDownloadInterceptor(output_dir=str(dir_a))
+        event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
+
+        await interceptor._handle_browser_download(event)
+        assert (dir_a / "note.txt").read_bytes() == b"hello"
+
+        interceptor.set_download_dir(str(dir_b))
+        await interceptor._handle_browser_download(event)
+        assert (dir_b / "note.txt").read_bytes() == b"hello"
+
+        await interceptor._handle_browser_download(event)
+        assert [path.name for path in dir_b.iterdir()] == ["note.txt"]
+
+    @pytest.mark.asyncio
+    async def test_same_dir_set_preserves_data_url_dedupe(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
+
+        await interceptor._handle_browser_download(event)
+        assert interceptor._download_index == 1
+
+        interceptor.set_download_dir(str(tmp_path))
+        await interceptor._handle_browser_download(event)
+
+        assert interceptor._download_index == 1
+        assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
+
+    def test_real_dir_change_clears_cross_path_dedupe(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path / "run_a"))
+        interceptor._downloaded_urls.update(
+            {"https://site.example/report.pdf", "blob:https://site.example/abc", "data:sha256:deadbeef"}
+        )
+
+        interceptor.set_download_dir(str(tmp_path / "run_b"))
+
+        assert interceptor._downloaded_urls == set()
+
+    def test_same_dir_set_preserves_cross_path_dedupe(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        seeded = {"https://site.example/report.pdf", "blob:https://site.example/abc"}
+        interceptor._downloaded_urls.update(seeded)
+
+        interceptor.set_download_dir(str(tmp_path))
+
+        assert interceptor._downloaded_urls == seeded
+
+    def test_first_dir_set_from_none_does_not_touch_dedupe(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor()
+        assert interceptor._output_dir is None
+
+        interceptor.set_download_dir(str(tmp_path))
+
+        assert interceptor._downloaded_urls == set()
+        assert interceptor._output_dir == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_in_flight_data_write_does_not_readd_identity_into_new_scope(self, tmp_path: Path) -> None:
+        """A data-URL write that began under dir A but publishes while a rebind to dir B is in flight
+        must not re-insert its identity into dir B's (freshly cleared) dedupe scope — the file landed
+        in dir A, so dir B could otherwise skip an identical download and miss its artifact."""
+        dir_a = tmp_path / "run_a"
+        dir_b = tmp_path / "run_b"
+        interceptor = CDPDownloadInterceptor(output_dir=str(dir_a))
+        event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
+
+        entered_replace, release_replace, replace_patch = TestDataUrlDownloadCapture._paused_replace()
+        with replace_patch:
+            writing = asyncio.create_task(interceptor._handle_browser_download(event))
+            assert await asyncio.to_thread(entered_replace.wait, 2)
+            interceptor.set_download_dir(str(dir_b))
+            assert interceptor._downloaded_urls == set()
+            release_replace.set()
+            await asyncio.wait_for(writing, timeout=2)
+
+        assert (dir_a / "note.txt").read_bytes() == b"hello"
+        assert interceptor._downloaded_urls == set()
+
+        await interceptor._handle_browser_download(event)
+        assert (dir_b / "note.txt").read_bytes() == b"hello"
+        assert len(interceptor._downloaded_urls) == 1
+
+        await interceptor._handle_browser_download(event)
+        assert [path.name for path in dir_b.iterdir()] == ["note.txt"]
+
+    @pytest.mark.asyncio
+    async def test_mkdir_failure_then_same_dir_retry_clears_stale_dedupe_and_writes(self, tmp_path: Path) -> None:
+        """A failed mkdir during a real dir change must not leave the new scope carrying the prior
+        run's dedupe: the clear happens on scope assignment, before mkdir, so a same-dir retry
+        (dir_changed=False) still starts from an empty set and can write."""
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path / "run_a"))
+        interceptor._downloaded_urls.update({"https://site.example/report.pdf", "data:sha256:deadbeef"})
+        target = tmp_path / "run_b"
+        event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
+
+        with patch.object(mod.Path, "mkdir", autospec=True, side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                interceptor.set_download_dir(str(target))
+
+        assert interceptor._downloaded_urls == set()
+
+        interceptor.set_download_dir(str(target))
+        assert interceptor._downloaded_urls == set()
+
+        await interceptor._handle_browser_download(event)
+        assert (target / "note.txt").read_bytes() == b"hello"
+        assert len(interceptor._downloaded_urls) == 1
