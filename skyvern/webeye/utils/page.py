@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 import urllib.parse
 from enum import StrEnum
@@ -66,6 +67,24 @@ async def build_open_tabs_context(
     return "\n".join(lines)
 
 
+_JS_TOP_LEVEL_DECL_RE = re.compile(
+    r"^(?:async\s+function|function|class|let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+    re.MULTILINE,
+)
+
+
+def _wrap_js_in_isolated_scope(script: str) -> str:
+    # page.evaluate runs string scripts through a sloppy indirect eval, which hoists
+    # top-level declarations into the page's global scope and throws
+    # "Identifier 'X' has already been declared" when the site's own JS holds a global
+    # lexical binding with the same name. Scope the script in an IIFE and export via
+    # property writes, which never collide; typeof guards drop names the column-0 regex
+    # matched inside block comments.
+    names = sorted(set(_JS_TOP_LEVEL_DECL_RE.findall(script)))
+    exports = "\n".join(f'if (typeof {name} !== "undefined") globalThis.{name} = {name};' for name in names)
+    return f"(() => {{\n{script}\n{exports}\n}})();"
+
+
 def load_js_script() -> str:
     # TODO: Handle file location better. This is a hacky way to find the file location.
     path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
@@ -73,7 +92,7 @@ def load_js_script() -> str:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
         with open(path, encoding="utf-8") as f:
-            return f.read()
+            return _wrap_js_in_isolated_scope(f.read())
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)
         raise e
