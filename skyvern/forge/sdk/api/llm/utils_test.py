@@ -32,6 +32,14 @@ class TestLoadsWithRepair:
         assert isinstance(result, dict)
         assert "path" in result
 
+    def test_unescaped_quote_in_value_does_not_raise(self) -> None:
+        # A rendered href containing a literal quote makes strict json.loads fail with
+        # "Expecting ',' delimiter" mid-string.
+        rendered = '{"reason": "pick", "href": "https://example.com/a"b", "n": 1}'
+        with pytest.raises(json.JSONDecodeError, match="Expecting ',' delimiter"):
+            json.loads(rendered)
+        assert loads_with_repair(rendered) == {"reason": "pick", "href": 'https://example.com/a"b', "n": 1}
+
 
 class TestParseApiResponse:
     """Tests for parse_api_response function"""
