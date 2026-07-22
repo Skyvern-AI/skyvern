@@ -444,7 +444,7 @@ function WorkflowPage() {
                         workflowRun.workflow_run_id,
                       );
                       const runPath = studioEnabled
-                        ? `/agents/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
+                        ? `/runs/${workflowRun.workflow_run_id}`
                         : legacyRunDetailPath(
                             workflowPermanentId,
                             workflowRun.workflow_run_id,

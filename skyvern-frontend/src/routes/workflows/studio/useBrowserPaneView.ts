@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRunViewStore } from "@/store/RunViewStore";
@@ -36,7 +37,7 @@ type BrowserPaneViewState = {
  * the pane body and its header chrome (queries dedupe via react-query).
  */
 export function useBrowserPaneView(): BrowserPaneViewState {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const [searchParams] = useSearchParams();
   const { runId, explicit } = useStudioInspectedRun();
   const visuals = useRunVisuals(runId);

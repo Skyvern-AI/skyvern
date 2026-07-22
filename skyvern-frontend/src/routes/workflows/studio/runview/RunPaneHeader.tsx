@@ -7,7 +7,7 @@ import {
   ReloadIcon,
   Share1Icon,
 } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
@@ -45,7 +45,7 @@ import { ViewToggle } from "../ViewToggle";
 export function RunPaneViewToggles() {
   const compact = useStudioPaneCompact();
   const { runId } = useStudioInspectedRun();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     runId ? { workflowRunId: runId } : undefined,
   );

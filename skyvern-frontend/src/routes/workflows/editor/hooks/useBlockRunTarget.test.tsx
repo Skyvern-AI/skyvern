@@ -61,6 +61,30 @@ describe("useBlockRunTarget", () => {
     });
   });
 
+  test("resolves the short /runs/{wr} run id from the runId path param", () => {
+    // The short URL has no ?wr= and names the run `runId`, not `workflowRunId`;
+    // the block controls must still see the live run (running-chip + play-disable).
+    const { result } = renderHook(() => useBlockRunTarget(), {
+      wrapper: wrapperAt("/runs/wr_9", "/runs/:runId/*"),
+    });
+    expect(result.current).toEqual({
+      workflowRunId: "wr_9",
+      blockLabel: undefined,
+    });
+  });
+
+  test("a block run overlaid on the short URL (?wr= over the path run) targets the block run", () => {
+    // Starting a block run on /runs/{wr} keeps the pathname and sets ?wr={block};
+    // ?wr= wins over the path run id, same precedence as useStudioRunId.
+    const { result } = renderHook(() => useBlockRunTarget(), {
+      wrapper: wrapperAt("/runs/wr_1?wr=wr_2&bl=login-block", "/runs/:runId/*"),
+    });
+    expect(result.current).toEqual({
+      workflowRunId: "wr_2",
+      blockLabel: "login-block",
+    });
+  });
+
   test("no run anywhere resolves to no target", () => {
     const { result } = renderHook(() => useBlockRunTarget(), {
       wrapper: wrapperAt(

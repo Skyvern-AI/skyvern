@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -10,7 +10,7 @@ import type {
 } from "@/routes/workflows/types/scheduleTypes";
 
 function useCreateScheduleMutation() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -47,7 +47,7 @@ function useCreateScheduleMutation() {
 }
 
 function useToggleScheduleMutation() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -90,7 +90,7 @@ function useToggleScheduleMutation() {
 }
 
 function useDeleteScheduleMutation() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 

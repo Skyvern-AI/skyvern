@@ -223,6 +223,24 @@ export function toReadableSearch(params: URLSearchParams): string {
   return raw ? `?${raw}` : "";
 }
 
+// The pane layout keys the focused run off ?wr=; the short /runs/{wr} URL carries
+// it in the path instead, so pane RESOLUTION runs against a search that reflects
+// that run. This is never written back — the address bar stays paramless.
+export function searchWithRunReference(
+  search: string,
+  runId: string | undefined,
+): string {
+  if (!runId) {
+    return search;
+  }
+  const params = new URLSearchParams(search);
+  if (params.has("wr")) {
+    return search;
+  }
+  params.set("wr", runId);
+  return toReadableSearch(params);
+}
+
 // Serialize the open list into a search string, preserving unrelated params.
 export function searchWithPanes(
   search: string,

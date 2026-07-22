@@ -8,12 +8,8 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  Link,
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -64,7 +60,7 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
   const { title, setTitle } = useWorkflowTitleStore();
   const setHasChanges = useWorkflowHasChangesStore((s) => s.setHasChanges);
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const canEdit = editable && !isRecording;
   return (
     <div className="flex min-w-0 max-w-[19rem] items-center gap-1">
@@ -268,7 +264,7 @@ function PanelToggle({
 // land here and must be stoppable — render Stop when active, nothing otherwise.
 export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const navigate = useNavigate();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const runId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();

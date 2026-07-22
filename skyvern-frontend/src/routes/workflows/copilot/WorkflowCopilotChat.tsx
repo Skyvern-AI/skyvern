@@ -18,6 +18,7 @@ import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
 import { getHostname } from "@/util/getHostname";
 import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   ReloadIcon,
   Cross2Icon,
@@ -890,8 +891,8 @@ export function WorkflowCopilotChat({
     posY: 0,
   });
   const credentialGetter = useCredentialGetter();
-  const { workflowRunId: routeWorkflowRunId, workflowPermanentId } =
-    useParams();
+  const { workflowRunId: routeWorkflowRunId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   // The studio focuses a run via ?wr= (not a path param), so the route param is
   // empty there; an explicit prop grounds the chat in that run and wins.
   const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;

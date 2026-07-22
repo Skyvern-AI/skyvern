@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { Cross2Icon } from "@radix-ui/react-icons";
 
 import {
@@ -544,7 +544,7 @@ function WorkflowDeletedPaneNotice() {
 function StudioStage(props: StudioWorkspaceProps) {
   const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
   const { registerStageElement } = useStudioPaneDefaults();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const workflowDeleted = Boolean(props.workflow.deleted_at);
   const isRecording = useRecordingStore((s) => s.isRecording);
   // The title store is normally seeded by the embedded Workspace's canvas,

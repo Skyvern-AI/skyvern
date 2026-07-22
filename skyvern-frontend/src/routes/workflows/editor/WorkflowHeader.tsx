@@ -6,7 +6,8 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { type ReactNode } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { BrowserIcon } from "@/components/icons/BrowserIcon";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -56,7 +57,7 @@ function GeneratingCodeButton() {
 
 function BrowserModeButton() {
   const navigate = useNavigate();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -199,7 +200,7 @@ function PanelToggleButton({
 
 function RunButton() {
   const navigate = useNavigate();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const closeWorkflowPanel = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const isRecording = useRecordingStore().isRecording;
 
@@ -262,7 +263,7 @@ function TitleSection() {
 }
 
 function WorkflowHeader() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const cacheKey = workflow?.cache_key ?? "";

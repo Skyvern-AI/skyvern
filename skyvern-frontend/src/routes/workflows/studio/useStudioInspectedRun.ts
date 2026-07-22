@@ -1,4 +1,4 @@
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { useStudioRunId } from "./useStudioRunId";
@@ -14,7 +14,7 @@ export function useStudioInspectedRun(): {
   pending: boolean;
 } {
   const urlRunId = useStudioRunId();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: runs, isPending } = useWorkflowRunsQuery({
     workflowPermanentId,
     page: 1,

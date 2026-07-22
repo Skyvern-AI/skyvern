@@ -4,7 +4,7 @@ import {
   Cross2Icon,
   ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -79,6 +79,7 @@ export function RunView({
   onFix,
   onRetry,
 }: RunViewProps) {
+  const { runId: pathRunId } = useParams();
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
   // isLoading here, not isPending like RunTab: this query is enabled only once a run
   // id exists, so a disabled query means "no run" → fall through to the empty CTA.
@@ -154,6 +155,11 @@ export function RunView({
     if (!workflowRunId) {
       return;
     }
+    // Under the short /runs/{wr} URL the run is already named by the path, so
+    // pinning ?wr= would only duplicate it; the pane reads the run from either.
+    if (pathRunId === workflowRunId) {
+      return;
+    }
     if (new URLSearchParams(window.location.search).get("wr")) {
       return;
     }
@@ -165,7 +171,7 @@ export function RunView({
     }
     next.set("wr", workflowRunId);
     navigate({ search: toReadableSearch(next) }, { replace: true });
-  }, [runPaneOpen, workflowRunId, navigate]);
+  }, [runPaneOpen, workflowRunId, pathRunId, navigate]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
@@ -197,7 +203,11 @@ export function RunView({
     const params = new URLSearchParams(
       window.location.search || searchParamsRef.current.toString(),
     );
-    if (params.get("wr") !== workflowRunId || params.get("active")) {
+    // The short /runs/{wr} URL names the run in the path rather than ?wr=, so a
+    // matching path id is the focused deep link too (parity with ?wr= cold open).
+    const isFocusedDeepLink =
+      params.get("wr") === workflowRunId || pathRunId === workflowRunId;
+    if (!isFocusedDeepLink || params.get("active")) {
       return;
     }
     if (params.has("bl")) {
@@ -217,7 +227,7 @@ export function RunView({
     if (last) {
       pinFrame(last.id);
     }
-  }, [workflowRunId, workflowRun, timeline, frames, pinFrame]);
+  }, [workflowRunId, workflowRun, timeline, frames, pinFrame, pathRunId]);
 
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.

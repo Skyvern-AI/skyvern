@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import type {
@@ -8,7 +8,7 @@ import type {
 } from "@/routes/workflows/types/scheduleTypes";
 
 function useWorkflowSchedulesQuery() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
 
   return useQuery<Array<WorkflowSchedule>>({

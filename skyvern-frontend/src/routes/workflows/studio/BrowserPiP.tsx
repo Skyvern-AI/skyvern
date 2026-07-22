@@ -3,7 +3,7 @@ import {
   EnterFullScreenIcon,
   GlobeIcon,
 } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useStudioShellStore } from "@/store/StudioShellStore";
 import { cn } from "@/util/utils";
@@ -23,7 +23,7 @@ export function BrowserPiP() {
   const { openPane } = useStudioPanes();
   const { setEditorStreamSlot } = useStudioShellContext();
 
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   // The session is owned (fetched) by the editor's Workspace; read it passively.
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,

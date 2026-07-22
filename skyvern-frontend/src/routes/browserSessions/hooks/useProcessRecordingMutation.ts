@@ -1,4 +1,3 @@
-import { useParams } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
 import { useRef } from "react";
 import { useFeatureFlagEnabled } from "posthog-js/react";
@@ -6,6 +5,7 @@ import { useFeatureFlagEnabled } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { RECORD_BROWSER_CODE_FIRST_FLAG } from "@/util/featureFlags";
 import {
   useRecordingStore,
@@ -34,7 +34,7 @@ const useProcessRecordingMutation = ({
 }) => {
   const credentialGetter = useCredentialGetter();
   const recordingStore = useRecordingStore();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const mutationStartedAtRef = useRef<number | null>(null);
   // Per-user opt-in preview; not enrolled reads as false (agent blocks).
   const codeFirst =

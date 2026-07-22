@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import {
   Tooltip,
@@ -25,7 +25,7 @@ function BlockOutputs({
   blockLabel: string;
   blockOutput: { [k: string]: unknown } | null;
 }) {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const blockOutputStore = useBlockOutputStore();
   const [pageName, setPageName] = useState<PageName>("output");
   const [overrideHasError, setOverrideHasError] = useState(false);

@@ -7,7 +7,7 @@ import {
 import { AxiosError } from "axios";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
@@ -103,7 +103,7 @@ export function BrowserPaneViewPills() {
 }
 
 export function BrowserPaneActions() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const compact = useStudioPaneCompact();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
