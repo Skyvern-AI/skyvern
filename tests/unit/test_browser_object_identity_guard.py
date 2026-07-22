@@ -31,6 +31,14 @@ import pytest
 # import root must be registered here, or identity checks against it slip past.
 _BROWSER_DRIVER_ROOTS = ("playwright", "patchright", "rustwright")
 
+# Public API submodules of a browser driver whose ``Page``/``Frame``/... attributes
+# are engine-native object classes. Kept as an explicit allowlist so that a value
+# imported from a driver package (``from playwright import expect`` / ``Error``) is
+# never mistaken for a module in ``from <driver> import <name> as alias`` form.
+# ``async_api`` is the only such submodule imported in this repo today; ``sync_api``
+# is the driver's other public API module. Add a name here only with import evidence.
+_BROWSER_DRIVER_API_SUBMODULES = frozenset({"async_api", "sync_api"})
+
 # Browser *object* classes whose identity is engine-specific. Driver *error*
 # classes (Error, TimeoutError, TargetClosedError, ...) are intentionally absent:
 # migrating those catches is a separate tranche, not this guard's concern.
@@ -109,6 +117,10 @@ class _IdentityCheckVisitor(ast.NodeVisitor):
             for alias in node.names:
                 if alias.name in _BROWSER_OBJECT_CLASSES:
                     self._driver_object_names[alias.asname or alias.name] = alias.name
+                elif alias.name in _BROWSER_DRIVER_API_SUBMODULES:
+                    # ``from playwright import async_api as pw``: bind the local name to
+                    # the full driver module path so ``pw.Page`` resolves by origin.
+                    self._driver_module_aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -210,6 +222,36 @@ def test_flags_dotted_attribute_access_under_bare_driver_root_import() -> None:
 def test_flags_unaliased_dotted_import_for_other_driver_root() -> None:
     src = "import patchright.async_api\nx = issubclass(cls, patchright.async_api.Browser)\n"
     assert [x.class_name for x in find_browser_object_identity_checks(src)] == ["Browser"]
+
+
+def test_flags_aliased_importfrom_submodule_attribute_access() -> None:
+    src = "from playwright import async_api as pw\nx = isinstance(obj, pw.Page)\n"
+    assert [x.class_name for x in find_browser_object_identity_checks(src)] == ["Page"]
+
+
+def test_flags_unaliased_importfrom_submodule_attribute_access() -> None:
+    src = "from playwright import async_api\nx = isinstance(obj, async_api.Page)\n"
+    assert [x.class_name for x in find_browser_object_identity_checks(src)] == ["Page"]
+
+
+def test_flags_importfrom_submodule_for_other_driver_root() -> None:
+    src = "from patchright import async_api as pr\nx = issubclass(cls, pr.Frame)\n"
+    assert [x.class_name for x in find_browser_object_identity_checks(src)] == ["Frame"]
+
+
+def test_flags_aliased_importfrom_sync_api_submodule_attribute_access() -> None:
+    src = "from playwright import sync_api as pw\nx = isinstance(obj, pw.Page)\n"
+    assert [x.class_name for x in find_browser_object_identity_checks(src)] == ["Page"]
+
+
+def test_ignores_importfrom_submodule_from_non_driver_package() -> None:
+    src = "from starlette import responses as r\nx = isinstance(summary, r.Response)\n"
+    assert find_browser_object_identity_checks(src) == []
+
+
+def test_ignores_non_module_value_imported_from_driver_root() -> None:
+    src = "from playwright import expect\nx = isinstance(obj, expect.Page)\n"
+    assert find_browser_object_identity_checks(src) == []
 
 
 def test_ignores_dotted_attribute_access_from_non_driver_package() -> None:
