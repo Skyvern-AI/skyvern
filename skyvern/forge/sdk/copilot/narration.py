@@ -72,6 +72,12 @@ MAX_DESIGN_ACTIVITY_ENTRIES = 50
 # Mirror of the FE ACTIVITY_TOOL_DENYLIST in narrativeState.ts.
 ACTIVITY_TOOL_DENYLIST = frozenset({"list_credentials", "get_run_results", "get_browser_screenshot"})
 
+# Tools that kick off a block run. Mirror of the FE RUN_TOOLS in narrativeState.ts.
+# Their tool_call is recorded before the run flips running_block_label to the
+# running block, so the matching tool_result is pinned to the call's bucket (see
+# NarratorState._activity_bucket_label) rather than routed live.
+_RUN_ACTIVITY_TOOLS = frozenset({"update_and_run_blocks", "run_blocks_and_collect_debug"})
+
 # Shared classification for a code-authoring reject the streaming adapter renders
 # as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
 # consumed by the SSE layer (streaming_adapter) — one source of truth for both.
@@ -92,6 +98,8 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "navigate_browser": "Opening page",
     "get_block_schema": "Checking workflow block options",
     "inspect_current_workflow": "Inspecting workflow",
+    "discover_workflow_entrypoint": "Finding the entry page",
+    "inspect_page_for_composition": "Inspecting the page",
 }
 
 
@@ -195,13 +203,17 @@ class NarratorState:
     block_activity: dict[str, list[NarrativeActivityEntry]] = field(default_factory=dict)
     design_activity: list[NarrativeActivityEntry] = field(default_factory=list)
     running_block_label: str | None = None
+    # tool_call_id -> the bucket its tool_call landed in, tracked for
+    # _RUN_ACTIVITY_TOOLS only so the later tool_result rejoins the call's bucket.
+    # An unmatched call (result never arrives) is bounded by this state's one-turn lifetime.
+    run_tool_call_buckets: dict[str, str | None] = field(default_factory=dict)
     # Per-turn (NarratorState lives one turn); collapses repeated code-repair progress to one entry.
     emitted_progress_texts: set[str] = field(default_factory=set)
 
     def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
         if entry is None:
             return
-        label = self.running_block_label
+        label = self._activity_bucket_label(entry)
         if label is None:
             self.design_activity.append(entry)
             if len(self.design_activity) > MAX_DESIGN_ACTIVITY_ENTRIES:
@@ -211,6 +223,25 @@ class NarratorState:
         bucket.append(entry)
         if len(bucket) > MAX_BLOCK_ACTIVITY_ENTRIES:
             del bucket[:-MAX_BLOCK_ACTIVITY_ENTRIES]
+
+    def _activity_bucket_label(self, entry: NarrativeActivityEntry) -> str | None:
+        """Bucket an entry to a running block (its label) or design (None).
+
+        A run tool's call is recorded before the run it triggers flips
+        running_block_label, so routing its result live would split the
+        call/result pair across buckets and the FE could never fold it. Pin the
+        result to the call's bucket by tool_call_id; everything else routes live.
+        """
+        entry_id = entry.get("id") or ""
+        if entry.get("kind") == "tool_call" and entry.get("toolName") in _RUN_ACTIVITY_TOOLS:
+            bucket = self.running_block_label
+            self.run_tool_call_buckets[entry_id.removeprefix("tc-")] = bucket
+            return bucket
+        if entry.get("kind") == "tool_result":
+            call_id = entry_id.removeprefix("tr-")
+            if call_id in self.run_tool_call_buckets:
+                return self.run_tool_call_buckets.pop(call_id)
+        return self.running_block_label
 
     def record_tool(
         self,

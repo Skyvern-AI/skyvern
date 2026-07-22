@@ -12,6 +12,7 @@ import {
   BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
+  toolActivityDisplayLabel,
 } from "./narrativeState";
 
 const entry = (
@@ -63,6 +64,21 @@ describe("AUTHORING_TOOLS / RUN_TOOLS", () => {
   it("run_blocks_and_collect_debug is a run tool only, not authoring", () => {
     expect(RUN_TOOLS.has("run_blocks_and_collect_debug")).toBe(true);
     expect(AUTHORING_TOOLS.has("run_blocks_and_collect_debug")).toBe(false);
+  });
+});
+
+describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
+  it("labels discover_workflow_entrypoint and inspect_page_for_composition", () => {
+    expect(toolActivityDisplayLabel("discover_workflow_entrypoint")).toBe(
+      "Finding the entry page",
+    );
+    expect(toolActivityDisplayLabel("inspect_page_for_composition")).toBe(
+      "Inspecting the page",
+    );
+  });
+
+  it("still falls back to Working for unmapped tools", () => {
+    expect(toolActivityDisplayLabel("some_unmapped_tool")).toBe("Working");
   });
 });
 

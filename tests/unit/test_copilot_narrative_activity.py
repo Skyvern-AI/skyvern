@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.narration import (
     build_narration_activity,
     build_tool_call_activity,
     build_tool_result_activity,
+    tool_activity_display_label,
 )
 
 
@@ -122,6 +123,39 @@ def test_record_activity_caps_keep_most_recent() -> None:
         design_state.record_activity(build_narration_activity(f"n{i}", i, datetime(2026, 1, 1, tzinfo=timezone.utc)))
     assert len(design_state.design_activity) == MAX_DESIGN_ACTIVITY_ENTRIES
     assert design_state.design_activity[0]["text"] == "n5"
+
+
+def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
+    # A run tool's call is recorded before the run it triggers flips
+    # running_block_label; its result must rejoin the call's bucket so the FE
+    # folds the pair instead of stranding the call row "calling…".
+    state = NarratorState()
+    state.record_activity(build_tool_call_activity("update_and_run_blocks", 0, "c1"))
+    assert [e["id"] for e in state.design_activity] == ["tc-c1"]
+
+    state.running_block_label = "step_1"
+    state.record_activity(build_tool_result_activity("update_and_run_blocks", "Workflow updated", True, 1, "c1"))
+
+    assert [e["id"] for e in state.design_activity] == ["tc-c1", "tr-c1"]
+    assert state.block_activity == {}
+
+
+def test_record_activity_non_run_tool_result_routes_live_not_pinned() -> None:
+    # The pin is scoped to run tools; other tools keep live running_block_label routing.
+    state = NarratorState()
+    state.record_activity(build_tool_call_activity("evaluate", 0, "c9"))
+    assert [e["id"] for e in state.design_activity] == ["tc-c9"]
+
+    state.running_block_label = "step_2"
+    state.record_activity(build_tool_result_activity("evaluate", "Inspecting page", True, 1, "c9"))
+
+    assert [e["id"] for e in state.block_activity["step_2"]] == ["tr-c9"]
+    assert [e["id"] for e in state.design_activity] == ["tc-c9"]
+
+
+def test_tool_activity_display_label_covers_discovery_tools() -> None:
+    assert tool_activity_display_label("discover_workflow_entrypoint") == "Finding the entry page"
+    assert tool_activity_display_label("inspect_page_for_composition") == "Inspecting the page"
 
 
 def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
