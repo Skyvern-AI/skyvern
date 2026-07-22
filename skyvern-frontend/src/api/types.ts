@@ -829,6 +829,7 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  queued_at: string | null;
   started_at: string | null;
   finished_at: string;
   modified_at: string;
@@ -869,6 +870,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  queued_at: string | null;
   started_at: string | null;
   finished_at: string;
   modified_at: string;

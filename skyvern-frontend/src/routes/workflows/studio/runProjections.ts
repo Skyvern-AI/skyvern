@@ -12,7 +12,7 @@ import {
 } from "@/routes/workflows/types/workflowRunTypes";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
 import { isRecord } from "@/util/utils";
-import { normalizeUtcTimestamp } from "@/util/timeFormat";
+import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
 
 export type RunOutcome = "idle" | "running" | "failed" | "success";
 
@@ -38,6 +38,30 @@ export function formatElapsed(
     return `${sec}s`;
   }
   return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+}
+
+// The elapsed value's hover tooltip: the full created/queued/started/finished
+// breakdown, one per line, omitting timestamps the run doesn't have yet.
+export function formatRunTimesTooltip(
+  workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
+): string {
+  const finalized = statusIsFinalized(workflowRun);
+  return [
+    workflowRun.created_at
+      ? `Created ${basicLocalTimeFormat(workflowRun.created_at)}`
+      : null,
+    workflowRun.queued_at
+      ? `Queued ${basicLocalTimeFormat(workflowRun.queued_at)}`
+      : null,
+    workflowRun.started_at
+      ? `Started ${basicLocalTimeFormat(workflowRun.started_at)}`
+      : null,
+    finalized && workflowRun.finished_at
+      ? `Finished ${basicLocalTimeFormat(workflowRun.finished_at)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function runOutcomeFromStatus(
