@@ -376,6 +376,33 @@ describe("applyNarrativeEvent — activity", () => {
     });
     expect(s.designActivity[0]?.text).not.toContain("update_and_run_blocks");
   });
+
+  it("co-locates a run tool's result with its call after a block starts running (SKY-12831)", () => {
+    // The call lands in designActivity (no block running yet); the run then
+    // flips a block to running. The result must rejoin the call in
+    // designActivity so the pair folds — not land in the block card.
+    const afterCall = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolCall({ tool_call_id: "call-1" }),
+    );
+    const afterBlock = applyNarrativeEvent(
+      afterCall,
+      blockProgress({ block_label: "step_1", status: "running" }),
+    );
+    const s = applyNarrativeEvent(
+      afterBlock,
+      toolResult({ tool_call_id: "call-1" }),
+    );
+
+    expect(s.designActivity.map((e) => e.id)).toEqual([
+      "tc-call-1",
+      "tr-call-1",
+    ]);
+    expect(
+      s.blocks.find((b) => b.label === "step_1")?.activity ?? [],
+    ).toHaveLength(0);
+    expect(condenseActivityEntries(s.designActivity)).toHaveLength(1);
+  });
 });
 
 describe("condenseActivityEntries", () => {

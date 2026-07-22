@@ -334,6 +334,8 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   navigate_browser: "Opening page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
+  discover_workflow_entrypoint: "Finding the entry page",
+  inspect_page_for_composition: "Inspecting the page",
 };
 
 export function toolActivityDisplayLabel(toolName?: string | null): string {
@@ -521,6 +523,39 @@ function appendActivity(
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  // A run tool's result must rejoin its call's bucket. The run flips the active
+  // block between the call and the result, so routing the result to the live
+  // active block would split the call/result pair across buckets and it could
+  // never fold (mirrors the backend NarratorState._activity_bucket_label fix).
+  if (
+    entry.kind === "tool_result" &&
+    entry.toolName !== undefined &&
+    RUN_TOOLS.has(entry.toolName)
+  ) {
+    const callId = `tc-${toolCallIdOf(entry) ?? ""}`;
+    if (designActivity.some((e) => e.id === callId)) {
+      return {
+        blocks,
+        designActivity: appendCapped(
+          designActivity,
+          entry,
+          MAX_DESIGN_ACTIVITY_ENTRIES,
+        ),
+      };
+    }
+    const callBlockIdx = blocks.findIndex((b) =>
+      b.activity.some((e) => e.id === callId),
+    );
+    if (callBlockIdx !== -1) {
+      const nextBlocks = blocks.slice();
+      const callBlock = nextBlocks[callBlockIdx]!;
+      nextBlocks[callBlockIdx] = {
+        ...callBlock,
+        activity: appendCapped(callBlock.activity, entry, MAX_ACTIVITY_ENTRIES),
+      };
+      return { blocks: nextBlocks, designActivity };
+    }
+  }
   const activeIdx = blocks.findIndex((b) => b.state === "running");
   if (activeIdx === -1) {
     return {
