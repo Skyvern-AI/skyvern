@@ -193,9 +193,21 @@ def request_slot_request_digest(request: RequestSlotProducerInputV1) -> str:
     return _request_digest(request.version, request_slot_sources(request), request.datum_targets)
 
 
+_CANONICAL_SLOT_LEAF_PREFIX = "request_slot_"
+
+
 def _canonical_path(request_digest: str, ordinal: int) -> tuple[str, tuple[str, str]]:
-    leaf = f"request_slot_{request_digest[:48]}_{ordinal:02d}"
+    leaf = f"{_CANONICAL_SLOT_LEAF_PREFIX}{request_digest[:48]}_{ordinal:02d}"
     return f"output.{leaf}", ("output", leaf)
+
+
+def is_canonical_request_slot_path(path: str | None) -> bool:
+    """Whether a path is a server-minted slot identity, which carries a request digest and so
+    identifies an output without naming it."""
+    if not path:
+        return False
+    leaf = path.removeprefix("output.")
+    return leaf.startswith(_CANONICAL_SLOT_LEAF_PREFIX)
 
 
 def _slot_id(version: str, request_digest: str, ordinal: int, plane: RequestSlotPlane) -> str:

@@ -55,7 +55,9 @@ from skyvern.forge.sdk.copilot.enforcement import (
     arm_credential_scout_reopen,
     consume_uncovered_output_reopen_event,
     mint_scout_observation_contract_for_ctx,
+    pre_run_gated_outputs_without_path,
     record_scouted_output_coverage,
+    requested_scalar_output_extraction_plan,
     run_with_enforcement,
     synthesized_block_persistence_signal,
     synthesized_goal_completion_landing_pending,
@@ -3183,6 +3185,129 @@ class TestScoutOutputCoverageGate:
         ctx.scout_observation_contract = object()
         _restore_post_hook_context(ctx, snapshot)
         assert ctx.scout_observation_contract is None
+
+    def test_both_surfaces_grounded_still_blocks_mutating_tool(self) -> None:
+        ctx = self._authoring_ctx(
+            _criterion("output.visitors", "Visitors"),
+            _criterion("output.signups", "Signups"),
+        )
+        surface_one = self._kv_page(
+            key_text="Visitors",
+            url="https://analytics.example.com/dashboard",
+            value_prose="Visitors 1,234 recorded this week",
+        )
+        first_contract = mint_scout_observation_contract_for_ctx(
+            ctx, surface_one, url="https://analytics.example.com/dashboard"
+        )
+        record_scouted_output_coverage(ctx, surface_one, contract=first_contract)
+
+        surface_two = self._kv_page(
+            key_text="Signups",
+            url="https://analytics.example.com/query",
+            value_prose="Signups 987 total this week",
+        )
+        second_contract = mint_scout_observation_contract_for_ctx(
+            ctx, surface_two, url="https://analytics.example.com/query"
+        )
+        record_scouted_output_coverage(ctx, surface_two, contract=second_contract)
+
+        assert ctx.scouted_output_covered_paths == {"output.visitors", "output.signups"}
+        assert uncovered_requested_output_paths(ctx) == set()
+
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is True
+        signal = synthesized_block_persistence_signal(ctx, "click")
+        assert signal is not None
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_rekeyed_requested_output_compiles_the_offer_recipe_named_from_its_label(self) -> None:
+        # Without the rekey fallback no label reaches the plan, so the offer is skipped and the
+        # schema is left to the agent to invent.
+        rekeyed = CompletionCriterion(
+            id="slot0",
+            outcome="Document Name",
+            output_path=None,
+            requested_output_evidence_source="runtime_output",
+            requested_output_floor_rekeyed=True,
+            floor_rekeyed_from_path="output.request_slot_abc_00",
+        )
+        ctx = self._authoring_ctx(rekeyed)
+        self._attach_document_plan(ctx, step=6)
+        ctx.synthesized_block_offered = False
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        content = str(message["content"])
+        assert 'return {"output": {"document_name": _extraction_value_0}}' in content
+        assert "request_slot_abc_00" not in content
+
+    def test_requested_output_without_a_label_leaves_the_ask_legitimate(self) -> None:
+        # An underivable field yields no plan, so a clarification about it stays legitimate.
+        unlabelled = CompletionCriterion(
+            id="slot0",
+            outcome="",
+            output_path=None,
+            requested_output_evidence_source="runtime_output",
+            requested_output_floor_rekeyed=True,
+            floor_rekeyed_from_path="output.request_slot_abc_00",
+        )
+        ctx = self._authoring_ctx(unlabelled)
+        self._attach_document_plan(ctx, step=6)
+
+        assert requested_scalar_output_extraction_plan(ctx) is None
+
+    def test_floor_rekeyed_runtime_output_stays_owed_until_grounded(self) -> None:
+        # The rekey clears output_path but keeps floor_rekeyed_from_path; keyed only on the former,
+        # both outputs vanish from the requested set and the blocker forecloses scouting.
+        rekeyed = [
+            CompletionCriterion(
+                id=f"slot{index}",
+                outcome=outcome,
+                output_path=None,
+                requested_output_evidence_source="runtime_output",
+                requested_output_floor_rekeyed=True,
+                floor_rekeyed_from_path=f"output.request_slot_b97f_{index:02d}",
+            )
+            for index, outcome in enumerate(["number of website visitors", "number of new signups"])
+        ]
+        ctx = self._authoring_ctx(*rekeyed)
+
+        # Provenance stands in for the cleared path, so both stay owed and neither is flagged.
+        assert uncovered_requested_output_paths(ctx) == {
+            "output.request_slot_b97f_00",
+            "output.request_slot_b97f_01",
+        }
+        assert pre_run_gated_outputs_without_path(ctx) == ()
+
+        surface_one = self._kv_page(
+            key_text="Website visitors",
+            url="https://analytics.example.com/web-analytics",
+            value_prose="Website visitors 9,420 recorded for the past 7 days",
+        )
+        contract = mint_scout_observation_contract_for_ctx(
+            ctx, surface_one, url="https://analytics.example.com/web-analytics"
+        )
+        record_scouted_output_coverage(ctx, surface_one, contract=contract)
+
+        # Coverage keys on the outcome text, since the digest leaf carries no groundable tokens.
+        assert uncovered_requested_output_paths(ctx) == {"output.request_slot_b97f_01"}
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
+        assert synthesized_block_persistence_signal(ctx, "click") is None
+
+    def test_pathless_runtime_output_criterion_reaching_enforcement_is_flagged(self) -> None:
+        # A runtime-output criterion reaching enforcement with no identity is surfaced, not dropped.
+        pathless = CompletionCriterion(
+            id="c0",
+            outcome="number of new signups is extracted for the past 7 days",
+            output_path=None,
+            requested_output_evidence_source="runtime_output",
+        )
+        flagged = pre_run_gated_outputs_without_path(self._authoring_ctx(pathless))
+        assert [criterion.id for criterion in flagged] == ["c0"]
+
+        with_path = _criterion("output.new_signups", "number of new signups is extracted")
+        assert pre_run_gated_outputs_without_path(self._authoring_ctx(with_path)) == ()
 
 
 class TestAdvisoryRunDispatchForceLane:

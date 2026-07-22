@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _degrade_pathless_contingent_criteria,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
+    _requested_output_fields,
     build_classifier_fallback_floor,
     is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
@@ -512,6 +513,58 @@ def test_completion_criteria_preserve_requested_output_evidence_source() -> None
     assert trace["requested_output_criterion_1_evidence_source"] == "runtime_output"
     assert trace["requested_output_criterion_2_evidence_source"] == "registered_output_parameter"
     assert trace["requested_output_criterion_3_evidence_source"] == "registered_artifact_content"
+
+
+def test_quantifier_of_shape_extracts_noun_phrase_not_quantifier() -> None:
+    # A quantifier followed by "of <noun phrase>" inverts the head-at-end shape the window assumes.
+    assert _requested_output_fields(
+        'extract "number of website visitors" and "number of new signups" in the past 7 days.', {}
+    ) == ["website visitors", "new signups"]
+    # The rule covers the quantifier class, not two hard-coded prefixes.
+    assert _requested_output_fields("extract the count of active users", {}) == ["active users"]
+    assert _requested_output_fields("return the total number of orders", {}) == ["orders"]
+
+
+def test_head_at_end_field_shape_unchanged_by_quantifier_rule() -> None:
+    # A head-at-end phrase has no "<quantifier> of" trigger, so the backward window is untouched.
+    assert _requested_output_fields("Return a final record with account number and invoice date.", {}) == [
+        "account number",
+        "invoice date",
+    ]
+    assert _requested_output_fields("Return a final record with record id and status.", {}) == [
+        "record id",
+        "status",
+    ]
+    assert _requested_output_fields("Extract the invoice total.", {}) == ["invoice total"]
+
+
+def test_quantifier_extract_goal_binds_output_paths_to_pathless_criteria() -> None:
+    # Pathless "number of X" criteria bind to canonical output paths once the field is extracted.
+    policy = RequestPolicy(
+        testing_intent="require_test",
+        classifier_status="success",
+        classifier_failure_kind="none",
+        completion_criteria=_parse_completion_criteria(
+            [
+                {"outcome": "number of website visitors is extracted for the past 7 days"},
+                {"outcome": "number of new signups is extracted for the past 7 days"},
+            ]
+        ),
+    )
+    _apply_requested_output_completion_criteria(
+        policy,
+        'extract "number of website visitors" and "number of new signups" in the past 7 days.',
+    )
+    assert _criteria_for_path(policy, "output.website_visitors")
+    assert _criteria_for_path(policy, "output.new_signups")
+    assert not any(criterion.output_path is None for criterion in policy.completion_criteria)
+
+
+def test_quantifier_rule_leaves_negated_forbidden_fields_as_noun_phrase() -> None:
+    # The forbidden-output path shares the cleaner, so the negated field is the noun phrase too.
+    assert _requested_output_fields("Do not return the number of website visitors.", {}, negated=True) == [
+        "website visitors"
+    ]
 
 
 def test_requested_output_canonicalization_preserves_independent_evidence_source() -> None:

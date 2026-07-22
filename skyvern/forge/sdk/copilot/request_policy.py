@@ -276,6 +276,15 @@ _OUTPUT_FIELD_WORDS = frozenset(
     "amount amounts domain domains name names number numbers owner owners phone phones rate rates specialties specialty "
     "status statuses taxonomy total totals url urls website websites".split()
 )
+# When one of these is followed by "of <noun phrase>" the field is the noun phrase, not the
+# quantifier; the head-at-end window below cannot reach a subject that trails the field word.
+_OUTPUT_QUANTIFIER_HEAD_WORDS = frozenset(
+    "number numbers count counts total totals amount amounts sum sums quantity quantities "
+    "average averages percentage percentages proportion proportions share shares".split()
+)
+# Words that end a quantifier's noun phrase: a scope/time qualifier ("... in the past 7 days") or another
+# preposition begins here, so the field name stops before it.
+_OUTPUT_PHRASE_BOUNDARY_WORDS = frozenset("in on over during within for per by from since between as at with".split())
 # Intentionally distinct from enforcement._COVERAGE_GENERIC_TOKENS: this list filters intent prose when
 # parsing requested-output field names, so it drops phrase-level noise ("each", "profile", "structured");
 # the coverage list filters path leaf tokens only. Not unified — the consumers differ.
@@ -1647,6 +1656,21 @@ def _bind_criterion_to_request_slot(
         or isinstance(expected_classification, bool)
         or judgment_truth_condition is not None
     )
+    if rekeyed:
+        LOG.info(
+            "copilot_request_slot_criterion_rekeyed",
+            slot_id=slot.slot_id,
+            canonical_path=slot.canonical_path,
+            pinability=pinability,
+            antecedent_family=antecedent_family,
+            has_exact_requirement=has_exact_requirement,
+            degraded=degraded,
+            rekeyed_reason="degraded" if degraded else "shapeless_valid",
+            kind=kind,
+            original_output_path=original_output_path,
+            requested_output_evidence_source=criterion.requested_output_evidence_source,
+            outcome=(criterion.outcome or source_quote or "")[:80],
+        )
     return replace(
         criterion,
         id=slot.slot_id,
@@ -2190,6 +2214,26 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
         return None
     if all(word in _OUTPUT_GENERIC_WORDS for word in normalized_words):
         return None
+    quantifier_index = next(
+        (
+            index
+            for index, word in enumerate(normalized_words)
+            if word in _OUTPUT_QUANTIFIER_HEAD_WORDS
+            and index + 1 < len(normalized_words)
+            and normalized_words[index + 1] == "of"
+        ),
+        None,
+    )
+    if quantifier_index is not None:
+        subject_words: list[str] = []
+        for word, normalized_word in zip(words[quantifier_index + 2 :], normalized_words[quantifier_index + 2 :]):
+            if normalized_word in _OUTPUT_PHRASE_BOUNDARY_WORDS:
+                break
+            if normalized_word in _OUTPUT_GENERIC_WORDS:
+                continue
+            subject_words.append(word)
+        if subject_words:
+            return " ".join(subject_words)
     field_indexes = [i for i, word in enumerate(normalized_words) if word in _OUTPUT_FIELD_WORDS]
     if not field_indexes:
         return None
