@@ -11,6 +11,7 @@ import {
   fitPanesToWidth,
   panesFitWidth,
   resolveOpenPanes,
+  searchWithRunReference,
   STUDIO_PANE_IDS,
   type StudioPaneId,
 } from "./panes";
@@ -19,6 +20,7 @@ import {
   type PaneClamp,
   type PaneWrite,
 } from "./StudioPaneDefaultsContext";
+import { useStudioRunId } from "./useStudioRunId";
 
 // Drop unknown ids and duplicates; return null when the result is empty/invalid.
 function sanitizeLearnedPanes(
@@ -55,6 +57,7 @@ export function StudioPaneDefaultsProvider({
   children: ReactNode;
 }) {
   const location = useLocation();
+  const studioRunId = useStudioRunId();
 
   // hasBlocks gates only the learned-layout lookup, not the factory default
   // itself — empty agents never restore a saved arrangement.
@@ -74,7 +77,7 @@ export function StudioPaneDefaultsProvider({
 
   const [initialPanes] = useState<readonly StudioPaneId[]>(() =>
     resolveOpenPanes(
-      liveSearch(location.search),
+      searchWithRunReference(liveSearch(location.search), studioRunId),
       defaultPanes,
       learnedRunPanes,
     ),

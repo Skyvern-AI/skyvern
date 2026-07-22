@@ -14,12 +14,14 @@ import {
   panesWithoutDeletedBlocked,
   resolveOpenPanes,
   searchWithPanes,
+  searchWithRunReference,
   togglePane as togglePaneIn,
   withPaneClosed,
   withPaneOpen,
   type StudioPaneId,
 } from "./panes";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
+import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
@@ -38,6 +40,9 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
 export function useStudioPanes() {
   const location = useLocation();
   const navigate = useNavigate();
+  // Under /runs/{wr} the focused run is the path, not ?wr=; fold it into the
+  // search used for resolution so the run layout (not the edit default) opens.
+  const studioRunId = useStudioRunId();
   const { defaultPanes, clamp, notePaneWrite, learnedRunPanes } =
     useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
@@ -63,8 +68,14 @@ export function useStudioPanes() {
 
   const panes = useMemo(
     () =>
-      present(resolveOpenPanes(location.search, defaultPanes, learnedRunPanes)),
-    [location.search, defaultPanes, present, learnedRunPanes],
+      present(
+        resolveOpenPanes(
+          searchWithRunReference(location.search, studioRunId),
+          defaultPanes,
+          learnedRunPanes,
+        ),
+      ),
+    [location.search, studioRunId, defaultPanes, present, learnedRunPanes],
   );
 
   // The open list as the live URL resolves it right now — what cross-route
@@ -74,12 +85,12 @@ export function useStudioPanes() {
     (): StudioPaneId[] =>
       present(
         resolveOpenPanes(
-          liveSearch(location.search),
+          searchWithRunReference(liveSearch(location.search), studioRunId),
           defaultPanes,
           learnedRunPanes,
         ),
       ),
-    [location.search, defaultPanes, present, learnedRunPanes],
+    [location.search, studioRunId, defaultPanes, present, learnedRunPanes],
   );
 
   const applyPanes = useCallback(
@@ -99,7 +110,9 @@ export function useStudioPanes() {
         { replace: true, state: options?.state },
       );
       if (options?.learn && next.length > 0 && !workflowDeleted) {
-        const cls = layoutClassForSearch(search);
+        const cls = layoutClassForSearch(
+          searchWithRunReference(search, studioRunId),
+        );
         if (cls !== null) {
           setPaneLayout(cls, next);
         }
@@ -108,6 +121,7 @@ export function useStudioPanes() {
     [
       navigate,
       location.search,
+      studioRunId,
       resolveLivePanes,
       notePaneWrite,
       workflowDeleted,

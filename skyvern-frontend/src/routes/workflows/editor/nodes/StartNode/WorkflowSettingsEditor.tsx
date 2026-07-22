@@ -1,7 +1,7 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserProfileSelector";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -88,7 +88,7 @@ function WorkflowSettingsEditorBody({
   blockId: string;
   data: WorkflowStartNodeData;
 }) {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const update = useUpdate<StartNode["data"]>({ id: blockId, editable: true });

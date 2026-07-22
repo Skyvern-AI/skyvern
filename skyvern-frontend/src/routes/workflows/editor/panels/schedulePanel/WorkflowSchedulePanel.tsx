@@ -19,7 +19,7 @@ import { ScheduleCard } from "./ScheduleCard";
 import { CreateScheduleDialog } from "./CreateScheduleDialog";
 import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 type Props = {
   onClose?: () => void;
@@ -40,7 +40,7 @@ function WorkflowSchedulePanel({ onClose }: Props) {
     scheduleId: string | null;
   }>({ open: false, scheduleId: null });
 
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const workflowParameters = workflow?.workflow_definition.parameters ?? [];
 

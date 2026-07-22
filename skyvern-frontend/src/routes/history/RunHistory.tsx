@@ -48,7 +48,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
-import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
@@ -170,17 +169,12 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   return null;
 }
 
-function getRunNavigationPath(
-  run: TaskRunListItem,
-  studioEnabled: boolean,
-): string {
+function getRunNavigationPath(run: TaskRunListItem): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
-      // With the studio on, workflow runs open in its Run tab; otherwise they
-      // use the standalone run page (also the fallback when there is no wpid).
-      return studioEnabled && run.workflow_permanent_id
-        ? `/agents/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
-        : `/runs/${run.run_id}`;
+      // /runs/{wr} renders the studio run view when the preview is on and the
+      // legacy run page when it is off, so one short path serves both.
+      return `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV1:
@@ -254,7 +248,6 @@ function RunHistory() {
     workflowPermanentIds,
   });
   const navigate = useNavigate();
-  const studioEnabled = useWorkflowStudioEnabled();
 
   const { data: nextPageRuns } = useRunsQuery({
     page: page + 1,
@@ -418,7 +411,7 @@ function RunHistory() {
       );
       const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
-      const navPath = getRunNavigationPath(run, studioEnabled);
+      const navPath = getRunNavigationPath(run);
       const triggerType = inferTriggerType(run);
       const runTags = runTagsMap[run.run_id];
       const selectableIndex = selectableIndexById.get(run.run_id) ?? -1;

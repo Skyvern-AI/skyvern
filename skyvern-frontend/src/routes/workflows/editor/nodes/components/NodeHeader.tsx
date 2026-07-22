@@ -7,7 +7,8 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useRef, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
 
@@ -253,7 +254,7 @@ function NodeHeader({
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
     useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
@@ -590,7 +591,13 @@ function NodeHeader({
           bl: label,
         });
         search.set(STUDIO_PANES_PARAM, panes.join(","));
-        navigate(`/agents/${workflowPermanentId}/studio?${search}`);
+        // Under the short /runs/{wr} URL the run id is the pathname, so keep it
+        // and only swap the search; from the editor it is a full studio path.
+        if (location.pathname.startsWith("/runs/")) {
+          navigate({ search: `?${search.toString()}` });
+        } else {
+          navigate(`/agents/${workflowPermanentId}/studio?${search}`);
+        }
       } else {
         navigate(
           `/agents/${workflowPermanentId}/${response.data.run_id}/${label}/build`,

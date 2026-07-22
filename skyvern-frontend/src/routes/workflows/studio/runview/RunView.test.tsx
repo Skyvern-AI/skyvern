@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
@@ -248,7 +248,16 @@ function renderRunView(
           <StudioPaneCompactContext.Provider value={compact}>
             <RunPaneViewToggles />
           </StudioPaneCompactContext.Provider>
-          <RunView workflowRunId="wr_1" {...props} />
+          {initialEntry.startsWith("/runs/") ? (
+            <Routes>
+              <Route
+                path="/runs/:runId"
+                element={<RunView workflowRunId="wr_1" {...props} />}
+              />
+            </Routes>
+          ) : (
+            <RunView workflowRunId="wr_1" {...props} />
+          )}
         </TooltipProvider>
         <LocationSpy />
       </MemoryRouter>
@@ -418,6 +427,13 @@ describe("RunView cold-open selection", () => {
 
     expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
     expect(getByTestId("location-search").textContent).toContain("active=");
+  });
+
+  test("a terminal /runs/{wr} short link with no ?active= selects the last item", () => {
+    seedTerminalRunWithActions();
+    renderRunView({}, "/runs/wr_1");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
   });
 
   test("an explicit ?active= deep link wins over the last-item default", () => {

@@ -532,11 +532,10 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       if (studioEnabled) {
-        // A full-run start lands on the bare ?wr= deep link; the learned run
-        // layout (or factory copilot,browser,overview) restores via the fallback.
-        navigate(
-          `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
-        );
+        // A full-run start lands on the bare /runs/{wr} deep link; the learned
+        // run layout (or factory copilot,browser,overview) restores via the
+        // fallback.
+        navigate(`/runs/${response.data.workflow_run_id}`);
       } else {
         navigate(
           env.useNewRunsUrl

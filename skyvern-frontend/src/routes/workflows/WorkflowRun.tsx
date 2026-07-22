@@ -537,20 +537,21 @@ function WorkflowRun() {
     return <Status404 />;
   }
 
-  // With the preview on, route legacy run links into the studio Run tab
-  // (preserving the selected item); flag-off keeps this legacy run view.
+  // With the preview on, route legacy run links into the studio run view under
+  // the short /runs/{wr} URL (preserving the selected item); flag-off keeps this
+  // legacy run view. The run id lives in the path, so it stays out of the query.
   if (studioEnabled && !isEmbedded && workflowRunId && workflowPermanentId) {
     const studioParams = new URLSearchParams();
-    studioParams.set("wr", workflowRunId);
     if (active) {
       studioParams.set("active", active);
     }
     if (iterationParam) {
       studioParams.set("iteration", iterationParam);
     }
+    const search = studioParams.toString();
     return (
       <Navigate
-        to={`/agents/${workflowPermanentId}/studio?${studioParams.toString()}`}
+        to={`/runs/${workflowRunId}${search ? `?${search}` : ""}`}
         replace
       />
     );

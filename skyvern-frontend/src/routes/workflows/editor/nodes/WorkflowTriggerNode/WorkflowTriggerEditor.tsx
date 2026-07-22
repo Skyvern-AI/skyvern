@@ -1,6 +1,6 @@
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useCallback, useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
@@ -80,7 +80,7 @@ function WorkflowTriggerEditorBody({
     nextLoopOnFailure,
   } = data;
 
-  const { workflowPermanentId: parentWorkflowPermanentId } = useParams();
+  const parentWorkflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);

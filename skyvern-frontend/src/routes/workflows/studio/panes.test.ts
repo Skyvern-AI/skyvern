@@ -16,6 +16,7 @@ import {
   parsePanesParam,
   resolveOpenPanes,
   searchWithPanes,
+  searchWithRunReference,
   toReadableSearch,
   togglePane,
   withPaneClosed,
@@ -498,5 +499,32 @@ describe("layoutClassForSearch", () => {
 
   test("?active= with ?bl= → null", () => {
     expect(layoutClassForSearch("?active=act_1&bl=block_1")).toBeNull();
+  });
+});
+
+describe("searchWithRunReference", () => {
+  test("injects ?wr= from the path run so /runs/{wr} resolves run-class panes", () => {
+    expect(searchWithRunReference("", "wr_123")).toBe("?wr=wr_123");
+    expect(resolveOpenPanes(searchWithRunReference("", "wr_123"))).toEqual(
+      RUN_APPEND_PANES,
+    );
+    expect(layoutClassForSearch(searchWithRunReference("", "wr_123"))).toBe(
+      "run",
+    );
+  });
+
+  test("keeps an explicit ?wr= and other params untouched", () => {
+    expect(searchWithRunReference("?wr=wr_a&bl=b", "wr_b")).toBe(
+      "?wr=wr_a&bl=b",
+    );
+    expect(searchWithRunReference("?panes=browser", "wr_1")).toBe(
+      "?panes=browser&wr=wr_1",
+    );
+  });
+
+  test("no run id is a no-op (edit surfaces keep their search)", () => {
+    expect(searchWithRunReference("?panes=editor", undefined)).toBe(
+      "?panes=editor",
+    );
   });
 });

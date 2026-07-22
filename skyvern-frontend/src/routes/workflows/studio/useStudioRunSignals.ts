@@ -1,4 +1,4 @@
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
@@ -12,7 +12,7 @@ import { useStudioRunId } from "./useStudioRunId";
  */
 export function useStudioRunSignals() {
   const urlRunId = useStudioRunId();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: urlRun } = useWorkflowRunWithWorkflowQuery(
     urlRunId ? { workflowRunId: urlRunId } : undefined,
   );
