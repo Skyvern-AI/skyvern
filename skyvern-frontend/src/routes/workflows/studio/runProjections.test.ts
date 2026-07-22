@@ -1,6 +1,11 @@
 import { describe, expect, test } from "vitest";
 
-import { ActionsApiResponse, Status, TaskV2 } from "@/api/types";
+import {
+  ActionsApiResponse,
+  Status,
+  TaskV2,
+  type WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 import {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem,
@@ -11,6 +16,7 @@ import {
   buildBlockStatusMap,
   buildFilmstrip,
   finalizedRunStatus,
+  formatRunTimesTooltip,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "./runProjections";
@@ -445,5 +451,40 @@ describe("buildActionIndex", () => {
 
   test("empty timeline yields an empty index", () => {
     expect(buildActionIndex(undefined).size).toBe(0);
+  });
+});
+
+describe("formatRunTimesTooltip", () => {
+  function run(
+    overrides: Partial<WorkflowRunStatusApiResponseWithWorkflow> = {},
+  ): WorkflowRunStatusApiResponseWithWorkflow {
+    return {
+      status: Status.Completed,
+      created_at: "2026-06-30T23:59:00Z",
+      queued_at: "2026-06-30T23:59:30Z",
+      started_at: "2026-07-01T00:00:00Z",
+      finished_at: "2026-07-01T00:05:00Z",
+      ...overrides,
+    } as WorkflowRunStatusApiResponseWithWorkflow;
+  }
+
+  test("lists created, queued, started, finished for a finalized run", () => {
+    const title = formatRunTimesTooltip(run());
+    expect(title).toContain("Created");
+    expect(title).toContain("Queued");
+    expect(title).toContain("Started");
+    expect(title).toContain("Finished");
+    expect(title.split("\n")).toHaveLength(4);
+  });
+
+  test("omits absent timestamps and holds Finished until the run finalizes", () => {
+    const title = formatRunTimesTooltip(
+      run({ status: Status.Running, queued_at: null, started_at: null }),
+    );
+    expect(title).toContain("Created");
+    expect(title).not.toContain("Queued");
+    expect(title).not.toContain("Started");
+    // finished_at is present but the run is not finalized → still hidden.
+    expect(title).not.toContain("Finished");
   });
 });

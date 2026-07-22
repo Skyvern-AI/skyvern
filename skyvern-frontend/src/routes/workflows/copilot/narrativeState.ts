@@ -575,6 +575,21 @@ export function isBlockOk(
   );
 }
 
+// Labels that occur exactly once in the given set — the only labels safe to
+// key recorded actions on when the run-block id is missing (the terminal
+// narrative_payload drops workflowRunBlockId). Loop iterations reuse a label,
+// so an ambiguous label falls back to today's drop rather than mis-attributing.
+function uniqueLabelSet(labels: Array<string | undefined>): Set<string> {
+  const counts = new Map<string, number>();
+  for (const label of labels) {
+    if (!label) continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const unique = new Set<string>();
+  for (const [label, n] of counts) if (n === 1) unique.add(label);
+  return unique;
+}
+
 export function applyNarrativeEvent(
   prev: TurnNarrativeState,
   event: NarrativeEvent,
@@ -728,6 +743,10 @@ export function applyNarrativeEvent(
       // visibly wrong, re-merge matched actionIds instead of skipping them.
       let carry = 0;
       let changed = false;
+      // Match by run-block id only. A terminal frame restores each block's real
+      // id from the live blocks (see the `response` case), so a post-terminal
+      // fetch still matches by id — and a different run's ids never collide with
+      // this turn's, keeping late fetches from cross-contaminating prior turns.
       const blocks = prev.blocks.map((b) => {
         const match = event.blocks.find(
           (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
@@ -840,24 +859,44 @@ export function applyNarrativeEvent(
     case "response": {
       const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
       if (hydrated) {
-        // The backend payload never carries recordedActions/recordedActionsAt
-        // (client-only replay data); carry them over from the prior live
-        // blocks so a fetch that resolved before this terminal frame
-        // survives hydration instead of being silently dropped.
-        const recordedById = new Map(
+        // The BE narrative_payload drops workflowRunBlockId and the client-only
+        // recordedActions. Re-associate each hydrated block with the live block
+        // of the same label to restore its real run-block id (and carry any
+        // recordedActions). Restoring the real id keeps this frozen turn keyed
+        // by id, so a later test run that reuses a label matches by id and can't
+        // graft its actions onto this turn. Unique labels only — loop iterations
+        // reuse a label and can't be told apart without the id.
+        const liveById = new Map(
           prev.blocks
-            .filter((b) => b.recordedActions !== undefined)
+            .filter((b) => b.workflowRunBlockId !== "")
             .map((b) => [b.workflowRunBlockId, b] as const),
         );
+        const uniqueLiveLabels = uniqueLabelSet(
+          prev.blocks.map((b) => b.label),
+        );
+        const uniqueHydratedLabels = uniqueLabelSet(
+          hydrated.blocks.map((b) => b.label),
+        );
+        const liveByLabel = new Map(
+          prev.blocks
+            .filter((b) => uniqueLiveLabels.has(b.label))
+            .map((b) => [b.label, b] as const),
+        );
         const blocks = hydrated.blocks.map((b) => {
-          const carried = recordedById.get(b.workflowRunBlockId);
-          return carried
-            ? {
-                ...b,
-                recordedActions: carried.recordedActions,
-                recordedActionsAt: carried.recordedActionsAt,
-              }
-            : b;
+          const live =
+            (b.workflowRunBlockId !== ""
+              ? liveById.get(b.workflowRunBlockId)
+              : undefined) ??
+            (b.workflowRunBlockId === "" && uniqueHydratedLabels.has(b.label)
+              ? liveByLabel.get(b.label)
+              : undefined);
+          if (!live) return b;
+          return {
+            ...b,
+            workflowRunBlockId: live.workflowRunBlockId,
+            recordedActions: live.recordedActions,
+            recordedActionsAt: live.recordedActionsAt,
+          };
         });
         return {
           ...hydrated,
