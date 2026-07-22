@@ -597,3 +597,32 @@ describe("derivePhases — redraft re-activation (SKY-11970 pin)", () => {
     expect(phase(rows, "draft").status).not.toBe("active");
   });
 });
+
+describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)", () => {
+  const notConfirmedTurn = (runToolNames: string[]): TurnNarrativeState =>
+    turn({
+      terminal: "response",
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [block({ state: "completed", outcome: "not_demonstrated" })],
+      designActivity: runToolNames.map((toolName, i) =>
+        entry({ id: `r${i}`, kind: "tool_call", toolName }),
+      ),
+    });
+
+  it("surfaces the run count on a multi-run redraft loop (else 6 runs read as 1)", () => {
+    const rows = derivePhases(
+      notConfirmedTurn([
+        "update_and_run_blocks",
+        "update_and_run_blocks",
+        "run_blocks_and_collect_debug",
+      ]),
+    );
+    expect(phase(rows, "test").stub).toBe("3 runs · not confirmed");
+  });
+
+  it("omits the count for a single run, keeping today's look", () => {
+    const rows = derivePhases(notConfirmedTurn(["update_and_run_blocks"]));
+    expect(phase(rows, "test").stub).toBe("· not confirmed");
+  });
+});
