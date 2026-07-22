@@ -2353,9 +2353,49 @@ def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCri
     )
 
 
+def _floor_rekeyed_requested_output_paths(ctx: AgentContext) -> set[str]:
+    """Identity of runtime-output criteria whose slot rekey cleared ``output_path``; the rekey
+    preserves it in ``floor_rekeyed_from_path``, and without it they vanish from the requested set."""
+    return {
+        criterion.floor_rekeyed_from_path
+        for criterion in _pre_run_gated_completion_criteria(ctx)
+        if criterion.requested_output_floor_rekeyed
+        and criterion.floor_rekeyed_from_path
+        and criterion.kind == "outcome"
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.requested_output_evidence_source == "runtime_output"
+    }
+
+
+def pre_run_gated_outputs_without_path(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    """Pre-run-gated runtime-output criteria carrying neither an ``output_path`` nor rekey
+    provenance, so nothing identifies them and they would drop from the gate unseen."""
+    return tuple(
+        criterion
+        for criterion in _pre_run_gated_completion_criteria(ctx)
+        if criterion.kind == "outcome"
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.requested_output_evidence_source == "runtime_output"
+        and not criterion.output_path
+        and not (criterion.requested_output_floor_rekeyed and criterion.floor_rekeyed_from_path)
+    )
+
+
 def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
     pre_run_gated_paths = set(requested_output_paths(_pre_run_gated_completion_criteria(ctx)))
-    paths = set(pre_run_gated_paths)
+    unregisterable = pre_run_gated_outputs_without_path(ctx)
+    if unregisterable:
+        LOG.warning(
+            "copilot_pre_run_gated_output_criterion_without_path",
+            count=len(unregisterable),
+            criterion_ids=[criterion.id for criterion in unregisterable],
+            outcomes=[criterion.outcome[:80] for criterion in unregisterable],
+            floor_rekeyed=[criterion.requested_output_floor_rekeyed for criterion in unregisterable],
+            floor_rekeyed_from_path=[criterion.floor_rekeyed_from_path for criterion in unregisterable],
+        )
+    paths = set(pre_run_gated_paths) | _floor_rekeyed_requested_output_paths(ctx)
     repair_context = ctx.last_code_authoring_repair_context
     if repair_context is not None:
         paths.update(
@@ -2389,6 +2429,18 @@ def _requested_output_coverage_tokens(ctx: AgentContext) -> dict[str, frozenset[
         tokens_by_path.setdefault(path, set()).update(
             token for token in leaf_tokens if token not in _COVERAGE_GENERIC_TOKENS
         )
+    # A rekeyed path is an opaque digest whose leaf would never match the page and would false-match
+    # on "request"/"slot", so coverage keys on the outcome text instead.
+    for criterion in _pre_run_gated_completion_criteria(ctx):
+        if not (criterion.requested_output_floor_rekeyed and criterion.floor_rekeyed_from_path):
+            continue
+        outcome_tokens = {
+            token
+            for token in COVERAGE_TOKEN_RE.findall((criterion.outcome or "").lower())
+            if token not in _COVERAGE_GENERIC_TOKENS
+        }
+        if outcome_tokens:
+            tokens_by_path[criterion.floor_rekeyed_from_path] = outcome_tokens
     return {
         path: frozenset(token for token in tokens if not token.isdigit()) for path, tokens in tokens_by_path.items()
     }
@@ -2430,14 +2482,24 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
+def _effective_requested_output_path(criterion: CompletionCriterion) -> str | None:
+    """The path a requested output is known by, falling back to the identity a slot rekey preserved."""
+    if criterion.output_path:
+        return criterion.output_path
+    if criterion.requested_output_floor_rekeyed and criterion.floor_rekeyed_from_path:
+        return criterion.floor_rekeyed_from_path
+    return None
+
+
 def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, ...]]:
     requested_paths = _requested_output_paths_for_ctx(ctx)
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
         outcome = criterion.outcome.strip()
-        if criterion.output_path in requested_paths and outcome:
-            labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (outcome,)
+        path = _effective_requested_output_path(criterion)
+        if path in requested_paths and outcome:
+            labels_by_path.setdefault(path, ())
+            labels_by_path[path] += (outcome,)
     return labels_by_path
 
 
@@ -2464,9 +2526,11 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
         outcome = criterion.outcome.strip()
-        if criterion.output_path in requested_paths and outcome:
-            labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (outcome,)
+        path = _effective_requested_output_path(criterion)
+        if path in requested_paths and outcome:
+            labels_by_path.setdefault(path, ())
+            labels_by_path[path] += (outcome,)
+    # A path with no label is an underivable field; withholding the plan keeps a clarification legitimate.
     if set(labels_by_path) != requested_paths:
         return None
     return derive_requested_output_extraction_plan(
