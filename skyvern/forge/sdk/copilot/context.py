@@ -130,7 +130,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentClassifierResult
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -678,6 +678,9 @@ class CopilotContext(AgentContext):
     impose_synthesized_code_block: bool = False
     target_block_label: str | None = None
     turn_intent: TurnIntent | None = None
+    # Retained so a policy mutated after the pre-flight credential pause can be
+    # re-derived into an authority envelope without re-running the classifier.
+    turn_intent_classifier_result: TurnIntentClassifierResult | None = None
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None

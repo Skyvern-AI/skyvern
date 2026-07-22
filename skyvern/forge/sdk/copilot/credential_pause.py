@@ -44,6 +44,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.context import CopilotContext
+
     # Importing the routes package at module scope pulls in workflow_copilot.py ->
     # agent.py -> enforcement.py, which imports this module -> circular import.
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
@@ -237,6 +239,9 @@ def credential_pause_reason(ctx: Any) -> str | None:
     """
     policy = getattr(ctx, "request_policy", None)
     skip_test = isinstance(policy, RequestPolicy) and policy.testing_intent == "skip_test"
+    if isinstance(policy, RequestPolicy) and policy.clarification_reason == "login_credentials_unresolved":
+        return "login_credentials_unresolved"
+
     if getattr(ctx, "last_run_skipped_unbound_credentials", False) and not skip_test:
         # A skip_test turn can still land here: _request_policy_allows_update_and_skip_run
         # (guardrails.py) skips the run for a skip_test-deferred credential, same as it
@@ -393,18 +398,18 @@ async def _wait_for_credential_response(
     return None
 
 
-async def maybe_credential_pause(
+async def _run_credential_pause(
     ctx: Any,
-    result: RunResultStreaming,
+    message: str,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
-) -> list[dict[str, Any]] | None:
-    """Pause a finalizing turn that hit a typed mid-build credential ask.
+) -> CredentialPauseResolution | None:
+    """Send the credential card and wait for the user's decision.
 
-    Returns the resume messages to re-enter the loop with, or None to let
-    the caller finalize normally (kill-switch off, client can't render the
-    frame, already paused once this turn, no cache configured or not shared
-    across workers, client gone, or no typed signal fired).
+    Returns the resolution, or None to let the caller proceed without one
+    (kill-switch off, client can't render the frame, already paused once this
+    turn, no cache configured or not shared across workers, client gone, no
+    typed signal fired, or the wait timed out).
     """
     if not credential_pause_would_fire(ctx, copilot_config):
         return None
@@ -447,12 +452,6 @@ async def maybe_credential_pause(
         _encode_active_pause(resume_token, expires_at),
         ex=_credential_pause_record_ttl(timeout_seconds),
     )
-
-    # Local import: same module-load-cycle reason as _assemble_resume_messages.
-    from skyvern.forge.sdk.copilot.enforcement import _parse_normalized_final_response
-
-    parsed = _parse_normalized_final_response(result)
-    message = str((parsed or {}).get("user_response") or "")
 
     await stream.send(
         WorkflowCopilotCredentialRequiredUpdate(
@@ -530,7 +529,7 @@ async def maybe_credential_pause(
         # last_test_ok=False; without clearing it, the resumed reply is intercepted
         # by the generic failed-test nudge instead of honoring the skip decision.
         ctx.last_test_ok = None
-        return _assemble_resume_messages(ctx, _SKIP_RESUME_TEXT)
+        return resolution
 
     credential = resolution.credential
     if credential is None:
@@ -539,4 +538,70 @@ async def maybe_credential_pause(
     if isinstance(policy, RequestPolicy):
         _apply_connected_credential_to_policy(ctx, policy, credential)
     ctx.credential_pause_outcome = "connected"
+    return resolution
+
+
+async def maybe_credential_pause(
+    ctx: Any,
+    result: RunResultStreaming,
+    stream: EventSourceStream,
+    copilot_config: CopilotConfig,
+) -> list[dict[str, Any]] | None:
+    """Pause a finalizing turn that hit a typed mid-build credential ask.
+
+    Returns the resume messages to re-enter the loop with, or None to let the
+    caller finalize normally.
+    """
+    if not credential_pause_would_fire(ctx, copilot_config):
+        return None
+    # Local import: same module-load-cycle reason as _assemble_resume_messages.
+    from skyvern.forge.sdk.copilot.enforcement import _parse_normalized_final_response
+
+    parsed = _parse_normalized_final_response(result)
+    resolution = await _run_credential_pause(
+        ctx,
+        str((parsed or {}).get("user_response") or ""),
+        stream,
+        copilot_config,
+    )
+    if resolution is None:
+        return None
+    if resolution.action == "skip":
+        return _assemble_resume_messages(ctx, _SKIP_RESUME_TEXT)
+    credential = resolution.credential
+    if credential is None:
+        return None
     return _assemble_resume_messages(ctx, _connected_resume_text(credential))
+
+
+async def preflight_credential_pause(
+    ctx: CopilotContext,
+    stream: EventSourceStream,
+    copilot_config: CopilotConfig,
+) -> CredentialPauseResolution | None:
+    """Ask for a credential before the agent loop starts, so no build precedes the ask.
+
+    Both decisions clear the clarification block the request policy raised, so the
+    caller falls through into a normal run instead of the terminal clarify; a
+    declined turn must not keep a reason that would re-surface the card CTA.
+    """
+    policy = ctx.request_policy
+    question = (policy.clarification_question or "") if policy is not None else ""
+    resolution = await _run_credential_pause(ctx, question, stream, copilot_config)
+    if resolution is None or policy is None:
+        return resolution
+    policy.user_response_policy = "proceed"
+    if policy.authoring_intent == "defer_authoring":
+        # Lifting the credential clarification must not also lift the user's
+        # explicit defer_authoring hold. Re-apply it, overriding the run grant
+        # a connect resolution stamped via _apply_connected_credential_to_policy.
+        policy.allow_update_workflow = False
+        policy.allow_run_blocks = False
+    else:
+        policy.allow_update_workflow = True
+        policy.allow_run_blocks = True
+    if resolution.action == "skip":
+        policy.allow_missing_credentials_in_draft = True
+        policy.requires_user_clarification = False
+        policy.clarification_reason = "none"
+    return resolution

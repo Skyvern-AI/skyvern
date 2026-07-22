@@ -453,6 +453,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "workflow_credential_inputs_unbound",
         "missing_credential_run_failure",
         "credential_deferred_draft",
+        "login_credentials_unresolved",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
