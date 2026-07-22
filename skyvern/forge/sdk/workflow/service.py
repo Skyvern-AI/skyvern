@@ -9162,12 +9162,24 @@ class WorkflowService:
         """Whether this run should attempt cached-script execution.
 
         Priority: run-level run_with > workflow-level run_with. Intended-code
-        runs are then passed through the app-level code-mode gate.
+        runs are then passed through the app-level code-mode gate. Runs not
+        already intended as code may be upgraded by a flag-gated rollout;
+        an upgraded run has no matching script for a non-eligible workflow
+        and so degrades cleanly to agent per block.
         """
         if workflow_run.run_with is not None:
             intended_code = workflow_run.run_with == "code"
         else:
             intended_code = workflow.run_with == "code"
+        # A fallback retry has already made a deliberate execution-mode choice; the rollout must not
+        # re-upgrade it to code. Gate on the retry marker rather than `run_with is None`: normal runs
+        # inherit run_with="agent" from the workflow, so keying on None would disable the rollout for
+        # every ordinary run.
+        if not intended_code and workflow_run.retried_from_workflow_run_id is None:
+            intended_code = await app.AGENT_FUNCTION.should_upgrade_to_code_mode(
+                workflow=workflow,
+                workflow_run=workflow_run,
+            )
         if not intended_code:
             return False
         return await app.AGENT_FUNCTION.should_keep_code_mode_for_workflow_run(
