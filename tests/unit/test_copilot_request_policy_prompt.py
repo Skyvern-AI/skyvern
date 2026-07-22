@@ -737,3 +737,39 @@ class TestClassifierFallbackCompletionCriteria:
                 },
             )
         ]
+
+
+class TestLoginIntentSignal:
+    def test_prompt_declares_login_intent_in_the_output_contract(self) -> None:
+        rendered = _render()
+        assert "login_intent" in rendered
+
+    def test_prompt_keeps_login_intent_orthogonal_to_credential_input_kind(self) -> None:
+        rendered = _render()
+        assert "Independent of credential_input_kind" in rendered
+
+    @pytest.mark.asyncio
+    async def test_classifier_login_intent_is_carried_onto_the_policy(self) -> None:
+        async def stub(prompt: str, prompt_name: str) -> dict[str, object]:
+            return {"credential_input_kind": "none", "login_intent": True}
+
+        policy = await _classify_request(
+            user_message="Log in to the billing portal and export the statement.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=stub,
+        )
+
+        assert policy.login_intent is True
+
+    @pytest.mark.asyncio
+    async def test_absent_login_intent_defaults_to_false(self) -> None:
+        policy = await _classify("Build a workflow that scrapes the product table.", kind="none")
+
+        assert policy.login_intent is False
+
+    def test_login_intent_is_stamped_in_turn_telemetry(self) -> None:
+        """QA discards runs whose request_policy span carries no typed signal."""
+        assert request_policy_module.RequestPolicy(login_intent=True).to_trace_data()["login_intent"] is True
+        assert request_policy_module.RequestPolicy().to_trace_data()["login_intent"] is False

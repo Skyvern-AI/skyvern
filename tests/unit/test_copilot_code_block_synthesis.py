@@ -417,6 +417,46 @@ def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
     assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
 
 
+def test_rekeyed_outputs_with_alike_labels_return_under_distinct_keys() -> None:
+    # Labels are not guaranteed distinct, so alike-slugging labels must not collapse onto one key.
+    plan = RequestedOutputExtractionPlan(
+        requested_output_paths=("output.request_slot_aaa_00", "output.request_slot_aaa_01"),
+        observation_step=3,
+        observation_identity="observation-identity",
+        reveal=RevealAnchor(selector="#show"),
+        live_reads=(
+            LiveReadBinding(
+                output_path="output.request_slot_aaa_00",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=0,
+                child_index=1,
+                child_count=2,
+                relation_label="Visitors",
+            ),
+            LiveReadBinding(
+                output_path="output.request_slot_aaa_01",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=1,
+                child_index=1,
+                child_count=2,
+                relation_label="visitors",
+            ),
+        ),
+        identity="plan-identity",
+    )
+
+    suffix = synthesize_extraction_suffix(plan)
+
+    assert suffix is not None
+    assert '"visitors": _extraction_value_0' in suffix.code
+    assert '"visitors_2": _extraction_value_1' in suffix.code
+    assert "request_slot_aaa" not in suffix.code
+
+
 def _extraction_plan() -> RequestedOutputExtractionPlan:
     return RequestedOutputExtractionPlan(
         requested_output_paths=(

@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
     RequestPolicy,
+    _classification_from_raw,
     _workflow_credential_inputs_unbound,
     build_request_policy,
     credential_prompt_reason,
@@ -352,6 +353,7 @@ def test_credential_prompt_clarification_reasons_membership() -> None:
         "credential_name_unresolved",
         "credential_invention_requested",
         "workflow_credential_inputs_unbound",
+        "login_credentials_unresolved",
     }
 
 
@@ -454,6 +456,7 @@ async def _build_with_forced_classifier(
     org_credentials: list[SimpleNamespace],
     get_credentials: AsyncMock | None = None,
     get_credentials_by_ids: AsyncMock | None = None,
+    workflow_yaml: str = "",
 ) -> RequestPolicy:
     load_mock = get_credentials or AsyncMock(return_value=org_credentials)
     by_ids_mock = get_credentials_by_ids or AsyncMock(return_value=[])
@@ -467,7 +470,7 @@ async def _build_with_forced_classifier(
     ):
         return await build_request_policy(
             user_message=user_message,
-            workflow_yaml="",
+            workflow_yaml=workflow_yaml,
             chat_history=[],
             global_llm_context="",
             organization_id="o_test",
@@ -681,3 +684,199 @@ async def test_success_raw_secret_blocks_name_scan_before_loading_credentials() 
 
     assert policy.resolved_credentials == []
     load_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_login_intent_with_no_reachable_credential_asks_before_any_build() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log in to https://portal.example.com/login and download this month's invoices.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[],
+    )
+
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.user_response_policy == "ask_clarification"
+    assert policy.requires_user_clarification is True
+    assert policy.allow_run_blocks is False
+    assert policy.allow_update_workflow is False
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+async def test_first_touch_bare_login_task_without_a_concrete_target_draws_no_credential_ask() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Let's log in to the webpage and export the latest statement.",
+        classifier_policy=RequestPolicy(login_intent=True, classifier_status="success"),
+        org_credentials=[],
+    )
+
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.user_response_policy == "proceed"
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_login_intent_without_credential_phrasing_asks_once_a_url_names_the_target() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://billing.example.com and export the statement.",
+        classifier_policy=RequestPolicy(login_intent=True, classifier_status="success"),
+        org_credentials=[],
+    )
+
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.user_response_policy == "ask_clarification"
+    assert policy.clarification_question is not None
+
+
+@pytest.mark.asyncio
+async def test_login_intent_on_an_existing_workflow_asks_without_a_url_in_the_message() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to the billing portal and export the statement.",
+        classifier_policy=RequestPolicy(login_intent=True, classifier_status="success"),
+        org_credentials=[],
+        workflow_yaml=_yaml(
+            """
+            title: Billing export
+            workflow_definition:
+              blocks:
+                - block_type: task
+                  label: export
+            """
+        ),
+    )
+
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.user_response_policy == "ask_clarification"
+
+
+@pytest.mark.asyncio
+async def test_classifier_emitted_login_credentials_unresolved_is_not_trusted() -> None:
+    policy = _classification_from_raw(
+        {
+            "testing_intent": "unspecified",
+            "credential_input_kind": "none",
+            "credential_refs": [],
+            "login_page_urls": [],
+            "requires_user_clarification": True,
+            "clarification_reason": "login_credentials_unresolved",
+            "completion_contract": None,
+        }
+    )
+
+    assert policy.clarification_reason == "none"
+
+
+@pytest.mark.asyncio
+async def test_login_intent_satisfied_by_matching_org_credential_draws_no_ask() -> None:
+    credential = _cred("portal-cred", "cred_url", tested_url="https://portal.example.com/login")
+    policy = await _build_with_forced_classifier(
+        user_message="Log in to https://portal.example.com/login and download this month's invoices.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.user_response_policy == "proceed"
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_login_intent_satisfied_by_a_workflow_bound_credential_draws_no_ask() -> None:
+    yaml = _yaml(
+        """
+        title: example
+        workflow_definition:
+          parameters:
+          - key: portal_login
+            parameter_type: credential
+            credential_id: cred_bound
+          blocks: []
+        """
+    )
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to the portal and export the statement.",
+        classifier_policy=RequestPolicy(login_intent=True, classifier_status="success"),
+        org_credentials=[],
+        workflow_yaml=yaml,
+    )
+
+    assert policy.existing_workflow_credential_ids == ["cred_bound"]
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.user_response_policy == "proceed"
+
+
+@pytest.mark.asyncio
+async def test_a_non_login_request_never_draws_the_login_credential_ask() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Go to https://portal.example.com/login and tell me what fields the form has.",
+        classifier_policy=RequestPolicy(login_intent=False, classifier_status="success"),
+        org_credentials=[],
+    )
+
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.user_response_policy == "proceed"
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_a_user_named_credential_that_misses_keeps_the_name_unresolved_ask() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log in using my saved credential named portal-login.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="credential_name",
+            credential_refs=["portal-login"],
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("something-else", "cred_other")],
+    )
+
+    assert policy.clarification_reason == "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_draft_only_login_request_is_not_interrupted_for_a_credential() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Draft a workflow that logs in to the portal. Don't run it, I'll test it myself.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            testing_intent="skip_test",
+            classifier_status="success",
+        ),
+        org_credentials=[],
+    )
+
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.allow_missing_credentials_in_draft is True
+
+
+@pytest.mark.asyncio
+async def test_a_pasted_secret_under_login_intent_keeps_the_raw_secret_refusal() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log in with password hunter2",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="raw_secret",
+            raw_secret_detected=True,
+            classifier_status="success",
+        ),
+        org_credentials=[],
+    )
+
+    assert policy.clarification_reason == "raw_secret"
+
+
+def test_login_credentials_unresolved_surfaces_a_prompt_but_grants_no_deferred_draft_authority() -> None:
+    assert "login_credentials_unresolved" in CREDENTIAL_PROMPT_CLARIFICATION_REASONS
+    assert "login_credentials_unresolved" not in CREDENTIAL_DEFERRED_DRAFT_REASONS
