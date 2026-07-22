@@ -417,7 +417,7 @@ class SkyvernElement:
         if not must_visible_style:
             return True
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-        return await skyvern_frame.get_element_visible(await self.get_element_handler())
+        return await skyvern_frame.get_element_visible(self.get_locator())
 
     async def is_editable(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         try:

@@ -388,8 +388,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
               <DialogTitle>Start a full run?</DialogTitle>
               <DialogDescription>
                 A block run is still executing. It will keep running — you can
-                watch it in the Browser pane while the Overview pane switches to
-                the new full run.
+                watch it in the Browser pane while the Run pane switches to the
+                new full run.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -441,7 +441,8 @@ export function StudioTopBar() {
       <div className="min-w-3 flex-1" />
       {workflowDeletedAt ? (
         // Legacy run-header tag idiom; every workflow-mutating action (save,
-        // schedule, inputs, run) is gone with the agent.
+        // schedule, inputs, run) is gone with the agent. Run history stays
+        // reachable from the Past Runs rail tab.
         <span
           title={basicTimeFormat(workflowDeletedAt)}
           className="shrink-0 text-xs text-muted-foreground"

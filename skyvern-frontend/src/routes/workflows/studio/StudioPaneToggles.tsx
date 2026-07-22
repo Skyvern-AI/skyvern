@@ -1,12 +1,18 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
 
 import { Status } from "@/api/types";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
 import { ControlTooltip } from "./ControlTooltip";
+import { PastRunsList } from "./PastRunsList";
 import { studioPanelId, studioTabId } from "./constants";
-import { STUDIO_PANE_META } from "./paneMeta";
+import { STUDIO_PANE_META, railLabel } from "./paneMeta";
 import {
   DELETED_WORKFLOW_BLOCKED_PANES,
   STUDIO_PANE_IDS,
@@ -57,21 +63,32 @@ function useLabelsCollapsed(): boolean {
 }
 
 /**
- * The studio's pane toggles, top-center in the top bar: Copilot, Editor,
- * Browser and Overview are peer TOGGLES (multi-active, not exclusive tabs) —
- * each opens or closes its pane on the stage. Labels collapse to icons below
- * xl so the cluster never crowds the title or the run actions.
+ * The studio's pane toggles, top-center in the top bar. Copilot, Editor and
+ * Browser are peer TOGGLES (multi-active — each opens or closes its pane). The
+ * run pane's tab is different: it's the "Past Runs" selector — clicking always
+ * opens a run-history popover (it never toggles the pane), and picking a run
+ * opens/retargets the run pane. Labels collapse to icons below xl so the
+ * cluster never crowds the title or the run actions.
  */
 export function StudioPaneToggles() {
-  const { panes, togglePane } = useStudioPanes();
+  const { panes, togglePane, openPane } = useStudioPanes();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   const hasUnseenBrowserActivity = useStudioBrowserStore(
     (s) => s.hasUnseenActivity,
   );
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
 
-  const { hasRun, runStatus } = useStudioRunSignals();
+  const { runStatus } = useStudioRunSignals();
   const labelsCollapsed = useLabelsCollapsed();
+  const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
+
+  // Picking a run in the selector opens/retargets the run pane. The row's own
+  // handler pushes ?wr= first; openPane then merges against the live URL, so
+  // this materializes the run pane (overview) without dropping the new ?wr=.
+  const onSelectRun = () => {
+    openPane("overview", { learn: true });
+    setRunsSelectorOpen(false);
+  };
 
   const onToggle = (id: StudioPaneId) => {
     if (id === "browser" && !panes.includes("browser")) {
@@ -84,11 +101,9 @@ export function StudioPaneToggles() {
     workflowDeleted && DELETED_WORKFLOW_BLOCKED_PANES.includes(id);
 
   // Roving tabindex (WAI-ARIA toolbar): the cluster is one tab stop; arrow
-  // keys move focus across the enabled toggles, Enter/Space toggles.
+  // keys move focus across the enabled toggles, Enter/Space toggles/opens.
   const [focusedId, setFocusedId] = useState<StudioPaneId>(STUDIO_PANE_IDS[0]!);
-  const enabledIds = STUDIO_PANE_IDS.filter(
-    (id) => !(id === "overview" && !hasRun) && !paneBlockedByDeletion(id),
-  );
+  const enabledIds = STUDIO_PANE_IDS.filter((id) => !paneBlockedByDeletion(id));
   const tabStopId = enabledIds.includes(focusedId) ? focusedId : enabledIds[0];
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
@@ -120,47 +135,24 @@ export function StudioPaneToggles() {
       onKeyDown={onKeyDown}
     >
       {STUDIO_PANE_IDS.map((id) => {
-        const { label, icon: Icon } = STUDIO_PANE_META[id];
+        const { icon: Icon } = STUDIO_PANE_META[id];
+        // The run pane's tab reads the static "Past Runs" (railLabel); the
+        // dynamic "Run: wr_…" label lives in the pane header, not the rail.
+        const label = railLabel(id);
         const open = panes.includes(id);
         const blockedByDeletion = paneBlockedByDeletion(id);
-        const disabled = (id === "overview" && !hasRun) || blockedByDeletion;
+        const isRunSelector = id === "overview";
+        const disabled = blockedByDeletion;
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && !open;
-        const showRunStatusDot = id === "overview" && Boolean(runStatus);
+        const showRunStatusDot = isRunSelector && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
-          : id === "overview" && runStatus
-            ? `Overview, ${runStatusLabel(runStatus)}`
+          : isRunSelector && runStatus
+            ? `${label}, ${runStatusLabel(runStatus)}`
             : label;
-        const tip = blockedByDeletion
-          ? "Source agent deleted"
-          : disabled
-            ? "Overview: no runs yet"
-            : runStatus && id === "overview"
-              ? `Overview: ${runStatusLabel(runStatus)}`
-              : `${open ? "Close" : "Open"} ${label}`;
-        const button = (
-          <button
-            key={id}
-            id={studioTabId(id)}
-            type="button"
-            aria-pressed={open}
-            aria-expanded={open}
-            aria-controls={studioPanelId(id)}
-            aria-label={ariaLabel}
-            disabled={disabled}
-            tabIndex={id === tabStopId ? 0 : -1}
-            onFocus={() => setFocusedId(id)}
-            onClick={() => onToggle(id)}
-            className={cn(
-              "relative inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium transition-colors",
-              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-              open
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-              disabled && "pointer-events-none opacity-50",
-            )}
-          >
+        const iconAndDot = (
+          <>
             <Icon className="size-3.5" aria-hidden />
             <span className="hidden xl:inline">{label}</span>
             {showActivityDot ? (
@@ -181,6 +173,81 @@ export function StudioPaneToggles() {
                 )}
               />
             ) : null}
+          </>
+        );
+        const buttonClassName = cn(
+          "relative inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium transition-colors",
+          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          open
+            ? "bg-accent text-foreground"
+            : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+          disabled && "pointer-events-none opacity-50",
+        );
+
+        // The run pane's tab is a popover trigger: clicking opens the run
+        // selector (Radix manages aria-haspopup/expanded/controls). Its
+        // active state still reflects whether the run pane is open.
+        if (isRunSelector) {
+          const trigger = (
+            <PopoverTrigger asChild>
+              <button
+                id={studioTabId(id)}
+                type="button"
+                aria-pressed={open}
+                aria-label={ariaLabel}
+                tabIndex={id === tabStopId ? 0 : -1}
+                onFocus={() => setFocusedId(id)}
+                className={buttonClassName}
+              >
+                {iconAndDot}
+              </button>
+            </PopoverTrigger>
+          );
+          const tip =
+            runStatus && !showActivityDot
+              ? `${label} · ${runStatusLabel(runStatus)}`
+              : label;
+          return (
+            <Popover
+              key={id}
+              open={runsSelectorOpen}
+              onOpenChange={setRunsSelectorOpen}
+            >
+              {labelsCollapsed ? (
+                <ControlTooltip content={tip}>{trigger}</ControlTooltip>
+              ) : (
+                trigger
+              )}
+              <PopoverContent
+                align="start"
+                sideOffset={8}
+                className="w-[22rem] p-0"
+              >
+                <PastRunsList open={runsSelectorOpen} onSelect={onSelectRun} />
+              </PopoverContent>
+            </Popover>
+          );
+        }
+
+        const tip = blockedByDeletion
+          ? "Source agent deleted"
+          : `${open ? "Close" : "Open"} ${label}`;
+        const button = (
+          <button
+            key={id}
+            id={studioTabId(id)}
+            type="button"
+            aria-pressed={open}
+            aria-expanded={open}
+            aria-controls={studioPanelId(id)}
+            aria-label={ariaLabel}
+            disabled={disabled}
+            tabIndex={id === tabStopId ? 0 : -1}
+            onFocus={() => setFocusedId(id)}
+            onClick={() => onToggle(id)}
+            className={buttonClassName}
+          >
+            {iconAndDot}
           </button>
         );
         // Disabled toggles always voice their reason; enabled ones tooltip

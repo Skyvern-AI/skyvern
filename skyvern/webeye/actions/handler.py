@@ -1019,7 +1019,7 @@ class CustomSingleSelectResult:
         if await self.dropdown_menu.get_locator().count() == 0:
             return True
 
-        return not await self.skyvern_frame.get_element_visible(await self.dropdown_menu.get_element_handler())
+        return not await self.skyvern_frame.get_element_visible(self.dropdown_menu.get_locator())
 
 
 def is_ul_or_listbox_element_factory(
@@ -1098,7 +1098,7 @@ def check_disappeared_element_id_in_incremental_factory(
             return True
 
         skyvern_frame = incremental_scraped.skyvern_frame
-        return not await skyvern_frame.get_element_visible(await skyvern_element.get_element_handler())
+        return not await skyvern_frame.get_element_visible(skyvern_element.get_locator())
 
     return helper
 
@@ -8430,7 +8430,7 @@ async def locate_dropdown_menu(
             )
             continue
 
-        if not await skyvern_frame.get_element_visible(await head_element.get_element_handler()):
+        if not await skyvern_frame.get_element_visible(head_element.get_locator()):
             LOG.debug(
                 "Skip the element since it's invisible",
                 element_id=element_id,

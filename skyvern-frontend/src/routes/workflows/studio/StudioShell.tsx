@@ -47,7 +47,7 @@ import {
   paneResizable,
   type PaneWidths,
 } from "./paneLayout";
-import { STUDIO_PANE_META } from "./paneMeta";
+import { STUDIO_PANE_META, paneAccessibleName, paneLabel } from "./paneMeta";
 import {
   panesListEqual,
   STUDIO_PANE_MIN_WIDTH,
@@ -65,6 +65,7 @@ import { StudioStageLauncher } from "./StudioStageLauncher";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
 import { useStudioPanes } from "./useStudioPanes";
+import { useStudioRunId } from "./useStudioRunId";
 
 // Below this header width, pane header chrome (view pills, badges) collapses
 // to icons — same idea as the run hero, measured per pane, not per viewport.
@@ -88,6 +89,7 @@ type PaneReorder = {
 
 export function StudioPane({
   id,
+  runId,
   open,
   order,
   flex,
@@ -99,6 +101,8 @@ export function StudioPane({
   children,
 }: {
   id: StudioPaneId;
+  // The inspected run id, so the run pane's label can read "Run: wr_…".
+  runId?: string | null;
   open: boolean;
   order: number | undefined;
   flex: string | undefined;
@@ -112,7 +116,12 @@ export function StudioPane({
   iconBadge?: ReactNode;
   children: ReactNode;
 }) {
-  const { label, icon: Icon } = STUDIO_PANE_META[id];
+  const { icon: Icon } = STUDIO_PANE_META[id];
+  const label = paneLabel(id, runId);
+  // The run id shows in the visible header label only; the region, header,
+  // drag hint, and close control take the stable accessible name so a run
+  // switch never renames them for screen readers.
+  const accessibleLabel = paneAccessibleName(id);
   const headerRef = useRef<HTMLDivElement>(null);
   const hasChrome = headerExtras != null || headerActions != null;
   const [compact, setCompact] = useState(false);
@@ -167,7 +176,7 @@ export function StudioPane({
     <section
       id={studioPanelId(id)}
       role="region"
-      aria-label={label}
+      aria-label={accessibleLabel}
       style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
         "relative min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1",
@@ -182,7 +191,7 @@ export function StudioPane({
         role="group"
         tabIndex={0}
         draggable
-        aria-label={`${label} pane header`}
+        aria-label={`${accessibleLabel} pane header`}
         aria-keyshortcuts="Control+Shift+ArrowLeft Control+Shift+ArrowRight"
         onPointerDownCapture={(event) => {
           pointerOnControl.current =
@@ -228,14 +237,14 @@ export function StudioPane({
             buttons keep their own tooltips instead of inheriting this one. */}
         <span
           className="relative shrink-0"
-          title={`Drag to reorder the ${label} pane (or Ctrl/Cmd+Shift+←/→)`}
+          title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
         >
           <Icon className="size-3.5 text-muted-foreground" aria-hidden />
           {iconBadge}
         </span>
         <span
           className="min-w-0 truncate text-xs font-medium text-foreground"
-          title={`Drag to reorder the ${label} pane (or Ctrl/Cmd+Shift+←/→)`}
+          title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
         >
           {label}
         </span>
@@ -249,13 +258,13 @@ export function StudioPane({
             <button
               type="button"
               onClick={onClose}
-              aria-label={`Close ${label} pane`}
+              aria-label={`Close ${accessibleLabel} pane`}
               className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             >
               <Cross2Icon className="size-3.5" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">Close {label}</TooltipContent>
+          <TooltipContent side="bottom">Close {accessibleLabel}</TooltipContent>
         </Tooltip>
       </div>
       <div className="min-h-0 min-w-0 flex-1">{children}</div>
@@ -475,8 +484,8 @@ function StudioPaneDivider({
     onCommit(widths);
   };
 
-  const leftLabel = STUDIO_PANE_META[leftId].label;
-  const rightLabel = STUDIO_PANE_META[rightId].label;
+  const leftLabel = paneAccessibleName(leftId);
+  const rightLabel = paneAccessibleName(rightId);
   return (
     <div
       role="separator"
@@ -545,6 +554,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
   const { registerStageElement } = useStudioPaneDefaults();
   const workflowPermanentId = useWorkflowPermanentId();
+  const runId = useStudioRunId();
   const workflowDeleted = Boolean(props.workflow.deleted_at);
   const isRecording = useRecordingStore((s) => s.isRecording);
   // The title store is normally seeded by the embedded Workspace's canvas,
@@ -649,7 +659,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     }
     setPanesOrder(next, { learn: true });
     setReorderAnnouncement(
-      `${STUDIO_PANE_META[movedId].label} pane moved to position ${
+      `${paneAccessibleName(movedId)} pane moved to position ${
         next.indexOf(movedId) + 1
       } of ${next.length}`,
     );
@@ -688,6 +698,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     const index = panes.indexOf(id);
     return {
       id,
+      runId,
       open: index >= 0,
       // Panes take even slots and the dividers between them take odd slots.
       order: index >= 0 ? index * 2 : undefined,
