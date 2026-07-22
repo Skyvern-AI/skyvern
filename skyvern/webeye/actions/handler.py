@@ -40,6 +40,7 @@ from skyvern.exceptions import (
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
     FailedToFetchSecret,
+    FailedToTakeScreenshot,
     FailToClick,
     FailToHover,
     FailToSelectByIndex,
@@ -171,7 +172,7 @@ from skyvern.webeye.utils.dom import (
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 LOG = structlog.get_logger()
 
@@ -8459,7 +8460,19 @@ async def locate_dropdown_menu(
 
         # sometimes taking screenshot might scroll away, need to scroll back after the screenshot
         x, y = await skyvern_frame.get_scroll_x_y()
-        screenshot = await head_element.get_locator().screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        try:
+            screenshot = await take_element_screenshot(
+                head_element.get_locator(), timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+            )
+        except FailedToTakeScreenshot:
+            LOG.debug(
+                "Failed to screenshot dropdown candidate, skipping it",
+                element_id=element_id,
+                exc_info=True,
+            )
+            # capture may have scrolled the candidate into view; restore before the next candidate
+            await skyvern_frame.safe_scroll_to_x_y(x, y)
+            continue
         await skyvern_frame.scroll_to_x_y(x, y)
 
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
