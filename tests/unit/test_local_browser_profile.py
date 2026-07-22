@@ -840,6 +840,38 @@ def test_create_retries_when_directory_reaped_mid_creation(tmp_path: Path, monke
 
 
 @pytest.mark.skipif(os.name == "nt", reason="flock is POSIX-only")
+def test_create_retries_when_sweep_tombstones_freshly_locked_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    real_revalidate = local_browser_profile.LocalBrowserProfile.revalidate
+    calls = {"count": 0}
+
+    def tombstoned_during_first_revalidate(profile: local_browser_profile.LocalBrowserProfile) -> bool:
+        calls["count"] += 1
+        if calls["count"] > 1:
+            return real_revalidate(profile)
+        tombstone = profile.path.with_name(".reap-test")
+        profile.path.rename(tombstone)
+        try:
+            return real_revalidate(profile)
+        finally:
+            tombstone.rename(profile.path)
+
+    monkeypatch.setattr(local_browser_profile.LocalBrowserProfile, "revalidate", tombstoned_during_first_revalidate)
+    profile = local_browser_profile.create_local_browser_profile()
+    try:
+        assert profile is not None
+        assert calls["count"] == 2
+        assert profile.path.exists()
+        assert profile.revalidate()
+    finally:
+        if profile is not None:
+            profile.release()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock is POSIX-only")
 def test_create_retries_when_sweep_wins_published_lock_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     real_lock = local_browser_profile._lock_exclusive_nonblocking
