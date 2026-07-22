@@ -182,7 +182,7 @@ function buildMetadata(values: CreditCardCredentialValues) {
 }
 
 type Props = {
-  onCredentialCreated?: (id: string) => void;
+  onCredentialCreated?: (id: string, name?: string) => void;
   /** Optional controlled mode: pass isOpen and onOpenChange to control modal state locally */
   isOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -190,6 +190,10 @@ type Props = {
   editingCredential?: CredentialApiResponse;
   /** Override the modal type (used in edit mode to set the correct form) */
   overrideType?: CredentialModalType;
+  // Copilot-only: seed the login URL so a quick-added credential carries a
+  // tested_url and matches later hostname-keyed asks. Create mode only; leaving
+  // it undefined (every non-copilot caller) keeps the field empty as before.
+  defaultTestUrl?: string;
   /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
   onStartBackgroundTest?: (
     credentialId: string,
@@ -217,6 +221,7 @@ function CredentialsModal({
   onOpenChange: controlledOnOpenChange,
   editingCredential,
   overrideType,
+  defaultTestUrl,
   onStartBackgroundTest,
 }: Props) {
   const credentialGetter = useCredentialGetter();
@@ -496,8 +501,11 @@ function CredentialsModal({
         ...prev,
         name: defaultName,
       }));
+      if (defaultTestUrl) {
+        setTestUrl(defaultTestUrl);
+      }
     }
-  }, [isOpen, credentials, isEditMode, editingCredential]);
+  }, [isOpen, credentials, isEditMode, editingCredential, defaultTestUrl]);
 
   function reset() {
     setVaultType("default");
@@ -757,7 +765,7 @@ function CredentialsModal({
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      onCredentialCreated?.(data.credential_id);
+      onCredentialCreated?.(data.credential_id, data.name);
       reset();
       setIsOpen(false);
 
@@ -923,7 +931,7 @@ function CredentialsModal({
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      onCredentialCreated?.(data.credential_id);
+      onCredentialCreated?.(data.credential_id, data.name);
       reset();
       setIsOpen(false);
       toast({
