@@ -7,7 +7,7 @@ import inspect
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
 
@@ -246,6 +246,39 @@ class ScoutedInteraction(TypedDict):
     credential_name: NotRequired[str]
 
 
+NeverCapturedObligationState: TypeAlias = Literal["armed", "captured", "consumed"]
+
+
+@dataclass(frozen=True)
+class NeverCapturedReplayPayload:
+    """Turn-ephemeral inputs required to retry the exact rejected authoring call."""
+
+    params: dict[str, Any]
+    allow_missing_credentials: bool | None = None
+    allow_static_output_uncertainty: bool = False
+    formation_prepared: bool = False
+
+
+@dataclass(frozen=True)
+class NeverCapturedObligation:
+    """Turn-ephemeral authority to re-scout one exact authored browser mutation."""
+
+    identity_digest: str
+    turn_id: str
+    draft_fingerprint: str
+    block_label: str
+    site: str
+    method: str
+    normalized_receiver: str
+    call_shape_digest: str
+    expected_tool_name: str
+    armed_after_trajectory_index: int
+    expected_argument_literal: str | None = None
+    captured_trajectory_index: int | None = None
+    state: NeverCapturedObligationState = "armed"
+    replay_payload: NeverCapturedReplayPayload | None = None
+
+
 @dataclass
 class AgentContext:
     organization_id: str
@@ -421,6 +454,10 @@ class AgentContext:
     # preserves repeats and ordering so code_block_synthesis can emit a faithful
     # linear Playwright trajectory.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    # One exact `never_captured` mutation may reopen scouting within this turn. The obligation is
+    # completed only by a later generator-emitted canonical interaction, never by selector text alone.
+    never_captured_obligation: NeverCapturedObligation | None = None
+    never_captured_obligation_identity_history: set[str] = field(default_factory=set)
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
@@ -499,6 +536,10 @@ class AgentContext:
     synthesized_block_reopened_after_failed_run: bool = False
     synthesized_block_reopened_for_output_coverage: bool = False
     synthesized_block_reopened_for_credential_scout: bool = False
+    synthesized_block_reopened_for_capture_obligation: bool = False
+    # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
+    # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
+    synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
     scouted_output_covered_paths: set[str] = field(default_factory=set)
     # Ids of active terminal_action completion criteria the scout has structurally reached past the
     # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.

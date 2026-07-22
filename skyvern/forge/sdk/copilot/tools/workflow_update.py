@@ -197,6 +197,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     AgentContext,
     AuthorTimeGateAblationPayload,
+    NeverCapturedObligation,
+    NeverCapturedReplayPayload,
     RejectedCodeArtifactMetadataCapture,
     ScoutedInteraction,
     copilot_author_time_gate_log_only_enabled,
@@ -1798,6 +1800,9 @@ class _DefinitionPlaneReject(NamedTuple):
     unreferenced_parameter_keys: tuple[str, ...]
 
 
+SYNTHESIZED_BUSINESS_INPUT_FLOOR_REASON_CODE = "synthesized_business_input_floor_unsatisfied"
+
+
 def _expression_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
     if isinstance(expression, ast.Name) and isinstance(expression.ctx, ast.Load):
         return set(bindings.get(expression.id, set()))
@@ -2191,6 +2196,65 @@ def _definition_plane_preflight_reject(
         or (("definition_parameters_unreferenced",) if unreferenced_parameter_keys else ()),
         unreferenced_parameter_keys=unreferenced_parameter_keys,
     )
+
+
+def _synthesized_business_input_floor_reject(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    imposition: _SynthesizedCodeImpositionResult,
+) -> _DefinitionPlaneReject | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    if not (
+        imposition.substitutions is not None or ctx.synthesized_block_offered or ctx.spine_imposition_owned_attempt
+    ):
+        return None
+    criteria = _active_completion_criteria(ctx)
+    has_business_goal = any(
+        criterion.kind == "terminal_action"
+        or (
+            criterion.level == "run"
+            and criterion.requested_output_floor_rekeyed
+            and bool(criterion.floor_rekeyed_from_path)
+        )
+        for criterion in criteria
+    )
+    if not has_business_goal:
+        return None
+    rejection = _definition_plane_preflight_reject(
+        ctx,
+        workflow_yaml,
+        enforce_untagged_declared_inputs=True,
+    )
+    retained_required_keys = set(getattr(ctx, "synthesized_business_required_parameter_keys", set()))
+    if not retained_required_keys:
+        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
+    runtime_sources = _workflow_runtime_parameter_sources(parsed)
+    if runtime_sources is None:
+        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
+    missing_retained_keys = retained_required_keys - runtime_sources
+    if not missing_retained_keys:
+        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
+    current_missing_keys = set(rejection.unreferenced_parameter_keys) if rejection is not None else set()
+    return _DefinitionPlaneReject(
+        criterion_ids=(
+            rejection.criterion_ids if rejection is not None else tuple(criterion.id for criterion in criteria)
+        ),
+        reason_codes=(
+            rejection.reason_codes if rejection is not None else ("synthesized_required_parameters_unreferenced",)
+        ),
+        unreferenced_parameter_keys=tuple(sorted(current_missing_keys | missing_retained_keys)),
+    )
+
+
+def _reopen_scout_after_synthesized_business_input_floor(ctx: AgentContext) -> None:
+    ctx.synthesized_block_offered = False
+    ctx.synthesized_block_offered_trajectory_len = 0
+    ctx.synthesized_block_offered_goal_complete = False
+    ctx.spine_imposition_owned_attempt = False
 
 
 def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
@@ -7712,6 +7776,16 @@ def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
     return "\n".join(errors) if errors else None
 
 
+class _NeverCapturedObligationCandidate(NamedTuple):
+    block_label: str
+    site: str
+    method: str
+    receiver: str
+    call_shape: str
+    expected_tool_name: str
+    expected_argument_literal: str | None
+
+
 def _code_repair_progress_data(
     repair_context: CodeAuthoringRepairContext | None = None,
     *,
@@ -7751,6 +7825,7 @@ class _SynthesizedCodeImpositionResult:
     minted_parameter_keys: list[str] = dataclass_field(default_factory=list)
     metadata_repair_contract: dict[str, object] | None = None
     ablation_gate_id: str | None = None
+    never_captured_candidate: _NeverCapturedObligationCandidate | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -7974,6 +8049,7 @@ def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
         (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
         or synthesized_persistence_reopened_after_failed_run(ctx)
         or ctx.synthesized_block_reopened_for_credential_scout
+        or ctx.synthesized_block_reopened_for_capture_obligation
         or _author_time_reject_reopens_synthesized_imposition(ctx)
     )
 
@@ -8369,6 +8445,8 @@ class _BrowserMutationSignature(NamedTuple):
     method: str
     receiver: str
     call_shape: str
+    argument_literal: str | None
+    generator_compatible: bool
 
 
 _BrowserSurfaceProvenanceKind = Literal["never_captured", "shape_diverged", "ambiguous", "suffix_disallowed"]
@@ -8387,11 +8465,104 @@ class _BrowserSurfaceRejectionProvenance(NamedTuple):
     nearest_receiver: str | None = None
     nearest_selector: str | None = None
     divergence_source: _BrowserSurfaceDivergenceSource | None = None
+    mutation: _BrowserMutationSignature | None = None
 
 
 class _BrowserSurfaceValidation(NamedTuple):
     violations: list[str]
     provenance: list[_BrowserSurfaceRejectionProvenance]
+
+
+_NEVER_CAPTURED_SCOUT_TOOL_BY_METHOD = {
+    "click": "click",
+    "fill": "type_text",
+    "press": "press_key",
+    "select_option": "select_option",
+}
+
+
+def _never_captured_obligation_candidate(
+    provenance: Iterable[_BrowserSurfaceRejectionProvenance],
+) -> _NeverCapturedObligationCandidate | None:
+    for record in provenance:
+        mutation = record.mutation
+        if record.kind != "never_captured" or mutation is None:
+            continue
+        expected_tool_name = _NEVER_CAPTURED_SCOUT_TOOL_BY_METHOD.get(mutation.method)
+        if expected_tool_name is None or not mutation.generator_compatible:
+            continue
+        if mutation.method == "press" and mutation.argument_literal is None:
+            continue
+        return _NeverCapturedObligationCandidate(
+            block_label=record.block_label,
+            site=record.site,
+            method=mutation.method,
+            receiver=normalized_locator_expr(mutation.receiver),
+            call_shape=mutation.call_shape,
+            expected_tool_name=expected_tool_name,
+            expected_argument_literal=mutation.argument_literal,
+        )
+    return None
+
+
+def _arm_never_captured_obligation(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    candidate: _NeverCapturedObligationCandidate | None,
+    replay_payload: NeverCapturedReplayPayload,
+) -> None:
+    if candidate is None:
+        return
+    turn_id = str(getattr(ctx, "turn_id", ""))
+    draft_fingerprint = hashlib.sha256(workflow_yaml.encode()).hexdigest()
+    call_shape_digest = hashlib.sha256(candidate.call_shape.encode()).hexdigest()
+    identity_payload = "\0".join(
+        (
+            turn_id,
+            draft_fingerprint,
+            candidate.block_label,
+            candidate.site,
+            candidate.method,
+            candidate.receiver,
+            call_shape_digest,
+        )
+    )
+    identity_digest = hashlib.sha256(identity_payload.encode()).hexdigest()
+    if identity_digest in ctx.never_captured_obligation_identity_history:
+        return
+    armed_after_trajectory_index = max(
+        (index for item in ctx.scout_trajectory if isinstance((index := item.get("trajectory_index")), int)),
+        default=-1,
+    )
+    ctx.never_captured_obligation = NeverCapturedObligation(
+        identity_digest=identity_digest,
+        turn_id=turn_id,
+        draft_fingerprint=draft_fingerprint,
+        block_label=candidate.block_label,
+        site=candidate.site,
+        method=candidate.method,
+        normalized_receiver=candidate.receiver,
+        call_shape_digest=call_shape_digest,
+        expected_tool_name=candidate.expected_tool_name,
+        armed_after_trajectory_index=armed_after_trajectory_index,
+        expected_argument_literal=candidate.expected_argument_literal,
+        replay_payload=replay_payload,
+    )
+    ctx.never_captured_obligation_identity_history.add(identity_digest)
+    LOG.info(
+        "copilot_never_captured_obligation_armed",
+        identity_digest=identity_digest,
+        turn_id=turn_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        draft_fingerprint=draft_fingerprint,
+        block_label=candidate.block_label,
+        site=candidate.site,
+        method=candidate.method,
+        receiver=candidate.receiver,
+        call_shape_digest=call_shape_digest,
+        expected_tool_name=candidate.expected_tool_name,
+        armed_after_trajectory_index=armed_after_trajectory_index,
+    )
 
 
 class _BrowserBindings(NamedTuple):
@@ -8462,6 +8633,23 @@ def _direct_page_method_signature(node: ast.AST) -> str | None:
     return "page"
 
 
+def _browser_mutation_argument_literal(node: ast.Call) -> str | None:
+    if not node.args:
+        return None
+    value = node.args[0]
+    return value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else None
+
+
+def _browser_mutation_is_generator_compatible(node: ast.Call, method: str) -> bool:
+    if node.keywords:
+        return False
+    if method == "click":
+        return not node.args
+    if method in {"fill", "press", "select_option"}:
+        return len(node.args) == 1
+    return False
+
+
 def _bounded_nth_constant(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Constant)
@@ -8480,12 +8668,24 @@ def _browser_mutation_signature_for_call(node: ast.Call) -> _BrowserMutationSign
             func.value
         )
         if receiver is not None:
-            return _BrowserMutationSignature(func.attr, receiver, ast.dump(node, include_attributes=False))
+            return _BrowserMutationSignature(
+                func.attr,
+                receiver,
+                ast.dump(node, include_attributes=False),
+                _browser_mutation_argument_literal(node),
+                _browser_mutation_is_generator_compatible(node, func.attr),
+            )
         return None
     if func.attr in _PAGE_MUTATION_METHODS:
         receiver = _direct_page_method_signature(func.value)
         if receiver is not None:
-            return _BrowserMutationSignature(func.attr, receiver, ast.dump(node, include_attributes=False))
+            return _BrowserMutationSignature(
+                func.attr,
+                receiver,
+                ast.dump(node, include_attributes=False),
+                _browser_mutation_argument_literal(node),
+                False,
+            )
     return None
 
 
@@ -8813,6 +9013,7 @@ def _classify_unscouted_mutation(
             nearest_receiver=exact.receiver,
             nearest_selector=_captured_selector_for_signature(exact, diagnostics),
             divergence_source="synthesized",
+            mutation=mutation,
         )
     receiver_literals = locator_selector_literals(mutation.receiver)
     emitted_records = diagnostics.emitted_interactions if diagnostics is not None else []
@@ -8828,6 +9029,7 @@ def _classify_unscouted_mutation(
                 nearest_receiver=str(record.get("locator") or "") or None,
                 nearest_selector=selector,
                 divergence_source="synthesized",
+                mutation=mutation,
             )
     dropped_records = diagnostics.dropped_interactions if diagnostics is not None else []
     for record in dropped_records:
@@ -8844,6 +9046,7 @@ def _classify_unscouted_mutation(
             nearest_method=mutation.method,
             nearest_selector=selector or None,
             divergence_source="trajectory_dropped",
+            mutation=mutation,
         )
     nearest = next((signature for signature in scouted_mutations if signature.method == mutation.method), None) or next(
         (signature for signature in scouted_mutations if signature.receiver == mutation.receiver), None
@@ -8856,6 +9059,7 @@ def _classify_unscouted_mutation(
         nearest_method=nearest.method if nearest is not None else None,
         nearest_receiver=nearest.receiver if nearest is not None else None,
         nearest_selector=_captured_selector_for_signature(nearest, diagnostics) if nearest is not None else None,
+        mutation=mutation,
     )
 
 
@@ -9434,6 +9638,7 @@ def _freehand_surface_reject(
         workflow_yaml=workflow_yaml,
         violations=validation.violations,
         repair_context=repair_context,
+        never_captured_candidate=_never_captured_obligation_candidate(validation.provenance),
     )
 
 
@@ -11109,6 +11314,7 @@ def _maybe_impose_synthesized_code_block(
         synthesized_diagnostics=diagnostics,
     )
     violations.extend(surface_validation.violations)
+    rejection_provenance = list(surface_validation.provenance)
     ambiguous_reject_present = any(record.kind == "ambiguous" for record in surface_validation.provenance)
     submitted_extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized_spine_code)
     extraction_suffix = submitted_extraction_suffix or synthesized.extraction_code
@@ -11141,6 +11347,7 @@ def _maybe_impose_synthesized_code_block(
                     nearest_method=mutation.method,
                     nearest_receiver=mutation.receiver,
                     nearest_selector=_captured_selector_for_signature(mutation, diagnostics),
+                    mutation=mutation,
                 )
                 if mutation in synthesized_signatures
                 else _classify_unscouted_mutation(
@@ -11153,6 +11360,7 @@ def _maybe_impose_synthesized_code_block(
                 for mutation in sorted(suffix_mutations)
             ]
             _log_browser_surface_rejection_provenance(suffix_provenance)
+            rejection_provenance.extend(suffix_provenance)
             violations.append(
                 "Unable to impose synthesized code block: extraction suffix contains unscouted browser action(s): "
                 + action_text
@@ -11198,6 +11406,7 @@ def _maybe_impose_synthesized_code_block(
             violations=violations,
             repair_context=repair_context,
             metadata_repair_contract=_co_computed_metadata_repair_contract(ctx, workflow_yaml, raw_metadata),
+            never_captured_candidate=_never_captured_obligation_candidate(rejection_provenance),
             ablation_gate_id=(
                 SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID
                 if parameter_binding_is_only_violation
@@ -12527,6 +12736,12 @@ async def _update_workflow(
         return reject(error=authority_error)
 
     workflow_yaml = params["workflow_yaml"]
+    never_captured_replay_payload = NeverCapturedReplayPayload(
+        params=copy.deepcopy(params),
+        allow_missing_credentials=allow_missing_credentials,
+        allow_static_output_uncertainty=allow_static_output_uncertainty,
+        formation_prepared=formation_prepared,
+    )
     raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
     if raw_conflict_marker_error is not None:
         return reject(
@@ -12543,11 +12758,27 @@ async def _update_workflow(
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     _enrich_scout_trajectory_input_correspondences(workflow_yaml, ctx)
     runtime_parameters = params.get("parameters")
+    capture_obligation = ctx.never_captured_obligation
+    if (
+        capture_obligation is not None
+        and capture_obligation.state == "captured"
+        and capture_obligation.draft_fingerprint != hashlib.sha256(workflow_yaml.encode()).hexdigest()
+    ):
+        ctx.never_captured_obligation = replace(capture_obligation, state="consumed")
+        ctx.synthesized_block_reopened_for_capture_obligation = False
+        LOG.info(
+            "copilot_never_captured_obligation_expired_for_different_draft",
+            identity_digest=capture_obligation.identity_digest,
+        )
     imposition = _maybe_impose_synthesized_code_block(
         workflow_yaml,
         ctx,
         runtime_parameters if isinstance(runtime_parameters, Mapping) else None,
     )
+    capture_obligation = ctx.never_captured_obligation
+    if capture_obligation is not None and capture_obligation.state == "captured":
+        ctx.never_captured_obligation = replace(capture_obligation, state="consumed")
+    ctx.synthesized_block_reopened_for_capture_obligation = False
     # Consume the one-shot credential-scout reopen before the gate below so a fresh reject can re-arm it.
     ctx.synthesized_block_reopened_for_credential_scout = False
     if imposition.violations:
@@ -12562,6 +12793,12 @@ async def _update_workflow(
         ):
             imposition = _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
         else:
+            _arm_never_captured_obligation(
+                ctx,
+                workflow_yaml,
+                imposition.never_captured_candidate,
+                never_captured_replay_payload,
+            )
             if (
                 imposition.repair_context is not None
                 and imposition.repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
@@ -12598,6 +12835,12 @@ async def _update_workflow(
     if imposition.substitutions is None:
         freehand_surface = _persist_seam_freehand_surface_result(workflow_yaml, ctx)
         if freehand_surface is not None:
+            _arm_never_captured_obligation(
+                ctx,
+                workflow_yaml,
+                freehand_surface.never_captured_candidate,
+                never_captured_replay_payload,
+            )
             _set_code_authoring_repair_context(ctx, freehand_surface.repair_context)
             _record_code_authoring_guardrail_reject(ctx)
             return reject(
@@ -12634,6 +12877,35 @@ async def _update_workflow(
             error="\n".join(final_structural_violations),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
+        )
+    business_input_floor_reject = _synthesized_business_input_floor_reject(ctx, workflow_yaml, imposition)
+    if business_input_floor_reject is not None:
+        unreferenced_keys = list(business_input_floor_reject.unreferenced_parameter_keys)
+        ctx.synthesized_business_required_parameter_keys.update(unreferenced_keys)
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="required_input_unbound",
+            summary=_definition_plane_reject_error(business_input_floor_reject),
+            structural_payload={
+                "reason_code": SYNTHESIZED_BUSINESS_INPUT_FLOOR_REASON_CODE,
+                "unreferenced_parameter_keys": unreferenced_keys,
+            },
+            block_labels=[
+                _code_block_label(block) for block in _workflow_code_blocks(parse_workflow_yaml(workflow_yaml) or {})
+            ],
+        )
+        _record_code_authoring_guardrail_reject(ctx)
+        _reopen_scout_after_synthesized_business_input_floor(ctx)
+        return reject(
+            error=(
+                _definition_plane_reject_error(business_input_floor_reject)
+                + " Continue scouting the business-value fields before saving or running this synthesized block."
+            ),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data={
+                "reason_code": SYNTHESIZED_BUSINESS_INPUT_FLOOR_REASON_CODE,
+                "unreferenced_parameter_keys": unreferenced_keys,
+            },
         )
     definition_reject = _definition_plane_preflight_reject(ctx, workflow_yaml)
     if definition_reject is not None:
@@ -13524,6 +13796,77 @@ async def _update_workflow(
             user_facing_summary=user_facing_summary,
             data=repair_data,
         )
+
+
+async def _replay_captured_never_captured_obligation(ctx: AgentContext) -> dict[str, Any] | None:
+    """Retry the exact rejected authoring call after its canonical browser action is captured."""
+    obligation = getattr(ctx, "never_captured_obligation", None)
+    if (
+        obligation is None
+        or obligation.state != "captured"
+        or obligation.turn_id != str(getattr(ctx, "turn_id", ""))
+        or obligation.replay_payload is None
+    ):
+        return None
+    payload = obligation.replay_payload
+    workflow_yaml = payload.params.get("workflow_yaml")
+    if (
+        not isinstance(workflow_yaml, str)
+        or hashlib.sha256(workflow_yaml.encode()).hexdigest() != obligation.draft_fingerprint
+    ):
+        ctx.never_captured_obligation = replace(obligation, state="consumed")
+        ctx.synthesized_block_reopened_for_capture_obligation = False
+        LOG.warning(
+            "copilot_never_captured_obligation_replay_payload_invalid",
+            identity_digest=obligation.identity_digest,
+            turn_id=obligation.turn_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            draft_fingerprint=obligation.draft_fingerprint,
+            block_label=obligation.block_label,
+            site=obligation.site,
+        )
+        return None
+    prior_definition = getattr(getattr(ctx, "last_workflow", None), "workflow_definition", None)
+    try:
+        result = await _update_workflow(
+            copy.deepcopy(payload.params),
+            ctx,
+            allow_missing_credentials=payload.allow_missing_credentials,
+            allow_static_output_uncertainty=payload.allow_static_output_uncertainty,
+            formation_prepared=payload.formation_prepared,
+        )
+    except Exception:
+        current_obligation = getattr(ctx, "never_captured_obligation", None)
+        if current_obligation is not None and current_obligation.identity_digest == obligation.identity_digest:
+            ctx.never_captured_obligation = obligation
+            ctx.synthesized_block_reopened_for_capture_obligation = True
+        raise
+    current_obligation = ctx.never_captured_obligation
+    if current_obligation is not None and current_obligation.state == "captured":
+        ctx.never_captured_obligation = replace(current_obligation, state="consumed")
+        ctx.synthesized_block_reopened_for_capture_obligation = False
+    _record_workflow_update_result(ctx, result, prior_definition)
+    data = result.get("data")
+    post_replay_obligation = ctx.never_captured_obligation
+    obligation_state = (
+        post_replay_obligation.state
+        if post_replay_obligation is not None and post_replay_obligation.identity_digest == obligation.identity_digest
+        else "superseded"
+    )
+    LOG.info(
+        "copilot_never_captured_obligation_replayed",
+        identity_digest=obligation.identity_digest,
+        turn_id=obligation.turn_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        draft_fingerprint=obligation.draft_fingerprint,
+        block_label=obligation.block_label,
+        site=obligation.site,
+        captured_trajectory_index=obligation.captured_trajectory_index,
+        obligation_state=obligation_state,
+        ok=result.get("ok") is True,
+        reason_code=data.get("reason_code") if isinstance(data, dict) else None,
+    )
+    return result
 
 
 def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:
