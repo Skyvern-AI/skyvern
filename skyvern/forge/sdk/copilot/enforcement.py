@@ -47,7 +47,9 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
+    locator_selector_literals,
     missing_rung_text,
+    normalized_scout_selector,
     obligation_finding_reason_code,
     obligation_finding_selector,
     render_missing_rung_call_sources,
@@ -2200,6 +2202,16 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     trajectory_len = len(trajectory)
     previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
     trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    known_terminal_actions = _known_non_method_mandated_terminal_actions(ctx)
+    business_goal_complete = (
+        _trajectory_reaches_post_credential_commit(ctx) if known_terminal_actions else trajectory_goal_complete
+    )
+    if (
+        (known_terminal_actions or _active_floor_rekeyed_runtime_outputs(ctx))
+        and _last_scout_credential_fill_index(trajectory) is not None
+        and not business_goal_complete
+    ):
+        return None
     if (
         getattr(ctx, "synthesized_block_offered", False)
         and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
@@ -2287,6 +2299,8 @@ def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
     if ctx.synthesized_block_reopened_for_output_coverage:
         return True
     if ctx.synthesized_block_reopened_for_credential_scout:
+        return True
+    if getattr(ctx, "synthesized_block_reopened_for_capture_obligation", False):
         return True
     if synthesized_goal_completion_landing_pending(ctx):
         return True
@@ -2711,13 +2725,52 @@ def _active_non_method_mandated_terminal_actions(ctx: AgentContext) -> tuple[Com
     )
 
 
+def _known_non_method_mandated_terminal_actions(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    return tuple(
+        criterion
+        for criterion in _coverage_completion_criteria(ctx)
+        if criterion.kind == "terminal_action" and not criterion.method_mandated
+    )
+
+
+def _active_floor_rekeyed_runtime_outputs(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    """Runtime outputs whose exact paths were moved to producer-floor custody.
+
+    They no longer participate in requested-output extraction planning, but they still prove the
+    workflow has a business goal beyond authentication. A credential-only trajectory must not use
+    the generic fill/commit heuristic to offer a completed block while these outputs are pending.
+    """
+    return tuple(
+        criterion
+        for criterion in _active_completion_criteria(ctx)
+        if criterion.level == "run"
+        and criterion.requested_output_floor_rekeyed
+        and bool(criterion.floor_rekeyed_from_path)
+        and criterion.requested_output_evidence_source == "runtime_output"
+    )
+
+
+def _trajectory_has_noncredential_business_fill(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    return trajectory_has_browser_fill_interaction(
+        [
+            interaction
+            for interaction in trajectory
+            if str(interaction.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME
+        ]
+    )
+
+
 def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
     """The scout trajectory covers an opening click followed by a commit, a durable entry followed by a commit,
     or a reached download target with a selector. Monotone in what the scout captured."""
     trajectory = ctx.scout_trajectory
     if not trajectory:
         return False
-    if _active_non_method_mandated_terminal_actions(ctx):
+    if _active_floor_rekeyed_runtime_outputs(ctx) and not _trajectory_has_noncredential_business_fill(trajectory):
+        return False
+    if _active_non_method_mandated_terminal_actions(ctx) or (
+        _active_floor_rekeyed_runtime_outputs(ctx) and _last_scout_credential_fill_index(trajectory) is not None
+    ):
         return _trajectory_reaches_post_credential_commit(ctx)
     return _trajectory_reaches_generic_goal(ctx, trajectory, include_download=True)
 
@@ -2746,6 +2799,7 @@ def _trajectory_reaches_generic_goal(
             and trajectory_index > opening_trajectory_index
             and str(interaction.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
             and not is_generic_entry_opener_click(interaction)
+            and not _is_result_surface_navigation_click(interaction)
         ):
             return True
         if opening_trajectory_index is None and str(interaction.get("tool_name") or "") == "click":
@@ -2760,8 +2814,28 @@ def _trajectory_reaches_generic_goal(
         isinstance(item, dict)
         and str(item.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
         and not is_generic_entry_opener_click(item)
+        and not _is_result_surface_navigation_click(item)
         for item in trajectory[last_entry_index + 1 :]
     )
+
+
+def _is_result_surface_navigation_click(interaction: Mapping[str, Any]) -> bool:
+    """A results/list navigation click is not evidence that a business mutation committed."""
+    if str(interaction.get("tool_name") or "") != "click":
+        return False
+    target = " ".join(
+        (
+            str(interaction.get("selector") or ""),
+            str(interaction.get("accessible_name") or ""),
+        )
+    ).lower()
+    if any(token in target for token in ("submit", "confirm", "save", "place-order", "place_order")):
+        return False
+    selector = str(interaction.get("selector") or "").strip().lower()
+    role = str(interaction.get("role") or "").strip().lower()
+    if role == "link" or selector.startswith(("a[", "a.", "a#")):
+        return True
+    return any(token in target for token in ("table", "results", "history", "listing"))
 
 
 def _request_expects_unreached_download(ctx: AgentContext) -> bool:
@@ -2924,7 +2998,7 @@ def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
 def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
     if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
         return False
-    if _active_non_method_mandated_terminal_actions(ctx):
+    if _active_non_method_mandated_terminal_actions(ctx) or _active_floor_rekeyed_runtime_outputs(ctx):
         if not synthesized_trajectory_is_goal_complete(ctx):
             return False
     else:
@@ -3059,6 +3133,33 @@ def _credential_scout_reopen_admits_evaluate(ctx: CopilotContext, tool_name: str
     return tool_name == "evaluate" and bool(ctx.synthesized_block_reopened_for_credential_scout)
 
 
+def _never_captured_obligation_admits_expected_tool(
+    ctx: CopilotContext, tool_name: str, arguments: Mapping[str, Any] | None
+) -> bool:
+    obligation = getattr(ctx, "never_captured_obligation", None)
+    if (
+        obligation is None
+        or obligation.state != "armed"
+        or obligation.turn_id != ctx.turn_id
+        or tool_name != obligation.expected_tool_name
+        or not isinstance(arguments, Mapping)
+    ):
+        return False
+    selector = arguments.get("selector")
+    if not isinstance(selector, str) or not selector.strip():
+        return False
+    expected_selectors = {
+        normalized_scout_selector(candidate) for candidate in locator_selector_literals(obligation.normalized_receiver)
+    }
+    if normalized_scout_selector(selector.strip()) not in expected_selectors:
+        return False
+    expected_argument = obligation.expected_argument_literal
+    if expected_argument is None:
+        return True
+    argument_key = {"press_key": "key", "select_option": "value", "type_text": "text"}.get(tool_name)
+    return argument_key is not None and str(arguments.get(argument_key) or "") == expected_argument
+
+
 def consume_uncovered_output_reopen_event(ctx: CopilotContext) -> bool:
     """Arm a one-shot scout-window reopen for the first author-time reject citing an uncovered
     requested-output path. Returns True only on that first reject per structural identity; a
@@ -3144,7 +3245,9 @@ def _should_block_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: st
     return _completion_verification_unsatisfied(ctx)
 
 
-def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
+def synthesized_block_persistence_signal(
+    ctx: Any, tool_name: str, arguments: Mapping[str, Any] | None = None
+) -> CopilotToolBlockerSignal | None:
     if _should_block_tool_after_unresolved_recorded_outcome(ctx, tool_name):
         return CopilotToolBlockerSignal(
             blocker_kind="tool_error",
@@ -3171,6 +3274,9 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
         return None
     if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN)
+        return None
+    if _never_captured_obligation_admits_expected_tool(ctx, tool_name, arguments):
+        claim_turn(ctx, TurnClaimant.CAPTURE_OBLIGATION_REOPEN)
         return None
     if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)

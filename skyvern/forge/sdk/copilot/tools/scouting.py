@@ -17,7 +17,12 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import normalized_scout_selector
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    locator_selector_literals,
+    normalized_locator_expr,
+    normalized_scout_selector,
+    synthesize_code_block,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
 )
@@ -411,6 +416,87 @@ def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
     return highest + 1 if highest >= 0 else len(trajectory)
 
 
+def _maybe_complete_never_captured_obligation(
+    ctx: AgentContext, *, interaction: ScoutedInteraction, trajectory_index: int
+) -> None:
+    obligation = getattr(ctx, "never_captured_obligation", None)
+    if obligation is None or obligation.state != "armed":
+        return
+    if obligation.turn_id != str(getattr(ctx, "turn_id", "")):
+        return
+    tool_name = str(interaction.get("tool_name") or "")
+    if tool_name != obligation.expected_tool_name or trajectory_index <= obligation.armed_after_trajectory_index:
+        return
+    # Bare locator obligations can reject unrelated same-tool events without paying for a full
+    # trajectory synthesis. Non-bare canonical locators still fall through to the exact emitted
+    # interaction comparison below.
+    if obligation.normalized_receiver.startswith("page.locator("):
+        expected_selectors = {
+            normalized_scout_selector(candidate)
+            for candidate in locator_selector_literals(obligation.normalized_receiver)
+        }
+        captured_selector = str(interaction.get("selector") or "").strip()
+        if normalized_scout_selector(captured_selector) not in expected_selectors:
+            return
+    expected_argument = obligation.expected_argument_literal
+    if expected_argument is not None:
+        if tool_name == "press_key":
+            captured_argument = str(interaction.get("key") or "")
+        elif tool_name == "select_option":
+            captured_argument = str(interaction.get("value") or "")
+        elif tool_name == "type_text":
+            captured_argument = str(interaction.get("raw_typed_value") or interaction.get("typed_value") or "")
+        else:
+            captured_argument = ""
+        if captured_argument != expected_argument:
+            return
+    synthesized = synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+    if synthesized is None:
+        return
+    current_position = next(
+        (
+            position
+            for position, item in enumerate(ctx.scout_trajectory)
+            if item.get("trajectory_index") == trajectory_index
+        ),
+        None,
+    )
+    if current_position is None:
+        return
+    emitted = next(
+        (
+            record
+            for record in synthesized.diagnostics.emitted_interactions
+            if record.get("trajectory_index") == current_position
+        ),
+        None,
+    )
+    if emitted is None:
+        return
+    method = str(emitted.get("method") or "")
+    locator = normalized_locator_expr(str(emitted.get("locator") or ""))
+    if method != obligation.method or locator != obligation.normalized_receiver:
+        return
+    ctx.never_captured_obligation = replace(
+        obligation,
+        captured_trajectory_index=trajectory_index,
+        state="captured",
+    )
+    ctx.synthesized_block_reopened_for_capture_obligation = True
+    LOG.info(
+        "copilot_never_captured_obligation_completed",
+        identity_digest=obligation.identity_digest,
+        turn_id=obligation.turn_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        draft_fingerprint=obligation.draft_fingerprint,
+        block_label=obligation.block_label,
+        site=obligation.site,
+        trajectory_index=trajectory_index,
+        method=method,
+        locator=locator,
+    )
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -495,6 +581,11 @@ def _record_scouted_interaction(
     trajectory_artifact["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(trajectory_artifact)
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
+    _maybe_complete_never_captured_obligation(
+        ctx,
+        interaction=trajectory_artifact,
+        trajectory_index=trajectory_artifact["trajectory_index"],
+    )
 
     LOG.info(
         "copilot_scout_interaction_captured",

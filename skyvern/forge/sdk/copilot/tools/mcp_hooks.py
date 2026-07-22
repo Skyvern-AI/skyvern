@@ -421,6 +421,36 @@ async def _screenshot_post_hook(
     return result
 
 
+async def _maybe_replay_captured_never_captured_obligation(result: dict[str, Any], ctx: AgentContext) -> None:
+    """Complete the capture/reconciliation handshake without another model-authored update call."""
+    try:
+        from .workflow_update import _replay_captured_never_captured_obligation
+
+        replay = await _replay_captured_never_captured_obligation(ctx)
+    except Exception:
+        # The browser action already succeeded. Preserve its capture so the turn can
+        # retry reconciliation instead of converting a save failure into capture loss.
+        LOG.warning("copilot_never_captured_obligation_replay_failed", exc_info=True)
+        return
+    if replay is None:
+        return
+    result_data = result.get("data")
+    if not isinstance(result_data, dict):
+        result_data = {}
+        result["data"] = result_data
+    replay_data = replay.get("data")
+    reconciliation: dict[str, Any] = {"ok": replay.get("ok") is True}
+    if replay.get("ok") is True:
+        message = replay_data.get("message") if isinstance(replay_data, dict) else None
+        reconciliation["message"] = message or "Workflow reconciled after capturing the missing browser action."
+    else:
+        if replay.get("user_facing_summary"):
+            reconciliation["user_facing_summary"] = replay["user_facing_summary"]
+        if replay.get("error"):
+            reconciliation["error"] = replay["error"]
+    result_data["workflow_reconciliation"] = reconciliation
+
+
 async def _click_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -480,6 +510,7 @@ async def _click_post_hook(
         await _attach_reperception_targets_on_non_advancing_click(result, raw, ctx, attempted_selector)
     except Exception:
         LOG.warning("copilot_click_reperception_attach_failed", exc_info=True)
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
@@ -797,6 +828,7 @@ async def _type_text_post_hook(
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
@@ -905,6 +937,7 @@ async def _select_option_post_hook(
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
@@ -932,6 +965,7 @@ async def _press_key_post_hook(
             source_url=source_url,
             key=data.get("key", ""),
         )
+    await _maybe_replay_captured_never_captured_obligation(result, ctx)
     return result
 
 
