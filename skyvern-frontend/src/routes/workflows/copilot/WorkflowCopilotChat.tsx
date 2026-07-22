@@ -74,7 +74,7 @@ import {
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
-import { NarrativeView } from "./NarrativeView";
+import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
@@ -444,7 +444,11 @@ function historicalCredentialOutcome(
   };
 }
 
-type CredentialResolution = CredentialPauseHistorical & { name?: string };
+type CredentialResolution = CredentialPauseHistorical & {
+  name?: string;
+  // Terminal connect auto-sent a "continue" turn — drives the receipt copy.
+  continued?: boolean;
+};
 
 // Append a resolution keyed by turn, capping the map with oldest-eviction like
 // the sibling per-turn maps (turnSnapshots/turnOwnedRunIds). delete-then-set
@@ -803,10 +807,18 @@ export function WorkflowCopilotChat({
   const credentialsFetchInFlight = useRef(false);
   // Routes the add-credential modal's onCredentialCreated back to the card that
   // opened it: a live frame (POST resume) or a terminal turn (local resolve).
+  // isLastMessage is captured at open time so a terminal connect only
+  // auto-continues from the conversation's tail, not a scrolled-back card.
   const pendingCredentialConnect = useRef<{
     frame: WorkflowCopilotCredentialRequiredUpdate | null;
     turnId: string;
+    isLastMessage: boolean;
   } | null>(null);
+  // Latest handleSend for callbacks defined before it (the terminal
+  // auto-continue fires from the modal's onCredentialCreated).
+  const handleSendRef = useRef<((messageOverride?: string) => void) | null>(
+    null,
+  );
   // Single-flight guard for the resume POST against a double-click.
   const credentialResponseInFlight = useRef(false);
   const streamingAbortController = useRef<AbortController | null>(null);
@@ -1109,28 +1121,66 @@ export function WorkflowCopilotChat({
   // Terminal-mode cards have no resume_token — connect/skip is a local UI morph,
   // no network call.
   const resolveTerminalCredential = useCallback(
-    (turnId: string, action: "connected" | "skip", credentialId?: string) => {
+    (
+      turnId: string,
+      action: "connected" | "skip",
+      credentialId?: string,
+      name?: string,
+      continued?: boolean,
+    ) => {
       setCredentialResolutions((prev) =>
         withCappedResolution(
           prev,
           turnId,
           action === "connected"
-            ? { outcome: "connected", credentialId }
+            ? { outcome: "connected", credentialId, name, continued }
             : { outcome: "skipped" },
         ),
       );
     },
     [],
   );
+  // A terminal ask is a dead-end otherwise: the turn already ended, so connecting
+  // a credential does nothing without a fresh turn. Auto-send one — but only from
+  // the tail of an idle conversation (SKY-12384 gating), and only when we know
+  // the credential's name to reference.
+  const continueAfterTerminalConnect = useCallback(
+    (
+      turnId: string,
+      credentialId: string,
+      name: string | undefined,
+      isLastMessage: boolean,
+    ) => {
+      const shouldContinue =
+        isLastMessage && !isLoading && !isLoadingHistory && Boolean(name);
+      resolveTerminalCredential(
+        turnId,
+        "connected",
+        credentialId,
+        name,
+        shouldContinue,
+      );
+      if (shouldContinue) {
+        void handleSendRef.current?.(
+          `I've connected the credential '${name}' — continue.`,
+        );
+      }
+    },
+    [isLoading, isLoadingHistory, resolveTerminalCredential],
+  );
   const openCredentialModal = useCallback(
-    (frame: WorkflowCopilotCredentialRequiredUpdate | null, turnId: string) => {
-      pendingCredentialConnect.current = { frame, turnId };
+    (
+      frame: WorkflowCopilotCredentialRequiredUpdate | null,
+      turnId: string,
+      isLastMessage = false,
+    ) => {
+      pendingCredentialConnect.current = { frame, turnId, isLastMessage };
       setCredentialModalOpen(true);
     },
     [],
   );
   const handleCredentialCreated = useCallback(
-    (credentialId: string) => {
+    (credentialId: string, name?: string) => {
       const ctx = pendingCredentialConnect.current;
       pendingCredentialConnect.current = null;
       setCredentialModalOpen(false);
@@ -1140,10 +1190,15 @@ export function WorkflowCopilotChat({
       if (ctx.frame) {
         void respondToCredentialPause(ctx.frame, "connected", credentialId);
       } else {
-        resolveTerminalCredential(ctx.turnId, "connected", credentialId);
+        continueAfterTerminalConnect(
+          ctx.turnId,
+          credentialId,
+          name,
+          ctx.isLastMessage,
+        );
       }
     },
-    [respondToCredentialPause, resolveTerminalCredential],
+    [respondToCredentialPause, continueAfterTerminalConnect],
   );
   // Explore/Draft boundary is unobservable (the LLM writes code with no
   // frames emitted); after DRAFTING_GAP_MS of silence with no pending block
@@ -1952,6 +2007,14 @@ export function WorkflowCopilotChat({
       }
       setIsLoading(true);
       inFlightRef.current = true;
+      if (copilotUxV1Enabled) {
+        // Clear the prior turn's lingering narrative so the instant-ack placeholder's
+        // turnId===null gate holds on every send, and the first frame hands off cleanly.
+        // Reset the ref too (it lags setNarrative by a passive effect) so a late
+        // prior-turn recorded-actions fetch can't rebase onto the stale narrative.
+        narrativeRef.current = EMPTY_NARRATIVE;
+        setNarrative(EMPTY_NARRATIVE);
+      }
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -2410,6 +2473,9 @@ export function WorkflowCopilotChat({
       workflowRunId,
     ],
   );
+  useEffect(() => {
+    handleSendRef.current = handleSend;
+  }, [handleSend]);
 
   // A code block's "Generate" button asks the copilot to (re)build that one block
   // from its goal. Force build + code mode, then fire the send on the next tick.
@@ -3193,14 +3259,19 @@ export function WorkflowCopilotChat({
                             localResolution ??
                             historicalCredentialOutcome(message.narrative)
                           }
+                          continued={Boolean(localResolution?.continued)}
+                          // Terminal cards surface no pre-connect matches today,
+                          // so only the modal branch fires; the id branch shares
+                          // the same helper for when terminal mode gains matches.
                           onConnect={(credentialId) =>
                             credentialId
-                              ? resolveTerminalCredential(
+                              ? continueAfterTerminalConnect(
                                   turnId,
-                                  "connected",
                                   credentialId,
+                                  localResolution?.name,
+                                  isLastMessage,
                                 )
-                              : openCredentialModal(null, turnId)
+                              : openCredentialModal(null, turnId, isLastMessage)
                           }
                           onSkip={() =>
                             resolveTerminalCredential(turnId, "skip")
@@ -3291,6 +3362,19 @@ export function WorkflowCopilotChat({
                 />
               );
             })}
+            {/*
+            Instant-ack placeholder: fills the send→first-frame gap. isLoading +
+            turnId===null is the whole gate — mutually exclusive with the live
+            bubble below (turnId!==null), so the first frame swaps them in one
+            render. The send-time reset (see handleSend) keeps turnId null on
+            every send, including queued-then-drained follow-ups.
+          */}
+            {copilotUxV1Enabled &&
+            isLoading &&
+            !isLoadingHistory &&
+            narrative.turnId === null ? (
+              <InstantAckPlaceholder />
+            ) : null}
             {/*
             Bottom in-flight narrative bubble. Suppressed once the terminal
             RESPONSE has frozen the narrative into the latest AI message —
@@ -3685,6 +3769,12 @@ export function WorkflowCopilotChat({
           // A sign-in pause always needs a password credential; force the form
           // so a lingering ?type=credit-card/secret param can't open the wrong one.
           overrideType={CredentialModalTypes.PASSWORD}
+          // Seed tested_url from the pause frame's login page so a quick-add
+          // credential matches later asks. Terminal frames carry no URL — the
+          // field stays empty then.
+          defaultTestUrl={
+            pendingCredentialConnect.current?.frame?.login_page_urls?.[0]
+          }
           onOpenChange={(open) => {
             setCredentialModalOpen(open);
             if (!open) pendingCredentialConnect.current = null;

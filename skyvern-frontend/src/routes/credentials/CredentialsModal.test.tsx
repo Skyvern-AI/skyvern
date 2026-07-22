@@ -330,3 +330,91 @@ describe("CredentialsModal edit-mode inline test", () => {
     }
   }, 15_000);
 });
+
+describe("CredentialsModal copilot-context tested_url default", () => {
+  function renderCopilotPasswordModal(opts: {
+    defaultTestUrl?: string;
+    onCredentialCreated?: (id: string, name?: string) => void;
+  }) {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            defaultTestUrl={opts.defaultTestUrl}
+            onCredentialCreated={opts.onCredentialCreated}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  async function fillUsernameAndPassword() {
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    expect(usernameInput).toBeTruthy();
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    const passwordInput = document.querySelector('input[type="password"]');
+    expect(passwordInput).toBeTruthy();
+    fireEvent.change(passwordInput as HTMLInputElement, {
+      target: { value: "password" },
+    });
+  }
+
+  it("persists tested_url from defaultTestUrl on a plain create (no test run)", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-x", name: "credentials" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({
+      defaultTestUrl: "https://news.ycombinator.com/login",
+      onCredentialCreated,
+    });
+    await fillUsernameAndPassword();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith("/credentials", expect.anything()),
+    );
+    await waitFor(() =>
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/cred-x",
+        expect.objectContaining({
+          tested_url: "https://news.ycombinator.com/login",
+        }),
+      ),
+    );
+    expect(onCredentialCreated).toHaveBeenCalledWith("cred-x", "credentials");
+  }, 10_000);
+
+  it("sends no tested_url when defaultTestUrl is absent (modal from elsewhere)", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-y", name: "credentials" },
+    });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({ onCredentialCreated });
+    await fillUsernameAndPassword();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith("cred-y", "credentials"),
+    );
+    expect(patchMock).not.toHaveBeenCalled();
+  }, 10_000);
+});

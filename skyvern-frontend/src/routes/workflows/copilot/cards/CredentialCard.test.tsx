@@ -585,6 +585,36 @@ describe("CredentialCard countdown (inline-pause vs terminal)", () => {
   });
 });
 
+describe("CredentialCard terminal next-step hint", () => {
+  it("shows the continue hint in terminal mode", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Connect a credential and I'll continue."),
+    ).toBeTruthy();
+  });
+
+  it("omits the continue hint in inline-pause mode", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByText("Connect a credential and I'll continue."),
+    ).toBeNull();
+  });
+});
+
 describe("CredentialCard historical (resolvedOutcome) rendering", () => {
   it("renders a fallback instead of crashing on an out-of-union outcome value", () => {
     // Simulates untyped network data reaching a compile-time-exhaustive
@@ -623,6 +653,37 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
     ).toBeNull();
     expect(onConnect).not.toHaveBeenCalled();
     expect(onSkip).not.toHaveBeenCalled();
+  });
+
+  it("renders a 'Continuing' receipt when a terminal connect auto-continued", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        matchingCredentials={ONE_MATCHING_CREDENTIAL}
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        continued
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Continuing with 'HN login'…")).toBeTruthy();
+    expect(screen.queryByText(/added/)).toBeNull();
+  });
+
+  it("uses unnamed 'Continuing…' copy when the continued id has no match", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        matchingCredentials={NO_MATCHING_CREDENTIALS}
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        continued
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Continuing…")).toBeTruthy();
   });
 
   it("falls back to unnamed receipt copy when the connected id has no matching credential", () => {
