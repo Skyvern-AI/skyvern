@@ -9,7 +9,7 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     FailedToTakeScreenshot,
     NoElementFound,
@@ -34,7 +34,7 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapeExcludeFunc,
     json_to_html,
 )
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
 
 LOG = structlog.get_logger()
 
@@ -135,19 +135,6 @@ BASE64_INCLUDE_ATTRIBUTES = {
     "srcset",
     "icon",
 }
-
-
-def load_js_script() -> str:
-    # TODO: Handle file location better. This is a hacky way to find the file location.
-    path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
-    try:
-        # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
-        # This will allow our code to be type safe.
-        with open(path) as f:
-            return f.read()
-    except FileNotFoundError as e:
-        LOG.exception("Failed to load the JS script", path=path)
-        raise e
 
 
 JS_FUNCTION_DEFS = load_js_script()

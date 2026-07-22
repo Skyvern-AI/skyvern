@@ -4099,6 +4099,8 @@ class ForgeAgent:
                 template = "single-upload-action"
             elif action_type == ActionType.SELECT_OPTION:
                 template = "single-select-action"
+            elif action_type == ActionType.HOVER:
+                template = "single-hover-action"
             else:
                 raise UnsupportedActionType(action_type=action_type)
 
