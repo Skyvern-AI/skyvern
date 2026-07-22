@@ -13,6 +13,7 @@ browsers shared across parent/child runs) must NOT have their driver stopped.
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -26,6 +27,7 @@ from skyvern.webeye.browser_engine import (
     BrowserEngineSelection,
     BrowserSourceNotSupportedByEngine,
 )
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _EngineSelectionOwner, canonical_run_key
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -39,6 +41,7 @@ def _pw_stub() -> MagicMock:
 def _context_stub() -> MagicMock:
     context = MagicMock()
     context.close = AsyncMock()
+    context._skyvern_cdp_download_interceptor = None
     return context
 
 
@@ -68,6 +71,87 @@ async def test_close_keeps_driver_by_default_when_browser_kept() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_reused_context_preserves_download_interceptor() -> None:
+    pw = _pw_stub()
+    context = _context_stub()
+    interceptor = MagicMock(disable=AsyncMock())
+    context._skyvern_cdp_download_interceptor = interceptor
+    state = RealBrowserState(pw=pw, browser_context=context)
+
+    await state.close(close_browser_on_completion=False)
+
+    interceptor.disable.assert_not_awaited()
+    assert context._skyvern_cdp_download_interceptor is interceptor
+    context.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_close_context_disables_download_interceptor_once() -> None:
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    interceptor = MagicMock(disable=AsyncMock())
+    context._skyvern_cdp_download_interceptor = interceptor
+    state = RealBrowserState(pw=_pw_stub(), browser_context=context)
+
+    await state.close(close_browser_on_completion=True)
+    await state.close(close_browser_on_completion=True)
+
+    interceptor.disable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_true_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pw = _pw_stub()
+    context = _context_stub()
+    interceptor = CDPDownloadInterceptor()
+    interceptor._accepting_browser_downloads = True
+    context._skyvern_cdp_download_interceptor = interceptor
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def suspended_handler(event: dict[str, object]) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.05)
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CLOSE_TIMEOUT", 0.05)
+    monkeypatch.setattr(interceptor, "_handle_browser_download", suspended_handler)
+    interceptor._schedule_browser_download_handler({"url": "https://example.test/download"})
+    await started.wait()
+
+    start = time.monotonic()
+    state = RealBrowserState(pw=pw, browser_context=context)
+    result = await asyncio.wait_for(state.close(True), timeout=0.5)
+    elapsed = time.monotonic() - start
+
+    assert result is None
+    assert elapsed < 0.5
+    await asyncio.wait_for(cancelled.wait(), timeout=0.5)
+    assert not cleaned.is_set()
+    assert len(interceptor._browser_download_tasks) == 1
+    assert context._skyvern_cdp_download_interceptor is None
+    # The bounded interceptor drain is detached independently, so later teardown steps
+    # (context close, driver stop) still run instead of being starved by the stuck drain.
+    context.close.assert_awaited_once()
+    pw.stop.assert_awaited_once()
+
+    release.set()
+    await asyncio.wait_for(cleaned.wait(), timeout=0.5)
+    await asyncio.sleep(0)
+    assert not interceptor._browser_download_tasks
+
+
+@pytest.mark.asyncio
 async def test_close_release_driver_override_preserves_reuse() -> None:
     """An explicit release_driver=False wins over the creation-time marker."""
     pw = _pw_stub()
@@ -89,6 +173,230 @@ async def test_close_true_still_stops_driver_and_context() -> None:
 
     pw.stop.assert_awaited_once()
     context.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_true_cancellation_resistant_interceptor_disable_still_runs_provider_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The paid-provider cleanup must still be attempted exactly once even when disabling the
+    # download interceptor is cancellation-resistant (ignores the cancel it receives when its
+    # budget is exhausted). close() must return within an outer watchdog, and the stuck drain
+    # must stay owned (its eventual exception retrieved) rather than orphaned.
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.05)
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    cleanup = AsyncMock()
+
+    started = asyncio.Event()
+    entered_cancel = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stuck_disable(_ctx: object) -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            entered_cancel.set()
+            await release.wait()  # cancellation-resistant: ignore the cancel until released
+            raise RuntimeError("drain boom after detach")
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.disable_download_interceptor_for_context", stuck_disable)
+
+    unretrieved: list[dict] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context_: unretrieved.append(context_))
+    try:
+        state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+        start = time.monotonic()
+        await asyncio.wait_for(state.close(True), timeout=1.0)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0
+        cleanup.assert_awaited_once()  # provider cleanup ran despite the stuck drain
+        context.close.assert_awaited_once()
+        pw.stop.assert_awaited_once()
+
+        await asyncio.wait_for(entered_cancel.wait(), timeout=1.0)  # the drain was cancelled (best-effort reclaim)
+        release.set()
+        await asyncio.sleep(0)  # let the detached drain finish and its done-callback retrieve the exception
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert not any("never retrieved" in str(c.get("message", "")) for c in unretrieved)
+
+
+@pytest.mark.asyncio
+async def test_close_true_detached_teardown_task_is_strongly_held_until_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A detached, cancellation-resistant teardown phase must be strongly referenced for its whole
+    # remaining life: asyncio only holds tasks weakly, so without an owner set a still-pending drain
+    # could be GC'd ("Task was destroyed but it is pending!"). It must be in the owner set right after
+    # detach and gone only once it actually completes — leaking neither a task nor an exception.
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.05)
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    cleanup = AsyncMock()
+
+    entered_cancel = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stuck_disable(_ctx: object) -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            entered_cancel.set()
+            await release.wait()  # cancellation-resistant: outlive close()
+            raise RuntimeError("drain boom after detach")
+
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.disable_download_interceptor_for_context", stuck_disable)
+
+    unretrieved: list[dict] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context_: unretrieved.append(context_))
+    try:
+        state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+        await asyncio.wait_for(state.close(True), timeout=1.0)
+
+        await asyncio.wait_for(entered_cancel.wait(), timeout=1.0)
+        assert len(state._detached_teardown_tasks) == 1  # detached drain is strongly held while pending
+
+        release.set()
+        detached = next(iter(state._detached_teardown_tasks))
+        await asyncio.wait_for(asyncio.shield(asyncio.gather(detached, return_exceptions=True)), timeout=1.0)
+        await asyncio.sleep(0)  # let the done-callback discard the finished task
+
+        assert state._detached_teardown_tasks == set()  # discarded only after it actually completed
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert not any("never retrieved" in str(c.get("message", "")) for c in unretrieved)
+
+
+@pytest.mark.asyncio
+async def test_close_true_context_close_hang_does_not_suppress_provider_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A hung context close must not starve the paid-provider cleanup: the context-teardown phase is
+    # bounded independently, so cleanup still runs exactly once after the teardown budget elapses.
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CLOSE_TIMEOUT", 0.05)
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+
+    async def hang(*_a: object, **_k: object) -> None:
+        await asyncio.sleep(3600)
+
+    context.close = AsyncMock(side_effect=hang)
+    cleanup = AsyncMock()
+    state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+
+    await asyncio.wait_for(state.close(True), timeout=1.0)
+
+    cleanup.assert_awaited_once()
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_true_persist_cookies_failure_does_not_suppress_provider_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A raising cookie-persistence step (an "earlier teardown callback raises") must not suppress cleanup.
+    pw = _pw_stub()
+    context = _context_stub()
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_state.persist_session_cookies",
+        AsyncMock(side_effect=RuntimeError("persist boom")),
+    )
+    cleanup = AsyncMock()
+    state = RealBrowserState(
+        pw=pw,
+        browser_context=context,
+        browser_artifacts=BrowserArtifacts(browser_session_dir="/tmp/does-not-need-to-exist"),
+        browser_cleanup=cleanup,
+    )
+
+    await state.close(close_browser_on_completion=True)
+
+    cleanup.assert_awaited_once()
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_true_browser_cleanup_exception_is_handled_not_leaked() -> None:
+    # A raising provider cleanup must be caught (best-effort teardown) and must not leak or block driver stop.
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    cleanup = AsyncMock(side_effect=RuntimeError("cleanup boom"))
+    state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+
+    await state.close(close_browser_on_completion=True)  # must not raise
+
+    cleanup.assert_awaited_once()
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_true_runs_teardown_phases_in_order() -> None:
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    cleanup = AsyncMock()
+    interceptor = MagicMock(disable=AsyncMock())
+    context._skyvern_cdp_download_interceptor = interceptor
+    state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+
+    order: list[str] = []
+    callback = AsyncMock(side_effect=lambda: order.append("callback"))
+    state.add_on_close(callback)
+    interceptor.disable.side_effect = lambda: order.append("disable_interceptor")
+    context.close.side_effect = lambda: order.append("context_close")
+    cleanup.side_effect = lambda: order.append("browser_cleanup")
+    pw.stop.side_effect = lambda: order.append("stop_driver")
+
+    await state.close(close_browser_on_completion=True)
+
+    assert order == ["disable_interceptor", "callback", "context_close", "browser_cleanup", "stop_driver"]
+
+
+@pytest.mark.asyncio
+async def test_close_false_preserves_reuse_and_does_not_invoke_cleanup() -> None:
+    pw = _pw_stub()
+    context = _context_stub()
+    interceptor = MagicMock(disable=AsyncMock())
+    context._skyvern_cdp_download_interceptor = interceptor
+    cleanup = AsyncMock()
+    state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+
+    await state.close(close_browser_on_completion=False)
+
+    cleanup.assert_not_awaited()
+    interceptor.disable.assert_not_awaited()
+    context.close.assert_not_awaited()
+    pw.stop.assert_not_awaited()
+    assert context._skyvern_cdp_download_interceptor is interceptor
+
+
+@pytest.mark.asyncio
+async def test_close_true_runs_provider_cleanup_exactly_once_across_reentry() -> None:
+    # Re-entrant close() must not stop/delete the paid provider a second time (avoid double-cleanup).
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    cleanup = AsyncMock()
+    state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
+
+    await state.close(close_browser_on_completion=True)
+    await state.close(close_browser_on_completion=True)
+
+    cleanup.assert_awaited_once()
 
 
 def _patch_create_browser_state(
