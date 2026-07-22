@@ -14,8 +14,10 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForCustomSelection,
 )
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
-from skyvern.webeye.actions.actions import InputOrSelectContext, SelectOption, SelectOptionAction
+from skyvern.webeye.actions.actions import ActionType, InputOrSelectContext, SelectOption, SelectOptionAction
 from skyvern.webeye.actions.handler import (
     _collect_option_texts,
     _custom_select_candidates_from_elements,
@@ -1605,6 +1607,26 @@ class TestNoMatchExceptionForDropdown:
         assert isinstance(exc, NoAvailableOptionFoundForCustomSelection)
         assert exc.target_value is None
 
+    def test_widget_mutated_defaults_false_and_propagates_when_set(self) -> None:
+        default = _no_match_exception_for_dropdown(
+            reasoning=None,
+            target_value="Target",
+            observed_options=["Alpha"],
+            transient_fallback_element_id=None,
+        )
+        assert isinstance(default, NoAvailableOptionFoundForCustomSelection)
+        assert default.widget_mutated is False
+
+        mutated = _no_match_exception_for_dropdown(
+            reasoning=None,
+            target_value="Target",
+            observed_options=["Alpha"],
+            transient_fallback_element_id=None,
+            widget_mutated=True,
+        )
+        assert isinstance(mutated, NoAvailableOptionFoundForCustomSelection)
+        assert mutated.widget_mutated is True
+
     def test_native_select_populated_routes_to_permanent_not_transient(self) -> None:
         # Regression: a native <select> populated via element["options"]
         # must NOT be misread as zero-options and routed to the transient
@@ -1700,3 +1722,275 @@ class TestSelectFromDropdownByValueNoMatch:
         assert result.exception_type == NoElementMatchedForTargetOption.__name__
         assert "after scrolling" in (result.exception_message or "")
         scroll_down_to_load_all_options.assert_awaited_once()
+
+
+class TestCustomSelectMissRespectsOptionality:
+    @staticmethod
+    def _patch_open_dropdown_then_miss(
+        monkeypatch: pytest.MonkeyPatch, *, is_required: bool | None, widget_mutated: bool = False
+    ) -> AsyncMock:
+        """Drive handle_select_option_action to the no-match raise, returning the value-fallback mock."""
+        anchor_element = _FakeAnchorElement()
+        fake_frame = MagicMock()
+        fake_frame.safe_wait_for_animation_end = AsyncMock()
+        fake_incremental = _FakeIncrementalScrapePage([[{"id": "opened-option"}]])
+
+        class FakeDomUtil:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            async def get_skyvern_element_by_id(self, _element_id: str) -> _FakeAnchorElement:
+                return anchor_element
+
+        miss = NoAvailableOptionFoundForCustomSelection(
+            reason="target not in list",
+            target_value="Choice",
+            observed_options=["Alpha", "Bravo"],
+        )
+        miss.widget_mutated = widget_mutated
+        value_fallback = AsyncMock(return_value=handler.ActionSuccess())
+        monkeypatch.setattr(handler, "DomUtil", FakeDomUtil)
+        monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame))
+        monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock(return_value=fake_incremental))
+        monkeypatch.setattr(
+            handler,
+            "_get_input_or_select_context",
+            AsyncMock(return_value=InputOrSelectContext(field="Field", is_required=is_required)),
+        )
+        monkeypatch.setattr(handler, "sequentially_select_from_dropdown", AsyncMock(side_effect=miss))
+        monkeypatch.setattr(handler, "select_from_dropdown_by_value", value_fallback)
+        return value_fallback
+
+    async def _run(self) -> list[handler.ActionResult]:
+        return await handler.handle_select_option_action(
+            action=_select_action(),
+            page=MagicMock(),
+            scraped_page=SimpleNamespace(
+                id_to_element_dict={"field-control": {"id": "field-control"}},
+                id_to_css_dict={},
+            ),
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_optional_miss_records_abort_and_skips_value_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        value_fallback = self._patch_open_dropdown_then_miss(monkeypatch, is_required=False)
+
+        results = await self._run()
+
+        assert len(results) == 1
+        assert isinstance(results[0], handler.ActionAbort)
+        assert results[0].success is True
+        value_fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_required_miss_records_typed_option_not_available_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        value_fallback = self._patch_open_dropdown_then_miss(monkeypatch, is_required=True)
+
+        results = await self._run()
+
+        assert len(results) == 1
+        assert isinstance(results[0], handler.ActionFailure)
+        assert results[0].exception_type == NoAvailableOptionFoundForCustomSelection.__name__
+        assert "OPTION_NOT_AVAILABLE" in (results[0].exception_message or "")
+        value_fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_requiredness_miss_fails_closed_not_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # is_required is LLM-populated and may be None; an undetermined field must fail closed
+        # (typed failure) rather than silently skip a possibly-required selection.
+        value_fallback = self._patch_open_dropdown_then_miss(monkeypatch, is_required=None)
+
+        results = await self._run()
+
+        assert len(results) == 1
+        assert isinstance(results[0], handler.ActionFailure)
+        assert results[0].exception_type == NoAvailableOptionFoundForCustomSelection.__name__
+        assert "OPTION_NOT_AVAILABLE" in (results[0].exception_message or "")
+        value_fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_optional_miss_after_prior_cascade_click_fails_closed_not_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A cascading optional select that clicked an earlier level before a deeper miss left the
+        # widget partially mutated; it must fail closed rather than report a clean skip.
+        value_fallback = self._patch_open_dropdown_then_miss(monkeypatch, is_required=False, widget_mutated=True)
+
+        results = await self._run()
+
+        assert len(results) == 1
+        assert isinstance(results[0], handler.ActionFailure)
+        assert results[0].exception_type == NoAvailableOptionFoundForCustomSelection.__name__
+        value_fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emerging_path_optional_miss_closes_open_dropdown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The emerging (re-scrape) path raises before the old is_open assignment, so its optional
+        # miss must still dismiss the dropdown the anchor click opened (coordinate click + Escape).
+        anchor_element = _FakeAnchorElement()
+        anchor_element.is_visible = AsyncMock(return_value=True)
+        fake_frame = MagicMock()
+        fake_frame.safe_wait_for_animation_end = AsyncMock()
+        # Empty incremental tree routes into select_from_emerging_elements.
+        fake_incremental = _FakeIncrementalScrapePage([[]])
+
+        class FakeDomUtil:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            async def get_skyvern_element_by_id(self, _element_id: str) -> _FakeAnchorElement:
+                return anchor_element
+
+        value_fallback = AsyncMock(return_value=handler.ActionSuccess())
+        monkeypatch.setattr(handler, "DomUtil", FakeDomUtil)
+        monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame))
+        monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock(return_value=fake_incremental))
+        monkeypatch.setattr(
+            handler,
+            "_get_input_or_select_context",
+            AsyncMock(return_value=InputOrSelectContext(field="Field", is_required=False)),
+        )
+        monkeypatch.setattr(
+            handler,
+            "select_from_emerging_elements",
+            AsyncMock(
+                side_effect=NoAvailableOptionFoundForCustomSelection(
+                    reason="target not in list", target_value="Choice", observed_options=["Alpha"]
+                )
+            ),
+        )
+        monkeypatch.setattr(handler, "select_from_dropdown_by_value", value_fallback)
+
+        results = await self._run()
+
+        assert len(results) == 1
+        assert isinstance(results[0], handler.ActionAbort)
+        anchor_element.coordinate_click.assert_awaited()
+        anchor_element.press_key.assert_any_await("Escape")
+        value_fallback.assert_not_awaited()
+
+
+class TestSequentialSelectMarksWidgetMutation:
+    @staticmethod
+    def _level_result(*, action_result: object, action_type: object, dropdown_menu: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            action_result=action_result,
+            action_type=action_type,
+            dropdown_menu=dropdown_menu,
+            value="Level0",
+            is_done=AsyncMock(return_value=False),
+        )
+
+    @pytest.mark.asyncio
+    async def test_marks_mutation_when_earlier_level_clicked_before_deeper_miss(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        skyvern_frame = MagicMock()
+        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+        incremental_scraped = MagicMock()
+        incremental_scraped.get_incremental_element_tree = AsyncMock(return_value=[{"id": "next-level"}])
+
+        # Level 0 commits a click (ActionSuccess) and stays open as an INPUT_TEXT level so the loop
+        # advances straight to level 1 without the confirm-finish screenshot/LLM; level 1 misses.
+        level0 = self._level_result(
+            action_result=handler.ActionSuccess(),
+            action_type=ActionType.INPUT_TEXT,
+            dropdown_menu=object(),
+        )
+        deeper_miss = NoAvailableOptionFoundForCustomSelection(
+            reason="target not in list", target_value="Choice", observed_options=["Alpha"]
+        )
+        monkeypatch.setattr(handler, "select_from_dropdown", AsyncMock(side_effect=[level0, deeper_miss]))
+
+        with pytest.raises(NoAvailableOptionFoundForCustomSelection) as excinfo:
+            await handler.sequentially_select_from_dropdown(
+                action=_select_action(),
+                input_or_select_context=InputOrSelectContext(field="Field", is_required=False),
+                page=MagicMock(),
+                dom=MagicMock(),
+                skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+                skyvern_frame=skyvern_frame,
+                incremental_scraped=incremental_scraped,
+                step=MagicMock(),
+                task=_task(),  # type: ignore[arg-type]
+                force_select=True,
+                target_value="Choice",
+            )
+
+        assert excinfo.value.widget_mutated is True
+
+    @pytest.mark.asyncio
+    async def test_first_level_miss_leaves_widget_unmutated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        skyvern_frame = MagicMock()
+        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+        first_miss = NoAvailableOptionFoundForCustomSelection(
+            reason="target not in list", target_value="Choice", observed_options=["Alpha"]
+        )
+        monkeypatch.setattr(handler, "select_from_dropdown", AsyncMock(side_effect=first_miss))
+
+        with pytest.raises(NoAvailableOptionFoundForCustomSelection) as excinfo:
+            await handler.sequentially_select_from_dropdown(
+                action=_select_action(),
+                input_or_select_context=InputOrSelectContext(field="Field", is_required=False),
+                page=MagicMock(),
+                dom=MagicMock(),
+                skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+                skyvern_frame=skyvern_frame,
+                incremental_scraped=MagicMock(),
+                step=MagicMock(),
+                task=_task(),  # type: ignore[arg-type]
+                force_select=True,
+                target_value="Choice",
+            )
+
+        assert excinfo.value.widget_mutated is False
+
+
+class TestSameLevelClickMarksWidgetMutation:
+    @pytest.mark.asyncio
+    async def test_select_from_dropdown_marks_mutation_when_deterministic_clicked_then_missed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The deterministic path can click the current candidate and still return None (route to
+        # LLM), so a same-level click followed by an LLM no-match must mark the widget mutated even
+        # though nothing is recorded in select_history.
+        async def fake_deterministic(*, on_click_attempted: object = None, **_kwargs: object) -> None:
+            if on_click_attempted is not None:
+                on_click_attempted()  # type: ignore[operator]
+            return None
+
+        monkeypatch.setattr(handler, "_select_deterministic_custom_option", fake_deterministic)
+        monkeypatch.setattr(handler.prompt_engine, "load_prompt", MagicMock(return_value="prompt"))
+        monkeypatch.setattr(
+            handler.app,
+            "CUSTOM_SELECT_AGENT_LLM_API_HANDLER",
+            AsyncMock(return_value={"action_type": "", "id": "", "reasoning": "not present"}),
+        )
+        monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=None))
+        fake_incremental = _FakeIncrementalScrapePage(
+            [[{"tagName": "li", "attributes": {"role": "option"}, "text": "Alpha"}]]
+        )
+
+        skyvern_context.set(SkyvernContext(task_id="tsk-test"))
+        try:
+            with pytest.raises(NoAvailableOptionFoundForCustomSelection) as excinfo:
+                await handler.select_from_dropdown(
+                    context=InputOrSelectContext(field="Field", is_required=False),
+                    page=MagicMock(),
+                    skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+                    skyvern_frame=MagicMock(),
+                    incremental_scraped=fake_incremental,  # type: ignore[arg-type]
+                    check_filter_funcs=[],
+                    step=MagicMock(),
+                    task=_task(),  # type: ignore[arg-type]
+                    force_select=True,
+                    target_value="Choice",
+                )
+        finally:
+            skyvern_context.reset()
+
+        assert excinfo.value.widget_mutated is True
