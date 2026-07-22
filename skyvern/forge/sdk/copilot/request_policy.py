@@ -38,7 +38,11 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids, workflow_credential_origins
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    URL_CANDIDATE_RE,
+    workflow_credential_ids,
+    workflow_credential_origins,
+)
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -69,6 +73,7 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "credential_input_kind",
     "credential_refs",
     "login_page_urls",
+    "login_intent",
     "requires_user_clarification",
     "completion_contract",
     "completion_criteria",
@@ -92,16 +97,26 @@ ClarificationReason = Literal[
     "missing_conditional_condition",
     "missing_target_context",
     "workflow_credential_inputs_unbound",
+    "login_credentials_unresolved",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
+# Only deterministic post-resolution code may mint these; a classifier emission would
+# skip the concrete-target and credential-reachability checks the reason stands for.
+_DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset({"login_credentials_unresolved"})
 # Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 )
 # Broader: any reason credential_prompt_reason() should surface an add-credential CTA for.
 CREDENTIAL_PROMPT_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"raw_secret", "credential_name_unresolved", "credential_invention_requested", "workflow_credential_inputs_unbound"}
+    {
+        "raw_secret",
+        "credential_name_unresolved",
+        "credential_invention_requested",
+        "workflow_credential_inputs_unbound",
+        "login_credentials_unresolved",
+    }
 )
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "credential_invention_requested",
@@ -110,6 +125,11 @@ _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "missing_conditional_condition",
     "missing_target_context",
 }
+# A failed credential lookup under explicit login intent is the same condition
+# login_credentials_unresolved names, so it may be upgraded; other planes may not.
+_LOGIN_CREDENTIAL_OVERRIDABLE_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"none", "credential_name_unresolved"}
+)
 _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
     "ambiguous_loop_edit",
     "invalid_conditional_container",
@@ -132,6 +152,11 @@ _RAW_SECRET_QUESTION = (
 )
 _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
 _SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
+_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX = (
+    "This request needs to sign in, and no saved credential for it is available yet. "
+    "Please connect one, or reply with its exact saved credential name or a credential ID beginning with cred_."
+)
+_LOGIN_CREDENTIAL_QUESTION = f"{_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
     "Which website or login page should I use to look up the stored credential?"
 )
@@ -276,6 +301,15 @@ _OUTPUT_FIELD_WORDS = frozenset(
     "amount amounts domain domains name names number numbers owner owners phone phones rate rates specialties specialty "
     "status statuses taxonomy total totals url urls website websites".split()
 )
+# When one of these is followed by "of <noun phrase>" the field is the noun phrase, not the
+# quantifier; the head-at-end window below cannot reach a subject that trails the field word.
+_OUTPUT_QUANTIFIER_HEAD_WORDS = frozenset(
+    "number numbers count counts total totals amount amounts sum sums quantity quantities "
+    "average averages percentage percentages proportion proportions share shares".split()
+)
+# Words that end a quantifier's noun phrase: a scope/time qualifier ("... in the past 7 days") or another
+# preposition begins here, so the field name stops before it.
+_OUTPUT_PHRASE_BOUNDARY_WORDS = frozenset("in on over during within for per by from since between as at with".split())
 # Intentionally distinct from enforcement._COVERAGE_GENERIC_TOKENS: this list filters intent prose when
 # parsing requested-output field names, so it drops phrase-level noise ("each", "profile", "structured");
 # the coverage list filters path leaf tokens only. Not unified — the consumers differ.
@@ -443,6 +477,7 @@ class RequestPolicy:
     credential_input_kind: str = "none"
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
+    login_intent: bool = False
     requires_user_clarification: bool = False
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
@@ -482,6 +517,7 @@ class RequestPolicy:
             "testing_intent": self.testing_intent,
             "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
+            "login_intent": self.login_intent,
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
@@ -863,7 +899,7 @@ def _verify_raw_secret_evidence(evidence: str | None, user_message: str) -> bool
 
 
 def _coerce_clarification_reason(value: Any) -> ClarificationReason:
-    if value in _VALID_CLARIFICATION_REASONS:
+    if value in _VALID_CLARIFICATION_REASONS and value not in _DETERMINISTIC_ONLY_CLARIFICATION_REASONS:
         return cast(ClarificationReason, value)
     return "none"
 
@@ -1647,6 +1683,21 @@ def _bind_criterion_to_request_slot(
         or isinstance(expected_classification, bool)
         or judgment_truth_condition is not None
     )
+    if rekeyed:
+        LOG.info(
+            "copilot_request_slot_criterion_rekeyed",
+            slot_id=slot.slot_id,
+            canonical_path=slot.canonical_path,
+            pinability=pinability,
+            antecedent_family=antecedent_family,
+            has_exact_requirement=has_exact_requirement,
+            degraded=degraded,
+            rekeyed_reason="degraded" if degraded else "shapeless_valid",
+            kind=kind,
+            original_output_path=original_output_path,
+            requested_output_evidence_source=criterion.requested_output_evidence_source,
+            outcome=(criterion.outcome or source_quote or "")[:80],
+        )
     return replace(
         criterion,
         id=slot.slot_id,
@@ -1786,6 +1837,7 @@ def _classification_from_raw(
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
+        login_intent=bool(raw.get("login_intent")),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
         completion_criteria=completion_criteria,
@@ -2190,6 +2242,26 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
         return None
     if all(word in _OUTPUT_GENERIC_WORDS for word in normalized_words):
         return None
+    quantifier_index = next(
+        (
+            index
+            for index, word in enumerate(normalized_words)
+            if word in _OUTPUT_QUANTIFIER_HEAD_WORDS
+            and index + 1 < len(normalized_words)
+            and normalized_words[index + 1] == "of"
+        ),
+        None,
+    )
+    if quantifier_index is not None:
+        subject_words: list[str] = []
+        for word, normalized_word in zip(words[quantifier_index + 2 :], normalized_words[quantifier_index + 2 :]):
+            if normalized_word in _OUTPUT_PHRASE_BOUNDARY_WORDS:
+                break
+            if normalized_word in _OUTPUT_GENERIC_WORDS:
+                continue
+            subject_words.append(word)
+        if subject_words:
+            return " ".join(subject_words)
     field_indexes = [i for i, word in enumerate(normalized_words) if word in _OUTPUT_FIELD_WORDS]
     if not field_indexes:
         return None
@@ -3838,6 +3910,43 @@ def _has_resolvable_credential_scope(policy: RequestPolicy) -> bool:
     return False
 
 
+def _login_target_is_concrete(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
+    """A login phrase with no site, workflow, or URL yet has nothing to hold a credential.
+
+    Asking there would demand a credential on first touch, before the task and URL
+    clarification the user still owes.
+    """
+    return bool(
+        policy.login_page_urls
+        or workflow_yaml.strip()
+        or policy.existing_workflow_credential_ids
+        or URL_CANDIDATE_RE.search(user_message)
+    )
+
+
+def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
+    """Login was explicitly requested against a concrete target and no credential is reachable.
+
+    Evaluated after ``_resolve_credentials`` so an org/URL/name match counts as
+    resolved; a user-named credential keeps ``credential_name_unresolved`` because
+    naming one makes the lookup failure, not the absence of login credentials, the ask.
+    """
+    if not policy.login_intent or policy.raw_secret_detected:
+        return False
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return False
+    if policy.clarification_reason not in _LOGIN_CREDENTIAL_OVERRIDABLE_REASONS:
+        return False
+    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
+        return False
+    return not (
+        policy.credential_refs
+        or policy.resolved_credentials
+        or policy.discovered_credentials
+        or policy.existing_workflow_credential_ids
+    )
+
+
 def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
     if policy.credential_input_kind not in ("credential_id", "credential_name"):
         return
@@ -4256,6 +4365,12 @@ async def build_request_policy(
                 policy,
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
+
+    if _login_credentials_unresolved(policy, user_message, workflow_yaml):
+        if policy.clarification_reason == "none":
+            _block(policy, _LOGIN_CREDENTIAL_QUESTION, reason="login_credentials_unresolved")
+        else:
+            policy.clarification_reason = "login_credentials_unresolved"
 
     if policy.authoring_intent == "defer_authoring":
         policy.allow_update_workflow = False

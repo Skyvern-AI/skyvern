@@ -21,7 +21,7 @@ PRIMARY COMPLETION CRITERIA:
 ```{{ reconciliation_criteria }}```
 {% else %}
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; login_intent; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
 
 terminal_action priority:
 - Separate authentication from the requested end state before writing completion_criteria. Authentication is a prefix
@@ -50,6 +50,12 @@ credential_input_kind:
 - website_stored_credential: the user explicitly asks to use stored/saved credentials for a specific website or login page URL — the message must include a credential or authentication phrase (for example "log in", "sign in", "authenticate", "use the saved/stored login/creds/credentials", "with my credentials", and similar). Put URLs in login_page_urls. A URL alone, or a URL paired only with task language such as "scrape", "fill the form", "extract orders", "navigate to", or "go to", is NOT a website_stored_credential request even when the URL host or path looks like a login, admin, portal, or dashboard page.
 - placeholder: the user asks to add credential/password/username fields but explicitly says there are no real credentials yet.
 - none: the request mentions a login workflow but does not provide, request, or refer to any credential material.
+
+login_intent:
+- true when the latest request explicitly asks the workflow to authenticate — sign in, log in, authenticate, or get past a login gate — as part of reaching the goal. "Log in and place an order" and a pure "log into <site>" are both true.
+- false for an ordinary task with no authentication step, for a message that is essentially just a URL or a URL paired only with task language such as "scrape", "extract", "fill the form", "navigate to", or "go to", and for session-reuse phrasing such as "I'm already signed in" or "use my current browser session".
+- false on a first-touch task phrase that merely implies an eventual login without explicitly asking to sign in or authenticate, for example "check my account balance" or "download my invoices". Let task or URL clarification happen first.
+- Independent of credential_input_kind: decide it from whether authentication is required, not from whether the user supplied credential material. It is true for an explicit login request that names a saved credential and true for one that names none.
 
 requires_user_clarification:
 - true only when the user refers to credentials but does not provide enough information to identify a saved credential or login page.

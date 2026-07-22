@@ -100,6 +100,7 @@ from skyvern.forge.sdk.copilot.context import (
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
@@ -534,19 +535,8 @@ def _store_request_policy_on_context(
         chat_history_text=policy_inputs.chat_history_text,
         previous_user_message=policy_inputs.previous_user_message,
     )
-    turn_intent = build_turn_intent(
-        user_message=policy_inputs.user_message,
-        workflow_yaml=policy_inputs.workflow_yaml,
-        chat_history=policy_inputs.chat_history_messages,
-        global_llm_context=policy_inputs.global_llm_context,
-        request_policy=policy,
-        workflow_id=policy_inputs.workflow_id,
-        workflow_permanent_id=policy_inputs.workflow_permanent_id,
-        workflow_run_id=policy_inputs.workflow_run_id,
-        browser_session_id=policy_inputs.browser_session_id,
-        classifier_result=turn_intent_classifier_result,
-        fix_origin=policy_inputs.fix_origin,
-    )
+    ctx.turn_intent_classifier_result = turn_intent_classifier_result
+    _derive_turn_intent_on_context(ctx, policy, policy_inputs)
     _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
     ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
@@ -556,7 +546,32 @@ def _store_request_policy_on_context(
         chat_history_text=policy_chat_history_text,
         global_llm_context=policy_inputs.global_llm_context,
     )
-    ctx.turn_intent = turn_intent
+
+
+def _derive_turn_intent_on_context(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    """Snapshot ``policy``'s authority into ``ctx.turn_intent``.
+
+    build_turn_intent hard-clears may_update_workflow/may_run_blocks for a CLARIFY
+    policy, so any code that later un-blocks the policy must re-derive here or the
+    turn keeps clarify-shaped authority.
+    """
+    ctx.turn_intent = build_turn_intent(
+        user_message=policy_inputs.user_message,
+        workflow_yaml=policy_inputs.workflow_yaml,
+        chat_history=policy_inputs.chat_history_messages,
+        global_llm_context=policy_inputs.global_llm_context,
+        request_policy=policy,
+        workflow_id=policy_inputs.workflow_id,
+        workflow_permanent_id=policy_inputs.workflow_permanent_id,
+        workflow_run_id=policy_inputs.workflow_run_id,
+        browser_session_id=policy_inputs.browser_session_id,
+        classifier_result=ctx.turn_intent_classifier_result,
+        fix_origin=policy_inputs.fix_origin,
+    )
 
 
 def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
@@ -5272,12 +5287,18 @@ async def _run_copilot_turn_impl(
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
-        return _build_request_policy_clarification_result(
-            request_policy,
-            prior_global_llm_context=global_llm_context,
-            prior_workflow_yaml=chat_request.workflow_yaml,
-            ctx=ctx,
-        )
+        preflight_resolution = None
+        if request_policy.clarification_reason == "login_credentials_unresolved":
+            preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
+            if preflight_resolution is not None:
+                _derive_turn_intent_on_context(ctx, request_policy, policy_inputs)
+        if preflight_resolution is None:
+            return _build_request_policy_clarification_result(
+                request_policy,
+                prior_global_llm_context=global_llm_context,
+                prior_workflow_yaml=chat_request.workflow_yaml,
+                ctx=ctx,
+            )
     if request_policy is None:
         raise CopilotRequestPolicyMissingError()
 

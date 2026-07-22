@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     output_path_segments,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.runtime import ScoutedInputCorrespondence
 from skyvern.utils.strings import escape_code_fences
 
@@ -2507,16 +2508,41 @@ def _table_group_read_lines(
     return lines
 
 
+def _returned_output_segments_by_binding(
+    bindings: list[LiveReadBinding],
+) -> dict[str, tuple[tuple[str, bool], ...]]:
+    """Segments each extracted value is returned under, keyed by output path. A slot identity is a
+    digest, so the matched label names the field and an already-taken name is suffixed."""
+    segments_by_path: dict[str, tuple[tuple[str, bool], ...]] = {}
+    used_names: set[str] = set()
+    for binding in bindings:
+        if not (is_canonical_request_slot_path(binding.output_path) and binding.relation_label.strip()):
+            segments = output_path_segments(binding.output_path)
+            used_names.update(name for name, _is_array in segments[1:])
+            segments_by_path[binding.output_path] = segments
+            continue
+        base = _slug(binding.relation_label)
+        name = base
+        suffix = 2
+        while name in used_names:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        used_names.add(name)
+        segments_by_path[binding.output_path] = (("output", False), (name, False))
+    return segments_by_path
+
+
 def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> SynthesizedExtractionSuffix | None:
     if not plan.live_reads:
         return None
     lines: list[str] = []
     return_root = _ExtractionReturnNode()
     scalar_bindings = [binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE]
+    segments_by_path = _returned_output_segments_by_binding(scalar_bindings)
     for index, binding in enumerate(scalar_bindings):
         variable = f"_extraction_value_{index}"
         lines.extend(_key_value_scalar_read_statements(binding, variable, guard_empty=False))
-        _set_return_expression(return_root, output_path_segments(binding.output_path), variable)
+        _set_return_expression(return_root, segments_by_path[binding.output_path], variable)
 
     table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
     for binding in plan.live_reads:
