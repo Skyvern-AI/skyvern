@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.webeye import cdp_frame_publisher as publisher_module
 from skyvern.webeye.cdp_frame_publisher import (
@@ -19,6 +20,15 @@ from skyvern.webeye.cdp_frame_publisher import (
 
 ORG_ID = "o_test_123"
 STREAM_KEY = "wr_test_456.png"
+
+
+class TargetClosedError(Exception):
+    """Stand-in named exactly like the driver's teardown class.
+
+    Both stock Playwright and patchright name this class ``TargetClosedError`` while
+    exposing it as distinct types, so the publisher classifies it by type name. A local
+    look-alike proves that name-based match without importing either driver.
+    """
 
 
 def _make_cdp_session(frame_bytes_seq: list[bytes]) -> MagicMock:
@@ -199,6 +209,136 @@ async def test_capture_screenshot_failure_is_non_fatal(streaming_temp_dir: Path,
     fake_storage.assert_not_awaited()
     # Failed session should be detached so the next tick reattaches.
     session.detach.assert_awaited()
+
+
+@pytest.mark.parametrize(
+    "teardown_exc",
+    [
+        TargetClosedError("Target page, context or browser has been closed"),
+        TargetClosedError("boom"),
+        RuntimeError("Connection closed while reading from the driver"),
+    ],
+    ids=["target_closed_type", "target_closed_type_noncanonical_message", "driver_pipe_message"],
+)
+@pytest.mark.asyncio
+async def test_cdp_session_open_teardown_error_is_debug_and_retried(
+    teardown_exc: Exception, fake_storage: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = MagicMock()
+    page.context = MagicMock()
+    page.context.new_cdp_session = AsyncMock(side_effect=teardown_exc)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    fake_log = SimpleNamespace(debug=MagicMock(), warning=MagicMock())
+    monkeypatch.setattr(publisher_module, "LOG", fake_log)
+
+    await _drive_publish_once(pub)
+    await _drive_publish_once(pub)
+
+    # A known teardown race is expected and benign: kept at debug, never warned, retried.
+    assert page.context.new_cdp_session.await_count == 2
+    assert fake_log.debug.call_count == 2
+    fake_log.debug.assert_called_with(
+        "Could not open CDP session for frame publishing",
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+        exc_info=True,
+    )
+    fake_log.warning.assert_not_called()
+    fake_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cdp_session_open_unexpected_error_warns_once_then_dedupes(
+    fake_storage: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = MagicMock()
+    page.context = MagicMock()
+    page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("CDP proxy handshake incompatible"))
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    fake_log = SimpleNamespace(debug=MagicMock(), warning=MagicMock())
+    monkeypatch.setattr(publisher_module, "LOG", fake_log)
+
+    await _drive_publish_once(pub)
+    await _drive_publish_once(pub)
+    await _drive_publish_once(pub)
+
+    # An unexpected, non-teardown attachment failure while the page may still be live must
+    # stay visible so persistently blank frames are explainable -- but only the first
+    # occurrence warns; subsequent failures in the same streak drop to debug to avoid a flood.
+    assert page.context.new_cdp_session.await_count == 3
+    fake_log.warning.assert_called_once_with(
+        "Could not open CDP session for frame publishing",
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+        exc_info=True,
+    )
+    assert fake_log.debug.call_count == 2
+    fake_storage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cdp_session_open_warn_gate_resets_after_successful_attach(
+    streaming_temp_dir: Path, fake_storage: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A healthy attach must re-arm the warning so a *new* unhealthy streak warns again,
+    proving the first-occurrence gate silences repeats without hiding fresh failures."""
+    bad_page_first = MagicMock()
+    bad_page_first.context = MagicMock()
+    bad_page_first.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("CDP proxy handshake incompatible"))
+    good_page = _make_page_with_session(_make_cdp_session([b"recovered-frame"]))
+    bad_page_second = MagicMock()
+    bad_page_second.context = MagicMock()
+    bad_page_second.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("CDP proxy handshake incompatible"))
+
+    current = {"page": bad_page_first}
+
+    async def _get_page() -> MagicMock:
+        return current["page"]
+
+    state = SimpleNamespace(get_working_page=_get_page, is_connected=lambda: True)
+    pub = CDPFramePublisher(browser_state=state, stream_key=STREAM_KEY, organization_id=ORG_ID)
+    fake_log = SimpleNamespace(debug=MagicMock(), warning=MagicMock(), info=MagicMock())
+    monkeypatch.setattr(publisher_module, "LOG", fake_log)
+
+    await _drive_publish_once(pub)  # unexpected failure -> warn (1)
+    current["page"] = good_page
+    await _drive_publish_once(pub)  # healthy attach -> gate re-arms
+    current["page"] = bad_page_second
+    await _drive_publish_once(pub)  # new unexpected streak -> warn (2)
+
+    assert fake_log.warning.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_unexpected_publish_iteration_failure_remains_warning() -> None:
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+
+    async def _unexpected_failure() -> None:
+        pub._stopped.set()
+        raise RuntimeError("unexpected publisher failure")
+
+    pub._publish_one_frame = AsyncMock(side_effect=_unexpected_failure)  # type: ignore[method-assign]
+
+    with capture_logs() as logs:
+        await pub._run()
+
+    matching_logs = [log for log in logs if log.get("event") == "CDP frame publish iteration failed"]
+    assert len(matching_logs) == 1
+    assert matching_logs[0].get("log_level") == "warning"
+    assert matching_logs[0].get("stream_key") == STREAM_KEY
+    assert matching_logs[0].get("organization_id") == ORG_ID
 
 
 @pytest.mark.asyncio
