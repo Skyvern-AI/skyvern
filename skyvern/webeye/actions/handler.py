@@ -6992,12 +6992,14 @@ async def sequentially_select_from_dropdown(
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
         )
+        # Fall back to the secondary (vision-capable) handler so this screenshot-based
+        # verification stays sighted when the main model is vision-less.
         llm_api_handler = await resolve_prompt_type_handler_with_override(
             "confirm-multi-selection-finish",
             task.llm_key,
             task.workflow_run_id if task.workflow_run_id else task.task_id,
             task.organization_id,
-            LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER),
+            LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.SECONDARY_LLM_API_HANDLER),
         )
         json_response = await llm_api_handler(
             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
