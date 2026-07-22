@@ -4193,3 +4193,52 @@ class TestSharedSubmitPredicate:
         ]
         gap = credential_scout_gap(trajectory, [(frozenset({"cred_1"}), frozenset({"username"}))], requires_submit=True)
         assert gap.missing_submit is False
+
+
+_LOGIN_HOST = "https://authenticationtest.com/login"
+_INLINE_SECRET_SENTINEL = "Hunter2Portal!"
+
+
+def test_credential_fill_trajectory_binds_param_access_and_omits_literals() -> None:
+    trajectory = [
+        _credential_fill(
+            selector="#username", credential_id="cred_x", credential_field="username", source_url=_LOGIN_HOST
+        ),
+        _credential_fill(
+            selector="#password", credential_id="cred_x", credential_field="password", source_url=_LOGIN_HOST
+        ),
+        _interaction("click", selector="button[type=submit]", source_url=_LOGIN_HOST),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
+    credential_key = credential_param["key"]
+    assert f"{credential_key}.username" in result.code
+    assert f"{credential_key}.password" in result.code
+    assert _INLINE_SECRET_SENTINEL not in result.code
+
+
+def test_type_text_secret_bypass_is_not_carried_into_synthesized_block() -> None:
+    trajectory = [
+        _credential_fill(
+            selector="#username", credential_id="cred_x", credential_field="username", source_url=_LOGIN_HOST
+        ),
+        _interaction(
+            "type_text",
+            selector="#password",
+            source_url=_LOGIN_HOST,
+            typed_value="",
+            raw_typed_value=_INLINE_SECRET_SENTINEL,
+            typed_length=len(_INLINE_SECRET_SENTINEL),
+            role="textbox",
+        ),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert _INLINE_SECRET_SENTINEL not in result.code
+    credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
+    assert f"{credential_param['key']}.username" in result.code
