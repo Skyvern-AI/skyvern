@@ -6,6 +6,7 @@ import json
 import re
 import time
 import urllib.parse
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from io import BytesIO
 from typing import TYPE_CHECKING, Any
@@ -106,6 +107,8 @@ _NAVIGATION_SETTLE_TIMEOUT_MS = 3000
 
 def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Execution context was destroyed" in error_msg:
+        return True
+    if "Cannot find context with specified id" in error_msg:
         return True
     return "ReferenceError" in error_msg and "is not defined" in error_msg
 
@@ -503,9 +506,26 @@ class SkyvernFrame:
         arg: Any | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> Any:
+        async def evaluate_expression() -> Any:
+            return await _dispatch_evaluate(frame, expression, arg)
+
+        return await SkyvernFrame._evaluate_expression(
+            frame=frame,
+            expression=expression,
+            evaluate_expression=evaluate_expression,
+            timeout_ms=timeout_ms,
+        )
+
+    @staticmethod
+    async def _evaluate_expression(
+        frame: Page | Frame,
+        expression: str,
+        evaluate_expression: Callable[[], Awaitable[Any]],
+        timeout_ms: float,
+    ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
-                return await _dispatch_evaluate(frame, expression, arg)
+                return await evaluate_expression()
         except PlaywrightError as e:
             error_msg = str(e)
             if not _is_navigation_context_lost(error_msg):
@@ -513,7 +533,7 @@ class SkyvernFrame:
             return await SkyvernFrame._evaluate_with_navigation_recovery(
                 frame=frame,
                 expression=expression,
-                arg=arg,
+                evaluate_expression=evaluate_expression,
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
             )
@@ -526,7 +546,7 @@ class SkyvernFrame:
             return await SkyvernFrame._evaluate_with_navigation_recovery(
                 frame=frame,
                 expression=expression,
-                arg=arg,
+                evaluate_expression=evaluate_expression,
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
             )
@@ -540,7 +560,7 @@ class SkyvernFrame:
     async def _evaluate_with_navigation_recovery(
         frame: Page | Frame,
         expression: str,
-        arg: Any | None,
+        evaluate_expression: Callable[[], Awaitable[Any]],
         timeout_ms: float,
         initial_error: str,
     ) -> Any:
@@ -611,7 +631,7 @@ class SkyvernFrame:
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    return await _dispatch_evaluate(frame, expression, arg)
+                    return await evaluate_expression()
             except asyncio.TimeoutError:
                 LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
@@ -903,9 +923,20 @@ class SkyvernFrame:
         js_script = "(element) => isScrollable(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
-    async def get_element_visible(self, element: ElementHandle) -> bool:
+    async def get_element_visible(self, locator: Locator) -> bool:
         js_script = "(element) => isElementVisible(element) && !isHidden(element)"
-        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+
+        async def evaluate_expression() -> bool:
+            if await locator.count() == 0:
+                return False
+            return await locator.evaluate(js_script)
+
+        return await self._evaluate_expression(
+            frame=self.frame,
+            expression=js_script,
+            evaluate_expression=evaluate_expression,
+            timeout_ms=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
 
     async def get_disabled_from_style(self, element: ElementHandle) -> bool:
         js_script = "(element) => checkDisabledFromStyle(element)"

@@ -84,9 +84,13 @@ export function RunView({
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
   // isLoading here, not isPending like RunTab: this query is enabled only once a run
   // id exists, so a disabled query means "no run" → fall through to the empty CTA.
-  const { data: workflowRun, isLoading } =
-    useWorkflowRunWithWorkflowQuery(queryOptions);
-  const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
+  const {
+    data: workflowRun,
+    isLoading,
+    isPlaceholderData: runIsPlaceholder,
+  } = useWorkflowRunWithWorkflowQuery(queryOptions);
+  const { data: timeline, isPlaceholderData: timelineIsPlaceholder } =
+    useWorkflowRunTimelineQuery(queryOptions);
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
@@ -193,6 +197,13 @@ export function RunView({
     if (!workflowRun || !timeline) {
       return;
     }
+    // On a run switch, keepPreviousData briefly serves the PREVIOUS run's
+    // (finalized) run + timeline. Deciding auto-pin on it would lock THIS run's
+    // one-shot to the old run's last frame and never re-decide; wait for the
+    // new run's real payload.
+    if (runIsPlaceholder || timelineIsPlaceholder) {
+      return;
+    }
     if (!statusIsFinalized(workflowRun)) {
       // Still running: leave the one-shot open so the terminal transition of
       // a watched run lands the same last-item pin as a cold open.
@@ -228,7 +239,16 @@ export function RunView({
     if (last) {
       pinFrame(last.id);
     }
-  }, [workflowRunId, workflowRun, timeline, frames, pinFrame, pathRunId]);
+  }, [
+    workflowRunId,
+    workflowRun,
+    timeline,
+    frames,
+    pinFrame,
+    pathRunId,
+    runIsPlaceholder,
+    timelineIsPlaceholder,
+  ]);
 
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
