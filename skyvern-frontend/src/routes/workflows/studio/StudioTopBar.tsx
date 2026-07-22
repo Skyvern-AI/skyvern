@@ -78,12 +78,19 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
         inputClassName="px-2 text-base"
         renderIdle={({ startEditing }) => (
           <>
-            <Link
-              to={`/agents/${workflowPermanentId}/runs`}
-              className="min-w-0 truncate px-2 text-base hover:underline hover:underline-offset-2"
+            {/* min-w-0 shrink overrides ControlTooltip's default shrink-0 (cn/twMerge
+                drops shrink-0) so the wrapper stays shrinkable and the Link truncates. */}
+            <ControlTooltip
+              content="View past runs"
+              wrapperClassName="min-w-0 shrink"
             >
-              {title}
-            </Link>
+              <Link
+                to={`/agents/${workflowPermanentId}/runs`}
+                className="min-w-0 truncate px-2 text-base hover:text-blue-700 hover:underline hover:underline-offset-2 dark:hover:text-blue-400"
+              >
+                {title}
+              </Link>
+            </ControlTooltip>
             {canEdit && (
               <ControlTooltip content="Click to edit title">
                 <button
