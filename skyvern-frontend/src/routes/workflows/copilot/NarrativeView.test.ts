@@ -981,6 +981,177 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.glyph).toBe("✦");
   });
 
+  it("renders non-build REPLY + not_demonstrated as Outcome not confirmed", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        verifiedSuccess: false,
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          displayReason: "The run never reached the target page.",
+          activitySeqAtVerdict: 3,
+        },
+      }),
+    );
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("uses hydrated not_demonstrated block outcomes when lastRunOutcome is absent", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        verifiedSuccess: false,
+        blocks: [
+          {
+            ...reproBlock("open_registry_find_registrant"),
+            outcome: "demonstrated",
+          },
+          {
+            ...reproBlock("search_jane_doe_credential_a"),
+            outcome: "not_demonstrated",
+            outcomeReason: "A verification challenge prevented confirmation.",
+          },
+          {
+            ...reproBlock("expand_and_extract_certifications"),
+            outcome: "demonstrated",
+          },
+        ],
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("keeps the Question headline when response_type is ASK_QUESTION", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        verifiedSuccess: false,
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          displayReason: "The run never reached the target page.",
+          activitySeqAtVerdict: 3,
+        },
+      }),
+    );
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("keeps the Question headline for ASK_QUESTION even when hydrated blocks carry not_demonstrated", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        verifiedSuccess: false,
+        blocks: [
+          {
+            ...reproBlock("open_registry_find_registrant"),
+            outcome: "not_demonstrated",
+            outcomeReason: "A verification challenge prevented confirmation.",
+          },
+          {
+            ...reproBlock("search_jane_doe_credential_a"),
+            outcome: "demonstrated",
+          },
+          {
+            ...reproBlock("expand_and_extract_certifications"),
+            outcome: "demonstrated",
+          },
+        ],
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("treats build-kind ASK_QUESTION as an ask when no draft review is pending", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "no_proposal",
+      responseKind: "build",
+      responseType: "ASK_QUESTION",
+      verifiedSuccess: true,
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+
+    const uxSummary = computeTurnSummary(turn, { uxV1: true });
+    expect(uxSummary.headline).toBe("Needs your input");
+    expect(uxSummary.accent).toBe("qa");
+    expect(uxSummary.glyph).toBe("✦");
+  });
+
+  it("keeps review disposition precedence over build-kind ASK_QUESTION", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_untested",
+      responseKind: "build",
+      responseType: "ASK_QUESTION",
+      verifiedSuccess: true,
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Draft needs review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("keeps build-kind REPLY summary behavior unchanged", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "no_proposal",
+      responseKind: "build",
+      responseType: "REPLY",
+      verifiedSuccess: true,
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Built and tested the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
+  it("keeps legacy non-build behavior unchanged when responseType and verdict are absent", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        verifiedSuccess: false,
+      }),
+    );
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("keeps legacy non-build behavior unchanged when hydrated turns have neither signal", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        verifiedSuccess: false,
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    expect(
+      turn.blocks.some((block) => block.outcome === "not_demonstrated"),
+    ).toBe(false);
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
   it("keeps the factual stats line on an adjudicated clarify build turn", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({ responseKind: "clarify", verifiedSuccess: false }),
@@ -1245,7 +1416,11 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
 
   it("renames the pure-ask clarify headline to Needs your input", () => {
     const summary = computeTurnSummary(
-      buildTurn({ responseKind: "clarify", verifiedSuccess: false }),
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        verifiedSuccess: false,
+      }),
       { uxV1: true },
     );
     expect(summary.headline).toBe("Needs your input");
