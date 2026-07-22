@@ -346,6 +346,11 @@ describe("RunView view toggles", () => {
     expect(scope.queryByTestId("workflow-run-code")).toBeNull();
     fireEvent.click(scope.getByRole("button", { name: "Code" }));
     expect(scope.queryByTestId("workflow-run-code")).not.toBeNull();
+    // The Code toggle exposes aria-pressed once it's the active view, matching
+    // the sibling view toggles (defends the shared ViewToggle disabled-prop add).
+    expect(
+      scope.getByRole("button", { name: "Code", pressed: true }),
+    ).not.toBeNull();
   });
 
   test("the Code toggle shows a spinner while cached code is generating", () => {
