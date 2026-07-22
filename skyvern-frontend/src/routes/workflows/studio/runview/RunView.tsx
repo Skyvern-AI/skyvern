@@ -28,6 +28,7 @@ import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
   formatElapsed,
+  formatRunTimesTooltip,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
@@ -348,6 +349,7 @@ export function RunView({
     workflowRun.started_at ?? workflowRun.created_at ?? null,
     finalized ? (workflowRun.finished_at ?? null) : null,
   );
+  const elapsedTitle = formatRunTimesTooltip(workflowRun);
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col">
@@ -408,7 +410,7 @@ export function RunView({
 
         {view === "timeline" ? (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <RunSummaryStrip workflowRun={workflowRun} elapsed={elapsed} />
+            <RunSummaryStrip workflowRun={workflowRun} />
             <ResizableTimelineSplit
               className="flex-1"
               top={
@@ -417,6 +419,8 @@ export function RunView({
                     workflowRunId={workflowRunId}
                     hideLiveBadge
                     enableSearch
+                    elapsed={elapsed}
+                    elapsedTitle={elapsedTitle}
                     activeItem={activeItem}
                     activeIteration={activeIteration}
                     onActionItemSelected={(item) => {
