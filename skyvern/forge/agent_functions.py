@@ -830,8 +830,8 @@ class AgentFunction:
     async def should_upgrade_to_code_mode(
         self,
         *,
-        workflow: "Workflow",
-        workflow_run: "WorkflowRun",
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
     ) -> bool:
         return False
 
