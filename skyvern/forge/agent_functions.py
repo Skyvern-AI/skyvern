@@ -835,6 +835,15 @@ class AgentFunction:
     ) -> bool:
         return False
 
+    async def should_replace_cached_script(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        script: Any,
+    ) -> bool:
+        return False
+
     async def resolve_mcp_code_only_mode(
         self,
         organization_id: str | None,
