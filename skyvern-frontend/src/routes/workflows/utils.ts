@@ -221,31 +221,40 @@ export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
 };
 
 /**
- * Returns run parameter entries ordered by the workflow definition's parameter array.
- * Falls back to Object.entries() if no definition is available.
+ * Returns run parameter entries ordered by the workflow definition's parameter array,
+ * each paired with its matched workflow-parameter definition (undefined when absent).
+ * Falls back to Object.entries() ordering if no definition is available.
  */
 export function getOrderedRunParameters(
   definitionParameters: Array<Parameter> | undefined,
   runParameters: Record<string, unknown>,
-): Array<[string, unknown]> {
+): Array<[string, unknown, WorkflowParameter?]> {
+  const workflowDefs = (definitionParameters ?? []).filter(
+    (p): p is WorkflowParameter => p.parameter_type === "workflow",
+  );
+  const defByKey = new Map(workflowDefs.map((p) => [p.key, p] as const));
+  const attach = (
+    key: string,
+    value: unknown,
+  ): [string, unknown, WorkflowParameter?] => [key, value, defByKey.get(key)];
+
   if (!definitionParameters) {
-    return Object.entries(runParameters);
+    return Object.entries(runParameters).map(([key, value]) =>
+      attach(key, value),
+    );
   }
 
-  const orderedKeys = definitionParameters
-    .filter((p) => p.parameter_type === "workflow")
-    .map((p) => p.key);
-
+  const orderedKeys = workflowDefs.map((p) => p.key);
   const seenKeys = new Set(orderedKeys);
 
-  const ordered: Array<[string, unknown]> = orderedKeys
+  const ordered: Array<[string, unknown, WorkflowParameter?]> = orderedKeys
     .filter((key) => key in runParameters)
-    .map((key) => [key, runParameters[key]]);
+    .map((key) => attach(key, runParameters[key]));
 
   // Append any run parameters not in the definition (backward compat)
   for (const [key, value] of Object.entries(runParameters)) {
     if (!seenKeys.has(key)) {
-      ordered.push([key, value]);
+      ordered.push(attach(key, value));
     }
   }
 

@@ -101,6 +101,57 @@ describe("RunOutputsSection run outputs", () => {
     expect(screen.queryByText("Run outputs")).toBeNull();
     expect(screen.queryByTestId("summarize")).toBeNull();
   });
+
+  test("hides the run outputs header when outputs holds only extracted_information", () => {
+    render(
+      <RunOutputsSection
+        {...baseProps}
+        outputs={{ extracted_information: { answer: 42 } }}
+        extractedInformation={{ answer: 42 }}
+      />,
+    );
+    // Extracted information keeps its own dedicated section.
+    expect(screen.queryByText("Extracted information")).not.toBeNull();
+    // No per-field run outputs remain, so no empty header or Summarize button.
+    expect(screen.queryByText("Run outputs")).toBeNull();
+    expect(screen.queryByTestId("summarize")).toBeNull();
+  });
+
+  test("keeps the run outputs block when only a persisted summary remains", () => {
+    render(
+      <RunOutputsSection
+        {...baseProps}
+        outputs={{ extracted_information: { answer: 42 } }}
+        extractedInformation={{ answer: 42 }}
+        summary="A persisted summary."
+      />,
+    );
+    expect(screen.queryByText("Run outputs")).not.toBeNull();
+    expect(screen.getByText("A persisted summary.")).not.toBeNull();
+  });
+
+  test("splits the outputs bag into per-block fields, excluding extracted_information", () => {
+    render(
+      <RunOutputsSection
+        {...baseProps}
+        outputs={{
+          extracted_information: { answer: 42 },
+          summary_block: "done",
+          data_block: { rows: 2 },
+        }}
+        extractedInformation={{ answer: 42 }}
+      />,
+    );
+
+    // Each non-extracted output key becomes its own labeled field.
+    expect(screen.queryByText("summary_block")).not.toBeNull();
+    expect(screen.queryByText("done")).not.toBeNull();
+    // extracted_information keeps its dedicated section and is not repeated as a
+    // per-block output field.
+    expect(screen.queryByText("extracted_information")).toBeNull();
+    // The nested block output renders the collapsible searchable tree.
+    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+  });
 });
 
 describe("RunOutputsSection task 2.0 and webhook surfaces", () => {
