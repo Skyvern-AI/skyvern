@@ -35,6 +35,7 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ClickAction,
+    HoverAction,
     InputTextAction,
     SelectOptionAction,
     UploadFileAction,
@@ -42,6 +43,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.handler import (
     get_actual_value_of_parameter_if_secret,
     handle_click_action,
+    handle_hover_action,
     handle_input_text_action,
     handle_select_option_action,
     handle_upload_file_action,
@@ -1661,6 +1663,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
         elif action_type == "SELECT_OPTION":
             template = "single-select-action"
             llm_handler = app.SELECT_AGENT_LLM_API_HANDLER
+        elif action_type == "HOVER":
+            template = "single-hover-action"
+            llm_handler = app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
         else:
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
@@ -1726,6 +1731,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "SELECT_OPTION" and isinstance(action, SelectOptionAction):
                 result = await handle_select_option_action(action, self.page, self.scraped_page, task, step)
+            elif action_type == "HOVER" and isinstance(action, HoverAction):
+                result = await handle_hover_action(action, self.page, self.scraped_page, task, step)
             else:
                 LOG.warning(
                     "ai_act: action type mismatch",

@@ -494,6 +494,7 @@ _SINGLE_ACTION_TEMPLATES = [
     "single-input-action",
     "single-upload-action",
     "single-select-action",
+    "single-hover-action",
 ]
 _SINGLE_ACTION_BOUNDARY_KWARGS = {
     "navigation_goal": _TRUSTED_GOAL,
