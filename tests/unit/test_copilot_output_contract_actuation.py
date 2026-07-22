@@ -1268,6 +1268,7 @@ def _ladder_ctx() -> SimpleNamespace:
     ctx = _advisory_ctx()
     ctx.turn_halt = None
     ctx.output_contract_bail_actuated_this_call = False
+    ctx.metadata_reject_ladder_state = None
     return ctx
 
 
