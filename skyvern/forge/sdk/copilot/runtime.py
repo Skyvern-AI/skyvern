@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingSnapshot
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
+        MetadataRejectLadderState,
         RecordedBuildTestOutcome,
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
@@ -393,6 +394,7 @@ class AgentContext:
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    metadata_reject_ladder_state: MetadataRejectLadderState | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None

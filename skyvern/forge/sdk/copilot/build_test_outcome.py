@@ -67,6 +67,13 @@ BuildTestOutcomeReasonCode = Literal[
     "output_source_unobservable",
     "actuation_exhausted",
 ]
+MetadataRejectFamily = Literal[
+    "missing_code_artifact_metadata",
+    "metadata_normalization",
+    "recorded_outcome_output_candidate",
+    "recorded_outcome_output_coverage",
+]
+MetadataRejectLadderAction = Literal["rung_1", "rung_2", "terminal"]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
@@ -142,6 +149,76 @@ class RecordedBuildTestOutcome(BaseModel):
     @property
     def is_authoritative(self) -> bool:
         return self.structural_key is not None
+
+
+class MetadataRejectLadderInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reject_family: MetadataRejectFamily
+    structural_key: str = Field(min_length=1)
+    gate_id: Literal["code_artifact_metadata"] = "code_artifact_metadata"
+    missing_fields_by_label: dict[str, list[str]]
+
+
+class MetadataRejectLadderState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reject_family: MetadataRejectFamily
+    structural_key: str = Field(min_length=1)
+    gate_id: Literal["code_artifact_metadata"] = "code_artifact_metadata"
+    missing_fields_by_label: dict[str, list[str]]
+    streak_count: int = Field(ge=1)
+
+
+class MetadataRejectLadderDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: MetadataRejectLadderAction
+    rung: Literal[1, 2] | None
+    gate_id: Literal["code_artifact_metadata"] = "code_artifact_metadata"
+    missing_fields_by_label: dict[str, list[str]]
+    state: MetadataRejectLadderState
+
+
+def adjudicate_metadata_reject_ladder(
+    prior_state: MetadataRejectLadderState | None,
+    reject: MetadataRejectLadderInput,
+) -> MetadataRejectLadderDecision:
+    same_reject = (
+        prior_state is not None
+        and prior_state.reject_family == reject.reject_family
+        and prior_state.structural_key == reject.structural_key
+        and prior_state.gate_id == reject.gate_id
+        and prior_state.missing_fields_by_label == reject.missing_fields_by_label
+    )
+    if same_reject:
+        assert prior_state is not None
+        streak_count = prior_state.streak_count + 1
+    else:
+        streak_count = 1
+    state = MetadataRejectLadderState(
+        reject_family=reject.reject_family,
+        structural_key=reject.structural_key,
+        gate_id=reject.gate_id,
+        missing_fields_by_label=reject.missing_fields_by_label,
+        streak_count=streak_count,
+    )
+    if streak_count >= 3:
+        action: MetadataRejectLadderAction = "terminal"
+        rung = None
+    elif streak_count == 2:
+        action = "rung_2"
+        rung = 2
+    else:
+        action = "rung_1"
+        rung = 1
+    return MetadataRejectLadderDecision(
+        action=action,
+        rung=rung,
+        gate_id=reject.gate_id,
+        missing_fields_by_label=reject.missing_fields_by_label,
+        state=state,
+    )
 
 
 class RecordedOutcomeGroundingPayload(BaseModel):

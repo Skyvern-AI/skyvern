@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ RecoveryHint = Literal[
 ]
 
 LOG = structlog.get_logger()
+METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE = "metadata_reject_same_key_terminal"
 
 
 # Matched case-insensitively. Imperative variants are narrow ("do not run" etc.) so plain "do not worry" prose doesn't false-positive.
@@ -147,6 +149,52 @@ class CopilotToolBlockerSignal(BaseModel):
     @field_serializer("extra")
     def _serialize_extra(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
+
+
+def build_metadata_reject_same_key_terminal_signal(
+    *,
+    structural_key: str,
+    reject_family: Literal[
+        "missing_code_artifact_metadata",
+        "metadata_normalization",
+        "recorded_outcome_output_candidate",
+        "recorded_outcome_output_coverage",
+    ],
+    missing_fields_by_label: Mapping[str, list[str]],
+) -> CopilotToolBlockerSignal:
+    exact_fields = {label: list(fields) for label, fields in missing_fields_by_label.items()}
+    rendered_fields = json.dumps(exact_fields, sort_keys=True, separators=(",", ":"))
+    user_facing_reason = (
+        "I couldn't satisfy the code_artifact_metadata gate after repeated identical submissions. "
+        f"missing_fields_by_label={rendered_fields}. I've kept the draft so those exact fields can be added."
+    )
+    try:
+        assert_clean_user_facing_text(user_facing_reason, blocked_tool="update_and_run_blocks")
+    except ValueError:
+        user_facing_reason = (
+            "I couldn't satisfy the required output metadata after repeated identical submissions. "
+            "I've kept the draft so the missing fields can be added."
+        )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=(
+            "The same structural metadata rejection reached its terminal rung. Preserve the draft and report "
+            f"the code_artifact_metadata gate with missing_fields_by_label={rendered_fields}."
+        ),
+        user_facing_reason=user_facing_reason,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+        extra={
+            "reject_family": reject_family,
+            "structural_key": structural_key,
+            "gate_id": "code_artifact_metadata",
+            "missing_fields_by_label": exact_fields,
+        },
+    )
 
 
 def build_output_source_unobservable_blocker_signal(
@@ -420,6 +468,7 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         "advisory_dispatch_stalled",
         DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
         "repair_ceiling_reached",
+        METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     }
 )
 
