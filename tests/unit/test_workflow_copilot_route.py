@@ -78,6 +78,44 @@ def _make_chat_request(
 
 
 @pytest.mark.asyncio
+async def test_get_debug_run_info_bounds_visible_elements_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    max_chars = workflow_copilot_route.WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS
+    html = "HEAD_MARKER" + ("x" * (max_chars * 2)) + "TAIL_MARKER"
+    artifact = SimpleNamespace()
+    block = SimpleNamespace(
+        label="block-1",
+        block_type=SimpleNamespace(name="task"),
+        status="failed",
+        failure_reason="timed out",
+    )
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "_get_debug_artifact",
+        AsyncMock(return_value=artifact),
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "observer",
+        SimpleNamespace(get_workflow_run_blocks=AsyncMock(return_value=[block])),
+    )
+    monkeypatch.setattr(
+        app,
+        "ARTIFACT_MANAGER",
+        SimpleNamespace(retrieve_artifact=AsyncMock(return_value=html.encode("utf-8"))),
+    )
+
+    run_info = await workflow_copilot_route._get_debug_run_info("org-1", "wr-1")
+
+    assert run_info is not None
+    assert run_info.html is not None
+    assert len(run_info.html) < len(html)
+    assert len(run_info.html) <= max_chars + 100
+    assert "HEAD_MARKER" in run_info.html
+    assert "TAIL_MARKER" in run_info.html
+    assert "truncated by Skyvern" in run_info.html
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("finalizer", ["normal", "cancel"], ids=["normal-turn", "cancel-turn"])
 @pytest.mark.parametrize("destination", ["persistence", "sse", "history"])
 async def test_delivered_unverified_narrative_payload_survives_persistence_sse_and_history(
