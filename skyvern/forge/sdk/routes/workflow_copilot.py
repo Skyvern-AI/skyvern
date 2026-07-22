@@ -58,6 +58,11 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import is_defer_authoring_durable_fill_criterion
+from skyvern.forge.sdk.copilot.terminal_envelope import (
+    TerminalOutcomeEnvelope,
+    finalize_applied_state,
+    reason_in_reply_shadow,
+)
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CopilotComposerMode,
     build_minimal_turn_outcome,
@@ -462,14 +467,69 @@ def _with_terminal_narrative_metadata(
     *,
     cancelled: bool,
     proposal_disposition: ProposalDisposition,
+    terminal_envelope: dict[str, Any] | None = None,
 ) -> TurnNarrativePayload | None:
     if narrative_payload is None:
         return None
-    return {
+    payload: TurnNarrativePayload = {
         **narrative_payload,
         "cancelled": cancelled,
         "proposalDisposition": proposal_disposition,
     }
+    if terminal_envelope is not None:
+        payload["terminalEnvelope"] = terminal_envelope
+    return payload
+
+
+def _agent_terminal_envelope(agent_result: AgentResult | None) -> dict[str, Any] | None:
+    if agent_result is None:
+        return None
+    try:
+        payload = agent_result.terminal_envelope
+    except AttributeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _finalized_terminal_envelope(
+    agent_result: AgentResult | None,
+    *,
+    workflow_applied: bool,
+    final_message: str,
+    response_type: str,
+) -> dict[str, Any] | None:
+    payload = _agent_terminal_envelope(agent_result)
+    if payload is None:
+        return None
+    # workflow_applied mirrors the legacy auto-accept SSE field, which reads
+    # true on no-proposal turns because AgentResult defaults its disposition
+    # to auto_applicable. The envelope must only claim applied when a
+    # proposal actually existed to commit.
+    proposal_present = getattr(agent_result, "updated_workflow", None) is not None or bool(
+        getattr(agent_result, "has_staged_proposal", False)
+    )
+    try:
+        finalized = finalize_applied_state(
+            TerminalOutcomeEnvelope.model_validate(payload),
+            applied=workflow_applied and proposal_present,
+        )
+        payload = finalized.model_dump(mode="json")
+    except Exception:
+        LOG.warning("copilot terminal envelope finalization failed", exc_info=True)
+        return None
+    reason_in_reply = reason_in_reply_shadow(
+        payload.get("run_display_reason") if isinstance(payload.get("run_display_reason"), str) else None,
+        final_message,
+    )
+    LOG.info(
+        "copilot_terminal_envelope",
+        **payload,
+        response_type=response_type,
+        envelope_response_kind=payload.get("response_kind"),
+        reason_in_reply=reason_in_reply,
+        finalized=True,
+    )
+    return payload
 
 
 def _build_recoverable_route_agent_result(
@@ -698,6 +758,7 @@ async def _persist_cancel_turn(
     the success path; pass ``None`` for pre-agent cancels.
     """
     turn_outcome: TurnOutcome | None
+    workflow_applied = False
     if agent_result is None:
         user_response = "Cancelled by user."
         updated_workflow = None
@@ -709,6 +770,7 @@ async def _persist_cancel_turn(
         response_turn_id = turn_id
         narrative_summary = None
         narrative_payload = None
+        terminal_envelope = None
         if chat.proposed_workflow is not None and not keep_pending_proposal:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
@@ -751,12 +813,20 @@ async def _persist_cancel_turn(
         response_turn_id = turn_id or agent_result.turn_id
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
+        workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
+        terminal_envelope = _finalized_terminal_envelope(
+            agent_result,
+            workflow_applied=workflow_applied,
+            final_message=user_response,
+            response_type=response_type,
+        )
 
     proposal_disposition = _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
         cancelled=True,
         proposal_disposition=proposal_disposition,
+        terminal_envelope=terminal_envelope,
     )
 
     await asyncio.shield(
@@ -791,11 +861,13 @@ async def _persist_cancel_turn(
                     total_tokens=total_tokens,
                     response_type=response_type,
                     proposal_disposition=proposal_disposition,
+                    workflow_applied=workflow_applied,
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
                     turn_id=response_turn_id,
                     narrative_summary=narrative_summary,
                     narrative_payload=narrative_payload,
+                    terminal_envelope=terminal_envelope,
                 )
             )
         )
@@ -872,10 +944,17 @@ async def _finalise_normal_turn(
     await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
+    terminal_envelope = _finalized_terminal_envelope(
+        agent_result,
+        workflow_applied=workflow_applied,
+        final_message=user_response,
+        response_type=agent_result.response_type,
+    )
     narrative_payload = _with_terminal_narrative_metadata(
         agent_result.narrative_payload,
         cancelled=False,
         proposal_disposition=proposal_disposition,
+        terminal_envelope=terminal_envelope,
     )
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -911,6 +990,7 @@ async def _finalise_normal_turn(
             turn_id=agent_result.turn_id,
             narrative_summary=agent_result.narrative_summary,
             narrative_payload=narrative_payload,
+            terminal_envelope=terminal_envelope,
         )
     )
 

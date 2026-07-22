@@ -282,6 +282,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         None,
         description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
     )
+    terminal_envelope: dict[str, Any] | None = Field(
+        None,
+        description="Shadow-only terminal outcome envelope for end-of-turn typed-state validation.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):

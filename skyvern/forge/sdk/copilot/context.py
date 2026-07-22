@@ -90,6 +90,7 @@ class TurnNarrativePayload(TypedDict):
     proposalDisposition: NotRequired[ProposalDisposition]
     # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
+    terminalEnvelope: NotRequired[dict[str, Any]]
     # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):
     # True only when outcome evidence authorizes a tested-success claim.
     verifiedSuccess: NotRequired[bool]
@@ -128,6 +129,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
@@ -669,6 +671,8 @@ class AgentResult:
     narrative_summary: str | None = None
     # Persisted on the assistant chat message so the bubble survives a reload.
     narrative_payload: TurnNarrativePayload | None = None
+    # Shadow-only typed terminal-state envelope persisted and streamed on terminal frames.
+    terminal_envelope: dict[str, Any] | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
@@ -801,6 +805,11 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
+    # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
+    # (the same source that powers run_outcome SSE frames). Append-only across
+    # per-run pointer resets (``last_run_outcome = None``); cleared only by the
+    # workflow-edit evidence reset, which invalidates pre-edit run evidence.
+    terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
     delivered_unverified_terminal: bool = False
     delivered_unverified_workflow_run_id: str | None = None
     delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=DeliveredUnverifiedPublicOutputs)
@@ -958,6 +967,32 @@ class CopilotContext(AgentContext):
     block_ended_at_map: dict[str, str] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+
+    def __post_init__(self) -> None:
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+        if isinstance(self.last_run_outcome, RecordedRunOutcome):
+            super().__setattr__("terminal_envelope_run_outcomes", [self.last_run_outcome])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name != "last_run_outcome":
+            return
+        from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+        if not isinstance(value, RecordedRunOutcome):
+            # ``last_run_outcome = None`` is a per-run pointer reset, not an
+            # evidence reset — the trace survives so a later run in the same
+            # turn cannot mask an earlier honest not_demonstrated.
+            return
+        outcomes = getattr(self, "terminal_envelope_run_outcomes", None)
+        if isinstance(outcomes, list):
+            outcomes.append(value)
+        else:
+            super().__setattr__("terminal_envelope_run_outcomes", [value])
 
     def has_genuine_workflow_attempt(self) -> bool:
         """This turn persisted a workflow proposal or executed a real build-test run; excludes
