@@ -3,11 +3,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import type { WorkflowParameter } from "../../types/workflowTypes";
 import { RunInputsSection } from "./RunInputsSection";
-
-vi.mock("./OverviewCodeBlock", () => ({
-  OverviewCodeBlock: ({ value }: { value: string }) => <pre>{value}</pre>,
-}));
 
 const emptyProps = {
   parameters: [],
@@ -96,6 +93,34 @@ describe("RunInputsSection", () => {
     expect(empty.container.firstChild).toBeNull();
   });
 
+  test("renders parameters as labeled fields: primitive prose, nested tree, description", () => {
+    render(
+      <RunInputsSection
+        {...emptyProps}
+        parameters={[
+          [
+            "invoice_url",
+            "https://example.test/invoice.pdf",
+            {
+              description: "Where the invoice lives",
+            } as unknown as WorkflowParameter,
+          ],
+          ["line_items", { count: 3 }],
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText("Run inputs")).not.toBeNull();
+    expect(screen.queryByText("invoice_url")).not.toBeNull();
+    expect(screen.queryByText("Where the invoice lives")).not.toBeNull();
+    // Primitive renders as prose text, not a single JSON dump.
+    expect(
+      screen.queryByText("https://example.test/invoice.pdf"),
+    ).not.toBeNull();
+    // Nested value renders the collapsible searchable tree (JsonExplorer).
+    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+  });
+
   test("labels every prompt inset, including single-field blocks", () => {
     render(
       <RunInputsSection
@@ -124,10 +149,11 @@ describe("RunInputsSection", () => {
     expect(screen.queryByText("Extraction goal")).not.toBeNull();
   });
 
-  test("renders the expansion toggle when measured content overflows", () => {
-    // jsdom has no layout engine, so it cannot measure line-clamp overflow itself.
-    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(80);
-    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(48);
+  test("toggles the clamped prose block via Show more / Show less", () => {
+    // jsdom has no layout engine, so mock the clamp overflow the component
+    // measures (scrollHeight > clientHeight).
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(200);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(96);
 
     render(
       <RunInputsSection
@@ -139,8 +165,7 @@ describe("RunInputsSection", () => {
             fields: [
               {
                 fieldLabel: "Prompt",
-                prompt:
-                  "A synthetic prompt long enough to overflow three lines.",
+                prompt: "A synthetic prompt long enough to overflow the clamp.",
               },
             ],
           },
@@ -148,16 +173,28 @@ describe("RunInputsSection", () => {
       />,
     );
 
-    expect(screen.queryByRole("button", { name: "Show more" })).not.toBeNull();
+    const toggle = screen.getByRole("button", { name: "Show more" });
+    const promptText = "A synthetic prompt long enough to overflow the clamp.";
+    // Collapsed: the prose block carries the line clamp.
+    expect(screen.getByText(promptText).className).toContain("line-clamp-6");
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("button", { name: "Show less" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    // Expanded: the clamp is dropped so the full prompt is visible.
+    expect(screen.getByText(promptText).className).not.toContain(
+      "line-clamp-6",
+    );
   });
 
-  test("bounds the collapsed render and toggles many-line prompts without layout", () => {
-    // 20 short lines: jsdom can't measure height, so the line-count cap alone
-    // must drive the toggle and keep the hidden lines out of the DOM.
+  test("renders the whole prompt as one wrapped block, not per-line rows", () => {
+    // Prose keeps the entire prompt in the DOM and clamps height via CSS; the
+    // old code inset sliced hidden lines out, so a collapsed multi-line prompt
+    // must now expose every line (copy/accessibility) as a single text node.
     const prompt = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join(
       "\n",
     );
-    render(
+    const { container } = render(
       <RunInputsSection
         {...emptyProps}
         blockPrompts={[
@@ -170,11 +207,10 @@ describe("RunInputsSection", () => {
       />,
     );
 
-    expect(screen.queryByText("line 6")).not.toBeNull();
-    expect(screen.queryByText("line 7")).toBeNull();
-    const toggle = screen.getByRole("button", { name: "Show more" });
-
-    fireEvent.click(toggle);
-    expect(screen.queryByText("line 20")).not.toBeNull();
+    expect(container.textContent).toContain("line 1");
+    expect(container.textContent).toContain("line 20");
+    // No per-line row elements: the prompt lives in one node, so no element's
+    // text is exactly "line 6".
+    expect(screen.queryByText("line 6")).toBeNull();
   });
 });

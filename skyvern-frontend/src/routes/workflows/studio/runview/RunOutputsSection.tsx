@@ -8,6 +8,8 @@ import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 
 import { OverviewCodeBlock } from "./OverviewCodeBlock";
+import { OverviewField } from "./OverviewField";
+import { RunFieldValue } from "./RunFieldValue";
 
 export type RunOutputFile = { url: string; filename: string };
 export type RunOutputError = Record<string, unknown>;
@@ -183,8 +185,16 @@ export function RunOutputsSection({
     return null;
   }
 
-  const hasAgentRunOutputs =
-    outputs !== null && Object.keys(outputs).length > 0;
+  // extracted_information has its own dedicated section above, so drop it from the
+  // per-block field list to avoid rendering it twice.
+  const outputFields = outputs
+    ? Object.entries(outputs).filter(([key]) => key !== "extracted_information")
+    : [];
+  // Gate the block on real per-field content or a persisted summary: an outputs
+  // bag holding only extracted_information yields no fields, and that content
+  // already renders in its dedicated section above — so an empty header +
+  // Summarize button would otherwise render over nothing.
+  const hasAgentRunOutputs = outputFields.length > 0 || summary !== null;
 
   return (
     <div className="flex flex-col gap-5">
@@ -245,10 +255,15 @@ export function RunOutputsSection({
               {summary}
             </div>
           ) : null}
-          <OverviewCodeBlock
-            value={JSON.stringify(outputs, null, 2)}
-            maxHeight="320px"
-          />
+          {outputFields.length > 0 ? (
+            <div className="flex flex-col gap-4">
+              {outputFields.map(([key, value]) => (
+                <OverviewField key={key} label={key}>
+                  <RunFieldValue value={value} label={key} />
+                </OverviewField>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {files.length > 0 ? (
