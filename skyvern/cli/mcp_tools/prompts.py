@@ -14,6 +14,8 @@ from typing import Annotated
 
 from pydantic import Field
 
+from ._common import CODE_ONLY_SCHEMA_GUIDANCE
+
 # ---------------------------------------------------------------------------
 # build_workflow
 # ---------------------------------------------------------------------------
@@ -69,6 +71,7 @@ BAD navigation_goal — describes HOW to do it (Skyvern already knows):
 8. **action** — single focused action on the current page (e.g., click one button).
 
 Use skyvern_block_schema() to see full schemas and examples for any block type.
+{CODE_ONLY_SCHEMA_GUIDANCE}
 
 ### Engine selection for workflow blocks
 
@@ -112,6 +115,7 @@ GOOD (3 blocks):
 BAD (1 block):
   Block 1 (navigation): "Search for the product, click the first result, add to cart, go to checkout,
    fill in shipping, enter payment, and submit the order."
+{CODE_ONLY_SCHEMA_GUIDANCE}
 
 ### Common workflow shapes
 
@@ -233,7 +237,7 @@ Before calling skyvern_workflow_create, verify:
 6. Login is handled by a login block (not embedded in a navigation goal).
 7. You have test parameter values ready for the first skyvern_workflow_run call.
 8. Validate blocks with skyvern_block_validate before submitting the full definition.
-"""
+""".replace("{CODE_ONLY_SCHEMA_GUIDANCE}", CODE_ONLY_SCHEMA_GUIDANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +411,7 @@ code_version=2 is also injected by default; YAML definitions use the backend sch
 leaves code_version unset, so pass `code_version: 2` explicitly in YAML if you want to opt into \
 the v2 caching framework). Set run_with="code" on the workflow (or at run time) to opt into cached \
 script execution.
+{CODE_ONLY_SCHEMA_GUIDANCE}
 
 ### What this means for workflow design
 
@@ -430,7 +435,7 @@ in navigation_goal become part of the script literally.
 Pass `run_with="code"` to `skyvern_workflow_run` to force cached-script execution for a single run \
 without changing the workflow definition (only meaningful once a script exists). Pass \
 `run_with="agent"` to force AI execution for debugging or after a site redesign.
-"""
+""".replace("{CODE_ONLY_SCHEMA_GUIDANCE}", CODE_ONLY_SCHEMA_GUIDANCE)
 
 
 # ---------------------------------------------------------------------------

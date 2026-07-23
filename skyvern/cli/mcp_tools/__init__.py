@@ -330,6 +330,7 @@ Multi-tab flow: tab_list -> tab_new or click link -> tab_wait_for_new -> tab_swi
 ## Workflows
 
 Split into multiple blocks — one intent per block. Use **navigation** blocks for actions, **extraction** for data.
+Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
 Call skyvern_block_schema() for available types. Validate with skyvern_block_validate() before creating.
 Do NOT use deprecated "task" or "task_v2" block types — use "navigation" for actions, "extraction" for data.
 Use {{parameter_key}} to reference workflow parameters. Blocks share a browser session automatically.
