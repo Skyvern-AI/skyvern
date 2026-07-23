@@ -5946,6 +5946,19 @@ async def chain_click(
         blocking_element, blocked = await skyvern_element.find_blocking_element(
             dom=DomUtil(scraped_page=scraped_page, page=page)
         )
+        verify_checkbox_toggle = click_count == 1 and await skyvern_element.is_checkbox()
+        skip_coordinate_click = False
+        if verify_checkbox_toggle and blocking_element is not None:
+            if not await blocking_element.is_safe_for_checkbox_direct_click():
+                LOG.info(
+                    "Chain click: skipping unsafe or unknown blocker click for checkbox",
+                    action=action,
+                    element=str(blocking_element),
+                    locator=locator,
+                )
+                blocking_element = None
+                skip_coordinate_click = True
+
         if blocking_element is None:
             if blocked:
                 LOG.info(
@@ -5996,14 +6009,14 @@ async def chain_click(
             # than once, so its final state is not a dependable no-op signal.
             # Gate the checkbox verification on a single click and fold it into
             # the shared coordinate -> JS ladder below instead of a parallel one.
-            verify_checkbox_toggle = click_count == 1 and await skyvern_element.is_checkbox()
             checked_before = await skyvern_element.is_checked(timeout=timeout) if verify_checkbox_toggle else None
 
             coordinate_error: Exception | None = None
-            try:
-                await skyvern_element.coordinate_click(page=page, click_count=click_count)
-            except Exception as e:
-                coordinate_error = e
+            if not skip_coordinate_click:
+                try:
+                    await skyvern_element.coordinate_click(page=page, click_count=click_count)
+                except Exception as e:
+                    coordinate_error = e
 
             if verify_checkbox_toggle:
                 checked_after = await skyvern_element.is_checked(timeout=timeout)
@@ -6014,12 +6027,23 @@ async def chain_click(
                 if not state_known:
                     # Unknown post-click state (detached/navigated): a second
                     # click risks a double toggle, so never fall through to JS.
-                    if coordinate_error is None:
+                    # A real coordinate click that then lost the element is the
+                    # legacy success case; when the coordinate click was skipped
+                    # (unsafe blocker) or errored, fail closed instead.
+                    if coordinate_error is None and not skip_coordinate_click:
                         action_results.append(ActionSuccess())
                     else:
                         action_results.append(
                             ActionFailure(
-                                FailToClick(action.element_id, anchor="coordinate_click", msg=str(coordinate_error))
+                                FailToClick(
+                                    action.element_id,
+                                    anchor="coordinate_click",
+                                    msg=(
+                                        str(coordinate_error)
+                                        if coordinate_error is not None
+                                        else "checkbox state unknown after coordinate click"
+                                    ),
+                                )
                             )
                         )
                     return action_results
