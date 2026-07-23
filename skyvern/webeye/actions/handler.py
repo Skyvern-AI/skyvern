@@ -179,6 +179,11 @@ LOG = structlog.get_logger()
 
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
+DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
+    "No file download was observed or credited after this action. "
+    "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+)
+
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
@@ -2862,6 +2867,9 @@ class ActionHandler:
                     )
                 else:
                     results[-1].download_triggered = False
+                    if isinstance(results[-1], ActionSuccess):
+                        results[-1].needs_followup = True
+                        results[-1].followup_message = DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True

@@ -15,6 +15,7 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ClickAction, DownloadFileAction
 from skyvern.webeye.actions.handler import (
+    DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE,
     ActionHandler,
     ScopedXhrDownloadCapture,
     _cleanup_captured_download_popup,
@@ -54,6 +55,20 @@ def _download(*, path: Path | None = None, failure: str | None = None, save_as: 
     download.path = AsyncMock(return_value=path)
     download.save_as = AsyncMock(side_effect=save_as)
     return download
+
+
+def test_download_not_triggered_message_claims_only_observation() -> None:
+    # download_triggered=false proves only that Skyvern did not observe/credit a
+    # download after the action — NOT categorically that no download started or no
+    # file was saved (late/missed artifacts are possible). Pin the exact intended
+    # observation-only string so no categorical save/start wording can creep back in.
+    assert DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE == (
+        "No file download was observed or credited after this action. "
+        "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+    )
+    lowered = DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE.lower()
+    assert "not saved" not in lowered
+    assert "download started" not in lowered
 
 
 @pytest.mark.asyncio
@@ -1601,7 +1616,7 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
-            await ActionHandler.handle_action(
+            results = await ActionHandler.handle_action(
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
@@ -1611,6 +1626,10 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
 
     # The blank-page recovery should have navigated back to the original URL
     browser_state.navigate_to_url.assert_called_once_with(page=page, url=original_url)
+    # A successful download must not attach the no-download followup feedback.
+    assert results[-1].download_triggered is True
+    assert results[-1].needs_followup is None
+    assert results[-1].followup_message is None
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_signal_observed"] is True
     assert span_attrs["download_signal_source"] == "download_file_detected"
@@ -1765,6 +1784,8 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
     assert elapsed < 1.0
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
+    assert results[-1].needs_followup is True
+    assert results[-1].followup_message == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
     assert wait_for_downloads.await_count == 0
     page.off.assert_called_once()
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -1773,6 +1794,58 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
     assert "download_signal_source" not in span_attrs
     assert "download_signal_elapsed_seconds" not in span_attrs
     assert "download_signal_poll_iterations" not in span_attrs
+
+
+@pytest.mark.asyncio
+async def test_handle_action_download_no_signal_preserves_action_failure() -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/no-download",
+    )
+    action.errors = []
+    failure = ActionFailure(RuntimeError("click failed"))
+
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionFailure]:
+        return [failure]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    assert results == [failure]
+    assert results[-1] is failure
+    assert isinstance(results[-1], ActionFailure)
+    assert results[-1].success is False
+    assert results[-1].download_triggered is False
+    assert action.download_triggered is False
+    assert action.errors == []
+    assert results[-1].needs_followup is None
+    assert results[-1].followup_message is None
 
 
 @pytest.mark.asyncio
@@ -1860,6 +1933,9 @@ async def test_handle_action_download_fails_on_transient_user_defined_error_text
     assert results[-1].download_triggered is False
     assert "download failure says the generated archive could not be saved" in (results[-1].exception_message or "")
     assert action.download_triggered is False
+    # Page-confirmed terminal user errors are definitive: no "keep trying" followup.
+    assert results[-1].needs_followup is None
+    assert results[-1].followup_message is None
     assert action.errors is not None
     assert [error.error_code for error in action.errors] == ["previous_error", "data_not_downloadable"]
     assert action.terminal_user_errors is True
