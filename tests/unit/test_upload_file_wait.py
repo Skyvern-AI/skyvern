@@ -12,6 +12,7 @@ import pytest
 from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.actions import handler as handler_module
 from skyvern.webeye.actions.handler import _wait_for_upload_processing
 
@@ -55,6 +56,16 @@ async def test_swallows_asyncio_timeout() -> None:
     mock_frame.wait_for_page_ready.side_effect = asyncio.TimeoutError()
     with patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new_callable=AsyncMock) as mock_create:
         mock_create.return_value = mock_frame
+        await _wait_for_upload_processing(AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_swallows_page_analysis_timeout_during_frame_creation() -> None:
+    with patch(
+        "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+        new_callable=AsyncMock,
+        side_effect=SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page"),
+    ):
         await _wait_for_upload_processing(AsyncMock())
 
 

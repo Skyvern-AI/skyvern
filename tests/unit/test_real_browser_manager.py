@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -1019,3 +1021,43 @@ async def test_pbs_recovery_falls_through_to_get_or_create_page_when_fresh_state
     assert create_call.kwargs.get("url") == "https://example.com"
     # We never re-attempted navigate_to_url on the fresh state (no page to use).
     fresh.navigate_to_url.assert_not_awaited()
+
+
+class _EngineUnderTestError(Exception):
+    pass
+
+
+class _EngineUnderTestTimeout(_EngineUnderTestError):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_stamps_resolved_engine_selection() -> None:
+    """The exact BrowserEngineSelection resolved at the manager's ownership boundary
+    (get_or_resolve_engine_selection) must be the identical object pinned on the constructed
+    RealBrowserState, so a run's recovery/classification code binds to THIS run's engine identity
+    rather than a rebuilt or dropped selection."""
+    manager = RealBrowserManager()
+    fake_pw = MagicMock()
+    selection = BrowserEngineSelection(
+        name="engine-under-test",
+        start_driver=AsyncMock(return_value=fake_pw),
+        error_type=_EngineUnderTestError,
+        timeout_error_type=_EngineUnderTestTimeout,
+        metadata=BrowserEngineMetadata(name="engine-under-test", version="0.0.0"),
+        selection_reason="test",
+    )
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_engine_stamp")
+
+    assert state.engine_selection is selection
+    assert state.pw is fake_pw
+    selection.start_driver.assert_awaited_once()

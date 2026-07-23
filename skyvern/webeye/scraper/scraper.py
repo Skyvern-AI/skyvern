@@ -15,6 +15,7 @@ from skyvern.exceptions import (
     NoElementFound,
     ScrapingFailed,
     ScrapingFailedBlankPage,
+    SkyvernPageAnalysisTimeout,
     UnknownElementTreeFormat,
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
@@ -72,6 +73,21 @@ async def build_scraping_failed_reason(
     if safe_landed and safe_landed != safe_requested and safe_landed not in {"about:blank", ""}:
         return f"{base} Requested URL: {safe_requested}. Current URL: {safe_landed}."
     return f"{base} URL: {safe_requested}."
+
+
+def _scrape_timed_out(browser_state: BrowserState, error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout from THIS run's selected browser engine.
+
+    Uses the per-run engine selection's timeout family so a run pinned to a non-Playwright engine
+    still routes its native timeouts to PAGE_LOAD_TIMEOUT; falls back to the stock Playwright
+    timeout identity for states built outside the per-run engine seam (``engine_selection`` is None).
+    """
+    if isinstance(error, SkyvernPageAnalysisTimeout):
+        return True
+    selection = browser_state.engine_selection
+    if selection is not None:
+        return selection.is_engine_timeout_error(error)
+    return isinstance(error, TimeoutError)
 
 
 RESERVED_ATTRIBUTES = {
@@ -254,7 +270,9 @@ async def scrape_website(
                 raise e
             else:
                 raise ScrapingFailed(
-                    reason=await build_scraping_failed_reason(browser_state, url, timed_out=isinstance(e, TimeoutError))
+                    reason=await build_scraping_failed_reason(
+                        browser_state, url, timed_out=_scrape_timed_out(browser_state, e)
+                    )
                 ) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
         await asyncio.sleep(0.5)
@@ -738,7 +756,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
             incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
                 wait_until_finished=True
             )
-        except TimeoutError:
+        except (TimeoutError, SkyvernPageAnalysisTimeout):
             LOG.warning(
                 "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
             )

@@ -71,6 +71,7 @@ from skyvern.exceptions import (
     PhoneNumberInputMismatch,
     SecretInputMismatch,
     SkyvernException,
+    SkyvernPageAnalysisTimeout,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -4394,6 +4395,17 @@ async def handle_input_text_action(
                         if action.stop_batch_after_dropdown_select:
                             select_result.action_result.skip_remaining_actions = True
                         return [select_result.action_result]
+        except SkyvernPageAnalysisTimeout as inc_error:
+            # A page-analysis timeout after both incremental attempts previously arrived here as a
+            # Playwright TimeoutError (a PlaywrightError) and was re-raised; the neutral
+            # SkyvernPageAnalysisTimeout is not a PlaywrightError, so re-raise explicitly instead of
+            # letting the broad handler below swallow it and falsely return ActionSuccess.
+            LOG.warning(
+                "Page-analysis timeout during incremental element processing",
+                error_type=type(inc_error).__name__,
+                error_message=str(inc_error),
+            )
+            raise inc_error
         except PlaywrightError as inc_error:
             # Handle Playwright-specific errors during incremental element processing
             # (e.g., TOTP form auto-submit, or search-dropdown selection triggering navigation)
@@ -4506,7 +4518,7 @@ async def _wait_for_upload_processing(page: Page) -> None:
             dom_stable_ms=300,
             dom_stability_timeout_ms=2000,
         )
-    except (TimeoutError, asyncio.TimeoutError):
+    except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
         LOG.info("Upload processing page-ready wait timed out, continuing")
     except PlaywrightError:
         LOG.warning("Upload processing page-ready wait interrupted by Playwright error, continuing", exc_info=True)
