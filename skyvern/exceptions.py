@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         return type(self).__name__
 
 
+class SkyvernPageAnalysisTimeout(SkyvernException):
+    pass
+
+
 class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
         self.feature = feature

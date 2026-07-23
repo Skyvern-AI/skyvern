@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Literal, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
@@ -11,12 +11,18 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
+
 
 class BrowserState(Protocol):
     browser_context: BrowserContext | None
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
     pw: Playwright
+    # The per-run pinned engine (or None for states built outside the per-run engine seam), so
+    # recovery code can classify driver-native errors against THIS run's selected engine.
+    engine_selection: BrowserEngineSelection | None
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 
