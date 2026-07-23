@@ -48,6 +48,7 @@ class ActiveCredentialCiphertext:
     encrypted_method: EncryptMethod
     scopes_granted: list[str]
     client_id: str | None = None
+    credential_version: datetime.datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,10 @@ class GoogleOAuthRepository(BaseRepository):
         # stale nonce, but only after the code has already been consumed.
         cutoff = now if now is not None else datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
         async with self.Session() as session:
+            # A consent nonce lives on a fresh ``pending_consent`` row (first connect) or on an
+            # existing ``active``/``error`` row that is being re-authorized in place. The nonce is
+            # globally unique while set, so matching nonce + org + unexpired identifies the row in
+            # either case; a successful promotion (or revoke) nulls the nonce afterward.
             stmt = select(
                 GoogleOAuthCredentialModel.id,
                 GoogleOAuthCredentialModel.consent_redirect_uri,
@@ -117,7 +122,7 @@ class GoogleOAuthRepository(BaseRepository):
             ).where(
                 GoogleOAuthCredentialModel.consent_nonce == nonce,
                 GoogleOAuthCredentialModel.organization_id == organization_id,
-                GoogleOAuthCredentialModel.state == STATE_PENDING_CONSENT,
+                GoogleOAuthCredentialModel.state.in_([STATE_PENDING_CONSENT, STATE_ACTIVE, STATE_ERROR]),
                 GoogleOAuthCredentialModel.consent_expires_at >= cutoff,
             )
             row = (await session.execute(stmt)).one_or_none()
@@ -130,6 +135,88 @@ class GoogleOAuthRepository(BaseRepository):
                 consent_app_origin=row[3],
                 client_id=row[4],
             )
+
+    @db_operation("begin_reauthorization")
+    async def begin_reauthorization(
+        self,
+        credential_id: str,
+        organization_id: str,
+        consent_nonce: str,
+        consent_redirect_uri: str,
+        consent_expires_at: datetime.datetime,
+        consent_code_verifier: str,
+        now: datetime.datetime,
+        consent_app_origin: str | None = None,
+        client_id: str | None = None,
+        requested_scopes: list[str] | None = None,
+        fallback_scopes: list[str] | None = None,
+    ) -> GoogleOAuthCredentialBase | None:
+        """Stamp a fresh consent challenge onto an existing connectable row so re-auth
+        preserves the credential id.
+
+        The row's live ``encrypted_refresh_token`` and ``state`` are left untouched, so any
+        workflow referencing this credential keeps working until the callback promotes it with
+        the new token. Only ``active``/``error`` rows are re-authorizable; returns None otherwise.
+        """
+        async with self.Session() as session:
+            stmt = (
+                select(GoogleOAuthCredentialModel)
+                .where(
+                    GoogleOAuthCredentialModel.id == credential_id,
+                    GoogleOAuthCredentialModel.organization_id == organization_id,
+                    GoogleOAuthCredentialModel.state.in_([STATE_ACTIVE, STATE_ERROR]),
+                )
+                .with_for_update()
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            row.scopes_requested = list(
+                requested_scopes
+                if requested_scopes is not None
+                else row.scopes_requested or row.scopes_granted or fallback_scopes or []
+            )
+            row.consent_nonce = consent_nonce
+            row.consent_redirect_uri = consent_redirect_uri
+            row.consent_expires_at = consent_expires_at
+            row.consent_code_verifier = consent_code_verifier
+            row.consent_app_origin = consent_app_origin
+            row.client_id = client_id
+            row.modified_at = now
+            await session.flush()
+            result = GoogleOAuthCredentialBase.model_validate(row, from_attributes=True)
+            await session.commit()
+            return result
+
+    @db_operation("mark_needs_reconnect")
+    async def mark_needs_reconnect(
+        self,
+        organization_id: str,
+        credential_id: str,
+        now: datetime.datetime,
+        expected_version: datetime.datetime | None = None,
+    ) -> str | None:
+        """Flip an active credential to ``error`` after its refresh token is rejected upstream.
+
+        No-op when the row is no longer active or changed after the failing refresh loaded it.
+        """
+        async with self.Session() as session:
+            filters = [
+                GoogleOAuthCredentialModel.id == credential_id,
+                GoogleOAuthCredentialModel.organization_id == organization_id,
+                GoogleOAuthCredentialModel.state == STATE_ACTIVE,
+            ]
+            if expected_version is not None:
+                filters.append(GoogleOAuthCredentialModel.modified_at == expected_version)
+            stmt = (
+                update(GoogleOAuthCredentialModel)
+                .where(*filters)
+                .values(state=STATE_ERROR, modified_at=now)
+                .returning(GoogleOAuthCredentialModel.id)
+            )
+            flipped = (await session.execute(stmt)).scalar_one_or_none()
+            await session.commit()
+            return flipped
 
     @db_operation("mark_active_mismatched_client_as_error")
     async def mark_active_mismatched_client_as_error(
@@ -169,12 +256,16 @@ class GoogleOAuthRepository(BaseRepository):
         now: datetime.datetime,
     ) -> GoogleOAuthCredentialBase:
         async with self.Session() as session:
+            # Promotes both a first-connect row (``pending_consent``) and an in-place re-auth of an
+            # existing ``active``/``error`` row: whichever row currently holds this nonce receives the
+            # new refresh token and is (re)set to ``active``, preserving the credential id so workflows
+            # keep referencing the same connection.
             stmt = (
                 update(GoogleOAuthCredentialModel)
                 .where(
                     GoogleOAuthCredentialModel.consent_nonce == nonce,
                     GoogleOAuthCredentialModel.organization_id == organization_id,
-                    GoogleOAuthCredentialModel.state == STATE_PENDING_CONSENT,
+                    GoogleOAuthCredentialModel.state.in_([STATE_PENDING_CONSENT, STATE_ACTIVE, STATE_ERROR]),
                     GoogleOAuthCredentialModel.consent_expires_at >= now,
                 )
                 .values(
@@ -201,12 +292,11 @@ class GoogleOAuthRepository(BaseRepository):
                         )
                     )
                 ).scalar_one_or_none()
+                # A successful promotion (or revoke) nulls the nonce, so a missing row means the
+                # nonce is unknown or already consumed. A row that still holds the nonce but failed
+                # the UPDATE only failed the expiry guard.
                 if fallback is None:
-                    raise InvalidConsentNonceError("Unknown OAuth consent nonce")
-                if fallback.state == STATE_ERROR:
-                    raise InvalidConsentNonceError("OAuth consent row is in error state")
-                if fallback.state != STATE_PENDING_CONSENT:
-                    raise InvalidConsentNonceError("OAuth consent nonce already consumed")
+                    raise InvalidConsentNonceError("Unknown or already consumed OAuth consent nonce")
                 raise InvalidConsentNonceError("OAuth consent nonce expired")
             result = GoogleOAuthCredentialBase.model_validate(promoted, from_attributes=True)
             await session.commit()
@@ -257,6 +347,7 @@ class GoogleOAuthRepository(BaseRepository):
                 GoogleOAuthCredentialModel.encrypted_method,
                 GoogleOAuthCredentialModel.scopes_granted,
                 GoogleOAuthCredentialModel.client_id,
+                GoogleOAuthCredentialModel.modified_at,
             ).where(
                 GoogleOAuthCredentialModel.id == credential_id,
                 GoogleOAuthCredentialModel.organization_id == organization_id,
@@ -265,7 +356,7 @@ class GoogleOAuthRepository(BaseRepository):
             row = (await session.execute(stmt)).one_or_none()
             if row is None:
                 return None
-            ciphertext, method, scopes, client_id = row
+            ciphertext, method, scopes, client_id, credential_version = row
             if not ciphertext or not method:
                 return None
             return ActiveCredentialCiphertext(
@@ -273,6 +364,7 @@ class GoogleOAuthRepository(BaseRepository):
                 encrypted_method=EncryptMethod(method),
                 scopes_granted=list(scopes or []),
                 client_id=client_id,
+                credential_version=credential_version,
             )
 
     @db_operation("load_ciphertext_for_revoke")
@@ -316,7 +408,7 @@ class GoogleOAuthRepository(BaseRepository):
                 .where(
                     GoogleOAuthCredentialModel.id == credential_id,
                     GoogleOAuthCredentialModel.organization_id == organization_id,
-                    GoogleOAuthCredentialModel.state == STATE_ACTIVE,
+                    GoogleOAuthCredentialModel.state.in_([STATE_ACTIVE, STATE_ERROR]),
                 )
                 .values(credential_name=credential_name, modified_at=now)
                 .returning(GoogleOAuthCredentialModel)

@@ -1299,6 +1299,13 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+        except google_oauth_service.ExpiredRefreshTokenError:
+            await google_oauth_service.mark_credential_expired(
+                organization_id,
+                credential_id,
+                expected_version=secrets.credential_version,
+            )
+            return None
         except Exception:
             LOG.exception(
                 "Failed to get Google Sheets credentials",
@@ -1369,6 +1376,13 @@ class AgentFunction:
                 "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
                 organization_id=organization_id,
                 credential_id=credential_id,
+            )
+            return None
+        except google_oauth_service.ExpiredRefreshTokenError:
+            await google_oauth_service.mark_credential_expired(
+                organization_id,
+                credential_id,
+                expected_version=secrets.credential_version,
             )
             return None
         except Exception:
