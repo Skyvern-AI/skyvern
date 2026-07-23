@@ -402,6 +402,27 @@ async def test_workflow_create_auto_wire_excludes_unsafe_and_malformed_parameter
     assert block["parameter_keys"] == ["eligible"]
 
 
+@pytest.mark.parametrize("serialized_as", ["json", "yaml"])
+@pytest.mark.asyncio
+async def test_workflow_create_defaults_code_block_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    serialized_as: str,
+) -> None:
+    """An MCP-created code block without a prompt persists with prompt "" (new code block experience)."""
+    request_mock = _patch_skyvern_http(monkeypatch)
+    definition = _workflow_definition([_code_block()])
+
+    result = await workflow_tools.skyvern_workflow_create(
+        definition=_serialized_definition(definition, serialized_as),
+        format=serialized_as,
+    )
+
+    assert result["ok"] is True, result
+    sent = _sent_definition(request_mock)
+    blocks = sent["workflow_definition"]["blocks"]
+    assert blocks[0]["prompt"] == ""
+
+
 @pytest.mark.parametrize("format_name", ["yaml", "auto"])
 @pytest.mark.asyncio
 async def test_workflow_create_code_only_false_preserves_yaml_bytes(
@@ -409,8 +430,10 @@ async def test_workflow_create_code_only_false_preserves_yaml_bytes(
     format_name: str,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch)
+    # prompt supplied explicitly: an omitted prompt is now defaulted (new code block
+    # experience), which intentionally rewrites the definition.
     definition = _workflow_definition(
-        [_code_block()],
+        [_code_block(prompt="")],
         proxy_location="RESIDENTIAL",
         code_version=2,
         run_with="agent",
