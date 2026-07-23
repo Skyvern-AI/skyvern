@@ -406,6 +406,9 @@ export interface CreateGoogleOAuthAuthorizeRequest {
   credential_name?: string;
   scope_profile?: string;
   app_origin?: string;
+  // Existing credential to re-authenticate in place, preserving its id so
+  // workflows referencing it keep working without edits.
+  credential_id?: string;
 }
 
 export interface GoogleOAuthAuthorizeResponse {
