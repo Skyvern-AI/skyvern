@@ -687,16 +687,13 @@ def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
 
 
 def _collect_code_block_labels(blocks: Any) -> frozenset[str]:
-    labels: set[str] = set()
     if not isinstance(blocks, list):
         return frozenset()
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        if block.get("block_type") == "code" and isinstance(block.get("label"), str):
-            labels.add(block["label"])
-        labels |= _collect_code_block_labels(block.get("loop_blocks"))
-    return frozenset(labels)
+    return frozenset(
+        block["label"]
+        for block in _iter_blocks_flat(blocks)
+        if block.get("block_type") == "code" and isinstance(block.get("label"), str)
+    )
 
 
 def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_labels: frozenset[str]) -> str:
@@ -716,24 +713,15 @@ def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_
         return definition
 
     changed = False
+    for block in _iter_blocks_flat(blocks):
+        if (
+            block.get("block_type") == "code"
+            and "prompt" not in block
+            and block.get("label") not in existing_code_labels
+        ):
+            block["prompt"] = ""
+            changed = True
 
-    def _walk(items: list[Any]) -> None:
-        nonlocal changed
-        for block in items:
-            if not isinstance(block, dict):
-                continue
-            if (
-                block.get("block_type") == "code"
-                and "prompt" not in block
-                and block.get("label") not in existing_code_labels
-            ):
-                block["prompt"] = ""
-                changed = True
-            loop_blocks = block.get("loop_blocks")
-            if isinstance(loop_blocks, list):
-                _walk(loop_blocks)
-
-    _walk(blocks)
     return _dump_definition_dict(raw, parsed_format) if changed else definition
 
 
