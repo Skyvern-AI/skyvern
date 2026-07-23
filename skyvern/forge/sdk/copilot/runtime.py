@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -207,6 +208,12 @@ class AuthorTimeGateAblationEvent:
     payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
 
 
+class ScoutedEquivalentInput(TypedDict):
+    input_key: str
+    parameter_value: str
+    transform: str
+
+
 class ScoutedInputCorrespondence(TypedDict):
     input_key: str
     matched_literal: str
@@ -214,6 +221,25 @@ class ScoutedInputCorrespondence(TypedDict):
     surface: str
     transform: str
     position: int
+    equivalent_inputs: NotRequired[list[ScoutedEquivalentInput]]
+
+
+class ScoutedDynamicRowPeriodMatch(TypedDict):
+    period: str
+    selected_row_match_count: int
+    row_match_count: int
+
+
+class ScoutedDynamicRowEvidence(TypedDict):
+    source_url: str
+    target_selector: str
+    row_selector: str
+    row_text: str
+    row_selector_count: int
+    row_text_match_count: int
+    period_matches: list[ScoutedDynamicRowPeriodMatch]
+    selected_index: int
+    evidence_fingerprint: str
 
 
 class ScoutedInteraction(TypedDict):
@@ -224,6 +250,7 @@ class ScoutedInteraction(TypedDict):
     # Grounded value-containment witnesses computed at the update_workflow confluence; drive
     # generator-owned templated locators. Empty/absent => literal replay.
     input_correspondences: NotRequired[list[ScoutedInputCorrespondence]]
+    dynamic_row_evidence: NotRequired[ScoutedDynamicRowEvidence]
     typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
@@ -579,6 +606,12 @@ class AgentContext:
     # get_by_role(role, name, exact=True) re-anchor resolves to exactly one live element on the source
     # page; a non-unique or nameless ambiguous selector leaves this None so synthesis drops the interaction.
     pending_scout_reanchor: tuple[str, str, str] | None = None
+    # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
+    # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
+    pending_scout_dynamic_row: ScoutedDynamicRowEvidence | None = None
+    # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
+    # directly instead of silently accepting a dynamically attached dependency.
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.
