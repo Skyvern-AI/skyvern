@@ -720,7 +720,7 @@ class ForgeAgent:
             task = await app.DATABASE.tasks.create_task(
                 url=task_url,
                 title=code_block.label,
-                navigation_goal=code_block.prompt,
+                navigation_goal=code_block.prompt or None,
                 data_extraction_goal=None,
                 navigation_payload=None,
                 organization_id=organization_id,
