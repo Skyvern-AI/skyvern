@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import structlog
 
@@ -43,7 +43,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -161,6 +161,7 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
     "Which website or login page should I use to look up the stored credential?"
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
+_AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
@@ -3823,23 +3824,41 @@ def _url_parts(url: str) -> tuple[str, str] | None:
         return None
     host = parsed.netloc.lower()
     path = parsed.path.rstrip("/")
-    return f"{parsed.scheme.lower()}://{host}{path}", f"{parsed.scheme.lower()}://{host}"
+    # Login pages can differ only by query (?tenant=a vs ?tenant=b), so the
+    # exact tier keys on the full URL with a param-order-insensitive query.
+    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    exact = f"{parsed.scheme.lower()}://{host}{path}"
+    if query:
+        exact = f"{exact}?{query}"
+    return exact, f"{parsed.scheme.lower()}://{host}"
 
 
-def _match_by_url(credentials: list[Credential], urls: list[str]) -> list[Credential]:
+def _match_by_url(
+    credentials: list[Credential], urls: list[str], *, allow_host_fallback: bool = True
+) -> list[Credential]:
     indexed = [
         (credential, parts)
         for credential in credentials
         if credential.tested_url and (parts := _url_parts(credential.tested_url))
     ]
     requested = [parts for url in urls if (parts := _url_parts(url))]
-    for index in range(2):
+    for index in range(2 if allow_host_fallback else 1):
         matches = [
             credential for credential, parts in indexed if any(parts[index] == target[index] for target in requested)
         ]
         if matches:
             return matches
     return []
+
+
+def _login_url_candidates(policy: RequestPolicy, user_message: str) -> list[str]:
+    if policy.login_page_urls:
+        return _clean_list(policy.login_page_urls)
+    candidates = _clean_list([candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)])
+    candidate_hosts = {parts[1] for candidate in candidates if (parts := _url_parts(candidate))}
+    if len(candidate_hosts) > 1:
+        return []
+    return candidates
 
 
 _CLARIFICATION_DECISION_PREFIX = "request-policy clarification required:"
@@ -4073,6 +4092,7 @@ async def _resolve_credentials(
     policy: RequestPolicy,
     organization_id: str,
     *,
+    user_message: str,
     defer_unresolved_credential_name: bool = False,
 ) -> None:
     if policy.credential_input_kind == "credential_id":
@@ -4112,7 +4132,43 @@ async def _resolve_credentials(
             reason="missing_target_context",
         )
         return
-    if policy.credential_input_kind not in ("credential_name", "website_stored_credential"):
+    if policy.credential_input_kind not in ("credential_name", "website_stored_credential", "none"):
+        return
+
+    if policy.credential_input_kind == "none":
+        if not policy.login_intent or policy.raw_secret_detected:
+            return
+        if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+            return
+        candidates = _login_url_candidates(policy, user_message)
+        if not candidates:
+            return
+        # Card/secret credentials can carry a tested_url too; a login turn
+        # must only ever auto-bind a password credential.
+        login_credentials = [
+            credential
+            for credential in await _load_credentials(organization_id)
+            if credential.credential_type == CredentialType.PASSWORD
+        ]
+        matches = _match_by_url(
+            login_credentials,
+            candidates,
+            # A URL merely mentioned in prose is a weaker signal than a
+            # classifier-extracted login page; require an exact tested-URL hit.
+            allow_host_fallback=bool(policy.login_page_urls),
+        )
+        if len(matches) == 1:
+            policy.resolved_credentials = matches
+        elif matches:
+            # Found-but-unbound keeps the unresolved-login override from
+            # relabeling this disambiguation ask as a missing-credential turn.
+            policy.discovered_credentials = matches
+            _block(
+                policy,
+                _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+                matches,
+                reason="credential_name_unresolved",
+            )
         return
 
     credentials = await _load_credentials(organization_id)
@@ -4148,7 +4204,7 @@ async def _resolve_credentials(
     elif matches:
         _block(
             policy,
-            "I found multiple stored credentials for that login page. Which one should I use?",
+            _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
             matches,
             reason="credential_name_unresolved",
         )
@@ -4381,6 +4437,7 @@ async def build_request_policy(
             await _resolve_credentials(
                 policy,
                 organization_id,
+                user_message=user_message,
                 defer_unresolved_credential_name=_last_assistant_message_was_saved_credential_question(chat_history),
             )
         except Exception:

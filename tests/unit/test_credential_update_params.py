@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialType,
     CredentialVaultType,
+    TotpType,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -39,6 +40,35 @@ def _make_browser_sessions_repo(mock_browser_profile: MagicMock) -> BrowserSessi
     return BrowserSessionsRepository(session_factory=lambda: MockAsyncSessionCtx(mock_session))
 
 
+def _make_password_credential(**overrides: object) -> Credential:
+    defaults: dict[str, object] = {
+        "credential_id": "cred_123",
+        "organization_id": "org_123",
+        "name": "test",
+        "vault_type": CredentialVaultType.AZURE_VAULT,
+        "item_id": "item_123",
+        "credential_type": CredentialType.PASSWORD,
+        "username": "user@example.com",
+        "totp_type": TotpType.NONE,
+        "totp_identifier": None,
+        "card_last4": None,
+        "card_brand": None,
+        "secret_label": None,
+        "browser_profile_id": None,
+        "tested_url": None,
+        "user_context": None,
+        "save_browser_session_intent": False,
+        "folder_id": None,
+        "proxy_location": None,
+        "proxy_session_id": None,
+        "created_at": datetime(2026, 1, 1),
+        "modified_at": datetime(2026, 1, 1),
+        "deleted_at": None,
+    }
+    defaults.update(overrides)
+    return Credential(**defaults)
+
+
 # --- CredentialRepository tests ---
 
 
@@ -54,6 +84,7 @@ async def test_credential_vault_service_create_db_credential_passes_proxy_pin(
         credential_type=CredentialType.PASSWORD,
         credential={"username": "user@example.com", "password": "pw"},
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        tested_url="https://example.com/login",
     )
 
     await CredentialVaultService._create_db_credential(
@@ -66,26 +97,17 @@ async def test_credential_vault_service_create_db_credential_passes_proxy_pin(
     create_credential.assert_awaited_once()
     assert create_credential.await_args.kwargs["proxy_location"] == ProxyLocation.RESIDENTIAL_ISP
     assert create_credential.await_args.kwargs["proxy_session_id"] is None
+    assert create_credential.await_args.kwargs["tested_url"] == "https://example.com/login"
 
 
 @pytest.mark.asyncio
 async def test_create_credential_response_includes_generated_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     proxy_session_id = generate_proxy_session_id("cred_123")
-    stored_credential = Credential(
-        credential_id="cred_123",
-        organization_id="org_123",
-        name="test",
-        vault_type=CredentialVaultType.AZURE_VAULT,
-        item_id="item_123",
-        credential_type=CredentialType.PASSWORD,
-        username="user@example.com",
-        card_last4=None,
-        card_brand=None,
-        secret_label=None,
+    stored_credential = _make_password_credential(
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         proxy_session_id=proxy_session_id,
-        created_at=datetime(2026, 1, 1),
-        modified_at=datetime(2026, 1, 1),
+        tested_url="https://example.com/login",
+        totp_type=TotpType.AUTHENTICATOR,
     )
     vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=stored_credential))
     monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
@@ -105,6 +127,85 @@ async def test_create_credential_response_includes_generated_proxy_pin(monkeypat
 
     assert response.proxy_location == ProxyLocation.RESIDENTIAL_ISP
     assert response.proxy_session_id == proxy_session_id
+    assert response.tested_url == "https://example.com/login"
+    assert response.credential.totp_type == TotpType.AUTHENTICATOR
+
+
+@pytest.mark.asyncio
+async def test_credential_vault_service_update_db_credential_persists_tested_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    update_credential = AsyncMock(return_value=MagicMock())
+    update_credential_vault_data = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential_vault_data", update_credential_vault_data)
+
+    data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "user@example.com", "password": "pw"},
+        tested_url="https://example.com/login",
+    )
+    credential = SimpleNamespace(credential_id="cred_123", organization_id="org_123")
+    await CredentialVaultService._update_db_credential(credential=credential, data=data, item_id="item_123")
+
+    update_credential.assert_not_awaited()
+    update_credential_vault_data.assert_awaited_once()
+    assert update_credential_vault_data.await_args.kwargs["tested_url"] == "https://example.com/login"
+
+
+@pytest.mark.asyncio
+async def test_credential_vault_service_update_db_credential_skips_tested_url_when_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    update_credential = AsyncMock(return_value=MagicMock())
+    update_credential_vault_data = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential_vault_data", update_credential_vault_data)
+
+    data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "user@example.com", "password": "pw"},
+        tested_url=None,
+    )
+    credential = SimpleNamespace(credential_id="cred_123", organization_id="org_123")
+    await CredentialVaultService._update_db_credential(credential=credential, data=data, item_id="item_123")
+
+    update_credential.assert_not_awaited()
+    update_credential_vault_data.assert_awaited_once()
+    assert update_credential_vault_data.await_args.kwargs["tested_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_credential_then_get_credential_returns_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    stored_credential = _make_password_credential(tested_url="https://example.com/login")
+    vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=stored_credential))
+    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=stored_credential),
+    )
+
+    create_data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "user@example.com", "password": "pw"},
+        tested_url="https://example.com/login",
+    )
+    create_response = await credentials_routes.create_credential(
+        background_tasks=BackgroundTasks(),
+        data=create_data,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+    get_response = await credentials_routes.get_credential(
+        credential_id="cred_123",
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert create_response.tested_url == "https://example.com/login"
+    assert get_response.tested_url == "https://example.com/login"
 
 
 @pytest.mark.asyncio
@@ -134,6 +235,33 @@ async def test_repo_create_credential_clears_incompatible_proxy_pin() -> None:
     stored_credential = mock_session.add.call_args.args[0]
     assert stored_credential.proxy_location == ProxyLocation.NONE.value
     assert stored_credential.proxy_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_repo_create_credential_persists_tested_url() -> None:
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    mock_session.flush = AsyncMock()
+    mock_session.commit = AsyncMock()
+    mock_session.refresh = AsyncMock()
+    repo = CredentialRepository(session_factory=lambda: MockAsyncSessionCtx(mock_session))
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.create_credential(
+            organization_id="org_123",
+            name="test",
+            vault_type=CredentialVaultType.AZURE_VAULT,
+            item_id="item_123",
+            credential_type=CredentialType.PASSWORD,
+            username="user@example.com",
+            totp_type="none",
+            card_last4=None,
+            card_brand=None,
+            tested_url="https://example.com/login",
+        )
+
+    stored_credential = mock_session.add.call_args.args[0]
+    assert stored_credential.tested_url == "https://example.com/login"
 
 
 @pytest.mark.asyncio
@@ -171,6 +299,23 @@ async def test_repo_update_credential_accepts_save_browser_session_intent() -> N
 
 
 @pytest.mark.asyncio
+async def test_repo_update_credential_accepts_tested_url() -> None:
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.tested_url = None
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            tested_url="https://example.com/login",
+        )
+
+    assert mock_credential.tested_url == "https://example.com/login"
+
+
+@pytest.mark.asyncio
 async def test_repo_update_credential_unset_params_not_applied() -> None:
     mock_credential = MagicMock()
     mock_credential.name = "test"
@@ -186,6 +331,23 @@ async def test_repo_update_credential_unset_params_not_applied() -> None:
 
     assert mock_credential.user_context == "existing"
     assert mock_credential.save_browser_session_intent is True
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_tested_url_none_preserves_existing_value() -> None:
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.tested_url = "https://example.com/existing"
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            tested_url=None,
+        )
+
+    assert mock_credential.tested_url == "https://example.com/existing"
 
 
 @pytest.mark.asyncio
@@ -251,6 +413,34 @@ async def test_repo_update_credential_vault_data_persists_proxy_pin() -> None:
     assert mock_credential.proxy_location == ProxyLocation.RESIDENTIAL_ISP.value
     assert mock_credential.proxy_session_id is not None
     assert is_proxy_session_id(mock_credential.proxy_session_id)
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_vault_data_writes_tested_url_only_when_provided() -> None:
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.tested_url = "https://old.example.com/login"
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential_vault_data(
+            credential_id="cred_123",
+            organization_id="org_123",
+            item_id="item_123",
+            name="test",
+            credential_type="password",
+        )
+        assert mock_credential.tested_url == "https://old.example.com/login"
+
+        await repo.update_credential_vault_data(
+            credential_id="cred_123",
+            organization_id="org_123",
+            item_id="item_123",
+            name="test",
+            credential_type="password",
+            tested_url="https://new.example.com/login",
+        )
+        assert mock_credential.tested_url == "https://new.example.com/login"
 
 
 @pytest.mark.asyncio
@@ -738,6 +928,28 @@ def test_credential_route_passes_rotate_proxy_session_id_intent() -> None:
         "proxy_location": ProxyLocation.RESIDENTIAL_ISP,
         "rotate_proxy_session_id": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_rename_credential_route_passes_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(tested_url="https://example.com/original")
+    updated = _make_password_credential(name="renamed", tested_url="https://example.com/new")
+    update_credential = AsyncMock(return_value=updated)
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    response = await credentials_routes.rename_credential(
+        credential_id="cred_123",
+        data=credentials_routes.UpdateCredentialRequest(
+            name="renamed",
+            tested_url="https://example.com/new",
+        ),
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    update_credential.assert_awaited_once()
+    assert update_credential.await_args.kwargs["tested_url"] == "https://example.com/new"
+    assert response.tested_url == "https://example.com/new"
 
 
 def test_generate_proxy_session_id_rejects_empty_entity_id() -> None:
