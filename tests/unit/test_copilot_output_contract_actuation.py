@@ -2680,3 +2680,173 @@ def test_deficient_candidate_still_rejected_by_gate() -> None:
     assert evaluation.has_deficiencies is True
     assert "output.record_id" in evaluation.missing_return_paths
     assert "output.record_id" in evaluation.missing_metadata_paths
+
+
+# ---------------------------------------------------------------------------
+# SKY-12907: impose-or-credit at the convergence ceiling.
+# ---------------------------------------------------------------------------
+
+
+def _record_criterion_ctx() -> CopilotContext:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    ctx.turn_id = "turn_ceiling_record"
+    return ctx
+
+
+def _record_contract_metadata() -> list[dict[str, object]]:
+    return [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output.record_id"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+        )
+    ]
+
+
+_UNCERTAIN_ROOT_ENVELOPE_CODE = 'envelope = {"output": {"blocker": None}}\nenvelope.update(status)\nreturn envelope'
+
+
+def _declaration_only_root_contract() -> tuple[CopilotContext, str, list[dict[str, object]]]:
+    ctx = _antecedent_ctx(_blocker_contingent_criterion())
+    ctx.turn_id = "turn_ceiling_root"
+    workflow_yaml = _declaration_waiver_yaml(_UNCERTAIN_ROOT_ENVELOPE_CODE)
+    metadata = [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            declaration_paths={"output.blocker"},
+        )
+    ]
+    return ctx, workflow_yaml, metadata
+
+
+def test_credit_flag_admits_uncertain_root_envelope_and_keeps_absent_rejected() -> None:
+    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None
+    assert wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in strict.shape_violations
+
+    credited = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True, credit_convergence_ceiling=True
+    )
+    assert credited is not None
+    assert credited.has_deficiencies is False
+
+    # A provably output-less envelope stays rejected even with crediting on.
+    absent_yaml = _declaration_waiver_yaml('return {"status": "done"}')
+    absent = wu._evaluate_output_contract_for_code_block(
+        ctx, absent_yaml, metadata, enforce_value_bearing_liveness=True, credit_convergence_ceiling=True
+    )
+    assert absent is not None
+    assert wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in absent.shape_violations
+
+
+def test_ceiling_credits_uncertain_but_bound_submission() -> None:
+    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None and strict.has_deficiencies
+
+    # Below the ceiling the server keeps steering: no credit, no imposition.
+    assert (
+        wu._credit_or_impose_output_contract_at_ceiling(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+        is None
+    )
+
+    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    with capture_logs() as logs:
+        resolution = wu._credit_or_impose_output_contract_at_ceiling(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+    assert resolution is not None
+    assert resolution.mode == "credited"
+    assert resolution.workflow_yaml == workflow_yaml
+    assert resolution.code_artifact_metadata is metadata
+    assert resolution.evaluation.has_deficiencies is False
+    assert ctx.output_contract_imposed_since_last_reject_by_signature[strict.canonical_signature] is True
+    assert any(log.get("event") == "copilot_output_contract_submission_credited_at_ceiling" for log in logs)
+
+
+def test_ceiling_imposes_binding_from_scouted_observation() -> None:
+    ctx = _record_criterion_ctx()
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")')
+    metadata = _record_contract_metadata()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None
+    assert "output.record_id" in strict.missing_return_paths
+    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+
+    # Enforcing-mode negative: without a recorded source, the reject path stays untouched.
+    assert (
+        wu._credit_or_impose_output_contract_at_ceiling(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+        is None
+    )
+
+    ctx.scouted_output_covered_paths = {"output.record_id"}
+    with capture_logs() as logs:
+        resolution = wu._credit_or_impose_output_contract_at_ceiling(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+    assert resolution is not None
+    assert resolution.mode == "imposed"
+    imposed_code = str(
+        wu._workflow_yaml_code_blocks_by_label(resolution.workflow_yaml)["extract_record"].get("code") or ""
+    )
+    assert 'return {"output": {"record_id": record_id}}' in imposed_code
+    assert resolution.evaluation.has_deficiencies is False
+    assert ctx.output_contract_imposed_since_last_reject_by_signature[strict.canonical_signature] is True
+    assert any(log.get("event") == "copilot_output_contract_binding_imposed_at_ceiling" for log in logs)
+
+
+def test_ceiling_abstains_when_no_binding_composable_even_with_observation() -> None:
+    ctx = _record_criterion_ctx()
+    workflow_yaml = _declaration_waiver_yaml('await page.click("#next")\nreturn "done"')
+    metadata = _record_contract_metadata()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None and strict.has_deficiencies
+    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    ctx.scouted_output_covered_paths = {"output.record_id"}
+
+    assert (
+        wu._credit_or_impose_output_contract_at_ceiling(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+        is None
+    )
+    assert ctx.output_contract_imposed_since_last_reject_by_signature.get(strict.canonical_signature) is None
+
+
+def test_ceiling_hook_inert_in_log_only_mode() -> None:
+    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None
+    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    ctx.author_time_gate_log_only_ids = frozenset({wu._OUTPUT_CONTRACT_ABLATION_GATE_ID})
+
+    assert (
+        wu._credit_or_impose_output_contract_at_ceiling(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+        is None
+    )
