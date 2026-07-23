@@ -28,6 +28,7 @@ class TerminalOutcomeEnvelope(BaseModel):
     user_action_required: bool = False
     attempted: str | None = None
     response_kind: TerminalResponseKind
+    rendered_from_envelope: bool = False
     envelope_version: int = 1
 
 
@@ -101,6 +102,33 @@ def finalize_applied_state(envelope: TerminalOutcomeEnvelope, *, applied: bool) 
     )
 
 
+def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:
+    # Diagnose/refuse answers share next_state="stopped" but their text IS the
+    # deliverable — only stopped-kind turns get the honest-stop replacement.
+    if cancelled or envelope.next_state != "stopped" or envelope.response_kind != "stopped":
+        return agent_message, False
+
+    if envelope.run_verdict == "not_demonstrated":
+        message = "I ran the workflow, but I could not confirm the goal was met."
+    elif envelope.run_verdict == "not_evaluated":
+        message = "I ran the workflow, but this turn finished without outcome evaluation."
+    elif envelope.run_verdict == "demonstrated":
+        message = (
+            "I ran the workflow and the latest run demonstrated the requested outcome, "
+            "but this turn stopped before applying and finishing it."
+        )
+    else:
+        message = "I stopped without confirming the goal was met."
+
+    if envelope.run_display_reason:
+        message = _append_labeled_sentence(message, label="Reason", text=envelope.run_display_reason)
+
+    blocker_reason = envelope.blocker_reason
+    if blocker_reason and not _text_contains(message, blocker_reason):
+        message = _append_labeled_sentence(message, label="Evidence", text=blocker_reason)
+    return message, True
+
+
 def _select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> RecordedRunOutcome | None:
     final_outcomes = [outcome for outcome in run_outcomes if outcome.verdict in _FINAL_RUN_VERDICTS]
     if not final_outcomes:
@@ -156,7 +184,9 @@ def _derive_response_kind(
         return "update"
     if prior_response_kind == "answer":
         return "answer"
-    if workflow_mutated is False and turn_outcome_response_kind == "diagnose":
+    # Refusals and repeat-reply recover escalations are complete answer-only
+    # replies, not halted work — their text must survive envelope rendering.
+    if workflow_mutated is False and turn_outcome_response_kind in ("diagnose", "refuse", "recover"):
         return "answer"
     return "stopped"
 
@@ -187,3 +217,14 @@ def _clean_text(value: str | None) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _append_labeled_sentence(base: str, *, label: str, text: str) -> str:
+    prefix = base if base.endswith((".", "!", "?")) else f"{base}."
+    return f"{prefix} {label}: {text}"
+
+
+def _text_contains(text: str, fragment: str) -> bool:
+    normalized_text = normalize_shadow_reason_text(text)
+    normalized_fragment = normalize_shadow_reason_text(fragment)
+    return bool(normalized_text and normalized_fragment and normalized_fragment in normalized_text)

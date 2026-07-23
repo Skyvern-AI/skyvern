@@ -88,6 +88,32 @@ export type BlockOutcome =
   | "not_demonstrated"
   | "not_evaluated";
 
+export interface TerminalEnvelopeFacts {
+  runVerdict: BlockOutcome | null;
+  runDisplayReason: string | null;
+}
+
+// Envelope dicts are backend model_dump output, so keys stay snake_case.
+// The backend anchors run_verdict from final outcomes only, so "evaluating"
+// is not a wire value here and parses to null like any unknown.
+export function parseTerminalEnvelope(
+  raw: unknown,
+): TerminalEnvelopeFacts | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const v = obj.run_verdict;
+  return {
+    runVerdict:
+      v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
+        ? v
+        : null,
+    runDisplayReason:
+      typeof obj.run_display_reason === "string"
+        ? obj.run_display_reason
+        : null,
+  };
+}
+
 export interface BlockState {
   workflowRunBlockId: string;
   label: string;
@@ -154,6 +180,10 @@ export interface TurnNarrativeState {
   // Outcome-evidence verdict authorizing tested-success claims (ADR 0005).
   // Null means unknown (legacy/grafted rows) — distinct from false.
   verifiedSuccess: boolean | null;
+  // Run-outcome facts from the backend-finalized terminal envelope carried
+  // in the narrative payload. Authoritative once runVerdict is set; null on
+  // rows persisted before the envelope existed.
+  terminalEnvelope: TerminalEnvelopeFacts | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -223,6 +253,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   proposalDisposition: null,
   responseKind: null,
   verifiedSuccess: null,
+  terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -1175,6 +1206,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.verifiedSuccess === "boolean"
         ? payload.verifiedSuccess
         : null,
+    terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
     draft,
@@ -1305,8 +1337,23 @@ export interface NotConfirmedOutcome {
 }
 
 export function notConfirmedOutcome(
-  turn: Pick<TurnNarrativeState, "lastRunOutcome" | "blocks">,
+  turn: Pick<
+    TurnNarrativeState,
+    "terminalEnvelope" | "lastRunOutcome" | "blocks"
+  >,
 ): NotConfirmedOutcome | null {
+  // The backend-finalized envelope is authoritative once it carries a run
+  // verdict; the pointer/block inference below only covers rows persisted
+  // before the envelope existed (or envelopes from run-less turns).
+  const envelope = turn.terminalEnvelope;
+  if (envelope !== null && envelope.runVerdict !== null) {
+    return envelope.runVerdict === "not_demonstrated"
+      ? {
+          verdict: "not_demonstrated",
+          displayReason: envelope.runDisplayReason,
+        }
+      : null;
+  }
   if (turn.lastRunOutcome !== null) {
     return turn.lastRunOutcome.verdict === "not_demonstrated"
       ? {

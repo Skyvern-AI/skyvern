@@ -62,6 +62,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalOutcomeEnvelope,
     finalize_applied_state,
     reason_in_reply_shadow,
+    render_terminal_message,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CopilotComposerMode,
@@ -497,7 +498,7 @@ def _finalized_terminal_envelope(
     workflow_applied: bool,
     final_message: str,
     response_type: str,
-) -> dict[str, Any] | None:
+) -> tuple[TerminalOutcomeEnvelope, dict[str, Any]] | None:
     payload = _agent_terminal_envelope(agent_result)
     if payload is None:
         return None
@@ -529,6 +530,23 @@ def _finalized_terminal_envelope(
         reason_in_reply=reason_in_reply,
         finalized=True,
     )
+    return finalized, payload
+
+
+def _with_rendered_terminal_text(
+    narrative_payload: TurnNarrativePayload | None,
+    *,
+    rendered_message: str,
+) -> TurnNarrativePayload | None:
+    if narrative_payload is None:
+        return None
+    payload: TurnNarrativePayload = narrative_payload.copy()
+    if isinstance(payload.get("terminalMessage"), str):
+        payload["terminalMessage"] = rendered_message
+    # The FE renders narrativeSummary ahead of terminalMessage, so a distinct
+    # concise summary must not survive a replaced reply with stale prose.
+    if payload.get("narrativeSummary") is not None:
+        payload["narrativeSummary"] = rendered_message
     return payload
 
 
@@ -814,12 +832,24 @@ async def _persist_cancel_turn(
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
         workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
-        terminal_envelope = _finalized_terminal_envelope(
+        terminal_envelope_result = _finalized_terminal_envelope(
             agent_result,
             workflow_applied=workflow_applied,
             final_message=user_response,
             response_type=response_type,
         )
+        if terminal_envelope_result is None:
+            terminal_envelope = None
+        else:
+            terminal_envelope_model, terminal_envelope = terminal_envelope_result
+            # Cancelled turns keep the agent text (render_terminal_message
+            # passes them through), so only the flag marker is stamped here.
+            # Shielded like the persistence writes above: a cancel landing on
+            # this await must not skip the chat-row persistence that follows.
+            if await asyncio.shield(app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)):
+                terminal_envelope = terminal_envelope_model.model_copy(
+                    update={"rendered_from_envelope": True}
+                ).model_dump(mode="json")
 
     proposal_disposition = _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
@@ -944,14 +974,41 @@ async def _finalise_normal_turn(
     await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
-    terminal_envelope = _finalized_terminal_envelope(
+    terminal_envelope_result = _finalized_terminal_envelope(
         agent_result,
         workflow_applied=workflow_applied,
         final_message=user_response,
         response_type=agent_result.response_type,
     )
+    narrative_payload = agent_result.narrative_payload
+    narrative_summary = agent_result.narrative_summary
+    if terminal_envelope_result is None:
+        terminal_envelope = None
+    else:
+        terminal_envelope_model, terminal_envelope = terminal_envelope_result
+        should_render_terminal_from_envelope = await app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(
+            organization_id
+        )
+        if should_render_terminal_from_envelope:
+            # rendered_from_envelope means "flag on, envelope is display
+            # authority" for the FE — not that this turn's text was replaced.
+            terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
+            user_response, replaced = render_terminal_message(
+                terminal_envelope_model,
+                user_response,
+                cancelled=False,
+            )
+            terminal_envelope = terminal_envelope_model.model_dump(mode="json")
+            if replaced:
+                narrative_payload = _with_rendered_terminal_text(
+                    agent_result.narrative_payload,
+                    rendered_message=user_response,
+                )
+                # The frame-level summary is preferred by the FE over the
+                # message on hydration, so it must carry the rendered text too.
+                narrative_summary = user_response
     narrative_payload = _with_terminal_narrative_metadata(
-        agent_result.narrative_payload,
+        narrative_payload,
         cancelled=False,
         proposal_disposition=proposal_disposition,
         terminal_envelope=terminal_envelope,
@@ -988,7 +1045,7 @@ async def _finalise_normal_turn(
             workflow_applied=workflow_applied,
             output_policy_diagnostics=agent_result.output_policy_diagnostics,
             turn_id=agent_result.turn_id,
-            narrative_summary=agent_result.narrative_summary,
+            narrative_summary=narrative_summary,
             narrative_payload=narrative_payload,
             terminal_envelope=terminal_envelope,
         )
