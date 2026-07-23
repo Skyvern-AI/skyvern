@@ -108,6 +108,7 @@ from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_con
 from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
     SCOUTED_SPINE_TURN_HALT_USER_REASON,
+    _get_scouted_spine_missing_steps_for_halt,
     artifact_health_blocked,
     log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
@@ -2139,6 +2140,7 @@ async def _build_goal_satisfied_exit_result(
     terminal_reason: str = "verified_goal_satisfied",
     exit_site: str = "verified_goal_satisfied",
     flush_goal_satisfied: bool = True,
+    name_missing_spine_steps: bool = False,
 ) -> AgentResult:
     # Bypass one extra LLM turn after a full workflow test already satisfies
     # the diagnosis contract.
@@ -2162,6 +2164,10 @@ async def _build_goal_satisfied_exit_result(
         user_response = (
             "I reached the requested outcome, but the workflow has not been tested end-to-end. "
             "Review the draft before using it."
+        )
+    if name_missing_spine_steps and log_scouted_spine_unresolved_at_turn_halt(ctx):
+        user_response = _with_scouted_spine_missing_steps(
+            ctx, user_response, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
         )
     final_text, outcome = apply_repeated_reply_guard(
         final_text=user_response,
@@ -2251,10 +2257,36 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
         terminal_reason=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
         exit_site=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
         flush_goal_satisfied=False,
+        name_missing_spine_steps=True,
     )
 
 
 _SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+_SCOUTED_SPINE_MISSING_STEPS_PREFIX = "This draft is still missing steps you demonstrated:"
+
+
+def _with_scouted_spine_missing_steps(
+    ctx: CopilotContext,
+    user_response: str,
+    missing_steps: str | None,
+    *,
+    held_signal_unrelated: bool = False,
+) -> str:
+    """Name the demonstrated-but-missing steps on any give-up offer that carries a staged proposal, and
+    anchor them in the held blocker signal so the blocker-override finalizer cannot re-render them away.
+    When the held signal is an unrelated blocker that owns the turn (output policy, timeout, credential),
+    the steps are surfaced in the reply only; its reason and claimant stay intact so the turn's single
+    owner keeps rendering its own reply. Idempotent so a pre-finalizer append plus the finalizer re-render
+    never doubles the note."""
+    if not missing_steps or not ctx.has_staged_proposal:
+        return user_response
+    if _SCOUTED_SPINE_MISSING_STEPS_PREFIX in user_response:
+        return user_response
+    reframed = f"{user_response}\n\n{_SCOUTED_SPINE_MISSING_STEPS_PREFIX} {missing_steps}"
+    if not held_signal_unrelated and isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
+        ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": reframed})
+        ctx.blocker_signal_claimant = None
+    return reframed
 
 
 def _build_turn_halt_exit_result(
@@ -2263,6 +2295,7 @@ def _build_turn_halt_exit_result(
     halt: TurnHalt,
 ) -> AgentResult:
     under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
+    missing_steps = _get_scouted_spine_missing_steps_for_halt(ctx) if under_build_open else None
     if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
         return _build_wip_exit_result(
             ctx,
@@ -2271,15 +2304,15 @@ def _build_turn_halt_exit_result(
             unvalidated_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
             tested_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
             terminal_reason=f"turn_halt:{halt.kind.value}",
+            missing_spine_steps=missing_steps,
         )
     signal = halt.blocker_signal
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
         signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
-    if under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS:
+    scouted_spine_owns = under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS
+    if scouted_spine_owns:
         user_response = SCOUTED_SPINE_TURN_HALT_USER_REASON
-        # The blocker-override finalizer re-renders from the held signal, so the
-        # reframed reason must live there, not just in the local reply.
         if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
             ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
             ctx.blocker_signal_claimant = None
@@ -2287,6 +2320,9 @@ def _build_turn_halt_exit_result(
         user_response = signal.user_facing_reason
     else:
         user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
+    user_response = _with_scouted_spine_missing_steps(
+        ctx, user_response, missing_steps, held_signal_unrelated=not scouted_spine_owns
+    )
     return _build_exit_result(
         ctx,
         user_response,
@@ -3122,6 +3158,9 @@ def _finalize_result_with_blocker_override(
             return preserved
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
+    rendered_reply = _with_scouted_spine_missing_steps(
+        ctx, rendered_reply, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
+    )
 
     rendered_kind = (
         CopilotOutputKind.CLARIFICATION_REQUEST
@@ -3488,8 +3527,11 @@ def _build_wip_exit_result(
     tested_reply: str,
     cancelled: bool = False,
     terminal_reason: str | None = None,
+    missing_spine_steps: str | None = None,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
+    if missing_spine_steps is None:
+        missing_spine_steps = _get_scouted_spine_missing_steps_for_halt(ctx)
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
@@ -3509,6 +3551,7 @@ def _build_wip_exit_result(
                 terminal_reason=effective_terminal,
             )
             text = _observed_facts_halt_reply(ctx)
+        text = _with_scouted_spine_missing_steps(ctx, text, missing_spine_steps, held_signal_unrelated=True)
         return apply_repeated_reply_guard(
             final_text=text,
             attempted_kind=ResponseKind.CLARIFY,
@@ -4982,6 +5025,9 @@ def _build_output_policy_blocked_result(
                 composed_from_recorded_evidence = True
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+    user_response = _with_scouted_spine_missing_steps(
+        ctx, user_response, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
+    )
     has_non_actuation_hard_block = any(
         reason
         not in {

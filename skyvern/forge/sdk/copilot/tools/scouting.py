@@ -697,6 +697,8 @@ def _record_scouted_interaction(
         selector=selector or None,
         source_url=artifact.get("source_url"),
         role=role or None,
+        credential_field=credential_field or None,
+        credential_id=credential_id or None,
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
