@@ -5222,7 +5222,6 @@ def _credit_output_contract_submission_at_ceiling(
     )
     if credited is None or credited.has_deficiencies:
         return None
-    _mark_output_contract_imposed(ctx, evaluation.canonical_signature)
     LOG.info(
         "copilot_output_contract_submission_credited_at_ceiling",
         block_label=evaluation.block_label,

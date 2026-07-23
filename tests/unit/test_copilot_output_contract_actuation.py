@@ -7,8 +7,10 @@ OSS-synced: only synthetic labels and RFC-2606 placeholder identifiers.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -2760,9 +2762,7 @@ def test_ceiling_credits_uncertain_but_bound_submission() -> None:
 
     # Below the ceiling the server keeps steering: no credit, no imposition.
     assert (
-        wu._credit_or_impose_output_contract_at_ceiling(
-            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
-        )
+        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
         is None
     )
 
@@ -2776,8 +2776,30 @@ def test_ceiling_credits_uncertain_but_bound_submission() -> None:
     assert resolution.workflow_yaml == workflow_yaml
     assert resolution.code_artifact_metadata is metadata
     assert resolution.evaluation.has_deficiencies is False
-    assert ctx.output_contract_imposed_since_last_reject_by_signature[strict.canonical_signature] is True
+    assert ctx.output_contract_imposed_since_last_reject_by_signature.get(strict.canonical_signature) is not True
     assert any(log.get("event") == "copilot_output_contract_submission_credited_at_ceiling" for log in logs)
+
+
+def test_credit_preserves_reject_streak_so_downstream_reject_keeps_ceiling() -> None:
+    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None and strict.has_deficiencies
+    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+
+    credited = wu._credit_output_contract_submission_at_ceiling(
+        ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+    )
+    assert credited is not None
+
+    downstream = wu._record_output_contract_family_reject(
+        ctx,
+        strict.required_paths,
+        reject_family="requested_output_contract_missing_output_coverage",
+        authored_structural_fingerprint="fp_downstream",
+    )
+    assert downstream == wu._MAX_OUTPUT_CONTRACT_REJECTS
 
 
 def test_ceiling_imposes_binding_from_scouted_observation() -> None:
@@ -2793,9 +2815,7 @@ def test_ceiling_imposes_binding_from_scouted_observation() -> None:
 
     # Enforcing-mode negative: without a recorded source, the reject path stays untouched.
     assert (
-        wu._credit_or_impose_output_contract_at_ceiling(
-            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
-        )
+        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
         is None
     )
 
@@ -2827,9 +2847,7 @@ def test_ceiling_abstains_when_no_binding_composable_even_with_observation() -> 
     ctx.scouted_output_covered_paths = {"output.record_id"}
 
     assert (
-        wu._credit_or_impose_output_contract_at_ceiling(
-            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
-        )
+        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
         is None
     )
     assert ctx.output_contract_imposed_since_last_reject_by_signature.get(strict.canonical_signature) is None
@@ -2845,8 +2863,77 @@ def test_ceiling_hook_inert_in_log_only_mode() -> None:
     ctx.author_time_gate_log_only_ids = frozenset({wu._OUTPUT_CONTRACT_ABLATION_GATE_ID})
 
     assert (
-        wu._credit_or_impose_output_contract_at_ceiling(
-            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
-        )
+        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
         is None
     )
+
+
+def test_ceiling_refuses_omitted_value_without_observation_byte_identically() -> None:
+    ctx, _, metadata = _declaration_only_root_contract()
+    ctx.scouted_output_covered_paths = set()
+    omitted_yaml = _declaration_waiver_yaml('return {"status": "done"}')
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, omitted_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None and strict.has_deficiencies
+    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+
+    assert (
+        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=omitted_yaml, raw_metadata=metadata)
+        is None
+    )
+    credited = wu._evaluate_output_contract_for_code_block(
+        ctx, omitted_yaml, metadata, enforce_value_bearing_liveness=True, credit_convergence_ceiling=True
+    )
+    assert credited is not None
+    assert credited.payload == strict.payload
+    assert wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in credited.shape_violations
+    assert ctx.output_contract_imposed_since_last_reject_by_signature.get(strict.canonical_signature) is None
+
+
+def test_ceiling_reached_at_final_counted_reject_not_before() -> None:
+    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None
+    counts = ctx.output_contract_reject_count_by_signature
+
+    counts[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 2
+    assert wu._output_contract_ceiling_reached(ctx, strict) is False
+
+    counts[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    assert wu._output_contract_ceiling_reached(ctx, strict) is True
+
+
+_PROD_METADATA_CORPUS = Path(
+    "/Users/andrewneilson/sky/.gauntlet-cache/output-contract-binder-20260722/prod_rejected_metadata_captures.json"
+)
+_PROD_METADATA_CORPUS_SHA256 = "0f99fa0ddb8ce52ad4d6191ea307277ff373ccfed3a647caa46d80d6ee2aa060"
+
+
+def _prod_capture_binding_dimension(payload: list[dict[str, object]]) -> tuple[bool, bool]:
+    element = payload[0]
+    observations = element.get("exploration_observations") or []
+    statuses = {str(observation.get("status")) for observation in observations}
+    binding_source_on_record = len(observations) > 0
+    liveness_uncertain = bool(statuses) and statuses <= {"observed_not_verified"}
+    return binding_source_on_record, liveness_uncertain
+
+
+@pytest.mark.skipif(not _PROD_METADATA_CORPUS.exists(), reason="prod evidence archive not present in this environment")
+def test_prod_rejected_metadata_corpus_adjudication() -> None:
+    raw = _PROD_METADATA_CORPUS.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == _PROD_METADATA_CORPUS_SHA256
+
+    captures = [
+        row["attributes"]["attributes"]["rejected_code_artifact_metadata_payload"] for row in json.loads(raw)["data"]
+    ]
+    assert len(captures) == 6
+
+    for payload in captures:
+        element = payload[0]
+        assert element["block_label"] == "extract_posthog_website_visitors"
+        binding_source_on_record, liveness_uncertain = _prod_capture_binding_dimension(payload)
+        assert binding_source_on_record is True
+        assert liveness_uncertain is True
