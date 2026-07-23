@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    PostRunPagePathFailure,
     RecordedBuildTestOutcome,
     author_time_reject_missing_output_paths,
     latest_recorded_build_test_outcome_repeated,
@@ -141,6 +142,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     AuthorTimeGateAblationPayload,
+    PostRunPagePathInteractionWindow,
     record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -162,6 +164,8 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_and_stash_blocker_signal,
     claim_turn,
+    claimant_outranks,
+    current_turn_owner,
     emit_blocker_signal_payload,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
@@ -252,6 +256,7 @@ _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
 # for either or an update_workflow re-author silently spends the one-shot rescout.
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
+_POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
 _LOGIN_SUBMIT_NAME_PATTERN = re.compile(
     r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
     re.I,
@@ -3297,11 +3302,142 @@ def _should_block_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: st
     return _completion_verification_unsatisfied(ctx)
 
 
+def _post_run_page_path_tool_allowed(
+    condition: PostRunPagePathFailure,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> bool:
+    if not condition.is_page_path or not isinstance(arguments, Mapping):
+        return False
+    selectors = {target.selector for target in condition.continuation_targets}
+    if tool_name == "click":
+        selector = arguments.get("selector")
+        return isinstance(selector, str) and selector in selectors
+    if tool_name != "press_key" or arguments.get("key") != "Enter" or not condition.enter_allowed:
+        return False
+    selector = arguments.get("selector")
+    enter_selectors = {
+        target.selector for target in condition.continuation_targets if target.kind in {"form_submit", "challenge"}
+    }
+    return isinstance(selector, str) and selector in enter_selectors
+
+
+def _latest_scout_trajectory_index(ctx: CopilotContext) -> int:
+    return max(
+        (
+            trajectory_index
+            for interaction in ctx.scout_trajectory
+            if isinstance((trajectory_index := interaction.get("trajectory_index")), int)
+        ),
+        default=-1,
+    )
+
+
+def _post_run_page_path_successful_interactions(
+    ctx: CopilotContext,
+    window: PostRunPagePathInteractionWindow,
+) -> int:
+    return sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if isinstance((trajectory_index := interaction.get("trajectory_index")), int)
+        and trajectory_index > window.trajectory_anchor
+        and str(interaction.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+    )
+
+
+def _post_run_page_path_admission_state(
+    ctx: CopilotContext,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> tuple[PostRunPagePathInteractionWindow, str, str, int, int] | None:
+    if not _should_block_tool_after_unresolved_recorded_outcome(ctx, tool_name):
+        return None
+    latest = ctx.latest_recorded_build_test_outcome
+    if latest is None:
+        return None
+    condition = latest.page_path_failure
+    if condition is None or not _post_run_page_path_tool_allowed(condition, tool_name, arguments):
+        return None
+    structural_key = latest.structural_key
+    workflow_run_id = latest.workflow_run_id
+    if not structural_key or not workflow_run_id:
+        return None
+    if (
+        ctx.post_run_page_observation_after_failed_test is not True
+        or ctx.post_run_page_observation_tool not in _POST_RUN_PAGE_OBSERVATION_TOOLS
+        or ctx.post_run_page_observation_workflow_run_id != workflow_run_id
+        or ctx.post_run_page_observation_url != condition.current_url
+        or condition.workflow_run_id != workflow_run_id
+        or ctx.last_run_blocks_workflow_run_id != workflow_run_id
+    ):
+        return None
+    window = ctx.post_run_page_path_interaction_window
+    if window is None or (window.structural_key, window.workflow_run_id) != (structural_key, workflow_run_id):
+        window = PostRunPagePathInteractionWindow(
+            structural_key=structural_key,
+            workflow_run_id=workflow_run_id,
+            trajectory_anchor=_latest_scout_trajectory_index(ctx),
+        )
+    successful_interactions = _post_run_page_path_successful_interactions(ctx, window)
+    observation_generation = ctx.post_run_page_observation_generation
+    if window.admitted_attempts >= _POST_RUN_PAGE_PATH_INTERACTION_BUDGET or (
+        successful_interactions > window.observed_successful_interactions
+        and observation_generation <= window.observation_generation
+    ):
+        return None
+    owner = current_turn_owner(ctx)
+    if (
+        owner is not None
+        and owner.claimant is not TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION
+        and not claimant_outranks(TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION, owner.claimant)
+    ):
+        return None
+    return window, structural_key, workflow_run_id, successful_interactions, observation_generation
+
+
+def post_run_page_path_interaction_allowed(
+    ctx: CopilotContext,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> bool:
+    return _post_run_page_path_admission_state(ctx, tool_name, arguments) is not None
+
+
+def try_admit_post_run_page_path_interaction(
+    ctx: CopilotContext,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> bool:
+    state = _post_run_page_path_admission_state(ctx, tool_name, arguments)
+    if state is None:
+        return False
+    window, structural_key, workflow_run_id, successful_interactions, observation_generation = state
+    if claim_turn(ctx, TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION) is ClaimOutcome.YIELDED:
+        return False
+    ctx.post_run_page_path_interaction_window = replace(
+        window,
+        admitted_attempts=window.admitted_attempts + 1,
+        observation_generation=observation_generation,
+        observed_successful_interactions=successful_interactions,
+    )
+    LOG.info(
+        "copilot post-run page-path interaction admitted",
+        tool_name=tool_name,
+        selector=arguments.get("selector") if isinstance(arguments, Mapping) else None,
+        structural_key=structural_key,
+        workflow_run_id=workflow_run_id,
+        admitted_attempts=window.admitted_attempts + 1,
+        observation_generation=observation_generation,
+    )
+    return True
+
+
 def synthesized_block_persistence_signal(
     ctx: Any, tool_name: str, arguments: Mapping[str, Any] | None = None
 ) -> CopilotToolBlockerSignal | None:
     if _should_block_tool_after_unresolved_recorded_outcome(ctx, tool_name):
-        return CopilotToolBlockerSignal(
+        signal = CopilotToolBlockerSignal(
             blocker_kind="tool_error",
             agent_steering_text=(
                 "The last recorded test outcome is authoritative and still has unsatisfied completion criteria. "
@@ -3317,6 +3453,9 @@ def synthesized_block_persistence_signal(
             blocked_tool=tool_name,
             extra={"recorded_outcome_reason_code": "outcome_not_demonstrated"},
         )
+        if try_admit_post_run_page_path_interaction(ctx, tool_name, arguments):
+            return None
+        return signal
     if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
         return None
     ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)

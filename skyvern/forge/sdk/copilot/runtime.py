@@ -307,6 +307,16 @@ class NeverCapturedObligation:
     replay_payload: NeverCapturedReplayPayload | None = None
 
 
+@dataclass(frozen=True)
+class PostRunPagePathInteractionWindow:
+    structural_key: str
+    workflow_run_id: str
+    trajectory_anchor: int
+    admitted_attempts: int = 0
+    observation_generation: int = 0
+    observed_successful_interactions: int = 0
+
+
 @dataclass
 class AgentContext:
     organization_id: str
@@ -470,6 +480,8 @@ class AgentContext:
     post_run_page_observation_url: str | None = None
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
+    post_run_page_observation_generation: int = 0
+    post_run_page_path_interaction_window: PostRunPagePathInteractionWindow | None = None
     post_run_current_page_inspection_workflow_run_id: str | None = None
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None

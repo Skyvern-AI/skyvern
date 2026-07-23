@@ -968,6 +968,38 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
                 lines.append(f"- {'; '.join(fields)}")
     if outcome.workflow_run_id:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    page_path_failure = outcome.page_path_failure
+    if page_path_failure is not None and page_path_failure.is_page_path:
+        lines.extend(
+            [
+                "POST-RUN PAGE-PATH CONTINUATION:",
+                f"kind: {_clean_authoring_repair_prompt_atom(page_path_failure.kind)}",
+            ]
+        )
+        for target in page_path_failure.continuation_targets:
+            selector = _clean_authoring_repair_prompt_atom(target.selector)
+            lines.append(f"- allowed click: selector={selector}")
+            if page_path_failure.enter_allowed and target.kind in {"form_submit", "challenge"}:
+                lines.append(f"- allowed Enter: selector={selector}")
+        lines.append(
+            "Continue from the current page with one exact listed click or Enter action. "
+            "Do not navigate away or re-author the workflow before attempting that bounded continuation."
+        )
+    elif (
+        page_path_failure is None
+        and outcome.phase == "persisted_block_run"
+        and outcome.reason_code == "outcome_not_demonstrated"
+        and outcome.workflow_run_id
+    ):
+        lines.extend(
+            [
+                "POST-RUN PAGE-PATH CONTRACT UNBOUND:",
+                'Before any click or key press, call inspect_page_for_composition with target_url="current_page". '
+                "Do not use evaluate as a substitute. If the fresh same-run observation is page-path-shaped, it "
+                "will emit the exact allowed click or Enter selector; use only that selector without navigating or "
+                "re-authoring first. Otherwise the existing blocker remains in force.",
+            ]
+        )
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
     if outcome.observed_page_value_excerpt:
