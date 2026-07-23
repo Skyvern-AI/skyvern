@@ -6,7 +6,7 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.exceptions import MissingElement
+from skyvern.exceptions import MissingElement, MultipleElementsFound
 from skyvern.webeye.utils.dom import SkyvernElement, is_element_detached_error, resolve_locator
 
 _DETACHED_ERROR = "ElementHandle.content_frame: Element is not attached to the DOM"
@@ -102,7 +102,43 @@ async def test_input_sequentially_reresolves_stale_locator_by_xpath(monkeypatch:
 
     frame.locator.assert_called_once_with("xpath=//form/input")
     assert element.get_locator() is fresh_locator
+    assert typed_with.await_args is not None
     assert typed_with.await_args.args[0] is fresh_locator
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_reresolves_ambiguous_locator_by_xpath(monkeypatch: pytest.MonkeyPatch) -> None:
+    fresh_locator = _locator_with_counts(1)
+    frame = MagicMock()
+    frame.locator.return_value = fresh_locator
+    element = _make_element(_locator_with_counts(16), frame=frame, xpath="//div/pre[3]")
+
+    typed_with = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.input_sequentially", typed_with)
+    await element.input_sequentially("hello")
+
+    frame.locator.assert_called_once_with("xpath=//div/pre[3]")
+    assert element.get_locator() is fresh_locator
+    assert typed_with.await_args is not None
+    assert typed_with.await_args.args[0] is fresh_locator
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_rejects_ambiguous_locator_without_unique_xpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ambiguous_locator = _locator_with_counts(16)
+    frame = MagicMock()
+    frame.locator.return_value = _locator_with_counts(2)
+    element = _make_element(ambiguous_locator, frame=frame, xpath="//div/pre")
+
+    typed_with = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.input_sequentially", typed_with)
+
+    with pytest.raises(MultipleElementsFound):
+        await element.input_sequentially("hello")
+
+    typed_with.assert_not_awaited()
 
 
 @pytest.mark.asyncio
