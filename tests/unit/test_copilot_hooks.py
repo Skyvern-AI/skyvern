@@ -13,6 +13,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import hooks as hooks_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.code_block_synthesis import dynamic_row_evidence_fingerprint, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
@@ -1913,13 +1914,17 @@ class TestClickPostHookReachedDownloadTarget:
 
     @staticmethod
     def _patch_scouting(monkeypatch: pytest.MonkeyPatch, *, page_evidence: dict[str, Any] | None) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks as mh
-
-        monkeypatch.setattr(mh, "_clear_pending_browser_interaction_observation", lambda *_a, **_k: None)
-        monkeypatch.setattr(mh, "_consume_scout_source_url", lambda *_a, **_k: "http://localhost:8901/x/")
-        monkeypatch.setattr(mh, "_mark_pending_browser_interaction_observation", lambda *_a, **_k: None)
-        monkeypatch.setattr(mh, "_record_scouted_interaction", lambda *_a, **_k: None)
-        monkeypatch.setattr(mh, "_attach_scout_page_summary", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            tools_module.mcp_hooks, "_clear_pending_browser_interaction_observation", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            tools_module.mcp_hooks, "_consume_scout_source_url", lambda *_a, **_k: "http://localhost:8901/x/"
+        )
+        monkeypatch.setattr(
+            tools_module.mcp_hooks, "_mark_pending_browser_interaction_observation", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(tools_module.mcp_hooks, "_record_scouted_interaction", lambda *_a, **_k: None)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_attach_scout_page_summary", lambda *_a, **_k: None)
 
         async def fake_resolve_url_title(_raw: Any, _ctx: Any) -> tuple[str, str]:
             return "http://localhost:8901/x/statement", "Statement"
@@ -1930,9 +1935,9 @@ class TestClickPostHookReachedDownloadTarget:
         async def fake_register(*_a: Any, **_k: Any) -> tuple[int | None, dict[str, Any] | None]:
             return (1, page_evidence)
 
-        monkeypatch.setattr(mh, "_resolve_url_title", fake_resolve_url_title)
-        monkeypatch.setattr(mh, "_resolve_scout_role_name", fake_resolve_role_name)
-        monkeypatch.setattr(mh, "_register_scout_interaction_observation", fake_register)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_url_title", fake_resolve_url_title)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_scout_role_name", fake_resolve_role_name)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_register_scout_interaction_observation", fake_register)
 
     @staticmethod
     def _ctx(policy: BlockAuthoringPolicy = BlockAuthoringPolicy.CODE_ONLY_BROWSER) -> Any:

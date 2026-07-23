@@ -1452,7 +1452,7 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     data = result.get("data")
     if not isinstance(data, dict):
         return False
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return False
     selector = target["selector"]

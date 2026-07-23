@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.context import (
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.credential_literal_rebind import rebind_scouted_credential_literals
 from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -187,6 +188,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, reason_in_reply_shadow
+from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_churn
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -3790,6 +3792,33 @@ async def _resolve_wrapped_exception_exit_result(
     return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
 
 
+def _inline_replace_workflow_credential_verdict(
+    ctx: CopilotContext, action_data: dict[str, Any], resp_type: str, user_response: str
+) -> tuple[str, OutputPolicyVerdict, OutputPolicyVerdict]:
+    """Rebind scouted credential literals into ``action_data['workflow_yaml']`` and evaluate the inline
+    REPLACE_WORKFLOW output policy, recording churn when the hard-block verdict rejects. Returns the
+    effective YAML plus the raw and hard-block verdicts."""
+    workflow_yaml = action_data.get("workflow_yaml", "")
+    inline_rebind = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
+    if inline_rebind.changed:
+        workflow_yaml = inline_rebind.workflow_yaml
+        action_data["workflow_yaml"] = workflow_yaml
+        LOG.info("copilot inline REPLACE_WORKFLOW rebound scouted credential literals")
+    raw_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type=resp_type,
+        user_response=str(user_response),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=action_data,
+        has_workflow_proposal=True,
+        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+    )
+    hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
+    if not hard_block_verdict.allowed:
+        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, hard_block_verdict)
+    return workflow_yaml, raw_verdict, hard_block_verdict
+
+
 async def _translate_to_agent_result(
     result: RunResultStreaming,
     ctx: CopilotContext,
@@ -3867,16 +3896,9 @@ async def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
-            inline_raw_verdict = evaluate_output_policy(
-                request_policy=ctx.request_policy,
-                response_type=resp_type,
-                user_response=str(user_response),
-                workflow_yaml=workflow_yaml,
-                tool_arguments=action_data,
-                has_workflow_proposal=True,
-                output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+            workflow_yaml, inline_raw_verdict, inline_policy_verdict = _inline_replace_workflow_credential_verdict(
+                ctx, action_data, resp_type, str(user_response)
             )
-            inline_policy_verdict = hard_block_output_policy_verdict(inline_raw_verdict)
             if not inline_policy_verdict.allowed:
                 inline_diagnostics = build_output_policy_diagnostics(
                     raw_verdict=inline_raw_verdict,
