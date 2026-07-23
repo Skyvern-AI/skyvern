@@ -169,7 +169,7 @@ class AzureStorage(BaseStorage):
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, tier=tier, tags=tags)
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"azure://{settings.AZURE_STORAGE_CONTAINER_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         tier = await self._get_storage_tier_for_org(organization_id)
@@ -184,6 +184,7 @@ class AzureStorage(BaseStorage):
             tags=tags,
         )
         await self.async_client.upload_file_from_path(to_path, from_path, tier=tier, tags=tags)
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"azure://{settings.AZURE_STORAGE_CONTAINER_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"

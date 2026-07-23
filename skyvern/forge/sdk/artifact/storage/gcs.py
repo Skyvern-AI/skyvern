@@ -173,7 +173,7 @@ class GcsStorage(BaseStorage):
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=storage_class, tags=tags)
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"gs://{settings.GCS_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         storage_class = await self._get_storage_class_for_org(organization_id)
@@ -188,6 +188,7 @@ class GcsStorage(BaseStorage):
             tags=tags,
         )
         await self.async_client.upload_file_from_path(to_path, from_path, storage_class=storage_class, tags=tags)
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"gs://{settings.GCS_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"

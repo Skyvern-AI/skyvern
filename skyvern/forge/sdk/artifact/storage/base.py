@@ -173,8 +173,9 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
-        pass
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
+        """None/True means the frame was uploaded; False means a gate intentionally skipped it,
+        so callers must not record a skipped frame as published."""
 
     @abstractmethod
     async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:

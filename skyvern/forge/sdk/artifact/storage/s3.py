@@ -242,7 +242,7 @@ class S3Storage(BaseStorage):
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc)
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_SCREENSHOTS)
@@ -255,6 +255,7 @@ class S3Storage(BaseStorage):
             storage_class=sc,
         )
         await self.async_client.upload_file_from_path(to_path, from_path, storage_class=sc)
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
