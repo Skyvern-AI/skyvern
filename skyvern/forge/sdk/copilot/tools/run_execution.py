@@ -3386,7 +3386,12 @@ def _mark_stored_post_run_failure_page(copilot_ctx: Any) -> None:
     if not post_run_inspection_cleanly_matches(evidence, run_id):
         return
     url = evidence.get("current_url") or evidence.get("inspected_url") or ""
-    _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=url)
+    _mark_post_run_page_observed(
+        copilot_ctx,
+        source_tool="inspect_page_for_composition",
+        url=url,
+        page_evidence=evidence,
+    )
     page_title = evidence.get("page_title")
     if isinstance(page_title, str) and page_title:
         _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]

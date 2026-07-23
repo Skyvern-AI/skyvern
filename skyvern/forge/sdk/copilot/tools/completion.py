@@ -591,7 +591,7 @@ async def _maybe_run_completion_verification_from_page_observation(
     title: str = "",
     observed_data: object | None = None,
 ) -> CompletionVerificationResult | None:
-    """Verify completion only for post-run page observations after failed tests."""
+    """Verify completion only after failed or authoritative-unsatisfied runs."""
 
     existing = getattr(copilot_ctx, "completion_verification_result", None)
     if isinstance(existing, CompletionVerificationResult) and existing.is_fully_satisfied():

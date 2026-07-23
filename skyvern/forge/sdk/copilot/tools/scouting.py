@@ -13,6 +13,8 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    bind_post_run_page_path_failure,
     record_build_test_outcome,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
@@ -1019,6 +1021,7 @@ async def _register_scout_interaction_observation(
             record_scouted_output_coverage(
                 ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
             )
+            _mark_post_run_page_observed(ctx, source_tool="evaluate", url=url, page_evidence=parsed)
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
@@ -1747,14 +1750,41 @@ async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, u
     )
 
 
-def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
+def _mark_post_run_page_observed(
+    ctx: AgentContext,
+    *,
+    source_tool: str,
+    url: str,
+    page_evidence: dict[str, Any] | None = None,
+) -> None:
     run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     if not isinstance(run_id, str) or not run_id:
         return
     ctx.post_run_page_observation_tool = source_tool
     ctx.post_run_page_observation_url = url
     ctx.post_run_page_observation_workflow_run_id = run_id
-    ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+    latest_outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    authoritative_unsatisfied = (
+        isinstance(latest_outcome, RecordedBuildTestOutcome)
+        and latest_outcome.is_authoritative
+        and latest_outcome.phase == "persisted_block_run"
+        and latest_outcome.reason_code == "outcome_not_demonstrated"
+        and latest_outcome.workflow_run_id == run_id
+    )
+    ctx.post_run_page_observation_after_failed_test = (
+        getattr(ctx, "last_test_ok", None) is False or authoritative_unsatisfied
+    )
+    if page_evidence is not None and ctx.post_run_page_observation_after_failed_test:
+        bound_evidence = {
+            **page_evidence,
+            "workflow_run_id": run_id,
+            "observed_after_workflow_run": True,
+            "current_url": url,
+        }
+        if bind_post_run_page_path_failure(ctx, bound_evidence):
+            ctx.post_run_page_observation_generation = (
+                getattr(ctx, "post_run_page_observation_generation", 0) or 0
+            ) + 1
     evidence = _workflow_verification_evidence(ctx)
     evidence.live_page_state_verified = True
     evidence.verified_from_current_browser_state = True

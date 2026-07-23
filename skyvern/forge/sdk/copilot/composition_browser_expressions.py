@@ -486,7 +486,10 @@ for (const form of document.querySelectorAll('form')) {
   const submitControls = [];
   for (const node of form.querySelectorAll('input,select,textarea,button')) {
     const tag = (node.tagName || '').toLowerCase();
-    const fieldType = lower(attr(node, 'type') || tag || 'text');
+    const declaredType = lower(attr(node, 'type'));
+    const fieldType = tag === 'button'
+      ? (['button', 'reset', 'submit'].includes(declaredType) ? declaredType : 'submit')
+      : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
       submitControls.push({ text: nodeText(node) || attr(node, 'value'), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
@@ -524,6 +527,12 @@ const clickableSelector = (el) => {
   return '';
 };
 const clickableText = (el) => nodeText(el) || attr(el, 'aria-label') || attr(el, 'value') || attr(el, 'title');
+const elementVisible = (node) => {
+  if (!node || !node.getBoundingClientRect) return false;
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
+};
 const usedClickableSelectors = new Set();
 for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.selector) usedClickableSelectors.add(sc.selector);
 for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
@@ -533,6 +542,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
   const tag = (el.tagName || '').toLowerCase();
   if (SKIP_TAGS.has(tag)) continue;
+  if (!elementVisible(el)) continue;
   if (el.closest && el.closest('form')) continue;
   const text = clickableText(el);
   const selector = clickableSelector(el);
@@ -552,12 +562,6 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
 const resultContainers = [];
 let resultContainersTruncated = false;
 const selectorMatchCount = (selector) => { if (!selector) return 0; try { return document.querySelectorAll(selector).length; } catch (e) { return 0; } };
-const elementVisible = (node) => {
-  if (!node || !node.getBoundingClientRect) return false;
-  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
-  const rect = node.getBoundingClientRect();
-  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
-};
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
   return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
@@ -669,15 +673,28 @@ for (const node of all) {
 
 const challengeControls = [];
 const seenChallenge = new Set();
+const challengeIdentity = (node) => {
+  const tag = (node.tagName || '').toLowerCase();
+  return [tag, attr(node, 'id'), attr(node, 'name'), classesFor(node).join(' '), attr(node, 'src'), attr(node, 'type'), attr(node, 'data-sitekey'), attr(node, 'data-callback'), attr(node, 'data-expired-callback'), attr(node, 'data-error-callback'), attr(node, 'aria-label'), attr(node, 'title')].join(' ').toLowerCase();
+};
+const insideChallengeCarrier = (node) => {
+  for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    const identity = challengeIdentity(ancestor);
+    if (ANTI_BOT_PATTERNS.some((p) => identity.includes(p))) return true;
+  }
+  return false;
+};
 for (const node of all) {
   if (challengeControls.length >= MAX_CHALLENGE_CONTROLS) break;
+  if (!elementVisible(node)) continue;
   const tag = (node.tagName || '').toLowerCase();
-  const identity = [tag, attr(node, 'id'), attr(node, 'name'), '', attr(node, 'src'), attr(node, 'type'), attr(node, 'data-sitekey'), attr(node, 'data-callback'), attr(node, 'data-expired-callback'), attr(node, 'data-error-callback'), attr(node, 'aria-label'), attr(node, 'title')].join(' ').toLowerCase();
-  if (!ANTI_BOT_PATTERNS.some((p) => identity.includes(p))) continue;
+  const identity = challengeIdentity(node);
+  const interactiveDescendant = ['a', 'button', 'input', 'select', 'textarea'].includes(tag) && insideChallengeCarrier(node);
+  if (!ANTI_BOT_PATTERNS.some((p) => identity.includes(p)) && !interactiveDescendant) continue;
   const selector = selectorFor(node);
   if (seenChallenge.has(selector)) continue;
   seenChallenge.add(selector);
-  const entry = { tag: tag, id: attr(node, 'id'), name: attr(node, 'name'), class: classesFor(node), type: attr(node, 'type'), selector: selector, text: nodeText(node) || attr(node, 'aria-label') };
+  const entry = { tag: tag, id: attr(node, 'id'), name: attr(node, 'name'), class: classesFor(node), type: attr(node, 'type'), selector: selector, text: nodeText(node) || attr(node, 'value') || attr(node, 'aria-label'), checked: !!node.checked, disabled: controlDisabled(node) };
   for (const k of ['src', 'title', 'data-sitekey', 'data-callback', 'data-expired-callback', 'data-error-callback']) {
     const v = attr(node, k);
     if (v) entry[k.split('-').join('_')] = v;
