@@ -848,6 +848,29 @@ class SkyvernElement:
         except Exception:
             return False
 
+    async def is_safe_for_checkbox_direct_click(self) -> bool:
+        # A checkbox blocker is safe to click directly only when the click cannot be
+        # intercepted by actionable content that would navigate/submit: the blocker
+        # must not itself be an <a href>/<button>, nor a <label> wrapping one. Any
+        # probe failure or anomalous result fails closed (treated as unsafe).
+        locator = self.get_locator()
+        try:
+            is_interactive = await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression="(element) => element.matches('a[href], button')",
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            return False
+        if not isinstance(is_interactive, bool) or is_interactive:
+            return False
+        if self.get_tag_name() != "label":
+            return True
+        try:
+            return await locator.locator("a[href], button").count() == 0
+        except Exception:
+            return False
+
     async def find_bound_label_by_attr_id(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> Locator | None:
         if self.get_tag_name() == "label":
             return None
