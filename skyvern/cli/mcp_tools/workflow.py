@@ -686,6 +686,74 @@ def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
     return json.dumps(raw) if changed else definition
 
 
+def _collect_code_block_labels(blocks: Any) -> frozenset[str]:
+    labels: set[str] = set()
+    if not isinstance(blocks, list):
+        return frozenset()
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("block_type") == "code" and isinstance(block.get("label"), str):
+            labels.add(block["label"])
+        labels |= _collect_code_block_labels(block.get("loop_blocks"))
+    return frozenset(labels)
+
+
+def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_labels: frozenset[str]) -> str:
+    """Default `prompt` to "" on new code blocks, matching the editor's new-block default.
+
+    A non-null prompt is what makes the frontend render the code-first (new) code block
+    experience; the empty string is runtime-neutral (all backend prompt checks are truthiness
+    based). Blocks whose label is in `existing_code_labels`, or that carry an explicit prompt
+    value (including null), are left untouched so existing legacy blocks are never migrated.
+    """
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+    workflow_definition = raw.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
+    if not isinstance(blocks, list):
+        return definition
+
+    changed = False
+
+    def _walk(items: list[Any]) -> None:
+        nonlocal changed
+        for block in items:
+            if not isinstance(block, dict):
+                continue
+            if (
+                block.get("block_type") == "code"
+                and "prompt" not in block
+                and block.get("label") not in existing_code_labels
+            ):
+                block["prompt"] = ""
+                changed = True
+            loop_blocks = block.get("loop_blocks")
+            if isinstance(loop_blocks, list):
+                _walk(loop_blocks)
+
+    _walk(blocks)
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
+async def _inject_workflow_update_code_block_prompt_defaults(
+    definition: str,
+    fmt: str,
+    fetch_existing: Callable[[], Awaitable[dict[str, Any]]],
+) -> str:
+    """Apply the new-code-block prompt default on update, only for labels new to the workflow."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    existing = await fetch_existing()
+    existing_definition = existing.get("workflow_definition")
+    existing_blocks = existing_definition.get("blocks") if isinstance(existing_definition, dict) else None
+    return _inject_code_block_prompt_defaults(definition, fmt, _collect_code_block_labels(existing_blocks))
+
+
 async def _inject_workflow_update_proxy_default(
     definition: str,
     fmt: str,
@@ -1637,6 +1705,8 @@ async def skyvern_workflow_create(
     Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
     injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
+    Code blocks that omit `prompt` are defaulted to prompt="" so they render the current code block
+    editor experience.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
@@ -1662,6 +1732,7 @@ async def skyvern_workflow_create(
     # Default MCP-created workflows to the same editor defaults while preserving
     # any explicit user-supplied values.
     definition = _inject_code_v2_defaults(definition, format)
+    definition = _inject_code_block_prompt_defaults(definition, format, existing_code_labels=frozenset())
     definition = _inject_missing_top_level_defaults(
         definition,
         format,
@@ -1771,6 +1842,7 @@ async def skyvern_workflow_update(
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, fetch_existing)
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
+        definition = await _inject_workflow_update_code_block_prompt_defaults(definition, format, fetch_existing)
         if code_only:
             existing = await fetch_existing()
             existing_wf_def = existing.get("workflow_definition")
