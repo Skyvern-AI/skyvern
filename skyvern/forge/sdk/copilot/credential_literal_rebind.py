@@ -7,10 +7,16 @@ from typing import Any, Callable, Mapping, Sequence
 import yaml
 
 from skyvern.forge.sdk.copilot.code_block_synthesis import _CREDENTIAL_FIELDS, CREDENTIAL_FILL_TOOL_NAME
-from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_param_ids
+from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_param_ids, workflow_blocks
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
-_STRING_ASSIGN_TMPL = r"^[ \t]*{name}[ \t]*=[ \t]*(?P<q>['\"])(?:\\.|(?!(?P=q)).)*(?P=q)[ \t]*\n?"
+_STRING_LITERAL_RE = re.compile(r"(?P<q>['\"])(?:\\.|(?!(?P=q)).)*(?P=q)")
+_STRING_ASSIGN_TMPL = r"^[ \t]*{name}[ \t]*=[ \t]*" + _STRING_LITERAL_RE.pattern + r"[ \t]*\n?"
+_GOTO_RE = re.compile(r"\.goto\(\s*['\"]([^'\"]+)['\"]")
+
+
+def _normalize_page_url(url: str) -> str:
+    return url.split("#", 1)[0].strip().rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -21,8 +27,9 @@ class CredentialRebindResult:
 
 
 def scouted_credential_targets(scout_trajectory: Sequence[Mapping[str, Any]] | None) -> dict[str, tuple[str, str]]:
-    """Map each scouted selector to the (credential_id, field) that `fill_credential_field` typed into it."""
+    """Map each scouted selector to the (credential_id, field) `fill_credential_field` typed into it, dropping any selector scouted with conflicting credential/field targets so its literals fall to the fail-closed refusal backstop rather than being rebound to an ambiguous parameter."""
     targets: dict[str, tuple[str, str]] = {}
+    conflicted: set[str] = set()
     for interaction in scout_trajectory or []:
         if not isinstance(interaction, Mapping):
             continue
@@ -33,8 +40,33 @@ def scouted_credential_targets(scout_trajectory: Sequence[Mapping[str, Any]] | N
         field = str(interaction.get("credential_field") or "").strip()
         if not selector or not credential_id or field not in _CREDENTIAL_FIELDS:
             continue
-        targets.setdefault(selector, (credential_id, field))
+        mapping = (credential_id, field)
+        existing = targets.get(selector)
+        if existing is not None and existing != mapping:
+            conflicted.add(selector)
+            continue
+        targets.setdefault(selector, mapping)
+    for selector in conflicted:
+        targets.pop(selector, None)
     return targets
+
+
+def scouted_selector_source_urls(scout_trajectory: Sequence[Mapping[str, Any]] | None) -> dict[str, frozenset[str]]:
+    """Map each `fill_credential_field` selector to the normalized page URL(s) it was scouted on, so a
+    block that navigates elsewhere cannot rebind a same-named selector to a credential scouted on a
+    different page."""
+    by_selector: dict[str, set[str]] = {}
+    for interaction in scout_trajectory or []:
+        if not isinstance(interaction, Mapping):
+            continue
+        if str(interaction.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        selector = str(interaction.get("selector") or "").strip()
+        source_url = _normalize_page_url(str(interaction.get("source_url") or ""))
+        if not selector or not source_url:
+            continue
+        by_selector.setdefault(selector, set()).add(source_url)
+    return {selector: frozenset(urls) for selector, urls in by_selector.items()}
 
 
 def _existing_param_key(parameters: Sequence[object], credential_id: str) -> str | None:
@@ -55,6 +87,11 @@ def _mint_param_key(credential_id: str, used: set[str]) -> str:
     return candidate
 
 
+def _identifier_bound_to_string_literal(code: str, name: str) -> bool:
+    pattern = re.compile(_STRING_ASSIGN_TMPL.format(name=re.escape(name)), re.MULTILINE)
+    return pattern.search(code) is not None
+
+
 def _drop_dead_string_assignment(code: str, name: str) -> str:
     pattern = re.compile(_STRING_ASSIGN_TMPL.format(name=re.escape(name)), re.MULTILINE)
     match = pattern.search(code)
@@ -67,22 +104,38 @@ def _drop_dead_string_assignment(code: str, name: str) -> str:
     return remaining
 
 
+def _block_page_incompatible(block_goto_urls: set[str], target_source_urls: frozenset[str]) -> bool:
+    # A block counts as a different page only when it navigates yet lands on none of the scout pages;
+    # scoping is block-level, so a multi-goto block that mixes pages leans on the refusal backstop.
+    return bool(block_goto_urls) and bool(target_source_urls) and not (block_goto_urls & target_source_urls)
+
+
 def _rebind_block_code(
-    code: str, targets: Mapping[str, tuple[str, str]], param_key_for: Callable[[str], str]
+    code: str,
+    targets: Mapping[str, tuple[str, str]],
+    param_key_for: Callable[[str], str],
+    source_urls_by_selector: Mapping[str, frozenset[str]],
 ) -> tuple[str, list[str], set[str]]:
     rebound: list[str] = []
     used_params: set[str] = set()
     replaced_identifiers: set[str] = set()
     new_code = code
+    block_goto_urls = {_normalize_page_url(url) for url in _GOTO_RE.findall(code)}
 
     for selector, (credential_id, field) in targets.items():
+        if _block_page_incompatible(block_goto_urls, source_urls_by_selector.get(selector, frozenset())):
+            continue
         param_key = param_key_for(credential_id)
         access = f"{param_key}.{field}"
         selector_pattern = re.escape(selector)
         patterns = (
-            re.compile(r"(\.(?:fill|type)\(\s*['\"]" + selector_pattern + r"['\"]\s*,\s*)([^),]+?)(\s*\))"),
             re.compile(
-                r"(\.locator\(\s*['\"]" + selector_pattern + r"['\"]\s*\)\s*\.(?:fill|type)\(\s*)([^),]+?)(\s*\))"
+                r"(\.(?:fill|type|press_sequentially)\(\s*['\"]" + selector_pattern + r"['\"]\s*,\s*)([^),]+?)(\s*\))"
+            ),
+            re.compile(
+                r"(\.locator\(\s*['\"]"
+                + selector_pattern
+                + r"['\"]\s*\)\s*\.(?:fill|type|press_sequentially)\(\s*)([^),]+?)(\s*\))"
             ),
         )
 
@@ -91,7 +144,12 @@ def _rebind_block_code(
             if argument == access:
                 used_params.add(param_key)
                 return match.group(0)
-            if _IDENTIFIER_RE.fullmatch(argument):
+            bound_identifier = _IDENTIFIER_RE.fullmatch(argument) is not None and _identifier_bound_to_string_literal(
+                code, argument
+            )
+            if not _STRING_LITERAL_RE.fullmatch(argument) and not bound_identifier:
+                return match.group(0)
+            if bound_identifier:
                 replaced_identifiers.add(argument)
             rebound.append(f"{param_key}.{field}")
             used_params.add(param_key)
@@ -121,6 +179,7 @@ def rebind_scouted_credential_literals(
     targets = scouted_credential_targets(scout_trajectory)
     if not targets:
         return empty
+    source_urls_by_selector = scouted_selector_source_urls(scout_trajectory)
     try:
         parsed = yaml.safe_load(workflow_yaml)
     except yaml.YAMLError:
@@ -130,8 +189,8 @@ def rebind_scouted_credential_literals(
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return empty
-    blocks = workflow_definition.get("blocks")
-    if not isinstance(blocks, list):
+    blocks = workflow_blocks(parsed)
+    if not blocks:
         return empty
 
     parameters = workflow_definition.get("parameters")
@@ -155,7 +214,7 @@ def rebind_scouted_credential_literals(
         code = block.get("code")
         if not isinstance(code, str) or not code.strip():
             continue
-        new_code, rebound, used_params = _rebind_block_code(code, targets, param_key_for)
+        new_code, rebound, used_params = _rebind_block_code(code, targets, param_key_for, source_urls_by_selector)
         if not rebound:
             continue
         block["code"] = new_code

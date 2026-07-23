@@ -33,6 +33,14 @@ _MAX_CLASSIFIER_ATTEMPTS = 4
 _SOURCE_ID_PATTERN = re.compile(r"^u(?:0|[1-9][0-9]?)$")
 _PATH_SEGMENT_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _REQUEST_SLOT_PATH_PATTERN = re.compile(r"^request_slot_[0-9a-f]{48}_[0-9]{2}$")
+_DIRECT_INTERROGATIVE_CLAUSE_PATTERN = re.compile(
+    r"\bwhether\b.*?(?=\s+(?:and|or)\s+whether\b|[,;.!?]|$)",
+    re.IGNORECASE,
+)
+_DIRECT_INTERROGATIVE_TRAILING_WRAPPERS = " \t\r\n)]}\"'"
+_DATUM_ASSOCIATION_FILLER_TOKENS = frozenset(
+    {"a", "an", "the", "am", "is", "are", "was", "were", "be", "been", "being"}
+)
 
 
 class RequestSlotPlane(StrEnum):
@@ -408,6 +416,34 @@ def request_slot_source_text(request: RequestSlotProducerInputV1, slot: Canonica
     return source.text[slot.source_start : slot.source_end]
 
 
+def _datum_association_tokens(value: str) -> tuple[str, ...]:
+    leaf = value.rsplit(".", 1)[-1]
+    return tuple(
+        token for token in re.findall(r"[a-z0-9]+", leaf.casefold()) if token not in _DATUM_ASSOCIATION_FILLER_TOKENS
+    )
+
+
+def _direct_interrogative_output_anchor(
+    sources: tuple[RequestSlotSourceV1, ...],
+    target: RequestSlotDatumTargetV1,
+) -> tuple[str, str] | None:
+    target_tokens = _datum_association_tokens(target.datum_value)
+    if not target_tokens:
+        return None
+    for source in reversed(sources):
+        matches: list[str] = []
+        for clause_match in _DIRECT_INTERROGATIVE_CLAUSE_PATTERN.finditer(source.text):
+            quote = clause_match.group(0).rstrip(_DIRECT_INTERROGATIVE_TRAILING_WRAPPERS)
+            clause_tokens = _datum_association_tokens(quote[len("whether") :])
+            if clause_tokens == target_tokens:
+                matches.append(quote)
+        if len(matches) > 1:
+            raise ValueError("direct interrogative output phrase must be unique in its request source")
+        if matches:
+            return source.source_id, matches[0]
+    return None
+
+
 def canonicalize_request_slots(
     *,
     request: RequestSlotProducerInputV1,
@@ -481,7 +517,10 @@ def canonicalize_request_slots(
     seen_binding_slot_ids: set[str] = set()
     for target in request.datum_targets:
         resolution = resolution_by_identity[(target.criterion_index, target.datum_field)]
+        direct_output_anchor = _direct_interrogative_output_anchor(sources, target)
         if isinstance(resolution, RequestSlotDatumDeclineDeclarationV1):
+            if direct_output_anchor is not None:
+                raise ValueError("a directly named interrogative output datum cannot be declined")
             canonical_declines.append(
                 CanonicalRequestSlotDatumDeclineV1(
                     criterion_index=target.criterion_index,
@@ -492,6 +531,15 @@ def canonicalize_request_slots(
             )
             continue
         binding = resolution
+        if (
+            direct_output_anchor is not None
+            and (
+                binding.source_id,
+                binding.source_quote,
+            )
+            != direct_output_anchor
+        ):
+            raise ValueError("datum binding must use the exact direct interrogative output anchor")
         source = source_by_id.get(binding.source_id)
         if source is None:
             raise ValueError(f"unknown datum-binding source: {binding.source_id}")

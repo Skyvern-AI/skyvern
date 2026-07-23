@@ -122,7 +122,10 @@ def _decode_completion_criteria_set(
                 not _floor_rekeyed_association_is_coherent(item)
                 or any(
                     field in item and item[field] != canonical_value
-                    for field, canonical_value in criterion_authority_projection(criterion).items()
+                    for field, canonical_value in criterion_authority_projection(
+                        criterion,
+                        stored_item=item,
+                    ).items()
                 )
                 or ("antecedent_family" in item and item["antecedent_family"] is None)
                 for item, criterion in zip(inner, decoded)
