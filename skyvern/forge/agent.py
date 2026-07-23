@@ -1998,7 +1998,9 @@ class ForgeAgent:
                     action_result=results,
                 )
             else:
-                if action_node.next is not None:
+                # A failure that set skip_remaining_actions must not fall through to the duplicate
+                # element id, or the action it was protecting against gets replayed anyway.
+                if action_node.next is not None and (not results or not results[-1].skip_remaining_actions):
                     LOG.warning(
                         "Action failed, but have duplicated element id in the action list. Continue excuting.",
                         step_order=step.order,
