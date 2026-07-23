@@ -937,6 +937,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     discovery_entrypoint_url_question_nudge_count: int = 0
     pre_discovery_url_question_nudge_count: int = 0
+    discovery_failure_streak_this_turn: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None

@@ -449,6 +449,7 @@ RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
 DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE = "definition_contract_unsatisfied"
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE = "output_contract_reject_budget_exhausted"
+DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE = "loop_detected_discovery_exhausted_no_entry_url"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -475,6 +476,7 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
         "repair_ceiling_reached",
         METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
+        DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
 

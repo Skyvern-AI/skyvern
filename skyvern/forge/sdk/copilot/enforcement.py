@@ -28,7 +28,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     loop_blocker_evidence_from_ctx,
     stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD, DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
@@ -1261,6 +1261,11 @@ def _pre_discovery_url_question_nudge(
     if getattr(ctx, "build_phase", None) not in DISCOVERY_PERMITTED_PHASES:
         return None
     if _get_int(ctx, "discovery_calls_this_turn") != 0:
+        return None
+    if (
+        getattr(ctx, "turn_halt", None) is not None
+        or _get_int(ctx, "discovery_failure_streak_this_turn") >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD
+    ):
         return None
     request_policy = getattr(ctx, "request_policy", None)
     clarification_reason = getattr(request_policy, "clarification_reason", "none")

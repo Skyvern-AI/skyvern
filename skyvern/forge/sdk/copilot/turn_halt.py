@@ -10,6 +10,7 @@ import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
+    DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES as GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
@@ -80,6 +81,7 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
         "loop_detected_no_forward_progress_interaction",
+        DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(

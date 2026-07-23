@@ -122,6 +122,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -7360,3 +7361,27 @@ class TestDeclaredEqualsGradedCompletionCriteria:
         assert "__copilot_fallback_floor__run" not in verification.criterion_ids
         assert verification.criterion_ids == ["__copilot_authored_output_contract_missing"]
         assert not verification.is_fully_satisfied()
+
+
+def _transcript_packet(earliest_user_turn: str) -> TurnContextPacket:
+    return TurnContextPacket(
+        turn_intent_summary={},
+        transcript_context=TranscriptContext(
+            earliest_user_turn=earliest_user_turn,
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history="",
+            omitted_any=False,
+        ),
+        omissions=[],
+    )
+
+
+def test_transcript_anchor_blanked_when_retained_window_at_capacity() -> None:
+    packet = _transcript_packet("go to https://example.com/login")
+    assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES - 1) == (
+        "go to https://example.com/login"
+    )
+    assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES) == ""
+    assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES + 5) == ""
+    assert agent_module._transcript_anchor_for_turn(None, 0) == ""
