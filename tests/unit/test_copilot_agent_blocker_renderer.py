@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, DeliveredUnverifiedPublicOutputs
+from skyvern.forge.sdk.copilot.enforcement import SCOUTED_SPINE_TURN_HALT_USER_REASON
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_STEER_REASON_CODE,
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools.discovery import _build_discovery_exhausted_escape_signal
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
@@ -599,6 +601,18 @@ def test_turn_halt_exit_renders_no_forward_progress_interaction_reason() -> None
 
     assert "couldn't get past this step" in result.user_response
     assert "click" not in result.user_response
+
+
+def test_turn_halt_exit_keeps_discovery_exhaustion_ask_when_no_scouted_spine() -> None:
+    ctx = _ctx()
+    signal = _build_discovery_exhausted_escape_signal()
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == signal.user_facing_reason
+    assert result.user_response != SCOUTED_SPINE_TURN_HALT_USER_REASON
 
 
 def test_turn_halt_exit_keeps_credential_scout_reply_through_refresh_with_draft() -> None:

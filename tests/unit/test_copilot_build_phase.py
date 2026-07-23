@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from skyvern.forge.sdk.copilot.build_phase import (
@@ -13,9 +15,16 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_composing,
     advance_to_discovering,
     advance_to_testing,
+    anchor_recovers_entrypoint,
+    extract_anchor_entry_url,
     initial_build_phase,
 )
+from skyvern.forge.sdk.copilot.request_policy import build_transcript_context
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+)
 
 
 class _Ctx:
@@ -159,6 +168,166 @@ def test_initial_build_phase_returns_expected(
     expected: BuildPhase,
 ) -> None:
     assert initial_build_phase(_ti(mode), user_message, agent_message, workflow_yaml) == expected
+
+
+def test_initial_build_phase_resolves_composing_from_transcript_anchor() -> None:
+    # No this-turn URL signal, but the earliest-user-turn anchor carries the URL
+    # a prior abnormally-ended turn dropped -> COMPOSING.
+    assert (
+        initial_build_phase(
+            _ti(TurnIntentMode.BUILD),
+            "yes go ahead",
+            "yes go ahead",
+            "",
+            "go to https://example.com/login and fill it",
+        )
+        == BuildPhase.COMPOSING
+    )
+    # Sentinel anchor ("(none)") carries no URL -> INITIAL.
+    assert (
+        initial_build_phase(_ti(TurnIntentMode.BUILD), "yes go ahead", "yes go ahead", "", "(none)")
+        == BuildPhase.INITIAL
+    )
+
+
+def test_initial_build_phase_default_anchor_arg_is_back_compatible() -> None:
+    # Existing four-arg callers keep INITIAL when no this-turn URL exists.
+    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "go to example", "go to example", "") == BuildPhase.INITIAL
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("go to https://example.com/login", "https://example.com/login"),
+        ("visit https://example.com/path.", "https://example.com/path"),
+        ("(https://example.com/x)", "https://example.com/x"),
+        (
+            "open http://localhost:8942/analytics_console/houndline/?captcha=block&mfa=1",
+            "http://localhost:8942/analytics_console/houndline/?captcha=block&mfa=1",
+        ),
+        ("no url here at all", None),
+        ("(none)", None),
+        ("", None),
+        (None, None),
+        # Bare host with no dot and no port is rejected as mangled.
+        ("go to http://internalhost/path", None),
+        # A match abutting the middle-truncation marker is rejected.
+        ("prefix https://example.com/very-long-pa<…120 chars truncated…>th", None),
+        ("<…120 chars truncated…>https://example.com/tail", None),
+        ("go to https://example.com… please", None),
+        ("https://example.com/aaa…bbb", None),
+        # Markdown delimiters wrapping a URL are stripped, not adopted into the path.
+        (
+            "use `http://localhost:8945/analytics_console/houndline/`",
+            "http://localhost:8945/analytics_console/houndline/",
+        ),
+        ("bold *http://localhost:8945/x* here", "http://localhost:8945/x"),
+        ("under _http://localhost:8945/y_ end", "http://localhost:8945/y"),
+        ("tilde ~http://localhost:8945/z~ end", "http://localhost:8945/z"),
+        # A bare trailing wrapper char that is a legal URL character is preserved when the URL is not wrapped.
+        ("data at http://localhost:8945/path_bar_ end", "http://localhost:8945/path_bar_"),
+        # A markdown-wrapped URL is unwrapped while its internal underscore stays intact.
+        ("emphasis _http://localhost:8945/foo_bar_ done", "http://localhost:8945/foo_bar"),
+    ],
+)
+def test_extract_anchor_entry_url(text: str | None, expected: str | None) -> None:
+    assert extract_anchor_entry_url(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "http://localhost:abc",
+        "go to http://example.com:999999/x",
+        "visit http://localhost:70000",
+    ],
+)
+def test_extract_anchor_entry_url_malformed_port_returns_none(text: str) -> None:
+    assert extract_anchor_entry_url(text) is None
+
+
+_FIXTURE_ENTRYPOINT_URL = "http://localhost:8942/analytics_console/houndline/?captcha=block&mfa=1"
+
+
+def _history_message(sender: WorkflowCopilotChatSender, content: str) -> WorkflowCopilotChatHistoryMessage:
+    return WorkflowCopilotChatHistoryMessage(
+        sender=sender, content=content, created_at=datetime(2026, 7, 23, tzinfo=timezone.utc)
+    )
+
+
+def test_two_turn_bare_answer_recovers_entrypoint_from_earliest_user_turn() -> None:
+    messages = [
+        _history_message(WorkflowCopilotChatSender.USER, f"Build me a workflow at {_FIXTURE_ENTRYPOINT_URL}"),
+        _history_message(WorkflowCopilotChatSender.AI, "Which page should I start on?"),
+    ]
+    transcript = build_transcript_context(messages, "yes go ahead")
+    anchor = transcript.earliest_user_turn
+
+    assert (
+        initial_build_phase(_ti(TurnIntentMode.BUILD), "yes go ahead", "yes go ahead", "", anchor)
+        == BuildPhase.COMPOSING
+    )
+    assert (
+        anchor_recovers_entrypoint(_ti(TurnIntentMode.BUILD), "yes go ahead", "yes go ahead", "", anchor)
+        == _FIXTURE_ENTRYPOINT_URL
+    )
+
+
+def test_anchor_recovery_defers_to_in_turn_url_signal() -> None:
+    assert (
+        anchor_recovers_entrypoint(
+            _ti(TurnIntentMode.BUILD),
+            "actually go to https://fresh.example/now",
+            "",
+            "",
+            "earlier: https://stale.example/old",
+        )
+        is None
+    )
+
+
+def test_anchor_recovery_defers_to_in_turn_yaml_url() -> None:
+    yaml_with_url = """
+title: T
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open
+      url: https://fresh.example/page
+"""
+    assert (
+        anchor_recovers_entrypoint(
+            _ti(TurnIntentMode.BUILD), "run it", "run it", yaml_with_url, "earlier: https://stale.example/old"
+        )
+        is None
+    )
+
+
+def test_anchor_recovery_skips_non_build_modes() -> None:
+    assert (
+        anchor_recovers_entrypoint(_ti(TurnIntentMode.EDIT), "tweak it", "tweak it", "", _FIXTURE_ENTRYPOINT_URL)
+        is None
+    )
+
+
+def test_anchor_recovery_none_without_anchor_url() -> None:
+    assert anchor_recovers_entrypoint(_ti(TurnIntentMode.BUILD), "yes", "yes", "", "(none)") is None
+
+
+def test_anchor_recovery_adopts_earliest_url_on_url_less_corrective_pivot() -> None:
+    # Ceiling: a URL-less corrective pivot carries no in-turn signal, so the
+    # earliest-turn anchor still resolves — the pivot cannot retarget without a URL.
+    assert (
+        anchor_recovers_entrypoint(
+            _ti(TurnIntentMode.BUILD),
+            "no, do the reporting flow instead",
+            "no, do the reporting flow instead",
+            "",
+            f"Build me a workflow at {_FIXTURE_ENTRYPOINT_URL}",
+        )
+        == _FIXTURE_ENTRYPOINT_URL
+    )
 
 
 def test_initial_build_phase_none_turn_intent_acts_like_unknown_mode() -> None:

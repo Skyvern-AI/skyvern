@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD, BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES,
@@ -139,6 +139,18 @@ def test_no_nudge_for_non_ask_question() -> None:
     ctx = _Ctx()
     reply = {"type": "REPLY", "user_response": "Please provide the URL to start from."}
     assert _pre_discovery_url_question_nudge(ctx, reply) is None
+
+
+def test_no_nudge_after_discovery_failure_escape() -> None:
+    ctx = _Ctx()
+    ctx.discovery_failure_streak_this_turn = DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD
+    assert _pre_discovery_url_question_nudge(ctx, _URL_ASK) is None
+
+
+def test_no_nudge_when_turn_halt_stashed() -> None:
+    ctx = _Ctx()
+    ctx.turn_halt = object()
+    assert _pre_discovery_url_question_nudge(ctx, _URL_ASK) is None
 
 
 # ---------------------------------------------------------------------------
