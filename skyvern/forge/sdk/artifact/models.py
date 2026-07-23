@@ -27,6 +27,7 @@ class ArtifactType(StrEnum):
     SCREENSHOT_LLM = "screenshot_llm"
     SCREENSHOT_ACTION = "screenshot_action"
     SCREENSHOT_FINAL = "screenshot_final"
+    SCREENSHOT_PROXY = "screenshot_proxy"
 
     LLM_PROMPT = "llm_prompt"
     LLM_REQUEST = "llm_request"
