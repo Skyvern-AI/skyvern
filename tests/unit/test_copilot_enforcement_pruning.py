@@ -24,8 +24,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    PostRunPagePathFailure,
+    PostRunPagePathTarget,
     RecordedBuildTestOutcome,
+    _post_run_page_path_failure,
     author_time_reject_missing_output_paths,
+    bind_post_run_page_path_failure,
     recorded_outcome_from_author_time_reject,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
@@ -70,6 +74,8 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     _POST_HOOK_CONTEXT_ROLLBACK_FIELDS,
+    SchemaOverlay,
+    SkyvernOverlayMCPServer,
     _restore_post_hook_context,
     _snapshot_post_hook_context,
 )
@@ -85,13 +91,18 @@ from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from
 from skyvern.forge.sdk.copilot.tools import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _analyze_run_blocks,
+    _click_post_hook,
     _is_meaningful_extracted_data,
+    _press_key_post_hook,
     _record_run_blocks_result,
     _record_workflow_update_result,
+    mcp_hooks,
 )
+from skyvern.forge.sdk.copilot.tools.page_observation import _record_composition_page_observation
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _MAX_SCOUTED_INTERACTIONS,
     _capped_with_eviction_accounting,
+    _mark_post_run_page_observed,
     _record_scout_page_observation,
 )
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
@@ -153,11 +164,20 @@ class _Ctx:
         self.scout_observed_terminal_criterion_ids: set[str] = set()
         self.scout_observation_contract: object | None = None
         self.flow_evidence: list[dict[str, object]] = []
+        self.composition_page_evidence = None
         self.copilot_config: CopilotConfig | None = None
         self.uncovered_output_rescout_context_key = None
         self.uncovered_output_rescout_steer_key = None
         self.latest_recorded_build_test_outcome = None
         self.last_run_blocks_workflow_run_id = None
+        self.post_run_page_observation_tool = None
+        self.post_run_page_observation_url = None
+        self.post_run_page_observation_workflow_run_id = None
+        self.post_run_page_observation_after_failed_test = False
+        self.post_run_page_observation_generation = 0
+        self.post_run_page_path_interaction_window = None
+        self.workflow_yaml = ""
+        self.workflow_verification_evidence = WorkflowVerificationEvidence()
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
         self.author_time_gate_log_only_ids: frozenset[str] = frozenset()
@@ -768,6 +788,939 @@ class TestSynthesizedOfferPersistenceGate:
         assert update_signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
         assert synthesized_block_persistence_signal(ctx, "update_and_run_blocks") is None
         assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def _post_run_page_path_ctx(
+        self,
+        *,
+        workflow_run_id: str = "wr_129160000000000001",
+        structural_failure_identity: str = "completion:page-path",
+        trajectory: list[dict[str, object]] | None = None,
+        page_path_failure: PostRunPagePathFailure | None = None,
+    ) -> _Ctx:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.completion_verification_result = self._unsatisfied_verification()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id=workflow_run_id,
+            structural_failure_identity=structural_failure_identity,
+            page_path_failure=page_path_failure
+            or PostRunPagePathFailure(
+                kind="challenge",
+                workflow_run_id=workflow_run_id,
+                current_url="https://example.test/challenge",
+                continuation_targets=[
+                    PostRunPagePathTarget(kind="challenge", selector="#continue"),
+                    PostRunPagePathTarget(kind="challenge", selector="#token"),
+                    PostRunPagePathTarget(kind="challenge", selector="#missing"),
+                ],
+                enter_allowed=True,
+            ),
+        )
+        ctx.last_run_blocks_workflow_run_id = workflow_run_id
+        ctx.post_run_page_observation_tool = "evaluate"
+        ctx.post_run_page_observation_url = "https://example.test/challenge"
+        ctx.post_run_page_observation_workflow_run_id = workflow_run_id
+        ctx.post_run_page_observation_after_failed_test = True
+        ctx.post_run_page_observation_generation = 1
+        ctx.scout_trajectory = trajectory or []
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_post_run_page_path_admission_uses_existing_hooks_to_record_click_and_enter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def no_role_name(*_args: object, **_kwargs: object) -> tuple[str, str]:
+            return "", ""
+
+        async def no_observation(*_args: object, **_kwargs: object) -> tuple[None, None]:
+            return None, None
+
+        monkeypatch.setattr(mcp_hooks, "_resolve_scout_role_name", no_role_name)
+        monkeypatch.setattr(mcp_hooks, "_register_scout_interaction_observation", no_observation)
+        ctx = make_copilot_context()
+        qualified = self._post_run_page_path_ctx()
+        for field in (
+            "turn_intent",
+            "block_authoring_policy",
+            "completion_verification_result",
+            "latest_recorded_build_test_outcome",
+            "last_run_blocks_workflow_run_id",
+            "post_run_page_observation_tool",
+            "post_run_page_observation_url",
+            "post_run_page_observation_workflow_run_id",
+            "post_run_page_observation_after_failed_test",
+        ):
+            setattr(ctx, field, getattr(qualified, field))
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}) is None
+        ctx.pending_scout_source_url = "https://example.test/challenge"
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#continue"}},
+            {"browser_context": {"url": "https://example.test/mfa", "title": "MFA"}},
+            ctx,
+        )
+        assert [(item["tool_name"], item["trajectory_index"]) for item in ctx.scout_trajectory] == [("click", 0)]
+
+        enter_ctx = make_copilot_context()
+        qualified = self._post_run_page_path_ctx()
+        for field in (
+            "turn_intent",
+            "block_authoring_policy",
+            "completion_verification_result",
+            "latest_recorded_build_test_outcome",
+            "last_run_blocks_workflow_run_id",
+            "post_run_page_observation_tool",
+            "post_run_page_observation_url",
+            "post_run_page_observation_workflow_run_id",
+            "post_run_page_observation_after_failed_test",
+            "post_run_page_observation_generation",
+        ):
+            setattr(enter_ctx, field, getattr(qualified, field))
+        assert (
+            synthesized_block_persistence_signal(
+                enter_ctx,
+                "press_key",
+                {"key": "Enter", "selector": "#token"},
+            )
+            is None
+        )
+        enter_ctx.pending_scout_source_url = "https://example.test/challenge"
+        await _press_key_post_hook(
+            {"ok": True, "data": {"selector": "#token", "key": "Enter"}},
+            {"browser_context": {"url": "https://example.test/dashboard", "title": "Dashboard"}},
+            enter_ctx,
+        )
+        assert [(item["tool_name"], item["trajectory_index"]) for item in enter_ctx.scout_trajectory] == [
+            ("press_key", 0)
+        ]
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION in ctx.turn_ownership.claims
+        assert enter_ctx.turn_ownership is not None
+        assert TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION in enter_ctx.turn_ownership.claims
+        assert isinstance(
+            synthesized_block_persistence_signal(ctx, "click", {"selector": "#unrelated"}),
+            CopilotToolBlockerSignal,
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_run_page_path_admission_precedes_only_matching_current_page_challenge_action(
+        self,
+    ) -> None:
+        class RawResult:
+            structured_content = {"ok": True, "data": {"selector": "#continue"}}
+            is_error = False
+            content: list[object] = []
+
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                raise_on_error: bool = False,
+            ) -> RawResult:
+                self.calls.append((name, arguments))
+                return RawResult()
+
+        def challenge_ctx() -> Any:
+            ctx = make_copilot_context()
+            qualified = self._post_run_page_path_ctx()
+            for field in (
+                "turn_intent",
+                "block_authoring_policy",
+                "completion_verification_result",
+                "latest_recorded_build_test_outcome",
+                "last_run_blocks_workflow_run_id",
+                "post_run_page_observation_tool",
+                "post_run_page_observation_url",
+                "post_run_page_observation_workflow_run_id",
+                "post_run_page_observation_after_failed_test",
+                "post_run_page_observation_generation",
+            ):
+                setattr(ctx, field, getattr(qualified, field))
+            ctx.composition_page_evidence = {
+                "observed_after_workflow_run": True,
+                "workflow_run_id": "wr_129160000000000001",
+                "challenge_state": {
+                    "detected": True,
+                    "kind": "verification",
+                    "requires_human_verification": True,
+                    "gates_submit_controls": True,
+                },
+                "challenge_controls": [{"selector": "#continue", "interactive": True}],
+            }
+            return ctx
+
+        admitted_ctx = challenge_ctx()
+        admitted_client = RecordingClient()
+        admitted_server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay()},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: admitted_ctx,
+        )
+        admitted_server._client = admitted_client
+
+        admitted = await admitted_server.call_tool("click", {"selector": "#continue"})
+
+        assert admitted.isError is False
+        assert admitted_client.calls == [("click", {"selector": "#continue"})]
+        assert admitted_ctx.turn_halt is None
+
+        blocked_ctx = challenge_ctx()
+        blocked_client = RecordingClient()
+        blocked_server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay()},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: blocked_ctx,
+        )
+        blocked_server._client = blocked_client
+
+        blocked = await blocked_server.call_tool("click", {"selector": "#unrelated"})
+
+        assert blocked.isError is True
+        assert blocked_client.calls == []
+        assert blocked_ctx.turn_halt is not None
+
+        terminal_ctx = challenge_ctx()
+        terminal_signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="The current page is a terminal challenge.",
+            user_facing_reason="I could not continue past the site challenge.",
+            recovery_hint="report_blocker_to_user",
+            cleared_by_tools=frozenset(),
+            preserves_workflow_draft=True,
+            renders_final_reply=True,
+            internal_reason_code="probable_site_block_stop",
+            blocked_tool="click",
+        )
+        assert stash_turn_halt_from_blocker_signal(terminal_ctx, terminal_signal, source="test") is not None
+        terminal_client = RecordingClient()
+        terminal_server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay()},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: terminal_ctx,
+        )
+        terminal_server._client = terminal_client
+
+        terminal = await terminal_server.call_tool("click", {"selector": "#continue"})
+
+        assert terminal.isError is True
+        assert terminal_client.calls == []
+        assert terminal_ctx.turn_halt.blocker_signal == terminal_signal
+        assert terminal_ctx.post_run_page_path_interaction_window is None
+
+    @pytest.mark.asyncio
+    async def test_post_run_page_path_pre_hook_rejection_does_not_spend_admission_budget(self) -> None:
+        class RecordingClient:
+            calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                raise_on_error: bool = False,
+            ) -> None:
+                self.calls.append((name, arguments))
+
+        async def reject_before_dispatch(
+            _arguments: dict[str, Any],
+            _ctx: Any,
+        ) -> dict[str, object]:
+            return {"ok": False, "error": "pre-dispatch rejection"}
+
+        ctx = make_copilot_context()
+        qualified = self._post_run_page_path_ctx()
+        for field in (
+            "turn_intent",
+            "block_authoring_policy",
+            "completion_verification_result",
+            "latest_recorded_build_test_outcome",
+            "last_run_blocks_workflow_run_id",
+            "post_run_page_observation_tool",
+            "post_run_page_observation_url",
+            "post_run_page_observation_workflow_run_id",
+            "post_run_page_observation_after_failed_test",
+            "post_run_page_observation_generation",
+        ):
+            setattr(ctx, field, getattr(qualified, field))
+        client = RecordingClient()
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay(pre_hook=reject_before_dispatch)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = client
+
+        result = await server.call_tool("click", {"selector": "#continue"})
+
+        assert result.isError is True
+        assert client.calls == []
+        assert ctx.post_run_page_path_interaction_window is None
+
+    def test_post_run_page_path_admission_requires_typed_page_path_failure_contract(self) -> None:
+        ctx = self._post_run_page_path_ctx(
+            page_path_failure=PostRunPagePathFailure(
+                kind="non_page_outcome",
+                workflow_run_id="wr_129160000000000001",
+                current_url="https://example.test/challenge",
+                continuation_targets=[],
+                enter_allowed=False,
+            )
+        )
+        expected_ctx = self._post_run_page_path_ctx()
+        expected_ctx.post_run_page_observation_after_failed_test = False
+        expected = synthesized_block_persistence_signal(expected_ctx, "click", {"selector": "#continue"})
+
+        blocked = synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"})
+
+        assert isinstance(expected, CopilotToolBlockerSignal)
+        assert isinstance(blocked, CopilotToolBlockerSignal)
+        assert blocked.model_dump() == expected.model_dump()
+        assert ctx.post_run_page_path_interaction_window is None
+
+    def test_post_run_page_path_contract_mints_only_structured_current_page_continuations(self) -> None:
+        run_id = "wr_129160000000000001"
+        base_evidence = {
+            "workflow_run_id": run_id,
+            "observed_after_workflow_run": True,
+            "current_url": "https://example.test/login",
+            "forms": [
+                {
+                    "fields": [{"type": "password", "selector": "#password"}],
+                    "submit_controls": [{"type": "submit", "selector": "#continue"}],
+                }
+            ],
+        }
+
+        page_path = _post_run_page_path_failure(base_evidence, run_id)
+        non_page = _post_run_page_path_failure(
+            {
+                **base_evidence,
+                "forms": [],
+                "navigation_targets": [{"selector": "#settings"}],
+                "result_containers": [{"selector": "#results"}],
+            },
+            run_id,
+        )
+
+        assert page_path is not None
+        assert page_path.kind == "login"
+        assert page_path.continuation_targets == (PostRunPagePathTarget(kind="form_submit", selector="#continue"),)
+        assert page_path.enter_allowed is True
+        assert non_page is not None
+        assert non_page.kind == "non_page_outcome"
+        assert non_page.continuation_targets == ()
+
+    def test_post_run_page_path_contract_mints_only_structural_password_form_submits(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/login",
+                "forms": [
+                    {
+                        "fields": [{"type": "password", "selector": "#password"}],
+                        "submit_controls": [
+                            {"type": "submit", "text": "Sign in", "selector": "#sign-in"},
+                            {"type": "button", "text": "Delete account", "selector": "#delete-account"},
+                            {"type": "button", "text": "Cancel", "selector": "#cancel"},
+                        ],
+                    }
+                ],
+            },
+            run_id,
+        )
+
+        assert condition is not None
+        assert condition.kind == "login"
+        assert condition.continuation_targets == (PostRunPagePathTarget(kind="form_submit", selector="#sign-in"),)
+        assert condition.enter_allowed is True
+
+    def test_post_run_page_path_contract_requires_explicit_navigation_and_challenge_association(self) -> None:
+        run_id = "wr_129160000000000001"
+        base_evidence = {
+            "workflow_run_id": run_id,
+            "observed_after_workflow_run": True,
+            "current_url": "https://example.test/interstitial",
+            "forms": [
+                {
+                    "fields": [{"type": "search", "selector": "#query"}],
+                    "submit_controls": [{"selector": "#delete"}],
+                }
+            ],
+            "clickable_controls": [{"selector": "#delete"}],
+            "navigation_targets": [
+                {"selector": "#settings", "href": "https://example.test/settings"},
+                {"selector": "#continue", "href": "https://example.test/report"},
+            ],
+            "challenge_state": {
+                "detected": True,
+                "gates_submit_controls": False,
+                "gated_submit_controls": [],
+            },
+        }
+
+        unrelated = _post_run_page_path_failure(base_evidence, run_id)
+        navigation = _post_run_page_path_failure(
+            base_evidence,
+            run_id,
+            required_target_url="https://example.test/report",
+        )
+
+        assert unrelated is not None
+        assert unrelated.kind == "non_page_outcome"
+        assert unrelated.continuation_targets == ()
+        assert navigation is not None
+        assert navigation.kind == "incomplete_navigation"
+        assert navigation.continuation_targets == (PostRunPagePathTarget(kind="navigation", selector="#continue"),)
+
+    def test_post_run_page_path_contract_distinguishes_hash_route_navigation_targets(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/app#/login",
+                "navigation_targets": [
+                    {"selector": "#settings", "href": "https://example.test/app#/settings"},
+                    {"selector": "#delete", "href": "https://example.test/app#/delete"},
+                ],
+            },
+            run_id,
+            required_target_url="https://example.test/app#/settings",
+        )
+
+        assert condition is not None
+        assert condition.kind == "incomplete_navigation"
+        assert condition.continuation_targets == (PostRunPagePathTarget(kind="navigation", selector="#settings"),)
+
+    def test_post_run_page_path_contract_excludes_unrelated_form_submit_from_challenge(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/challenge",
+                "forms": [{"submit_controls": [{"selector": "#newsletter"}]}],
+                "challenge_state": {
+                    "detected": True,
+                    "gates_submit_controls": True,
+                    "gated_submit_controls": [{"selector": "#continue"}],
+                },
+            },
+            run_id,
+        )
+
+        assert condition is not None
+        assert condition.kind == "challenge"
+        assert condition.continuation_targets == (PostRunPagePathTarget(kind="challenge", selector="#continue"),)
+
+    def test_post_run_page_path_contract_does_not_bind_selectorless_label_to_form_control(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/challenge",
+                "forms": [
+                    {
+                        "submit_controls": [
+                            {"text": "Delete account", "selector": "#delete-account"},
+                            {"text": "Subscribe", "selector": "#newsletter"},
+                        ]
+                    }
+                ],
+                "challenge_state": {
+                    "detected": True,
+                    "gates_submit_controls": True,
+                    "gated_submit_controls": [{"text": "Delete account", "disabled": True}],
+                },
+            },
+            run_id,
+        )
+
+        assert condition is not None
+        assert condition.kind == "non_page_outcome"
+        assert condition.continuation_targets == ()
+
+    def test_post_run_page_path_contract_keeps_structurally_proven_challenge_descendants_only(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/challenge",
+                "challenge_controls": [
+                    {"tag": "div", "selector": "div", "text": "Login confirmation challenge"},
+                    {"tag": "input", "type": "checkbox", "selector": "#notRobot", "checked": False},
+                    {"tag": "input", "type": "checkbox", "selector": "#alreadyChecked", "checked": True},
+                    {"tag": "button", "type": "submit", "selector": "button.btn-primary", "text": "Continue"},
+                    {"tag": "button", "selector": "button.goback", "text": "Go back to login"},
+                    {"tag": "button", "selector": "#delete", "text": "Delete account"},
+                    {"tag": "button", "selector": "#disabled", "text": "Verify", "disabled": True},
+                    {"tag": "a", "selector": "#privacy", "text": "Privacy policy"},
+                    {"tag": "textarea", "selector": "#notes", "text": "Notes"},
+                ],
+                "challenge_state": {
+                    "detected": True,
+                    "gates_submit_controls": False,
+                    "gated_submit_controls": [],
+                },
+            },
+            run_id,
+        )
+
+        assert condition is not None
+        assert condition.kind == "challenge"
+        assert condition.continuation_targets == (
+            PostRunPagePathTarget(kind="challenge", selector="#notRobot"),
+            PostRunPagePathTarget(kind="challenge", selector="button.btn-primary"),
+        )
+
+    def test_post_run_page_path_contract_does_not_admit_lone_destructive_challenge_control(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/challenge",
+                "challenge_controls": [
+                    {"tag": "div", "selector": "#challenge-carrier"},
+                    {"tag": "button", "selector": "#zurueck", "text": "Zurück zur Anmeldung"},
+                ],
+                "challenge_state": {
+                    "detected": True,
+                    "gates_submit_controls": False,
+                    "gated_submit_controls": [],
+                },
+            },
+            run_id,
+        )
+
+        assert condition is not None
+        assert condition.kind == "non_page_outcome"
+        assert condition.continuation_targets == ()
+
+    def test_post_run_page_path_contract_rejects_ambiguous_loose_challenge_buttons(self) -> None:
+        run_id = "wr_129160000000000001"
+        condition = _post_run_page_path_failure(
+            {
+                "workflow_run_id": run_id,
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/challenge",
+                "challenge_controls": [
+                    {"tag": "div", "selector": "#challenge-carrier"},
+                    {"tag": "button", "selector": "#weiter", "text": "Weiter"},
+                    {"tag": "button", "selector": "#bestaetigen", "text": "Bestätigen"},
+                ],
+                "challenge_state": {
+                    "detected": True,
+                    "gates_submit_controls": False,
+                    "gated_submit_controls": [],
+                },
+            },
+            run_id,
+        )
+
+        assert condition is not None
+        assert condition.kind == "non_page_outcome"
+        assert condition.continuation_targets == ()
+
+    def test_post_run_page_path_contract_does_not_change_structural_identity_across_runs(self) -> None:
+        def outcome(run_id: str) -> RecordedBuildTestOutcome:
+            return RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id=run_id,
+                structural_failure_identity="completion:page-path",
+                page_path_failure=PostRunPagePathFailure(
+                    kind="challenge",
+                    workflow_run_id=run_id,
+                    current_url=f"https://example.test/challenge?run={run_id}",
+                    continuation_targets=[PostRunPagePathTarget(kind="challenge", selector="#continue")],
+                ),
+            )
+
+        assert outcome("wr_129160000000000001").structural_key == outcome("wr_129160000000000002").structural_key
+
+    def test_post_run_observation_binds_typed_failure_to_existing_authoritative_outcome(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+        ctx.latest_recorded_build_test_outcome = ctx.latest_recorded_build_test_outcome.model_copy(
+            update={"page_path_failure": None}
+        )
+        ctx.last_test_ok = True
+        ctx.post_run_page_observation_generation = 0
+        page_evidence = {
+            "workflow_run_id": "wr_129160000000000001",
+            "observed_after_workflow_run": True,
+            "current_url": "https://example.test/challenge",
+            "challenge_state": {
+                "detected": True,
+                "gates_submit_controls": True,
+                "gated_submit_controls": [{"selector": "#continue"}],
+            },
+        }
+
+        _mark_post_run_page_observed(
+            ctx,
+            source_tool="inspect_page_for_composition",
+            url="https://example.test/challenge",
+            page_evidence=page_evidence,
+        )
+
+        assert ctx.post_run_page_observation_generation == 1
+        assert ctx.latest_recorded_build_test_outcome.page_path_failure == PostRunPagePathFailure(
+            kind="challenge",
+            workflow_run_id="wr_129160000000000001",
+            current_url="https://example.test/challenge",
+            continuation_targets=[PostRunPagePathTarget(kind="challenge", selector="#continue")],
+            enter_allowed=True,
+        )
+        assert ctx.post_run_page_observation_after_failed_test is True
+
+    def test_post_run_page_path_binding_replaces_stale_target_with_fresh_page_contract(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        bind_post_run_page_path_failure(
+            ctx,
+            {
+                "workflow_run_id": "wr_129160000000000001",
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/mfa",
+                "forms": [
+                    {
+                        "fields": [{"type": "password", "selector": "#token"}],
+                        "submit_controls": [{"type": "submit", "selector": "#verify"}],
+                    }
+                ],
+            },
+        )
+
+        condition = ctx.latest_recorded_build_test_outcome.page_path_failure
+        assert condition is not None
+        assert condition.current_url == "https://example.test/mfa"
+        assert condition.continuation_targets == (PostRunPagePathTarget(kind="form_submit", selector="#verify"),)
+
+    def test_schema_empty_screenshot_does_not_replace_post_run_page_path_contract(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+        original = ctx.latest_recorded_build_test_outcome.page_path_failure
+
+        _record_composition_page_observation(
+            ctx,
+            source_tool="get_browser_screenshot",
+            url="https://example.test/challenge",
+            title="Challenge",
+        )
+
+        assert ctx.latest_recorded_build_test_outcome.page_path_failure == original
+        assert ctx.post_run_page_observation_generation == 1
+
+    def test_post_run_page_path_admission_rejects_non_page_verification_failure(self) -> None:
+        ctx = self._post_run_page_path_ctx(page_path_failure=None)
+        ctx.latest_recorded_build_test_outcome = ctx.latest_recorded_build_test_outcome.model_copy(
+            update={"page_path_failure": None}
+        )
+
+        blocked = synthesized_block_persistence_signal(ctx, "press_key", {"key": "Enter", "selector": "#continue"})
+
+        assert isinstance(blocked, CopilotToolBlockerSignal)
+        assert blocked.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert ctx.post_run_page_path_interaction_window is None
+
+    def test_post_run_page_path_admission_requires_current_page_contract_url(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+        ctx.post_run_page_observation_url = "https://example.test/other"
+
+        blocked = synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"})
+
+        assert isinstance(blocked, CopilotToolBlockerSignal)
+        assert blocked.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert ctx.post_run_page_path_interaction_window is None
+
+    def test_post_run_page_path_admission_rejects_click_outside_recorded_continuation(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        for arguments in (
+            None,
+            {},
+            {"selector": ""},
+            {"selector": "#unrelated"},
+            {"selector": "button:contains('Continue')"},
+        ):
+            blocked = synthesized_block_persistence_signal(ctx, "click", arguments)
+            assert isinstance(blocked, CopilotToolBlockerSignal)
+
+        assert ctx.post_run_page_path_interaction_window is None
+
+    def test_post_run_page_path_admission_rejects_blast_radius_sibling_without_contract(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+        ctx.latest_recorded_build_test_outcome = ctx.latest_recorded_build_test_outcome.model_copy(
+            update={"page_path_failure": None}
+        )
+
+        for tool_name, arguments in (("click", {"selector": "#continue"}), ("press_key", {"key": "Enter"})):
+            blocked = synthesized_block_persistence_signal(ctx, tool_name, arguments)
+            assert isinstance(blocked, CopilotToolBlockerSignal)
+            assert blocked.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_post_run_page_path_invalid_click_does_not_spend_admission_budget(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        blocked = synthesized_block_persistence_signal(ctx, "click", {"selector": "#not-recorded"})
+
+        assert isinstance(blocked, CopilotToolBlockerSignal)
+        assert ctx.post_run_page_path_interaction_window is None
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}) is None
+        assert ctx.post_run_page_path_interaction_window.admitted_attempts == 1
+
+    def test_post_run_page_path_admission_is_same_run_and_argument_exact(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}) is None
+        assert (
+            synthesized_block_persistence_signal(
+                ctx,
+                "press_key",
+                {"key": "Enter", "selector": "#token"},
+            )
+            is None
+        )
+        assert ctx.post_run_page_path_interaction_window.admitted_attempts == 2
+        for malformed in (
+            None,
+            {},
+            {"key": "Enter"},
+            {"key": "enter", "selector": "#token"},
+            {"key": " Enter ", "selector": "#token"},
+            {"key": 1, "selector": "#token"},
+            {"key": "Enter", "selector": "#unrelated"},
+        ):
+            assert isinstance(
+                synthesized_block_persistence_signal(ctx, "press_key", malformed),
+                CopilotToolBlockerSignal,
+            )
+        assert isinstance(
+            synthesized_block_persistence_signal(ctx, "type_text", {"selector": "#token", "text": "123456"}),
+            CopilotToolBlockerSignal,
+        )
+
+        ctx.post_run_page_observation_workflow_run_id = "wr_129160000000000099"
+        assert isinstance(
+            synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}),
+            CopilotToolBlockerSignal,
+        )
+
+        ctx = self._post_run_page_path_ctx()
+        ctx.latest_recorded_build_test_outcome = ctx.latest_recorded_build_test_outcome.model_copy(
+            update={"workflow_run_id": None}
+        )
+        assert isinstance(
+            synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}),
+            CopilotToolBlockerSignal,
+        )
+        assert ctx.post_run_page_path_interaction_window is None
+
+    def test_post_run_page_path_window_anchors_after_stale_trajectory(self) -> None:
+        stale_reached_trajectory = [
+            {"tool_name": "click", "selector": "#open", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit", "trajectory_index": 4},
+        ]
+        ctx = self._post_run_page_path_ctx(trajectory=stale_reached_trajectory)
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}) is None
+        assert ctx.post_run_page_path_interaction_window.trajectory_anchor == 4
+        assert ctx.post_run_page_path_interaction_window.admitted_attempts == 1
+
+    def test_post_run_page_path_success_requires_fresh_observation_and_closes_on_completed_page(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}) is None
+        ctx.scout_trajectory.append(
+            {
+                "tool_name": "click",
+                "selector": "#continue",
+                "source_url": "https://example.test/challenge",
+                "trajectory_index": 0,
+            }
+        )
+        expected_ctx = self._post_run_page_path_ctx()
+        expected_ctx.post_run_page_observation_after_failed_test = False
+        expected = synthesized_block_persistence_signal(expected_ctx, "click", {"selector": "#continue"})
+
+        stale = synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"})
+
+        assert isinstance(expected, CopilotToolBlockerSignal)
+        assert isinstance(stale, CopilotToolBlockerSignal)
+        assert stale.model_dump() == expected.model_dump()
+
+        ctx.last_test_ok = False
+        _mark_post_run_page_observed(
+            ctx,
+            source_tool="evaluate",
+            url="https://example.test/dashboard",
+            page_evidence={
+                "workflow_run_id": "wr_129160000000000001",
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/dashboard",
+                "result_containers": [{"selector": "#results"}],
+            },
+        )
+
+        completed = synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"})
+        assert isinstance(completed, CopilotToolBlockerSignal)
+        assert completed.model_dump() == expected.model_dump()
+
+    def test_post_run_page_path_fresh_observation_supports_three_steps_without_resetting_budget(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}) is None
+        ctx.scout_trajectory.append(
+            {
+                "tool_name": "click",
+                "selector": "#continue",
+                "source_url": "https://example.test/challenge",
+                "trajectory_index": 0,
+            }
+        )
+        ctx.last_test_ok = False
+        _mark_post_run_page_observed(
+            ctx,
+            source_tool="evaluate",
+            url="https://example.test/mfa",
+            page_evidence={
+                "workflow_run_id": "wr_129160000000000001",
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/mfa",
+                "forms": [
+                    {
+                        "fields": [{"type": "password", "selector": "#token"}],
+                        "submit_controls": [{"type": "submit", "selector": "#verify"}],
+                    }
+                ],
+            },
+        )
+
+        assert isinstance(
+            synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"}),
+            CopilotToolBlockerSignal,
+        )
+        assert (
+            synthesized_block_persistence_signal(
+                ctx,
+                "press_key",
+                {"key": "Enter", "selector": "#verify"},
+            )
+            is None
+        )
+        assert ctx.post_run_page_path_interaction_window.admitted_attempts == 2
+        ctx.scout_trajectory.append(
+            {
+                "tool_name": "press_key",
+                "selector": "#verify",
+                "key": "Enter",
+                "source_url": "https://example.test/mfa",
+                "trajectory_index": 1,
+            }
+        )
+        _mark_post_run_page_observed(
+            ctx,
+            source_tool="inspect_page_for_composition",
+            url="https://example.test/confirmation",
+            page_evidence={
+                "workflow_run_id": "wr_129160000000000001",
+                "observed_after_workflow_run": True,
+                "current_url": "https://example.test/confirmation",
+                "challenge_state": {
+                    "detected": True,
+                    "gates_submit_controls": True,
+                    "gated_submit_controls": [{"selector": "#confirm"}],
+                },
+            },
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#confirm"}) is None
+        assert ctx.post_run_page_path_interaction_window.admitted_attempts == 3
+
+    def test_post_run_page_path_window_charges_failed_attempts_and_resets_for_new_identity(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+
+        for _ in range(4):
+            assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#missing"}) is None
+        expected_blocker_ctx = self._post_run_page_path_ctx()
+        expected_blocker_ctx.post_run_page_observation_after_failed_test = False
+        expected = synthesized_block_persistence_signal(expected_blocker_ctx, "click", {"selector": "#missing"})
+        exhausted = synthesized_block_persistence_signal(ctx, "click", {"selector": "#missing"})
+        assert isinstance(expected, CopilotToolBlockerSignal)
+        assert isinstance(exhausted, CopilotToolBlockerSignal)
+        assert exhausted.model_dump() == expected.model_dump()
+
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_129160000000000002",
+            structural_failure_identity="completion:new-page-path",
+            page_path_failure=PostRunPagePathFailure(
+                kind="incomplete_navigation",
+                workflow_run_id="wr_129160000000000002",
+                current_url="https://example.test/challenge",
+                continuation_targets=[
+                    PostRunPagePathTarget(kind="navigation", selector="#missing"),
+                ],
+            ),
+        )
+        ctx.last_run_blocks_workflow_run_id = "wr_129160000000000002"
+        ctx.post_run_page_observation_workflow_run_id = "wr_129160000000000002"
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": f"#evicted-{index}", "trajectory_index": index}
+            for index in range(80, 100)
+        ]
+        for _ in range(4):
+            assert synthesized_block_persistence_signal(ctx, "click", {"selector": "#missing"}) is None
+        assert ctx.post_run_page_path_interaction_window.trajectory_anchor == 99
+
+    def test_post_run_page_path_admission_yields_to_terminal_owner_without_spending_budget(self) -> None:
+        ctx = self._post_run_page_path_ctx()
+        terminal_signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="The current page is a terminal challenge.",
+            user_facing_reason="I could not continue past the site challenge.",
+            recovery_hint="report_blocker_to_user",
+            cleared_by_tools=frozenset(),
+            preserves_workflow_draft=True,
+            renders_final_reply=True,
+            internal_reason_code="probable_site_block_stop",
+            blocked_tool="click",
+        )
+        assert stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="test") is not None
+
+        signal = synthesized_block_persistence_signal(ctx, "click", {"selector": "#continue"})
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert ctx.post_run_page_path_interaction_window is None
 
     @pytest.mark.parametrize(
         "ctx_attrs",

@@ -33,7 +33,11 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    PostRunPagePathFailure,
+    PostRunPagePathTarget,
+    RecordedBuildTestOutcome,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
@@ -1041,6 +1045,80 @@ workflow_definition:
         assert "reason_code: runtime_block_failure" in prompt
         assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
         assert "change the next authored step, selector, extraction, or binding based on" in prompt
+
+    def test_recorded_build_test_outcome_prompt_renders_exact_post_run_page_path_actions(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:page-path",
+                page_path_failure=PostRunPagePathFailure(
+                    kind="challenge",
+                    workflow_run_id="wr_failed",
+                    current_url="https://example.test/challenge",
+                    continuation_targets=(
+                        PostRunPagePathTarget(kind="challenge", selector="#notRobot"),
+                        PostRunPagePathTarget(kind="challenge", selector="#continue"),
+                    ),
+                    enter_allowed=True,
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "POST-RUN PAGE-PATH CONTINUATION:" in prompt
+        assert "kind: challenge" in prompt
+        assert "- allowed click: selector=#notRobot" in prompt
+        assert "- allowed Enter: selector=#continue" in prompt
+        assert "Do not navigate away or re-author the workflow" in prompt
+
+    def test_recorded_build_test_outcome_prompt_requires_fresh_inspection_when_page_path_is_unbound(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:page-path",
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" in prompt
+        assert 'inspect_page_for_composition with target_url="current_page"' in prompt
+        assert "Do not use evaluate as a substitute" in prompt
+
+    def test_recorded_build_test_outcome_prompt_does_not_offer_page_actions_for_non_page_outcome(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:non-page",
+                page_path_failure=PostRunPagePathFailure(
+                    kind="non_page_outcome",
+                    workflow_run_id="wr_failed",
+                    current_url="https://example.test/results",
+                    continuation_targets=(),
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "POST-RUN PAGE-PATH CONTINUATION:" not in prompt
+        assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" not in prompt
 
     def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
         ctx = _ctx(
