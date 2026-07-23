@@ -4,10 +4,11 @@ import inspect
 
 import pytest
 
+import skyvern.cli.mcp_tools._common as mcp_common
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.cli.mcp_tools.inspection import skyvern_get_html
-from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT
+from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT, EXTRACT_DATA_CONTENT
 from skyvern.cli.mcp_tools.session import skyvern_browser_session_create, skyvern_browser_session_list
 from skyvern.cli.mcp_tools.workflow import (
     skyvern_workflow_create,
@@ -37,6 +38,19 @@ def test_mcp_instructions_guide_text_prompt_defaults() -> None:
     assert "skyvern_extract" in mcp.instructions
     assert "skyvern_act" in mcp.instructions
     assert "skyvern_observe" in mcp.instructions
+
+
+def test_workflow_create_guides_code_only_policy() -> None:
+    assert mcp_common.CODE_ONLY_SCHEMA_GUIDANCE in (skyvern_workflow_create.__doc__ or "")
+
+
+def test_mcp_instructions_guide_code_only_policy() -> None:
+    assert mcp_common.CODE_ONLY_SCHEMA_GUIDANCE in mcp.instructions
+
+
+def test_workflow_prompts_guide_code_only_policy_at_each_authoring_surface() -> None:
+    assert BUILD_WORKFLOW_CONTENT.count(mcp_common.CODE_ONLY_SCHEMA_GUIDANCE) == 2
+    assert EXTRACT_DATA_CONTENT.count(mcp_common.CODE_ONLY_SCHEMA_GUIDANCE) == 1
 
 
 @pytest.mark.asyncio
