@@ -23983,3 +23983,146 @@ class TestDefinitionContractRecordedPacketReplay:
             "I kept the workflow draft, but it does not yet satisfy the required workflow definition. "
             "Complete the missing definition requirements before trying again."
         )
+
+
+class TestScoutedSpineRepeatedOmissionSeam:
+    @staticmethod
+    def _uncovered_record(selector: str) -> dict[str, object]:
+        return {"tool_name": "click", "method": "click", "selector": selector, "trajectory_index": 1}
+
+    def test_two_consecutive_identical_omissions_set_repeated_flag(self) -> None:
+        ctx = _code_only_ctx()
+        digest = workflow_update_module._scouted_spine_omission_digest([self._uncovered_record("#submit")])
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert ctx.scouted_spine_previous_omission_digest == digest
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+
+    def test_changed_omission_clears_repeated_flag(self) -> None:
+        ctx = _code_only_ctx()
+        first = workflow_update_module._scouted_spine_omission_digest([self._uncovered_record("#a")])
+        second = workflow_update_module._scouted_spine_omission_digest([self._uncovered_record("#b")])
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, first)
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, first)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, second)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert ctx.scouted_spine_previous_omission_digest == second
+
+    def test_repeated_flag_reopens_imposition_for_attempt_three(self) -> None:
+        ctx = _code_only_ctx()
+        assert workflow_update_module._should_impose_after_update_attempt(ctx) is False
+        assert workflow_update_module._should_impose_after_update_attempt(ctx, repeated_identical_omission=True) is True
+
+    @staticmethod
+    def _omitting_draft() -> str:
+        return _freehand_block_yaml('print(await page.locator("body").inner_text())')
+
+    def test_two_consecutive_rejections_at_seam_force_attempt_three_impose_or_name(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        draft = self._omitting_draft()
+
+        first = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert first is not None
+        assert "#search-submit" in first.violations[0]
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, first.omission_digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+
+        second = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert second is not None
+        assert second.omission_digest == first.omission_digest
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, second.omission_digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(draft, ctx) is True
+        assert workflow_update_module._should_impose_after_update_attempt(ctx, repeated_identical_omission=True) is True
+        third = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert third is not None
+        assert "#search-submit" in third.violations[0]
+
+    @pytest.mark.asyncio
+    async def test_third_differing_draft_not_admitted_after_two_identical_omissions(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#b",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 1,
+            },
+        ]
+        omitting = _freehand_block_yaml('await page.goto("https://example.com/records", wait_until="domcontentloaded")')
+        ctx.update_workflow_called = True
+
+        first = await _update_workflow({"workflow_yaml": omitting}, ctx)
+        assert first["ok"] is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+
+        second = await _update_workflow({"workflow_yaml": omitting}, ctx)
+        assert second["ok"] is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+        latched_digest = ctx.scouted_spine_previous_omission_digest
+        assert latched_digest is not None
+
+        differing = _freehand_block_yaml('await page.locator("#a").fill("x")')
+        assert ctx.scouted_spine_previous_omission_digest == latched_digest
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(omitting, ctx) is True
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(differing, ctx) is False
+
+        third = await _update_workflow({"workflow_yaml": differing}, ctx)
+        assert third["ok"] is False
+        assert ctx.spine_imposition_owned_attempt is False
+        assert ctx.scouted_spine_previous_omission_digest != latched_digest
+
+    def test_returning_omission_after_differing_draft_does_not_misfire_imposition(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#b",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 1,
+            },
+        ]
+        omitting = _freehand_block_yaml('await page.goto("https://example.com/records", wait_until="domcontentloaded")')
+        differing = _freehand_block_yaml('await page.locator("#a").fill("x")')
+        omitting_result = workflow_update_module._pre_persist_scouted_spine_result(omitting, ctx)
+        assert omitting_result is not None
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+        ctx.scouted_spine_previous_omission_digest = omitting_result.omission_digest
+
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(differing, ctx) is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(omitting, ctx) is False
+
+    def test_identical_resubmission_no_op_still_names_at_persist_seam(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        draft = self._omitting_draft()
+        ctx.update_workflow_called = True
+        ctx.last_workflow_yaml = draft
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+
+        imposition = workflow_update_module._maybe_impose_synthesized_code_block(draft, ctx)
+        assert ctx.spine_imposition_owned_attempt is False
+        assert imposition.violations == []
+
+        naming = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert naming is not None
+        assert "#search-submit" in naming.violations[0]

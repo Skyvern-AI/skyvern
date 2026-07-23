@@ -547,6 +547,19 @@ SCOUTED_SPINE_TURN_HALT_USER_REASON = (
 )
 
 
+def _get_scouted_spine_missing_steps_for_halt(ctx: AgentContext) -> str | None:
+    """Missing-steps text for any give-up offer, covering every open obligation family
+    (uncovered rungs, unforgiven drops, unrecorded indices, truncation), not uncovered rungs alone."""
+    try:
+        findings = _scouted_spine_open_obligation(ctx)
+    except Exception:
+        LOG.warning("copilot_scouted_spine_halt_missing_steps_failed", exc_info=True)
+        return None
+    if not findings:
+        return None
+    return _scouted_spine_missing_text(findings)
+
+
 def log_scouted_spine_unresolved_at_turn_halt(ctx: AgentContext) -> bool:
     """Log-only and never raises: a failed obligation read must not block rendering the halt reply."""
     try:
@@ -2265,7 +2278,11 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     if reopened_after_failed_run:
         ctx.synthesized_block_reopened_after_failed_run = True
     goal = getattr(ctx, "block_goal_main_goal", "") or getattr(ctx, "user_message", "") or ""
-    return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory, goal=goal)}
+    offer_text = render_synthesized_offer_text(synthesized, trajectory, goal=goal)
+    missing_steps = _get_scouted_spine_missing_steps_for_halt(ctx)
+    if missing_steps:
+        offer_text += f"\n\n**Note:** This draft is missing these demonstrated steps: {missing_steps}"
+    return {"role": "user", "content": offer_text}
 
 
 def _completion_verification_unsatisfied(ctx: Any) -> bool:

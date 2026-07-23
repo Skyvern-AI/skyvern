@@ -1162,6 +1162,32 @@ class TestSynthesizedOfferPersistenceGate:
         assert ctx.synthesized_block_offered_trajectory_len == len(trajectory)
         assert ctx.synthesized_block_offered_goal_complete is True
 
+    def test_offer_names_missing_steps_when_obligation_open_regardless_of_repeated_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
+            lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement._get_scouted_spine_missing_steps_for_halt",
+            lambda ctx: "`click` on '#search-submit'",
+        )
+        trajectory = [
+            {"tool_name": "click", "selector": "a.home", "accessible_name": "Home"},
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 2
+        ctx.synthesized_block_offered_goal_complete = False
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        assert "#search-submit" in message["content"]
+
     def test_goal_complete_offer_refresh_suppresses_near_duplicate_followup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

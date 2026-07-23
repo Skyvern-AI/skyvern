@@ -4,7 +4,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -781,6 +781,22 @@ class Settings(BaseSettings):
     # "CRITICAL") to drop its retry/failure records where the OTLP endpoint is
     # intentionally unavailable; the default keeps export failures visible.
     OTEL_EXPORTER_LOG_LEVEL: str = "WARNING"
+    # Per-export deadline (seconds) for the OTLP span exporter. Must exceed the exporter's
+    # ~31s retry-backoff window (2**n over _MAX_RETRYS) so a brief node-local collector blip
+    # is retried to success instead of logged as a failure; the library default (10s) cuts
+    # the retry sequence short and turns each blip into an error burst.
+    OTEL_EXPORTER_TIMEOUT_SECONDS: float = Field(
+        default=45.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "OTEL_EXPORTER_TIMEOUT_SECONDS",
+            "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+            "OTEL_EXPORTER_OTLP_TIMEOUT",
+        ),
+    )
+    # BatchSpanProcessor queue depth (library default 2048); enlarged to buffer more spans
+    # while an export is retrying against a briefly unavailable collector.
+    OTEL_BSP_MAX_QUEUE_SIZE: int = 8192
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"

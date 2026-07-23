@@ -8120,6 +8120,7 @@ class _SynthesizedCodeImpositionResult:
     metadata_repair_contract: dict[str, object] | None = None
     ablation_gate_id: str | None = None
     never_captured_candidate: _NeverCapturedObligationCandidate | None = None
+    omission_digest: str | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -8337,15 +8338,31 @@ def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | No
     return True
 
 
-def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
+def _should_impose_after_update_attempt(ctx: AgentContext, *, repeated_identical_omission: bool = False) -> bool:
     target = ctx.reached_download_target
     return (
         (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
         or synthesized_persistence_reopened_after_failed_run(ctx)
         or ctx.synthesized_block_reopened_for_credential_scout
         or ctx.synthesized_block_reopened_for_capture_obligation
+        or repeated_identical_omission
         or _author_time_reject_reopens_synthesized_imposition(ctx)
     )
+
+
+def _current_draft_repeats_prior_scouted_spine_omission(workflow_yaml: str, ctx: AgentContext) -> bool:
+    """The repeated-omission imposition arm admits only when the CURRENT draft still leaves the same
+    scouted-spine rungs open: recompute this draft's omission digest and require it non-empty and equal
+    to the immediately-prior reject's digest, so A,A,B never imposes on B off a latch set by a prior draft."""
+    if not ctx.scouted_spine_repeated_identical_missing_steps:
+        return False
+    current = _pre_persist_scouted_spine_result(workflow_yaml, ctx)
+    digest = current.omission_digest if current is not None else None
+    if digest is None or digest != ctx.scouted_spine_previous_omission_digest:
+        ctx.scouted_spine_repeated_identical_missing_steps = False
+        ctx.scouted_spine_previous_omission_digest = None
+        return False
+    return True
 
 
 def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> bool:
@@ -9720,6 +9737,28 @@ def _synthesized_resubmission_credential_scout_requirements(
     return _credentialed_code_block_scout_gate_errors(probe_yaml, ctx)
 
 
+def _record_scouted_spine_omission_reject(ctx: AgentContext, digest: str | None) -> None:
+    if digest is not None and digest == ctx.scouted_spine_previous_omission_digest:
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+        LOG.info("copilot_scouted_spine_repeated_identical_omission", omission_digest=digest)
+    else:
+        ctx.scouted_spine_repeated_identical_missing_steps = False
+    ctx.scouted_spine_previous_omission_digest = digest
+
+
+def _scouted_spine_omission_digest(records: Sequence[Mapping[str, Any]]) -> str:
+    items = sorted(
+        (
+            str(record.get("tool_name") or ""),
+            str(record.get("method") or ""),
+            str(record.get("selector") or record.get("locator") or ""),
+            str(record.get("trajectory_index")),
+        )
+        for record in records
+    )
+    return hashlib.sha256(json.dumps(items).encode()).hexdigest()
+
+
 def _scouted_spine_under_build_result(
     workflow_yaml: str,
     *,
@@ -9783,6 +9822,7 @@ def _scouted_spine_under_build_result(
                 reason_code=_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
                 selector=str(first_uncovered.get("selector") or "") or None,
             ),
+            omission_digest=_scouted_spine_omission_digest(uncovered),
         )
     # Non-uncovered partition findings are synthesizer-side: no draft edit closes them, so a
     # repair-convergence-only site routes them to the turn-end obligation halt instead of a churn loop.
@@ -11498,7 +11538,12 @@ def _maybe_impose_synthesized_code_block(
     # Goal-completeness gates on the requested-output plan, which materializes mid-turn, so keying availability on
     # it would make ownership race the plan; reach is monotone in the scout's capture. Landing still closes the lane.
     spine_landing_available = reaches_goal and not ctx.synthesized_goal_complete_landed
-    if ctx.update_workflow_called and not spine_landing_available and not _should_impose_after_update_attempt(ctx):
+    repeated_identical_omission = _current_draft_repeats_prior_scouted_spine_omission(workflow_yaml, ctx)
+    if (
+        ctx.update_workflow_called
+        and not spine_landing_available
+        and not _should_impose_after_update_attempt(ctx, repeated_identical_omission=repeated_identical_omission)
+    ):
         _log_imposition_skipped_after_update(ctx)
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if ctx.update_workflow_called:
@@ -14212,6 +14257,7 @@ async def _update_workflow(
 
     pre_persist_spine = _pre_persist_scouted_spine_result(workflow_yaml, ctx)
     if pre_persist_spine is not None:
+        _record_scouted_spine_omission_reject(ctx, pre_persist_spine.omission_digest)
         _set_code_authoring_repair_context(ctx, pre_persist_spine.repair_context)
         _record_code_authoring_guardrail_reject(ctx)
         return reject(
@@ -14297,6 +14343,8 @@ async def _update_workflow(
         ctx.workflow_yaml = workflow_yaml
         ctx.persisted_draft_browser_calls = _workflow_yaml_browser_call_pairs(workflow_yaml)
         ctx.code_authoring_guardrail_reject_count = 0
+        ctx.scouted_spine_previous_omission_digest = None
+        ctx.scouted_spine_repeated_identical_missing_steps = False
         ctx.last_code_authoring_reject_was_credential_priority = False
         ctx.last_output_policy_reject_reason_codes = None
         ctx.metadata_reject_ladder_state = None

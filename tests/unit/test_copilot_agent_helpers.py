@@ -1605,6 +1605,45 @@ class TestVerifiedGoalSatisfiedStop:
         assert result.narrative_payload is not None
         assert result.narrative_payload["verifiedSuccess"] is False
 
+    @pytest.mark.asyncio
+    async def test_built_unverified_terminal_names_demonstrated_missing_steps(self) -> None:
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.impose_synthesized_code_block = True
+        ctx.has_staged_proposal = True
+        ctx.persisted_draft_browser_calls = []
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+
+        result = await _build_built_unverified_exit_result(ctx, global_llm_context=None)
+
+        assert "#search-submit" in result.user_response
+
     def test_corroborated_structural_abstention_avoids_built_unverified_terminal(self) -> None:
         ctx = _ctx(
             last_test_ok=True,
