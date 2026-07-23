@@ -2662,6 +2662,84 @@
         }
       }
     },
+    "/v1/artifacts/{artifact_id}/content": {
+      "get": {
+        "tags": [
+          "Artifacts"
+        ],
+        "summary": "Get artifact content",
+        "description": "Download the raw content of an artifact (supports bundled artifacts).\n\nThe response body is the artifact's raw bytes. The endpoint advertises `Accept-Ranges: bytes` and supports a single-range `Range` request header (for example, `bytes=0-1023` or `bytes=-512` for a suffix range), allowing partial downloads and resumable transfers of large artifacts. Multi-range requests are not supported and fall back to returning the full content.",
+        "operationId": "get_artifact_content_v1_artifacts__artifact_id__content_get",
+        "parameters": [
+          {
+            "name": "artifact_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Artifact Id"
+            }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "title": "Range",
+              "description": "Optional HTTP Range header for partial content. Accepts a single byte range such as `bytes=0-1023` or a suffix range such as `bytes=-512` (the last 512 bytes). Multi-range requests are ignored and return the full content. Out-of-range requests respond with 416."
+            },
+            "description": "Optional HTTP Range header for partial content. Accepts a single byte range such as `bytes=0-1023` or a suffix range such as `bytes=-512` (the last 512 bytes). Multi-range requests are ignored and return the full content. Out-of-range requests respond with 416."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Raw artifact content. The response sets `Accept-Ranges: bytes`, `Content-Disposition` (inline for most artifact types; attachment with a sanitized filename for downloaded files), `X-Content-Type-Options: nosniff`, and a `Cache-Control` header (`private, no-cache` for org-authenticated requests, or `private, max-age=<remaining seconds>` for signed-URL requests).",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Partial artifact content returned in response to a satisfiable single-range `Range` request. Includes a `Content-Range: bytes <start>-<end>/<total>` header.",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Invalid or expired artifact URL (signed-URL flow)."
+          },
+          "404": {
+            "description": "Artifact not found or content unavailable."
+          },
+          "416": {
+            "description": "Range not satisfiable. The response includes a `Content-Range: bytes */<total>` header indicating the resource size."
+          }
+        }
+      }
+    },
     "/v1/runs/{run_id}/artifacts": {
       "get": {
         "tags": [
