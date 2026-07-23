@@ -109,6 +109,9 @@ class CDPFramePublisher:
         # dedupe identical frames without losing a retry on transient upload
         # failure.
         self._last_published_digest: bytes | None = None
+        # Warn once per publisher on unexpected gate errors so a miswired hook is
+        # visible instead of silently reverting to unconditional publishing.
+        self._warned_gate_failure = False
 
     @property
     def stream_key(self) -> str:
@@ -200,6 +203,10 @@ class CDPFramePublisher:
             return False
 
     async def _publish_one_frame(self) -> None:
+        # Gate before capture: skipping the CDP screenshot saves browser CPU, not
+        # just the upload. Fail-open — a broken gate must not blank the live view.
+        if not await self._viewer_wants_frames():
+            return
         page = await self._browser_state.get_working_page()
         if page is None:
             return
@@ -266,6 +273,22 @@ class CDPFramePublisher:
             # transient upload failure retries instead of getting deduped away.
             self._last_published_digest = digest
 
+    async def _viewer_wants_frames(self) -> bool:
+        try:
+            return bool(
+                await app.AGENT_FUNCTION.should_publish_streaming_frame(self._organization_id, self._stream_key)
+            )
+        except Exception:
+            if not self._warned_gate_failure:
+                self._warned_gate_failure = True
+                LOG.warning(
+                    "Streaming gate check failed; publishing unconditionally",
+                    stream_key=self._stream_key,
+                    organization_id=self._organization_id,
+                    exc_info=True,
+                )
+            return True
+
     def _log_cdp_open_failure(self, exc: BaseException) -> None:
         """Log a ``new_cdp_session`` failure at the severity its cause warrants.
 
@@ -293,7 +316,7 @@ class CDPFramePublisher:
         )
 
     async def _write_frame(self, data: bytes) -> bool:
-        """Persist one frame; True iff both the local write and the upload succeeded."""
+        """Persist one frame; True iff the local write and a real (non-gated) upload both succeeded."""
         temp_dir = Path(get_skyvern_temp_dir()) / self._organization_id
         try:
             # Blocking I/O runs on a worker thread so a large flush does not
@@ -311,7 +334,7 @@ class CDPFramePublisher:
         # Local-disk storage reads the temp file directly; remote object-storage
         # backends need an explicit upload.
         try:
-            await app.STORAGE.save_streaming_file(self._organization_id, self._stream_key)
+            upload_result = await app.STORAGE.save_streaming_file(self._organization_id, self._stream_key)
         except Exception:
             LOG.debug(
                 "save_streaming_file failed; will retry on next iteration",
@@ -319,6 +342,10 @@ class CDPFramePublisher:
                 organization_id=self._organization_id,
                 exc_info=True,
             )
+            return False
+        # A gate skip (False) is a normal no-viewer outcome, not a failure: don't advance the
+        # dedupe digest, or an unchanged page could be suppressed when a viewer later attaches.
+        if upload_result is False:
             return False
         return True
 

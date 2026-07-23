@@ -29,6 +29,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_statu
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.webeye.cdp_frame_publisher import stream_key_for_task, stream_key_for_workflow_run
 
 LOG = structlog.get_logger()
 STREAMING_TIMEOUT = 300
@@ -112,9 +113,10 @@ async def task_stream(
                 return
 
             if task.status == TaskStatus.running:
-                file_name = f"{task_id}.png"
+                file_name = stream_key_for_task(task_id)
                 if task.workflow_run_id:
-                    file_name = f"{task.workflow_run_id}.png"
+                    file_name = stream_key_for_workflow_run(task.workflow_run_id)
+                await app.AGENT_FUNCTION.mark_streaming_viewer_active(organization_id, file_name)
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")
@@ -247,7 +249,8 @@ async def workflow_run_streaming(
                 return
 
             if workflow_run.status in (WorkflowRunStatus.running, WorkflowRunStatus.paused):
-                file_name = f"{workflow_run_id}.png"
+                file_name = stream_key_for_workflow_run(workflow_run_id)
+                await app.AGENT_FUNCTION.mark_streaming_viewer_active(organization_id, file_name)
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")

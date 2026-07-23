@@ -806,6 +806,20 @@ class AgentFunction:
         routers so the default returns False."""
         return False
 
+    async def mark_streaming_viewer_active(self, organization_id: str, file_name: str) -> None:
+        """Record that a live-view consumer is currently polling this stream key.
+
+        Cloud overrides this with a TTL'd presence marker that frame publishers
+        consult via should_publish_streaming_frame. OSS no-op: frames always publish."""
+        return None
+
+    async def should_publish_streaming_frame(self, organization_id: str, file_name: str) -> bool:
+        """Whether a frame publisher should capture+upload a frame for this stream key.
+
+        Cloud gates this on viewer presence so unwatched runs skip uploads entirely.
+        OSS default keeps the historical always-publish behavior."""
+        return True
+
     async def resolve_recording_video_size(
         self,
         current_size: dict[str, int] | None,
