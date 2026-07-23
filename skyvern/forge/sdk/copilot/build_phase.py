@@ -24,6 +24,7 @@ import re
 import time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 import yaml
@@ -81,6 +82,44 @@ _COMPOSITION_CONTEXT_TOOLS: frozenset[str] = frozenset({"inspect_page_for_compos
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"\)]+", re.IGNORECASE)
 
+# Two discovery failures with no resolvable entrypoint end the turn with one ask.
+DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD = 2
+
+_ANCHOR_URL_TRAILING_PUNCTUATION = ",.;:!?)]}'\"`"
+_ANCHOR_URL_MARKDOWN_WRAPPERS = frozenset("*_~")
+_ANCHOR_TRUNCATION_SENTINEL = "…"
+
+
+def extract_anchor_entry_url(text: str | None) -> str | None:
+    """Extract the first well-formed http(s) URL from a transcript anchor.
+
+    Consulted last and read-side only, so a stale URL from an unrelated turn
+    cannot leak. Matches abutting the `_safe_slot` middle-truncation marker are
+    rejected because the URL may be mangled across the splice.
+    """
+    if not text:
+        return None
+    for match in _URL_IN_TEXT_RE.finditer(text):
+        start, end = match.span()
+        if text[end : end + 1] == "<" or text[start - 1 : start] == ">":
+            continue
+        if _ANCHOR_TRUNCATION_SENTINEL in text[max(0, start - 2) : end + 2]:
+            continue
+        candidate = match.group(0).rstrip(_ANCHOR_URL_TRAILING_PUNCTUATION)
+        preceding = text[start - 1 : start]
+        if preceding in _ANCHOR_URL_MARKDOWN_WRAPPERS:
+            candidate = candidate.rstrip(preceding)
+        try:
+            parsed = urlparse(candidate)
+            port = parsed.port
+        except ValueError:
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        if "." in parsed.hostname or port is not None or parsed.hostname == "localhost":
+            return candidate
+    return None
+
 
 def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
     if not workflow_yaml:
@@ -115,6 +154,7 @@ def initial_build_phase(
     user_message: str,
     agent_user_message: str,
     workflow_yaml: str | None,
+    transcript_earliest_user_turn: str = "",
 ) -> BuildPhase:
     """Decide the initial build phase for this turn.
 
@@ -133,11 +173,14 @@ def initial_build_phase(
     alternative is to let mutation through on an ambiguous turn, which is
     worse than asking discovery to resolve or falling through to ASK_QUESTION.
 
-    Signals considered (this-turn only — never prior visited URLs or chat
-    history, which can leak stale URLs across unrelated turns):
+    Signals considered, in order:
     - The raw latest user message.
     - The rewritten agent input (request-policy may carry the prior request).
     - The current workflow YAML's first goto_url/navigation block.
+    - The earliest-user-turn transcript anchor, consulted last and read-side
+      only. The anchor IS the original request, so it recovers the URL an
+      abnormally-ended turn dropped without reviving stale URLs from prior
+      visited pages or middle history turns.
     """
     mode_value = getattr(getattr(turn_intent, "mode", None), "value", None)
     if mode_value in _PHASE_NON_BUILD_MODE_VALUES:
@@ -146,10 +189,36 @@ def initial_build_phase(
         _URL_IN_TEXT_RE.search(user_message or "")
         or _URL_IN_TEXT_RE.search(agent_user_message or "")
         or _yaml_has_target_url(workflow_yaml)
+        or extract_anchor_entry_url(transcript_earliest_user_turn)
     )
     if not has_url_signal:
         return BuildPhase.INITIAL
     return BuildPhase.COMPOSING
+
+
+def anchor_recovers_entrypoint(
+    turn_intent: TurnIntent | None,
+    user_message: str,
+    agent_user_message: str,
+    workflow_yaml: str | None,
+    transcript_earliest_user_turn: str = "",
+) -> str | None:
+    """The transcript-anchor URL to record as the resolved entrypoint, or None.
+
+    Returns a URL only when the anchor is the sole entrypoint signal this turn:
+    an in-turn URL (message, rewritten input, or YAML) is authoritative and
+    must not be overridden by the older anchor, so any of those returns None.
+    """
+    mode_value = getattr(getattr(turn_intent, "mode", None), "value", None)
+    if mode_value in _PHASE_NON_BUILD_MODE_VALUES:
+        return None
+    if (
+        _URL_IN_TEXT_RE.search(user_message or "")
+        or _URL_IN_TEXT_RE.search(agent_user_message or "")
+        or _yaml_has_target_url(workflow_yaml)
+    ):
+        return None
+    return extract_anchor_entry_url(transcript_earliest_user_turn)
 
 
 def _log_transition(ctx: CopilotContext, *, prev: BuildPhase, new: BuildPhase, reason: str) -> None:

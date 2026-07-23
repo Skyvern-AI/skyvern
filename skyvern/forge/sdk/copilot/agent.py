@@ -50,7 +50,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase, initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase, anchor_recovers_entrypoint, initial_build_phase
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -598,6 +598,21 @@ def _turn_context_log_fields(packet: TurnContextPacket | None) -> dict[str, Any]
 
 def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, str]:
     return {key: str(value) for key, value in _turn_context_log_fields(packet).items()}
+
+
+def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
+    """The earliest-user-turn anchor, or "" when it cannot be trusted this turn.
+
+    Blanked when the retained window is at capacity: a full window may have
+    dropped older turns, so earliest_user_turn would be a middle-history turn
+    rather than the original request.
+    """
+    # Deferred: routes.workflow_copilot imports this module (circular at import time).
+    from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
+
+    if not isinstance(packet, TurnContextPacket) or chat_history_len >= CHAT_HISTORY_CONTEXT_MESSAGES:
+        return ""
+    return packet.transcript_context.earliest_user_turn
 
 
 def _store_turn_context_packet_on_context(
@@ -5510,12 +5525,23 @@ async def _run_copilot_turn_impl(
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
     ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
+    transcript_anchor = _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
         agent_user_message or "",
         chat_request.workflow_yaml or "",
+        transcript_anchor,
     )
+    anchor_entrypoint = anchor_recovers_entrypoint(
+        ctx.turn_intent,
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
+        transcript_anchor,
+    )
+    if anchor_entrypoint is not None and ctx.resolved_discovery_entrypoint_url is None:
+        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint
     LOG.info(
         "copilot.build_phase_initial",
         build_phase=ctx.build_phase.value,
