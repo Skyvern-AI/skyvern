@@ -980,23 +980,30 @@ class SkyvernElement:
 
     async def refresh_locator_if_stale(self) -> None:
         """Re-resolve via the tag-name xpath (same fallback as get_skyvern_element_by_id)
-        when the scraped css selector no longer matches — a page mutation replaced the node
-        and the stamped unique-id attribute went with it. Best-effort: swaps the locator
-        only on an unambiguous xpath match; a detach can be transient (mid re-render), so
-        anything else falls through to Playwright's own auto-wait instead of failing fast."""
-        if await self._safe_match_count(self.get_locator()) > 0:
+        when the scraped css selector is missing or ambiguous after a page mutation.
+        Best-effort for missing targets; ambiguous targets must resolve uniquely or fail."""
+        match_count = await self._safe_match_count(self.get_locator())
+        if match_count == 1:
             return
         xpath: str | None = self.get_element_dict().get("xpath")
-        if not xpath:
-            return
-        fresh_locator = self.get_frame().locator(f"xpath={xpath}")
-        if await self._safe_match_count(fresh_locator) == 1:
-            LOG.info(
-                "Re-resolved stale element locator by xpath",
+        if xpath:
+            fresh_locator = self.get_frame().locator(f"xpath={xpath}")
+            if await self._safe_match_count(fresh_locator) == 1:
+                LOG.info(
+                    "Re-resolved stale or ambiguous element locator by xpath",
+                    element_id=self.get_id(),
+                    xpath=xpath,
+                    previous_match_count=match_count,
+                )
+                self.locator = fresh_locator
+                return
+
+        if match_count > 1:
+            raise MultipleElementsFound(
+                num=match_count,
+                selector=str(self.get_locator()),
                 element_id=self.get_id(),
-                xpath=xpath,
             )
-            self.locator = fresh_locator
 
     async def _safe_match_count(self, locator: Locator) -> int:
         # count() itself raises when the locator's frame detached; that means 0 matches
