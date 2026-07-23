@@ -34,6 +34,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    ActionExecutionTimeout,
     CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
@@ -2963,41 +2964,44 @@ class ActionHandler:
         )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+        execution_timeout_seconds = _resolve_action_execution_timeout(action)
+        execution_timeout_scope: asyncio.Timeout | None = None
         try:
-            if action.action_type in ActionHandler._handled_action_types:
-                invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
-                if invalid_web_action_check:
-                    actions_result.extend(invalid_web_action_check)
-                    return actions_result
-
-                # do setup before action handler
-                if setup := ActionHandler._setup_action_types.get(action.action_type):
-                    results = await setup(action, page, scraped_page, task, step)
-                    actions_result.extend(results)
-                    if results and results[-1] != ActionSuccess:
+            async with asyncio.timeout(execution_timeout_seconds) as execution_timeout_scope:
+                if action.action_type in ActionHandler._handled_action_types:
+                    invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
+                    if invalid_web_action_check:
+                        actions_result.extend(invalid_web_action_check)
                         return actions_result
 
-                # do the handler
-                handler = ActionHandler._handled_action_types[action.action_type]
-                results = await handler(action, page, scraped_page, task, step)
-                actions_result.extend(results)
-                await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
-                # do the teardown
-                teardown = ActionHandler._teardown_action_types.get(action.action_type)
-                if teardown:
-                    results = await teardown(action, page, scraped_page, task, step)
+                    # do setup before action handler
+                    if setup := ActionHandler._setup_action_types.get(action.action_type):
+                        results = await setup(action, page, scraped_page, task, step)
+                        actions_result.extend(results)
+                        if results and results[-1] != ActionSuccess:
+                            return actions_result
+
+                    # do the handler
+                    handler = ActionHandler._handled_action_types[action.action_type]
+                    results = await handler(action, page, scraped_page, task, step)
                     actions_result.extend(results)
+                    await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
+                    # do the teardown
+                    teardown = ActionHandler._teardown_action_types.get(action.action_type)
+                    if teardown:
+                        results = await teardown(action, page, scraped_page, task, step)
+                        actions_result.extend(results)
 
-                return actions_result
+                    return actions_result
 
-            else:
-                LOG.error(
-                    "Unsupported action type in handler",
-                    action=action,
-                    type=type(action),
-                )
-                actions_result.append(ActionFailure(Exception(f"Unsupported action type: {type(action)}")))
-                return actions_result
+                else:
+                    LOG.error(
+                        "Unsupported action type in handler",
+                        action=action,
+                        type=type(action),
+                    )
+                    actions_result.append(ActionFailure(Exception(f"Unsupported action type: {type(action)}")))
+                    return actions_result
         except MissingElement as e:
             LOG.info(
                 "Known exceptions",
@@ -3026,6 +3030,19 @@ class ActionHandler:
                 exception_message=str(e),
             )
             actions_result.append(ActionFailure(e))
+        except asyncio.TimeoutError as e:
+            if execution_timeout_scope is not None and execution_timeout_scope.expired():
+                LOG.error(
+                    "Action execution exceeded the max duration and was aborted",
+                    action=action,
+                    timeout_seconds=execution_timeout_seconds,
+                )
+                actions_result.append(
+                    ActionFailure(ActionExecutionTimeout(action.action_type, execution_timeout_seconds))
+                )
+            else:
+                LOG.exception("Unhandled exception in action handler", action=action)
+                actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
@@ -3054,6 +3071,14 @@ class ActionHandler:
                 llm_caller.add_tool_result(tool_call_result)
 
         return actions_result
+
+
+def _resolve_action_execution_timeout(action: actions.Action) -> float:
+    base = float(settings.BROWSER_ACTION_MAX_EXECUTION_SECONDS)
+    # WaitAction sleeps action.seconds by design; give it that budget on top of the cap.
+    if isinstance(action, actions.WaitAction):
+        return base + action.seconds
+    return base
 
 
 def check_for_invalid_web_action(
