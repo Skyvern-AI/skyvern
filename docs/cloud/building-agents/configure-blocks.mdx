@@ -357,11 +357,11 @@ Additional fields in **Advanced Settings:**
 
 ### Cloud Storage Upload
 
-Upload downloaded files to S3 or Azure Blob Storage.
+Upload downloaded files to S3, Azure Blob Storage, or Google Drive.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Storage Type** | select | `Amazon S3` or `Azure Blob Storage` |
+| **Storage Type** | select | `Amazon S3`, `Azure Blob Storage`, or `Google Drive` |
 | **Folder Path** | text | Upload path/prefix (optional) |
 
 <Accordion title="S3 fields">
@@ -382,6 +382,15 @@ Upload downloaded files to S3 or Azure Blob Storage.
 | **Storage Account Name** | Storage account name |
 | **Storage Account Key** | Storage account key |
 | **Blob Container Name** | Container name |
+
+</Accordion>
+
+<Accordion title="Google Drive fields">
+
+| Field | Description |
+|-------|-------------|
+| **Google Credential** | A connected Google account credential authorized with the `google_drive` scope profile |
+| **Google Drive Folder ID** | Destination folder ID in Google Drive (optional) |
 
 </Accordion>
 
