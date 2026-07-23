@@ -875,6 +875,334 @@ def test_datum_targets_must_map_injectively_to_independent_slots() -> None:
         )
 
 
+def test_datum_binding_prefers_exact_direct_interrogative_output_over_broad_task_goal() -> None:
+    request = _input(
+        latest_request=(
+            "Check whether Riverbend Gas has a public path for starting gas service. "
+            "Return a structured summary showing whether a public form exists, "
+            "whether the path is login-only, and the recommended next action."
+        ),
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.public_form_exists",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, "Riverbend Gas")
+    broad_quote = "whether Riverbend Gas has a public path for starting gas service"
+    exact_quote = "whether a public form exists"
+
+    with pytest.raises(ValueError, match="direct interrogative output"):
+        canonicalize_request_slots(
+            request=request,
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(
+                    RequestSlotDeclarationV1(
+                        source_id=source_id,
+                        source_quote=broad_quote,
+                        plane=RequestSlotPlane.RUN,
+                        pinability=RequestSlotPinability.SHAPELESS_VALID,
+                        antecedent_family=RequestSlotAntecedentFamily.UNDECIDABLE,
+                    ),
+                ),
+                datum_bindings=(
+                    RequestSlotDatumBindingDeclarationV1(
+                        criterion_index=0,
+                        datum_field="output_path",
+                        declined=False,
+                        source_id=source_id,
+                        source_quote=broad_quote,
+                    ),
+                ),
+            ),
+        )
+
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id=source_id,
+                    source_quote=exact_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id=source_id,
+                    source_quote=exact_quote,
+                ),
+            ),
+        ),
+    )
+
+    assert contract.datum_bindings[0].source_quote == exact_quote
+    assert contract.slots[0].antecedent_family == RequestSlotAntecedentFamily.UNCONDITIONAL
+
+
+@pytest.mark.parametrize(
+    ("latest_request", "exact_quote"),
+    [
+        (
+            "Return whether a public form exists and whether the path is login-only.",
+            "whether a public form exists",
+        ),
+        (
+            "Return (whether a public form exists), plus the recommended next action.",
+            "whether a public form exists",
+        ),
+    ],
+)
+def test_direct_interrogative_output_anchor_handles_coordination_and_wrappers(
+    latest_request: str,
+    exact_quote: str,
+) -> None:
+    request = _input(
+        latest_request=latest_request,
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.public_form_exists",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, exact_quote)
+
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id=source_id,
+                    source_quote=exact_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id=source_id,
+                    source_quote=exact_quote,
+                ),
+            ),
+        ),
+    )
+
+    assert contract.datum_bindings[0].source_quote == exact_quote
+
+
+def test_direct_interrogative_output_anchor_prefers_latest_matching_source() -> None:
+    exact_quote = "whether a public form exists"
+    request = _input(
+        latest_prior_user_turn=f"Earlier, return {exact_quote}.",
+        latest_request=f"Now return {exact_quote}.",
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.public_form_exists",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    latest_source_id = request_slot_sources(request)[-1].source_id
+
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id=latest_source_id,
+                    source_quote=exact_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="output_path",
+                    declined=False,
+                    source_id=latest_source_id,
+                    source_quote=exact_quote,
+                ),
+            ),
+        ),
+    )
+
+    assert contract.datum_bindings[0].source_id == latest_source_id
+
+
+def test_duplicate_direct_interrogative_output_in_latest_source_fails_closed() -> None:
+    exact_quote = "whether a public form exists"
+    request = _input(
+        latest_request=f"Return {exact_quote}; confirm {exact_quote}.",
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.public_form_exists",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, exact_quote)
+
+    with pytest.raises(ValueError, match="must be unique"):
+        canonicalize_request_slots(
+            request=request,
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(
+                    RequestSlotDeclarationV1(
+                        source_id=source_id,
+                        source_quote="Return",
+                        plane=RequestSlotPlane.RUN,
+                        pinability=RequestSlotPinability.SHAPELESS_VALID,
+                        antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                    ),
+                ),
+                datum_bindings=(
+                    RequestSlotDatumDeclineDeclarationV1(
+                        criterion_index=0,
+                        datum_field="output_path",
+                        declined=True,
+                    ),
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_producer_retries_broad_binding_until_direct_interrogative_output_is_bound() -> None:
+    request = _input(
+        latest_request=(
+            "Check whether Riverbend Gas has a public path for starting gas service. "
+            "Return a structured summary showing whether a public form exists."
+        ),
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.public_form_exists",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, "Riverbend Gas")
+    broad_quote = "whether Riverbend Gas has a public path for starting gas service"
+    exact_quote = "whether a public form exists"
+    calls = 0
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        assert "Never bind the target to an earlier, broader task goal" in prompt
+        quote = broad_quote if calls == 1 else exact_quote
+        antecedent_family = "undecidable" if calls == 1 else "unconditional"
+        return {
+            "version": "1",
+            "slots": [
+                {
+                    "source_id": source_id,
+                    "source_quote": quote,
+                    "plane": "run",
+                    "pinability": "shapeless_valid",
+                    "antecedent_family": antecedent_family,
+                }
+            ],
+            "datum_bindings": [
+                {
+                    "criterion_index": 0,
+                    "datum_field": "output_path",
+                    "declined": False,
+                    "source_id": source_id,
+                    "source_quote": quote,
+                }
+            ],
+        }
+
+    result = await produce_request_slots(request=request, handler=handler, timeout_seconds=1.0)
+
+    assert result.status == "success"
+    assert result.attempts == 3
+    assert result.contract is not None
+    assert result.contract.datum_bindings[0].source_quote == exact_quote
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_producer_exhausts_retries_when_direct_interrogative_output_is_always_misbound() -> None:
+    request = _input(
+        latest_request=(
+            "Check whether Riverbend Gas has a public path for starting gas service. "
+            "Return a structured summary showing whether a public form exists."
+        ),
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="output_path",
+                datum_value="output.public_form_exists",
+                criterion_outcome_sha256="1" * 64,
+            ),
+        ),
+    )
+    source_id = _source_id(request, "Riverbend Gas")
+    broad_quote = "whether Riverbend Gas has a public path for starting gas service"
+    calls = 0
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "version": "1",
+            "slots": [
+                {
+                    "source_id": source_id,
+                    "source_quote": broad_quote,
+                    "plane": "run",
+                    "pinability": "shapeless_valid",
+                    "antecedent_family": "undecidable",
+                }
+            ],
+            "datum_bindings": [
+                {
+                    "criterion_index": 0,
+                    "datum_field": "output_path",
+                    "declined": False,
+                    "source_id": source_id,
+                    "source_quote": broad_quote,
+                }
+            ],
+        }
+
+    result = await produce_request_slots(request=request, handler=handler, timeout_seconds=1.0)
+
+    assert result.status == "failure"
+    assert result.attempts == 4
+    assert result.failure_kind == RequestSlotProducerFailureKind.INVALID_OUTPUT
+    assert calls == 4
+
+
 def test_datum_binding_model_accepts_only_identity_and_new_source_evidence() -> None:
     binding = RequestSlotDatumBindingDeclarationV1.model_validate(
         {

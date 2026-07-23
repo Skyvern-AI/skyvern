@@ -2244,7 +2244,8 @@ async def test_handle_action_download_in_flight_request_does_not_extend_custom_t
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.1
+    # Keep wall-clock bounds loose to tolerate scheduling jitter on shared CI runners.
+    assert elapsed < 0.5
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)

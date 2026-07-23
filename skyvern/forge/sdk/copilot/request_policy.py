@@ -210,6 +210,7 @@ _COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS = 500
 _COMPLETION_CRITERION_CLASSIFICATION_TARGET_MAX_CHARS = 120
 _CLASSIFICATION_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE = re.compile(r"^output\.[A-Za-z_][A-Za-z0-9_]*$")
+_REQUEST_SLOT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUESTED_OUTPUT_CRITERION_ID_PREFIX = "__copilot_requested_output__"
 _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS: dict[str, tuple[str, bool]] = {
     "output.login_only": ("login_only", True),
@@ -594,6 +595,24 @@ class RequestPolicy:
             prefix = f"mint_degraded_criterion_{index}"
             data[f"{prefix}_id"] = criterion.id
             data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
+        neutral_reported_booleans = [
+            criterion for criterion in self.completion_criteria if is_neutral_reported_boolean_criterion(criterion)
+        ]
+        data["neutral_reported_boolean_criterion_count"] = len(neutral_reported_booleans)
+        for index, criterion in enumerate(neutral_reported_booleans[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"neutral_reported_boolean_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_kind"] = criterion.kind
+            data[f"{prefix}_classification_output_key"] = criterion.classification_output_key
+            data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
+            data[f"{prefix}_expected_output_value"] = criterion.expected_output_value
+            data[f"{prefix}_expected_classification"] = criterion.expected_classification
+            data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
+            data[f"{prefix}_request_slot_id"] = criterion.request_slot_id
+            data[f"{prefix}_pinability"] = criterion.pinability
+            data[f"{prefix}_mint_disposition"] = criterion.mint_disposition
+            data[f"{prefix}_requested_output_floor_rekeyed"] = criterion.requested_output_floor_rekeyed
+            data[f"{prefix}_floor_rekeyed_from_path"] = criterion.floor_rekeyed_from_path
         return data
 
     def prompt_summary(self) -> str:
@@ -1276,11 +1295,119 @@ def _request_slot_datum_binding_targets(
     return tuple(targets)
 
 
+def _interrogative_slot_classification_output_key(
+    source_quote: str,
+    *,
+    preserve_path_subject: bool = False,
+) -> str | None:
+    tokens = _word_tokens(source_quote)
+    if not tokens or tokens[0] != "whether":
+        return None
+    tokens = tokens[1:]
+    while tokens and tokens[0] in {"a", "an", "the"}:
+        tokens = tokens[1:]
+    if tokens[:2] == ["path", "is"]:
+        tokens = [tokens[0], *tokens[2:]] if preserve_path_subject else tokens[2:]
+    if not tokens:
+        return None
+    output_key = "_".join(tokens)
+    return output_key if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(output_key) is not None else None
+
+
+def _omitted_request_slot_datum_binding_targets(
+    raw_criteria: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+    existing_targets: tuple[RequestSlotDatumBindingTargetV1, ...],
+) -> tuple[RequestSlotDatumBindingTargetV1, ...]:
+    represented_slot_ids = {binding.slot_id for binding in request_slot_contract.datum_bindings}
+    if isinstance(raw_criteria, list):
+        for item in raw_criteria:
+            if not isinstance(item, dict) or not _request_slot_anchor_is_valid(
+                item,
+                request_slot_request=request_slot_request,
+            ):
+                continue
+            slot = _request_slot_for_anchor(
+                _request_slot_anchor(item),
+                request_slot_request=request_slot_request,
+                request_slot_contract=request_slot_contract,
+            )
+            if slot is not None:
+                represented_slot_ids.add(slot.slot_id)
+    represented_output_keys = {target.datum_value for target in existing_targets}
+    next_criterion_index = len(raw_criteria) if isinstance(raw_criteria, list) else 0
+    targets: list[RequestSlotDatumBindingTargetV1] = []
+    for slot in request_slot_contract.slots:
+        if (
+            slot.slot_id in represented_slot_ids
+            or slot.plane.value != "run"
+            or slot.pinability.value != "shapeless_valid"
+        ):
+            continue
+        source_quote = request_slot_source_text(request_slot_request, slot)
+        output_key = _interrogative_slot_classification_output_key(source_quote)
+        if output_key is None or output_key in represented_output_keys:
+            continue
+        outcome = f"The run reports whether {output_key.replace('_', ' ')}."
+        targets.append(
+            RequestSlotDatumBindingTargetV1(
+                criterion_index=next_criterion_index,
+                datum_field="classification_output_key",
+                datum_value=output_key,
+                criterion_outcome_sha256=hashlib.sha256(outcome.encode()).hexdigest(),
+            )
+        )
+        represented_output_keys.add(output_key)
+        next_criterion_index += 1
+    return tuple(targets)
+
+
+def _trusted_omitted_request_slot_datum_bindings(
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+    omitted_targets: tuple[RequestSlotDatumBindingTargetV1, ...],
+) -> tuple[TrustedRequestSlotDatumBindingV1, ...]:
+    target_by_key = {(target.criterion_index, target.datum_field): target for target in omitted_targets}
+    trusted: list[TrustedRequestSlotDatumBindingV1] = []
+    for binding in request_slot_contract.datum_bindings:
+        target = target_by_key.get((binding.criterion_index, binding.datum_field))
+        if (
+            target is None
+            or binding.datum_value != target.datum_value
+            or binding.criterion_outcome_sha256 != target.criterion_outcome_sha256
+        ):
+            continue
+        resolved_slot = _request_slot_for_anchor(
+            (binding.source_id, binding.source_quote),
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+        )
+        if resolved_slot is None or binding.slot_id != resolved_slot.slot_id:
+            continue
+        trusted.append(
+            TrustedRequestSlotDatumBindingV1(
+                version="1",
+                criterion_index=target.criterion_index,
+                datum_field=target.datum_field,
+                datum_value=target.datum_value,
+                criterion_outcome_sha256=target.criterion_outcome_sha256,
+                source_id=binding.source_id,
+                source_quote=binding.source_quote,
+                slot_id=binding.slot_id,
+            )
+        )
+    return tuple(trusted)
+
+
 def _apply_request_slot_datum_bindings(
     original: dict[str, Any],
     *,
     request_slot_request: RequestSlotProducerInputV1,
     request_slot_contract: RequestSlotContractV1,
+    datum_binding_targets: tuple[RequestSlotDatumBindingTargetV1, ...] | None = None,
 ) -> RequestSlotDatumBindingApplicationDecisionV1:
     criteria = original.get("completion_criteria")
     if not isinstance(criteria, list):
@@ -1288,22 +1415,36 @@ def _apply_request_slot_datum_bindings(
     if request_slot_contract.request_digest != request_slot_request_digest(request_slot_request):
         return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_contract")
 
-    targets = _request_slot_datum_binding_targets(
+    targets = datum_binding_targets or _request_slot_datum_binding_targets(
         criteria,
         request_slot_request=request_slot_request,
     )
     target_by_key = {(target.criterion_index, target.datum_field): target for target in targets}
-    binding_by_key = {
+    all_binding_by_key = {
         (binding.criterion_index, binding.datum_field): binding for binding in request_slot_contract.datum_bindings
     }
-    decline_by_key = {
+    all_decline_by_key = {
         (decline.criterion_index, decline.datum_field): decline for decline in request_slot_contract.datum_declines
     }
+    request_target_by_key = {
+        (target.criterion_index, target.datum_field): target for target in request_slot_request.datum_targets
+    }
+    binding_by_key = {key: binding for key, binding in all_binding_by_key.items() if key in target_by_key}
+    decline_by_key = {key: decline for key, decline in all_decline_by_key.items() if key in target_by_key}
     if (
-        len(binding_by_key) != len(request_slot_contract.datum_bindings)
-        or len(decline_by_key) != len(request_slot_contract.datum_declines)
-        or set(binding_by_key) & set(decline_by_key)
+        len(all_binding_by_key) != len(request_slot_contract.datum_bindings)
+        or len(all_decline_by_key) != len(request_slot_contract.datum_declines)
+        or set(all_binding_by_key) & set(all_decline_by_key)
+        or set(all_binding_by_key) | set(all_decline_by_key) != set(request_target_by_key)
         or set(binding_by_key) | set(decline_by_key) != set(target_by_key)
+        or any(
+            (request_target := request_target_by_key.get(key)) is None
+            or request_target.criterion_index != target.criterion_index
+            or request_target.datum_field != target.datum_field
+            or request_target.datum_value != target.datum_value
+            or request_target.criterion_outcome_sha256 != target.criterion_outcome_sha256
+            for key, target in target_by_key.items()
+        )
     ):
         return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_contract")
 
@@ -1599,6 +1740,115 @@ def _request_slot_has_exact_requirement(criterion: CompletionCriterion) -> bool:
     return criterion.expected_output_value is not None or criterion.expected_output_shape is not None
 
 
+def _top_level_output_key(output_path: str | None) -> str | None:
+    if output_path is None or not output_path.startswith("output."):
+        return None
+    key = output_path.removeprefix("output.")
+    return key if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(key) else None
+
+
+def _boolean_output_signal_count(criterion: CompletionCriterion) -> int:
+    return sum(
+        (
+            isinstance(criterion.expected_output_value, bool),
+            criterion.expected_output_shape == "goal_judgment_boolean",
+            isinstance(criterion.expected_classification, bool),
+        )
+    )
+
+
+def _has_boolean_output_signal(criterion: CompletionCriterion) -> bool:
+    return _boolean_output_signal_count(criterion) > 0
+
+
+def _shapeless_boolean_output_binding_key(criterion: CompletionCriterion) -> str | None:
+    if _boolean_output_signal_count(criterion) != 1:
+        return None
+    bindings: list[str] = []
+    if criterion.output_path is not None:
+        output_key = _top_level_output_key(criterion.output_path)
+        if output_key is None:
+            return None
+        bindings.append(output_key)
+    if criterion.classification_output_key is not None:
+        if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(criterion.classification_output_key) is None:
+            return None
+        bindings.append(criterion.classification_output_key)
+    return bindings[0] if len(bindings) == 1 else None
+
+
+def is_neutral_reported_boolean_criterion(criterion: CompletionCriterion) -> bool:
+    output_key = criterion.classification_output_key
+    return (
+        criterion.kind == "outcome"
+        and criterion.output_path is None
+        and criterion.expected_output_value is None
+        and criterion.expected_classification is None
+        and criterion.expected_output_shape == "goal_judgment_boolean"
+        and criterion.requested_output_evidence_source == "independent_run_evidence"
+        and output_key is not None
+        and criterion.requested_output_floor_rekeyed is False
+        and criterion.floor_rekeyed_from_path is None
+        and criterion.request_slot_id is not None
+        and _REQUEST_SLOT_ID_RE.fullmatch(criterion.request_slot_id) is not None
+        and criterion.id == criterion.request_slot_id
+        and _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(output_key) is not None
+        and criterion.pinability == "shapeless_valid"
+        and criterion.mint_disposition == "decidable"
+        and criterion.mint_degrade is None
+        and criterion.judgment_truth_condition is None
+        and criterion.antecedent_family in {"unconditional", "blocker"}
+    )
+
+
+def _is_legacy_floor_marked_neutral_reported_boolean_criterion(criterion: CompletionCriterion) -> bool:
+    if not (
+        criterion.requested_output_floor_rekeyed
+        and criterion.classification_output_key is not None
+        and criterion.floor_rekeyed_from_path == f"output.{criterion.classification_output_key}"
+    ):
+        return False
+    return is_neutral_reported_boolean_criterion(
+        replace(
+            criterion,
+            requested_output_floor_rekeyed=False,
+            floor_rekeyed_from_path=None,
+        )
+    )
+
+
+def normalize_neutral_reported_boolean_criterion(criterion: CompletionCriterion) -> CompletionCriterion:
+    claims_neutral_reported_boolean = criterion.kind == "outcome" and (
+        criterion.classification_output_key is not None
+        or (criterion.pinability == "shapeless_valid" and _has_boolean_output_signal(criterion))
+    )
+    if not claims_neutral_reported_boolean:
+        return criterion
+    if is_neutral_reported_boolean_criterion(criterion):
+        return criterion
+    if _is_legacy_floor_marked_neutral_reported_boolean_criterion(criterion):
+        return replace(
+            criterion,
+            requested_output_floor_rekeyed=False,
+            floor_rekeyed_from_path=None,
+        )
+    return replace(
+        criterion,
+        output_path=None,
+        expected_output_value=None,
+        expected_output_shape=None,
+        requested_output_evidence_source="runtime_output",
+        classification_output_key=None,
+        expected_classification=None,
+        judgment_truth_condition=None,
+        antecedent_family="undecidable",
+        requested_output_floor_rekeyed=False,
+        floor_rekeyed_from_path=None,
+        mint_disposition="degraded",
+        mint_degrade="undecidable_judgment",
+    )
+
+
 def _degrade_unbound_request_slot_criterion(criterion: CompletionCriterion) -> CompletionCriterion:
     return replace(
         criterion,
@@ -1641,13 +1891,55 @@ def _request_slot_for_anchor(
     return matches[0] if len(matches) == 1 else None
 
 
+def _omitted_request_slot_criterion(
+    *,
+    slot: CanonicalRequestSlotV1,
+    source_quote: str,
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...],
+) -> CompletionCriterion:
+    criterion = CompletionCriterion(id="c0", outcome=source_quote)
+    if len(trusted_datum_bindings) != 1:
+        return criterion
+    binding = trusted_datum_bindings[0]
+    classification_output_key = _coerce_classification_output_key(binding.datum_value)
+    if not (
+        binding.slot_id == slot.slot_id
+        and binding.source_id == slot.source_id
+        and binding.source_quote == source_quote
+        and binding.datum_field == "classification_output_key"
+        and classification_output_key == binding.datum_value
+    ):
+        return criterion
+    return replace(
+        criterion,
+        kind="validation_classification",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        classification_output_key=classification_output_key,
+        mint_disposition="pending",
+    )
+
+
 def _bind_criterion_to_request_slot(
     criterion: CompletionCriterion,
     *,
     slot: CanonicalRequestSlotV1,
     source_quote: str,
+    allow_canonical_path_fallback: bool = True,
 ) -> CompletionCriterion:
     pinability = cast(Pinability, slot.pinability.value)
+    lexical_interrogative_key = _interrogative_slot_classification_output_key(
+        source_quote,
+        preserve_path_subject=True,
+    )
+    if (
+        pinability == "shapeless_valid"
+        and slot.plane.value == "run"
+        and lexical_interrogative_key is not None
+        and criterion.classification_output_key is not None
+        and lexical_interrogative_key == f"path_{criterion.classification_output_key}"
+    ):
+        criterion = replace(criterion, classification_output_key=lexical_interrogative_key)
     has_exact_requirement = _request_slot_has_exact_requirement(criterion)
     antecedent_family = cast(AntecedentFamily, slot.antecedent_family.value)
     degraded = (
@@ -1655,10 +1947,30 @@ def _bind_criterion_to_request_slot(
         or (pinability == "pinned" and not has_exact_requirement)
         or antecedent_family == "undecidable"
     )
+    neutral_boolean_candidate = (
+        slot.plane.value == "run"
+        and criterion.level == "run"
+        and pinability == "shapeless_valid"
+        and lexical_interrogative_key is not None
+        and not degraded
+    )
+    neutral_boolean_key = _shapeless_boolean_output_binding_key(criterion) if neutral_boolean_candidate else None
+    malformed_shapeless_boolean = (
+        neutral_boolean_candidate and _has_boolean_output_signal(criterion) and neutral_boolean_key is None
+    )
+    assertive_shapeless_boolean = (
+        slot.plane.value == "run"
+        and criterion.level == "run"
+        and pinability == "shapeless_valid"
+        and lexical_interrogative_key is None
+        and _has_boolean_output_signal(criterion)
+    )
+    degraded = degraded or malformed_shapeless_boolean or assertive_shapeless_boolean
     rekeyed = degraded or pinability == "shapeless_valid"
 
     expected_output_value = criterion.expected_output_value
     expected_output_shape = criterion.expected_output_shape
+    requested_output_evidence_source = criterion.requested_output_evidence_source
     expected_classification = criterion.expected_classification
     kind = criterion.kind
     classification_output_key = criterion.classification_output_key
@@ -1666,17 +1978,35 @@ def _bind_criterion_to_request_slot(
     original_output_path = (
         criterion.output_path
         or (f"output.{classification_output_key}" if classification_output_key is not None else None)
-        or slot.canonical_path
+        or (slot.canonical_path if allow_canonical_path_fallback else None)
     )
+    if rekeyed and neutral_boolean_key is None and original_output_path is None:
+        degraded = True
+        antecedent_family = "undecidable"
     if pinability != "pinned" or degraded:
         expected_output_value = None
         expected_output_shape = None
         expected_classification = None
         judgment_truth_condition = None
+    if malformed_shapeless_boolean:
+        requested_output_evidence_source = "runtime_output"
+        classification_output_key = None
+        antecedent_family = "undecidable"
+    if neutral_boolean_key is not None:
+        kind = "outcome"
+        outcome = f"The run reports whether {neutral_boolean_key.replace('_', ' ')}."
+        expected_output_shape = "goal_judgment_boolean"
+        requested_output_evidence_source = "independent_run_evidence"
+        classification_output_key = neutral_boolean_key
+    else:
+        outcome = criterion.outcome or source_quote
     if rekeyed and kind == "validation_classification":
         kind = "outcome"
         classification_output_key = None
     output_path = None if rekeyed else criterion.output_path
+    if neutral_boolean_key is not None:
+        original_output_path = f"output.{neutral_boolean_key}"
+    requested_output_floor_rekeyed = rekeyed and neutral_boolean_key is None and original_output_path is not None
 
     pending = pinability == "pinned" and (
         isinstance(expected_output_value, bool)
@@ -1702,11 +2032,12 @@ def _bind_criterion_to_request_slot(
     return replace(
         criterion,
         id=slot.slot_id,
-        outcome=criterion.outcome or source_quote,
+        outcome=outcome,
         level=cast(CriterionLevel, slot.plane.value),
         output_path=output_path,
         expected_output_value=expected_output_value,
         expected_output_shape=expected_output_shape,
+        requested_output_evidence_source=requested_output_evidence_source,
         kind=kind,
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
@@ -1716,8 +2047,8 @@ def _bind_criterion_to_request_slot(
         pinability=pinability,
         mint_disposition="degraded" if degraded else ("pending" if pending else "decidable"),
         mint_degrade="undecidable_judgment" if degraded else None,
-        requested_output_floor_rekeyed=rekeyed,
-        floor_rekeyed_from_path=original_output_path if rekeyed else None,
+        requested_output_floor_rekeyed=requested_output_floor_rekeyed,
+        floor_rekeyed_from_path=original_output_path if requested_output_floor_rekeyed else None,
     )
 
 
@@ -1731,7 +2062,11 @@ def _parse_fresh_request_slot_criteria(
     if request_slot_contract.version != "1" or not isinstance(raw, list):
         return []
     criterion_index_by_item_id = {id(item): index for index, item in enumerate(raw) if isinstance(item, dict)}
-    trusted_binding_by_index = {binding.criterion_index: binding for binding in trusted_datum_bindings}
+    trusted_bindings_by_index: dict[int, list[TrustedRequestSlotDatumBindingV1]] = {}
+    trusted_bindings_by_slot_id: dict[str, list[TrustedRequestSlotDatumBindingV1]] = {}
+    for binding in trusted_datum_bindings:
+        trusted_bindings_by_index.setdefault(binding.criterion_index, []).append(binding)
+        trusted_bindings_by_slot_id.setdefault(binding.slot_id, []).append(binding)
     bound_by_slot_id: dict[str, CompletionCriterion] = {}
     non_slot_criteria: list[CompletionCriterion] = []
     for item, criterion in _parse_completion_criterion_entries(raw):
@@ -1747,7 +2082,11 @@ def _parse_fresh_request_slot_criteria(
                 item,
                 request_slot_request=request_slot_request,
                 criterion_index=criterion_index,
-                trusted_binding=trusted_binding_by_index.get(criterion_index),
+                trusted_binding=(
+                    trusted_bindings_by_index[criterion_index][0]
+                    if len(trusted_bindings_by_index.get(criterion_index, ())) == 1
+                    else None
+                ),
                 allow_embedded_binding=False,
             )
             else None
@@ -1777,10 +2116,16 @@ def _parse_fresh_request_slot_criteria(
         if slot.slot_id in bound_by_slot_id:
             continue
         source_quote = request_slot_source_text(request_slot_request, slot)
+        slot_bindings = tuple(trusted_bindings_by_slot_id.get(slot.slot_id, ()))
         bound_by_slot_id[slot.slot_id] = _bind_criterion_to_request_slot(
-            CompletionCriterion(id="c0", outcome=source_quote),
+            _omitted_request_slot_criterion(
+                slot=slot,
+                source_quote=source_quote,
+                trusted_datum_bindings=slot_bindings,
+            ),
             slot=slot,
             source_quote=source_quote,
+            allow_canonical_path_fallback=False,
         )
     return ([bound_by_slot_id[slot.slot_id] for slot in request_slot_contract.slots] + non_slot_criteria)[
         :_MAX_COMPLETION_CRITERIA
@@ -3519,6 +3864,7 @@ async def _classify_request(
                 item.pop("request_slot_datum_binding", None)
 
     request_slot_contract: RequestSlotContractV1 | None = None
+    request_slot_contract_request = request_slot_request
     request_slot_failure_kind: str | None = None
     trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = ()
     datum_binding_targets = _request_slot_datum_binding_targets(
@@ -3550,6 +3896,7 @@ async def _classify_request(
             request_slot_result = await produce_request_slots(request=targeted_request, handler=handler)
             if request_slot_result.status == "success":
                 request_slot_contract = request_slot_result.contract
+                request_slot_contract_request = targeted_request
             else:
                 request_slot_failure_kind = (
                     request_slot_result.failure_kind.value
@@ -3566,6 +3913,7 @@ async def _classify_request(
                 raw_payload,
                 request_slot_request=targeted_request,
                 request_slot_contract=request_slot_contract,
+                datum_binding_targets=datum_binding_targets,
             )
             if datum_binding_decision.accepted_payload is not None:
                 raw_payload = datum_binding_decision.accepted_payload
@@ -3639,6 +3987,7 @@ async def _classify_request(
         request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
         if request_slot_result.status == "success":
             request_slot_contract = request_slot_result.contract
+            request_slot_contract_request = request_slot_request
         else:
             request_slot_failure_kind = (
                 request_slot_result.failure_kind.value if request_slot_result.failure_kind is not None else "unknown"
@@ -3648,9 +3997,66 @@ async def _classify_request(
                 failure_kind=request_slot_failure_kind,
                 attempts=request_slot_result.attempts,
             )
+    if request_slot_failure_kind is None and request_slot_contract is not None:
+        omitted_targets = _omitted_request_slot_datum_binding_targets(
+            raw_criteria,
+            request_slot_request=request_slot_contract_request,
+            request_slot_contract=request_slot_contract,
+            existing_targets=datum_binding_targets,
+        )
+        if omitted_targets:
+            completed_request_data = request_slot_request.model_dump()
+            completed_request_data["datum_targets"] = tuple(
+                RequestSlotDatumTargetV1(
+                    criterion_index=target.criterion_index,
+                    datum_field=target.datum_field,
+                    datum_value=target.datum_value,
+                    criterion_outcome_sha256=target.criterion_outcome_sha256,
+                )
+                for target in (*datum_binding_targets, *omitted_targets)
+            )
+            try:
+                completed_request = RequestSlotProducerInputV1.model_validate(completed_request_data)
+            except ValueError:
+                completed_request = None
+                request_slot_failure_kind = "invalid_output"
+                request_slot_contract = None
+            if completed_request is not None:
+                completed_result = await produce_request_slots(request=completed_request, handler=handler)
+                if completed_result.status == "success" and completed_result.contract is not None:
+                    request_slot_contract = completed_result.contract
+                    request_slot_contract_request = completed_request
+                    if datum_binding_targets:
+                        datum_binding_decision = _apply_request_slot_datum_bindings(
+                            raw_payload,
+                            request_slot_request=completed_request,
+                            request_slot_contract=request_slot_contract,
+                            datum_binding_targets=datum_binding_targets,
+                        )
+                        if datum_binding_decision.accepted_payload is None:
+                            request_slot_failure_kind = "invalid_anchor_correction"
+                            request_slot_contract = None
+                        else:
+                            raw_payload = datum_binding_decision.accepted_payload
+                            raw_criteria = raw_payload.get("completion_criteria")
+                            trusted_datum_bindings = datum_binding_decision.trusted_bindings
+                    if request_slot_contract is not None:
+                        trusted_datum_bindings = (
+                            *trusted_datum_bindings,
+                            *_trusted_omitted_request_slot_datum_bindings(
+                                request_slot_request=completed_request,
+                                request_slot_contract=request_slot_contract,
+                                omitted_targets=omitted_targets,
+                            ),
+                        )
+                else:
+                    request_slot_failure_kind = (
+                        completed_result.failure_kind.value if completed_result.failure_kind is not None else "unknown"
+                    )
+                    request_slot_contract = None
     policy = _classification_from_raw(
         raw_payload,
-        request_slot_request=request_slot_request,
+        request_slot_request=request_slot_contract_request,
         request_slot_contract=request_slot_contract,
         request_slot_failure_kind=request_slot_failure_kind,
         trusted_datum_bindings=trusted_datum_bindings,

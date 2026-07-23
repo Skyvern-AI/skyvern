@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
+    _satisfying_evidence_is_admissible,
     carry_criterion_metadata,
     carry_degraded_criterion_ids,
     carry_floor_rekeyed_criterion_ids,
@@ -69,6 +70,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestedOutputPathMintSource,
     _is_judgment_boolean_criterion,
     is_fallback_floor_criterion,
+    is_neutral_reported_boolean_criterion,
 )
 from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
@@ -314,23 +316,38 @@ def _exact_registered_output_path_value(value: object, output_path: str) -> tupl
     return True, current
 
 
-def _registered_blocker_evidence_by_request_slot_id(
+def _registered_output_path_for_request_slot_criterion(criterion: CompletionCriterion) -> str | None:
+    if is_neutral_reported_boolean_criterion(criterion) and criterion.classification_output_key is not None:
+        return f"output.{criterion.classification_output_key}"
+    if criterion.antecedent_family == "blocker":
+        return criterion.output_path or criterion.floor_rekeyed_from_path
+    return None
+
+
+def _registered_output_identity_path(criterion: CompletionCriterion) -> str | None:
+    if is_neutral_reported_boolean_criterion(criterion) and criterion.classification_output_key is not None:
+        return f"output.{criterion.classification_output_key}"
+    return criterion.output_path or criterion.floor_rekeyed_from_path
+
+
+def _registered_output_evidence_by_request_slot_id(
     copilot_ctx: Any,
     run_data: Mapping[str, Any],
 ) -> dict[str, tuple[RegisteredBlockerEvidence, ...]]:
-    """Bind blocker evidence through exact criterion -> artifact owner -> run row identity."""
+    """Bind request-slot evidence through exact criterion -> artifact owner -> run row identity."""
     metadata = _accepted_staged_output_contract_metadata(copilot_ctx)
     if not isinstance(metadata, Mapping):
         return {}
     formed_criteria = _formed_completion_criteria(copilot_ctx)
-    blocker_criteria = [
+    request_slot_criteria = [
         criterion
         for criterion in formed_criteria
-        if criterion.antecedent_family == "blocker" and criterion.request_slot_id is not None
+        if criterion.request_slot_id is not None
+        and _registered_output_path_for_request_slot_criterion(criterion) is not None
     ]
     criterion_paths: dict[str, list[CompletionCriterion]] = {}
     for criterion in formed_criteria:
-        output_path = criterion.output_path or criterion.floor_rekeyed_from_path
+        output_path = _registered_output_identity_path(criterion)
         if isinstance(output_path, str) and output_path.startswith("output."):
             criterion_paths.setdefault(output_path, []).append(criterion)
 
@@ -347,9 +364,9 @@ def _registered_blocker_evidence_by_request_slot_id(
     registered_rows = _registered_output_parameter_payloads(run_data)
     candidates_by_slot_id: dict[str, list[RegisteredBlockerEvidence]] = {}
     identity_owners: dict[tuple[str, str, str], list[str]] = {}
-    for criterion in blocker_criteria:
+    for criterion in request_slot_criteria:
         slot_id = criterion.request_slot_id
-        output_path = criterion.output_path or criterion.floor_rekeyed_from_path
+        output_path = _registered_output_path_for_request_slot_criterion(criterion)
         if slot_id is None or not isinstance(output_path, str) or len(criterion_paths.get(output_path, ())) != 1:
             continue
         metadata_labels = metadata_labels_by_path.get(output_path.removeprefix("output."), ())
@@ -392,6 +409,22 @@ def _registered_blocker_evidence_by_request_slot_id(
         if len(identity_owners.get(identity, ())) == 1:
             associations[slot_id] = (candidate,)
     return associations
+
+
+def _registered_blocker_evidence_by_request_slot_id(
+    copilot_ctx: Any,
+    run_data: Mapping[str, Any],
+) -> dict[str, tuple[RegisteredBlockerEvidence, ...]]:
+    blocker_slot_ids = {
+        criterion.request_slot_id
+        for criterion in _formed_completion_criteria(copilot_ctx)
+        if criterion.antecedent_family == "blocker" and criterion.request_slot_id is not None
+    }
+    return {
+        slot_id: evidence
+        for slot_id, evidence in _registered_output_evidence_by_request_slot_id(copilot_ctx, run_data).items()
+        if slot_id in blocker_slot_ids
+    }
 
 
 def _authored_output_contract_metadata_paths(metadata: object) -> set[str]:
@@ -1205,6 +1238,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         registered_blocker_evidence_by_request_slot_id=_registered_blocker_evidence_by_request_slot_id(
             copilot_ctx, data
         ),
+        registered_output_evidence_by_request_slot_id=_registered_output_evidence_by_request_slot_id(copilot_ctx, data),
         current_url=_valid_runtime_anchor_url(data.get("current_url")),
         page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
         run_terminal_status=run_terminal_status
@@ -1277,13 +1311,33 @@ def _apply_present_value_upgrades(
     if not upgrades and not semantic_verdicts:
         return run_result
 
+    criteria_by_id = {criterion.id: criterion for criterion in run_criteria}
+    evidence_catalog = snapshot.rendered_evidence_catalog()
+
+    def _upgrade_is_admissible(upgrade: CriterionVerdict) -> bool:
+        criterion = criteria_by_id.get(upgrade.criterion_id)
+        if criterion is None or not is_neutral_reported_boolean_criterion(criterion):
+            return True
+        return _satisfying_evidence_is_admissible(
+            criterion,
+            upgrade.evidence_ref,
+            evidence_catalog,
+            snapshot.registered_output_evidence_by_request_slot_id,
+        )
+
     def _merged(verdict: CriterionVerdict) -> CriterionVerdict:
         # Semantic contradictions are stronger than earlier satisfied verdicts:
         # a row-mixing/status contradiction means the record evidence is invalid.
         if verdict.criterion_id in semantic_verdicts:
             return semantic_verdicts[verdict.criterion_id]
-        if verdict.criterion_id in upgrades and not verdict.satisfied and verdict.reason_code != "evidence_contradicts":
-            return upgrades[verdict.criterion_id]
+        upgrade = upgrades.get(verdict.criterion_id)
+        if (
+            upgrade is not None
+            and _upgrade_is_admissible(upgrade)
+            and not verdict.satisfied
+            and verdict.reason_code != "evidence_contradicts"
+        ):
+            return upgrade
         return verdict
 
     verdicts = [_merged(verdict) for verdict in run_result.verdicts]
