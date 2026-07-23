@@ -11222,6 +11222,18 @@
             "title": "Rotate Proxy Session Id",
             "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
             "default": false
+          },
+          "tested_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tested Url",
+            "description": "Login page URL used during the credential test"
           }
         },
         "type": "object",
