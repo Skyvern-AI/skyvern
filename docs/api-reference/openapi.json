@@ -74,6 +74,9 @@
           "400": {
             "description": "Invalid agent engine"
           },
+          "403": {
+            "description": "The selected `engine` or `model` is gated to enterprise plans. Returned when a non-enterprise organization requests an enterprise-only CUA engine (`openai-cua`, `anthropic-cua`) or an enterprise-only model (any Anthropic Claude Opus 4.x variant)."
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -194,6 +197,9 @@
           },
           "400": {
             "description": "Invalid agent run request"
+          },
+          "403": {
+            "description": "The workflow contains a block configured with an enterprise-gated `engine` or `model` and the calling organization is not on an enterprise plan. Applies to CUA engines (`openai-cua`, `anthropic-cua`) and Anthropic Claude Opus 4.x models."
           },
           "422": {
             "description": "Validation Error",
@@ -22995,7 +23001,7 @@
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n\n**Enterprise-gated:** `openai-cua` and `anthropic-cua` are available only to enterprise organizations. Non-enterprise callers that request these engines receive HTTP 403.\n",
             "default": "skyvern-1.0"
           },
           "title": {
@@ -23165,7 +23171,7 @@
               }
             ],
             "title": "Model",
-            "description": "\nOptional model configuration.\n"
+            "description": "\nOptional model configuration. Pass an object such as `{\"model_name\": \"<model>\"}` to override the LLM used for the run.\n\n**Enterprise-gated models:** Anthropic Claude Opus 4.x variants (`us.anthropic.claude-opus-4-20250514-v1:0`, `claude-opus-4-5-20251101`, `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`) are available only to enterprise organizations. Non-enterprise callers that request these models receive HTTP 403.\n"
           },
           "extra_http_headers": {
             "anyOf": [
