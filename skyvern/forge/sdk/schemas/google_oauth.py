@@ -103,6 +103,11 @@ class CreateGoogleOAuthAuthorizeRequest(BaseModel):
         description="Origin the callback should bounce back to (e.g. a Vercel preview URL). "
         "Must be on the GOOGLE_OAUTH_APP_ORIGINS allowlist.",
     )
+    credential_id: str | None = Field(
+        default=None,
+        description="Existing credential to re-authenticate in place. When set, the connection keeps "
+        "its identity so workflows referencing it continue to work without edits.",
+    )
 
 
 class GoogleOAuthAuthorizeResponse(BaseModel):

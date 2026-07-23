@@ -71,7 +71,10 @@ async def google_oauth_authorize(
             credential_name=request.credential_name,
             scope_profile=request.scope_profile,
             app_origin=request.app_origin,
+            credential_id=request.credential_id,
         )
+    except google_oauth_service.CredentialNotReauthorizableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except InvalidAppOriginError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except google_oauth_service.UnsupportedScopeProfileError as exc:
