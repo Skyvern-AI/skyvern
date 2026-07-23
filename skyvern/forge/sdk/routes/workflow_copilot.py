@@ -989,6 +989,7 @@ async def _finalise_normal_turn(
         should_render_terminal_from_envelope = await app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(
             organization_id
         )
+        replaced = False
         if should_render_terminal_from_envelope:
             # rendered_from_envelope means "flag on, envelope is display
             # authority" for the FE — not that this turn's text was replaced.
@@ -1007,6 +1008,17 @@ async def _finalise_normal_turn(
                 # The frame-level summary is preferred by the FE over the
                 # message on hydration, so it must carry the rendered text too.
                 narrative_summary = user_response
+        # The envelope's own log fields are stamped pre-render, so this is the
+        # only signal that witnesses the render decision in prod.
+        LOG.info(
+            "copilot_terminal_render_decision",
+            flag_enabled=should_render_terminal_from_envelope,
+            replaced=replaced,
+            run_verdict=terminal_envelope_model.run_verdict,
+            next_state=terminal_envelope_model.next_state,
+            response_kind=terminal_envelope_model.response_kind,
+            reason_present=bool(terminal_envelope_model.run_display_reason),
+        )
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
         cancelled=False,
