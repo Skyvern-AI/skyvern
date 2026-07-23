@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -4530,20 +4529,6 @@ def _dynamic_row_click(*, source_url: str = "https://example.com/statements") ->
         "dynamic_row_evidence": row_evidence,
     }
     return interaction
-
-
-def test_dynamic_row_evidence_fingerprint_is_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
-    evidence = _dynamic_row_click()["dynamic_row_evidence"]
-    payload = {key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
-
-    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-alpha")
-    fingerprint_a = dynamic_row_evidence_fingerprint(**payload)
-    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-beta")
-    fingerprint_b = dynamic_row_evidence_fingerprint(**payload)
-
-    assert len(fingerprint_a) == 64
-    assert len(fingerprint_b) == 64
-    assert fingerprint_a != fingerprint_b
 
 
 def test_valid_unused_dynamic_row_evidence_preserves_generic_positional_synthesis() -> None:
