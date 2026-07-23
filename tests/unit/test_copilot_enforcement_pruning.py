@@ -1265,6 +1265,206 @@ class TestSynthesizedOfferPersistenceGate:
 
         assert ctx.blocker_signal is terminal_signal
 
+    def _in_progress_login_ctx(self, trajectory: list[dict[str, object]]) -> _Ctx:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.scout_trajectory = trajectory
+        ctx.synthesized_block_offered_trajectory_len = len(trajectory)
+        ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+        return ctx
+
+    @staticmethod
+    def _credential_fill(field: str, trajectory_index: int, source_url: str) -> dict[str, object]:
+        return {
+            "tool_name": "fill_credential_field",
+            "trajectory_index": trajectory_index,
+            "credential_id": "cred_login",
+            "credential_field": field,
+            "selector": f"input[name='{field}']",
+            "source_url": source_url,
+        }
+
+    @staticmethod
+    def _login_submit_click(trajectory_index: int, source_url: str) -> dict[str, object]:
+        return {
+            "tool_name": "click",
+            "trajectory_index": trajectory_index,
+            "selector": "button[type='submit']",
+            "accessible_name": "Log in",
+            "source_url": source_url,
+        }
+
+    def test_in_progress_login_admits_commit_interactions_after_credential_fills(self) -> None:
+        login_url = "https://portal.test/login"
+        ctx = self._in_progress_login_ctx(
+            [
+                self._credential_fill("username", 0, login_url),
+                self._credential_fill("password", 1, login_url),
+                self._login_submit_click(2, login_url),
+            ]
+        )
+
+        armed = synthesized_block_persistence_signal(ctx, "select_option", {"value": "monthly"})
+        assert isinstance(armed, CopilotToolBlockerSignal)
+        assert armed.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "button[type='submit']"}) is None
+        assert synthesized_block_persistence_signal(ctx, "press_key", {"key": "Enter"}) is None
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION in ctx.turn_ownership.claims
+
+        non_submit_key = synthesized_block_persistence_signal(ctx, "press_key", {"key": "Tab"})
+        assert isinstance(non_submit_key, CopilotToolBlockerSignal)
+        assert non_submit_key.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_in_progress_login_refuses_press_key_when_arguments_are_absent(self) -> None:
+        login_url = "https://portal.test/login"
+        ctx = self._in_progress_login_ctx(
+            [
+                self._credential_fill("username", 0, login_url),
+                self._credential_fill("password", 1, login_url),
+                self._login_submit_click(2, login_url),
+            ]
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "press_key", {"key": "Enter"}) is None
+
+        for absent in (None, "Enter", ["Enter"]):
+            refused = synthesized_block_persistence_signal(ctx, "press_key", absent)
+            assert isinstance(refused, CopilotToolBlockerSignal)
+            assert refused.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_in_progress_login_admits_two_factor_confirm_after_token_fill(self) -> None:
+        login_url = "https://portal.test/login"
+        ctx = self._in_progress_login_ctx(
+            [
+                self._credential_fill("username", 0, login_url),
+                self._credential_fill("password", 1, login_url),
+                self._login_submit_click(2, login_url),
+                self._credential_fill("totp", 3, "https://portal.test/mfa"),
+            ]
+        )
+
+        armed = synthesized_block_persistence_signal(ctx, "select_option", {"value": "monthly"})
+        assert isinstance(armed, CopilotToolBlockerSignal)
+        assert armed.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+        assert synthesized_block_persistence_signal(ctx, "fill_credential_field", {"credential_field": "totp"}) is None
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "button[data-action='verify']"}) is None
+        assert synthesized_block_persistence_signal(ctx, "press_key", {"key": "Enter"}) is None
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION in ctx.turn_ownership.claims
+
+    def test_login_completion_closes_at_post_credential_commit(self) -> None:
+        login_url = "https://portal.test/login"
+        reports_url = "https://portal.test/reports"
+        ctx = self._in_progress_login_ctx(
+            [
+                self._credential_fill("username", 0, login_url),
+                self._credential_fill("password", 1, login_url),
+                self._login_submit_click(2, login_url),
+                {
+                    "tool_name": "type_text",
+                    "trajectory_index": 3,
+                    "selector": "input[name='date_from']",
+                    "typed_value": "-7d",
+                    "source_url": reports_url,
+                },
+                {
+                    "tool_name": "click",
+                    "trajectory_index": 4,
+                    "selector": "button[data-action='run-report']",
+                    "accessible_name": "Run report",
+                    "source_url": reports_url,
+                },
+            ]
+        )
+
+        blocked_click = synthesized_block_persistence_signal(ctx, "click", {"selector": "button[data-action='next']"})
+        assert isinstance(blocked_click, CopilotToolBlockerSignal)
+        assert blocked_click.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+        blocked_key = synthesized_block_persistence_signal(ctx, "press_key", {"key": "Enter"})
+        assert isinstance(blocked_key, CopilotToolBlockerSignal)
+        assert blocked_key.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert ctx.turn_ownership is None
+
+    def test_login_completion_window_stays_open_on_read_only_post_login_surface(self) -> None:
+        """Characterizes the shipped bound, which is wider than 'until the login outcome is observable'.
+
+        The close condition credits a commit only from an ordered pair whose second click is neither a
+        generic opener nor results-surface navigation. A read-only post-login surface never supplies one,
+        so the window stays open for the rest of the turn. Tracked as a follow-up, not a shipped intent.
+        """
+        login_url = "https://portal.test/login"
+        app_url = "https://portal.test/analytics"
+        ctx = self._in_progress_login_ctx(
+            [
+                self._credential_fill("username", 0, login_url),
+                self._credential_fill("password", 1, login_url),
+                self._login_submit_click(2, login_url),
+                {
+                    "tool_name": "click",
+                    "trajectory_index": 3,
+                    "selector": "a[href='/analytics/web']",
+                    "accessible_name": "Web analytics",
+                    "role": "link",
+                    "source_url": app_url,
+                },
+                {
+                    "tool_name": "click",
+                    "trajectory_index": 4,
+                    "selector": "a[href='/analytics/web?range=7d']",
+                    "accessible_name": "Last 7 days",
+                    "role": "link",
+                    "source_url": app_url,
+                },
+                {
+                    "tool_name": "click",
+                    "trajectory_index": 5,
+                    "selector": "table tbody tr:nth-child(2)",
+                    "accessible_name": "Row 2",
+                    "source_url": app_url,
+                },
+            ]
+        )
+
+        assert synthesized_block_persistence_signal(ctx, "click", {"selector": "button#delete-account"}) is None
+
+    def test_click_outside_authentication_still_blocked_by_persistence_gate(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="form-submit",
+                    outcome="form fields are filled",
+                    kind="terminal_action",
+                    terminal_action_family="form",
+                )
+            ],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "button.start", "accessible_name": "Start"},
+        ]
+
+        click_signal = synthesized_block_persistence_signal(ctx, "click")
+        assert isinstance(click_signal, CopilotToolBlockerSignal)
+        assert click_signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
 
 # ---------------------------------------------------------------------------
 # _is_meaningful_extracted_data
