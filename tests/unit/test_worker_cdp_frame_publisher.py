@@ -74,7 +74,10 @@ def streaming_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def fake_storage(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     save_mock = AsyncMock()
-    fake_app = SimpleNamespace(STORAGE=SimpleNamespace(save_streaming_file=save_mock))
+    fake_app = SimpleNamespace(
+        STORAGE=SimpleNamespace(save_streaming_file=save_mock),
+        AGENT_FUNCTION=SimpleNamespace(should_publish_streaming_frame=AsyncMock(return_value=True)),
+    )
     monkeypatch.setattr(publisher_module, "app", fake_app)
     return save_mock
 
@@ -603,3 +606,78 @@ def test_write_frame_atomically_cleans_tempfile_on_replace_failure(
     assert not (target_dir / "wr_x.png").exists()
     leftovers = [p for p in target_dir.iterdir() if p.name.startswith(".") and p.suffix == ".tmp"]
     assert leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_gate_closed_skips_capture_and_upload(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    gate = AsyncMock(return_value=False)
+    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
+
+    await _drive_publish_once(pub)
+
+    gate.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+    page.context.new_cdp_session.assert_not_awaited()
+    fake_storage.assert_not_awaited()
+    assert not _stream_path(streaming_temp_dir).exists()
+
+
+@pytest.mark.asyncio
+async def test_gate_open_publishes_normally(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    gate = AsyncMock(return_value=True)
+    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
+
+    await _drive_publish_once(pub)
+
+    gate.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+    fake_storage.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+
+
+@pytest.mark.asyncio
+async def test_gate_error_fails_open_and_publishes(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    gate = AsyncMock(side_effect=RuntimeError("gate backend down"))
+    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
+
+    await _drive_publish_once(pub)
+
+    fake_storage.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+
+
+@pytest.mark.asyncio
+async def test_gated_skip_does_not_advance_dedupe_digest(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    # First save is gated at the storage chokepoint (False), second is a real upload.
+    fake_storage.side_effect = [False, None]
+
+    await _drive_publish_once(pub)
+    assert pub._last_published_digest is None
+
+    await _drive_publish_once(pub)
+    assert pub._last_published_digest is not None
+    assert fake_storage.await_count == 2
