@@ -9,9 +9,11 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
     finalize_applied_state,
     reason_in_reply_shadow,
+    render_terminal_message,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import _stash_recorded_run_outcome
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -134,6 +136,10 @@ def test_next_state_derivation(
         ({"proposal_disposition": "review_untested"}, "update"),
         ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": False}, "answer"),
         ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": True}, "stopped"),
+        ({"turn_outcome_response_kind": "refuse", "workflow_mutated": False}, "answer"),
+        ({"turn_outcome_response_kind": "refuse", "workflow_mutated": True}, "stopped"),
+        ({"turn_outcome_response_kind": "recover", "workflow_mutated": False}, "answer"),
+        ({"turn_outcome_response_kind": "recover", "workflow_mutated": True}, "stopped"),
         ({"turn_outcome_response_kind": "build", "workflow_mutated": False}, "stopped"),
     ],
 )
@@ -157,6 +163,7 @@ def test_blocker_fields_attempted_and_envelope_version() -> None:
     assert envelope.blocker_reason == "Need account credentials."
     assert envelope.halt_kind == "loop_detected"
     assert envelope.attempted == "Attempted full checkout run."
+    assert envelope.rendered_from_envelope is False
     assert envelope.envelope_version == 1
 
 
@@ -330,3 +337,102 @@ def test_safe_wrapper_returns_none_when_assembly_raises(monkeypatch: pytest.Monk
     )
 
     assert envelope is None
+
+
+def test_render_terminal_message_stopped_not_demonstrated_contains_verbatim_reason_without_continuation() -> None:
+    reason = "The submit button never enabled after entering all required fields."
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict="not_demonstrated",
+        run_display_reason=reason,
+        response_kind="stopped",
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+
+    assert replaced is True
+    assert reason in rendered
+    forbidden_phrases = (
+        "i'll keep working",
+        "i will keep working",
+        "i'm still working",
+        "keep working on it",
+        "next i will",
+        "next, i will",
+        "going to try again",
+    )
+    lowered = rendered.lower()
+    assert all(phrase not in lowered for phrase in forbidden_phrases)
+
+
+def test_render_terminal_message_stopped_degraded_envelope_uses_minimal_honest_stop() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict=None,
+        run_display_reason=None,
+        response_kind="stopped",
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+
+    assert replaced is True
+    assert rendered == "I stopped without confirming the goal was met."
+
+
+def test_render_terminal_message_no_run_blocker_stop_keeps_blocker_evidence() -> None:
+    blocker = "The site demands SSO before any page loads."
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict=None,
+        run_display_reason=None,
+        blocker_reason=blocker,
+        response_kind="stopped",
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+
+    assert replaced is True
+    assert rendered.startswith("I stopped without confirming the goal was met.")
+    assert blocker in rendered
+
+
+@pytest.mark.parametrize(
+    ("next_state", "cancelled"),
+    [
+        ("completed", False),
+        ("proposal_pending", False),
+        ("awaiting_user_input", False),
+        ("stopped", True),
+    ],
+)
+def test_render_terminal_message_passthrough_for_non_stopped_or_cancelled(next_state: str, cancelled: bool) -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state=next_state, verified=False, run_verdict="not_demonstrated", response_kind="stopped"
+    )
+    message = "keep-agent-message"
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=cancelled)
+
+    assert rendered == message
+    assert replaced is False
+
+
+def test_render_terminal_message_keeps_answer_kind_replies_on_stopped_state() -> None:
+    # Diagnose/refuse turns end next_state="stopped" with response_kind="answer";
+    # their specific reply text is the deliverable and must survive flag-on.
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict=None,
+        run_display_reason=None,
+        response_kind="answer",
+    )
+    message = "The run failed because the export needs admin rights; here is what that means."
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert rendered == message
+    assert replaced is False
