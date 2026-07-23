@@ -73,6 +73,8 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx.workflow_id = "w_test"
     ctx.workflow_permanent_id = "wpid_test"
     ctx.organization_id = "o_test"
+    ctx.code_authoring_guardrail_reject_count = 0
+    ctx.recorded_build_test_outcome_history = []
     return ctx
 
 
