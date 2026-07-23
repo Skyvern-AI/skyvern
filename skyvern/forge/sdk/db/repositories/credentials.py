@@ -39,6 +39,7 @@ class CredentialRepository(BaseRepository):
         card_brand: str | None,
         totp_identifier: str | None = None,
         secret_label: str | None = None,
+        tested_url: str | None = None,
         proxy_location: ProxyLocationInput = None,
         proxy_session_id: str | None = None,
     ) -> Credential:
@@ -60,6 +61,7 @@ class CredentialRepository(BaseRepository):
                 card_last4=card_last4,
                 card_brand=card_brand,
                 secret_label=secret_label,
+                tested_url=tested_url,
                 proxy_location=serialized_proxy_location,
                 proxy_session_id=proxy_session_id,
             )
@@ -205,6 +207,7 @@ class CredentialRepository(BaseRepository):
         card_last4: str | None = None,
         card_brand: str | None = None,
         secret_label: str | None = None,
+        tested_url: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         proxy_session_id: str | None | object = _UNSET,
         rotate_proxy_session_id: bool = False,
@@ -230,6 +233,8 @@ class CredentialRepository(BaseRepository):
             credential.card_last4 = card_last4
             credential.card_brand = card_brand
             credential.secret_label = secret_label
+            if tested_url is not None:
+                credential.tested_url = tested_url
             apply_proxy_pin_to_model(
                 credential,
                 entity_id=credential_id,

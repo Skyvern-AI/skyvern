@@ -235,6 +235,7 @@ class CreateCredentialRequest(BaseModel):
         default=False,
         description="Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
     )
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
     @field_validator("proxy_location", mode="before")
     @classmethod
