@@ -19,6 +19,7 @@ from agents.run import Runner
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    RAW_SECRET_LEAK_REASON_CODE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
     CopilotToolBlockerSignal,
@@ -470,10 +471,18 @@ def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBloc
     user_facing, _tiers = compose_loop_blocker_user_facing_reason(
         "credential_priority_authoring_churn", evidence, blocked_tool="update_workflow"
     )
-    agent_steering = (
-        f"The credential-scout gate has rejected the generated code {count} times without an accepted save; "
-        "stop rewriting it and report the recorded blocker from the preserved draft."
-    )
+    # Older context snapshots may not carry fields added after the snapshot was created.
+    reject_reason_codes = getattr(ctx, "last_output_policy_reject_reason_codes", None)
+    if reject_reason_codes == frozenset({RAW_SECRET_LEAK_REASON_CODE}):
+        agent_steering = (
+            "The generated login code embedded the credential's secret value and was refused; "
+            "stop rewriting it and report the recorded blocker from the preserved draft."
+        )
+    else:
+        agent_steering = (
+            f"The credential-scout gate has rejected the generated code {count} times without an accepted save; "
+            "stop rewriting it and report the recorded blocker from the preserved draft."
+        )
     return CopilotToolBlockerSignal(
         blocker_kind="loop_detected",
         agent_steering_text=agent_steering,
@@ -595,7 +604,11 @@ def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
 
 
 def _record_code_authoring_guardrail_reject(
-    ctx: AgentContext, *, defer_churn_stop: bool = False, frontier_unchanged: bool = False
+    ctx: AgentContext,
+    *,
+    defer_churn_stop: bool = False,
+    frontier_unchanged: bool = False,
+    output_policy_reason_codes: frozenset[str] | None = None,
 ) -> None:
     # Callers record the current build-test outcome first so repeat detection compares that key to history.
     repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
@@ -605,6 +618,9 @@ def _record_code_authoring_guardrail_reject(
         ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
+    # Any non-output-policy reject clears the cause, so the credential-priority terminal never
+    # attributes a scout-gate stop to a stale raw-secret-leak streak.
+    ctx.last_output_policy_reject_reason_codes = output_policy_reason_codes
     LOG.info(
         "copilot code-authoring guardrail reject recorded",
         reject_count=ctx.code_authoring_guardrail_reject_count,

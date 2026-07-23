@@ -13325,6 +13325,7 @@ async def _update_workflow(
         workflow_yaml, ctx
     )
     if typed_default_violations:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(
             error="\n".join(typed_default_violations),
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -13470,6 +13471,7 @@ async def _update_workflow(
         metadata_scrubbed_by_imposition = True
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
     if parameter_contract_error is not None:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(
             error=parameter_contract_error,
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -13559,6 +13561,7 @@ async def _update_workflow(
                     payload=payload,
                     tool_name="update_workflow",
                 )
+                _record_code_authoring_guardrail_reject(ctx)
                 return reject(
                     error=str(reject_result["error"]),
                     user_facing_summary=str(
@@ -13966,14 +13969,17 @@ async def _update_workflow(
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
     stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
     if stale_metadata:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=_stale_block_metadata_message(stale_metadata))
 
     wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
     if wait_block_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=wait_block_error)
 
     challenge_http_error = _challenge_http_request_reject_message(ctx, workflow_yaml, ctx.workflow_yaml)
     if challenge_http_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=challenge_http_error)
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
@@ -13987,14 +13993,17 @@ async def _update_workflow(
     )
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=_banned_block_reject_message(banned_items, ctx))
 
     download_scout_error = _download_scout_required_error(ctx, workflow_yaml)
     if download_scout_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=download_scout_error)
 
     download_binding_error = _download_binding_required_error(ctx, workflow_yaml)
     if download_binding_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=download_binding_error)
 
     composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
@@ -14004,6 +14013,7 @@ async def _update_workflow(
             workflow_permanent_id=ctx.workflow_permanent_id,
             target_url=workflow_target_url(workflow_yaml),
         )
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=composition_evidence_error)
 
     # New data-write blocks default to surfacing failures rather than swallowing them.
@@ -14288,6 +14298,7 @@ async def _update_workflow(
         ctx.persisted_draft_browser_calls = _workflow_yaml_browser_call_pairs(workflow_yaml)
         ctx.code_authoring_guardrail_reject_count = 0
         ctx.last_code_authoring_reject_was_credential_priority = False
+        ctx.last_output_policy_reject_reason_codes = None
         ctx.metadata_reject_ladder_state = None
         _clear_code_authoring_repair_context(ctx)
         _clear_held_churn_signals(ctx)

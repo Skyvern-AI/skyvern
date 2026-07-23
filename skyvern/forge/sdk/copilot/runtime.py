@@ -380,6 +380,7 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    last_output_policy_reject_reason_codes: frozenset[str] | None = None
     # Climbs on each click that made no verified forward progress (failed/timed-out
     # click or a hollow post-click observe); resets on verified progress.
     consecutive_no_progress_interaction_count: int = 0
