@@ -9,6 +9,7 @@ import ast
 import asyncio
 import json
 import keyword
+import re
 import sys
 import textwrap
 from dataclasses import replace
@@ -18,6 +19,7 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -55,10 +57,12 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _get_by_role_expr,
     _get_by_role_expr_strict,
     _is_submit_interaction,
+    _strict_period_date_pattern,
     build_input_templated_locator,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     credential_scout_gap,
+    dynamic_row_evidence_fingerprint,
     input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
     obligation_finding_reason_code,
@@ -4247,6 +4251,115 @@ def test_input_correspondence_selector_identity_and_month() -> None:
     assert by_key["billing_period"]["transform"] == "month_name_to_iso"
 
 
+def test_input_correspondence_iso_dates_collapse_to_canonical_period_key_independent_of_order() -> None:
+    interaction = {"tool_name": "click", "selector": "a[href='/statements/100245_2026-05.pdf']"}
+    forward = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    reverse = input_correspondences_for_interaction(
+        interaction,
+        {"download_end_date": "2026-05-31", "download_start_date": "2026-05-01"},
+    )
+
+    assert forward == reverse
+    period = next(correspondence for correspondence in forward if correspondence["matched_literal"] == "2026-05")
+    assert period["input_key"] == "download_end_date"
+    assert period["transform"] == "iso_date_to_year_month"
+    assert period["equivalent_inputs"] == [
+        {
+            "input_key": "download_start_date",
+            "parameter_value": "2026-05-01",
+            "transform": "iso_date_to_year_month",
+        }
+    ]
+
+
+@pytest.mark.parametrize("value", ["2026-5-01", "2026-02-30", "2026-13-01", "2026-05-01T00:00:00"])
+def test_input_correspondence_iso_date_transform_is_strict(value: str) -> None:
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": "a[href='/statements/2026-05.pdf']"},
+            {"download_start_date": value},
+        )
+        == []
+    )
+
+
+def test_input_correspondence_prefers_exact_iso_date_over_its_period_projection() -> None:
+    assert input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": '[data-range="2026-08-01"]'},
+        {"billing_start_date": "2026-08-01"},
+    ) == [
+        {
+            "input_key": "billing_start_date",
+            "matched_literal": "2026-08-01",
+            "parameter_value": "2026-08-01",
+            "surface": "selector",
+            "transform": "identity",
+            "position": 13,
+        }
+    ]
+
+
+def test_input_correspondence_keeps_distinct_iso_projection_outside_exact_span() -> None:
+    selector = 'a[data-date="2026-05-01"][href="/statements/2026-05.pdf"]'
+
+    correspondences = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": selector},
+        {"billing_start_date": "2026-05-01"},
+    )
+
+    assert [(hole["matched_literal"], hole["transform"], hole["position"]) for hole in correspondences] == [
+        ("2026-05-01", "identity", 13),
+        ("2026-05", "iso_date_to_year_month", 44),
+    ]
+    expression = build_input_templated_locator(
+        surface="selector", selector=selector, role="", name="", holes=correspondences
+    )
+    assert expression is not None
+    assert "{billing_start_date}" in expression
+    assert "{_scout_iso_date_to_year_month(billing_start_date)}" in expression
+    interaction = {"tool_name": "click", "selector": selector, "source_url": "https://example.com/statements"}
+    interaction["input_correspondences"] = correspondences
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    assert 'data-date="2026-05-01"' not in synthesized.code
+    assert "/statements/2026-05.pdf" not in synthesized.code
+
+
+def test_input_correspondence_rejects_partially_overlapping_matches() -> None:
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": "a[href='/statements/2026-05.pdf']"},
+            {"period": "2026-05", "month_suffix": "05.pdf"},
+        )
+        == []
+    )
+
+
+def test_synthesized_collision_guard_rejects_runtime_period_divergence_before_browser_mutation() -> None:
+    interaction = {
+        "tool_name": "click",
+        "selector": "a[href='/statements/100245_2026-05.pdf']",
+        "source_url": "https://example.com/statements",
+    }
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    code = synthesized.code
+    guard = "grounded parameters do not resolve to one period"
+    assert guard in code
+    assert code.index(guard) < code.index("await page.goto")
+    assert "_scout_iso_date_to_year_month(download_end_date)" in code
+    assert "_scout_iso_date_to_year_month(download_start_date)" in code
+
+
 def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
     # "Widget" also occurs as a non-boundary substring inside "Widgetry"; the hole must template the
     # boundary-validated standalone span, not the first find() hit.
@@ -4269,6 +4382,9 @@ def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
         {"page": "100245"},
         {"re": "100245"},
         {"_scout_month_to_iso": "100245"},
+        {"_scout_iso_date_to_year_month": "100245"},
+        {"_scout_period_month_name": "100245"},
+        {"_scout_period_year": "100245"},
         {"account_number": "100245'] , [href"},
     ],
 )
@@ -4390,6 +4506,234 @@ def test_synthesize_unwitnessed_selector_byte_identical() -> None:
     assert INPUT_TEMPLATED_PROVENANCE_SOURCE not in baseline.code
     assert all(p.get("source") != LOCATOR_WITNESS_PARAM_SOURCE for p in baseline.parameters)
     assert "_scout_month_to_iso" not in baseline.code
+
+
+def _dynamic_row_click(*, source_url: str = "https://example.com/statements") -> dict[str, Any]:
+    selector = "div.statement-row >> nth=2"
+    row_evidence = {
+        "source_url": "https://example.com/statements",
+        "target_selector": selector,
+        "row_selector": "div.statement-row",
+        "row_text": "Statement May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+    }
+    row_evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(**row_evidence)
+    interaction: dict[str, Any] = {
+        "tool_name": "click",
+        "selector": selector,
+        "source_url": source_url,
+        "dynamic_row_evidence": row_evidence,
+    }
+    return interaction
+
+
+def test_dynamic_row_evidence_fingerprint_is_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence = _dynamic_row_click()["dynamic_row_evidence"]
+    payload = {key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+
+    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-alpha")
+    fingerprint_a = dynamic_row_evidence_fingerprint(**payload)
+    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-beta")
+    fingerprint_b = dynamic_row_evidence_fingerprint(**payload)
+
+    assert len(fingerprint_a) == 64
+    assert len(fingerprint_b) == 64
+    assert fingerprint_a != fingerprint_b
+
+
+def test_valid_unused_dynamic_row_evidence_preserves_generic_positional_synthesis() -> None:
+    interaction = _dynamic_row_click()
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["row_text"] = "Current statement"
+    evidence["row_text_match_count"] = 2
+    evidence["period_matches"] = []
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    baseline_interaction = {key: value for key, value in interaction.items() if key != "dynamic_row_evidence"}
+    baseline = synthesize_code_block([baseline_interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    assert baseline is not None
+    assert synthesized.code == baseline.code
+    assert synthesized.parameters == baseline.parameters
+    assert synthesized.diagnostics.dropped_interactions == []
+
+
+def test_dynamic_row_period_requires_unique_period_across_candidate_rows() -> None:
+    interaction = _dynamic_row_click()
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["period_matches"][0]["row_match_count"] = 2
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    assert (
+        input_correspondences_for_interaction(
+            interaction,
+            {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+        )
+        == []
+    )
+
+
+def test_stamped_dynamic_row_period_license_fails_closed_when_cross_row_count_is_stale() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["period_matches"][0]["row_match_count"] = 2
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    assert synthesized.diagnostics.emitted_interactions == []
+    assert synthesized.diagnostics.dropped_interactions[0]["reason_code"] == "invalid_dynamic_row_evidence"
+
+
+@pytest.mark.parametrize(
+    ("period", "matching", "non_matching"),
+    [
+        ("2026-05", "Statement mAy 5, 2026", "Statement May 5, 2025"),
+        ("2026-05", "Statement MAY 05, 2026.", "Statement May 00, 2026."),
+        ("2024-02", "Statement February 29, 2024", "Statement February 31, 2024"),
+        ("2026-02", "Statement February 28, 2026", "Statement February 29, 2026"),
+        ("2026-04", "Statement April 30, 2026", "Statement April 31, 2026"),
+    ],
+)
+def test_period_matcher_is_case_insensitive_and_gregorian_valid(period: str, matching: str, non_matching: str) -> None:
+    pattern = _strict_period_date_pattern(period)
+
+    assert pattern is not None
+    assert pattern.search(matching) is not None
+    assert pattern.search(non_matching) is None
+
+
+def test_period_matcher_rejects_year_zero() -> None:
+    assert _strict_period_date_pattern("0000-05") is None
+
+
+def test_emitted_period_matcher_uses_same_case_and_calendar_contract() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    function = next(
+        node
+        for node in ast.parse(textwrap.dedent(synthesized.code)).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_scout_period_date_pattern"
+    )
+    namespace: dict[str, Any] = {"re": re}
+    exec(ast.unparse(function), namespace)
+    matcher = namespace["_scout_period_date_pattern"]
+
+    assert matcher("2026-05").search("Statement mAy 5, 2026") is not None
+    assert matcher("2026-05").search("Statement MAY 05, 2026.") is not None
+    assert matcher("2026-02").search("Statement February 29, 2026") is None
+    assert matcher("2024-02").search("Statement February 29, 2024") is not None
+    assert matcher("2026-04").search("Statement April 31, 2026") is None
+    with pytest.raises(Exception, match="unrecognized grounded period"):
+        matcher("0000-05")
+
+
+def test_dynamic_row_period_parity_accepts_zero_padded_day_and_trailing_punctuation() -> None:
+    interaction = _dynamic_row_click()
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["row_text"] = "Statement mAy 05, 2026."
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    correspondences = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+
+    assert any(item["surface"] == "row_text" for item in correspondences)
+    interaction["input_correspondences"] = correspondences
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    assert ".filter(has_text=_scout_period_date_pattern(" in synthesized.code
+
+
+def test_dynamic_row_period_evidence_emits_direct_count_guarded_locator() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    assert "nth=" not in synthesized.code
+    assert 'page.locator("div.statement-row")' in synthesized.code
+    assert synthesized.code.count("def _scout_period_date_pattern(") == 1
+    assert ".filter(has_text=_scout_period_date_pattern(" in synthesized.code
+    assert "_scout_period_month_name" not in synthesized.code
+    assert "_scout_period_year" not in synthesized.code
+    assert ".count() != 1" in synthesized.code
+    assert {parameter["key"] for parameter in synthesized.parameters} == {
+        "download_end_date",
+        "download_start_date",
+    }
+
+
+def test_dynamic_row_period_matcher_does_not_join_month_and_year_from_unrelated_fields() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    # The generated matcher requires one contiguous witnessed date; month/year in separate fields do not qualify.
+    pattern = _strict_period_date_pattern("2027-06")
+    assert pattern is not None
+    assert pattern.search("Month June | account opened 2027") is None
+    assert pattern.search("Statement June 5, 2027") is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda evidence: evidence.pop("row_text"),
+        lambda evidence: evidence.update(source_url="https://other.example.org/statements"),
+        lambda evidence: evidence.update(target_selector="div.other-row >> nth=2"),
+    ],
+)
+def test_dynamic_row_period_evidence_fails_closed_when_relation_is_missing_or_competing(mutation: Any) -> None:
+    interaction = _dynamic_row_click()
+    mutation(interaction["dynamic_row_evidence"])
+
+    assert (
+        input_correspondences_for_interaction(
+            interaction,
+            {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+        )
+        == []
+    )
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    assert synthesized.diagnostics.emitted_interactions == []
+    assert synthesized.diagnostics.dropped_interactions[0]["reason_code"] == "invalid_dynamic_row_evidence"
 
 
 def test_synthesize_input_purity() -> None:

@@ -22069,6 +22069,128 @@ def test_input_templated_provenance_rejects_tamper() -> None:
     assert not workflow_update_module._locator_provenance_is_self_validating(missing_holes)
 
 
+def test_input_templated_provenance_rejects_dropping_distinct_iso_projection() -> None:
+    selector = 'a[data-date="2026-05-01"][href="/statements/2026-05.pdf"]'
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": selector},
+        {"billing_start_date": "2026-05-01"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="selector", selector=selector, role="", name="", holes=holes
+    )
+    provenance = {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "selector",
+        "selector": selector,
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+    assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+
+    tampered = dict(provenance)
+    tampered["holes"] = [dict(holes[0])]
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+
+def test_dynamic_selection_row_input_templated_provenance_recomputes_and_rejects_capture_tamper() -> None:
+    selector = "div.statement-row >> nth=2"
+    row_evidence = {
+        "source_url": "https://example.com/statements",
+        "target_selector": selector,
+        "row_selector": "div.statement-row",
+        "row_text": "Statement May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+    }
+    row_evidence["evidence_fingerprint"] = code_block_synthesis_module.dynamic_row_evidence_fingerprint(**row_evidence)
+    interaction = {
+        "tool_name": "click",
+        "selector": selector,
+        "source_url": "https://example.com/statements",
+        "dynamic_row_evidence": row_evidence,
+    }
+    interaction["input_correspondences"] = workflow_update_module.input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = code_block_synthesis_module.synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    provenance = next(
+        record for record in synthesized.diagnostics.locator_provenance if record.get("surface") == "row_text"
+    )
+    assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+
+    tampered = dict(provenance)
+    tampered["row_text_match_count"] = 2
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+    tampered_period = json.loads(json.dumps(provenance))
+    tampered_period["period_matches"][0]["row_match_count"] = 2
+    tampered_period["evidence_fingerprint"] = code_block_synthesis_module.dynamic_row_evidence_fingerprint(
+        source_url=tampered_period["source_url"],
+        target_selector=tampered_period["target_selector"],
+        row_selector=tampered_period["row_selector"],
+        row_text=tampered_period["row_text"],
+        row_selector_count=tampered_period["row_selector_count"],
+        row_text_match_count=tampered_period["row_text_match_count"],
+        period_matches=tampered_period["period_matches"],
+        selected_index=tampered_period["selected_index"],
+    )
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered_period)
+
+
+def test_dynamic_selection_public_provenance_omits_page_text_query_and_credentials() -> None:
+    provenance = {
+        "trajectory_index": 2,
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "row_text",
+        "source_url": "https://user:password@example.com/statements?token=secret#private",
+        "target_selector": "div.row >> nth=2",
+        "row_selector": "div.row",
+        "row_text": "Customer Alice secret account text May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+        "emitted_literal": "page.locator('div.row')",
+        "holes": [
+            {
+                "input_key": "download_start_date",
+                "matched_literal": "2026-05",
+                "parameter_value": "2026-05-01",
+                "transform": "iso_date_to_year_month",
+                "position": 35,
+            }
+        ],
+    }
+
+    public = workflow_update_module._public_locator_provenance([provenance])
+
+    serialized = json.dumps(public)
+    assert public == [
+        {
+            "trajectory_index": 2,
+            "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+            "surface": "row_text",
+            "source_origin": "https://example.com",
+            "input_keys": ["download_start_date"],
+            "transforms": ["iso_date_to_year_month"],
+        }
+    ]
+    for secret in ("Alice", "secret", "password", "token", "2026-05-01"):
+        assert secret not in serialized
+
+    tampered = dict(provenance)
+    tampered["source_url"] = "https://other.example.org/statements"
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+
 def test_confluence_stamps_and_clears_input_correspondences() -> None:
     ctx = _code_only_ctx()
     ctx.scout_trajectory = [
