@@ -42,6 +42,15 @@ from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 LOG = structlog.get_logger()
 _UNSET = object()
 
+# A row with an upstream endpoint but no client-facing address yet is vendor-held (the vendor
+# owns the browser directly; the CDP proxy is the only way to reach it) and must stay off
+# customer-facing session surfaces. Self-hosted routed rows set both columns together, and
+# rows created before routing existed set neither — both cases stay visible.
+_VISIBLE_TO_CUSTOMER = or_(
+    PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
+    PersistentBrowserSessionModel.browser_address.isnot(None),
+)
+
 
 class BrowserSessionsRepository(BaseRepository):
     """Database operations for browser profiles and persistent browser sessions."""
@@ -441,6 +450,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter_by(deleted_at=None)
                 .filter_by(completed_at=None)
                 .filter(PersistentBrowserSessionModel.created_at > naive_utc_now() - timedelta(hours=active_hours))
+                .filter(_VISIBLE_TO_CUSTOMER)
             )
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
@@ -468,6 +478,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
                 .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
+                .filter(_VISIBLE_TO_CUSTOMER)
                 .order_by(
                     open_first.asc(),  # open sessions first
                     PersistentBrowserSessionModel.created_at.desc(),  # then newest within each group
@@ -496,6 +507,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
                 .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
+                .filter(_VISIBLE_TO_CUSTOMER)
             )
             return (await session.execute(count_query)).scalar_one()
 
@@ -558,6 +570,34 @@ class BrowserSessionsRepository(BaseRepository):
                 status="completed",
                 started_at=to_naive_utc(started_at) if started_at else None,
                 completed_at=to_naive_utc(completed_at) if completed_at else naive_utc_now(),
+            )
+            session.add(browser_session)
+            await session.commit()
+            await session.refresh(browser_session)
+            return PersistentBrowserSession.model_validate(browser_session)
+
+    @db_operation("create_vendor_cdp_browser_session")
+    async def create_vendor_cdp_browser_session(
+        self,
+        *,
+        organization_id: str,
+        upstream_cdp_url: str,
+        browser_vendor: str,
+        browser_id: str,
+        timeout_minutes: int,
+    ) -> PersistentBrowserSession:
+        """Create a row for a session the vendor already owns and holds directly, reachable only
+        through the CDP proxy. browser_address and runnable_* stay NULL so the row is excluded
+        from customer-facing session surfaces (see _VISIBLE_TO_CUSTOMER)."""
+        async with self.Session() as session:
+            browser_session = PersistentBrowserSessionModel(
+                organization_id=organization_id,
+                status="running",
+                started_at=naive_utc_now(),
+                timeout_minutes=timeout_minutes,
+                upstream_cdp_url=upstream_cdp_url,
+                browser_vendor=browser_vendor,
+                browser_id=browser_id,
             )
             session.add(browser_session)
             await session.commit()
@@ -701,8 +741,8 @@ class BrowserSessionsRepository(BaseRepository):
         """Set the browser address for a persistent browser session.
 
         browser_address is the client-facing (proxied) URL; upstream_cdp_url is the endpoint the
-        CDP proxy dials and must never be handed to a client or carry a credential — connect-time
-        credentials are injected from env at dial time.
+        CDP proxy dials and must never be handed to a client. It is never a long-lived operator
+        credential, though it may carry a session-scoped token.
         """
         async with self.Session() as session:
             persistent_browser_session = (
