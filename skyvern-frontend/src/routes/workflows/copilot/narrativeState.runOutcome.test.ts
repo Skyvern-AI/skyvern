@@ -6,6 +6,7 @@ import {
   applyNarrativeEvent,
   hydrateNarrativeFromPayload,
   isBlockOk,
+  notConfirmedOutcome,
 } from "./narrativeState";
 import {
   WorkflowCopilotBlockProgressUpdate,
@@ -319,5 +320,114 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(row.state).toBe("completed");
     expect(row.outcome).toBe("not_demonstrated");
     expect(isBlockOk(row)).toBe(false);
+  });
+
+  it("hydrates terminal envelope run facts and leaves legacy rows null", () => {
+    const withEnvelope = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        next_state: "stopped",
+        verified: false,
+        workflow_applied: false,
+        run_verdict: "not_demonstrated",
+        run_display_reason: "Checkout never reached confirmation.",
+        response_kind: "stopped",
+        envelope_version: 1,
+      },
+    })!;
+    expect(withEnvelope.terminalEnvelope).toEqual({
+      runVerdict: "not_demonstrated",
+      runDisplayReason: "Checkout never reached confirmation.",
+    });
+
+    const legacy = hydrateNarrativeFromPayload(payload([]))!;
+    expect(legacy.terminalEnvelope).toBeNull();
+
+    const malformed = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: { run_verdict: "maybe", run_display_reason: 7 },
+    })!;
+    expect(malformed.terminalEnvelope).toEqual({
+      runVerdict: null,
+      runDisplayReason: null,
+    });
+  });
+});
+
+describe("notConfirmedOutcome — envelope-first", () => {
+  const base = {
+    ...EMPTY_NARRATIVE,
+    lastRunOutcome: null,
+    blocks: [],
+  };
+
+  it("envelope not_demonstrated wins even when a later pointer says demonstrated", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      terminalEnvelope: {
+        runVerdict: "not_demonstrated",
+        runDisplayReason: "Cart never showed the item.",
+      },
+      lastRunOutcome: {
+        verdict: "demonstrated",
+        displayReason: null,
+        activitySeqAtVerdict: 3,
+      },
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Cart never showed the item.",
+    });
+  });
+
+  it("envelope demonstrated suppresses the block-derived not_demonstrated", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      terminalEnvelope: { runVerdict: "demonstrated", runDisplayReason: null },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          outcomeReason: "stale",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toBeNull();
+  });
+
+  it("envelope not_evaluated suppresses not-confirmed like demonstrated does", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      terminalEnvelope: { runVerdict: "not_evaluated", runDisplayReason: null },
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: "Stale pointer.",
+        activitySeqAtVerdict: 1,
+      },
+    });
+    expect(outcome).toBeNull();
+  });
+
+  it("envelope without a run verdict falls back to the legacy inference", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      terminalEnvelope: { runVerdict: null, runDisplayReason: null },
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: "Legacy pointer reason.",
+        activitySeqAtVerdict: 1,
+      },
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Legacy pointer reason.",
+    });
   });
 });
