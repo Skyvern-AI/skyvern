@@ -492,7 +492,8 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
     )
     monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
     monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div>Committed Value</div>"))
-    monkeypatch.setattr(handler, "_select_deterministic_custom_option", AsyncMock(return_value=None))
+    deterministic_select = AsyncMock(return_value=None)
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
     monkeypatch.setattr(
         handler.LLMAPIHandlerFactory,
@@ -524,11 +525,13 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
     assert len(events) == 1
     assert events[0]["prompt_name"] == "custom-select/emerging"
     assert events[0]["match_agrees_with_llm"] is True
+    assert deterministic_select.await_args.kwargs["execute"] is False
 
 
 @pytest.mark.asyncio
-async def test_dropdown_select_call_path_forwards_committed_value_to_shadow_match(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(("entry_action_type", "expected_execute"), [("select_option", True), ("input_text", False)])
+async def test_dropdown_select_call_path_forwards_committed_value_and_scopes_execution(
+    monkeypatch: pytest.MonkeyPatch, entry_action_type: str, expected_execute: bool
 ) -> None:
     incremental_scraped = MagicMock(
         get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]),
@@ -541,7 +544,8 @@ async def test_dropdown_select_call_path_forwards_committed_value_to_shadow_matc
         click=AsyncMock(),
     )
     monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=None))
-    monkeypatch.setattr(handler, "_select_deterministic_custom_option", AsyncMock(return_value=None))
+    deterministic_select = AsyncMock(return_value=None)
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
     monkeypatch.setattr(
         handler.app,
@@ -564,12 +568,46 @@ async def test_dropdown_select_call_path_forwards_committed_value_to_shadow_matc
                 task=_shadow_task(),
                 force_select=True,
                 target_value="Committed Value",
+                entry_action_type=entry_action_type,
             )
 
     events = [log for log in logs if log.get("event") == "select_shadow_match"]
     assert len(events) == 1
     assert events[0]["prompt_name"] == "custom-select/dropdown"
     assert events[0]["match_agrees_with_llm"] is True
+    assert deterministic_select.await_args.kwargs["execute"] is expected_execute
+
+
+@pytest.mark.asyncio
+async def test_dropdown_terminal_result_never_reaches_custom_select_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    incremental_scraped = MagicMock(get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]))
+    incremental_scraped.build_element_tree.return_value = "<div>Committed Value</div>"
+    failure = handler.ActionFailure(Exception("unverified deterministic click"))
+    failure.skip_remaining_actions = True
+    monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        handler,
+        "_select_deterministic_custom_option",
+        AsyncMock(return_value=(failure, "Committed Value")),
+    )
+    llm_handler = AsyncMock()
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
+
+    result = await handler.select_from_dropdown(
+        context=InputOrSelectContext(field="Field", is_required=True),
+        page=MagicMock(),
+        skyvern_element=MagicMock(get_id=Mock(return_value="field-id")),
+        skyvern_frame=MagicMock(),
+        incremental_scraped=incremental_scraped,
+        check_filter_funcs=[],
+        step=SimpleNamespace(step_id="step-1"),
+        task=_shadow_task(),
+        force_select=True,
+        target_value="Committed Value",
+    )
+
+    assert result.action_result is failure
+    llm_handler.assert_not_awaited()
 
 
 _OUTCOME_TASK = SimpleNamespace(
@@ -590,10 +628,11 @@ async def _run_outcome_case(
     *,
     family_enabled: bool = True,
     assigned: bool = False,
+    execute: bool = True,
     entry_action_type: str = "select_option",
     selection_group_id: str = "group-1",
     select_depth: int = 0,
-) -> tuple[object, dict[str, object], SimpleNamespace, AsyncMock]:
+) -> tuple[object, dict[str, object] | None, SimpleNamespace, AsyncMock, AsyncMock]:
     handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
     family = (
         AsyncMock(side_effect=RuntimeError("gate")) if case == "gate_error" else AsyncMock(return_value=family_enabled)
@@ -606,15 +645,23 @@ async def _run_outcome_case(
         fallback_to_llm=case == "no_match",
         matched_index=None if case == "no_match" else 2 if case == "bad_index" else 0,
         matched_label="Choice",
-        matched_tier=None if case == "no_match" else "exact",
+        matched_tier=None if case == "no_match" else "stem" if case == "stem" else "exact",
     )
     resolver = AsyncMock(side_effect=RuntimeError("matcher") if case == "matcher_error" else None)
     resolver.return_value = resolution
+    click_error = (
+        handler.InteractWithDisabledElement(element_id="choice-1")
+        if case == "disabled_click"
+        else RuntimeError("after dispatch")
+        if case == "post_click"
+        else None
+    )
     selected = SimpleNamespace(
         get_attr=AsyncMock(return_value="listbox" if case == "listbox" else None),
         scroll_into_view=AsyncMock(),
-        click=AsyncMock(side_effect=RuntimeError("after dispatch") if case == "post_click" else None),
+        click=AsyncMock(side_effect=click_error),
     )
+    get_skyvern_element = AsyncMock(return_value=selected)
     monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
     monkeypatch.setattr(handler.app, "AGENT_FUNCTION", SimpleNamespace(resolve_field_option=resolver))
     monkeypatch.setattr(
@@ -625,41 +672,50 @@ async def _run_outcome_case(
     monkeypatch.setattr(handler, "_resolve_custom_select_readback_scope_element", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(handler, "_anchor_is_combobox_input", AsyncMock(return_value=case.startswith("reset")))
     monkeypatch.setattr(
-        handler, "_custom_select_matched_state_confirms_pre_click", Mock(return_value=case == "precommit")
+        handler,
+        "_custom_select_matched_state_confirms_pre_click",
+        Mock(return_value=case == "precommit_matched"),
     )
-    monkeypatch.setattr(handler, "_custom_select_scope_confirms_committed", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        handler,
+        "_custom_select_scope_confirms_committed",
+        AsyncMock(return_value=case == "precommit_scope"),
+    )
     monkeypatch.setattr(handler, "_verify_custom_select_option_with_settle", AsyncMock(return_value=case == "verified"))
     monkeypatch.setattr(handler, "_reset_custom_select_combobox_input", AsyncMock(return_value=case == "reset_ok"))
     candidates = (
         Mock(side_effect=RuntimeError("walker"))
         if case == "walker_error"
         else Mock(
-            return_value=[
+            return_value=[]
+            if case == "no_options"
+            else [
                 {
                     "label": "Choice",
-                    "element_id": None if case == "no_element_id" else "choice-1",
+                    "element_id": None if case in {"no_element_id", "stem"} else "choice-1",
                     "value": "choice",
                     "is_choice_input": case == "toggle",
                 }
-            ]
+            ],
         )
     )
     with structlog.testing.capture_logs() as logs:
         result = await handler._select_deterministic_custom_option(
-            target_value="Choice",
+            target_value=None if case == "no_target" else "Choice",
             get_option_candidates=candidates,
-            field_context={},
+            field_context={"is_date_related": True} if case == "date_related" else {},
             page=MagicMock(),
-            get_skyvern_element=AsyncMock(return_value=selected),
+            get_skyvern_element=get_skyvern_element,
             task=_OUTCOME_TASK,
+            execute=False if case == "execution_disabled" else execute,
             step=SimpleNamespace(step_id="step"),
             entry_action_type=entry_action_type,
             selection_group_id=selection_group_id,
             select_depth=select_depth,
         )
     events = [log for log in logs if log.get("event") == "custom_select_family_outcome"]
-    assert len(events) == 1
-    return result, events[0], provider, resolver
+    assert len(events) == (0 if case in {"no_target", "date_related", "no_options"} else 1)
+    return result, events[0] if events else None, provider, resolver, get_skyvern_element
 
 
 @pytest.mark.asyncio
@@ -667,7 +723,8 @@ async def _run_outcome_case(
 async def test_outcome_event_emitted_once_per_opportunity(
     monkeypatch: pytest.MonkeyPatch, entry_action_type: str
 ) -> None:
-    _, event, _, _ = await _run_outcome_case(monkeypatch, "control", entry_action_type=entry_action_type)
+    _, event, _, _, _ = await _run_outcome_case(monkeypatch, "control", entry_action_type=entry_action_type)
+    assert event is not None
     assert event["outcome"] == "llm_fallback_control"
     assert event["entry_action_type"] == entry_action_type
 
@@ -685,6 +742,7 @@ async def test_click_route_without_target_emits_nothing_and_returns_none(monkeyp
             page=MagicMock(),
             get_skyvern_element=AsyncMock(),
             task=_OUTCOME_TASK,
+            execute=True,
             entry_action_type="click",
         )
 
@@ -845,7 +903,8 @@ async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: 
 
 @pytest.mark.asyncio
 async def test_outcome_event_family_off_emits_without_assignment_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, event, provider, resolver = await _run_outcome_case(monkeypatch, "family_off", family_enabled=False)
+    _, event, provider, resolver, _ = await _run_outcome_case(monkeypatch, "family_off", family_enabled=False)
+    assert event is not None
     assert event["outcome"] == "llm_fallback_family_off"
     assert (event["assigned"], event["eligible"], event["match_tier"]) == (None, True, "exact")
     provider.resolve_feature_enabled_unrecorded.assert_not_awaited()
@@ -854,7 +913,8 @@ async def test_outcome_event_family_off_emits_without_assignment_resolution(monk
 
 @pytest.mark.asyncio
 async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, event, _, _ = await _run_outcome_case(monkeypatch, "control")
+    _, event, _, _, _ = await _run_outcome_case(monkeypatch, "control")
+    assert event is not None
     expected_keys = set(
         "event log_level family workflow_run_id task_id organization_id step_id entry_action_type selection_group_id "
         "select_depth family_gate_enabled assigned gate_error encountered eligible match_tier option_count attempted "
@@ -863,8 +923,9 @@ async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPa
     expected_outcomes = set(
         "llm_fallback_gate_error llm_fallback_eval_error llm_fallback_family_off llm_fallback_control "
         "llm_fallback_no_match llm_fallback_match_unactionable llm_fallback_pre_click_error "
-        "llm_fallback_reset_verified llm_fallback_post_click_unverified success_precommit success_verified "
-        "terminal_post_click_exception terminal_unverified_reset terminal_unverified_click "
+        "llm_fallback_reset_verified llm_fallback_post_click_unverified llm_fallback_tier_excluded "
+        "llm_fallback_execution_disabled success_precommit success_verified terminal_post_click_exception "
+        "terminal_unverified_reset terminal_unverified_click "
         "terminal_unverified_toggle".split()
     )
     assert event["outcome"] == "llm_fallback_control"
@@ -874,7 +935,8 @@ async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.asyncio
 async def test_outcome_event_gate_error_fields(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, event, _, _ = await _run_outcome_case(monkeypatch, "gate_error")
+    _, event, _, _, _ = await _run_outcome_case(monkeypatch, "gate_error")
+    assert event is not None
     assert event["outcome"] == "llm_fallback_gate_error"
     assert (event["option_count"], event["eligible"], event["match_tier"]) == (None, False, None)
 
@@ -891,53 +953,124 @@ async def test_outcome_event_gate_error_fields(monkeypatch: pytest.MonkeyPatch) 
 async def test_outcome_event_eval_error_emits_on_all_arms(
     monkeypatch: pytest.MonkeyPatch, case: str, family_enabled: bool, assigned: bool
 ) -> None:
-    result, event, _, _ = await _run_outcome_case(monkeypatch, case, family_enabled=family_enabled, assigned=assigned)
+    result, event, _, _, _ = await _run_outcome_case(
+        monkeypatch, case, family_enabled=family_enabled, assigned=assigned
+    )
+    assert event is not None
     assert result is None
     assert event["outcome"] == "llm_fallback_eval_error"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "outcome", "attempted"),
+    ("case", "family_enabled", "assigned", "outcome", "click_attempted", "return_shape"),
     [
-        ("no_match", "llm_fallback_no_match", False),
-        ("bad_index", "llm_fallback_match_unactionable", False),
-        ("no_element_id", "llm_fallback_match_unactionable", False),
-        ("listbox", "llm_fallback_match_unactionable", False),
-        ("pre_click", "llm_fallback_pre_click_error", True),
-        ("precommit", "success_precommit", True),
-        ("verified", "success_verified", True),
-        ("nonchoice", "llm_fallback_post_click_unverified", True),
-        ("toggle", "terminal_unverified_toggle", True),
+        ("no_target", True, True, None, False, "none"),
+        ("date_related", True, True, None, False, "none"),
+        ("no_options", True, True, None, False, "none"),
+        ("gate_error", True, True, "llm_fallback_gate_error", False, "none"),
+        ("walker_error", True, True, "llm_fallback_eval_error", False, "none"),
+        ("matcher_error", True, True, "llm_fallback_eval_error", False, "none"),
+        ("family_off", False, True, "llm_fallback_family_off", False, "none"),
+        ("control", True, False, "llm_fallback_control", False, "none"),
+        ("no_match", True, True, "llm_fallback_no_match", False, "none"),
+        ("bad_index", True, True, "llm_fallback_match_unactionable", False, "none"),
+        ("stem", True, True, "llm_fallback_tier_excluded", False, "none"),
+        ("execution_disabled", True, True, "llm_fallback_execution_disabled", False, "none"),
+        ("no_element_id", True, True, "llm_fallback_match_unactionable", False, "none"),
+        ("listbox", True, True, "llm_fallback_match_unactionable", False, "none"),
+        ("pre_click", True, True, "llm_fallback_pre_click_error", False, "none"),
+        ("precommit_matched", True, True, "success_precommit", False, "success"),
+        ("precommit_scope", True, True, "success_precommit", False, "success"),
+        ("verified", True, True, "success_verified", True, "success"),
+        ("disabled_click", True, True, "llm_fallback_pre_click_error", True, "none"),
+        ("post_click", True, True, "terminal_post_click_exception", True, "failure"),
+        ("reset_ok", True, True, "llm_fallback_reset_verified", True, "none"),
+        ("reset_failed", True, True, "terminal_unverified_reset", True, "failure"),
+        ("nonchoice", True, True, "terminal_unverified_click", True, "failure"),
+        ("toggle", True, True, "terminal_unverified_toggle", True, "failure"),
     ],
 )
-async def test_outcome_event_exact_for_each_treatment_exit(
-    monkeypatch: pytest.MonkeyPatch, case: str, outcome: str, attempted: bool
+async def test_deterministic_custom_select_exit_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    family_enabled: bool,
+    assigned: bool,
+    outcome: str | None,
+    click_attempted: bool,
+    return_shape: str,
 ) -> None:
-    _, event, _, _ = await _run_outcome_case(monkeypatch, case, assigned=True)
-    assert event["outcome"] == outcome
-    assert event["attempted"] is attempted
+    result, event, _, _, get_skyvern_element = await _run_outcome_case(
+        monkeypatch,
+        case,
+        family_enabled=family_enabled,
+        assigned=assigned,
+    )
 
+    if outcome is None:
+        assert event is None
+    else:
+        assert event is not None
+        assert event["outcome"] == outcome
+        assert event["click_attempted"] is click_attempted
 
-@pytest.mark.asyncio
-async def test_click_attempted_true_when_click_dispatches_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, event, _, _ = await _run_outcome_case(monkeypatch, "post_click", assigned=True)
-    assert result is None
-    assert event["outcome"] == "llm_fallback_post_click_unverified"
-    assert event["click_attempted"] is True
+    if return_shape == "none":
+        assert result is None
+    else:
+        assert result is not None
+        action_result, _matched_label = result
+        expected_type = handler.ActionSuccess if return_shape == "success" else handler.ActionFailure
+        assert isinstance(action_result, expected_type)
+        if return_shape == "failure":
+            assert action_result.skip_remaining_actions is True
+
+    if event is not None and event["click_attempted"] is True and result is None:
+        assert (case, event["outcome"]) in {
+            ("disabled_click", "llm_fallback_pre_click_error"),
+            ("reset_ok", "llm_fallback_reset_verified"),
+        }
+    if case == "stem":
+        get_skyvern_element.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "outcome"),
-    [("reset_ok", "llm_fallback_reset_verified"), ("reset_failed", "llm_fallback_post_click_unverified")],
+    ("case", "outcome", "attempted", "return_shape"),
+    [
+        ("execution_disabled", "llm_fallback_execution_disabled", True, "none"),
+        ("precommit_matched", "success_precommit", True, "success"),
+        ("listbox", "llm_fallback_match_unactionable", False, "none"),
+    ],
 )
-async def test_reset_outcome_recorded_without_behavior_change(
-    monkeypatch: pytest.MonkeyPatch, case: str, outcome: str
+async def test_execution_disabled_reads_precommit_state_without_clicking(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    outcome: str,
+    attempted: bool,
+    return_shape: str,
 ) -> None:
-    result, event, _, _ = await _run_outcome_case(monkeypatch, case, assigned=True)
-    assert result is None
+    result, event, _, _, get_skyvern_element = await _run_outcome_case(
+        monkeypatch,
+        case,
+        assigned=True,
+        execute=False,
+    )
+
+    assert event is not None
     assert event["outcome"] == outcome
+    assert event["attempted"] is attempted
+    assert event["click_attempted"] is False
+    get_skyvern_element.assert_awaited_once_with("choice-1")
+    selected = get_skyvern_element.return_value
+    selected.scroll_into_view.assert_not_awaited()
+    selected.click.assert_not_awaited()
+    if return_shape == "none":
+        assert result is None
+    else:
+        assert result is not None
+        action_result, matched_label = result
+        assert isinstance(action_result, handler.ActionSuccess)
+        assert matched_label == "Choice"
 
 
 @pytest.mark.asyncio

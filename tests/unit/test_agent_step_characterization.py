@@ -314,6 +314,25 @@ async def test_failed_action_with_continue_flag_executes_remaining(monkeypatch: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("skip", "expected_calls"), [(True, 1), (False, 2)])
+async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
+    monkeypatch: pytest.MonkeyPatch, skip: bool, expected_calls: int
+) -> None:
+    first, duplicate = _click("node-1"), _click("node-1")
+    failure = ActionFailure(Exception("unverified click"))
+    failure.skip_remaining_actions = skip
+    action_handler = AsyncMock(return_value=[failure])
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[first, duplicate], action_handler=action_handler)
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert action_handler.await_count == expected_calls
+    assert output.actions_and_results is not None
+    assert [action for action, _ in output.actions_and_results] == ([first] if skip else [first, duplicate])
+
+
+@pytest.mark.asyncio
 async def test_skip_remaining_actions_stops_batch_but_step_completes(monkeypatch: pytest.MonkeyPatch) -> None:
     first, second = _click("node-1"), _click("node-2")
     handler = AsyncMock(return_value=[ActionResult(success=True, skip_remaining_actions=True)])

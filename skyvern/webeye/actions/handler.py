@@ -208,6 +208,8 @@ class CustomSelectFamilyOutcome(StrEnum):
     llm_fallback_control = "llm_fallback_control"
     llm_fallback_no_match = "llm_fallback_no_match"
     llm_fallback_match_unactionable = "llm_fallback_match_unactionable"
+    llm_fallback_tier_excluded = "llm_fallback_tier_excluded"
+    llm_fallback_execution_disabled = "llm_fallback_execution_disabled"
     llm_fallback_pre_click_error = "llm_fallback_pre_click_error"
     llm_fallback_reset_verified = "llm_fallback_reset_verified"
     llm_fallback_post_click_unverified = "llm_fallback_post_click_unverified"
@@ -7631,6 +7633,17 @@ async def _anchor_is_combobox_input(element: SkyvernElement | None) -> bool:
         return False
 
 
+def _terminal_custom_select_failure(
+    *, target_value: str, matched_label: str | None
+) -> tuple[ActionFailure, str | None]:
+    action_failure = _no_element_matched_failure(
+        target_value,
+        "Deterministic custom-select click could not be verified by matched element read-back",
+    )
+    action_failure.skip_remaining_actions = True
+    return action_failure, matched_label
+
+
 async def _select_deterministic_custom_option(
     *,
     target_value: str | None,
@@ -7640,6 +7653,7 @@ async def _select_deterministic_custom_option(
     get_skyvern_element: Callable[[str], Awaitable[SkyvernElement]],
     get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None = None,
     task: Task,
+    execute: bool,
     step: Step | None = None,
     entry_action_type: str = "select_option",
     selection_group_id: str | None = None,
@@ -7718,7 +7732,7 @@ async def _select_deterministic_custom_option(
 
     option_count = len(option_candidates)
     eligible = not resolution.fallback_to_llm and resolution.matched_index is not None
-    match_tier = getattr(resolution, "matched_tier", None)
+    match_tier = resolution.matched_tier
     if not gate.family_enabled:
         emit(CustomSelectFamilyOutcome.llm_fallback_family_off)
         return None
@@ -7730,6 +7744,9 @@ async def _select_deterministic_custom_option(
         return None
     if resolution.matched_index >= len(option_candidates):
         emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
+        return None
+    if resolution.matched_tier != "exact":
+        emit(CustomSelectFamilyOutcome.llm_fallback_tier_excluded)
         return None
 
     matched_candidate = option_candidates[resolution.matched_index]
@@ -7784,6 +7801,10 @@ async def _select_deterministic_custom_option(
                 emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
 
+        if not execute:
+            emit(CustomSelectFamilyOutcome.llm_fallback_execution_disabled)
+            return None
+
         await selected_element.scroll_into_view()
         click_attempted = True
         if on_click_attempted is not None:
@@ -7799,49 +7820,58 @@ async def _select_deterministic_custom_option(
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
             return ActionSuccess(), matched_label
-    except Exception:
+    except Exception as exc:
+        if not click_attempted or isinstance(exc, InteractWithDisabledElement):
+            LOG.info(
+                "Deterministic custom-select failed; falling back to LLM path",
+                target_value=target_value,
+                matched_element_id=element_id,
+                matched_label=matched_label,
+                exc_info=True,
+            )
+            emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
+            return None
         LOG.info(
-            "Deterministic custom-select failed; falling back to LLM path",
+            "Deterministic custom-select failed after click; returning failure to avoid replaying over mutated widget",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
             exc_info=True,
         )
-        emit(
-            CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
-            if click_attempted
-            else CustomSelectFamilyOutcome.llm_fallback_pre_click_error
-        )
-        return None
+        emit(CustomSelectFamilyOutcome.terminal_post_click_exception)
+        return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     if anchor_is_combobox_input:
         # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
         # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
         reset_verified = await _reset_custom_select_combobox_input(readback_scope_element, page)
+        if reset_verified:
+            LOG.info(
+                "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
+                target_value=target_value,
+                matched_element_id=element_id,
+                matched_label=matched_label,
+            )
+            emit(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
+            return None
         LOG.info(
-            "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
+            "Deterministic custom-select combobox reset failed; returning failure to avoid replaying over mutated widget",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
         )
-        emit(
-            CustomSelectFamilyOutcome.llm_fallback_reset_verified
-            if reset_verified
-            else CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
-        )
-        return None
+        emit(CustomSelectFamilyOutcome.terminal_unverified_reset)
+        return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     if not matched_option_is_choice_input:
-        # A non-toggle option (e.g. a button/div-anchored single-select listbox) can be safely
-        # replayed by the LLM mini-agent. Toggle-shaped options hard-fail below instead.
         LOG.info(
-            "Deterministic custom-select read-back inconclusive on non-choice-input option; routing to LLM fallback",
+            "Deterministic custom-select read-back inconclusive on non-choice-input option; returning terminal failure",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
         )
-        emit(CustomSelectFamilyOutcome.llm_fallback_post_click_unverified)
-        return None
+        emit(CustomSelectFamilyOutcome.terminal_unverified_click)
+        return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     LOG.info(
         "Deterministic custom-select read-back failed after click; returning failure to avoid replaying over mutated widget",
@@ -7849,15 +7879,8 @@ async def _select_deterministic_custom_option(
         matched_element_id=element_id,
         matched_label=matched_label,
     )
-    action_failure = ActionFailure(
-        NoElementMatchedForTargetOption(
-            target=target_value,
-            reason="Deterministic custom-select click could not be verified by matched element read-back",
-        )
-    )
-    action_failure.skip_remaining_actions = True
     emit(CustomSelectFamilyOutcome.terminal_unverified_toggle)
-    return action_failure, matched_label
+    return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
 
 async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> bool:
@@ -8005,6 +8028,7 @@ async def select_from_emerging_elements(
         widget_mutated = True
 
     deterministic_result = await _select_deterministic_custom_option(
+        execute=False,
         target_value=options.target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(shadow_candidate_elements),
         field_context=options.model_dump(),
@@ -8183,6 +8207,7 @@ async def select_from_dropdown(
         widget_mutated = True
 
     deterministic_result = await _select_deterministic_custom_option(
+        execute=entry_action_type == "select_option",
         target_value=target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(trimmed_element_tree),
         field_context=context.model_dump(),
@@ -8198,7 +8223,7 @@ async def select_from_dropdown(
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
-        single_select_result.reasoning = "Deterministic exact/stem custom-select match"
+        single_select_result.reasoning = "Deterministic exact custom-select match"
         single_select_result.value = matched_label or target_value
         single_select_result.action_type = ActionType.CLICK
         single_select_result.action_result = action_result
