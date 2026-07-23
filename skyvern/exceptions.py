@@ -1112,6 +1112,15 @@ class InvalidWorkflowParameter(SkyvernHTTPException):
         )
 
 
+class ActionExecutionTimeout(SkyvernException):
+    def __init__(self, action_type: str, timeout_seconds: float):
+        super().__init__(
+            f"Action execution timed out after {timeout_seconds:.0f} seconds and was aborted"
+            f" (action_type={action_type}). The browser action did not complete in time —"
+            " the page or browser may have become unresponsive."
+        )
+
+
 class InteractWithDisabledElement(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(

@@ -114,6 +114,8 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_input_templated_locator,
     build_same_month_file_match_locator,
     credential_scout_gap,
+    dynamic_row_evidence_fingerprint,
+    dynamic_row_period_matches_match_selected_row,
     freeze_requested_output_extraction_candidate,
     grounded_parameter_key_is_safe,
     input_correspondences_for_interaction,
@@ -134,6 +136,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
     uncovered_rung_records,
+    validated_dynamic_row_period_matches,
 )
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -8644,12 +8647,70 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         input_holes = provenance.get("holes")
         if not isinstance(input_holes, list) or not input_holes:
             return False
+        selector = str(provenance.get("selector") or "")
+        row_text = ""
+        if surface == "row_text":
+            source_url = provenance.get("source_url")
+            target_selector = provenance.get("target_selector")
+            row_selector = provenance.get("row_selector")
+            row_text_value = provenance.get("row_text")
+            row_selector_count = provenance.get("row_selector_count")
+            row_text_match_count = provenance.get("row_text_match_count")
+            period_matches = provenance.get("period_matches")
+            validated_period_matches = (
+                validated_dynamic_row_period_matches(period_matches, row_selector_count)
+                if isinstance(row_selector_count, int) and not isinstance(row_selector_count, bool)
+                else None
+            )
+            selected_index = provenance.get("selected_index")
+            evidence_fingerprint = provenance.get("evidence_fingerprint")
+            if (
+                not isinstance(source_url, str)
+                or not source_url.strip()
+                or not isinstance(target_selector, str)
+                or not target_selector.strip()
+                or not isinstance(row_selector, str)
+                or not row_selector.strip()
+                or not isinstance(row_text_value, str)
+                or not row_text_value.strip()
+                or isinstance(row_selector_count, bool)
+                or not isinstance(row_selector_count, int)
+                or row_selector_count < 2
+                or row_selector_count > 100
+                or isinstance(row_text_match_count, bool)
+                or not isinstance(row_text_match_count, int)
+                or row_text_match_count < 1
+                or row_text_match_count > row_selector_count
+                or validated_period_matches is None
+                or not dynamic_row_period_matches_match_selected_row(row_text_value, validated_period_matches)
+                or isinstance(selected_index, bool)
+                or not isinstance(selected_index, int)
+                or selected_index < 0
+                or selected_index >= row_selector_count
+                or not isinstance(evidence_fingerprint, str)
+                or evidence_fingerprint
+                != dynamic_row_evidence_fingerprint(
+                    source_url=source_url,
+                    target_selector=target_selector,
+                    row_selector=row_selector,
+                    row_text=row_text_value,
+                    row_selector_count=row_selector_count,
+                    row_text_match_count=row_text_match_count,
+                    period_matches=validated_period_matches,
+                    selected_index=selected_index,
+                )
+            ):
+                return False
+            selector = row_selector
+            row_text = row_text_value
         recomputed = build_input_templated_locator(
             surface=surface,
-            selector=str(provenance.get("selector") or ""),
+            selector=selector,
             role=str(provenance.get("role") or ""),
             name=str(provenance.get("name") or ""),
             holes=input_holes,
+            row_text=row_text,
+            period_matches=validated_period_matches if surface == "row_text" and validated_period_matches else (),
         )
         return recomputed is not None and recomputed == provenance.get("emitted_literal")
     if source == SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE:
@@ -8707,6 +8768,44 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         recomputed = build_same_month_file_match_locator(transform, transform.selector)
         return recomputed is not None and recomputed == provenance.get("emitted_literal")
     return False
+
+
+def _public_locator_provenance(provenance_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    public_rows: list[dict[str, Any]] = []
+    for provenance in provenance_rows:
+        if provenance.get("surface") != "row_text":
+            public_rows.append(dict(provenance))
+            continue
+        holes = provenance.get("holes")
+        input_keys: set[str] = set()
+        transforms: set[str] = set()
+        if isinstance(holes, list):
+            for hole in holes:
+                if not isinstance(hole, Mapping):
+                    continue
+                inputs = [hole]
+                equivalents = hole.get("equivalent_inputs")
+                if isinstance(equivalents, list):
+                    inputs.extend(item for item in equivalents if isinstance(item, Mapping))
+                for witness in inputs:
+                    key = str(witness.get("input_key") or "")
+                    transform = str(witness.get("transform") or "")
+                    if key:
+                        input_keys.add(key)
+                    if transform:
+                        transforms.add(transform)
+        source_url = str(provenance.get("source_url") or "")
+        public_rows.append(
+            {
+                "trajectory_index": provenance.get("trajectory_index"),
+                "source": str(provenance.get("source") or ""),
+                "surface": "row_text",
+                "source_origin": url_origin(source_url) if source_url else None,
+                "input_keys": sorted(input_keys),
+                "transforms": sorted(transforms),
+            }
+        )
+    return public_rows
 
 
 _PAGE_MUTATION_METHODS = frozenset(
@@ -11840,7 +11939,7 @@ def _maybe_impose_synthesized_code_block(
         "source_trajectory_count": len(scout_trajectory),
         "parameter_keys": parameter_reconciliation.parameter_keys,
         "credential_parameter_keys": credential_parameter_keys,
-        "selector_provenance": diagnostics.locator_provenance,
+        "selector_provenance": _public_locator_provenance(diagnostics.locator_provenance),
         "prior_source": prior_source,
     }
     if extraction_plan is not None:

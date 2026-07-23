@@ -119,6 +119,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         pending_scout_click_selector=None,
         pending_scout_ambiguous=None,
         pending_scout_reanchor=None,
+        pending_scout_dynamic_row=None,
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],

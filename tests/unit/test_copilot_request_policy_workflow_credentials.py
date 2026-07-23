@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.context import (
     record_approved_credentials_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    _LOGIN_CREDENTIAL_QUESTION,
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
     RequestPolicy,
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
+from skyvern.forge.sdk.schemas.credentials import CredentialType
 
 
 def _yaml(body: str) -> str:
@@ -450,8 +452,15 @@ async def test_request_policy_resolver_still_blocks_raw_secret_with_author_time_
     assert policy.allow_run_blocks is False
 
 
-def _cred(name: str, credential_id: str, tested_url: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(name=name, credential_id=credential_id, tested_url=tested_url)
+def _cred(
+    name: str,
+    credential_id: str,
+    tested_url: str | None = None,
+    credential_type: CredentialType = CredentialType.PASSWORD,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name, credential_id=credential_id, tested_url=tested_url, credential_type=credential_type
+    )
 
 
 async def _build_with_forced_classifier(
@@ -737,6 +746,290 @@ async def test_login_intent_without_credential_phrasing_asks_once_a_url_names_th
     assert policy.clarification_reason == "login_credentials_unresolved"
     assert policy.user_response_policy == "ask_clarification"
     assert policy.clarification_question is not None
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_one_message_url_with_single_match_resolves() -> None:
+    credential = _cred("portal-cred", "cred_url", tested_url="http://localhost:8941/analytics_console/")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to http://localhost:8941/analytics_console/ and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert policy.credential_input_kind == "none"
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    assert policy.requires_user_clarification is False
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_multiple_host_matches_asks_pick_question() -> None:
+    first = _cred("portal-a", "cred_a", tested_url="http://localhost:8941/analytics_console/")
+    second = _cred("portal-b", "cred_b", tested_url="http://localhost:8941/analytics_console/")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to http://localhost:8941/analytics_console/ and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[first, second],
+    )
+
+    assert policy.credential_input_kind == "none"
+    assert policy.requires_user_clarification is True
+    assert policy.clarification_question is not None
+    assert (
+        "I found multiple stored credentials for that login page. Which one should I use?"
+        in policy.clarification_question
+    )
+    assert "`cred_a`" in policy.clarification_question
+    assert "`cred_b`" in policy.clarification_question
+    assert policy.clarification_reason == "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_prose_host_mention_does_not_bind() -> None:
+    credential = _cred("portal-cred", "cred_url", tested_url="https://example.com/login")
+    policy = await _build_with_forced_classifier(
+        user_message="Log into my account — the steps are documented at https://example.com/help if you need them.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.clarification_question == _LOGIN_CREDENTIAL_QUESTION
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_query_distinct_tenants_do_not_collapse() -> None:
+    tenant_a = _cred("tenant-a", "cred_a", tested_url="https://portal.example.com/login?tenant=a")
+    tenant_b = _cred("tenant-b", "cred_b", tested_url="https://portal.example.com/login?tenant=b")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://portal.example.com/login?tenant=a and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[tenant_a, tenant_b],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_a"]
+    assert policy.requires_user_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_query_param_order_is_normalized() -> None:
+    credential = _cred("portal-cred", "cred_url", tested_url="https://portal.example.com/login?b=2&a=1")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://portal.example.com/login?a=1&b=2 and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_non_password_sole_match_does_not_bind() -> None:
+    card = _cred(
+        "corp-card",
+        "cred_card",
+        tested_url="https://portal.example.com/login",
+        credential_type=CredentialType.CREDIT_CARD,
+    )
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://portal.example.com/login and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[card],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.clarification_question == _LOGIN_CREDENTIAL_QUESTION
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_classifier_url_keeps_host_fallback() -> None:
+    credential = _cred("portal-cred", "cred_url", tested_url="https://example.com/login")
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal and pull this week's report.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=["https://example.com/portal"],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    assert policy.requires_user_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_zero_url_matches_keeps_existing_login_unresolved_text() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to http://localhost:8941/analytics_console/ and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("other", "cred_other", tested_url="http://localhost:8999/other")],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.clarification_question == _LOGIN_CREDENTIAL_QUESTION
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_multi_host_message_skips_resolution() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to http://localhost:8941/analytics_console/ then check https://example.org/login.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("portal", "cred_url", tested_url="http://localhost:8941/analytics_console/")],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.clarification_question == _LOGIN_CREDENTIAL_QUESTION
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_message_url_trailing_punctuation_still_matches() -> None:
+    credential = _cred("portal-cred", "cred_url", tested_url="http://localhost:8941/analytics_console/")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to http://localhost:8941/analytics_console/.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    assert policy.credential_input_kind == "none"
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_bare_host_message_does_not_trigger_url_resolution() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into portal.example.com and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("portal", "cred_url", tested_url="https://portal.example.com/login")],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.user_response_policy == "proceed"
+
+
+@pytest.mark.asyncio
+async def test_login_intent_false_none_kind_never_loads_credentials_for_message_url() -> None:
+    with patch(
+        "skyvern.forge.sdk.copilot.request_policy._load_credentials",
+        new=AsyncMock(side_effect=AssertionError("_load_credentials should not be called")),
+    ):
+        policy = await _build_with_forced_classifier(
+            user_message="Go to http://localhost:8941/analytics_console/ and inspect the page.",
+            classifier_policy=RequestPolicy(
+                login_intent=False,
+                credential_input_kind="none",
+                login_page_urls=[],
+                classifier_status="success",
+            ),
+            org_credentials=[],
+        )
+
+    assert policy.user_response_policy == "proceed"
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("testing_intent", "allow_missing_credentials_in_draft"),
+    [("skip_test", False), ("unspecified", True)],
+)
+async def test_login_intent_none_kind_skip_modes_do_not_lookup_credentials(
+    testing_intent: str,
+    allow_missing_credentials_in_draft: bool,
+) -> None:
+    with patch(
+        "skyvern.forge.sdk.copilot.request_policy._load_credentials",
+        new=AsyncMock(side_effect=AssertionError("_load_credentials should not be called")),
+    ):
+        policy = await _build_with_forced_classifier(
+            user_message="Sign in to http://localhost:8941/analytics_console/ and continue.",
+            classifier_policy=RequestPolicy(
+                login_intent=True,
+                credential_input_kind="none",
+                login_page_urls=[],
+                testing_intent=testing_intent,
+                allow_missing_credentials_in_draft=allow_missing_credentials_in_draft,
+                classifier_status="success",
+            ),
+            org_credentials=[],
+        )
+
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+async def test_login_intent_none_kind_prefers_classifier_login_page_urls_over_message_urls() -> None:
+    classifier_url_credential = _cred("classifier-url", "cred_classifier", tested_url="https://alpha.example.com/login")
+    message_url_credential = _cred("message-url", "cred_message", tested_url="https://beta.example.com/login")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://beta.example.com/login and continue.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            credential_input_kind="none",
+            login_page_urls=["https://alpha.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[classifier_url_credential, message_url_credential],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_classifier"]
 
 
 @pytest.mark.asyncio

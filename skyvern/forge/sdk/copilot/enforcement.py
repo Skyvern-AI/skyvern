@@ -3118,6 +3118,25 @@ def _actuation_obligation_admits_required_fill_tool(ctx: CopilotContext, tool_na
     return tool_name == _actuation_obligation_required_fill_tool(ctx)
 
 
+def _actuation_obligation_admits_login_completion_tool(
+    ctx: CopilotContext, tool_name: str, arguments: Mapping[str, Any] | None
+) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_COMMIT_TOOLS:
+        return False
+    # Only Enter commits a login form, matching what _first_stable_login_submit_index credits as a
+    # submit; every other keystroke stays gated. Absent arguments fail closed — the signature
+    # defaults them to None, so a caller that omits them must not admit arbitrary keystrokes.
+    if tool_name == "press_key" and (
+        not isinstance(arguments, Mapping) or str(arguments.get("key") or "").strip() != "Enter"
+    ):
+        return False
+    if not _actuation_obligation_live_fill_delivery_required(ctx):
+        return False
+    if _last_scout_credential_fill_index(ctx.scout_trajectory) is None:
+        return False
+    return not _trajectory_reaches_post_credential_commit(ctx)
+
+
 def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
     """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
     (structural identity + credential binding) digest. A repeat identical reject returns False and
@@ -3280,6 +3299,9 @@ def synthesized_block_persistence_signal(
         return None
     if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)
+        return None
+    if _actuation_obligation_admits_login_completion_tool(ctx, tool_name, arguments):
+        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION)
         return None
     if (
         ambiguous_selector_rescout_state != "block"
