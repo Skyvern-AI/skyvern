@@ -495,6 +495,8 @@ class AgentContext:
     # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
     persisted_draft_browser_calls: list[tuple[str, str]] | None = None
     scouted_spine_checkpoint_fired: bool = False
+    scouted_spine_previous_omission_digest: str | None = None
+    scouted_spine_repeated_identical_missing_steps: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)

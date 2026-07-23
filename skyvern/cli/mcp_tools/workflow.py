@@ -30,7 +30,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-from ._common import ErrorCode, Timer, make_error, make_result
+from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id, validate_workflow_run_id
 from ._workflow_http import (
@@ -484,7 +484,7 @@ def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str)
             ErrorCode.INVALID_INPUT,
             f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
             "In code-only mode, use a `code` block for durable browser/page work instead of "
-            "task/navigation/extraction/etc.",
+            "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
         ),
     )
 
@@ -1616,12 +1616,9 @@ async def skyvern_workflow_create(
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
     code_only: Annotated[
-        bool,
-        Field(
-            description="When true, structurally reject non-code browser/page block types before persisting "
-            "(code-only mode)"
-        ),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
@@ -1635,6 +1632,7 @@ async def skyvern_workflow_create(
     skyvern_workflow_list.
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
+    Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
     Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
     injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
@@ -1725,12 +1723,9 @@ async def skyvern_workflow_update(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
     code_only: Annotated[
-        bool,
-        Field(
-            description="When true, structurally reject non-code browser/page block types before persisting "
-            "(code-only mode)"
-        ),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow.
