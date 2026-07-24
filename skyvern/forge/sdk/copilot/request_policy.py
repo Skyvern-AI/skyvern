@@ -196,7 +196,70 @@ _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
 )
+_DIRECT_CREDENTIAL_TOKEN_RE = re.compile(
+    r"\b(?:use|using|with)\s+(?:the\s+)?(?:saved\s+)?credential"
+    r"(?:\s+(?:named|called))?\s+([A-Za-z0-9_.@:-]{2,100})\b",
+    re.I,
+)
+_POSTFIX_CREDENTIAL_TOKEN_RE = re.compile(
+    r"\b(?:use|using|with)\s+(?:my\s+|the\s+)?(?:saved\s+)?([A-Za-z0-9_.@:-]{2,100})\s+credential\b",
+    re.I,
+)
+_EXPLICIT_CREDENTIAL_ID_CONTEXT_RE = re.compile(
+    r"\b(?:use|using|with|select|choose)\s+"
+    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?(?:credential(?:\s+id)?\s*)?"
+    r"(?::\s*)?$",
+    re.I,
+)
+_CREDENTIAL_ID_LABEL_CONTEXT_RE = re.compile(r"\bcredential\s+id\s*$", re.I)
+_CREDENTIAL_ID_COORDINATOR_RE = re.compile(r"\s*,?\s*(?:and|or)\s*$", re.I)
+_CREDENTIAL_REPLACEMENT_TARGET_RES = (
+    re.compile(
+        r"\bswitch(?:ing)?\s+to\b"
+        r"(?=\s+(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?"
+        r"(?:credential\b|cred_|[A-Za-z0-9_.@:-]{2,100}\s+credential\b))",
+        re.I,
+    ),
+    re.compile(
+        r"\breplace\s+(?:(?:it|this|that)\b|cred_[A-Za-z0-9_-]+|"
+        r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?credential"
+        r"(?:\s+(?:(?:id|named|called)\s+)?[A-Za-z0-9_.@:-]{2,100})?)"
+        r"\s+with\b"
+        r"(?=\s+(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?"
+        r"(?:credential\b|cred_|[A-Za-z0-9_.@:-]{2,100}\s+credential\b))",
+        re.I,
+    ),
+)
+_REPLACEMENT_CONTEXT_RE = re.compile(
+    r"\breplace\b(?P<object>[^.!?\n,;]{1,80}?)\bwith\s+"
+    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?"
+    r"(?:credential(?:\s+(?:id|named|called))?\s*)?$",
+    re.I,
+)
+_CREDENTIAL_REPLACEMENT_OBJECT_RE = re.compile(
+    r"\s*(?:(?:it|this|that)|cred_[A-Za-z0-9_-]+|"
+    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?credential"
+    r"(?:\s+(?:(?:id|named|called)\s+)?[A-Za-z0-9_.@:-]{2,100})?)\s*",
+    re.I,
+)
 _CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
+_NEGATED_CREDENTIAL_CONTEXT_RE = re.compile(
+    r"(?:"
+    r"\b(?:do\s+not|don't|never|without|avoid(?:ing)?|exclud(?:e|ed|es|ing))\b"
+    r"(?:(?!\b(?:but|instead)\b)[^.!?\n,;])*"
+    r"|\b(?:instead\s+of|rather\s+than|not|except)\s+"
+    r"(?:(?:the|a)\s+)?(?:(?:saved\s+)?credential(?:\s+id)?\s*)?"
+    r")$",
+    re.I,
+)
+_EXPLICIT_LOGIN_ACTION_RE = re.compile(
+    r"(?<![/\w-])(?:log[\s-]?in|login|sign[\s-]?in)\b"
+    r"(?!\s+(?:form|page|path|route|screen|url)\b)",
+    re.I,
+)
+_CREDENTIAL_REFERENCE_STOPWORDS = frozenset(
+    {"a", "an", "credential", "for", "login", "my", "saved", "stored", "the", "to"}
+)
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
 _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
@@ -4140,68 +4203,131 @@ def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
     return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
 
 
-def _exact_credential_name_candidates(user_message: str) -> list[str]:
-    text = user_message or ""
-    candidates: list[str] = []
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
-        value = next((group for group in match.groups() if group), "").strip()
-        if value and _quote_in_credential_context(text, match.start()):
-            candidates.append(value)
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
-        value = match.group(1).strip()
-        if value:
-            candidates.append(value)
-    return _clean_list(candidates)
-
-
-def _exact_credential_name_scan_eligible(policy: RequestPolicy) -> bool:
-    if policy.raw_secret_detected:
-        return False
-    if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
-        return False
-    if policy.credential_input_kind == "credential_name" and policy.credential_refs:
-        return False
-    return policy.credential_input_kind in ("none", "credential_name", "website_stored_credential")
-
-
-async def _apply_exact_credential_name_scope(
-    policy: RequestPolicy,
-    *,
-    user_message: str,
-    organization_id: str,
-) -> None:
-    if not _exact_credential_name_scan_eligible(policy):
-        return
-    candidates = _exact_credential_name_candidates(user_message)
-    if not candidates:
-        return
-    credentials = await _load_credentials(organization_id)
-    if (
-        policy.credential_input_kind == "website_stored_credential"
-        and policy.login_page_urls
-        and _match_by_url(
-            [credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD],
-            policy.login_page_urls,
-        )
+def _credential_reference_is_negated(user_message: str, reference_start: int) -> bool:
+    clause_start = max(user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ";"))
+    context = user_message[clause_start + 1 : reference_start]
+    context = re.sub(r",\s*(?=credential\b)", " ", context, flags=re.I)
+    if context.rstrip().endswith(",") and re.match(
+        r"\s*(?:credential\b|cred_|[`'\"])",
+        user_message[reference_start:],
+        re.I,
     ):
-        return
-    matched_names = _clean_list(
-        [candidate for candidate in candidates if any(credential.name == candidate for credential in credentials)]
+        context = f"{context.rstrip()[:-1]} "
+    return bool(_NEGATED_CREDENTIAL_CONTEXT_RE.search(context))
+
+
+def _credential_reference_is_unrelated_replacement(user_message: str, reference_start: int) -> bool:
+    clause_start = max(
+        user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ",", ";")
     )
-    if len(matched_names) == 1:
-        policy.credential_input_kind = "credential_name"
-        policy.credential_refs = matched_names
-        policy.requires_user_clarification = False
-        policy.clarification_reason = "none"
-        policy.clarification_question = None
-    elif len(matched_names) > 1:
-        matches = [credential for credential in credentials if credential.name in matched_names]
-        _block(
-            policy,
-            "I found multiple saved credentials named in your request. Which one should I use?",
-            matches,
-            reason="credential_name_unresolved",
+    replacement = _REPLACEMENT_CONTEXT_RE.search(user_message[clause_start + 1 : reference_start])
+    return bool(replacement and not _CREDENTIAL_REPLACEMENT_OBJECT_RE.fullmatch(replacement.group("object")))
+
+
+def _credential_authority_text(user_message: str) -> str:
+    replacement_targets = [
+        match.end()
+        for pattern in _CREDENTIAL_REPLACEMENT_TARGET_RES
+        for match in pattern.finditer(user_message)
+        if not _credential_reference_is_negated(user_message, match.start())
+    ]
+    if not replacement_targets:
+        return user_message
+    return f"use {user_message[max(replacement_targets) :].lstrip()}"
+
+
+def _exact_credential_name_candidates(user_message: str) -> list[str]:
+    text = _credential_authority_text(user_message or "")
+    mentions: list[tuple[str, int, bool, bool]] = []
+
+    def add_mention(value: str, start: int, *, context_matches: bool = True) -> None:
+        value = value.strip()
+        if not context_matches or not value or value.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+            return
+        mentions.append(
+            (
+                value,
+                start,
+                _credential_reference_is_negated(text, start),
+                _credential_reference_is_unrelated_replacement(text, start),
+            )
         )
+
+    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
+        group_index = next((index for index, group in enumerate(match.groups(), start=1) if group), 1)
+        value = (match.group(group_index) or "").strip()
+        add_mention(
+            value,
+            match.start(),
+            context_matches=_quote_in_credential_context(text, match.start()),
+        )
+    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
+        add_mention(match.group(1), match.start(1))
+    for match in _DIRECT_CREDENTIAL_TOKEN_RE.finditer(text):
+        add_mention(match.group(1), match.start(1))
+    for match in _POSTFIX_CREDENTIAL_TOKEN_RE.finditer(text):
+        add_mention(match.group(1), match.start(1))
+
+    last_negated_mention = {
+        value: start for value, start, is_negated, is_unrelated in mentions if is_negated and not is_unrelated
+    }
+    return _clean_list(
+        [
+            value
+            for value, start, is_negated, is_unrelated in mentions
+            if not is_negated and not is_unrelated and last_negated_mention.get(value, -1) < start
+        ]
+    )
+
+
+def _credential_name_candidates(user_message: str) -> list[str]:
+    # Classifier refs are model-authored hints, not current-turn credential
+    # authority. Resolve names only from deterministic, affirmative references
+    # in the latest user message.
+    return _exact_credential_name_candidates(user_message)
+
+
+def _explicit_credential_ids(user_message: str) -> list[str]:
+    text = _credential_authority_text(user_message or "")
+    explicit: list[str] = []
+    matches = sorted(
+        [(match, match.group(0)) for match in _CREDENTIAL_ID_RE.finditer(text)]
+        + [(match, f"cred_{match.group(1)}") for match in _MALFORMED_CREDENTIAL_ID_RE.finditer(text)],
+        key=lambda item: item[0].start(),
+    )
+    last_negated_mention = {
+        credential_id: match.start()
+        for match, credential_id in matches
+        if _credential_reference_is_negated(text, match.start())
+    }
+    last_explicit_end: int | None = None
+    for match, credential_id in matches:
+        if last_negated_mention.get(credential_id, -1) > match.start():
+            continue
+        if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
+            text, match.start()
+        ):
+            continue
+        context = text[max(0, match.start() - 64) : match.start()]
+        if (
+            _EXPLICIT_CREDENTIAL_ID_CONTEXT_RE.search(context)
+            or _CREDENTIAL_ID_LABEL_CONTEXT_RE.search(context)
+            or match.group(0).strip() == text.strip()
+            or (
+                last_explicit_end is not None
+                and _CREDENTIAL_ID_COORDINATOR_RE.fullmatch(text[last_explicit_end : match.start()])
+            )
+        ):
+            explicit.append(credential_id)
+            last_explicit_end = match.end()
+    return _clean_list(explicit)
+
+
+def _deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
+    by_id: dict[str, Credential] = {}
+    for credential in credentials:
+        by_id.setdefault(credential.credential_id, credential)
+    return list(by_id.values())
 
 
 def _safe_label(credential: Credential) -> str:
@@ -4328,14 +4454,20 @@ def _clarification_question(policy: RequestPolicy, global_llm_context: str = "")
     return "I need one more detail before I can build and test this workflow safely."
 
 
-def _has_resolvable_credential_scope(policy: RequestPolicy) -> bool:
-    if policy.credential_input_kind == "credential_id":
-        return any(ref.startswith("cred_") for ref in policy.credential_refs)
-    if policy.credential_input_kind == "credential_name":
-        return bool(policy.credential_refs)
-    if policy.credential_input_kind == "website_stored_credential":
-        return bool(policy.login_page_urls)
-    return False
+def _has_resolvable_credential_scope(policy: RequestPolicy, user_message: str = "") -> bool:
+    if policy.raw_secret_detected:
+        return False
+    if _explicit_credential_ids(user_message):
+        return True
+    if _credential_name_candidates(user_message):
+        return True
+    if policy.login_page_urls:
+        return True
+    if not policy.login_intent:
+        return False
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return False
+    return bool(_login_url_candidates(policy, user_message))
 
 
 def _login_target_is_concrete(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
@@ -4367,12 +4499,7 @@ def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, work
         return False
     if not _login_target_is_concrete(policy, user_message, workflow_yaml):
         return False
-    return not (
-        policy.credential_refs
-        or policy.resolved_credentials
-        or policy.discovered_credentials
-        or policy.existing_workflow_credential_ids
-    )
+    return not (policy.resolved_credentials or policy.discovered_credentials or policy.existing_workflow_credential_ids)
 
 
 def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
@@ -4465,6 +4592,11 @@ def _can_defer_unresolved_credential_name_for_draft(
 ) -> bool:
     if policy.clarification_reason != "credential_name_unresolved":
         return False
+    # A classifier-carried name may justify leaving an unvalidated placeholder
+    # in a draft, but _credential_name_candidates still requires current-turn
+    # anchoring before the name can enter resolved_credentials and authorize a run.
+    if policy.credential_refs:
+        return True
     if _has_resolvable_credential_scope(policy):
         return True
     if _previous_credential_clarification_was_asked(global_llm_context):
@@ -4504,10 +4636,14 @@ async def _resolve_credentials(
     user_message: str,
     defer_unresolved_credential_name: bool = False,
 ) -> None:
-    if policy.credential_input_kind == "credential_id":
-        ids = _clean_list([ref for ref in policy.credential_refs if ref.startswith("cred_")])
-        if not ids:
-            return
+    if policy.raw_secret_detected:
+        return
+
+    # Explicit IDs are deterministic current-turn authority and must win
+    # regardless of the classifier label. Do not trust stale/model-authored
+    # credential_refs that are absent from the latest user message.
+    ids = _explicit_credential_ids(user_message)
+    if ids:
         existing = await app.DATABASE.credentials.get_credentials_by_ids(ids, organization_id=organization_id)
         found = {credential.credential_id for credential in existing}
         policy.resolved_credentials = existing
@@ -4524,51 +4660,103 @@ async def _resolve_credentials(
             policy.allow_missing_credentials_in_draft = True
         return
 
-    if policy.credential_input_kind == "credential_name" and not policy.credential_refs:
+    name_candidates = _credential_name_candidates(user_message)
+    credentials: list[Credential] | None = None
+    if name_candidates:
+        credentials = await _load_credentials(organization_id)
+        named_matches = _deduplicate_credentials(
+            [credential for credential in credentials if credential.name in name_candidates]
+        )
+        if len(named_matches) == 1:
+            policy.resolved_credentials = named_matches
+            if (
+                policy.classifier_status == "fallback"
+                and policy.credential_input_kind == "none"
+                and not policy.credential_refs
+            ):
+                # Preserve the pre-existing fallback telemetry contract while
+                # keeping successful classifier labels advisory.
+                policy.credential_input_kind = "credential_name"
+                policy.credential_refs = [named_matches[0].name]
+            return
+        if named_matches:
+            if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+                policy.allow_run_blocks = False
+                policy.allow_missing_credentials_in_draft = True
+                return
+            question = (
+                "I found multiple stored credentials with that exact name. Which one should I use?"
+                if len(name_candidates) == 1
+                else "I found multiple saved credentials named in your request. Which one should I use?"
+            )
+            _block(
+                policy,
+                question,
+                named_matches,
+                reason="credential_name_unresolved",
+            )
+            return
+        if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
+            policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
+            if defer_unresolved_credential_name:
+                _defer_unresolved_credential_for_draft(policy)
+            return
         if policy.allow_missing_credentials_in_draft:
             policy.allow_run_blocks = False
             return
+        question = (
+            f"I could not find a stored credential named `{name_candidates[0]}`. Please choose an existing credential "
+            "by exact name or a credential ID beginning with cred_."
+            if policy.credential_input_kind == "credential_name"
+            else _clarification_question(policy)
+        )
         _block(
             policy,
-            _SAVED_CREDENTIAL_NAME_QUESTION,
+            question,
             reason="credential_name_unresolved",
         )
         return
-    if policy.credential_input_kind == "website_stored_credential" and not policy.login_page_urls:
-        _block(
-            policy,
-            _STORED_CREDENTIAL_URL_QUESTION,
-            reason="missing_target_context",
-        )
-        return
-    if policy.credential_input_kind not in ("credential_name", "website_stored_credential", "none"):
-        return
 
-    if policy.credential_input_kind == "none":
-        if not policy.login_intent or policy.raw_secret_detected:
-            return
-        if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
-            return
-        candidates = _login_url_candidates(policy, user_message)
-        if not candidates:
-            return
-        # Card/secret credentials can carry a tested_url too; a login turn
-        # must only ever auto-bind a password credential.
-        login_credentials = [
-            credential
-            for credential in await _load_credentials(organization_id)
-            if credential.credential_type == CredentialType.PASSWORD
-        ]
+    message_url_candidates = _clean_list(
+        [candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)]
+    )
+    current_turn_login_authorized = policy.login_intent or bool(_EXPLICIT_LOGIN_ACTION_RE.search(user_message))
+    url_candidates: list[str] = []
+    allow_host_fallback = False
+    if (
+        current_turn_login_authorized
+        and policy.testing_intent != "skip_test"
+        and not policy.allow_missing_credentials_in_draft
+    ):
+        url_candidates = _login_url_candidates(policy, user_message)
+        allow_host_fallback = bool(policy.login_page_urls)
+    elif policy.credential_input_kind == "website_stored_credential" and message_url_candidates:
+        # A URL explicitly supplied by the current user is independent
+        # authority for the URL tier; classifier-only URLs are not.
+        url_candidates = message_url_candidates
+
+    if url_candidates:
+        if credentials is None:
+            credentials = await _load_credentials(organization_id)
+        url_credentials = credentials
+        if current_turn_login_authorized:
+            # Card/secret credentials can carry a tested_url too; a
+            # login turn must only ever auto-bind a password credential.
+            url_credentials = [
+                credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD
+            ]
         matches = _match_by_url(
-            login_credentials,
-            candidates,
+            url_credentials,
+            url_candidates,
             # A URL merely mentioned in prose is a weaker signal than a
             # classifier-extracted login page; require an exact tested-URL hit.
-            allow_host_fallback=bool(policy.login_page_urls),
+            allow_host_fallback=allow_host_fallback,
         )
+        matches = _deduplicate_credentials(matches)
         if len(matches) == 1:
             policy.resolved_credentials = matches
-        elif matches:
+            return
+        if matches:
             # Found-but-unbound keeps the unresolved-login override from
             # relabeling this disambiguation ask as a missing-credential turn.
             policy.discovered_credentials = matches
@@ -4578,68 +4766,51 @@ async def _resolve_credentials(
                 matches,
                 reason="credential_name_unresolved",
             )
-        return
-
-    credentials = await _load_credentials(organization_id)
-    if policy.credential_input_kind == "credential_name":
-        for ref in policy.credential_refs:
-            matches = [credential for credential in credentials if credential.name == ref]
-            if len(matches) == 1:
-                policy.resolved_credentials.append(matches[0])
-            elif matches:
-                _block(
-                    policy,
-                    "I found multiple stored credentials with that exact name. Which one should I use?",
-                    matches,
-                    reason="credential_name_unresolved",
-                )
-                return
-            elif policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
-                policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
-                if defer_unresolved_credential_name:
-                    _defer_unresolved_credential_for_draft(policy)
-            else:
-                _block(
-                    policy,
-                    f"I could not find a stored credential named `{ref}`. Please choose an existing credential by exact name or a credential ID beginning with cred_.",
-                    reason="credential_name_unresolved",
-                )
-                return
-        return
-
-    login_credentials = [
-        credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD
-    ]
-    matches = _match_by_url(login_credentials, policy.login_page_urls)
-    if not matches:
-        # A credential saved without a tested_url is still a valid login credential,
-        # so it stays a candidate once both URL tiers come up empty.
-        urlless = [credential for credential in login_credentials if not credential.tested_url]
-        if len(urlless) == 1:
-            policy.resolved_credentials = urlless
             return
-        if urlless:
-            # Found-but-unbound keeps the unresolved-login override from
-            # relabeling this disambiguation ask as a missing-credential turn.
-            policy.discovered_credentials = urlless
-            _block(
-                policy,
-                _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
-                urlless,
-                reason="credential_name_unresolved",
+        if current_turn_login_authorized:
+            # URL-matched password credentials rank first. If neither URL
+            # tier matches, credentials saved without a tested URL remain
+            # valid login candidates.
+            urlless = _deduplicate_credentials(
+                [credential for credential in url_credentials if not credential.tested_url]
             )
+            if len(urlless) == 1:
+                policy.resolved_credentials = urlless
+                return
+            if urlless:
+                policy.discovered_credentials = urlless
+                _block(
+                    policy,
+                    _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+                    urlless,
+                    reason="credential_name_unresolved",
+                )
+                return
+
+    if policy.credential_input_kind == "credential_name":
+        if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
+            policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
+            if defer_unresolved_credential_name:
+                _defer_unresolved_credential_for_draft(policy)
             return
-    if len(matches) == 1:
-        policy.resolved_credentials = matches
-    elif matches:
-        policy.discovered_credentials = matches
+        if policy.allow_missing_credentials_in_draft:
+            policy.allow_run_blocks = False
+            return
         _block(
             policy,
-            _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
-            matches,
+            _SAVED_CREDENTIAL_NAME_QUESTION,
             reason="credential_name_unresolved",
         )
-    else:
+        return
+
+    if policy.credential_input_kind == "website_stored_credential":
+        if not policy.login_page_urls:
+            _block(
+                policy,
+                _STORED_CREDENTIAL_URL_QUESTION,
+                reason="missing_target_context",
+            )
+            return
         _block(
             policy,
             "I could not find a stored credential for that login page. Please select a saved credential by exact name or a credential ID beginning with cred_, or create one in the Credentials UI.",
@@ -4773,18 +4944,6 @@ async def build_request_policy(
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
-    try:
-        await _apply_exact_credential_name_scope(
-            policy,
-            user_message=user_message,
-            organization_id=organization_id,
-        )
-    except Exception:
-        LOG.warning(
-            "request-policy exact credential-name extraction failed",
-            organization_id=organization_id,
-            exc_info=True,
-        )
     # This narrows classifier output only after the classifier has identified
     # credential intent; running it earlier would be overwritten by the model verdict.
     _apply_explicit_code_block_credential_draft_policy(policy, user_message)
@@ -4855,9 +5014,16 @@ async def build_request_policy(
             question,
             reason="raw_secret",
         )
-    elif policy.requires_user_clarification and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+    elif (
+        policy.requires_user_clarification
+        and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS
+        and not (
+            policy.clarification_reason == "missing_target_context"
+            and _has_resolvable_credential_scope(policy, user_message)
+        )
+    ):
         _block(policy, _clarification_question(policy, global_llm_context))
-    elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy):
+    elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy, user_message):
         _block(policy, _clarification_question(policy, global_llm_context))
     else:
         try:
@@ -4897,6 +5063,12 @@ async def build_request_policy(
             organization_id=organization_id,
             exc_info=True,
         )
+
+    if policy.resolved_credentials and policy.clarification_reason == "missing_target_context":
+        policy.requires_user_clarification = False
+        policy.user_response_policy = "proceed"
+        policy.clarification_reason = "none"
+        policy.clarification_question = None
 
     if _login_credentials_unresolved(policy, user_message, workflow_yaml):
         if policy.clarification_reason == "none":
