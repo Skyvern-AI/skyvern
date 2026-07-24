@@ -528,9 +528,8 @@ class WorkflowRunsRepository(BaseRepository):
                 workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
 
             if search_key:
-                key_like = f"%{search_key}%"
                 # Match workflow_run_id directly
-                id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
+                id_matches = WorkflowRunModel.workflow_run_id.icontains(search_key, autoescape=True)
                 # Match parameter key or description (only for non-deleted parameter definitions)
                 param_key_desc_exists = exists(
                     select(1)
@@ -543,8 +542,8 @@ class WorkflowRunsRepository(BaseRepository):
                     .where(WorkflowParameterModel.deleted_at.is_(None))
                     .where(
                         or_(
-                            WorkflowParameterModel.key.ilike(key_like),
-                            WorkflowParameterModel.description.ilike(key_like),
+                            WorkflowParameterModel.key.icontains(search_key, autoescape=True),
+                            WorkflowParameterModel.description.icontains(search_key, autoescape=True),
                         )
                     )
                 )
@@ -553,12 +552,12 @@ class WorkflowRunsRepository(BaseRepository):
                     select(1)
                     .select_from(WorkflowRunParameterModel)
                     .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-                    .where(WorkflowRunParameterModel.value.ilike(key_like))
+                    .where(WorkflowRunParameterModel.value.icontains(search_key, autoescape=True))
                 )
                 # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
                 extra_headers_match = and_(
                     WorkflowRunModel.extra_http_headers.isnot(None),
-                    func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
+                    func.cast(WorkflowRunModel.extra_http_headers, Text()).icontains(search_key, autoescape=True),
                 )
                 workflow_run_query = workflow_run_query.where(
                     or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match)
