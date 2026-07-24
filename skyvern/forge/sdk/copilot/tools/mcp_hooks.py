@@ -120,12 +120,12 @@ _BLOCK_JSON_ALIASES = ("block", "block_definition", "definition", "block_yaml")
 
 
 def _normalize_block_json_alias(params: dict[str, Any]) -> None:
-    """Promote a misnamed block payload (e.g. ``block``) to ``block_json`` in place.
+    """Normalize a block alias on a private copy for policy inspection.
 
-    The model sometimes passes the block under a shorter key than the schema's
-    ``block_json``; without this, FastMCP rejects the whole call at signature
-    validation before the tool runs. Stray alias keys are always dropped so they
-    cannot trip the "unexpected keyword argument" check.
+    The caller must pass a copy: this helper deliberately consumes aliases to
+    produce one inspectable value, while the original tool arguments continue
+    to the shared FastMCP boundary unchanged. Boundary middleware alone decides
+    whether a payload is unambiguous enough to repair.
     """
     has_block_json = isinstance(params.get("block_json"), str) and bool(params["block_json"].strip())
     promoted: str | None = None
@@ -137,7 +137,7 @@ def _normalize_block_json_alias(params: dict[str, Any]) -> None:
             continue
         if isinstance(value, str):
             promoted = value
-        elif isinstance(value, (dict, list)):
+        elif isinstance(value, dict):
             promoted = json.dumps(value)
     if promoted is not None:
         params["block_json"] = promoted
@@ -147,10 +147,11 @@ async def _validate_block_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    _normalize_block_json_alias(params)
+    normalized_params = dict(params)
+    _normalize_block_json_alias(normalized_params)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
-    block_json = params.get("block_json")
+    block_json = normalized_params.get("block_json")
     if not isinstance(block_json, str):
         return None
     try:

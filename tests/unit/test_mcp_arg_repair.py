@@ -108,10 +108,16 @@ def test_parameter_keys_python_repr_list_string_parsed() -> None:
     assert args["parameter_keys"] == ["a", "b"]
 
 
-def test_parameter_keys_bare_string_wrapped() -> None:
+def test_parameter_keys_bare_string_not_masked() -> None:
     args = {"parameter_keys": "only_key"}
     repair_tool_arguments("skyvern_code_block_lint", args)
-    assert args["parameter_keys"] == ["only_key"]
+    assert args["parameter_keys"] == "only_key"
+
+
+def test_parameter_keys_tuple_repr_not_masked() -> None:
+    args = {"parameter_keys": "('a', 'b')"}
+    repair_tool_arguments("skyvern_code_block_lint", args)
+    assert args["parameter_keys"] == "('a', 'b')"
 
 
 def test_parameter_keys_real_list_untouched() -> None:
@@ -280,6 +286,13 @@ def test_block_validate_dict_alias_serialized() -> None:
     assert "definition" not in args
 
 
+def test_block_validate_list_alias_not_promoted() -> None:
+    definition = [{"block_type": "navigation", "label": "x"}]
+    args = {"definition": definition}
+    repair_tool_arguments("skyvern_block_validate", args)
+    assert args == {"definition": definition}
+
+
 def test_block_validate_identical_aliases_promoted() -> None:
     # One payload under two names is unambiguous — promote it.
     args = {"block": '{"x":1}', "definition": '{"x":1}'}
@@ -317,33 +330,38 @@ def test_block_validate_non_promotable_alias_left_to_error() -> None:
     assert args == {"block": 7}
 
 
-def test_copilot_prehook_covers_every_middleware_block_alias_error() -> None:
-    # INVARIANT: on the copilot path the validate_block pre-hook
-    # (_normalize_block_json_alias) strips ALL block aliases before this
-    # middleware runs, so the (stricter) middleware is a no-op and can never
-    # newly error a copilot call that the pre-hook previously passed. This holds
-    # only while the two _BLOCK_JSON_ALIASES tuples stay identical — asserted
-    # here so a future resync/divergence that re-weakens the remote boundary
-    # fails loudly.
+@pytest.mark.parametrize(
+    ("arguments", "unsupported"),
+    [
+        ({"block": '{"a":1}', "definition": '{"b":2}'}, ["block", "definition"]),
+        ({"block_json": '{"a":1}', "block": '{"b":2}'}, ["block"]),
+        ({"block_json": 7, "block": '{"x":1}'}, ["block"]),
+        ({"block": 7}, ["block"]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_copilot_prehook_preserves_ambiguous_aliases_for_boundary_validation(
+    arguments: dict, unsupported: list[str]
+) -> None:
+    """The Copilot hook may inspect aliases, but the shared boundary owns repair."""
+    from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
+
+    params = dict(arguments)
+    ctx = SimpleNamespace(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+
+    assert await _validate_block_pre_hook(params, ctx) is None
+    assert params == arguments
+
+    res = await _call("skyvern_block_validate", params)
+    _assert_invalid_input(res, unsupported)
+
+
+def test_copilot_and_middleware_block_alias_registries_stay_in_sync() -> None:
     from skyvern.cli.mcp_tools.arg_repair import _BLOCK_JSON_ALIASES as MW_ALIASES
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _BLOCK_JSON_ALIASES as PREHOOK_ALIASES
-    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _normalize_block_json_alias
 
     assert PREHOOK_ALIASES == MW_ALIASES
-
-    for case in (
-        {"block": '{"a":1}', "definition": '{"b":2}'},  # conflicting distinct
-        {"block_json": '{"a":1}', "block": '{"b":2}'},  # distinct alongside canonical
-        {"block_json": 7, "block": '{"x":1}'},  # non-string canonical
-        {"block": 7},  # non-promotable alias
-        {"block": '{"x":1}', "definition": '{"x":1}'},  # identical across names
-    ):
-        params = dict(case)
-        _normalize_block_json_alias(params)  # copilot pre-hook runs first
-        assert not any(alias in params for alias in MW_ALIASES), case
-        before = dict(params)
-        repair_tool_arguments("skyvern_block_validate", params)  # then the middleware
-        assert params == before, case  # middleware is a no-op on the copilot path
 
 
 # --- deliberately NOT masked: wrong-tool block_schema (SKY-12140 / SKY-12141) ---
@@ -377,6 +395,31 @@ async def test_block_validate_block_alias_validates_at_boundary() -> None:
 async def test_parameter_keys_string_lints_at_boundary() -> None:
     res = await _call("skyvern_code_block_lint", {"code": "value = 1\n", "parameter_keys": "['value']"})
     assert res.is_error is False
+
+
+@pytest.mark.parametrize("parameter_keys", ["only_key", "('a', 'b')"])
+@pytest.mark.asyncio
+async def test_ambiguous_parameter_keys_string_errors_at_boundary(parameter_keys: str) -> None:
+    res = await _call("skyvern_code_block_lint", {"code": "value = 1\n", "parameter_keys": parameter_keys})
+    assert res.is_error is True
+    assert "Input should be a valid list" in str(res)
+
+
+@pytest.mark.asyncio
+async def test_parameter_keys_repair_does_not_mask_missing_code() -> None:
+    res = await _call("skyvern_code_block_lint", {"parameter_keys": "['value']"})
+    payload = getattr(res, "structured_content", None)
+    assert isinstance(payload, dict), f"expected structured content dict, got {res!r}"
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert error["code"] == "INVALID_INPUT"
+    assert error["details"]["missing_required_arguments"] == ["code"]
+
+
+@pytest.mark.asyncio
+async def test_block_validate_list_alias_errors_at_boundary() -> None:
+    res = await _call("skyvern_block_validate", {"block": [{"block_type": "navigation"}]})
+    _assert_invalid_input(res, ["block"])
 
 
 @pytest.mark.asyncio
