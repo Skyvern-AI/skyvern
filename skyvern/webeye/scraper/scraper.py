@@ -25,7 +25,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import (
@@ -482,7 +482,7 @@ async def scrape_web_unsafe(
         element_tree_trimmed_html_str = "".join(
             json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
         )
-        token_count = count_tokens(element_tree_trimmed_html_str)
+        token_count = approx_count_tokens(element_tree_trimmed_html_str)
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
 

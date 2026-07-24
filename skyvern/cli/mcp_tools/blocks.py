@@ -244,6 +244,16 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "code": {
+        "block_type": "code",
+        "label": "collect_post_titles",
+        "prompt": "Open the news page and collect the top post titles",
+        "code": (
+            'await page.goto("https://example.com/news")\n'
+            'titles = await page.locator("h2.title").all_text_contents()\n'
+            'return {"titles": titles}'
+        ),
+    },
     "goto_url": {
         "block_type": "goto_url",
         "label": "open_cart",

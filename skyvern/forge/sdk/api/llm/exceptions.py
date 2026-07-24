@@ -29,6 +29,15 @@ class InvalidLLMResponseType(BaseLLMError):
         super().__init__(f"LLM response content is expected to be a dict, but got {response_type}")
 
 
+class LLMResponseMissingActionsError(InvalidLLMResponseFormat):
+    def __init__(self, response_keys: list[str]) -> None:
+        # Skip InvalidLLMResponseFormat.__init__ — the response parsed fine, it just lacks the actions field
+        SkyvernException.__init__(
+            self,
+            f"LLM response does not contain a usable 'actions' list; received keys: {response_keys}",
+        )
+
+
 class DuplicateCustomLLMProviderError(BaseLLMError):
     def __init__(self, llm_key: str) -> None:
         super().__init__(f"Custom LLMProvider {llm_key} is already registered")

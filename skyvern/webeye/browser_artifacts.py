@@ -33,6 +33,31 @@ class BrowserArtifacts(BaseModel):
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
     _discarded_pages: set[Page] = PrivateAttr(default_factory=set)
+    # Freshness-guard state, captured at seed and read at write-back (in-memory only, per browser run).
+    # _seed_cookie_snapshot / _seed_profile_etag record what the profile held when this run seeded it;
+    # _run_performed_fresh_login flips true once a login block types a fresh sign-in.
+    _seed_cookie_snapshot: list[dict] | None = PrivateAttr(default=None)
+    _seed_profile_etag: str | None = PrivateAttr(default=None)
+    _run_performed_fresh_login: bool = PrivateAttr(default=False)
+    # _seed_load_failed flips true when a saved profile failed to launch (corruption/stale lock) and the
+    # run fell back to a blank dir — its end-state is not this profile's, so write-back must be suppressed.
+    _seed_load_failed: bool = PrivateAttr(default=False)
+    # _seed_capture_failed flips true when the seed fingerprint could not be captured — the guard then
+    # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
+    _seed_capture_failed: bool = PrivateAttr(default=False)
+
+    def record_seed_profile_state(self, cookies: list[dict], etag: str | None) -> None:
+        self._seed_cookie_snapshot = cookies
+        self._seed_profile_etag = etag
+
+    def mark_run_performed_fresh_login(self) -> None:
+        self._run_performed_fresh_login = True
+
+    def mark_seed_load_failed(self) -> None:
+        self._seed_load_failed = True
+
+    def mark_seed_capture_failed(self) -> None:
+        self._seed_capture_failed = True
 
     def discard_page_video(self, page: Page) -> None:
         self._discarded_pages.add(page)

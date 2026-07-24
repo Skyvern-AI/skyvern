@@ -137,16 +137,40 @@ def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
     return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
 
 
-def _yaml_has_target_url(workflow_yaml: str | None) -> bool:
-    """True when the YAML carries a goto_url or navigation block with a non-empty url."""
+def _first_yaml_target_url(workflow_yaml: str | None) -> str | None:
+    """The first goto_url/navigation block url in the YAML, or None."""
     for block in _parse_workflow_blocks(workflow_yaml):
         block_type = block.get("block_type")
         if block_type not in {"goto_url", "navigation"}:
             continue
         url = block.get("url")
         if isinstance(url, str) and url.strip():
-            return True
-    return False
+            return url.strip()
+    return None
+
+
+def _yaml_has_target_url(workflow_yaml: str | None) -> bool:
+    """True when the YAML carries a goto_url or navigation block with a non-empty url."""
+    return _first_yaml_target_url(workflow_yaml) is not None
+
+
+def extract_in_turn_entry_url(
+    user_message: str,
+    agent_user_message: str,
+    workflow_yaml: str | None,
+) -> str | None:
+    """The in-turn entrypoint URL (latest message, rewritten input, or YAML), or None.
+
+    Unlike the anchor extractor this applies no truncation/markdown rejection:
+    these are live in-turn sources, not a spliced transcript anchor.
+    """
+    for text in (user_message, agent_user_message):
+        match = _URL_IN_TEXT_RE.search(text or "")
+        if match:
+            candidate = match.group(0).rstrip(_ANCHOR_URL_TRAILING_PUNCTUATION)
+            if candidate:
+                return candidate
+    return _first_yaml_target_url(workflow_yaml)
 
 
 def initial_build_phase(
@@ -155,6 +179,7 @@ def initial_build_phase(
     agent_user_message: str,
     workflow_yaml: str | None,
     transcript_earliest_user_turn: str = "",
+    persisted_entrypoint_url: str | None = None,
 ) -> BuildPhase:
     """Decide the initial build phase for this turn.
 
@@ -177,6 +202,7 @@ def initial_build_phase(
     - The raw latest user message.
     - The rewritten agent input (request-policy may carry the prior request).
     - The current workflow YAML's first goto_url/navigation block.
+    - The persisted entrypoint slot carried across turns in durable state.
     - The earliest-user-turn transcript anchor, consulted last and read-side
       only. The anchor IS the original request, so it recovers the URL an
       abnormally-ended turn dropped without reviving stale URLs from prior
@@ -189,6 +215,7 @@ def initial_build_phase(
         _URL_IN_TEXT_RE.search(user_message or "")
         or _URL_IN_TEXT_RE.search(agent_user_message or "")
         or _yaml_has_target_url(workflow_yaml)
+        or persisted_entrypoint_url
         or extract_anchor_entry_url(transcript_earliest_user_turn)
     )
     if not has_url_signal:

@@ -279,6 +279,7 @@ class StructuredContext(BaseModel):
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
     loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
     fill_carry: list[FillCarry] = Field(default_factory=list)
+    entrypoint_url: str | None = None
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
@@ -583,6 +584,8 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
     scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
     raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    raw_entrypoint_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    resolved_entrypoint_url = raw_entrypoint_url if isinstance(raw_entrypoint_url, str) else None
     fill_carry = _fill_carry_from_scout_trajectory(
         [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
         credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
@@ -594,9 +597,12 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
         and not flow_evidence
         and not loaded_result_targets
         and not fill_carry
+        and not resolved_entrypoint_url
     ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
+    if resolved_entrypoint_url:
+        sc.entrypoint_url = resolved_entrypoint_url
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)

@@ -304,6 +304,19 @@ async def run_task(
     )
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
+        # The V1 / CUA task engines build a legacy TaskRequest that carries no browser-memory controls,
+        # so these run-level fields would silently no-op. Reject them explicitly rather than accept-and-
+        # ignore; skyvern_v2 honors both via initialize_task_v2. V1/CUA parity is deferred (SKY-12644).
+        if run_request.browser_profile_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="browser_profile_id is not supported for the skyvern_v1 or CUA task engines; use engine=skyvern_v2.",
+            )
+        if run_request.start_fresh_browser:
+            raise HTTPException(
+                status_code=400,
+                detail="start_fresh_browser is not supported for the skyvern_v1 or CUA task engines; use engine=skyvern_v2.",
+            )
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
         url = run_request.url
@@ -392,6 +405,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
@@ -417,6 +431,8 @@ async def run_task(
                 extra_http_headers=run_request.extra_http_headers,
                 cdp_connect_headers=run_request.cdp_connect_headers,
                 browser_session_id=run_request.browser_session_id,
+                browser_profile_id=run_request.browser_profile_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
             )
@@ -467,6 +483,8 @@ async def run_task(
                 proxy_location=task_v2.proxy_location,
                 max_steps=run_request.max_steps,
                 browser_session_id=run_request.browser_session_id,
+                browser_profile_id=run_request.browser_profile_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
@@ -486,6 +504,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
         browser_profile_id=workflow_run_request.browser_profile_id,
+        start_fresh_browser=workflow_run_request.start_fresh_browser,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         max_elapsed_time_minutes=workflow_run_request.max_elapsed_time_minutes,
         extra_http_headers=workflow_run_request.extra_http_headers,
@@ -602,6 +621,7 @@ async def run_workflow(
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -3598,6 +3618,7 @@ def _workflow_run_request_from_workflow_request(
         totp_identifier=workflow_request.totp_identifier,
         browser_session_id=workflow_request.browser_session_id,
         browser_profile_id=workflow_request.browser_profile_id,
+        start_fresh_browser=workflow_request.start_fresh_browser,
         max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
         max_elapsed_time_minutes=getattr(workflow_request, "max_elapsed_time_minutes", None),
         extra_http_headers=workflow_request.extra_http_headers,
@@ -3767,6 +3788,7 @@ async def retry_workflow_run(
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )

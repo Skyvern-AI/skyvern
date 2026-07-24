@@ -1387,10 +1387,12 @@ async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -
         # task.workflow_permanent_id is None on most fetch paths; fall back to context (SKY-8992).
         context = skyvern_context.current()
         workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
+        script_mode_run = bool(context and context.script_mode)
         # PostHog local evaluation cannot match exclusions when the property is absent.
         properties = {
             "organization_id": organization_id,
             "workflow_permanent_id": workflow_permanent_id or "",
+            "script_mode": "true" if script_mode_run else "false",
         }
         family_enabled = bool(
             await experimentation_provider.is_feature_enabled_cached(
@@ -1401,6 +1403,10 @@ async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -
         )
         if not family_enabled:
             return _CollapseGateResult(False, None, False)
+        # Cached-script runs skip only the umbrella randomization: they must always be
+        # in-treatment when the family is on, while the family flag stays the kill switch.
+        if script_mode_run:
+            return _CollapseGateResult(True, True, False)
         # PostHog hashes per flag key, so this umbrella is the only randomization source.
         # Family flags are kill switches and must never use percentage rollouts.
         assigned = await _resolve_collapse_xp_assignment(experimentation_provider, task, organization_id)
@@ -7691,6 +7697,7 @@ async def _select_deterministic_custom_option(
     match_tier: str | None = None
     attempted = False
     click_attempted = False
+    script_mode_run = False
 
     def emit(outcome: CustomSelectFamilyOutcome) -> None:
         try:
@@ -7704,6 +7711,7 @@ async def _select_deterministic_custom_option(
                 entry_action_type=entry_action_type,
                 selection_group_id=selection_group_id,
                 select_depth=select_depth,
+                script_mode=script_mode_run,
                 family_gate_enabled=gate.family_enabled,
                 assigned=gate.assigned,
                 gate_error=gate.gate_error,
@@ -7727,6 +7735,8 @@ async def _select_deterministic_custom_option(
     if isinstance(field_context, dict) and field_context.get("is_date_related") is True:
         return None
 
+    context = skyvern_context.current()
+    script_mode_run = bool(context and context.script_mode)
     gate = await _resolve_collapse_gate(
         task,
         COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,

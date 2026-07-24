@@ -272,6 +272,17 @@ class ScoutedInteraction(TypedDict):
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
     credential_name: NotRequired[str]
+    # Element identity fingerprint for credential-fill resolution: captured at fill time, attributes
+    # only (never values). Enables unambiguous identification of the scouted credential element
+    # across equivalent selectors (e.g., #pass vs input[type="password"]).
+    element_fingerprint_id: NotRequired[str]
+    element_fingerprint_name: NotRequired[str]
+    element_fingerprint_type: NotRequired[str]
+    element_fingerprint_placeholder: NotRequired[str]
+    element_fingerprint_label: NotRequired[str]
+    element_fingerprint_test_id: NotRequired[str]
+    element_fingerprint_tag: NotRequired[str]
+    element_fingerprint_probed: NotRequired[str]
 
 
 NeverCapturedObligationState: TypeAlias = Literal["armed", "captured", "consumed"]

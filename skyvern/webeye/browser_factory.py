@@ -56,7 +56,7 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
-from skyvern.webeye.session_cookies import restore_session_cookies
+from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -130,6 +130,25 @@ def sanitize_browser_headers(headers: dict[str, str] | None) -> dict[str, str] |
             continue
         sanitized[name] = value
     return sanitized or None
+
+
+async def _capture_seed_profile_state(
+    browser_context: BrowserContext, browser_artifacts: BrowserArtifacts, kwargs: dict[str, Any]
+) -> None:
+    """Snapshot what the seed profile held at run start — its cookies (post-restore, pre-navigation) plus
+    a stored-archive fingerprint — so the write-back freshness guard can contribute only this run's own
+    cookie changes when the stored profile moved under it. Best-effort: never break browser creation."""
+    browser_profile_id = kwargs.get("browser_profile_id")
+    organization_id = kwargs.get("organization_id")
+    if not browser_profile_id or not organization_id or not browser_artifacts.browser_session_dir:
+        return
+    try:
+        cookies = await browser_context.cookies()
+        etag = await app.STORAGE.get_browser_profile_etag(organization_id, browser_profile_id)
+        browser_artifacts.record_seed_profile_state([dict(cookie) for cookie in cookies], etag)
+    except Exception:
+        LOG.warning("Failed to capture seed profile state for the write-back freshness guard", exc_info=True)
+        browser_artifacts.mark_seed_capture_failed()
 
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
@@ -550,6 +569,12 @@ class BrowserContextFactory:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
+            # After session cookies so a verified-login heal (banked by the credential living-profile
+            # engine) wins over the profile's own older session cookies on a key clash. Gated on the
+            # engine kill-switch so a rollback also stops applying previously banked login state.
+            if await app.AGENT_FUNCTION.should_apply_banked_cookies(kwargs.get("organization_id")):
+                await restore_banked_cookies(browser_context, browser_artifacts.browser_session_dir)
+                await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
@@ -744,6 +769,7 @@ async def _create_headless_chromium(
                 har_path=browser_args["record_har_path"],
                 browser_session_dir=fallback_dir,
             )
+            browser_artifacts.mark_seed_load_failed()
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         else:
             raise
@@ -835,6 +861,7 @@ async def _create_headful_chromium(
                 har_path=browser_args["record_har_path"],
                 browser_session_dir=fallback_dir,
             )
+            browser_artifacts.mark_seed_load_failed()
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         else:
             raise

@@ -11,6 +11,7 @@ import binascii
 import contextlib
 import json
 import math
+import os
 import re
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -50,7 +51,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase, anchor_recovers_entrypoint, initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import (
+    BuildPhase,
+    anchor_recovers_entrypoint,
+    extract_in_turn_entry_url,
+    initial_build_phase,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -604,6 +610,11 @@ def _turn_context_log_fields(packet: TurnContextPacket | None) -> dict[str, Any]
 
 def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, str]:
     return {key: str(value) for key, value in _turn_context_log_fields(packet).items()}
+
+
+def _transcript_anchor_disabled() -> bool:
+    """Test-isolation knob: COPILOT_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
+    return os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
@@ -5557,13 +5568,26 @@ async def _run_copilot_turn_impl(
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
     ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
-    transcript_anchor = _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
+    persisted_entrypoint_url = prior_structured_context.entrypoint_url
+    # Blanking the anchor disables both its consumers below; the env knob exists so an
+    # E2E can prove the persisted slot alone carries recovery. Never set in production.
+    transcript_anchor = (
+        ""
+        if persisted_entrypoint_url or _transcript_anchor_disabled()
+        else _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
+    )
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
         agent_user_message or "",
         chat_request.workflow_yaml or "",
         transcript_anchor,
+        persisted_entrypoint_url=persisted_entrypoint_url,
+    )
+    in_turn_entrypoint = extract_in_turn_entry_url(
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
     )
     anchor_entrypoint = anchor_recovers_entrypoint(
         ctx.turn_intent,
@@ -5572,8 +5596,10 @@ async def _run_copilot_turn_impl(
         chat_request.workflow_yaml or "",
         transcript_anchor,
     )
-    if anchor_entrypoint is not None and ctx.resolved_discovery_entrypoint_url is None:
-        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint
+    if in_turn_entrypoint is not None:
+        ctx.resolved_discovery_entrypoint_url = in_turn_entrypoint
+    elif ctx.resolved_discovery_entrypoint_url is None:
+        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint or persisted_entrypoint_url
     LOG.info(
         "copilot.build_phase_initial",
         build_phase=ctx.build_phase.value,

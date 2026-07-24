@@ -768,19 +768,21 @@ async def _persist_cancel_turn(
     audio_artifact_id: str | None = None,
     turn_id: str | None = None,
     keep_pending_proposal: bool = False,
+    prior_global_llm_context: str | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
     Pass the agent's ``AgentResult`` for cancels during the agent run so
     rollback uses the same ``workflow_was_persisted`` source of truth as
-    the success path; pass ``None`` for pre-agent cancels.
+    the success path; pass ``None`` for pre-agent cancels. A pre-agent cancel
+    carries ``prior_global_llm_context`` forward so durable state survives.
     """
     turn_outcome: TurnOutcome | None
     workflow_applied = False
     if agent_result is None:
         user_response = "Cancelled by user."
         updated_workflow = None
-        updated_global_llm_context = None
+        updated_global_llm_context = prior_global_llm_context
         total_tokens = None
         response_type = "REPLY"
         output_policy_diagnostics = None
@@ -2073,6 +2075,7 @@ async def _new_copilot_chat_post(
                         audio_artifact_id=chat_request.audio_artifact_id,
                         turn_id=turn_id,
                         keep_pending_proposal=chat_request.keep_pending_proposal,
+                        prior_global_llm_context=global_llm_context,
                     )
                 )
                 terminal_frame_emitted = True
