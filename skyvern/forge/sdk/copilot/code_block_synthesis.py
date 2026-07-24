@@ -894,7 +894,9 @@ def dynamic_row_evidence_fingerprint(
         "period_matches": [dict(item) for item in period_matches],
         "selected_index": selected_index,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    # Tamper-evidence key over scouted DOM evidence, not a credential digest.
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(serialized, usedforsecurity=False).hexdigest()
 
 
 def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDynamicRowEvidence | None:
