@@ -408,7 +408,8 @@ async def test_workflow_create_defaults_code_block_prompt(
     monkeypatch: pytest.MonkeyPatch,
     serialized_as: str,
 ) -> None:
-    """An MCP-created code block without a prompt persists with prompt "" (new code block experience)."""
+    """An MCP-created code block without a prompt persists with prompt "" (new code block experience)
+    and steps derived from its code."""
     request_mock = _patch_skyvern_http(monkeypatch)
     definition = _workflow_definition([_code_block()])
 
@@ -421,6 +422,40 @@ async def test_workflow_create_defaults_code_block_prompt(
     sent = _sent_definition(request_mock)
     blocks = sent["workflow_definition"]["blocks"]
     assert blocks[0]["prompt"] == ""
+    assert [step["action_type"] for step in blocks[0]["steps"]] == ["goto_url"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_derives_steps_only_for_new_code_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3: an update resubmitting an existing old code block leaves it untouched (no prompt, no
+    steps), while a code block new to the workflow gets the new-block prompt default + derived steps."""
+    request_mock = _patch_skyvern_http(monkeypatch)
+    old_block = _code_block(label="old_block")
+    existing_workflow = {
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {"parameters": [], "blocks": [dict(old_block)]},
+    }
+    _patch_get_workflow_by_id(monkeypatch, AsyncMock(return_value=existing_workflow))
+
+    definition = _workflow_definition([dict(old_block), _code_block(label="new_block")])
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True, result
+    blocks = _sent_definition(request_mock)["workflow_definition"]["blocks"]
+    by_label = {block["label"]: block for block in blocks}
+    # The update pipeline normalizes blocks through the schema (explicit nulls); the AC is that
+    # the old block stays legacy: null prompt, no steps.
+    assert by_label["old_block"]["code"] == old_block["code"]
+    assert by_label["old_block"].get("prompt") is None
+    assert not by_label["old_block"].get("steps")
+    assert by_label["new_block"]["prompt"] == ""
+    assert [step["action_type"] for step in by_label["new_block"]["steps"]] == ["goto_url"]
 
 
 @pytest.mark.parametrize("format_name", ["yaml", "auto"])
@@ -430,10 +465,15 @@ async def test_workflow_create_code_only_false_preserves_yaml_bytes(
     format_name: str,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch)
-    # prompt supplied explicitly: an omitted prompt is now defaulted (new code block
-    # experience), which intentionally rewrites the definition.
+    # prompt and steps supplied explicitly: omitted values are now defaulted/derived (new code
+    # block experience), which intentionally rewrites the definition.
     definition = _workflow_definition(
-        [_code_block(prompt="")],
+        [
+            _code_block(
+                prompt="",
+                steps=[{"description": "Open the page", "action_type": "goto_url", "line_start": 1, "line_end": 1}],
+            )
+        ],
         proxy_location="RESIDENTIAL",
         code_version=2,
         run_with="agent",

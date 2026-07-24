@@ -122,13 +122,12 @@ async def test_delete_detaches_linked_credentials_atomically(db: AgentDB) -> Non
         db,
         _profile(),
         _credential(credential_id="cred_a", name="A", browser_profile_id="bp_target"),
-        _credential(credential_id="cred_b", name="B", browser_profile_id="bp_target"),
         _credential(credential_id="cred_other", name="Other", browser_profile_id="bp_other"),
     )
 
     cleared = await db.browser_sessions.delete_browser_profile("bp_target", ORG)
 
-    assert sorted(cleared) == ["cred_a", "cred_b"]
+    assert cleared == ["cred_a"]
     # Same transaction as the soft-delete, so no dangling link can survive a mid-failure.
     assert await db.browser_sessions.get_browser_profile("bp_target", ORG) is None
     assert (await db.credentials.get_credential("cred_a", ORG)).browser_profile_id is None

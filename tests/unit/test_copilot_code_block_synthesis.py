@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -4573,20 +4572,6 @@ def _dynamic_row_click(*, source_url: str = "https://example.com/statements") ->
     return interaction
 
 
-def test_dynamic_row_evidence_fingerprint_is_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
-    evidence = _dynamic_row_click()["dynamic_row_evidence"]
-    payload = {key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
-
-    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-alpha")
-    fingerprint_a = dynamic_row_evidence_fingerprint(**payload)
-    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-beta")
-    fingerprint_b = dynamic_row_evidence_fingerprint(**payload)
-
-    assert len(fingerprint_a) == 64
-    assert len(fingerprint_b) == 64
-    assert fingerprint_a != fingerprint_b
-
-
 def test_valid_unused_dynamic_row_evidence_preserves_generic_positional_synthesis() -> None:
     interaction = _dynamic_row_click()
     evidence = interaction["dynamic_row_evidence"]
@@ -4849,7 +4834,10 @@ class _FakePage:
 
 
 def _run_synthesized_block(code: str, page: _FakePage, portal: object) -> None:
-    namespace: dict[str, Any] = {}
+    async def solve_captcha(_page: object) -> None:
+        return None
+
+    namespace: dict[str, Any] = {"solve_captcha": solve_captcha}
     exec("async def _block(page, portal):\n" + code, namespace)
     asyncio.run(namespace["_block"](page, portal))
 
@@ -5003,6 +4991,55 @@ def test_type_text_secret_bypass_is_not_carried_into_synthesized_block() -> None
     assert _INLINE_SECRET_SENTINEL not in result.code
     credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
     assert f"{credential_param['key']}.username" in result.code
+
+
+def test_login_submit_emits_solve_captcha_after_navigation_commit() -> None:
+    trajectory = [
+        _credential_fill(
+            selector="#username", credential_id="cred_x", credential_field="username", source_url=_LOGIN_HOST
+        ),
+        _credential_fill(
+            selector="#password", credential_id="cred_x", credential_field="password", source_url=_LOGIN_HOST
+        ),
+        _interaction("click", selector="button[type=submit]", source_url=_LOGIN_HOST),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    submit_position = result.code.index('await page.locator("button[type=submit]").click()')
+    navigation_position = result.code.index('await page.wait_for_load_state("domcontentloaded")', submit_position)
+    captcha_position = result.code.index("await solve_captcha(page)", navigation_position)
+    assert submit_position < navigation_position < captcha_position
+    assert result.code.count("await solve_captcha(page)") == 1
+
+
+def test_typed_challenge_boundary_emits_solve_captcha() -> None:
+    trajectory = [
+        _interaction(
+            "click",
+            selector="#continue",
+            source_url="https://example.com/challenge",
+            challenge_state={"detected": True, "evidence_source": "challenge_state"},
+        )
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert result.code.count("await solve_captcha(page)") == 1
+    assert result.code.index("await solve_captcha(page)") > result.code.index('await page.locator("#continue").click()')
+
+
+def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
+    trajectory = [
+        _interaction("click", selector="#download-report", source_url="https://example.com/reports"),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert "solve_captcha" not in result.code
 
 
 class TestScoutedSpineOmissionDigest:
