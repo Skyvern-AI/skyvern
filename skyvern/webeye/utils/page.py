@@ -19,7 +19,7 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
-from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.exceptions import FailedToTakeScreenshot, SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
@@ -550,11 +550,11 @@ class SkyvernFrame:
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as error:
             # Re-raised and handled by the caller (scrape retries / failure classification),
             # so this is not the failure boundary; log without a traceback at warning.
             LOG.warning("Skyvern timed out trying to analyze the page", expression=expression)
-            raise TimeoutError("Skyvern timed out trying to analyze the page")
+            raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
 
     @staticmethod
     async def _evaluate_with_navigation_recovery(
@@ -583,7 +583,7 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
 
             LOG.warning(
                 "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
@@ -600,18 +600,18 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(inject_budget):
                     # Same dispatch helper so a prefixed Page re-injects
                     # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
                     await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
                 LOG.exception(
                     "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except (PlaywrightError, RuntimeError) as inject_err:
                 last_error_msg = str(inject_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
@@ -628,13 +628,13 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
                     return await evaluate_expression()
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
                 LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except (PlaywrightError, RuntimeError) as retry_err:
                 last_error_msg = str(retry_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
@@ -1148,7 +1148,7 @@ class SkyvernFrame:
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
             _span.set_attribute("animation_result", "finished")
-        except (TimeoutError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
             _span.set_attribute("animation_result", "timeout")
             LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
             return
@@ -1198,7 +1198,7 @@ class SkyvernFrame:
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
                 loading_indicator_result = "timeout"
                 LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
             except Exception:
@@ -1231,7 +1231,7 @@ class SkyvernFrame:
             _ds_span.set_attribute("stable_ms", dom_stable_ms)
             try:
                 await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
                 dom_stability_result = "timeout"
                 LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
             except Exception:

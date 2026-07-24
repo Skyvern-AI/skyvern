@@ -50,7 +50,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase, initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase, anchor_recovers_entrypoint, initial_build_phase
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -97,16 +97,23 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     TurnNarrativePayload,
     adopt_model_authored_context,
+    coerce_ask_subject,
     finalize_discovery_counter_in_global_llm_context,
+    parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
+)
+from skyvern.forge.sdk.copilot.credential_literal_rebind import (
+    rebind_scouted_credential_literals,
+    scouted_credential_targets,
 )
 from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
     SCOUTED_SPINE_TURN_HALT_USER_REASON,
+    _get_scouted_spine_missing_steps_for_halt,
     artifact_health_blocked,
     log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
@@ -187,6 +194,8 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, reason_in_reply_shadow
+from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
+from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_churn
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -597,6 +606,21 @@ def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, st
     return {key: str(value) for key, value in _turn_context_log_fields(packet).items()}
 
 
+def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
+    """The earliest-user-turn anchor, or "" when it cannot be trusted this turn.
+
+    Blanked when the retained window is at capacity: a full window may have
+    dropped older turns, so earliest_user_turn would be a middle-history turn
+    rather than the original request.
+    """
+    # Deferred: routes.workflow_copilot imports this module (circular at import time).
+    from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
+
+    if not isinstance(packet, TurnContextPacket) or chat_history_len >= CHAT_HISTORY_CONTEXT_MESSAGES:
+        return ""
+    return packet.transcript_context.earliest_user_turn
+
+
 def _store_turn_context_packet_on_context(
     ctx: CopilotContext,
     *,
@@ -965,6 +989,38 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
                 lines.append(f"- {'; '.join(fields)}")
     if outcome.workflow_run_id:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    page_path_failure = outcome.page_path_failure
+    if page_path_failure is not None and page_path_failure.is_page_path:
+        lines.extend(
+            [
+                "POST-RUN PAGE-PATH CONTINUATION:",
+                f"kind: {_clean_authoring_repair_prompt_atom(page_path_failure.kind)}",
+            ]
+        )
+        for target in page_path_failure.continuation_targets:
+            selector = _clean_authoring_repair_prompt_atom(target.selector)
+            lines.append(f"- allowed click: selector={selector}")
+            if page_path_failure.enter_allowed and target.kind in {"form_submit", "challenge"}:
+                lines.append(f"- allowed Enter: selector={selector}")
+        lines.append(
+            "Continue from the current page with one exact listed click or Enter action. "
+            "Do not navigate away or re-author the workflow before attempting that bounded continuation."
+        )
+    elif (
+        page_path_failure is None
+        and outcome.phase == "persisted_block_run"
+        and outcome.reason_code == "outcome_not_demonstrated"
+        and outcome.workflow_run_id
+    ):
+        lines.extend(
+            [
+                "POST-RUN PAGE-PATH CONTRACT UNBOUND:",
+                'Before any click or key press, call inspect_page_for_composition with target_url="current_page". '
+                "Do not use evaluate as a substitute. If the fresh same-run observation is page-path-shaped, it "
+                "will emit the exact allowed click or Enter selector; use only that selector without navigating or "
+                "re-authoring first. Otherwise the existing blocker remains in force.",
+            ]
+        )
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
     if outcome.observed_page_value_excerpt:
@@ -1189,6 +1245,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
             + _synthesized_block_offer_prompt(ctx)
+            + todo_list_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )
 
@@ -2137,6 +2194,7 @@ async def _build_goal_satisfied_exit_result(
     terminal_reason: str = "verified_goal_satisfied",
     exit_site: str = "verified_goal_satisfied",
     flush_goal_satisfied: bool = True,
+    name_missing_spine_steps: bool = False,
 ) -> AgentResult:
     # Bypass one extra LLM turn after a full workflow test already satisfies
     # the diagnosis contract.
@@ -2160,6 +2218,10 @@ async def _build_goal_satisfied_exit_result(
         user_response = (
             "I reached the requested outcome, but the workflow has not been tested end-to-end. "
             "Review the draft before using it."
+        )
+    if name_missing_spine_steps and log_scouted_spine_unresolved_at_turn_halt(ctx):
+        user_response = _with_scouted_spine_missing_steps(
+            ctx, user_response, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
         )
     final_text, outcome = apply_repeated_reply_guard(
         final_text=user_response,
@@ -2249,10 +2311,36 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
         terminal_reason=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
         exit_site=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
         flush_goal_satisfied=False,
+        name_missing_spine_steps=True,
     )
 
 
 _SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+_SCOUTED_SPINE_MISSING_STEPS_PREFIX = "This draft is still missing steps you demonstrated:"
+
+
+def _with_scouted_spine_missing_steps(
+    ctx: CopilotContext,
+    user_response: str,
+    missing_steps: str | None,
+    *,
+    held_signal_unrelated: bool = False,
+) -> str:
+    """Name the demonstrated-but-missing steps on any give-up offer that carries a staged proposal, and
+    anchor them in the held blocker signal so the blocker-override finalizer cannot re-render them away.
+    When the held signal is an unrelated blocker that owns the turn (output policy, timeout, credential),
+    the steps are surfaced in the reply only; its reason and claimant stay intact so the turn's single
+    owner keeps rendering its own reply. Idempotent so a pre-finalizer append plus the finalizer re-render
+    never doubles the note."""
+    if not missing_steps or not ctx.has_staged_proposal:
+        return user_response
+    if _SCOUTED_SPINE_MISSING_STEPS_PREFIX in user_response:
+        return user_response
+    reframed = f"{user_response}\n\n{_SCOUTED_SPINE_MISSING_STEPS_PREFIX} {missing_steps}"
+    if not held_signal_unrelated and isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
+        ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": reframed})
+        ctx.blocker_signal_claimant = None
+    return reframed
 
 
 def _build_turn_halt_exit_result(
@@ -2261,6 +2349,7 @@ def _build_turn_halt_exit_result(
     halt: TurnHalt,
 ) -> AgentResult:
     under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
+    missing_steps = _get_scouted_spine_missing_steps_for_halt(ctx) if under_build_open else None
     if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
         return _build_wip_exit_result(
             ctx,
@@ -2269,15 +2358,15 @@ def _build_turn_halt_exit_result(
             unvalidated_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
             tested_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
             terminal_reason=f"turn_halt:{halt.kind.value}",
+            missing_spine_steps=missing_steps,
         )
     signal = halt.blocker_signal
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
         signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
-    if under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS:
+    scouted_spine_owns = under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS
+    if scouted_spine_owns:
         user_response = SCOUTED_SPINE_TURN_HALT_USER_REASON
-        # The blocker-override finalizer re-renders from the held signal, so the
-        # reframed reason must live there, not just in the local reply.
         if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
             ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
             ctx.blocker_signal_claimant = None
@@ -2285,6 +2374,9 @@ def _build_turn_halt_exit_result(
         user_response = signal.user_facing_reason
     else:
         user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
+    user_response = _with_scouted_spine_missing_steps(
+        ctx, user_response, missing_steps, held_signal_unrelated=not scouted_spine_owns
+    )
     return _build_exit_result(
         ctx,
         user_response,
@@ -3120,6 +3212,9 @@ def _finalize_result_with_blocker_override(
             return preserved
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
+    rendered_reply = _with_scouted_spine_missing_steps(
+        ctx, rendered_reply, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
+    )
 
     rendered_kind = (
         CopilotOutputKind.CLARIFICATION_REQUEST
@@ -3486,8 +3581,11 @@ def _build_wip_exit_result(
     tested_reply: str,
     cancelled: bool = False,
     terminal_reason: str | None = None,
+    missing_spine_steps: str | None = None,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
+    if missing_spine_steps is None:
+        missing_spine_steps = _get_scouted_spine_missing_steps_for_halt(ctx)
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
@@ -3507,6 +3605,7 @@ def _build_wip_exit_result(
                 terminal_reason=effective_terminal,
             )
             text = _observed_facts_halt_reply(ctx)
+        text = _with_scouted_spine_missing_steps(ctx, text, missing_spine_steps, held_signal_unrelated=True)
         return apply_repeated_reply_guard(
             final_text=text,
             attempted_kind=ResponseKind.CLARIFY,
@@ -3790,6 +3889,52 @@ async def _resolve_wrapped_exception_exit_result(
     return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
 
 
+def _inline_replace_workflow_credential_verdict(
+    ctx: CopilotContext, action_data: dict[str, Any], resp_type: str, user_response: str
+) -> tuple[str, OutputPolicyVerdict, OutputPolicyVerdict]:
+    """Rebind scouted credential literals into ``action_data['workflow_yaml']`` and evaluate the inline
+    REPLACE_WORKFLOW output policy, recording churn when the hard-block verdict rejects. Returns the
+    effective YAML plus the raw and hard-block verdicts."""
+    workflow_yaml = action_data.get("workflow_yaml", "")
+    inline_rebind = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
+    if inline_rebind.changed:
+        workflow_yaml = inline_rebind.workflow_yaml
+        action_data["workflow_yaml"] = workflow_yaml
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW rebound scouted credential literals",
+            credential_literals_rebound=bool(inline_rebind.rebound),
+            authored_credential_fills=[list(pair) for pair in inline_rebind.authored],
+        )
+    for skip in inline_rebind.skips:
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW credential authoring skipped",
+            stage=skip.stage,
+            selector=skip.selector,
+            targets_present=len(scouted_credential_targets(ctx.scout_trajectory)),
+        )
+    raw_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type=resp_type,
+        user_response=str(user_response),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=action_data,
+        has_workflow_proposal=True,
+        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+    )
+    hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
+    if inline_rebind.residual_selectors and hard_block_verdict.allowed:
+        # This path bypasses the update_workflow guardrail, and the output-policy scan does not catch a bare
+        # `page.fill(sel, ...)`, so an inline secret the rebind could not neutralize would slip through here.
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW credential residual raw fill fail-closed",
+            residual_raw_credential_fill_selectors=list(inline_rebind.residual_selectors),
+        )
+        hard_block_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
+    if not hard_block_verdict.allowed:
+        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, hard_block_verdict)
+    return workflow_yaml, raw_verdict, hard_block_verdict
+
+
 async def _translate_to_agent_result(
     result: RunResultStreaming,
     ctx: CopilotContext,
@@ -3810,6 +3955,12 @@ async def _translate_to_agent_result(
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
+    if resp_type == "ASK_QUESTION":
+        LOG.info(
+            "copilot_ask_subject",
+            subject=coerce_ask_subject(action_data.get("ask_subject")),
+            refs=parsed_ask_refs(action_data.get("refs")),
+        )
     normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
     resp_type = normalized_scaffolding.response_type
     user_response = normalized_scaffolding.user_response or "Done."
@@ -3867,16 +4018,9 @@ async def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
-            inline_raw_verdict = evaluate_output_policy(
-                request_policy=ctx.request_policy,
-                response_type=resp_type,
-                user_response=str(user_response),
-                workflow_yaml=workflow_yaml,
-                tool_arguments=action_data,
-                has_workflow_proposal=True,
-                output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+            workflow_yaml, inline_raw_verdict, inline_policy_verdict = _inline_replace_workflow_credential_verdict(
+                ctx, action_data, resp_type, str(user_response)
             )
-            inline_policy_verdict = hard_block_output_policy_verdict(inline_raw_verdict)
             if not inline_policy_verdict.allowed:
                 inline_diagnostics = build_output_policy_diagnostics(
                     raw_verdict=inline_raw_verdict,
@@ -4960,6 +5104,9 @@ def _build_output_policy_blocked_result(
                 composed_from_recorded_evidence = True
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+    user_response = _with_scouted_spine_missing_steps(
+        ctx, user_response, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
+    )
     has_non_actuation_hard_block = any(
         reason
         not in {
@@ -5410,12 +5557,23 @@ async def _run_copilot_turn_impl(
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
     ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
+    transcript_anchor = _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
         agent_user_message or "",
         chat_request.workflow_yaml or "",
+        transcript_anchor,
     )
+    anchor_entrypoint = anchor_recovers_entrypoint(
+        ctx.turn_intent,
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
+        transcript_anchor,
+    )
+    if anchor_entrypoint is not None and ctx.resolved_discovery_entrypoint_url is None:
+        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint
     LOG.info(
         "copilot.build_phase_initial",
         build_phase=ctx.build_phase.value,

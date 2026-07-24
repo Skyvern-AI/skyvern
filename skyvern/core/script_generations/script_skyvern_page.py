@@ -57,6 +57,7 @@ from skyvern.webeye.actions.handler import (
     handle_terminate_action,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -81,8 +82,9 @@ class ScriptSkyvernPage(SkyvernPage):
         ai: SkyvernPageAi,
         *,
         recorder: Callable[[ActionCall], None] | None = None,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
-        super().__init__(page=page, ai=ai)
+        super().__init__(page=page, ai=ai, engine_selection=engine_selection)
         self.scraped_page = scraped_page
         self._record = recorder or (lambda ac: None)
 
@@ -158,7 +160,12 @@ class ScriptSkyvernPage(SkyvernPage):
         scraped_page = await cls.create_scraped_page(browser_session_id=browser_session_id, url=url)
         page = await scraped_page._browser_state.must_get_working_page()
         ai = RealSkyvernPageAi(scraped_page, page)
-        return cls(scraped_page=scraped_page, page=page, ai=ai)
+        return cls(
+            scraped_page=scraped_page,
+            page=page,
+            ai=ai,
+            engine_selection=scraped_page._browser_state.engine_selection,
+        )
 
     @classmethod
     async def create_scraped_page(
@@ -656,6 +663,15 @@ class ScriptSkyvernPage(SkyvernPage):
                 step_id=ctx.step_id if ctx else None,
                 exc_info=True,
             )
+
+    async def capture_action_screenshot(self) -> None:
+        """Persist a SCREENSHOT_ACTION of the current page as timeline-visible evidence.
+
+        Same persistence path as the per-action hook, callable on demand so a script can
+        record a screenshot at a specific moment (e.g. a confirmed submission). The run
+        timeline renders SCREENSHOT_ACTION / SCREENSHOT_LLM only, never SCREENSHOT_FINAL.
+        """
+        await self._create_screenshot_after_execution()
 
     @classmethod
     async def _create_html_action_after_execution(cls) -> None:

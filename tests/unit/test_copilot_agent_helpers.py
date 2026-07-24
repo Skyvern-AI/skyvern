@@ -33,7 +33,11 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    PostRunPagePathFailure,
+    PostRunPagePathTarget,
+    RecordedBuildTestOutcome,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
@@ -118,7 +122,9 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -1042,6 +1048,80 @@ workflow_definition:
         assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
         assert "change the next authored step, selector, extraction, or binding based on" in prompt
 
+    def test_recorded_build_test_outcome_prompt_renders_exact_post_run_page_path_actions(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:page-path",
+                page_path_failure=PostRunPagePathFailure(
+                    kind="challenge",
+                    workflow_run_id="wr_failed",
+                    current_url="https://example.test/challenge",
+                    continuation_targets=(
+                        PostRunPagePathTarget(kind="challenge", selector="#notRobot"),
+                        PostRunPagePathTarget(kind="challenge", selector="#continue"),
+                    ),
+                    enter_allowed=True,
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "POST-RUN PAGE-PATH CONTINUATION:" in prompt
+        assert "kind: challenge" in prompt
+        assert "- allowed click: selector=#notRobot" in prompt
+        assert "- allowed Enter: selector=#continue" in prompt
+        assert "Do not navigate away or re-author the workflow" in prompt
+
+    def test_recorded_build_test_outcome_prompt_requires_fresh_inspection_when_page_path_is_unbound(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:page-path",
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" in prompt
+        assert 'inspect_page_for_composition with target_url="current_page"' in prompt
+        assert "Do not use evaluate as a substitute" in prompt
+
+    def test_recorded_build_test_outcome_prompt_does_not_offer_page_actions_for_non_page_outcome(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:non-page",
+                page_path_failure=PostRunPagePathFailure(
+                    kind="non_page_outcome",
+                    workflow_run_id="wr_failed",
+                    current_url="https://example.test/results",
+                    continuation_targets=(),
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "POST-RUN PAGE-PATH CONTINUATION:" not in prompt
+        assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" not in prompt
+
     def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -1604,6 +1684,45 @@ class TestVerifiedGoalSatisfiedStop:
         assert result.turn_outcome.terminal_reason == BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON
         assert result.narrative_payload is not None
         assert result.narrative_payload["verifiedSuccess"] is False
+
+    @pytest.mark.asyncio
+    async def test_built_unverified_terminal_names_demonstrated_missing_steps(self) -> None:
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.impose_synthesized_code_block = True
+        ctx.has_staged_proposal = True
+        ctx.persisted_draft_browser_calls = []
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#search-submit",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+
+        result = await _build_built_unverified_exit_result(ctx, global_llm_context=None)
+
+        assert "#search-submit" in result.user_response
 
     def test_corroborated_structural_abstention_avoids_built_unverified_terminal(self) -> None:
         ctx = _ctx(
@@ -4684,8 +4803,16 @@ workflow_definition:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
-        credential = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        credential = SimpleNamespace(
+            credential_id="cred_bank",
+            name="Bank",
+            tested_url="https://bank.example/login",
+            credential_type=CredentialType.PASSWORD,
+        )
+        credentials = SimpleNamespace(
+            get_credentials=AsyncMock(return_value=[credential]),
+            get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        )
         monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
 
         async def handler(**kwargs):
@@ -5335,7 +5462,12 @@ workflow_definition:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
-        bank = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
+        bank = SimpleNamespace(
+            credential_id="cred_bank",
+            name="Bank",
+            tested_url="https://bank.example/login",
+            credential_type=CredentialType.PASSWORD,
+        )
         monkeypatch.setattr(
             policy_module.app,
             "DATABASE",
@@ -7243,3 +7375,27 @@ class TestDeclaredEqualsGradedCompletionCriteria:
         assert "__copilot_fallback_floor__run" not in verification.criterion_ids
         assert verification.criterion_ids == ["__copilot_authored_output_contract_missing"]
         assert not verification.is_fully_satisfied()
+
+
+def _transcript_packet(earliest_user_turn: str) -> TurnContextPacket:
+    return TurnContextPacket(
+        turn_intent_summary={},
+        transcript_context=TranscriptContext(
+            earliest_user_turn=earliest_user_turn,
+            latest_prior_user_turn="",
+            latest_assistant_turn="",
+            retained_history="",
+            omitted_any=False,
+        ),
+        omissions=[],
+    )
+
+
+def test_transcript_anchor_blanked_when_retained_window_at_capacity() -> None:
+    packet = _transcript_packet("go to https://example.com/login")
+    assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES - 1) == (
+        "go to https://example.com/login"
+    )
+    assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES) == ""
+    assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES + 5) == ""
+    assert agent_module._transcript_anchor_for_turn(None, 0) == ""

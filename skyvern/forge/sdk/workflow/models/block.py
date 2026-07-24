@@ -8,6 +8,7 @@ import copy
 import csv
 import hashlib
 import html
+import inspect
 import json
 import keyword
 import os
@@ -199,6 +200,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.agent_functions import CodeBlockEngineFailure
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
 
@@ -4135,11 +4137,18 @@ async def wrapper({default_args}):
             )
             return False
 
-    def _is_healable_page_failure(self, exception: Exception, recording_page: RecordingPage) -> bool:
+    def _is_healable_page_failure(
+        self,
+        exception: Exception,
+        recording_page: RecordingPage,
+        engine_selection: BrowserEngineSelection | None = None,
+    ) -> bool:
         """Heal genuine page failures only: a recorded page call raised, or an (unmapped) Playwright
         page error surfaced. A deliberate non-Playwright raise in user logic stays non-healable."""
         if recording_page.last_recorded_exception() is exception:
             return True
+        if engine_selection is not None:
+            return engine_selection.is_engine_error(exception) is True
         return isinstance(exception, PlaywrightError)  # locator/timeout/navigation errors subclass this
 
     async def _finalize_recovery_block(
@@ -4220,10 +4229,21 @@ async def wrapper({default_args}):
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         if not await self._self_heal_enabled(workflow_run_context):
             return None
-        effective_classification = classification or HealClassification(
-            healable=self._is_healable_page_failure(exception, recording_page),
-            skip_reason=None,
-        )
+        effective_classification = classification
+        if effective_classification is None:
+            engine_selection = (
+                browser_state.engine_selection
+                if browser_state and inspect.getattr_static(browser_state, "engine_selection", None) is not None
+                else None
+            )
+            effective_classification = HealClassification(
+                healable=self._is_healable_page_failure(
+                    exception,
+                    recording_page,
+                    engine_selection,
+                ),
+                skip_reason=None,
+            )
         if not effective_classification.healable:
             return None
         if not self.prompt:
@@ -5204,7 +5224,16 @@ async def wrapper({default_args}):
                     )
                 )
             await recorder.persist(recorded)
-            legacy_healable = self._is_healable_page_failure(e, recording_page)
+            engine_selection = (
+                browser_state.engine_selection
+                if browser_state and inspect.getattr_static(browser_state, "engine_selection", None) is not None
+                else None
+            )
+            legacy_healable = self._is_healable_page_failure(
+                e,
+                recording_page,
+                engine_selection,
+            )
             legacy_classification = HealClassification(
                 healable=legacy_healable,
                 skip_reason=None if legacy_healable else HealSkipReason.unclassifiable,

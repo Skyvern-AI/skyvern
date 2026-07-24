@@ -1,5 +1,12 @@
-from skyvern.webeye.actions.handler import UPLOAD_PENDING_FOLLOWUP_MESSAGE
-from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from skyvern.services.action_service import get_action_history
+from skyvern.webeye.actions.actions import ClickAction
+from skyvern.webeye.actions.handler import DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE, UPLOAD_PENDING_FOLLOWUP_MESSAGE
+from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 
 
 class TestUploadFollowupActionHistory:
@@ -64,3 +71,60 @@ class TestUploadFollowupActionHistory:
         d = r.model_dump(exclude_none=True)
         assert "needs_followup" not in d
         assert "followup_message" not in d
+
+
+async def _download_action_history(result: ActionResult) -> dict:
+    """Run the real get_action_history over a single download-intent action/result."""
+    action = ClickAction(element_id="download-link", download=True)
+    step = MagicMock()
+    step.output = SimpleNamespace(actions_and_results=[(action, [result])])
+    task = MagicMock(task_id="tsk_1", organization_id="o_1")
+    with patch("skyvern.services.action_service.app") as app_mock:
+        app_mock.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[])
+        history = await get_action_history(task, current_step=step)
+    assert len(history) == 1
+    return history[0]
+
+
+class TestDownloadFollowupActionHistory:
+    """The no-download feedback must survive action-history serialization for the next prompt."""
+
+    @pytest.mark.asyncio
+    async def test_no_download_success_result_carries_feedback_through_history(self) -> None:
+        r = ActionSuccess()
+        r.download_triggered = False
+        r.needs_followup = True
+        r.followup_message = DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+
+        entry = await _download_action_history(r)
+
+        assert entry["action"]["download"] is True
+        assert entry["result"]["success"] is True
+        assert entry["result"]["download_triggered"] is False
+        assert entry["result"]["needs_followup"] is True
+        assert entry["result"]["followup_message"] == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+
+    @pytest.mark.asyncio
+    async def test_terminal_failure_result_omits_followup_from_history(self) -> None:
+        # Negative control: a page-confirmed terminal user error yields an
+        # ActionFailure with download_triggered=false and NO followup fields, so the
+        # serialized history must not carry a contradictory "keep trying" signal.
+        r = ActionFailure(Exception("data not downloadable"), download_triggered=False)
+
+        entry = await _download_action_history(r)
+
+        assert entry["result"]["success"] is False
+        assert entry["result"]["download_triggered"] is False
+        assert "needs_followup" not in entry["result"]
+        assert "followup_message" not in entry["result"]
+
+    @pytest.mark.asyncio
+    async def test_successful_download_omits_followup_from_history(self) -> None:
+        r = ActionSuccess()
+        r.download_triggered = True
+
+        entry = await _download_action_history(r)
+
+        assert entry["result"]["download_triggered"] is True
+        assert "needs_followup" not in entry["result"]
+        assert "followup_message" not in entry["result"]

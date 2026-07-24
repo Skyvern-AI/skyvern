@@ -119,6 +119,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         pending_scout_click_selector=None,
         pending_scout_ambiguous=None,
         pending_scout_reanchor=None,
+        pending_scout_dynamic_row=None,
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],
@@ -1679,6 +1680,25 @@ class TestTerminalActionObservationStampSeam:
             )
         assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
         assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
+
+    def test_demonstrated_totp_fill_is_recorded_with_a_countable_capture_log(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = []
+        with capture_logs() as logs:
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="fill_credential_field",
+                selector="#totpCode",
+                source_url=self._PORTAL_URL,
+                typed_length=6,
+                credential_id="cred_1",
+                credential_field="totp",
+                credential_name="mock-portal-login-totp",
+            )
+        assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
+        capture = next(log for log in logs if log["event"] == "copilot_scout_interaction_captured")
+        assert capture["credential_field"] == "totp"
+        assert capture["credential_id"] == "cred_1"
 
     def test_login_only_commit_stamps_nothing(self) -> None:
         ctx = self._ctx_with(self._terminal_action_criterion())

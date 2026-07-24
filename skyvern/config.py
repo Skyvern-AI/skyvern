@@ -4,7 +4,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -108,6 +108,7 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
     POPUP_VIDEO_PATH_TIMEOUT_SECONDS: float = 3.0
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
     # Page readiness settings for cached action execution
@@ -212,6 +213,7 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
@@ -299,7 +301,7 @@ class Settings(BaseSettings):
     # Directory containing pre-built default browser profiles ({dir}/chrome/ and {dir}/chromium/).
     # When set, used as the default profile source for new browser sessions.
     # Cloud workers download S3 profiles here at startup; self-hosted users can point this at a
-    # local profile directory. Leave empty to use the in-repo template.
+    # local profile directory. Leave empty to use versioned temp caches and clean empty fallbacks.
     DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
@@ -780,6 +782,22 @@ class Settings(BaseSettings):
     # "CRITICAL") to drop its retry/failure records where the OTLP endpoint is
     # intentionally unavailable; the default keeps export failures visible.
     OTEL_EXPORTER_LOG_LEVEL: str = "WARNING"
+    # Per-export deadline (seconds) for the OTLP span exporter. Must exceed the exporter's
+    # ~31s retry-backoff window (2**n over _MAX_RETRYS) so a brief node-local collector blip
+    # is retried to success instead of logged as a failure; the library default (10s) cuts
+    # the retry sequence short and turns each blip into an error burst.
+    OTEL_EXPORTER_TIMEOUT_SECONDS: float = Field(
+        default=45.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "OTEL_EXPORTER_TIMEOUT_SECONDS",
+            "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+            "OTEL_EXPORTER_OTLP_TIMEOUT",
+        ),
+    )
+    # BatchSpanProcessor queue depth (library default 2048); enlarged to buffer more spans
+    # while an export is retrying against a briefly unavailable collector.
+    OTEL_BSP_MAX_QUEUE_SIZE: int = 8192
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"

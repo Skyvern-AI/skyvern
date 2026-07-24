@@ -112,7 +112,16 @@ async def test_all_method_mandated_floor_fallback_gate_fires(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_fallback_with_real_run_plane_criterion_does_not_fire(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",

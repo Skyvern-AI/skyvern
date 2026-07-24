@@ -19,11 +19,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.credential_literal_rebind import rebind_scouted_credential_literals
+from skyvern.forge.sdk.copilot.credential_literal_rebind import (
+    CredentialRebindResult,
+    rebind_scouted_credential_literals,
+    scouted_credential_targets,
+)
 from skyvern.forge.sdk.copilot.enforcement import _record_code_authoring_guardrail_reject
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
-    OutputPolicyReason,
     OutputPolicyVerdict,
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -82,9 +85,15 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
         )
     workflow_yaml_value = tool_arguments.get("workflow_yaml")
     workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
+
+    rebind_result = _rebind_scouted_credential_literals_in_place(tool_context, tool_arguments, workflow_yaml)
+    applied = rebind_result is not None and rebind_result.changed
+    effective_yaml = rebind_result.workflow_yaml if rebind_result is not None and applied else workflow_yaml
+    _log_credential_authoring_skips(tool_context, rebind_result)
+
     verdict = evaluate_output_policy(
         request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
-        workflow_yaml=workflow_yaml,
+        workflow_yaml=effective_yaml,
         tool_arguments=tool_arguments or raw_arguments,
     )
     trace_data = output_policy_verdict_to_trace_data(
@@ -92,61 +101,111 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
         surface="tool_input",
         tool_name=getattr(tool_context, "tool_name", None),
     )
-    LOG.info("copilot output policy tool guardrail verdict", **trace_data)
-    if not verdict.allowed:
-        rebound_yaml = _rebound_credential_yaml(tool_context, workflow_yaml, verdict, tool_arguments)
-        if rebound_yaml is not None:
-            rebound_trace = {**trace_data, "allowed": True, "credential_literals_rebound": True}
-            LOG.info("copilot output policy rebound scouted credential literals", **rebound_trace)
-            return ToolGuardrailFunctionOutput.allow(output_info=rebound_trace)
-        error = format_output_policy_tool_error(verdict)
+    residual_selectors = rebind_result.residual_selectors if rebind_result is not None else ()
+    if verdict.allowed and residual_selectors:
+        # A scouted credential selector still holds a non-parameter value the rebind could not neutralize,
+        # and the output-policy scan does not catch every such shape. Fail closed rather than persist it.
+        trace_data = {
+            **trace_data,
+            "allowed": False,
+            "residual_raw_credential_fill_selectors": list(residual_selectors),
+        }
+        LOG.info("copilot output policy credential residual raw fill fail-closed", **trace_data)
+        error = (
+            "A credential value could not be safely bound to a workflow parameter for selector(s) "
+            f"{', '.join(residual_selectors)}. Fill these fields with `<credential_key>.username` / "
+            "`<credential_key>.password` (or `await <credential_key>.otp()`) rather than an inline value."
+        )
         tool_name = getattr(tool_context, "tool_name", None)
-        copilot_ctx = getattr(tool_context, "context", None)
         if isinstance(tool_name, str) and tool_name:
             record_consecutive_tool_result_boundary_for_ctx(
-                copilot_ctx,
+                getattr(tool_context, "context", None),
                 tool_name,
                 {"ok": False, "error": error},
                 arguments=tool_arguments,
             )
-            _record_output_policy_guardrail_churn(copilot_ctx, tool_name, workflow_yaml, verdict)
         return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
-    return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
+    if verdict.allowed:
+        if applied and rebind_result is not None:
+            trace_data = {
+                **trace_data,
+                "credential_literals_rebound": True,
+                "authored_credential_fills": [list(pair) for pair in rebind_result.authored],
+            }
+            LOG.info("copilot output policy rebound scouted credential literals", **trace_data)
+        else:
+            LOG.info("copilot output policy tool guardrail verdict", **trace_data)
+        return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
+    LOG.info("copilot output policy tool guardrail verdict", **trace_data)
+    error = format_output_policy_tool_error(verdict)
+    tool_name = getattr(tool_context, "tool_name", None)
+    copilot_ctx = getattr(tool_context, "context", None)
+    if isinstance(tool_name, str) and tool_name:
+        record_consecutive_tool_result_boundary_for_ctx(
+            copilot_ctx,
+            tool_name,
+            {"ok": False, "error": error},
+            arguments=tool_arguments,
+        )
+        _record_output_policy_guardrail_churn(copilot_ctx, tool_name, effective_yaml, verdict)
+    return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
 
 
-def _rebound_credential_yaml(
-    tool_context: Any,
-    workflow_yaml: str | None,
-    verdict: OutputPolicyVerdict,
-    tool_arguments: dict[str, Any],
-) -> str | None:
-    """Rebind scouted credential literals so a leak the seam can repair never becomes a reject.
-
-    Returns the rebound YAML only when it independently clears the output policy, so the
-    raw_secret_leak clamp still fails closed on anything the deterministic rebind cannot fix.
-    """
-    if OutputPolicyReason.RAW_SECRET_LEAK not in verdict.reason_codes:
-        return None
+def _rebind_scouted_credential_literals_in_place(
+    tool_context: Any, tool_arguments: dict[str, Any], workflow_yaml: str | None
+) -> CredentialRebindResult | None:
+    """Rewrite scouted credential literals to parameter access and author missing sanctioned credential
+    fills into ``tool_context.tool_call.arguments`` before the output policy runs. Returns the full result
+    (None only without an ``AgentContext``); a changed result is downgraded to ``changed=False`` when no
+    tool_call is present or the write-back fails, so the clamp fails closed while skips still surface."""
     ctx = getattr(tool_context, "context", None)
     if not isinstance(ctx, AgentContext):
         return None
     result = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
     if not result.changed:
-        return None
-    recheck = evaluate_output_policy(
-        request_policy=ctx.request_policy,
-        workflow_yaml=result.workflow_yaml,
-        tool_arguments={**tool_arguments, "workflow_yaml": result.workflow_yaml},
-    )
-    if not recheck.allowed:
-        return None
+        return result
+    tool_call = getattr(tool_context, "tool_call", None)
+    if tool_call is None:
+        LOG.warning("copilot rebound credential yaml has no tool_call to persist through; failing closed")
+        return _unapplied_rebind_result(result, workflow_yaml)
     tool_arguments["workflow_yaml"] = result.workflow_yaml
     try:
-        tool_context.tool_arguments = json.dumps(tool_arguments)
+        rebound_arguments = json.dumps(tool_arguments)
+        tool_call.arguments = rebound_arguments
+        tool_context.tool_arguments = rebound_arguments
     except (AttributeError, TypeError, ValueError):
         LOG.warning("copilot rebound credential yaml could not be written back to tool arguments")
-        return None
-    return result.workflow_yaml
+        tool_arguments["workflow_yaml"] = workflow_yaml
+        return _unapplied_rebind_result(result, workflow_yaml)
+    return result
+
+
+def _unapplied_rebind_result(result: CredentialRebindResult, workflow_yaml: str | None) -> CredentialRebindResult:
+    return CredentialRebindResult(
+        workflow_yaml=workflow_yaml or "",
+        changed=False,
+        rebound=(),
+        skips=result.skips,
+        residual_selectors=result.residual_selectors,
+    )
+
+
+def _log_credential_authoring_skips(tool_context: Any, result: CredentialRebindResult | None) -> None:
+    if result is None or not result.skips:
+        return
+    ctx = getattr(tool_context, "context", None)
+    targets_present = (
+        len(scouted_credential_targets(ctx.scout_trajectory)) if isinstance(ctx, AgentContext) else len(result.skips)
+    )
+    tool_name = getattr(tool_context, "tool_name", None)
+    for skip in result.skips:
+        LOG.info(
+            "copilot output policy credential authoring skipped",
+            tool_name=tool_name,
+            stage=skip.stage,
+            selector=skip.selector,
+            targets_present=targets_present,
+        )
 
 
 def _record_output_policy_guardrail_churn(
@@ -154,10 +213,13 @@ def _record_output_policy_guardrail_churn(
 ) -> None:
     if not isinstance(ctx, AgentContext):
         return
+    reason_code_set = frozenset(reason.value for reason in verdict.reason_codes)
+    previous_reason_codes = ctx.last_output_policy_reject_reason_codes
+    frontier_unchanged = previous_reason_codes is not None and previous_reason_codes == reason_code_set
     structural_payload = {
         "surface": "output_policy_tool_input",
         "tool": tool_name,
-        "reason_codes": sorted(reason.value for reason in verdict.reason_codes),
+        "reason_codes": sorted(reason_code_set),
         "workflow_yaml_hash": hashlib.sha256((workflow_yaml or "").encode("utf-8")).hexdigest(),
     }
     record_build_test_outcome(
@@ -168,7 +230,12 @@ def _record_output_policy_guardrail_churn(
             structural_payload=structural_payload,
         ),
     )
-    _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
+    _record_code_authoring_guardrail_reject(
+        ctx,
+        defer_churn_stop=True,
+        frontier_unchanged=frontier_unchanged,
+        output_policy_reason_codes=reason_code_set,
+    )
 
 
 _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
@@ -260,8 +327,8 @@ def _request_policy_allows_untested_code_block_draft(ctx: Any) -> bool:
         and policy.allow_update_workflow
         and not policy.allow_run_blocks
         and policy.testing_intent == "skip_test"
-        and policy.credential_input_kind == "credential_name"
         and policy.allow_missing_credentials_in_draft
+        and policy.credential_draft_deferred_explicitly
     )
 
 

@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         return type(self).__name__
 
 
+class SkyvernPageAnalysisTimeout(SkyvernException):
+    pass
+
+
 class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
         self.feature = feature
@@ -1109,6 +1113,15 @@ class InvalidWorkflowParameter(SkyvernHTTPException):
         super().__init__(
             message,
             status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+class ActionExecutionTimeout(SkyvernException):
+    def __init__(self, action_type: str, timeout_seconds: float):
+        super().__init__(
+            f"Action execution timed out after {timeout_seconds:.0f} seconds and was aborted"
+            f" (action_type={action_type}). The browser action did not complete in time —"
+            " the page or browser may have become unresponsive."
         )
 
 

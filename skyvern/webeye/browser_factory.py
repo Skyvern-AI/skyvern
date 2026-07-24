@@ -10,6 +10,7 @@ import socket
 import subprocess
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import (
     Page,
     Playwright,
+    Video,
 )
 
 from skyvern.config import settings
@@ -157,6 +159,34 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
+async def resolve_video_path(video: Video, timeout_seconds: float) -> str | None:
+    """Wait for video.path() without ever cancelling patchright's shared artifact future"""
+    path_task = asyncio.ensure_future(video.path())
+    # Consume the task's eventual outcome even when it outlives this wait (timeout / caller
+    # cancelled), so a late PlaywrightError on page close doesn't log "Task exception was
+    # never retrieved".
+    path_task.add_done_callback(_consume_abandoned_task_result)
+    try:
+        raw_path = await asyncio.wait_for(asyncio.shield(path_task), timeout_seconds)
+    except TimeoutError:
+        # path_task keeps waiting harmlessly; the shared future stays live for other awaiters.
+        return None
+    except asyncio.CancelledError:
+        # path_task.cancelled() is direct evidence the shared artifact future was
+        # cancelled by another awaiter (shield keeps caller cancellation from reaching
+        # it); current_task().cancelling() is a counter that can read stale-nonzero
+        # after any caught-but-not-uncancelled CancelledError.
+        if path_task.cancelled():
+            return None
+        raise
+    return str(raw_path) if raw_path is not None else None
+
+
+def _consume_abandoned_task_result(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     tracked_paths: set[str] = set()
 
@@ -165,15 +195,19 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
             video = page.video
             if not video:
                 return
-            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
-                raw_path = await video.path()
-            if raw_path is None:
+            video_path_or_none = await resolve_video_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
+            if video_path_or_none is None:
+                try:
+                    page_origin = urlparse(page.url).hostname or "unknown"
+                except Exception:
+                    page_origin = "unknown"
+                LOG.warning("Popup video path resolution timed out", page_origin=page_origin)
                 return
             # The await above may have raced a discard (RealBrowserState closing this page
             # before it ever became the working page) — honor it even though it landed after.
             if browser_artifacts.is_page_video_discarded(page):
                 return
-            video_path = str(raw_path)
+            video_path = video_path_or_none
             # After the await, another handler may have already registered this path
             if video_path in tracked_paths:
                 return
@@ -185,12 +219,6 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
             browser_artifacts.video_artifacts.append(VideoArtifact(video_path=video_path))
         except PlaywrightError:
             LOG.debug("Failed to register popup page video", exc_info=True)
-        except TimeoutError:
-            try:
-                page_origin = urlparse(page.url).hostname or "unknown"
-            except Exception:
-                page_origin = "unknown"
-            LOG.warning("Popup video path resolution timed out", page_origin=page_origin)
         except Exception:
             LOG.warning("Failed to register popup page video", exc_info=True)
 
@@ -515,6 +543,7 @@ class BrowserContextFactory:
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
+        cleanup_func: BrowserCleanupFunc = None
         try:
             creator = cls._creators.get(browser_type)
             if not creator:
@@ -534,13 +563,17 @@ class BrowserContextFactory:
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
             return browser_context, browser_artifacts, cleanup_func
-        except Exception as e:
+        except BaseException as e:
             if browser_context is not None:
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
-                await browser_context.close()
+                with suppress(Exception):
+                    await browser_context.close()
+            if cleanup_func:
+                with suppress(Exception):
+                    await cleanup_func()
 
-            if isinstance(e, UnknownBrowserType):
+            if not isinstance(e, Exception) or isinstance(e, UnknownBrowserType):
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e

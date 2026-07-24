@@ -34,6 +34,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    ActionExecutionTimeout,
     CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
@@ -70,6 +71,7 @@ from skyvern.exceptions import (
     PhoneNumberInputMismatch,
     SecretInputMismatch,
     SkyvernException,
+    SkyvernPageAnalysisTimeout,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -139,6 +141,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import initialize_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
@@ -178,6 +181,11 @@ LOG = structlog.get_logger()
 
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
+DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
+    "No file download was observed or credited after this action. "
+    "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+)
+
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
@@ -186,6 +194,17 @@ COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
 # Cross-process re-resolution is deterministic under stable flag config.
 _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, ttl=86_400)
+
+
+def resolve_engine_selection_for_task(task: Task) -> BrowserEngineSelection | None:
+    """The logical run's pinned browser engine, resolved from its live browser state.
+
+    Threaded into ``IncrementalScrapePage`` so its wait-until-finished retry classifies driver-native
+    analysis timeouts against THIS run's selected engine. Returns None when no browser state is
+    registered for the run, which keeps the stock Playwright timeout identity (unchanged default).
+    """
+    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+    return browser_state.engine_selection if browser_state is not None else None
 
 
 class _CollapseGateResult(NamedTuple):
@@ -201,6 +220,8 @@ class CustomSelectFamilyOutcome(StrEnum):
     llm_fallback_control = "llm_fallback_control"
     llm_fallback_no_match = "llm_fallback_no_match"
     llm_fallback_match_unactionable = "llm_fallback_match_unactionable"
+    llm_fallback_tier_excluded = "llm_fallback_tier_excluded"
+    llm_fallback_execution_disabled = "llm_fallback_execution_disabled"
     llm_fallback_pre_click_error = "llm_fallback_pre_click_error"
     llm_fallback_reset_verified = "llm_fallback_reset_verified"
     llm_fallback_post_click_unverified = "llm_fallback_post_click_unverified"
@@ -530,7 +551,9 @@ async def _reset_autocomplete_for_llm_fallback(
     await current_incremental_scraped.stop_listen_dom_increment()
     await skyvern_element.input_clear()
 
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
     await skyvern_element.press_fill(text)
     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fallback_refill")
@@ -2861,6 +2884,9 @@ class ActionHandler:
                     )
                 else:
                     results[-1].download_triggered = False
+                    if isinstance(results[-1], ActionSuccess):
+                        results[-1].needs_followup = True
+                        results[-1].followup_message = DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True
@@ -2963,41 +2989,44 @@ class ActionHandler:
         )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+        execution_timeout_seconds = _resolve_action_execution_timeout(action)
+        execution_timeout_scope: asyncio.Timeout | None = None
         try:
-            if action.action_type in ActionHandler._handled_action_types:
-                invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
-                if invalid_web_action_check:
-                    actions_result.extend(invalid_web_action_check)
-                    return actions_result
-
-                # do setup before action handler
-                if setup := ActionHandler._setup_action_types.get(action.action_type):
-                    results = await setup(action, page, scraped_page, task, step)
-                    actions_result.extend(results)
-                    if results and results[-1] != ActionSuccess:
+            async with asyncio.timeout(execution_timeout_seconds) as execution_timeout_scope:
+                if action.action_type in ActionHandler._handled_action_types:
+                    invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
+                    if invalid_web_action_check:
+                        actions_result.extend(invalid_web_action_check)
                         return actions_result
 
-                # do the handler
-                handler = ActionHandler._handled_action_types[action.action_type]
-                results = await handler(action, page, scraped_page, task, step)
-                actions_result.extend(results)
-                await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
-                # do the teardown
-                teardown = ActionHandler._teardown_action_types.get(action.action_type)
-                if teardown:
-                    results = await teardown(action, page, scraped_page, task, step)
+                    # do setup before action handler
+                    if setup := ActionHandler._setup_action_types.get(action.action_type):
+                        results = await setup(action, page, scraped_page, task, step)
+                        actions_result.extend(results)
+                        if results and results[-1] != ActionSuccess:
+                            return actions_result
+
+                    # do the handler
+                    handler = ActionHandler._handled_action_types[action.action_type]
+                    results = await handler(action, page, scraped_page, task, step)
                     actions_result.extend(results)
+                    await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
+                    # do the teardown
+                    teardown = ActionHandler._teardown_action_types.get(action.action_type)
+                    if teardown:
+                        results = await teardown(action, page, scraped_page, task, step)
+                        actions_result.extend(results)
 
-                return actions_result
+                    return actions_result
 
-            else:
-                LOG.error(
-                    "Unsupported action type in handler",
-                    action=action,
-                    type=type(action),
-                )
-                actions_result.append(ActionFailure(Exception(f"Unsupported action type: {type(action)}")))
-                return actions_result
+                else:
+                    LOG.error(
+                        "Unsupported action type in handler",
+                        action=action,
+                        type=type(action),
+                    )
+                    actions_result.append(ActionFailure(Exception(f"Unsupported action type: {type(action)}")))
+                    return actions_result
         except MissingElement as e:
             LOG.info(
                 "Known exceptions",
@@ -3026,6 +3055,19 @@ class ActionHandler:
                 exception_message=str(e),
             )
             actions_result.append(ActionFailure(e))
+        except asyncio.TimeoutError as e:
+            if execution_timeout_scope is not None and execution_timeout_scope.expired():
+                LOG.error(
+                    "Action execution exceeded the max duration and was aborted",
+                    action=action,
+                    timeout_seconds=execution_timeout_seconds,
+                )
+                actions_result.append(
+                    ActionFailure(ActionExecutionTimeout(action.action_type, execution_timeout_seconds))
+                )
+            else:
+                LOG.exception("Unhandled exception in action handler", action=action)
+                actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
@@ -3054,6 +3096,14 @@ class ActionHandler:
                 llm_caller.add_tool_result(tool_call_result)
 
         return actions_result
+
+
+def _resolve_action_execution_timeout(action: actions.Action) -> float:
+    base = float(settings.BROWSER_ACTION_MAX_EXECUTION_SECONDS)
+    # WaitAction sleeps action.seconds by design; give it that budget on top of the cap.
+    if isinstance(action, actions.WaitAction):
+        return base + action.seconds
+    return base
 
 
 def check_for_invalid_web_action(
@@ -3237,7 +3287,9 @@ async def handle_click_action(
         incremental_scraped: IncrementalScrapePage | None = None
         try:
             skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-            incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+            incremental_scraped = IncrementalScrapePage(
+                skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+            )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
@@ -3767,7 +3819,9 @@ async def handle_input_text_action(
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
@@ -4361,6 +4415,17 @@ async def handle_input_text_action(
                         if action.stop_batch_after_dropdown_select:
                             select_result.action_result.skip_remaining_actions = True
                         return [select_result.action_result]
+        except SkyvernPageAnalysisTimeout as inc_error:
+            # A page-analysis timeout after both incremental attempts previously arrived here as a
+            # Playwright TimeoutError (a PlaywrightError) and was re-raised; the neutral
+            # SkyvernPageAnalysisTimeout is not a PlaywrightError, so re-raise explicitly instead of
+            # letting the broad handler below swallow it and falsely return ActionSuccess.
+            LOG.warning(
+                "Page-analysis timeout during incremental element processing",
+                error_type=type(inc_error).__name__,
+                error_message=str(inc_error),
+            )
+            raise inc_error
         except PlaywrightError as inc_error:
             # Handle Playwright-specific errors during incremental element processing
             # (e.g., TOTP form auto-submit, or search-dropdown selection triggering navigation)
@@ -4473,7 +4538,7 @@ async def _wait_for_upload_processing(page: Page) -> None:
             dom_stable_ms=300,
             dom_stability_timeout_ms=2000,
         )
-    except (TimeoutError, asyncio.TimeoutError):
+    except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
         LOG.info("Upload processing page-ready wait timed out, continuing")
     except PlaywrightError:
         LOG.warning("Upload processing page-ready wait interrupted by Playwright error, continuing", exc_info=True)
@@ -4853,7 +4918,9 @@ async def handle_select_option_action(
 
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     is_open = False
     suggested_value: str | None = None
     results: list[ActionResult] = []
@@ -5901,6 +5968,19 @@ async def chain_click(
         blocking_element, blocked = await skyvern_element.find_blocking_element(
             dom=DomUtil(scraped_page=scraped_page, page=page)
         )
+        verify_checkbox_toggle = click_count == 1 and await skyvern_element.is_checkbox()
+        skip_coordinate_click = False
+        if verify_checkbox_toggle and blocking_element is not None:
+            if not await blocking_element.is_safe_for_checkbox_direct_click():
+                LOG.info(
+                    "Chain click: skipping unsafe or unknown blocker click for checkbox",
+                    action=action,
+                    element=str(blocking_element),
+                    locator=locator,
+                )
+                blocking_element = None
+                skip_coordinate_click = True
+
         if blocking_element is None:
             if blocked:
                 LOG.info(
@@ -5951,14 +6031,14 @@ async def chain_click(
             # than once, so its final state is not a dependable no-op signal.
             # Gate the checkbox verification on a single click and fold it into
             # the shared coordinate -> JS ladder below instead of a parallel one.
-            verify_checkbox_toggle = click_count == 1 and await skyvern_element.is_checkbox()
             checked_before = await skyvern_element.is_checked(timeout=timeout) if verify_checkbox_toggle else None
 
             coordinate_error: Exception | None = None
-            try:
-                await skyvern_element.coordinate_click(page=page, click_count=click_count)
-            except Exception as e:
-                coordinate_error = e
+            if not skip_coordinate_click:
+                try:
+                    await skyvern_element.coordinate_click(page=page, click_count=click_count)
+                except Exception as e:
+                    coordinate_error = e
 
             if verify_checkbox_toggle:
                 checked_after = await skyvern_element.is_checked(timeout=timeout)
@@ -5969,12 +6049,23 @@ async def chain_click(
                 if not state_known:
                     # Unknown post-click state (detached/navigated): a second
                     # click risks a double toggle, so never fall through to JS.
-                    if coordinate_error is None:
+                    # A real coordinate click that then lost the element is the
+                    # legacy success case; when the coordinate click was skipped
+                    # (unsafe blocker) or errored, fail closed instead.
+                    if coordinate_error is None and not skip_coordinate_click:
                         action_results.append(ActionSuccess())
                     else:
                         action_results.append(
                             ActionFailure(
-                                FailToClick(action.element_id, anchor="coordinate_click", msg=str(coordinate_error))
+                                FailToClick(
+                                    action.element_id,
+                                    anchor="coordinate_click",
+                                    msg=(
+                                        str(coordinate_error)
+                                        if coordinate_error is not None
+                                        else "checkbox state unknown after coordinate click"
+                                    ),
+                                )
                             )
                         )
                     return action_results
@@ -6152,7 +6243,9 @@ async def choose_auto_completion_dropdown(
 
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
     try:
@@ -6697,7 +6790,9 @@ async def discover_and_select_from_full_dropdown(
 
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
     try:
@@ -7562,6 +7657,17 @@ async def _anchor_is_combobox_input(element: SkyvernElement | None) -> bool:
         return False
 
 
+def _terminal_custom_select_failure(
+    *, target_value: str, matched_label: str | None
+) -> tuple[ActionFailure, str | None]:
+    action_failure = _no_element_matched_failure(
+        target_value,
+        "Deterministic custom-select click could not be verified by matched element read-back",
+    )
+    action_failure.skip_remaining_actions = True
+    return action_failure, matched_label
+
+
 async def _select_deterministic_custom_option(
     *,
     target_value: str | None,
@@ -7571,6 +7677,7 @@ async def _select_deterministic_custom_option(
     get_skyvern_element: Callable[[str], Awaitable[SkyvernElement]],
     get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None = None,
     task: Task,
+    execute: bool,
     step: Step | None = None,
     entry_action_type: str = "select_option",
     selection_group_id: str | None = None,
@@ -7649,7 +7756,7 @@ async def _select_deterministic_custom_option(
 
     option_count = len(option_candidates)
     eligible = not resolution.fallback_to_llm and resolution.matched_index is not None
-    match_tier = getattr(resolution, "matched_tier", None)
+    match_tier = resolution.matched_tier
     if not gate.family_enabled:
         emit(CustomSelectFamilyOutcome.llm_fallback_family_off)
         return None
@@ -7661,6 +7768,9 @@ async def _select_deterministic_custom_option(
         return None
     if resolution.matched_index >= len(option_candidates):
         emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
+        return None
+    if resolution.matched_tier != "exact":
+        emit(CustomSelectFamilyOutcome.llm_fallback_tier_excluded)
         return None
 
     matched_candidate = option_candidates[resolution.matched_index]
@@ -7715,6 +7825,10 @@ async def _select_deterministic_custom_option(
                 emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
 
+        if not execute:
+            emit(CustomSelectFamilyOutcome.llm_fallback_execution_disabled)
+            return None
+
         await selected_element.scroll_into_view()
         click_attempted = True
         if on_click_attempted is not None:
@@ -7730,49 +7844,58 @@ async def _select_deterministic_custom_option(
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
             return ActionSuccess(), matched_label
-    except Exception:
+    except Exception as exc:
+        if not click_attempted or isinstance(exc, InteractWithDisabledElement):
+            LOG.info(
+                "Deterministic custom-select failed; falling back to LLM path",
+                target_value=target_value,
+                matched_element_id=element_id,
+                matched_label=matched_label,
+                exc_info=True,
+            )
+            emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
+            return None
         LOG.info(
-            "Deterministic custom-select failed; falling back to LLM path",
+            "Deterministic custom-select failed after click; returning failure to avoid replaying over mutated widget",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
             exc_info=True,
         )
-        emit(
-            CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
-            if click_attempted
-            else CustomSelectFamilyOutcome.llm_fallback_pre_click_error
-        )
-        return None
+        emit(CustomSelectFamilyOutcome.terminal_post_click_exception)
+        return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     if anchor_is_combobox_input:
         # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
         # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
         reset_verified = await _reset_custom_select_combobox_input(readback_scope_element, page)
+        if reset_verified:
+            LOG.info(
+                "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
+                target_value=target_value,
+                matched_element_id=element_id,
+                matched_label=matched_label,
+            )
+            emit(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
+            return None
         LOG.info(
-            "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
+            "Deterministic custom-select combobox reset failed; returning failure to avoid replaying over mutated widget",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
         )
-        emit(
-            CustomSelectFamilyOutcome.llm_fallback_reset_verified
-            if reset_verified
-            else CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
-        )
-        return None
+        emit(CustomSelectFamilyOutcome.terminal_unverified_reset)
+        return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     if not matched_option_is_choice_input:
-        # A non-toggle option (e.g. a button/div-anchored single-select listbox) can be safely
-        # replayed by the LLM mini-agent. Toggle-shaped options hard-fail below instead.
         LOG.info(
-            "Deterministic custom-select read-back inconclusive on non-choice-input option; routing to LLM fallback",
+            "Deterministic custom-select read-back inconclusive on non-choice-input option; returning terminal failure",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
         )
-        emit(CustomSelectFamilyOutcome.llm_fallback_post_click_unverified)
-        return None
+        emit(CustomSelectFamilyOutcome.terminal_unverified_click)
+        return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
     LOG.info(
         "Deterministic custom-select read-back failed after click; returning failure to avoid replaying over mutated widget",
@@ -7780,15 +7903,8 @@ async def _select_deterministic_custom_option(
         matched_element_id=element_id,
         matched_label=matched_label,
     )
-    action_failure = ActionFailure(
-        NoElementMatchedForTargetOption(
-            target=target_value,
-            reason="Deterministic custom-select click could not be verified by matched element read-back",
-        )
-    )
-    action_failure.skip_remaining_actions = True
     emit(CustomSelectFamilyOutcome.terminal_unverified_toggle)
-    return action_failure, matched_label
+    return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
 
 async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> bool:
@@ -7936,6 +8052,7 @@ async def select_from_emerging_elements(
         widget_mutated = True
 
     deterministic_result = await _select_deterministic_custom_option(
+        execute=False,
         target_value=options.target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(shadow_candidate_elements),
         field_context=options.model_dump(),
@@ -8114,6 +8231,7 @@ async def select_from_dropdown(
         widget_mutated = True
 
     deterministic_result = await _select_deterministic_custom_option(
+        execute=entry_action_type == "select_option",
         target_value=target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(trimmed_element_tree),
         field_context=context.model_dump(),
@@ -8129,7 +8247,7 @@ async def select_from_dropdown(
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
-        single_select_result.reasoning = "Deterministic exact/stem custom-select match"
+        single_select_result.reasoning = "Deterministic exact custom-select match"
         single_select_result.value = matched_label or target_value
         single_select_result.action_type = ActionType.CLICK
         single_select_result.action_result = action_result

@@ -304,11 +304,13 @@ class TestChainClickBlockedAnchorNavigation:
         action_download: bool = False,
         navigate_result: str | None = "https://portal.example.com/billpay",
         is_checkbox: bool = False,
+        is_checkbox_mock: AsyncMock | None = None,
         checked_states: list[bool | None] | None = None,
         coordinate_raises: bool = False,
         js_mock: AsyncMock | None = None,
         is_checked_mock: AsyncMock | None = None,
         repeat: int = 1,
+        blocking_element: SkyvernElement | None = None,
     ) -> tuple[list, AsyncMock, AsyncMock]:
         """Invoke chain_click through the ``blocking_element is None`` path
         with tightly-scoped stubs.  Returns (results, coordinate_click_mock,
@@ -351,6 +353,7 @@ class TestChainClickBlockedAnchorNavigation:
         elem._SkyvernElement__static_element = {"id": "AAA3", "tagName": tag}  # type: ignore[attr-defined]
         elem.get_tag_name = MagicMock(return_value=tag)  # type: ignore[method-assign]
         elem.get_id = MagicMock(return_value="AAA3")  # type: ignore[method-assign]
+        elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
         elem.locator = MagicMock()
 
         async def _get_attr(name: str, mode: str = "dynamic", **_: object) -> str | None:
@@ -365,12 +368,12 @@ class TestChainClickBlockedAnchorNavigation:
         elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        elem.find_blocking_element = AsyncMock(return_value=(None, blocked))  # type: ignore[method-assign]
+        elem.find_blocking_element = AsyncMock(return_value=(blocking_element, blocked))  # type: ignore[method-assign]
         elem.coordinate_click = AsyncMock(  # type: ignore[method-assign]
             side_effect=RuntimeError("coordinate click failed") if coordinate_raises else None
         )
         elem.click_in_javascript = js_mock if js_mock is not None else AsyncMock(return_value=None)  # type: ignore[method-assign]
-        elem.is_checkbox = AsyncMock(return_value=is_checkbox)  # type: ignore[method-assign]
+        elem.is_checkbox = is_checkbox_mock or AsyncMock(return_value=is_checkbox)  # type: ignore[method-assign]
         if is_checked_mock is not None:
             elem.is_checked = is_checked_mock  # type: ignore[method-assign]
         elif checked_states is not None:
@@ -397,6 +400,19 @@ class TestChainClickBlockedAnchorNavigation:
             y=action_y,
             repeat=repeat,
         )
+
+        # The blocker's checkbox-safety probe runs through the unified
+        # ``SkyvernFrame.evaluate`` entry point; resolve it to the outcome stashed
+        # on the blocker's element handle.
+        if blocking_element is not None:
+
+            async def _blocker_probe(*, frame: object, expression: str, arg: object, **_: object) -> object:
+                outcome = getattr(arg, "probe_outcome", None)
+                if outcome == "raise":
+                    raise RuntimeError("direct blocker probe failed")
+                return outcome
+
+            monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", AsyncMock(side_effect=_blocker_probe))
 
         results = await handler_module.chain_click(
             task=task,
@@ -650,8 +666,10 @@ class TestChainClickCheckboxCoordinateVerification:
     async def test_checkbox_unknown_post_state_reports_success_without_js(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Coordinate click did not raise but the post-click state is unreadable
-        # (detached/navigated): report success and never risk a second toggle.
+        # A real coordinate click ran without error but the post-click state is
+        # unreadable (detached/navigated): the legacy contract treats this as a
+        # success and never risks a second toggle. Only the unsafe-blocker path
+        # (which skips the coordinate click) fails closed here.
         from skyvern.webeye.actions.responses import ActionSuccess
 
         js_mock = AsyncMock(return_value=None)
@@ -740,3 +758,587 @@ class TestChainClickCheckboxCoordinateVerification:
         assert isinstance(results[-2], ActionFailure)
         assert "coordinate_click" in results[-2].exception_message
         assert isinstance(results[-1], ActionSuccess)
+
+
+def _make_blocking_element(
+    *,
+    tag: str,
+    interactive_descendant: str | None,
+    direct_interactive: bool | None = False,
+    direct_probe_error: bool = False,
+    descendant_probe_error: bool = False,
+) -> tuple[SkyvernElement, MagicMock]:
+    locator = MagicMock()
+    locator.click = AsyncMock(return_value=None)
+    # ``locator.evaluate`` is retained only as a spy: the direct-blocker probe now
+    # goes through ``SkyvernFrame.evaluate`` (see ``_run_chain_click``), so this
+    # must never be awaited by production code.
+    if direct_probe_error:
+        locator.evaluate = AsyncMock(side_effect=RuntimeError("direct blocker probe failed"))
+    else:
+        locator.evaluate = AsyncMock(return_value=direct_interactive)
+    element_handle = MagicMock()
+    element_handle.probe_outcome = "raise" if direct_probe_error else direct_interactive
+    locator.element_handle = AsyncMock(return_value=element_handle)
+
+    def _descendant_locator(selector: str) -> MagicMock:
+        descendant_locator = MagicMock()
+        if descendant_probe_error:
+            descendant_locator.count = AsyncMock(side_effect=RuntimeError("descendant probe failed"))
+        else:
+            requested_descendants = {part.strip() for part in selector.split(",")}
+            descendant_locator.count = AsyncMock(return_value=int(interactive_descendant in requested_descendants))
+        return descendant_locator
+
+    locator.locator = MagicMock(side_effect=_descendant_locator)
+    blocker = SkyvernElement(locator, MagicMock(), {"id": "BLOCKER", "tagName": tag})
+    blocker.is_parent_of = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    blocker.is_sibling_of = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    return blocker, locator
+
+
+class TestChainClickBlockingLabelGuard:
+    _run_chain_click = staticmethod(TestChainClickBlockedAnchorNavigation._run_chain_click)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("descendant", ["a[href]", "button"])
+    async def test_unsafe_label_blocker_uses_js_only_verified_toggle(
+        self, monkeypatch: pytest.MonkeyPatch, descendant: str
+    ) -> None:
+        # An unsafe wrapping label (nested actionable descendant) must not receive
+        # any real mouse event: neither the blocker click nor the checkbox
+        # coordinate click. The coordinate click is skipped and the shared JS
+        # fallback toggles + verifies, so a known before->after change succeeds.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant=descendant)
+        js_mock = AsyncMock(return_value=None)
+        is_checkbox_mock = AsyncMock(return_value=True)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            is_checkbox_mock=is_checkbox_mock,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        selector = blocker.get_locator().locator.call_args.args[0]  # type: ignore[union-attr]
+        assert descendant in selector
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        is_checkbox_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_label_blocker_unchanged_state_fails_without_real_mouse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Known before==after through the shared JS fallback: the toggle was a
+        # provable no-op. Report failure instead of a false success, and never
+        # dispatch a real mouse click.
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant="a[href]")
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, False],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        # The direct-blocker probe no longer calls ``locator.evaluate``; it goes
+        # through the unified ``SkyvernFrame.evaluate`` entry point.
+        blocker_locator.evaluate.assert_not_awaited()
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionFailure)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_label_blocker_unknown_post_state_fails_without_retry_or_navigation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Known pre-state, JS toggle, then post-state unreadable (detached/navigated):
+        # fail without a second toggle and without any real mouse click.
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant="a[href]")
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, None],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionFailure)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_blocker_unknown_pre_state_fails_without_js_or_coordinate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The state is unreadable with no coordinate click having run: without a
+        # known baseline the fallback fails closed with no coordinate click and no
+        # JS click (the skipped-coordinate path never claims a false success).
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant="a[href]")
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[None, None],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_not_awaited()
+        navigate.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionFailure)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_blocker_js_exception_fails_without_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The JS toggle itself raises: report the failure and never retry with a
+        # real mouse click.
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant="a[href]")
+        js_mock = AsyncMock(side_effect=RuntimeError("js click failed"))
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionFailure)
+
+    @pytest.mark.asyncio
+    async def test_label_descendant_probe_error_uses_js_only_verified_toggle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Descendant probe raises -> blocker safety is unknown. Treat as unsafe:
+        # no real mouse click, JS toggle only, verified by a known state change.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag="label", interactive_descendant=None, descendant_probe_error=True
+        )
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_unrelated_unsafe_blocker_uses_js_only_verified_toggle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.BUTTON,
+            interactive_descendant=None,
+            direct_interactive=True,
+        )
+        blocker.is_parent_of = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("relationship probe must not run")
+        )
+        blocker.is_sibling_of = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("relationship probe must not run")
+        )
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        blocker.is_parent_of.assert_not_awaited()
+        blocker.is_sibling_of.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_same_parent_non_label_unsafe_sibling_uses_js_only_verified_toggle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.A,
+            interactive_descendant=None,
+            direct_interactive=True,
+        )
+        blocker.is_parent_of = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("relationship probe must not run")
+        )
+        blocker.is_sibling_of = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("relationship probe must not run")
+        )
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        blocker.is_parent_of.assert_not_awaited()
+        blocker.is_sibling_of.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_sibling_under_shared_label_uses_js_only_verified_toggle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.A,
+            interactive_descendant=None,
+            direct_interactive=True,
+        )
+        blocker.is_parent_of = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        blocker.is_sibling_of = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_label_blocker_for_non_checkbox_keeps_direct_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant="button")
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=False,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_awaited_once()
+        blocker_locator.locator.assert_not_called()
+        coordinate_click.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_unsafe_label_blocker_for_repeated_checkbox_click_keeps_direct_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant="a[href]")
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            repeat=2,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_awaited_once()
+        blocker_locator.locator.assert_not_called()
+        coordinate_click.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_safe_label_blocker_keeps_direct_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(tag="label", interactive_descendant=None)
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_awaited_once()
+        blocker_locator.locator.assert_called_once_with("a[href], button")
+        coordinate_click.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_non_label_blocker_keeps_direct_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(tag="div", interactive_descendant="a[href]")
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_awaited_once()
+        blocker_locator.locator.assert_not_called()
+        coordinate_click.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tag", "direct_interactive"),
+        [(InteractiveElement.A, True), (InteractiveElement.BUTTON, True)],
+    )
+    async def test_blocker_itself_interactive_uses_js_only_verified_toggle(
+        self, monkeypatch: pytest.MonkeyPatch, tag: str, direct_interactive: bool
+    ) -> None:
+        # The blocker is itself an a[href]/button: dispatching a coordinate click
+        # at the checkbox could still land on it and navigate/submit. Use the
+        # JS-only verified toggle with no real mouse event.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=tag,
+            interactive_descendant=None,
+            direct_interactive=direct_interactive,
+        )
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        navigate.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("direct_interactive", "direct_probe_error"),
+        [(None, False), (False, True)],
+    )
+    async def test_blocker_itself_actionability_unknown_uses_js_only_verified_toggle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        direct_interactive: bool | None,
+        direct_probe_error: bool,
+    ) -> None:
+        # Blocker safety is unknown (non-boolean probe result or probe exception):
+        # fail closed on the real mouse click and toggle via JS only, verified by
+        # a known state change.
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.A,
+            interactive_descendant=None,
+            direct_interactive=direct_interactive,
+            direct_probe_error=direct_probe_error,
+        )
+        js_mock = AsyncMock(return_value=None)
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            checked_states=[False, False, True],
+            js_mock=js_mock,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_not_awaited()
+        coordinate_click.assert_not_awaited()
+        js_mock.assert_awaited_once()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_plain_anchor_blocker_keeps_direct_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.A,
+            interactive_descendant=None,
+            direct_interactive=False,
+        )
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=True,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.click.assert_awaited_once()
+        coordinate_click.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("is_checkbox", "repeat"), [(False, 1), (True, 2)])
+    async def test_direct_interactive_blocker_parity_outside_single_checkbox(
+        self, monkeypatch: pytest.MonkeyPatch, is_checkbox: bool, repeat: int
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.BUTTON,
+            interactive_descendant=None,
+            direct_interactive=True,
+        )
+
+        results, coordinate_click, _ = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            is_checkbox=is_checkbox,
+            repeat=repeat,
+            blocking_element=blocker,
+        )
+
+        blocker_locator.evaluate.assert_not_awaited()
+        blocker_locator.click.assert_awaited_once()
+        coordinate_click.assert_not_awaited()
+        assert results and isinstance(results[-1], ActionSuccess)
+
+
+class TestIsSafeForCheckboxDirectClickUsesSkyvernFrameEvaluate:
+    """The direct-blocker interactivity probe must dispatch through the unified
+    ``SkyvernFrame.evaluate`` entry point (repo-standard timeout/dispatch/
+    navigation recovery, handle marshalling) rather than ``Locator.evaluate``,
+    while preserving fail-closed semantics."""
+
+    @pytest.mark.asyncio
+    async def test_probe_routes_through_skyvernframe_evaluate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.BUTTON, interactive_descendant=None, direct_interactive=True
+        )
+        frame_eval = AsyncMock(return_value=True)
+        monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", frame_eval)
+
+        result = await blocker.is_safe_for_checkbox_direct_click()
+
+        assert result is False  # interactive blocker => unsafe
+        frame_eval.assert_awaited_once()
+        call = frame_eval.await_args
+        assert call.kwargs["expression"] == "(element) => element.matches('a[href], button')"
+        assert call.kwargs["frame"] is blocker.get_frame()
+        assert call.kwargs["arg"] is await blocker.get_element_handler()
+        blocker_locator.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probe_exception_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.A, interactive_descendant=None, direct_interactive=False
+        )
+        monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", AsyncMock(side_effect=RuntimeError("probe failed")))
+
+        assert await blocker.is_safe_for_checkbox_direct_click() is False
+        blocker_locator.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probe_non_boolean_result_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        blocker, blocker_locator = _make_blocking_element(
+            tag=InteractiveElement.A, interactive_descendant=None, direct_interactive=False
+        )
+        monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", AsyncMock(return_value=None))
+
+        assert await blocker.is_safe_for_checkbox_direct_click() is False
+        blocker_locator.evaluate.assert_not_awaited()

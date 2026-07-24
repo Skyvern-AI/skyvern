@@ -504,6 +504,7 @@ class TestDeterministicCustomSelect:
         get_readback_scope_element = AsyncMock()
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="United States",
             get_option_candidates=lambda: [
                 {"label": "United States", "element_id": "us-1", "value": "US", "is_choice_input": False},
@@ -534,6 +535,7 @@ class TestDeterministicCustomSelect:
         get_readback_scope_element = AsyncMock()
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Job Board",
             get_option_candidates=lambda: [
                 {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": False}
@@ -554,6 +556,7 @@ class TestDeterministicCustomSelect:
         get_skyvern_element = AsyncMock()
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="15",
             get_option_candidates=lambda: [
                 {"label": "15", "element_id": "day-15", "value": None, "is_choice_input": False}
@@ -583,6 +586,7 @@ class TestDeterministicCustomSelect:
         selected_element = _FakeCustomElement(role="listbox")
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Job Board",
             get_option_candidates=lambda: [
                 {"label": "Job Board", "element_id": "source-panel", "value": None, "is_choice_input": False}
@@ -628,6 +632,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Choice",
             get_option_candidates=lambda: [
                 {"label": "Choice", "element_id": "choice-radio", "value": None, "is_choice_input": True}
@@ -677,6 +682,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Choice",
             get_option_candidates=lambda: [
                 {"label": "Choice", "element_id": "choice-option", "value": None, "is_choice_input": True}
@@ -718,6 +724,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="WAKE",
             get_option_candidates=lambda: [
                 {"label": "WAKE", "element_id": "county-wake", "value": "WAKE", "is_choice_input": True}
@@ -788,6 +795,7 @@ class TestDeterministicCustomSelect:
         readback_scope_element = _FakeAnchorElement()
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Job Board",
             get_option_candidates=lambda: [
                 {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": False}
@@ -831,6 +839,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="WAKE",
             get_option_candidates=lambda: [
                 {"label": "WAKE", "element_id": "county-wake", "value": "WAKE", "is_choice_input": True}
@@ -874,6 +883,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Job Board",
             get_option_candidates=lambda: [
                 {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": False}
@@ -918,6 +928,7 @@ class TestDeterministicCustomSelect:
         readback_scope_element = _FakeAnchorElement(tag_name="button")
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Job Board",
             get_option_candidates=lambda: [
                 {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": True}
@@ -988,6 +999,7 @@ class TestDeterministicCustomSelect:
         )
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Alpha",
             get_option_candidates=lambda: candidates,
             field_context={},
@@ -1030,6 +1042,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Alpha",
             get_option_candidates=lambda: [
                 {
@@ -1046,20 +1059,15 @@ class TestDeterministicCustomSelect:
             task=_task(),  # type: ignore[arg-type]
         )
 
-        if walk_is_choice_input:
-            assert result is not None
-            action_result, matched_label = result
-            assert not action_result.success
-            assert action_result.skip_remaining_actions is True
-            assert matched_label == "Alpha"
-        else:
-            assert result is None
+        assert result is not None
+        action_result, matched_label = result
+        assert not action_result.success
+        assert action_result.skip_remaining_actions is True
+        assert matched_label == "Alpha"
         selected_element.click.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_clicked_but_unverified_non_choice_option_soft_fails_to_llm(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_clicked_but_unverified_non_choice_option_is_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
@@ -1079,11 +1087,10 @@ class TestDeterministicCustomSelect:
         )
         selected_element = _FakeCustomElement()
         selected_element.get_locator().count = AsyncMock(return_value=1)
-        # A button/div-anchored single-select listbox (role=option, not checkbox/radio) can be
-        # safely replayed by the LLM mini-agent, so an unverified click must soft-fail.
         readback_scope_element = _FakeAnchorElement(tag_name="button")
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="Choice",
             get_option_candidates=lambda: [
                 {"label": "Choice", "element_id": "choice-option", "value": None, "is_choice_input": False}
@@ -1095,7 +1102,11 @@ class TestDeterministicCustomSelect:
             task=_task(),  # type: ignore[arg-type]
         )
 
-        assert result is None
+        assert result is not None
+        action_result, matched_label = result
+        assert not action_result.success
+        assert action_result.skip_remaining_actions is True
+        assert matched_label == "Choice"
         selected_element.click.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1123,8 +1134,10 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
         # A text-input combobox anchor is resettable, so an inconclusive read-back must NOT hard-fail.
         readback_scope_element = _FakeAnchorElement(tag_name="input")
+        monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
 
         result = await _select_deterministic_custom_option(
+            execute=True,
             target_value="WAKE",
             get_option_candidates=lambda: [
                 {"label": "WAKE", "element_id": "source-wake", "value": "WAKE", "is_choice_input": False}

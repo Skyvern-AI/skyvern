@@ -30,7 +30,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-from ._common import ErrorCode, Timer, make_error, make_result
+from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id, validate_workflow_run_id
 from ._workflow_http import (
@@ -484,7 +484,7 @@ def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str)
             ErrorCode.INVALID_INPUT,
             f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
             "In code-only mode, use a `code` block for durable browser/page work instead of "
-            "task/navigation/extraction/etc.",
+            "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
         ),
     )
 
@@ -684,6 +684,62 @@ def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
             changed = True
 
     return json.dumps(raw) if changed else definition
+
+
+def _collect_code_block_labels(blocks: Any) -> frozenset[str]:
+    if not isinstance(blocks, list):
+        return frozenset()
+    return frozenset(
+        block["label"]
+        for block in _iter_blocks_flat(blocks)
+        if block.get("block_type") == "code" and isinstance(block.get("label"), str)
+    )
+
+
+def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_labels: frozenset[str]) -> str:
+    """Default `prompt` to "" on new code blocks, matching the editor's new-block default.
+
+    A non-null prompt is what makes the frontend render the code-first (new) code block
+    experience; the empty string is runtime-neutral (all backend prompt checks are truthiness
+    based). Blocks whose label is in `existing_code_labels`, or that carry an explicit prompt
+    value (including null), are left untouched so existing legacy blocks are never migrated.
+    """
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+    workflow_definition = raw.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
+    if not isinstance(blocks, list):
+        return definition
+
+    changed = False
+    for block in _iter_blocks_flat(blocks):
+        if (
+            block.get("block_type") == "code"
+            and "prompt" not in block
+            and block.get("label") not in existing_code_labels
+        ):
+            block["prompt"] = ""
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
+async def _inject_workflow_update_code_block_prompt_defaults(
+    definition: str,
+    fmt: str,
+    fetch_existing: Callable[[], Awaitable[dict[str, Any]]],
+) -> str:
+    """Apply the new-code-block prompt default on update, only for labels new to the workflow."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    existing = await fetch_existing()
+    existing_definition = existing.get("workflow_definition")
+    existing_blocks = existing_definition.get("blocks") if isinstance(existing_definition, dict) else None
+    return _inject_code_block_prompt_defaults(definition, fmt, _collect_code_block_labels(existing_blocks))
 
 
 async def _inject_workflow_update_proxy_default(
@@ -1616,12 +1672,9 @@ async def skyvern_workflow_create(
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
     code_only: Annotated[
-        bool,
-        Field(
-            description="When true, structurally reject non-code browser/page block types before persisting "
-            "(code-only mode)"
-        ),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
@@ -1635,10 +1688,13 @@ async def skyvern_workflow_create(
     skyvern_workflow_list.
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
+    Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
     Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
     injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
+    Code blocks that omit `prompt` are defaulted to prompt="" so they render the current code block
+    editor experience.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
@@ -1664,6 +1720,7 @@ async def skyvern_workflow_create(
     # Default MCP-created workflows to the same editor defaults while preserving
     # any explicit user-supplied values.
     definition = _inject_code_v2_defaults(definition, format)
+    definition = _inject_code_block_prompt_defaults(definition, format, existing_code_labels=frozenset())
     definition = _inject_missing_top_level_defaults(
         definition,
         format,
@@ -1725,12 +1782,9 @@ async def skyvern_workflow_update(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
     code_only: Annotated[
-        bool,
-        Field(
-            description="When true, structurally reject non-code browser/page block types before persisting "
-            "(code-only mode)"
-        ),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow.
@@ -1776,6 +1830,7 @@ async def skyvern_workflow_update(
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, fetch_existing)
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
+        definition = await _inject_workflow_update_code_block_prompt_defaults(definition, format, fetch_existing)
         if code_only:
             existing = await fetch_existing()
             existing_wf_def = existing.get("workflow_definition")

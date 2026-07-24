@@ -720,7 +720,7 @@ class ForgeAgent:
             task = await app.DATABASE.tasks.create_task(
                 url=task_url,
                 title=code_block.label,
-                navigation_goal=code_block.prompt,
+                navigation_goal=code_block.prompt or None,
                 data_extraction_goal=None,
                 navigation_payload=None,
                 organization_id=organization_id,
@@ -1998,7 +1998,9 @@ class ForgeAgent:
                     action_result=results,
                 )
             else:
-                if action_node.next is not None:
+                # A failure that set skip_remaining_actions must not fall through to the duplicate
+                # element id, or the action it was protecting against gets replayed anyway.
+                if action_node.next is not None and (not results or not results[-1].skip_remaining_actions):
                     LOG.warning(
                         "Action failed, but have duplicated element id in the action list. Continue excuting.",
                         step_order=step.order,
@@ -5388,6 +5390,20 @@ class ForgeAgent:
             )
             complete_action = None
 
+        if isinstance(complete_action, CompleteAction) and not await app.AGENT_FUNCTION.gate_step_completion(
+            task=task,
+            step=step,
+            task_block=task_block,
+            page=page,
+            browser_state=browser_state,
+        ):
+            LOG.info(
+                "Step completion vetoed by completion gate; continuing with next step",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            complete_action = None
+
         if complete_action is not None:
             asyncio.create_task(
                 self._persist_speculative_metadata_for_discarded_plan(
@@ -6185,7 +6201,28 @@ class ForgeAgent:
                     task_block=task_block,
                 )
 
-        if step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal)):
+        goal_achieved = step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal))
+        # A decisive COMPLETE action skips parallel verification, so this is the other place a
+        # completion is accepted — gate it too, or the veto is bypassed whenever the agent emits
+        # complete directly.
+        if (
+            goal_achieved
+            and browser_state is not None
+            and not await app.AGENT_FUNCTION.gate_step_completion(
+                task=task,
+                step=step,
+                task_block=task_block,
+                page=page,
+                browser_state=browser_state,
+            )
+        ):
+            LOG.info(
+                "Decisive step completion vetoed by completion gate; continuing with next step",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            goal_achieved = False
+        if goal_achieved:
             LOG.info(
                 "Step completed and goal achieved, marking task as completed",
                 step_order=step.order,

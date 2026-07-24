@@ -30,6 +30,22 @@ ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "other"]
+COPILOT_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
+
+
+def coerce_ask_subject(value: object) -> AskSubject | None:
+    for subject in COPILOT_ASK_SUBJECTS:
+        if value == subject:
+            return subject
+    return None
+
+
+def parsed_ask_refs(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [ref for ref in value if isinstance(ref, str) and ref]
+
 
 class DeliveredUnverifiedPublicOutputs(dict[str, Any]):
     """Run-output values explicitly selected for terminal presentation.
@@ -937,6 +953,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     discovery_entrypoint_url_question_nudge_count: int = 0
     pre_discovery_url_question_nudge_count: int = 0
+    discovery_failure_streak_this_turn: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None

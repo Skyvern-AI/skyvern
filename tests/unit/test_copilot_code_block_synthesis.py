@@ -9,6 +9,7 @@ import ast
 import asyncio
 import json
 import keyword
+import re
 import sys
 import textwrap
 from dataclasses import replace
@@ -18,6 +19,7 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -55,10 +57,12 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _get_by_role_expr,
     _get_by_role_expr_strict,
     _is_submit_interaction,
+    _strict_period_date_pattern,
     build_input_templated_locator,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     credential_scout_gap,
+    dynamic_row_evidence_fingerprint,
     input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
     obligation_finding_reason_code,
@@ -70,6 +74,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_extraction_suffix,
     templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
+    uncovered_rung_records,
     witness_prelude_lines,
 )
 from skyvern.forge.sdk.copilot.context import (
@@ -87,7 +92,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTar
 from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction, _with_trajectory_anchor
-from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
+from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors, _scouted_spine_omission_digest
 from skyvern.forge.sdk.workflow.exceptions import CustomizedCodeException
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 
@@ -2770,6 +2775,19 @@ class TestCredentialFillSynthesis:
     def test_runtime_otp_fill_is_detected_as_credential_fill_code(self) -> None:
         assert code_contains_credential_fill('await page.locator("#otp").fill(await login_credential.otp())')
 
+    def test_demonstrated_totp_is_a_required_rung_flagged_when_a_draft_omits_it(self) -> None:
+        trajectory = [
+            self._credential_fill(),
+            self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        emitted = result.diagnostics.emitted_interactions
+        assert all(not str(record.get("lane") or "") for record in emitted)
+        draft_omitting_totp = [("fill", 'page.locator("#userName")')]
+        uncovered = uncovered_required_emitted_interactions(emitted, draft_omitting_totp)
+        assert [record.get("selector") for record in uncovered] == ["#totpCode"]
+
     def test_missing_credential_reference_is_dropped_with_note(self) -> None:
         result = synthesize_code_block(
             [
@@ -3933,6 +3951,33 @@ class TestSpinePartitionFindings:
         draft_calls = _covering_draft_calls(result.diagnostics)
         assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
 
+    def test_omitted_demonstrated_totp_fill_is_an_uncovered_rung_finding(self) -> None:
+        login_url = "https://example.com/login"
+        trajectory = [
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#userName",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="username",
+                typed_length=20,
+            ),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#totpCode",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="totp",
+                typed_length=6,
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = [("fill", 'page.locator("#userName")')]
+        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
+        uncovered = uncovered_rung_records(findings)
+        assert [record.get("selector") for record in uncovered] == ["#totpCode"]
+
     def test_unforgiven_drop_is_a_typed_finding(self) -> None:
         trajectory = [
             {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
@@ -4247,6 +4292,115 @@ def test_input_correspondence_selector_identity_and_month() -> None:
     assert by_key["billing_period"]["transform"] == "month_name_to_iso"
 
 
+def test_input_correspondence_iso_dates_collapse_to_canonical_period_key_independent_of_order() -> None:
+    interaction = {"tool_name": "click", "selector": "a[href='/statements/100245_2026-05.pdf']"}
+    forward = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    reverse = input_correspondences_for_interaction(
+        interaction,
+        {"download_end_date": "2026-05-31", "download_start_date": "2026-05-01"},
+    )
+
+    assert forward == reverse
+    period = next(correspondence for correspondence in forward if correspondence["matched_literal"] == "2026-05")
+    assert period["input_key"] == "download_end_date"
+    assert period["transform"] == "iso_date_to_year_month"
+    assert period["equivalent_inputs"] == [
+        {
+            "input_key": "download_start_date",
+            "parameter_value": "2026-05-01",
+            "transform": "iso_date_to_year_month",
+        }
+    ]
+
+
+@pytest.mark.parametrize("value", ["2026-5-01", "2026-02-30", "2026-13-01", "2026-05-01T00:00:00"])
+def test_input_correspondence_iso_date_transform_is_strict(value: str) -> None:
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": "a[href='/statements/2026-05.pdf']"},
+            {"download_start_date": value},
+        )
+        == []
+    )
+
+
+def test_input_correspondence_prefers_exact_iso_date_over_its_period_projection() -> None:
+    assert input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": '[data-range="2026-08-01"]'},
+        {"billing_start_date": "2026-08-01"},
+    ) == [
+        {
+            "input_key": "billing_start_date",
+            "matched_literal": "2026-08-01",
+            "parameter_value": "2026-08-01",
+            "surface": "selector",
+            "transform": "identity",
+            "position": 13,
+        }
+    ]
+
+
+def test_input_correspondence_keeps_distinct_iso_projection_outside_exact_span() -> None:
+    selector = 'a[data-date="2026-05-01"][href="/statements/2026-05.pdf"]'
+
+    correspondences = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": selector},
+        {"billing_start_date": "2026-05-01"},
+    )
+
+    assert [(hole["matched_literal"], hole["transform"], hole["position"]) for hole in correspondences] == [
+        ("2026-05-01", "identity", 13),
+        ("2026-05", "iso_date_to_year_month", 44),
+    ]
+    expression = build_input_templated_locator(
+        surface="selector", selector=selector, role="", name="", holes=correspondences
+    )
+    assert expression is not None
+    assert "{billing_start_date}" in expression
+    assert "{_scout_iso_date_to_year_month(billing_start_date)}" in expression
+    interaction = {"tool_name": "click", "selector": selector, "source_url": "https://example.com/statements"}
+    interaction["input_correspondences"] = correspondences
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    assert 'data-date="2026-05-01"' not in synthesized.code
+    assert "/statements/2026-05.pdf" not in synthesized.code
+
+
+def test_input_correspondence_rejects_partially_overlapping_matches() -> None:
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": "a[href='/statements/2026-05.pdf']"},
+            {"period": "2026-05", "month_suffix": "05.pdf"},
+        )
+        == []
+    )
+
+
+def test_synthesized_collision_guard_rejects_runtime_period_divergence_before_browser_mutation() -> None:
+    interaction = {
+        "tool_name": "click",
+        "selector": "a[href='/statements/100245_2026-05.pdf']",
+        "source_url": "https://example.com/statements",
+    }
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    code = synthesized.code
+    guard = "grounded parameters do not resolve to one period"
+    assert guard in code
+    assert code.index(guard) < code.index("await page.goto")
+    assert "_scout_iso_date_to_year_month(download_end_date)" in code
+    assert "_scout_iso_date_to_year_month(download_start_date)" in code
+
+
 def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
     # "Widget" also occurs as a non-boundary substring inside "Widgetry"; the hole must template the
     # boundary-validated standalone span, not the first find() hit.
@@ -4269,6 +4423,9 @@ def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
         {"page": "100245"},
         {"re": "100245"},
         {"_scout_month_to_iso": "100245"},
+        {"_scout_iso_date_to_year_month": "100245"},
+        {"_scout_period_month_name": "100245"},
+        {"_scout_period_year": "100245"},
         {"account_number": "100245'] , [href"},
     ],
 )
@@ -4392,6 +4549,234 @@ def test_synthesize_unwitnessed_selector_byte_identical() -> None:
     assert "_scout_month_to_iso" not in baseline.code
 
 
+def _dynamic_row_click(*, source_url: str = "https://example.com/statements") -> dict[str, Any]:
+    selector = "div.statement-row >> nth=2"
+    row_evidence = {
+        "source_url": "https://example.com/statements",
+        "target_selector": selector,
+        "row_selector": "div.statement-row",
+        "row_text": "Statement May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+    }
+    row_evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(**row_evidence)
+    interaction: dict[str, Any] = {
+        "tool_name": "click",
+        "selector": selector,
+        "source_url": source_url,
+        "dynamic_row_evidence": row_evidence,
+    }
+    return interaction
+
+
+def test_dynamic_row_evidence_fingerprint_is_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence = _dynamic_row_click()["dynamic_row_evidence"]
+    payload = {key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+
+    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-alpha")
+    fingerprint_a = dynamic_row_evidence_fingerprint(**payload)
+    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-beta")
+    fingerprint_b = dynamic_row_evidence_fingerprint(**payload)
+
+    assert len(fingerprint_a) == 64
+    assert len(fingerprint_b) == 64
+    assert fingerprint_a != fingerprint_b
+
+
+def test_valid_unused_dynamic_row_evidence_preserves_generic_positional_synthesis() -> None:
+    interaction = _dynamic_row_click()
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["row_text"] = "Current statement"
+    evidence["row_text_match_count"] = 2
+    evidence["period_matches"] = []
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    baseline_interaction = {key: value for key, value in interaction.items() if key != "dynamic_row_evidence"}
+    baseline = synthesize_code_block([baseline_interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    assert baseline is not None
+    assert synthesized.code == baseline.code
+    assert synthesized.parameters == baseline.parameters
+    assert synthesized.diagnostics.dropped_interactions == []
+
+
+def test_dynamic_row_period_requires_unique_period_across_candidate_rows() -> None:
+    interaction = _dynamic_row_click()
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["period_matches"][0]["row_match_count"] = 2
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    assert (
+        input_correspondences_for_interaction(
+            interaction,
+            {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+        )
+        == []
+    )
+
+
+def test_stamped_dynamic_row_period_license_fails_closed_when_cross_row_count_is_stale() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["period_matches"][0]["row_match_count"] = 2
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    assert synthesized.diagnostics.emitted_interactions == []
+    assert synthesized.diagnostics.dropped_interactions[0]["reason_code"] == "invalid_dynamic_row_evidence"
+
+
+@pytest.mark.parametrize(
+    ("period", "matching", "non_matching"),
+    [
+        ("2026-05", "Statement mAy 5, 2026", "Statement May 5, 2025"),
+        ("2026-05", "Statement MAY 05, 2026.", "Statement May 00, 2026."),
+        ("2024-02", "Statement February 29, 2024", "Statement February 31, 2024"),
+        ("2026-02", "Statement February 28, 2026", "Statement February 29, 2026"),
+        ("2026-04", "Statement April 30, 2026", "Statement April 31, 2026"),
+    ],
+)
+def test_period_matcher_is_case_insensitive_and_gregorian_valid(period: str, matching: str, non_matching: str) -> None:
+    pattern = _strict_period_date_pattern(period)
+
+    assert pattern is not None
+    assert pattern.search(matching) is not None
+    assert pattern.search(non_matching) is None
+
+
+def test_period_matcher_rejects_year_zero() -> None:
+    assert _strict_period_date_pattern("0000-05") is None
+
+
+def test_emitted_period_matcher_uses_same_case_and_calendar_contract() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    function = next(
+        node
+        for node in ast.parse(textwrap.dedent(synthesized.code)).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_scout_period_date_pattern"
+    )
+    namespace: dict[str, Any] = {"re": re}
+    exec(ast.unparse(function), namespace)
+    matcher = namespace["_scout_period_date_pattern"]
+
+    assert matcher("2026-05").search("Statement mAy 5, 2026") is not None
+    assert matcher("2026-05").search("Statement MAY 05, 2026.") is not None
+    assert matcher("2026-02").search("Statement February 29, 2026") is None
+    assert matcher("2024-02").search("Statement February 29, 2024") is not None
+    assert matcher("2026-04").search("Statement April 31, 2026") is None
+    with pytest.raises(Exception, match="unrecognized grounded period"):
+        matcher("0000-05")
+
+
+def test_dynamic_row_period_parity_accepts_zero_padded_day_and_trailing_punctuation() -> None:
+    interaction = _dynamic_row_click()
+    evidence = interaction["dynamic_row_evidence"]
+    evidence["row_text"] = "Statement mAy 05, 2026."
+    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
+        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
+    )
+
+    correspondences = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+
+    assert any(item["surface"] == "row_text" for item in correspondences)
+    interaction["input_correspondences"] = correspondences
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    assert ".filter(has_text=_scout_period_date_pattern(" in synthesized.code
+
+
+def test_dynamic_row_period_evidence_emits_direct_count_guarded_locator() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    assert "nth=" not in synthesized.code
+    assert 'page.locator("div.statement-row")' in synthesized.code
+    assert synthesized.code.count("def _scout_period_date_pattern(") == 1
+    assert ".filter(has_text=_scout_period_date_pattern(" in synthesized.code
+    assert "_scout_period_month_name" not in synthesized.code
+    assert "_scout_period_year" not in synthesized.code
+    assert ".count() != 1" in synthesized.code
+    assert {parameter["key"] for parameter in synthesized.parameters} == {
+        "download_end_date",
+        "download_start_date",
+    }
+
+
+def test_dynamic_row_period_matcher_does_not_join_month_and_year_from_unrelated_fields() -> None:
+    interaction = _dynamic_row_click()
+    interaction["input_correspondences"] = input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+
+    assert synthesized is not None
+    # The generated matcher requires one contiguous witnessed date; month/year in separate fields do not qualify.
+    pattern = _strict_period_date_pattern("2027-06")
+    assert pattern is not None
+    assert pattern.search("Month June | account opened 2027") is None
+    assert pattern.search("Statement June 5, 2027") is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda evidence: evidence.pop("row_text"),
+        lambda evidence: evidence.update(source_url="https://other.example.org/statements"),
+        lambda evidence: evidence.update(target_selector="div.other-row >> nth=2"),
+    ],
+)
+def test_dynamic_row_period_evidence_fails_closed_when_relation_is_missing_or_competing(mutation: Any) -> None:
+    interaction = _dynamic_row_click()
+    mutation(interaction["dynamic_row_evidence"])
+
+    assert (
+        input_correspondences_for_interaction(
+            interaction,
+            {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+        )
+        == []
+    )
+    synthesized = synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    assert synthesized.diagnostics.emitted_interactions == []
+    assert synthesized.diagnostics.dropped_interactions[0]["reason_code"] == "invalid_dynamic_row_evidence"
+
+
 def test_synthesize_input_purity() -> None:
     trajectory = [_witnessed_click()]
     snapshot = json.loads(json.dumps(trajectory))
@@ -4422,6 +4807,9 @@ class _FakeLocator:
         return self._page.counts.get(self._selector, 0)
 
     async def wait_for(self, *, state: str, timeout: float | None = None) -> None:
+        if self._page.goto_done and self._selector in self._page.appears_after_goto:
+            self._page.counts.update(self._page.appears_after_goto)
+            return
         if self._page.counts.get(self._selector, 0) < 1:
             raise TimeoutError(f"{self._selector} not visible")
 
@@ -4440,18 +4828,21 @@ class _FakeLocator:
 
 
 class _FakePage:
-    def __init__(self, counts: dict[str, int]) -> None:
+    def __init__(self, counts: dict[str, int], appears_after_goto: dict[str, int] | None = None) -> None:
         self.counts = counts
         self.filled: list[str] = []
         self.clicked: list[str] = []
         self.pressed: list[tuple[str, str]] = []
         self.goto_calls: list[str] = []
+        self.appears_after_goto = appears_after_goto or {}
+        self.goto_done = False
 
     def locator(self, selector: str) -> _FakeLocator:
         return _FakeLocator(self, selector)
 
     async def goto(self, url: str, *, wait_until: str | None = None) -> None:
         self.goto_calls.append(url)
+        self.goto_done = True
 
     async def wait_for_load_state(self, state: str) -> None:
         return None
@@ -4528,6 +4919,18 @@ class TestLoginOnlyPresenceGuardSynthesis:
         assert page.filled == []
         assert page.clicked == []
 
+    def test_login_field_rendered_after_goto_is_filled_not_skipped(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({}, appears_after_goto={"#username": 1, "#password": 1, "#login-btn": 1})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == ["#username", "#password"]
+        assert page.clicked == ["#login-btn"]
+        assert page.goto_calls == ["https://example.com/login"]
+
 
 class TestSharedSubmitPredicate:
     def test_click_and_enter_are_submits_but_tab_is_not(self) -> None:
@@ -4600,3 +5003,23 @@ def test_type_text_secret_bypass_is_not_carried_into_synthesized_block() -> None
     assert _INLINE_SECRET_SENTINEL not in result.code
     credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
     assert f"{credential_param['key']}.username" in result.code
+
+
+class TestScoutedSpineOmissionDigest:
+    @staticmethod
+    def _record(selector: str, index: int = 1) -> dict[str, Any]:
+        return {"tool_name": "click", "method": "click", "selector": selector, "trajectory_index": index}
+
+    def test_identical_omissions_share_a_digest_regardless_of_order(self) -> None:
+        forward = _scouted_spine_omission_digest([self._record("#a", 1), self._record("#b", 2)])
+        reversed_order = _scouted_spine_omission_digest([self._record("#b", 2), self._record("#a", 1)])
+        assert forward == reversed_order
+
+    def test_distinct_omissions_produce_distinct_digests(self) -> None:
+        assert _scouted_spine_omission_digest([self._record("#a")]) != _scouted_spine_omission_digest(
+            [self._record("#b")]
+        )
+
+    def test_digest_is_cross_process_stable_sha256_not_salted_hash(self) -> None:
+        digest = _scouted_spine_omission_digest([self._record("#search-submit", 0)])
+        assert digest == "8065b147a155c4e35cab8b3b35da9beab958cddc9c355b6200bac957878954ec"

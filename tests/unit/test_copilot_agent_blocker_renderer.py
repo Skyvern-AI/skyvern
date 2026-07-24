@@ -29,7 +29,9 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     build_definition_contract_unsatisfied_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, DeliveredUnverifiedPublicOutputs
+from skyvern.forge.sdk.copilot.enforcement import SCOUTED_SPINE_TURN_HALT_USER_REASON
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_STEER_REASON_CODE,
@@ -39,6 +41,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools.discovery import _build_discovery_exhausted_escape_signal
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
@@ -600,6 +603,18 @@ def test_turn_halt_exit_renders_no_forward_progress_interaction_reason() -> None
     assert "click" not in result.user_response
 
 
+def test_turn_halt_exit_keeps_discovery_exhaustion_ask_when_no_scouted_spine() -> None:
+    ctx = _ctx()
+    signal = _build_discovery_exhausted_escape_signal()
+    ctx.blocker_signal = signal
+    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == signal.user_facing_reason
+    assert result.user_response != SCOUTED_SPINE_TURN_HALT_USER_REASON
+
+
 def test_turn_halt_exit_keeps_credential_scout_reply_through_refresh_with_draft() -> None:
     ctx = _ctx()
     ctx.last_workflow_yaml = "title: Draft\nworkflow_definition:\n  blocks: []\n"
@@ -953,6 +968,120 @@ def test_delivered_unverified_halt_without_workflow_renders_observed_output() ->
     assert result.narrative_payload is not None
     observed_outputs = result.narrative_payload["deliveredUnverifiedObservedOutputs"]
     assert observed_outputs["result"] == ctx.delivered_unverified_observed_outputs["result"]
+
+
+def test_repair_ceiling_give_up_halt_names_demonstrated_missing_steps() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.has_staged_proposal = True
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.impose_synthesized_code_block = True
+    ctx.persisted_draft_browser_calls = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/search",
+            "trajectory_index": 0,
+        }
+    ]
+
+    result = _build_turn_halt_exit_result(
+        ctx,
+        global_llm_context=None,
+        halt=TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED),
+    )
+
+    assert "#search-submit" in result.user_response
+
+
+def test_delivered_unverified_halt_names_demonstrated_missing_steps() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {"result": {"amount": 0}}
+    ctx.has_staged_proposal = True
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.impose_synthesized_code_block = True
+    ctx.persisted_draft_browser_calls = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/search",
+            "trajectory_index": 0,
+        }
+    ]
+
+    result = _build_turn_halt_exit_result(
+        ctx,
+        global_llm_context=None,
+        halt=TurnHalt(kind=TurnHaltKind.DELIVERED_UNVERIFIED),
+    )
+
+    assert "#search-submit" in result.user_response
+
+
+def _scouted_obligation_ctx() -> CopilotContext:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.has_staged_proposal = True
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.impose_synthesized_code_block = True
+    ctx.persisted_draft_browser_calls = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/search",
+            "trajectory_index": 0,
+        }
+    ]
+    return ctx
+
+
+def test_timeout_wip_exit_names_demonstrated_missing_steps() -> None:
+    ctx = _scouted_obligation_ctx()
+
+    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert "#search-submit" in result.user_response
+
+
+def test_output_policy_blocked_result_names_demonstrated_missing_steps() -> None:
+    ctx = _scouted_obligation_ctx()
+    verdict = OutputPolicyVerdict(
+        allowed=False,
+        output_kind=CopilotOutputKind.REFUSAL,
+        reason_codes=[OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE],
+    )
+
+    result = _build_output_policy_blocked_result(ctx, verdict, prior_global_llm_context=None, prior_workflow_yaml=None)
+
+    assert "#search-submit" in result.user_response
+
+
+def test_wip_exit_render_path_names_missing_steps_under_unrelated_blocker() -> None:
+    ctx = _scouted_obligation_ctx()
+    unrelated_reason = "I couldn't finish this after several attempts. Tell me what to change and I'll try again."
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="An unrelated blocker owns the turn.",
+        user_facing_reason=unrelated_reason,
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="output_contract_actuation_exhausted",
+        blocked_tool="update_workflow",
+    )
+
+    result = _build_wip_exit_result(ctx, None, default_reply="wip", unvalidated_reply="wip", tested_reply="wip")
+
+    assert "#search-submit" in result.user_response
+    assert result.user_response.count("This draft is still missing steps you demonstrated:") == 1
+    assert ctx.blocker_signal.user_facing_reason == unrelated_reason
 
 
 def test_delivered_unverified_exit_prioritizes_nested_scalars_and_accounts_for_omissions() -> None:

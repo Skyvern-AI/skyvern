@@ -13,8 +13,9 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import hooks as hooks_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.copilot.code_block_synthesis import dynamic_row_evidence_fingerprint, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
@@ -23,6 +24,10 @@ from skyvern.forge.sdk.copilot.tools import (
     _click_post_hook,
     _click_pre_hook,
     _prenav_ambiguity_for_selector,
+)
+from skyvern.forge.sdk.copilot.tools.scouting import (
+    _capture_scout_dynamic_row,
+    _prenav_dynamic_row_for_selector,
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
 
@@ -1037,6 +1042,7 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_click_selector=None,
             pending_scout_ambiguous=None,
             pending_scout_reanchor=None,
+            pending_scout_dynamic_row=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1073,6 +1079,7 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_click_selector=None,
             pending_scout_ambiguous=None,
             pending_scout_reanchor=None,
+            pending_scout_dynamic_row=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1130,6 +1137,7 @@ class TestScoutedInteractionCapture:
             pending_scout_click_selector=None,
             pending_scout_ambiguous=None,
             pending_scout_reanchor=None,
+            pending_scout_dynamic_row=None,
             discovery_mcp_server=None,
             browser_session_id=None,
             scouted_interactions=[],
@@ -1491,6 +1499,147 @@ class TestScoutedInteractionCapture:
         assert ctx.pending_scout_ambiguous is None
 
     @pytest.mark.asyncio
+    async def test_capture_scout_dynamic_row_binds_source_selector_and_unique_row_text(self) -> None:
+        selector = "div.statement-row >> nth=2"
+        server = SimpleNamespace(
+            call_internal_tool=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "data": {
+                        "result": {
+                            "target_selector": selector,
+                            "row_selector": "div.statement-row",
+                            "row_text": "Statement May 5, 2026",
+                            "row_selector_count": 4,
+                            "row_text_match_count": 1,
+                            "period_matches": [
+                                {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+                            ],
+                            "selected_index": 2,
+                        }
+                    },
+                }
+            )
+        )
+        ctx = self._ctx(source_url="https://example.com/statements")
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.discovery_mcp_server = server
+
+        await _capture_scout_dynamic_row(ctx, selector)
+
+        evidence = ctx.pending_scout_dynamic_row
+        assert evidence is not None
+        assert evidence["source_url"] == "https://example.com/statements"
+        assert evidence["target_selector"] == selector
+        assert evidence["row_selector"] == "div.statement-row"
+        assert evidence["row_text_match_count"] == 1
+        assert evidence["period_matches"] == [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1}
+        ]
+        assert len(evidence["evidence_fingerprint"]) == 64
+        expression = server.call_internal_tool.await_args.args[1]["expression"]
+        assert "let rowSelector = indexed ? indexed[1].trim() : ''" in expression
+        assert "else if (!rowSelector && classes.length)" in expression
+        assert "periodMatches" in expression
+        assert "daysInMonth" in expression
+        assert "0?[1-9]" in expression
+        assert "year >= 1" in expression
+        assert _prenav_dynamic_row_for_selector(evidence, selector, evidence["source_url"]) == evidence
+        assert _prenav_dynamic_row_for_selector(evidence, selector, "https://example.com/other") is None
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_dynamic_row_ignores_non_positional_selector(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/statements")
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=AsyncMock())
+
+        await _capture_scout_dynamic_row(ctx, "#current-statement-row")
+
+        assert ctx.pending_scout_dynamic_row is None
+        ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_dynamic_row_does_not_evaluate_in_standard_mode(self) -> None:
+        ctx = self._ctx(source_url="https://example.com/statements")
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+        ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=AsyncMock())
+
+        await _capture_scout_dynamic_row(ctx, "div.statement-row >> nth=2")
+
+        assert ctx.pending_scout_dynamic_row is None
+        ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_click_cycle_records_bound_dynamic_row_evidence(self) -> None:
+        selector = "div.statement-row >> nth=2"
+        row_evidence = {
+            "source_url": "https://example.com/statements",
+            "target_selector": selector,
+            "row_selector": "div.statement-row",
+            "row_text": "Statement May 5, 2026",
+            "row_selector_count": 4,
+            "row_text_match_count": 1,
+            "period_matches": [
+                {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+            ],
+            "selected_index": 2,
+        }
+        row_evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(**row_evidence)
+        ctx = self._ctx(source_url="https://example.com/statements")
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.pending_scout_dynamic_row = row_evidence
+
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": selector}},
+            {"browser_context": {"url": "https://example.com/detail", "title": "Statement"}},
+            ctx,
+        )
+
+        assert ctx.scouted_interactions[-1]["dynamic_row_evidence"] == row_evidence
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_discards_dynamic_row_evidence_in_standard_mode(self) -> None:
+        selector = "div.statement-row >> nth=2"
+        ctx = self._ctx(source_url="https://example.com/statements")
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+        ctx.pending_scout_dynamic_row = {
+            "source_url": "https://example.com/statements",
+            "target_selector": selector,
+            "row_selector": "div.statement-row",
+            "row_text": "Statement May 5, 2026",
+            "row_selector_count": 4,
+            "row_text_match_count": 1,
+            "period_matches": [
+                {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+            ],
+            "selected_index": 2,
+            "evidence_fingerprint": "not-consumed-in-standard",
+        }
+
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": selector}},
+            {"browser_context": {"url": "https://example.com/detail", "title": "Statement"}},
+            ctx,
+        )
+
+        assert "dynamic_row_evidence" not in ctx.scouted_interactions[-1]
+
+    @pytest.mark.asyncio
+    async def test_click_pre_hook_does_not_capture_dynamic_row_in_standard_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
+
+        capture = AsyncMock()
+        monkeypatch.setattr(mcp_hooks_module, "_capture_scout_dynamic_row", capture)
+        ctx = self._ctx(source_url="https://example.com/statements")
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+
+        await _click_pre_hook({"selector": "div.statement-row >> nth=2"}, ctx)
+
+        capture.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_click_cycle_records_scout_ambiguous_multi_match(self) -> None:
         ctx = self._ctx_with_count(2)
         await _click_pre_hook({"selector": "button[data-action='orderDocuments']"}, ctx)
@@ -1765,13 +1914,17 @@ class TestClickPostHookReachedDownloadTarget:
 
     @staticmethod
     def _patch_scouting(monkeypatch: pytest.MonkeyPatch, *, page_evidence: dict[str, Any] | None) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks as mh
-
-        monkeypatch.setattr(mh, "_clear_pending_browser_interaction_observation", lambda *_a, **_k: None)
-        monkeypatch.setattr(mh, "_consume_scout_source_url", lambda *_a, **_k: "http://localhost:8901/x/")
-        monkeypatch.setattr(mh, "_mark_pending_browser_interaction_observation", lambda *_a, **_k: None)
-        monkeypatch.setattr(mh, "_record_scouted_interaction", lambda *_a, **_k: None)
-        monkeypatch.setattr(mh, "_attach_scout_page_summary", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            tools_module.mcp_hooks, "_clear_pending_browser_interaction_observation", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            tools_module.mcp_hooks, "_consume_scout_source_url", lambda *_a, **_k: "http://localhost:8901/x/"
+        )
+        monkeypatch.setattr(
+            tools_module.mcp_hooks, "_mark_pending_browser_interaction_observation", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(tools_module.mcp_hooks, "_record_scouted_interaction", lambda *_a, **_k: None)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_attach_scout_page_summary", lambda *_a, **_k: None)
 
         async def fake_resolve_url_title(_raw: Any, _ctx: Any) -> tuple[str, str]:
             return "http://localhost:8901/x/statement", "Statement"
@@ -1782,9 +1935,9 @@ class TestClickPostHookReachedDownloadTarget:
         async def fake_register(*_a: Any, **_k: Any) -> tuple[int | None, dict[str, Any] | None]:
             return (1, page_evidence)
 
-        monkeypatch.setattr(mh, "_resolve_url_title", fake_resolve_url_title)
-        monkeypatch.setattr(mh, "_resolve_scout_role_name", fake_resolve_role_name)
-        monkeypatch.setattr(mh, "_register_scout_interaction_observation", fake_register)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_url_title", fake_resolve_url_title)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_scout_role_name", fake_resolve_role_name)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_register_scout_interaction_observation", fake_register)
 
     @staticmethod
     def _ctx(policy: BlockAuthoringPolicy = BlockAuthoringPolicy.CODE_ONLY_BROWSER) -> Any:
