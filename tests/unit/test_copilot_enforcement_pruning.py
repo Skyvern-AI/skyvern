@@ -9,6 +9,7 @@ These cover three regressions observed in trace 019d7b5c884dff0ff648680b9f31f715
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -17,7 +18,7 @@ import pytest
 from agents import RunConfig
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
+from skyvern.config import Settings, settings
 from skyvern.forge.sdk.copilot.blocker_signal import (
     UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
     CopilotToolBlockerSignal,
@@ -50,12 +51,14 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _maybe_synthesized_block_offer_msg,
     _needs_suspicious_success_nudge,
     _prune_input_list,
+    _recover_from_context_overflow,
     _requested_output_paths_for_ctx,
     _should_block_mutating_tool_after_synthesized_offer,
     _should_force_advisory_run_dispatch,
     _should_force_synthesized_block_persistence,
     _summarize_tool_output,
     _uncovered_output_reject_admits_evaluate,
+    aggressive_prune,
     arm_credential_scout_reopen,
     consume_uncovered_output_reopen_event,
     mint_scout_observation_contract_for_ctx,
@@ -3002,6 +3005,174 @@ def test_suspicious_success_fires_when_flag_set() -> None:
 
 def _fco(call_id: str, output: str) -> dict:
     return {"type": "function_call_output", "call_id": call_id, "output": output}
+
+
+def _fc(call_id: str) -> dict[str, str]:
+    return {"type": "function_call", "call_id": call_id, "name": "evaluate", "arguments": "{}"}
+
+
+def _history_item(fields: dict[str, Any], *, attr_style: bool) -> dict[str, Any] | SimpleNamespace:
+    return SimpleNamespace(**fields) if attr_style else fields
+
+
+def _tool_history(
+    pair_count: int,
+    *,
+    interleave_screenshots: bool = False,
+    attr_style: bool = False,
+) -> list[Any]:
+    items: list[Any] = [_history_item({"role": "user", "content": "goal"}, attr_style=attr_style)]
+    for index in range(pair_count):
+        call_id = f"call_{index}"
+        items.extend(
+            [
+                _history_item(_fc(call_id), attr_style=attr_style),
+                _history_item(_fco(call_id, "x" * 50), attr_style=attr_style),
+            ]
+        )
+        if interleave_screenshots:
+            items.append(
+                _history_item(
+                    {"role": "user", "content": f"[copilot:screenshot] frame {index}"},
+                    attr_style=attr_style,
+                )
+            )
+    return items
+
+
+def _history_field(item: Any, name: str) -> Any:
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+
+def _orphaned_tool_result_ids(items: list[Any]) -> list[str]:
+    seen_call_ids: set[str] = set()
+    orphaned_ids: list[str] = []
+    for item in items:
+        item_type = _history_field(item, "type")
+        call_id = _history_field(item, "call_id")
+        if item_type == "function_call" and isinstance(call_id, str):
+            seen_call_ids.add(call_id)
+        elif item_type == "function_call_output" and call_id not in seen_call_ids:
+            orphaned_ids.append(call_id)
+    return orphaned_ids
+
+
+def _call_ids(items: list[Any], item_type: str) -> list[str]:
+    return [
+        call_id
+        for item in items
+        if _history_field(item, "type") == item_type and isinstance((call_id := _history_field(item, "call_id")), str)
+    ]
+
+
+def test_aggressive_prune_drops_orphan_from_eight_pair_repro() -> None:
+    pruned = aggressive_prune(_tool_history(8))
+
+    assert _orphaned_tool_result_ids(pruned) == []
+    assert _call_ids(pruned, "function_call") == ["call_5", "call_6", "call_7"]
+    assert _call_ids(pruned, "function_call_output") == ["call_5", "call_6", "call_7"]
+
+
+@pytest.mark.parametrize("pair_count", [1, 2, 4, 8, 10])
+@pytest.mark.parametrize("tail_size", range(1, 21))
+@pytest.mark.parametrize("interleave_screenshots", [False, True])
+@pytest.mark.parametrize("attr_style", [False, True])
+def test_aggressive_prune_never_keeps_orphaned_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+    pair_count: int,
+    tail_size: int,
+    interleave_screenshots: bool,
+    attr_style: bool,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement._AGGRESSIVE_PRUNE_TAIL", tail_size)
+    history = _tool_history(
+        pair_count,
+        interleave_screenshots=interleave_screenshots,
+        attr_style=attr_style,
+    )
+    original = deepcopy(history)
+
+    pruned = aggressive_prune(history)
+
+    assert _orphaned_tool_result_ids(pruned) == []
+    assert history == original
+    assert pruned[0] is history[0]
+    assert all(not str(_history_field(item, "content") or "").startswith("[copilot:screenshot]") for item in pruned)
+    retained_indexes = [
+        next(index for index, original_item in enumerate(history) if original_item is item) for item in pruned
+    ]
+    assert retained_indexes == sorted(retained_indexes)
+
+
+def test_aggressive_prune_drops_output_that_precedes_its_call() -> None:
+    opening = {"role": "user", "content": "goal"}
+    output = _fco("call_late", "result")
+    call = _fc("call_late")
+
+    pruned = aggressive_prune([opening, output, call])
+
+    assert pruned == [opening, call]
+
+
+def test_aggressive_prune_logs_content_free_pair_validity_telemetry() -> None:
+    history = _tool_history(8)
+
+    with capture_logs() as logs:
+        aggressive_prune(history)
+
+    event = next(entry for entry in logs if entry["event"] == "copilot_aggressive_prune_pair_validity")
+    assert event["retained_tail"] == [
+        "function_call",
+        "function_call_output",
+        "function_call",
+        "function_call_output",
+        "function_call",
+        "function_call_output",
+    ]
+    assert event["orphaned_output_dropped"] is True
+    assert "call_4" not in json.dumps(event)
+
+
+def test_copilot_config_qa_budget_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", None)
+
+    assert CopilotConfig().token_budget == 90_000
+
+
+def test_copilot_config_uses_typed_qa_budget_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    local_settings = Settings(_env_file=None, ENV="local", WORKFLOW_COPILOT_QA_TOKEN_BUDGET=3_000)
+    assert local_settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET == 3_000
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
+
+    assert CopilotConfig().token_budget == 3_000
+
+
+def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENV", "production")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
+
+    assert CopilotConfig().token_budget == 90_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail_size", range(1, 21))
+@pytest.mark.parametrize("attr_style", [False, True])
+async def test_context_overflow_session_rewrite_stores_pair_valid_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tail_size: int,
+    attr_style: bool,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement._AGGRESSIVE_PRUNE_TAIL", tail_size)
+    session = AsyncMock()
+    session.get_items.return_value = _tool_history(10, interleave_screenshots=True, attr_style=attr_style)
+
+    await _recover_from_context_overflow(session, current_input="continue")
+
+    stored_items = session.add_items.await_args.args[0]
+    assert _orphaned_tool_result_ids(stored_items) == []
+    session.clear_session.assert_awaited_once()
 
 
 def test_recent_outputs_preserved_full() -> None:
