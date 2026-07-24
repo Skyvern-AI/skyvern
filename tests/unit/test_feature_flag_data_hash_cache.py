@@ -88,9 +88,12 @@ async def test_feature_enabled_cached_bypasses_known_kill_switch_flags() -> None
 
     assert "RATE_LIMITING_ENABLED" in FEATURE_FLAG_CACHE_BYPASS_NAMES
     assert provider.enabled_calls == 3
+    # Freshness runs before every cached consult (TTL-gated inside the
+    # provider), so hits also record a cached-mode prepare call.
     assert provider.prepare_calls == [
         ("RATE_LIMITING_ENABLED", False),
         ("RATE_LIMITING_ENABLED", False),
+        ("NOT_A_KILL_SWITCH", True),
         ("NOT_A_KILL_SWITCH", True),
     ]
 
