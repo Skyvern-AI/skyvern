@@ -141,6 +141,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import initialize_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
@@ -193,6 +194,17 @@ COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
 # Cross-process re-resolution is deterministic under stable flag config.
 _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, ttl=86_400)
+
+
+def resolve_engine_selection_for_task(task: Task) -> BrowserEngineSelection | None:
+    """The logical run's pinned browser engine, resolved from its live browser state.
+
+    Threaded into ``IncrementalScrapePage`` so its wait-until-finished retry classifies driver-native
+    analysis timeouts against THIS run's selected engine. Returns None when no browser state is
+    registered for the run, which keeps the stock Playwright timeout identity (unchanged default).
+    """
+    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+    return browser_state.engine_selection if browser_state is not None else None
 
 
 class _CollapseGateResult(NamedTuple):
@@ -539,7 +551,9 @@ async def _reset_autocomplete_for_llm_fallback(
     await current_incremental_scraped.stop_listen_dom_increment()
     await skyvern_element.input_clear()
 
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
     await skyvern_element.press_fill(text)
     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fallback_refill")
@@ -3273,7 +3287,9 @@ async def handle_click_action(
         incremental_scraped: IncrementalScrapePage | None = None
         try:
             skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-            incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+            incremental_scraped = IncrementalScrapePage(
+                skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+            )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
@@ -3803,7 +3819,9 @@ async def handle_input_text_action(
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
@@ -4900,7 +4918,9 @@ async def handle_select_option_action(
 
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     is_open = False
     suggested_value: str | None = None
     results: list[ActionResult] = []
@@ -6223,7 +6243,9 @@ async def choose_auto_completion_dropdown(
 
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
     try:
@@ -6768,7 +6790,9 @@ async def discover_and_select_from_full_dropdown(
 
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
-    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    incremental_scraped = IncrementalScrapePage(
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+    )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
     try:

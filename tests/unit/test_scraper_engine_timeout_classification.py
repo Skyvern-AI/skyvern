@@ -10,7 +10,7 @@ hold on an image shipping only stock Playwright.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -104,6 +104,86 @@ async def test_incremental_element_tree_retries_without_wait_after_skyvern_page_
         call(wait_until_finished=False),
     ]
     cleanup_element_tree.assert_awaited_once_with(frame, frame.url, [])
+
+
+def _incremental_page(
+    selection: BrowserEngineSelection | None, side_effect: list
+) -> tuple[scraper.IncrementalScrapePage, AsyncMock]:
+    frame = SimpleNamespace(url="https://example.com")
+    get_incremental_element_tree = AsyncMock(side_effect=side_effect)
+    skyvern_frame = SimpleNamespace(
+        get_frame=lambda: frame,
+        get_incremental_element_tree=get_incremental_element_tree,
+    )
+    page = scraper.IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=selection)  # type: ignore[arg-type]
+    return page, get_incremental_element_tree
+
+
+@pytest.mark.asyncio
+async def test_incremental_tree_retries_once_on_selected_engine_native_timeout() -> None:
+    selection = _selection("engine-a", _EngineAError, _EngineATimeout)
+    page, get_tree = _incremental_page(selection, [_EngineATimeout("deadline exceeded"), ([], [])])
+    result = await page.get_incremental_element_tree(AsyncMock(return_value=[]))
+    assert result == []
+    assert get_tree.await_args_list == [call(wait_until_finished=True), call(wait_until_finished=False)]
+
+
+@pytest.mark.asyncio
+async def test_incremental_tree_does_not_retry_on_foreign_timeout_under_nonplaywright_selection() -> None:
+    selection = _selection("engine-a", _EngineAError, _EngineATimeout)
+    page, get_tree = _incremental_page(selection, [PlaywrightTimeoutError("pw timeout"), ([], [])])
+    with pytest.raises(PlaywrightTimeoutError):
+        await page.get_incremental_element_tree(AsyncMock(return_value=[]))
+    assert get_tree.await_args_list == [call(wait_until_finished=True)]
+
+
+@pytest.mark.asyncio
+async def test_incremental_tree_retries_on_stock_timeout_when_selection_missing() -> None:
+    page, get_tree = _incremental_page(None, [PlaywrightTimeoutError("pw timeout"), ([], [])])
+    result = await page.get_incremental_element_tree(AsyncMock(return_value=[]))
+    assert result == []
+    assert get_tree.await_args_list == [call(wait_until_finished=True), call(wait_until_finished=False)]
+
+
+@pytest.mark.asyncio
+async def test_incremental_tree_retries_on_skyvern_timeout_under_nonplaywright_selection() -> None:
+    selection = _selection("engine-a", _EngineAError, _EngineATimeout)
+    page, get_tree = _incremental_page(
+        selection, [SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page"), ([], [])]
+    )
+    result = await page.get_incremental_element_tree(AsyncMock(return_value=[]))
+    assert result == []
+    assert get_tree.await_args_list == [call(wait_until_finished=True), call(wait_until_finished=False)]
+
+
+@pytest.mark.asyncio
+async def test_incremental_tree_propagates_non_timeout_without_retry() -> None:
+    selection = _selection("engine-a", _EngineAError, _EngineATimeout)
+    page, get_tree = _incremental_page(selection, [ValueError("boom"), ([], [])])
+    with pytest.raises(ValueError):
+        await page.get_incremental_element_tree(AsyncMock(return_value=[]))
+    assert get_tree.await_args_list == [call(wait_until_finished=True)]
+
+
+def test_resolve_engine_selection_for_task_reads_live_browser_state() -> None:
+    from skyvern.forge import app
+    from skyvern.webeye.actions.handler import resolve_engine_selection_for_task
+
+    selection = _selection("engine-a", _EngineAError, _EngineATimeout)
+    task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+    get_for_task = MagicMock(return_value=SimpleNamespace(engine_selection=selection))
+    with patch.object(app.BROWSER_MANAGER, "get_for_task", get_for_task):
+        assert resolve_engine_selection_for_task(task) is selection  # type: ignore[arg-type]
+    get_for_task.assert_called_once_with("tsk_1", workflow_run_id="wr_1")
+
+
+def test_resolve_engine_selection_for_task_returns_none_when_no_browser_state() -> None:
+    from skyvern.forge import app
+    from skyvern.webeye.actions.handler import resolve_engine_selection_for_task
+
+    task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+    with patch.object(app.BROWSER_MANAGER, "get_for_task", MagicMock(return_value=None)):
+        assert resolve_engine_selection_for_task(task) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
