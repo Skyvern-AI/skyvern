@@ -1623,7 +1623,6 @@ class TestVerifiedGoalSatisfiedStop:
         assert result.updated_workflow is workflow
         assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
         assert result.proposal_disposition == "review_tested"
-        assert result.apply_without_review is False
         # No adjudicated outcome evidence: the turn ends but the claim renders
         # built-but-unverified instead of a tested-success claim.
         assert "not independently verified" in result.user_response.lower()
@@ -1678,7 +1677,6 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert result.updated_workflow is workflow
         assert result.proposal_disposition == "review_tested"
-        assert result.apply_without_review is False
         assert "not independently verified" in result.user_response.lower()
         assert result.turn_outcome is not None
         assert result.turn_outcome.terminal_reason == BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON
@@ -2694,11 +2692,10 @@ class TestTranslateToAgentResultGating:
         assert verified_goal_claim_authorized(ctx) is False
         assert agent_result.updated_workflow is workflow
         assert agent_result.proposal_disposition == "review_tested"
-        assert agent_result.apply_without_review is False
         assert agent_result.narrative_payload is not None
         assert agent_result.narrative_payload["verifiedSuccess"] is False
 
-    def test_wip_exit_verified_claim_still_auto_applies_code_only(self) -> None:
+    def test_wip_exit_verified_claim_yields_auto_applicable_proposal_code_only(self) -> None:
         from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 
         workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
@@ -2730,7 +2727,6 @@ class TestTranslateToAgentResultGating:
         assert verified_goal_claim_authorized(ctx) is True
         assert agent_result.updated_workflow is workflow
         assert agent_result.proposal_disposition == "auto_applicable"
-        assert agent_result.apply_without_review is True
 
     def test_output_field_confirmation_question_is_blocked_when_contract_present(self) -> None:
         ctx = _ctx(
@@ -3495,9 +3491,8 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "auto_applicable"
-        assert agent_result.apply_without_review is False
 
-    def test_code_only_verified_build_applies_without_review(self) -> None:
+    def test_code_only_verified_build_yields_auto_applicable_proposal(self) -> None:
         from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 
         wf = SimpleNamespace(name="drafted")
@@ -3525,7 +3520,6 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "auto_applicable"
-        assert agent_result.apply_without_review is True
 
     def test_goal_reached_string_false_is_coerced(self) -> None:
         # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
