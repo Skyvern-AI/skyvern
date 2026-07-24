@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.context import (
     record_approved_credentials_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
     _LOGIN_CREDENTIAL_QUESTION,
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
@@ -543,6 +544,161 @@ async def test_success_website_kind_with_matching_url_keeps_url_credential() -> 
 
     assert policy.credential_input_kind == "website_stored_credential"
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+
+
+@pytest.mark.asyncio
+async def test_website_kind_resolves_sole_url_less_credential() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("saved-login", "cred_urlless")],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_urlless"]
+    assert policy.clarification_question is None
+    assert policy.clarification_reason != "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_website_kind_url_match_wins_over_url_less_credential() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[
+            _cred("portal-cred", "cred_url", tested_url="https://portal.example.com/login"),
+            _cred("saved-login", "cred_urlless"),
+        ],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_website_kind_multiple_url_less_credentials_ask_which_one() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("first-login", "cred_one"), _cred("second-login", "cred_two")],
+    )
+
+    assert policy.requires_user_clarification is True
+    assert policy.clarification_question is not None
+    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
+    assert "first-login" in policy.clarification_question
+    assert "second-login" in policy.clarification_question
+    assert policy.clarification_reason == "credential_name_unresolved"
+    assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
+    assert not policy.resolved_credentials
+
+
+@pytest.mark.asyncio
+async def test_website_kind_multiple_url_matches_keep_disambiguation_reason() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[
+            _cred("first-login", "cred_one", tested_url="https://portal.example.com/login"),
+            _cred("second-login", "cred_two", tested_url="https://portal.example.com/login"),
+        ],
+    )
+
+    assert policy.clarification_question is not None
+    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
+    assert policy.clarification_reason == "credential_name_unresolved"
+    assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "org_credentials",
+    [
+        pytest.param([], id="no_credentials"),
+        pytest.param(
+            [_cred("saved-card", "cred_card", credential_type=CredentialType.CREDIT_CARD)],
+            id="url_less_card_only",
+        ),
+        pytest.param(
+            [
+                _cred(
+                    "saved-card",
+                    "cred_card",
+                    tested_url="https://portal.example.com/login",
+                    credential_type=CredentialType.CREDIT_CARD,
+                )
+            ],
+            id="url_matched_card_only",
+        ),
+    ],
+)
+async def test_website_kind_without_login_credentials_still_blocks(
+    org_credentials: list[SimpleNamespace],
+) -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=org_credentials,
+    )
+
+    assert policy.requires_user_clarification is True
+    assert policy.clarification_question is not None
+    assert "could not find a stored credential" in policy.clarification_question
+    assert not policy.resolved_credentials
+
+
+@pytest.mark.asyncio
+async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message=(
+            "Log into the portal at https://portal.example.com/login with the credential named analytics-login."
+        ),
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[
+            _cred(
+                "saved-card",
+                "cred_card",
+                tested_url="https://portal.example.com/login",
+                credential_type=CredentialType.CREDIT_CARD,
+            ),
+            _cred("analytics-login", "cred_named", tested_url="https://other.example.com/login"),
+        ],
+    )
+
+    assert policy.credential_input_kind == "credential_name"
+    assert policy.credential_refs == ["analytics-login"]
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_named"]
+    assert policy.requires_user_clarification is False
+    assert policy.clarification_question is None
 
 
 @pytest.mark.asyncio
