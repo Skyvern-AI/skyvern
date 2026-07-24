@@ -19,7 +19,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.credential_literal_rebind import rebind_scouted_credential_literals
+from skyvern.forge.sdk.copilot.credential_literal_rebind import (
+    CredentialRebindResult,
+    rebind_scouted_credential_literals,
+    scouted_credential_targets,
+)
 from skyvern.forge.sdk.copilot.enforcement import _record_code_authoring_guardrail_reject
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -82,8 +86,10 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
     workflow_yaml_value = tool_arguments.get("workflow_yaml")
     workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
 
-    rebound_yaml = _rebind_scouted_credential_literals_in_place(tool_context, tool_arguments, workflow_yaml)
-    effective_yaml = rebound_yaml if rebound_yaml is not None else workflow_yaml
+    rebind_result = _rebind_scouted_credential_literals_in_place(tool_context, tool_arguments, workflow_yaml)
+    applied = rebind_result is not None and rebind_result.changed
+    effective_yaml = rebind_result.workflow_yaml if rebind_result is not None and applied else workflow_yaml
+    _log_credential_authoring_skips(tool_context, rebind_result)
 
     verdict = evaluate_output_policy(
         request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
@@ -95,9 +101,37 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
         surface="tool_input",
         tool_name=getattr(tool_context, "tool_name", None),
     )
+    residual_selectors = rebind_result.residual_selectors if rebind_result is not None else ()
+    if verdict.allowed and residual_selectors:
+        # A scouted credential selector still holds a non-parameter value the rebind could not neutralize,
+        # and the output-policy scan does not catch every such shape. Fail closed rather than persist it.
+        trace_data = {
+            **trace_data,
+            "allowed": False,
+            "residual_raw_credential_fill_selectors": list(residual_selectors),
+        }
+        LOG.info("copilot output policy credential residual raw fill fail-closed", **trace_data)
+        error = (
+            "A credential value could not be safely bound to a workflow parameter for selector(s) "
+            f"{', '.join(residual_selectors)}. Fill these fields with `<credential_key>.username` / "
+            "`<credential_key>.password` (or `await <credential_key>.otp()`) rather than an inline value."
+        )
+        tool_name = getattr(tool_context, "tool_name", None)
+        if isinstance(tool_name, str) and tool_name:
+            record_consecutive_tool_result_boundary_for_ctx(
+                getattr(tool_context, "context", None),
+                tool_name,
+                {"ok": False, "error": error},
+                arguments=tool_arguments,
+            )
+        return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
     if verdict.allowed:
-        if rebound_yaml is not None:
-            trace_data = {**trace_data, "credential_literals_rebound": True}
+        if applied and rebind_result is not None:
+            trace_data = {
+                **trace_data,
+                "credential_literals_rebound": True,
+                "authored_credential_fills": [list(pair) for pair in rebind_result.authored],
+            }
             LOG.info("copilot output policy rebound scouted credential literals", **trace_data)
         else:
             LOG.info("copilot output policy tool guardrail verdict", **trace_data)
@@ -119,22 +153,21 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
 
 def _rebind_scouted_credential_literals_in_place(
     tool_context: Any, tool_arguments: dict[str, Any], workflow_yaml: str | None
-) -> str | None:
-    """Rewrite scouted credential literals to parameter access before the output policy runs. A
-    non-deferred function tool (as update_workflow is today) is invoked by the SDK from
-    ``tool_context.tool_call.arguments``, so the rebound YAML must be written there and into
-    ``tool_arguments``; returns None (leaving the original YAML for the clamp to fail closed on) when
-    nothing was rebound, no tool_call is present, or the write-back fails."""
+) -> CredentialRebindResult | None:
+    """Rewrite scouted credential literals to parameter access and author missing sanctioned credential
+    fills into ``tool_context.tool_call.arguments`` before the output policy runs. Returns the full result
+    (None only without an ``AgentContext``); a changed result is downgraded to ``changed=False`` when no
+    tool_call is present or the write-back fails, so the clamp fails closed while skips still surface."""
     ctx = getattr(tool_context, "context", None)
     if not isinstance(ctx, AgentContext):
         return None
     result = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
     if not result.changed:
-        return None
+        return result
     tool_call = getattr(tool_context, "tool_call", None)
     if tool_call is None:
         LOG.warning("copilot rebound credential yaml has no tool_call to persist through; failing closed")
-        return None
+        return _unapplied_rebind_result(result, workflow_yaml)
     tool_arguments["workflow_yaml"] = result.workflow_yaml
     try:
         rebound_arguments = json.dumps(tool_arguments)
@@ -143,8 +176,36 @@ def _rebind_scouted_credential_literals_in_place(
     except (AttributeError, TypeError, ValueError):
         LOG.warning("copilot rebound credential yaml could not be written back to tool arguments")
         tool_arguments["workflow_yaml"] = workflow_yaml
-        return None
-    return result.workflow_yaml
+        return _unapplied_rebind_result(result, workflow_yaml)
+    return result
+
+
+def _unapplied_rebind_result(result: CredentialRebindResult, workflow_yaml: str | None) -> CredentialRebindResult:
+    return CredentialRebindResult(
+        workflow_yaml=workflow_yaml or "",
+        changed=False,
+        rebound=(),
+        skips=result.skips,
+        residual_selectors=result.residual_selectors,
+    )
+
+
+def _log_credential_authoring_skips(tool_context: Any, result: CredentialRebindResult | None) -> None:
+    if result is None or not result.skips:
+        return
+    ctx = getattr(tool_context, "context", None)
+    targets_present = (
+        len(scouted_credential_targets(ctx.scout_trajectory)) if isinstance(ctx, AgentContext) else len(result.skips)
+    )
+    tool_name = getattr(tool_context, "tool_name", None)
+    for skip in result.skips:
+        LOG.info(
+            "copilot output policy credential authoring skipped",
+            tool_name=tool_name,
+            stage=skip.stage,
+            selector=skip.selector,
+            targets_present=targets_present,
+        )
 
 
 def _record_output_policy_guardrail_churn(

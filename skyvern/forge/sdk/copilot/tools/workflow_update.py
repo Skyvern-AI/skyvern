@@ -10,7 +10,6 @@ import re
 import textwrap
 import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -86,7 +85,6 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _CODE_SUBMIT_ACTION_RE,
-    _CREDENTIAL_FIELDS,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
@@ -111,6 +109,11 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _selector_refines,
     artifact_dependency_id,
     artifact_observation_ref_id,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    block_has_unguarded_credential_fill as _block_has_unguarded_credential_fill,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_input_templated_locator,
     build_same_month_file_match_locator,
     credential_scout_gap,
@@ -138,6 +141,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     uncovered_rung_records,
     validated_dynamic_row_period_matches,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
@@ -10328,74 +10332,6 @@ def _workflow_credential_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
     return keys
 
 
-def _credential_field_fill_argument(arg: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
-    if (
-        isinstance(arg, ast.Attribute)
-        and arg.attr in _CREDENTIAL_FIELDS
-        and isinstance(arg.value, ast.Name)
-        and arg.value.id in credential_parameter_keys
-    ):
-        return True
-    target = arg.value if isinstance(arg, ast.Await) else arg
-    return (
-        isinstance(target, ast.Call)
-        and isinstance(target.func, ast.Attribute)
-        and target.func.attr == "otp"
-        and isinstance(target.func.value, ast.Name)
-        and target.func.value.id in credential_parameter_keys
-    )
-
-
-def _is_credential_field_fill_call(node: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "fill"
-        and bool(node.args)
-        and _credential_field_fill_argument(node.args[0], credential_parameter_keys)
-    )
-
-
-def _is_presence_guard_test(test: ast.AST) -> bool:
-    for node in ast.walk(test):
-        if isinstance(node, ast.Attribute) and node.attr in {"count", "is_visible"}:
-            return True
-        if isinstance(node, ast.Name) and node.id in _INTERNAL_SCOUT_VARS:
-            return True
-    return False
-
-
-def _credential_fill_is_presence_guarded(node: ast.AST, parents: Mapping[int, ast.AST]) -> bool:
-    current: ast.AST = node
-    while id(current) in parents:
-        parent = parents[id(current)]
-        if (
-            isinstance(parent, ast.If)
-            and any(current is stmt for stmt in parent.body)
-            and _is_presence_guard_test(parent.test)
-        ):
-            return True
-        current = parent
-    return False
-
-
-def _block_has_unguarded_credential_fill(code: str, credential_parameter_keys: AbstractSet[str]) -> bool:
-    if not credential_parameter_keys:
-        return False
-    tree = _wrapped_code_ast(code)
-    if tree is None:
-        return False
-    parents: dict[int, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[id(child)] = node
-    return any(
-        _is_credential_field_fill_call(node, credential_parameter_keys)
-        and not _credential_fill_is_presence_guarded(node, parents)
-        for node in ast.walk(tree)
-    )
-
-
 def _freehand_surface_reject(
     workflow_yaml: str, code_blocks: list[dict[str, Any]], validation: _BrowserSurfaceValidation
 ) -> _SynthesizedCodeImpositionResult:
@@ -10589,16 +10525,6 @@ def _is_submitted_code_synthesized_only(submitted_code: str, synthesized_code: s
     submitted = textwrap.dedent(submitted_code).strip()
     synthesized = textwrap.dedent(synthesized_code).strip()
     return bool(submitted and synthesized and submitted == synthesized)
-
-
-def _wrapped_code_ast(code: str) -> ast.AST | None:
-    body = "\n".join(f"    {line}" for line in code.splitlines())
-    if not body.strip():
-        body = "    pass"
-    try:
-        return ast.parse(f"async def __submitted_code__():\n{body}\n")
-    except SyntaxError:
-        return None
 
 
 def _is_page_locator_expression(value: ast.AST) -> bool:

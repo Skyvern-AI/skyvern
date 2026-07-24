@@ -74,6 +74,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_extraction_suffix,
     templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
+    uncovered_rung_records,
     witness_prelude_lines,
 )
 from skyvern.forge.sdk.copilot.context import (
@@ -91,7 +92,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTar
 from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction, _with_trajectory_anchor
-from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
+from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors, _scouted_spine_omission_digest
 from skyvern.forge.sdk.workflow.exceptions import CustomizedCodeException
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 
@@ -2774,6 +2775,19 @@ class TestCredentialFillSynthesis:
     def test_runtime_otp_fill_is_detected_as_credential_fill_code(self) -> None:
         assert code_contains_credential_fill('await page.locator("#otp").fill(await login_credential.otp())')
 
+    def test_demonstrated_totp_is_a_required_rung_flagged_when_a_draft_omits_it(self) -> None:
+        trajectory = [
+            self._credential_fill(),
+            self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        emitted = result.diagnostics.emitted_interactions
+        assert all(not str(record.get("lane") or "") for record in emitted)
+        draft_omitting_totp = [("fill", 'page.locator("#userName")')]
+        uncovered = uncovered_required_emitted_interactions(emitted, draft_omitting_totp)
+        assert [record.get("selector") for record in uncovered] == ["#totpCode"]
+
     def test_missing_credential_reference_is_dropped_with_note(self) -> None:
         result = synthesize_code_block(
             [
@@ -3937,6 +3951,33 @@ class TestSpinePartitionFindings:
         draft_calls = _covering_draft_calls(result.diagnostics)
         assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
 
+    def test_omitted_demonstrated_totp_fill_is_an_uncovered_rung_finding(self) -> None:
+        login_url = "https://example.com/login"
+        trajectory = [
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#userName",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="username",
+                typed_length=20,
+            ),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#totpCode",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="totp",
+                typed_length=6,
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = [("fill", 'page.locator("#userName")')]
+        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
+        uncovered = uncovered_rung_records(findings)
+        assert [record.get("selector") for record in uncovered] == ["#totpCode"]
+
     def test_unforgiven_drop_is_a_typed_finding(self) -> None:
         trajectory = [
             {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
@@ -4766,6 +4807,9 @@ class _FakeLocator:
         return self._page.counts.get(self._selector, 0)
 
     async def wait_for(self, *, state: str, timeout: float | None = None) -> None:
+        if self._page.goto_done and self._selector in self._page.appears_after_goto:
+            self._page.counts.update(self._page.appears_after_goto)
+            return
         if self._page.counts.get(self._selector, 0) < 1:
             raise TimeoutError(f"{self._selector} not visible")
 
@@ -4784,18 +4828,21 @@ class _FakeLocator:
 
 
 class _FakePage:
-    def __init__(self, counts: dict[str, int]) -> None:
+    def __init__(self, counts: dict[str, int], appears_after_goto: dict[str, int] | None = None) -> None:
         self.counts = counts
         self.filled: list[str] = []
         self.clicked: list[str] = []
         self.pressed: list[tuple[str, str]] = []
         self.goto_calls: list[str] = []
+        self.appears_after_goto = appears_after_goto or {}
+        self.goto_done = False
 
     def locator(self, selector: str) -> _FakeLocator:
         return _FakeLocator(self, selector)
 
     async def goto(self, url: str, *, wait_until: str | None = None) -> None:
         self.goto_calls.append(url)
+        self.goto_done = True
 
     async def wait_for_load_state(self, state: str) -> None:
         return None
@@ -4872,6 +4919,18 @@ class TestLoginOnlyPresenceGuardSynthesis:
         assert page.filled == []
         assert page.clicked == []
 
+    def test_login_field_rendered_after_goto_is_filled_not_skipped(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({}, appears_after_goto={"#username": 1, "#password": 1, "#login-btn": 1})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == ["#username", "#password"]
+        assert page.clicked == ["#login-btn"]
+        assert page.goto_calls == ["https://example.com/login"]
+
 
 class TestSharedSubmitPredicate:
     def test_click_and_enter_are_submits_but_tab_is_not(self) -> None:
@@ -4944,3 +5003,23 @@ def test_type_text_secret_bypass_is_not_carried_into_synthesized_block() -> None
     assert _INLINE_SECRET_SENTINEL not in result.code
     credential_param = next(param for param in result.parameters if param.get("credential_id") == "cred_x")
     assert f"{credential_param['key']}.username" in result.code
+
+
+class TestScoutedSpineOmissionDigest:
+    @staticmethod
+    def _record(selector: str, index: int = 1) -> dict[str, Any]:
+        return {"tool_name": "click", "method": "click", "selector": selector, "trajectory_index": index}
+
+    def test_identical_omissions_share_a_digest_regardless_of_order(self) -> None:
+        forward = _scouted_spine_omission_digest([self._record("#a", 1), self._record("#b", 2)])
+        reversed_order = _scouted_spine_omission_digest([self._record("#b", 2), self._record("#a", 1)])
+        assert forward == reversed_order
+
+    def test_distinct_omissions_produce_distinct_digests(self) -> None:
+        assert _scouted_spine_omission_digest([self._record("#a")]) != _scouted_spine_omission_digest(
+            [self._record("#b")]
+        )
+
+    def test_digest_is_cross_process_stable_sha256_not_salted_hash(self) -> None:
+        digest = _scouted_spine_omission_digest([self._record("#search-submit", 0)])
+        assert digest == "8065b147a155c4e35cab8b3b35da9beab958cddc9c355b6200bac957878954ec"
