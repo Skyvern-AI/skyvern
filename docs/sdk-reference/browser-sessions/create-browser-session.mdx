@@ -15,12 +15,18 @@ Spin up a new cloud browser session.
 
 <CodeGroup>
 ```python Python
-session = await client.create_browser_session(timeout=60)
+session = await client.create_browser_session(
+    url="https://example.com",
+    timeout=60,
+)
 print(session.browser_session_id)  # pbs_abc123
 ```
 
 ```typescript TypeScript
-const session = await skyvern.createBrowserSession({ timeout: 60 });
+const session = await skyvern.createBrowserSession({
+  url: "https://example.com",
+  timeout: 60,
+});
 console.log(session.browser_session_id); // pbs_abc123
 ```
 </CodeGroup>
@@ -29,6 +35,7 @@ console.log(session.browser_session_id); // pbs_abc123
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `url` | `str` | No | `None` | Optional URL to open when the standalone browser session starts. Omit to start from a blank page. |
 | `timeout` | `int` | No | `60` | Session timeout in minutes (5–1440). Timer starts after the session is ready. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
 | `extensions` | `list[Extensions]` | No | `None` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
