@@ -195,6 +195,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                engine_selection=self.engine_selection,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -36,6 +37,9 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
+
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
 
@@ -75,19 +79,25 @@ async def build_scraping_failed_reason(
     return f"{base} URL: {safe_requested}."
 
 
-def _scrape_timed_out(browser_state: BrowserState, error: BaseException) -> bool:
-    """Whether ``error`` is a page-analysis timeout from THIS run's selected browser engine.
+def _is_page_analysis_timeout(engine_selection: "BrowserEngineSelection | None", error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout attributable to THIS run's selected browser engine.
 
-    Uses the per-run engine selection's timeout family so a run pinned to a non-Playwright engine
-    still routes its native timeouts to PAGE_LOAD_TIMEOUT; falls back to the stock Playwright
-    timeout identity for states built outside the per-run engine seam (``engine_selection`` is None).
+    The Skyvern-owned analyzer deadline (``SkyvernPageAnalysisTimeout``) is always a page-analysis
+    timeout; otherwise the driver-native decision routes through the per-run engine selection so a run
+    pinned to a non-Playwright engine recognizes its native timeout while a foreign driver's timeout is
+    rejected. Falls back to the stock Playwright timeout identity when no engine is pinned (callers or
+    states built outside the per-run engine seam).
     """
     if isinstance(error, SkyvernPageAnalysisTimeout):
         return True
-    selection = browser_state.engine_selection
-    if selection is not None:
-        return selection.is_engine_timeout_error(error)
+    if engine_selection is not None:
+        return engine_selection.is_engine_timeout_error(error)
     return isinstance(error, TimeoutError)
+
+
+def _scrape_timed_out(browser_state: BrowserState, error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout from THIS run's selected browser engine."""
+    return _is_page_analysis_timeout(browser_state.engine_selection, error)
 
 
 RESERVED_ATTRIBUTES = {
@@ -727,13 +737,20 @@ async def get_interactable_element_tree(
 
 
 class IncrementalScrapePage(ElementTreeBuilder):
-    def __init__(self, skyvern_frame: SkyvernFrame) -> None:
+    def __init__(
+        self,
+        skyvern_frame: SkyvernFrame,
+        engine_selection: "BrowserEngineSelection | None" = None,
+    ) -> None:
         self.id_to_element_dict: dict[str, dict] = dict()
         self.id_to_css_dict: dict[str, str] = dict()
         self.elements: list[dict] = list()
         self.element_tree: list[dict] = list()
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
+        # The logical run's pinned engine, so the wait-until-finished retry recognizes THIS engine's
+        # native analysis timeout; None (default) preserves the stock Playwright timeout identity.
+        self.engine_selection = engine_selection
         self.last_used_element_tree_html: str | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
@@ -756,7 +773,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
             incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
                 wait_until_finished=True
             )
-        except (TimeoutError, SkyvernPageAnalysisTimeout):
+        except Exception as e:
+            if not _is_page_analysis_timeout(self.engine_selection, e):
+                raise
             LOG.warning(
                 "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
             )
