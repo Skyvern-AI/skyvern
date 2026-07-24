@@ -766,6 +766,16 @@ class AgentFunction:
             headers.setdefault(key, value)
         return headers
 
+    async def resolve_browser_session_connect_url(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        browser_address: str | None,
+        upstream_cdp_url: str | None,
+    ) -> str | None:
+        return browser_address
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 

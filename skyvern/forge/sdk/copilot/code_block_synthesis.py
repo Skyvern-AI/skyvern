@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import hmac
 import io
 import json
 import keyword
@@ -25,7 +24,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
     SameMonthFileMatchTransform,
@@ -68,8 +66,6 @@ _READONLY_DEFERRED_VAR = "_scout_readonly_actual"
 _MONTH_HELPER_VAR = "_scout_month_to_iso"
 _ISO_DATE_HELPER_VAR = "_scout_iso_date_to_year_month"
 _PERIOD_DATE_PATTERN_HELPER_VAR = "_scout_period_date_pattern"
-_DYNAMIC_ROW_EVIDENCE_FINGERPRINT_DOMAIN = b"skyvern.copilot.dynamic_row_evidence.v1"
-_DYNAMIC_ROW_EVIDENCE_SCRYPT_N = 1 << 14
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
@@ -861,7 +857,6 @@ def dynamic_row_evidence_fingerprint(
     period_matches: Sequence[Mapping[str, Any]],
     selected_index: int,
 ) -> str:
-    """Return a keyed integrity tag for potentially sensitive captured row evidence."""
     payload = {
         "source_url": source_url,
         "target_selector": target_selector,
@@ -872,15 +867,7 @@ def dynamic_row_evidence_fingerprint(
         "period_matches": [dict(item) for item in period_matches],
         "selected_index": selected_index,
     }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.scrypt(
-        serialized,
-        salt=_DYNAMIC_ROW_EVIDENCE_FINGERPRINT_DOMAIN + b"\x00" + settings.SECRET_KEY.encode(),
-        n=_DYNAMIC_ROW_EVIDENCE_SCRYPT_N,
-        r=8,
-        p=1,
-        dklen=32,
-    ).hex()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDynamicRowEvidence | None:
@@ -928,18 +915,16 @@ def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDy
         or selected_index < 0
         or selected_index >= row_selector_count
         or not isinstance(evidence_fingerprint, str)
-        or not hmac.compare_digest(
-            evidence_fingerprint,
-            dynamic_row_evidence_fingerprint(
-                source_url=source_url,
-                target_selector=selector,
-                row_selector=row_selector.strip(),
-                row_text=" ".join(row_text.split()),
-                row_selector_count=row_selector_count,
-                row_text_match_count=row_text_match_count,
-                period_matches=period_matches,
-                selected_index=selected_index,
-            ),
+        or evidence_fingerprint
+        != dynamic_row_evidence_fingerprint(
+            source_url=source_url,
+            target_selector=selector,
+            row_selector=row_selector.strip(),
+            row_text=" ".join(row_text.split()),
+            row_selector_count=row_selector_count,
+            row_text_match_count=row_text_match_count,
+            period_matches=period_matches,
+            selected_index=selected_index,
         )
     ):
         return None
