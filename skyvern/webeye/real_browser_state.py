@@ -29,7 +29,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
+from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_video_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
@@ -144,17 +144,20 @@ class RealBrowserState(BrowserState):
         video = page.video
         if not video:
             return
+        page_origin = "unknown"
         try:
-            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
-                path = str(await video.path())
+            page_origin = urlparse(page.url).hostname or "unknown"
         except Exception:
+            pass
+        try:
+            path = await resolve_video_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
+        except Exception:
+            LOG.warning("Could not get video path to discard orphaned artifact", page_origin=page_origin, exc_info=True)
+            return
+        if path is None:
             # Best-effort: leave the artifact registered rather than raising — the
             # near-empty video is uploaded as-is instead of silently disappearing.
-            try:
-                page_origin = urlparse(page.url).hostname or "unknown"
-            except Exception:
-                page_origin = "unknown"
-            LOG.warning("Could not get video path to discard orphaned artifact", page_origin=page_origin, exc_info=True)
+            LOG.warning("Could not get video path to discard orphaned artifact", page_origin=page_origin)
             return
         video_artifacts = self.browser_artifacts.video_artifacts
         filtered = [va for va in video_artifacts if va.video_path != path]

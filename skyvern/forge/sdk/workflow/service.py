@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import random
+import sys
 import textwrap
 import time
 import uuid
@@ -213,6 +214,13 @@ POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
 
 # Bound pre-finalization write-back so a stuck profile upload cannot leave the run in a non-terminal state.
 BROWSER_SESSION_WRITE_BACK_TIMEOUT = SAVE_DOWNLOADED_FILES_TIMEOUT
+
+# Failure reason stamped when execute_workflow's body is interrupted before it captures a terminal
+# intent (pre_finally_status stays None)
+WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON = (
+    "Workflow run was interrupted before completion (worker eviction or in-process cancellation); "
+    "finalized as failed by execute_workflow's in-band cleanup."
+)
 
 # Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
 # run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
@@ -2753,10 +2761,14 @@ class WorkflowService:
                 )
 
             if max_elapsed_timeout_seconds <= 0:
+                # Capture the terminal intent so the finally's interrupted-body backstop
+                # doesn't treat this deliberate return as an interruption.
+                pre_finally_failure_reason = _require_elapsed_timeout_failure_reason(timeout_failure_reason)
                 workflow_run = await self.mark_workflow_run_as_timed_out(
                     workflow_run_id=workflow_run_id,
-                    failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
+                    failure_reason=pre_finally_failure_reason,
                 )
+                pre_finally_status = WorkflowRunStatus.timed_out
                 return workflow_run
             else:
                 timeout_context = asyncio.timeout(max_elapsed_timeout_seconds)
@@ -2766,10 +2778,12 @@ class WorkflowService:
                 except TimeoutError:
                     if not timeout_context.expired():
                         raise
+                    pre_finally_failure_reason = _require_elapsed_timeout_failure_reason(timeout_failure_reason)
                     workflow_run = await self.mark_workflow_run_as_timed_out(
                         workflow_run_id=workflow_run_id,
-                        failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
+                        failure_reason=pre_finally_failure_reason,
                     )
+                    pre_finally_status = WorkflowRunStatus.timed_out
                     return workflow_run
 
             post_run_timeout_seconds = _get_workflow_run_max_elapsed_timeout_seconds(workflow_run)
@@ -2980,6 +2994,41 @@ class WorkflowService:
                     # block and skip ``clean_up_workflow`` below.
                     LOG.warning(
                         "Finalize failed during execute_workflow cleanup",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+            elif isinstance(sys.exc_info()[1], asyncio.CancelledError):
+                # Cancellation ownership is decided at the activity layer: server-driven
+                # cancellations (timeout/cancel/pause/reset) have their own finalizers with
+                # concrete statuses, and the interrupted-activity backstop covers the rest
+                # with cancellation-details discrimination and an INFRASTRUCTURE_ERROR
+                # category. Finalizing here would race all of them with a generic failed.
+                LOG.info(
+                    "Skipping interrupted-run finalize for cancellation; owned at the activity layer",
+                    workflow_run_id=workflow_run_id,
+                )
+            else:
+                try:
+                    finalize_task = asyncio.ensure_future(
+                        self.mark_workflow_run_as_failed_if_not_final(
+                            workflow_run_id=workflow_run_id,
+                            failure_reason=WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON,
+                            cascade_children=True,
+                        )
+                    )
+                    while not finalize_task.done():
+                        try:
+                            await asyncio.shield(finalize_task)
+                        except asyncio.CancelledError:
+                            continue
+                    finalized = finalize_task.result()
+                    if finalized is not None:
+                        workflow_run = finalized
+                    else:
+                        workflow_run = await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
+                except BaseException:
+                    LOG.warning(
+                        "Failed to finalize interrupted workflow run during cleanup",
                         workflow_run_id=workflow_run_id,
                         exc_info=True,
                     )
@@ -6282,6 +6331,31 @@ class WorkflowService:
             ai_fallback=ai_fallback,
             failure_category=failure_category,
         )
+        await self._after_workflow_run_status_write(workflow_run, status)
+        return workflow_run
+
+    async def _update_workflow_run_status_if_not_final(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        failure_reason: str | None = None,
+        failure_category: list[dict] | None = None,
+    ) -> WorkflowRun | None:
+        """:meth:`_update_workflow_run_status` for writers that must lose a race against the
+        run's own finalizer. Returns ``None`` when the row was already terminal."""
+        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id=workflow_run_id,
+            status=status,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+        )
+        if workflow_run is None:
+            return None
+        await self._after_workflow_run_status_write(workflow_run, status)
+        return workflow_run
+
+    async def _after_workflow_run_status_write(self, workflow_run: WorkflowRun, status: WorkflowRunStatus) -> None:
+        workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
             # Free extraction-cache entries for this run.
             extraction_cache.clear_workflow_run(workflow_run_id)
@@ -6322,8 +6396,6 @@ class WorkflowService:
         )
         self._background_tasks.add(bg)
         bg.add_done_callback(self._background_tasks.discard)
-
-        return workflow_run
 
     async def _sync_task_run_from_workflow_run(
         self,
@@ -6386,6 +6458,11 @@ class WorkflowService:
         """
         Set final workflow run status based on pre-finally state.
         Called unconditionally to ensure unified flow.
+
+        Terminal writes are conditional: an out-of-band finalizer (the interrupted-activity
+        backstop) may have already terminalized the run and cascaded its children, and this
+        shielded write can land after the activity's own cancellation — an unconditional
+        write here would restore the parent while the children stay failed.
         """
         if pre_finally_status not in (
             WorkflowRunStatus.canceled,
@@ -6393,19 +6470,44 @@ class WorkflowService:
             WorkflowRunStatus.terminated,
             WorkflowRunStatus.timed_out,
         ):
-            return await self.mark_workflow_run_as_completed(workflow_run_id)
+            updated = await self._update_workflow_run_status_if_not_final(
+                workflow_run_id=workflow_run_id,
+                status=WorkflowRunStatus.completed,
+            )
+            if updated is not None:
+                otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.completed)
+                return updated
+            return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
 
         if workflow_run.status == WorkflowRunStatus.running:
-            workflow_run = await self._update_workflow_run_status(
+            updated = await self._update_workflow_run_status_if_not_final(
                 workflow_run_id=workflow_run_id,
                 status=pre_finally_status,
                 failure_reason=pre_finally_failure_reason,
             )
+            if updated is None:
+                return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
             if pre_finally_status == WorkflowRunStatus.timed_out:
                 await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
-            return workflow_run
+            return updated
 
         return workflow_run
+
+    async def _current_row_after_lost_finalize(self, workflow_run_id: str, fallback: WorkflowRun) -> WorkflowRun:
+        LOG.info(
+            "In-band finalize lost to an out-of-band finalizer; leaving terminal status intact",
+            workflow_run_id=workflow_run_id,
+        )
+        try:
+            current = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+        except Exception:
+            LOG.warning(
+                "Failed to re-read workflow run after lost finalize; using in-memory row",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            return fallback
+        return current or fallback
 
     async def mark_workflow_run_as_failed(
         self,
@@ -6413,6 +6515,7 @@ class WorkflowService:
         failure_reason: str | None,
         run_with: str | None = None,
         failure_category: list[dict] | None = None,
+        cascade_children: bool = False,
     ) -> WorkflowRun:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as failed",
@@ -6445,6 +6548,52 @@ class WorkflowService:
             run_with=run_with,
             failure_category=failure_category,
         )
+        if cascade_children:
+            # Opt-in: run-level failures normally leave child rows to their own executors,
+            # but out-of-band finalization (an interrupted worker) has no executor left to do it.
+            try:
+                await self._do_cascade_child_entities(workflow_run_id, WorkflowRunStatus.failed)
+            except Exception:
+                LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
+        return workflow_run
+
+    async def mark_workflow_run_as_failed_if_not_final(
+        self,
+        workflow_run_id: str,
+        failure_reason: str | None,
+        failure_category: list[dict] | None = None,
+        cascade_children: bool = False,
+    ) -> WorkflowRun | None:
+        """Conditional failure finalize that no-ops when the run has already reached a terminal
+        state. Out-of-band finalizers (the interrupted-activity backstop) run concurrently with
+        ``execute_workflow``'s shielded ``_finalize_workflow_run_status`` write, so a
+        read-then-write would clobber a real ``completed``/``timed_out`` status with ``failed``.
+        Children cascade only on the transition this call actually won.
+        """
+        if failure_category is None:
+            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+
+        workflow_run = await self._update_workflow_run_status_if_not_final(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.failed,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+        )
+        if workflow_run is None:
+            return None
+
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.failed)
+        LOG.info(
+            f"Marked workflow run {workflow_run_id} as failed (conditional)",
+            workflow_run_id=workflow_run_id,
+            workflow_status="failed",
+            failure_category=failure_category,
+        )
+        if cascade_children:
+            try:
+                await self._do_cascade_child_entities(workflow_run_id, WorkflowRunStatus.failed)
+            except Exception:
+                LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
         return workflow_run
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
