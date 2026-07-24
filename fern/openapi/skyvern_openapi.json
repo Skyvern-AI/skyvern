@@ -2499,6 +2499,59 @@
         "x-fern-sdk-method-name": "batch_get_run_tags_post"
       }
     },
+    "/v1/run-tag-suggestions": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List run tag suggestions",
+        "description": "List distinct (key, value) pairs ever set on a run for the organization, sourced from the run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys (which are never registered) so pickers can offer them alongside user-defined tags.",
+        "operationId": "get_run_tag_suggestions_v1_run_tag_suggestions_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run tag suggestions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagSuggestionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tag_suggestions"
+      }
+    },
     "/v1/artifacts/{artifact_id}/content": {
       "get": {
         "tags": [
@@ -2949,6 +3002,34 @@
               ],
               "title": "Run Type"
             }
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
           },
           {
             "name": "x-api-key",
@@ -6391,6 +6472,34 @@
             "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -8507,6 +8616,7 @@
           "recording",
           "audio",
           "session_replay",
+          "eval_score",
           "browser_console_log",
           "skyvern_log",
           "skyvern_log_raw",
@@ -19654,6 +19764,40 @@
           "events"
         ],
         "title": "RunTagHistoryResponse"
+      },
+      "RunTagSuggestionsResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keys",
+            "description": "Distinct grouped tag keys seen on runs."
+          },
+          "values_by_key": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Values By Key",
+            "description": "Values seen for each grouped key."
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Labels",
+            "description": "Distinct standalone (keyless) labels seen on runs."
+          }
+        },
+        "type": "object",
+        "title": "RunTagSuggestionsResponse",
+        "description": "Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs\never set on a run for the org, sourced from the event log rather than the\ntag-key/tag-value registry so reserved ``skyvern.*`` system keys (never\nregistered) reach the pickers too."
       },
       "RunTagsBatchRequest": {
         "properties": {
