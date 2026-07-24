@@ -213,6 +213,7 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
