@@ -779,6 +779,9 @@ class ForLoopBlockYAML(BlockYAML):
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
     data_schema: dict[str, Any] | str | None = None
+    # Task V2-generated loop controls. None/False preserve legacy authored loops.
+    max_loop_items: int | None = None
+    task_v2_loop_replay: bool = False
 
 
 class BranchCriteriaYAML(BaseModel):

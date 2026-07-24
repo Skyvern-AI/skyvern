@@ -76,7 +76,20 @@ Reply in JSON format with the following keys:
   "plan": str, // The mini goal to achieve to move towards the user goal. DO NOT come up or hallucinate any data that's not provided in the user goal. Be accurate and precise. Return null if the user goal has been achieved or if should_terminate is true.
   "task_type": str, // One of the available task types: navigate, extract, loop. Null if user_goal_achieved is true or should_terminate is true.
   "loop_values": list[str], // a list of string values to iterate through for loop task. null if it's not a loop task
-  "is_loop_value_link": bool, // true if the loop_values is a list of urls to go to before for each planning session inside the loop
+  "is_loop_value_link": bool{% if task_v2_loop_contract %}, // true if the loop_values is a list of urls to go to before for each planning session inside the loop
+  "loop_limit": int, // exact requested count when the user specifies one; otherwise null
+  "loop_source": str // "explicit" when values came from the goal, "discovered" when they must be found on the page
+  {% else %} // true if the loop_values is a list of urls to go to before for each planning session inside the loop
+  {% endif %}{% if task_v2_extraction_schema_reuse %},
+  "data_schema": json // extraction schema when task_type is extract; otherwise null
+  {% endif %}{% if task_v2_planning_deduplication %},
+  "loop_body": { // reusable loop-body metadata when task_type is loop; otherwise null
+    "navigation_goal": str,
+    "data_extraction_goal": str,
+    "data_schema": json,
+    "thoughts": str
+  }
+  {% endif %}
 }
 
 User goal:

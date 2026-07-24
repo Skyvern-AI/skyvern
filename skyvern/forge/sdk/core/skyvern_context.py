@@ -104,6 +104,12 @@ class SkyvernContext:
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
     feature_flag_entries: dict[str, bool | str | None] = field(default_factory=dict)
+    # Immutable Task V2 optimization cohort, resolved once when a Task V2 run starts.
+    # A plain mapping avoids coupling the core context module to the service layer.
+    task_v2_optimization_flags: dict[str, bool] | None = None
+    task_v2_loop_replay_active: bool = False
+    task_v2_loop_replay_source_task_id: str | None = None
+    task_v2_loop_replay_current_value: Any = None
 
     # feature flags
     enable_page_ready_wait: bool = False

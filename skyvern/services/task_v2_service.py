@@ -77,6 +77,15 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
+from skyvern.services.task_v2_optimizations import (
+    TaskV2OptimizationFlags,
+    compact_task_history,
+    generated_loop_item_limit,
+    normalize_loop_values,
+    observation_fingerprint,
+    resolve_task_v2_optimization_flags,
+    should_run_completion_check,
+)
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
@@ -557,6 +566,9 @@ async def run_task_v2(
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
         consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
+        task_v2_optimization_flags=(
+            copy.deepcopy(parent_context.task_v2_optimization_flags) if parent_context else None
+        ),
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
@@ -618,15 +630,20 @@ async def run_task_v2(
     return task_v2
 
 
-def _resolve_max_iterations(max_iterations_override: str | int | None) -> int:
-    """Resolve the planner-iteration budget, never below the historical floor.
+def _resolve_max_iterations(max_iterations_override: str | int | None, *, honor_lower_override: bool = False) -> int:
+    """Resolve the planner budget, optionally allowing the ablation to lower it.
 
-    The planner always ran DEFAULT_MAX_ITERATIONS regardless of the block field, so workflows
-    persisted with the old (smaller) default must not regress — floor every value at it.
+    Control behavior retains the historical floor. The optimization cohort honors any
+    positive explicit override so lower iteration budgets can be evaluated safely.
     """
     if max_iterations_override:
         try:
-            return max(int(max_iterations_override), DEFAULT_MAX_ITERATIONS)
+            parsed_override = int(max_iterations_override)
+            if parsed_override <= 0:
+                return DEFAULT_MAX_ITERATIONS
+            if honor_lower_override:
+                return parsed_override
+            return max(parsed_override, DEFAULT_MAX_ITERATIONS)
         except (ValueError, TypeError):
             LOG.info(
                 "max_iterations_override isn't an integer, won't override",
@@ -734,6 +751,8 @@ async def run_task_v2_helper(
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
 
+    optimization_flags = await resolve_task_v2_optimization_flags(context)
+
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
@@ -772,7 +791,13 @@ async def run_task_v2_helper(
     url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
-    max_iterations = _resolve_max_iterations(max_iterations_override)
+    max_iterations = _resolve_max_iterations(
+        max_iterations_override,
+        honor_lower_override=optimization_flags.honor_iteration_override,
+    )
+    reusable_scraped_page: ScrapedPage | None = None
+    previous_progress_fingerprint: str | None = None
+    consecutive_no_progress = 0
 
     # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
@@ -873,11 +898,15 @@ async def run_task_v2_helper(
                 )
         else:
             try:
-                scraped_page = await browser_state.scrape_website(
-                    url=url,
-                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
-                    scrape_exclude=app.scrape_exclude,
-                )
+                if optimization_flags.observation_reuse and reusable_scraped_page is not None:
+                    scraped_page = reusable_scraped_page
+                    reusable_scraped_page = None
+                else:
+                    scraped_page = await browser_state.scrape_website(
+                        url=url,
+                        cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                        scrape_exclude=app.scrape_exclude,
+                    )
                 if page is None:
                     page = await browser_state.get_working_page()
             except Exception:
@@ -898,9 +927,14 @@ async def run_task_v2_helper(
                 "task_v2",
                 current_url=current_url,
                 user_goal=user_prompt,
-                task_history=task_history,
+                task_history=(
+                    compact_task_history(task_history) if optimization_flags.compact_context else task_history
+                ),
                 open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
+                task_v2_loop_contract=optimization_flags.loop_contract,
+                task_v2_planning_deduplication=optimization_flags.planning_deduplication,
+                task_v2_extraction_schema_reuse=optimization_flags.extraction_schema_reuse,
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -935,6 +969,21 @@ async def run_task_v2_helper(
             thoughts: str = task_v2_response.get("thoughts", "")
             plan = task_v2_response.get("plan", "")
             task_type = task_v2_response.get("task_type", "")
+            if optimization_flags.no_progress_breaker and plan and task_type:
+                progress_fingerprint = observation_fingerprint(current_url, scraped_page, plan, task_type)
+                if progress_fingerprint == previous_progress_fingerprint:
+                    consecutive_no_progress += 1
+                else:
+                    previous_progress_fingerprint = progress_fingerprint
+                    consecutive_no_progress = 0
+                if consecutive_no_progress >= 2:
+                    task_v2 = await mark_task_v2_as_failed(
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                        failure_reason="Task made no progress after one recovery attempt.",
+                        organization_id=organization_id,
+                    )
+                    break
             # Create and save task thought
             await app.DATABASE.observer.update_thought(
                 thought_id=thought.observer_thought_id,
@@ -1008,6 +1057,10 @@ async def run_task_v2_helper(
                         scraped_page=scraped_page,
                         data_extraction_goal=plan,
                         task_history=task_history,
+                        data_schema=(
+                            task_v2_response.get("data_schema") if optimization_flags.extraction_schema_reuse else None
+                        ),
+                        max_attempts=2 if optimization_flags.extraction_schema_reuse else 3,
                     )
                     task_history_record = {"type": task_type, "task": plan}
                 except Exception:
@@ -1042,6 +1095,19 @@ async def run_task_v2_helper(
                         browser_state=browser_state,
                         original_url=url,
                         scraped_page=scraped_page,
+                        planner_loop_values=(
+                            task_v2_response.get("loop_values") if optimization_flags.loop_contract else None
+                        ),
+                        planner_is_loop_value_link=(
+                            task_v2_response.get("is_loop_value_link") if optimization_flags.loop_contract else None
+                        ),
+                        requested_loop_limit=(
+                            task_v2_response.get("loop_limit") if optimization_flags.loop_contract else None
+                        ),
+                        planner_loop_body=(
+                            task_v2_response.get("loop_body") if optimization_flags.planning_deduplication else None
+                        ),
+                        optimization_flags=optimization_flags,
                     )
                     task_history_record = {
                         "type": task_type,
@@ -1154,7 +1220,16 @@ async def run_task_v2_helper(
                 organization_id=organization_id,
             )
             break
-        if block_result.success is True:
+        completion_check_due = (
+            not optimization_flags.completion_scheduler
+            or i == max_iterations - 1
+            or should_run_completion_check(
+                iteration=i,
+                task_type=task_type,
+                has_extracted_data=extracted_data is not None,
+            )
+        )
+        if block_result.success is True and completion_check_due:
             completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None
             completion_open_tabs_context: str | None = None
@@ -1171,9 +1246,13 @@ async def run_task_v2_helper(
                     scrape_exclude=app.scrape_exclude,
                 )
                 completion_screenshots = completion_scraped_page.screenshots
+                if optimization_flags.compact_context and i > 0 and task_type != "extract":
+                    completion_screenshots = []
             except Exception:
                 LOG.warning("Failed to scrape the website for task v2 completion check", exc_info=True)
             if completion_scraped_page is not None:
+                if optimization_flags.observation_reuse:
+                    reusable_scraped_page = completion_scraped_page
                 try:
                     completion_open_tabs_context = await build_open_tabs_context(
                         browser_state, await browser_state.get_working_page()
@@ -1185,7 +1264,9 @@ async def run_task_v2_helper(
             task_v2_completion_prompt = prompt_engine.load_prompt(
                 "task_v2_check_completion",
                 user_goal=user_prompt,
-                task_history=task_history,
+                task_history=(
+                    compact_task_history(task_history) if optimization_flags.compact_context else task_history
+                ),
                 open_tabs_context=completion_open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
             )
@@ -1452,7 +1533,13 @@ async def _generate_loop_task(
     browser_state: BrowserState,
     original_url: str,
     scraped_page: ScrapedPage,
+    planner_loop_values: Any = None,
+    planner_is_loop_value_link: bool | None = None,
+    requested_loop_limit: Any = None,
+    planner_loop_body: dict[str, Any] | None = None,
+    optimization_flags: TaskV2OptimizationFlags | None = None,
 ) -> tuple[ForLoopBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES], dict[str, Any], dict[str, Any]]:
+    optimization_flags = optimization_flags or TaskV2OptimizationFlags()
     for_loop_parameter_yaml_list: list[PARAMETER_YAML_TYPES] = []
     loop_value_extraction_goal = prompt_engine.load_prompt(
         "task_v2_loop_task_extraction_goal",
@@ -1496,36 +1583,59 @@ async def _generate_loop_task(
         output_parameter=loop_value_extraction_output_parameter,
     )
 
-    # execute the extraction block
-    extraction_block_result = await extraction_block_for_loop.execute_safe(
-        workflow_run_id=workflow_run_id,
-        organization_id=task_v2.organization_id,
-    )
-    LOG.info("Extraction block result", extraction_block_result=extraction_block_result)
-    if extraction_block_result.success is False:
-        LOG.error(
-            "Failed to execute the extraction block for the loop task",
-            extraction_block_result=extraction_block_result,
+    parameter_value: dict[str, Any]
+    if optimization_flags.loop_contract and isinstance(planner_loop_values, list):
+        output_value_obj = {
+            loop_values_key: planner_loop_values,
+            "is_loop_value_link": bool(planner_is_loop_value_link),
+        }
+        parameter_value = {"extracted_information": output_value_obj}
+    else:
+        extraction_block_result = await extraction_block_for_loop.execute_safe(
+            workflow_run_id=workflow_run_id,
+            organization_id=task_v2.organization_id,
         )
-        # wofklow run and task v2 status update is handled in the upper caller layer
-        raise Exception("extraction_block failed")
-    # validate output parameter
-    try:
-        output_value_obj: dict[str, Any] = extraction_block_result.output_parameter_value.get("extracted_information")  # type: ignore
-        if not output_value_obj or not isinstance(output_value_obj, dict):
-            raise Exception("Invalid output parameter of the extraction block for the loop task")
-        if loop_values_key not in output_value_obj:
-            raise Exception("loop_values_key not found in the output parameter of the extraction block")
-        if "is_loop_value_link" not in output_value_obj:
-            raise Exception("is_loop_value_link not found in the output parameter of the extraction block")
-        loop_values = output_value_obj.get(loop_values_key, [])
-        is_loop_value_link = output_value_obj.get("is_loop_value_link")
-    except Exception:
-        LOG.error(
-            "Failed to validate the output parameter of the extraction block for the loop task",
-            extraction_block_result=extraction_block_result,
+        LOG.info("Extraction block result", extraction_block_result=extraction_block_result)
+        if extraction_block_result.success is False:
+            LOG.error(
+                "Failed to execute the extraction block for the loop task",
+                extraction_block_result=extraction_block_result,
+            )
+            raise RuntimeError("Loop-value extraction failed")
+        try:
+            extracted_parameter_value = extraction_block_result.output_parameter_value
+            if not isinstance(extracted_parameter_value, dict):
+                raise ValueError("Invalid output parameter of the extraction block for the loop task")
+            parameter_value = extracted_parameter_value
+            extracted_information = parameter_value.get("extracted_information")
+            if not extracted_information or not isinstance(extracted_information, dict):
+                raise ValueError("Invalid output parameter of the extraction block for the loop task")
+            output_value_obj = extracted_information
+            if loop_values_key not in output_value_obj:
+                raise ValueError("loop_values_key not found in the output parameter of the extraction block")
+            if "is_loop_value_link" not in output_value_obj:
+                raise ValueError("is_loop_value_link not found in the output parameter of the extraction block")
+        except Exception:
+            LOG.error("Failed to validate loop-value extraction output", exc_info=True)
+            raise
+
+    raw_loop_values = output_value_obj.get(loop_values_key)
+    if optimization_flags.loop_contract or optimization_flags.loop_guardrails:
+        loop_values = normalize_loop_values(
+            raw_loop_values,
+            requested_limit=requested_loop_limit,
+            apply_guardrail=optimization_flags.loop_guardrails,
         )
-        raise
+    elif isinstance(raw_loop_values, list):
+        loop_values = raw_loop_values
+    else:
+        raise ValueError("Task V2 loop values must be a list")
+    if not loop_values:
+        raise ValueError("Task V2 generated an empty loop-value list")
+    output_value_obj[loop_values_key] = loop_values
+    if optimization_flags.loop_contract or optimization_flags.loop_guardrails:
+        parameter_value = {"extracted_information": output_value_obj}
+    is_loop_value_link = output_value_obj.get("is_loop_value_link")
 
     # update the thought
     await app.DATABASE.observer.update_thought(
@@ -1550,7 +1660,7 @@ async def _generate_loop_task(
     await app.WORKFLOW_CONTEXT_MANAGER.set_parameter_values_for_output_parameter_dependent_blocks(
         workflow_run_id=workflow_run_id,
         output_parameter=loop_value_extraction_output_parameter,
-        value=extraction_block_result.output_parameter_value,
+        value=parameter_value,
     )
     url: str | None = None
     task_parameters: list[PARAMETER_TYPE] = []
@@ -1597,13 +1707,20 @@ async def _generate_loop_task(
         thought_type=ThoughtType.internal_plan,
         thought_scenario=ThoughtScenario.generate_task_in_loop,
     )
-    task_in_loop_metadata_response = await _get_task_v2_llm_api_handler(task_v2)(
-        task_in_loop_metadata_prompt,
-        screenshots=scraped_page.screenshots,
-        thought=thought_task_in_loop,
-        prompt_name="task_v2_generate_task_block",
-        system_prompt=task_v2.workflow_system_prompt,
-    )
+    if (
+        optimization_flags.planning_deduplication
+        and isinstance(planner_loop_body, dict)
+        and (planner_loop_body.get("navigation_goal") or planner_loop_body.get("data_extraction_goal"))
+    ):
+        task_in_loop_metadata_response = planner_loop_body
+    else:
+        task_in_loop_metadata_response = await _get_task_v2_llm_api_handler(task_v2)(
+            task_in_loop_metadata_prompt,
+            screenshots=scraped_page.screenshots,
+            thought=thought_task_in_loop,
+            prompt_name="task_v2_generate_task_block",
+            system_prompt=task_v2.workflow_system_prompt,
+        )
     LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
     data_extraction_goal = task_in_loop_metadata_response.get("data_extraction_goal")
@@ -1620,6 +1737,8 @@ async def _generate_loop_task(
             navigation_goal
             + " Optimize for extracting as much data as possible. Complete when most data is seen even if some data is partially missing."
         )
+    continue_on_failure = not optimization_flags.loop_fail_fast
+    max_retries = 1 if optimization_flags.loop_fail_fast else 0
     block_yaml = TaskBlockYAML(
         label=task_in_loop_label,
         url=url,
@@ -1628,7 +1747,8 @@ async def _generate_loop_task(
         data_extraction_goal=data_extraction_goal,
         data_schema=data_extraction_schema,
         parameter_keys=[param.key for param in task_parameters],
-        continue_on_failure=True,
+        continue_on_failure=continue_on_failure,
+        max_retries=max_retries,
         complete_verification=False,
     )
     block_yaml_output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
@@ -1644,7 +1764,8 @@ async def _generate_loop_task(
         data_schema=data_extraction_schema,
         output_parameter=block_yaml_output_parameter,
         parameters=task_parameters,
-        continue_on_failure=True,
+        continue_on_failure=continue_on_failure,
+        max_retries=max_retries,
         complete_verification=False,
     )
 
@@ -1653,6 +1774,10 @@ async def _generate_loop_task(
         label=f"loop_{generate_random_string()}",
         loop_over_parameter_key=loop_for_context_parameter.key,
         loop_blocks=[block_yaml],
+        max_loop_items=(
+            generated_loop_item_limit(requested_loop_limit) if optimization_flags.loop_guardrails else None
+        ),
+        task_v2_loop_replay=optimization_flags.loop_replay,
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -1665,6 +1790,8 @@ async def _generate_loop_task(
             loop_over=loop_for_context_parameter,
             loop_blocks=[task_in_loop_block],
             output_parameter=output_parameter,
+            max_loop_items=for_loop_yaml.max_loop_items,
+            task_v2_loop_replay=for_loop_yaml.task_v2_loop_replay,
         ),
         [extraction_block_yaml, for_loop_yaml],
         for_loop_parameter_yaml_list,
@@ -1686,6 +1813,8 @@ async def _generate_extraction_task(
     scraped_page: ScrapedPage,
     data_extraction_goal: str,
     task_history: list[dict] | None = None,
+    data_schema: dict[str, Any] | list | None = None,
+    max_attempts: int = 3,
 ) -> tuple[ExtractionBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating extraction task", data_extraction_goal=data_extraction_goal, current_url=current_url)
     # extract the data
@@ -1699,35 +1828,37 @@ async def _generate_extraction_task(
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
 
-    max_retries = 3
-    last_exc: Exception | None = None
     generate_extraction_task_response: dict[str, Any] | None = None
-    for attempt in range(max_retries):
-        try:
-            generate_extraction_task_response = await _get_task_v2_llm_api_handler(task_v2)(
-                generate_extraction_task_prompt,
-                task_v2=task_v2,
-                prompt_name="task_v2_generate_extraction_task",
-                organization_id=task_v2.organization_id,
-                system_prompt=task_v2.workflow_system_prompt,
-            )
-            break
-        except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
-            LOG.warning(
-                "Empty or invalid LLM response during extraction task generation, retrying",
-                attempt=attempt + 1,
-                max_attempts=max_retries,
-                error=str(e),
-            )
-            last_exc = e
+    if data_schema is not None:
+        generate_extraction_task_response = {"schema": data_schema}
     else:
-        raise last_exc  # type: ignore[misc]
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                generate_extraction_task_response = await _get_task_v2_llm_api_handler(task_v2)(
+                    generate_extraction_task_prompt,
+                    task_v2=task_v2,
+                    prompt_name="task_v2_generate_extraction_task",
+                    organization_id=task_v2.organization_id,
+                    system_prompt=task_v2.workflow_system_prompt,
+                )
+                break
+            except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
+                LOG.warning(
+                    "Empty or invalid LLM response during extraction task generation, retrying",
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    error=str(e),
+                )
+                last_exc = e
+        else:
+            raise last_exc  # type: ignore[misc]
 
     assert generate_extraction_task_response is not None
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
     # create OutputParameter for the data_extraction block
-    data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
+    resolved_data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
     label = f"data_extraction_{generate_random_string()}"
     url: str | None = None
     if not task_history:
@@ -1736,7 +1867,7 @@ async def _generate_extraction_task(
     extraction_block_yaml = ExtractionBlockYAML(
         label=label,
         data_extraction_goal=data_extraction_goal,
-        data_schema=data_schema,
+        data_schema=resolved_data_schema,
         url=url,
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
@@ -1749,7 +1880,7 @@ async def _generate_extraction_task(
             label=label,
             url=url,
             data_extraction_goal=data_extraction_goal,
-            data_schema=data_schema,
+            data_schema=resolved_data_schema,
             output_parameter=output_parameter,
         ),
         [extraction_block_yaml],
