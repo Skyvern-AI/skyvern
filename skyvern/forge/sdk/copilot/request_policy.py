@@ -4618,6 +4618,7 @@ def _can_defer_unresolved_credential_name_for_draft(
     policy: RequestPolicy,
     *,
     global_llm_context: str,
+    user_message: str,
 ) -> bool:
     if policy.clarification_reason != "credential_name_unresolved":
         return False
@@ -4626,7 +4627,7 @@ def _can_defer_unresolved_credential_name_for_draft(
     # anchoring before the name can enter resolved_credentials and authorize a run.
     if policy.credential_refs:
         return True
-    if _has_resolvable_credential_scope(policy):
+    if _has_resolvable_credential_scope(policy, user_message):
         return True
     if _previous_credential_clarification_was_asked(global_llm_context):
         return True
@@ -4637,13 +4638,14 @@ def _should_defer_repeated_unresolved_credential_question(
     policy: RequestPolicy,
     *,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
+    user_message: str,
 ) -> bool:
     if not _last_assistant_message_was_saved_credential_question(chat_history):
         return False
     return (
         policy.credential_input_kind in ("none", "credential_name")
         and policy.clarification_reason == "credential_name_unresolved"
-        and not _has_resolvable_credential_scope(policy)
+        and not _has_resolvable_credential_scope(policy, user_message)
     )
 
 
@@ -5017,6 +5019,7 @@ async def build_request_policy(
                 and not _can_defer_unresolved_credential_name_for_draft(
                     policy,
                     global_llm_context=global_llm_context,
+                    user_message=user_message,
                 )
             ):
                 policy.requires_user_clarification = True
@@ -5028,6 +5031,7 @@ async def build_request_policy(
     if _should_defer_repeated_unresolved_credential_question(
         policy,
         chat_history=chat_history,
+        user_message=user_message,
     ):
         policy.requires_user_clarification = False
         policy.allow_update_workflow = True
