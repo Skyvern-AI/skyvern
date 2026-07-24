@@ -327,8 +327,8 @@ def _request_policy_allows_untested_code_block_draft(ctx: Any) -> bool:
         and policy.allow_update_workflow
         and not policy.allow_run_blocks
         and policy.testing_intent == "skip_test"
-        and policy.credential_input_kind == "credential_name"
         and policy.allow_missing_credentials_in_draft
+        and policy.credential_draft_deferred_explicitly
     )
 
 

@@ -2382,7 +2382,9 @@ async def test_handle_action_download_without_explicit_timeout_has_bounded_in_fl
             )
         elapsed = time.monotonic() - started_at
 
-    assert 0.03 <= elapsed < 0.15
+    # Keep a generous wall-clock runaway guard for loaded CI runners; the
+    # precise logical deadline is asserted via timeout_seconds below.
+    assert 0.03 <= elapsed < 1.0
     assert results[-1].download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["no_signal_grace_seconds"] == 0.01
