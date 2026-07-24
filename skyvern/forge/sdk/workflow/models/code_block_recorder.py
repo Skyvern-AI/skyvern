@@ -200,7 +200,7 @@ def _recorded_action_fields(
     elif action_type == ActionType.EXECUTE_JS:
         fields["js_code"] = _string_value(kwargs.get("expression", _arg(args, 0)))
     elif action_type == ActionType.KEYPRESS:
-        keys = kwargs.get("keys", _arg(args, 0))
+        keys = kwargs.get("keys", _arg(args, value_index))
         fields["keys"] = (
             [str(key) for key in keys] if isinstance(keys, list) else [str(keys)] if keys is not None else []
         )

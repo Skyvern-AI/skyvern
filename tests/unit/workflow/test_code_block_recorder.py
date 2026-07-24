@@ -99,6 +99,9 @@ class FakePage:
     async def fill(self, selector, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
 
+    async def press(self, selector, key, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return None
+
     def get_by_role(self, role, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return self.inner
 
@@ -224,6 +227,17 @@ async def test_keyboard_press_records_keypress_action() -> None:
     recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.KEYPRESS]
     assert recorded[0].description and "Enter" in recorded[0].description
+
+
+@pytest.mark.asyncio
+async def test_direct_page_press_records_the_key_not_the_selector() -> None:
+    # page.press(selector, key) takes the selector first, unlike keyboard.press(key)/
+    # locator.press(key); the recorded KEYPRESS action must still capture the key.
+    page = RecordingPage(FakePage())
+    await page.press("#search-input", "Enter")
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.KEYPRESS]
+    assert recorded[0].keys == ["Enter"]
 
 
 @pytest.mark.asyncio
