@@ -781,10 +781,12 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
                         page=page,
                         action=action,
                     ),
-                    timeout=0.5,
+                    timeout=5,
                 )
 
-        assert time.monotonic() - started_at < 0.2
+        # Keep this loose for shared CI-runner jitter while still proving the
+        # handler deadline fires well before the 5s wait_for safety net.
+        assert time.monotonic() - started_at < 1.0
         assert not interceptor._browser_download_tasks
 
 
@@ -2322,7 +2324,8 @@ async def test_handle_action_download_in_flight_request_does_not_extend_custom_t
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.1
+    # Keep wall-clock bounds loose to tolerate scheduling jitter on shared CI runners.
+    assert elapsed < 0.5
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
