@@ -1142,12 +1142,14 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
                         page=page,
                         action=action,
                     ),
-                    timeout=0.5,
+                    timeout=5,
                 )
 
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.2
+    # Proves the 0.03s download budget raised, not the 5s wait_for safety net;
+    # the bound is loose because loaded CI runners add hundreds of ms of lag.
+    assert elapsed < 1.0
 
 
 def test_remove_download_listener_uses_playwright_remove_listener_when_off_unavailable() -> None:

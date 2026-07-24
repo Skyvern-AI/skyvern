@@ -401,6 +401,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
         terminal state. Returns the updated row, or ``None`` when the row was
@@ -424,6 +425,8 @@ class WorkflowRunsRepository(BaseRepository):
             values["failure_reason"] = failure_reason
         if run_with is not None:
             values["run_with"] = run_with
+        if failure_category is not None:
+            values["failure_category"] = failure_category
 
         async with self.Session() as session:
             result = await session.execute(

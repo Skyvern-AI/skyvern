@@ -559,8 +559,10 @@ async def test_popup_video_listener_registers_pre_existing_pages() -> None:
     browser_context.pages = [initial_page]
     set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
 
-    # Let the ensure_future tasks run
-    await asyncio.sleep(0)
+    # Let the ensure_future tasks run to completion (registration spans multiple loop turns)
+    async with asyncio.timeout(1):
+        while not artifacts.video_artifacts:
+            await asyncio.sleep(0)
 
     paths = [va.video_path for va in artifacts.video_artifacts]
     assert paths == ["/tmp/videos/initial.webm"]
