@@ -51,7 +51,7 @@ from skyvern.forge.sdk.services import (
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.webeye.actions.actions import Action
@@ -1125,6 +1125,26 @@ class AgentFunction:
     async def post_step_execution(self, task: Task, step: Step) -> None:
         if step.status == StepStatus.completed:
             await self._maybe_close_magic_link_page(task)
+
+    async def gate_step_completion(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        task_block: BaseTaskBlock | None,
+        page: Page | None,
+        browser_state: BrowserState,
+    ) -> bool:
+        """Gate whether an agent completion verdict for this step is accepted.
+
+        Called once the parallel verifier has produced a CompleteAction, before the step
+        and task are marked completed. Return True to accept; False to reject, which makes
+        the agent keep going and fail safe at max steps rather than falsely completing.
+        OSS accepts everything; a deployment may override to hold specific blocks (e.g. a
+        submit block whose AI fallback would otherwise complete without a deterministic
+        confirmation check) to a stricter gate.
+        """
+        return True
 
     async def _maybe_close_magic_link_page(self, task: Task) -> None:
         """Close a magic-link confirmation page if it shows close/return signals.
