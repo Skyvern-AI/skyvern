@@ -21,7 +21,13 @@ _SHADOW_OPTION = {
 
 def _shadow_task() -> SimpleNamespace:
     return SimpleNamespace(
-        navigation_goal="goal", navigation_payload={}, llm_key=None, organization_id=None, workflow_permanent_id=None
+        task_id="task-1",
+        workflow_run_id=None,
+        navigation_goal="goal",
+        navigation_payload={},
+        llm_key=None,
+        organization_id=None,
+        workflow_permanent_id=None,
     )
 
 
@@ -1089,7 +1095,7 @@ async def test_converted_route_reports_input_text_converted(monkeypatch: pytest.
         handler.InputTextAction(element_id="field", text="Choice"),
         MagicMock(),
         SimpleNamespace(id_to_element_dict={"field": {"tagName": "input"}}),
-        SimpleNamespace(workflow_run_id=None),
+        SimpleNamespace(workflow_run_id=None, task_id="task-1"),
         MagicMock(),
     )
     assert select.await_args.kwargs["entry_action_type"] == "input_text_converted"
