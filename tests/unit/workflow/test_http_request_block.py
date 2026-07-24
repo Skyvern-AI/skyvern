@@ -220,6 +220,23 @@ class TestHttpRequestBlockSecretResponsePaths:
         client_session.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_execute_blocks_loopback_url_before_request(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        context = _make_context()
+        block = _http_block(url="http://127.0.0.1:45427/private", method="GET")
+        request_mock = AsyncMock(return_value=(200, {}, "internal response"))
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", request_mock)
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert result.failure_reason is not None
+        assert "blocked" in result.failure_reason.lower()
+        request_mock.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_execute_records_placeholder_and_masks_duplicate_echo(self, monkeypatch: pytest.MonkeyPatch) -> None:
         context = _make_context()
         response_body = {"data": {"token": "real-token"}, "echo": "real-token"}

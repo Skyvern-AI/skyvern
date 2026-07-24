@@ -9,7 +9,7 @@ import pytest
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from skyvern.config import settings
-from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.exceptions import BlockedHost, DownloadFileMaxSizeExceeded
 from skyvern.forge.sdk.api import files
 
 
@@ -251,3 +251,14 @@ async def test_download_file_raises_http_error_without_aiohttp_auto_raise(
     assert captured_session_kwargs.get("raise_for_status") is not True
     assert not response.body_read
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_file_blocks_loopback_url_before_http_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_if_http_session_opens(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("loopback URL should be rejected before opening an HTTP session")
+
+    monkeypatch.setattr(files.aiohttp, "ClientSession", fail_if_http_session_opens)
+
+    with pytest.raises(BlockedHost, match="127.0.0.1"):
+        await files.download_file("http://127.0.0.1:45427/private")

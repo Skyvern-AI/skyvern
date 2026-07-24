@@ -14,7 +14,12 @@ from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, validate_fetch_url
 
 @pytest.fixture(autouse=True)
 def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_getaddrinfo = socket.getaddrinfo
+
     def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        flags = kwargs.get("flags", args[3] if len(args) > 3 else 0)
+        if isinstance(flags, int) and flags & socket.AI_NUMERICHOST:
+            return original_getaddrinfo(host, port, *args, **kwargs)
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
@@ -90,6 +95,101 @@ async def test_aiohttp_request_trusts_internal_proxy_without_trusting_target() -
     assert proxy_results
     with pytest.raises(BlockedHost):
         await SSRFGuardedResolver().resolve("127.0.0.1", 8080)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_public_network_validation_blocks_loopback_before_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_http_session_opens(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("loopback URL should be rejected before opening an HTTP session")
+
+    monkeypatch.setattr("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", fail_if_http_session_opens)
+
+    with pytest.raises(BlockedHost, match="127.0.0.1"):
+        await aiohttp_request(
+            method="GET",
+            url="http://127.0.0.1:45427/private",
+            validate_public_network=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_public_network_validation_rejects_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_http_session_opens(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("strict public-network requests with a proxy should fail closed")
+
+    monkeypatch.setattr("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", fail_if_http_session_opens)
+
+    with pytest.raises(BlockedHost, match="proxies are unsupported with public-network validation"):
+        await aiohttp_request(
+            method="GET",
+            url="https://8.8.8.8/dns-query",
+            proxy="http://127.0.0.1:8080",
+            validate_public_network=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_public_network_validation_allows_public_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_session_kwargs: dict[str, Any] = {}
+    captured_request_kwargs: dict[str, Any] = {}
+
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.headers = {"Content-Type": "application/json"}
+    mock_response.json = AsyncMock(return_value={"success": True})
+    mock_response.text = AsyncMock(return_value='{"success": true}')
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=None)
+
+    def capture_request(*_args: Any, **kwargs: Any) -> AsyncMock:
+        captured_request_kwargs.update(kwargs)
+        return mock_response
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(side_effect=capture_request)
+
+    def capture_session(**kwargs: Any) -> MagicMock:
+        captured_session_kwargs.update(kwargs)
+        return mock_session
+
+    captured_resolver: SSRFGuardedResolver | None = None
+    connector = object()
+    trace_config = object()
+
+    def capture_connector(resolver: SSRFGuardedResolver | None = None) -> object:
+        nonlocal captured_resolver
+        captured_resolver = resolver
+        return connector
+
+    monkeypatch.setattr("skyvern.forge.sdk.core.aiohttp_helper.ssrf_guarded_tcp_connector", capture_connector)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.core.aiohttp_helper.create_public_network_trace_config",
+        lambda: trace_config,
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", capture_session)
+
+    status, _headers, body = await aiohttp_request(
+        method="GET",
+        url="https://8.8.8.8/dns-query",
+        validate_public_network=True,
+    )
+
+    assert status == 200
+    assert body == {"success": True}
+    assert captured_session_kwargs["connector"] is connector
+    assert captured_session_kwargs["trace_configs"] == [trace_config]
+    assert captured_request_kwargs["url"] == "https://8.8.8.8/dns-query"
+    assert captured_resolver is not None
+    with pytest.raises(BlockedHost):
+        captured_resolver.pin_host_ips("shared.example.test", ("100.64.0.1",))
 
 
 @pytest.mark.asyncio
