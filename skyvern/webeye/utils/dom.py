@@ -40,6 +40,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -64,7 +65,10 @@ def is_element_detached_error(exc: BaseException) -> bool:
     return "not attached to the dom" in message or "frame was detached" in message
 
 
-def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
+def is_post_dispatch_click_timeout(
+    exc: BaseException,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
     """A Playwright `TimeoutError` whose message references the post-click
     auto-wait for scheduled navigations means the click was physically
     dispatched (Playwright logs ``click action done`` immediately before this
@@ -72,7 +76,10 @@ def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
     trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
     chain would duplicate the already-applied side effect.
     """
-    if not isinstance(exc, TimeoutError):
+    is_timeout = (
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+    )
+    if not is_timeout:
         return False
     return "scheduled navigation" in str(exc).lower()
 

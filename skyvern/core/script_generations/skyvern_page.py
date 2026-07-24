@@ -29,6 +29,7 @@ from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 if TYPE_CHECKING:
@@ -80,13 +81,17 @@ class SkyvernPage(Page):
     3. Provides an AI-based fallback for standard actions
     """
 
+    engine_selection: BrowserEngineSelection | None = None
+
     def __init__(
         self,
         page: Page,
         ai: SkyvernPageAi,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
         super().__init__(page)
         self.page = page
+        self.engine_selection = engine_selection
         self.current_label: str | None = None
         self._ai = ai
         self._working_frame: Frame | None = None
@@ -270,7 +275,12 @@ class SkyvernPage(Page):
                 # Only retry on element-not-found (timeout) or navigation errors
                 # (execution context destroyed). Non-transient errors (browser
                 # crashed, page closed) are re-raised immediately.
-                is_transient = isinstance(exc, PlaywrightTimeoutError) or "execution context" in str(exc).lower()
+                is_timeout = (
+                    self.engine_selection.is_engine_timeout_error(exc)
+                    if self.engine_selection is not None
+                    else isinstance(exc, PlaywrightTimeoutError)
+                )
+                is_transient = is_timeout or "execution context" in str(exc).lower()
                 if attempt < max_retries and is_transient:
                     LOG.info(
                         "Selector not found, retrying after wait",
@@ -416,7 +426,7 @@ class SkyvernPage(Page):
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
-                    if is_post_dispatch_click_timeout(e):
+                    if is_post_dispatch_click_timeout(e, self.engine_selection):
                         LOG.info(
                             "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
                             selector=selector,
@@ -424,7 +434,11 @@ class SkyvernPage(Page):
                         return selector
                     should_retry_after_escape = (
                         not _skip_element_prep
-                        or not isinstance(e, PlaywrightTimeoutError)
+                        or not (
+                            self.engine_selection.is_engine_timeout_error(e)
+                            if self.engine_selection is not None
+                            else isinstance(e, PlaywrightTimeoutError)
+                        )
                         or _is_pointer_interception_error(e)
                     )
                     # The click may have failed because an autocomplete dropdown
@@ -441,7 +455,14 @@ class SkyvernPage(Page):
                                 selector=selector,
                             )
                             return selector
-                        except Exception:
+                        except Exception as retry_error:
+                            if is_post_dispatch_click_timeout(retry_error, self.engine_selection):
+                                LOG.info(
+                                    "CSS selector click dispatched after dismissing overlay; "
+                                    "navigation-wait timed out — skipping fallback",
+                                    selector=selector,
+                                )
+                                return selector
                             pass  # retry failed too — fall through to AI
                     LOG.info(
                         "CSS selector click failed, falling back to AI",
