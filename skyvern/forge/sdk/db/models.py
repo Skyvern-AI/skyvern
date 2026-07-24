@@ -686,6 +686,7 @@ class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
     __table_args__ = (
         Index("idx_workflow_runs_org_created", "organization_id", "created_at"),
+        Index("idx_workflow_runs_wpid_created", "workflow_permanent_id", "created_at"),
         Index(
             "ix_workflow_runs_nonterminal_status",
             "status",
