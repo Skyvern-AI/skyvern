@@ -387,6 +387,7 @@ class RealBrowserManager(BrowserManager):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                engine_selection=engine_selection,
             )
         except BaseException:
             # start() already launched the local Node driver, so a failed context
