@@ -4179,7 +4179,10 @@ async def _apply_exact_credential_name_scope(
     if (
         policy.credential_input_kind == "website_stored_credential"
         and policy.login_page_urls
-        and _match_by_url(credentials, policy.login_page_urls)
+        and _match_by_url(
+            [credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD],
+            policy.login_page_urls,
+        )
     ):
         return
     matched_names = _clean_list(
@@ -4604,10 +4607,32 @@ async def _resolve_credentials(
                 return
         return
 
-    matches = _match_by_url(credentials, policy.login_page_urls)
+    login_credentials = [
+        credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD
+    ]
+    matches = _match_by_url(login_credentials, policy.login_page_urls)
+    if not matches:
+        # A credential saved without a tested_url is still a valid login credential,
+        # so it stays a candidate once both URL tiers come up empty.
+        urlless = [credential for credential in login_credentials if not credential.tested_url]
+        if len(urlless) == 1:
+            policy.resolved_credentials = urlless
+            return
+        if urlless:
+            # Found-but-unbound keeps the unresolved-login override from
+            # relabeling this disambiguation ask as a missing-credential turn.
+            policy.discovered_credentials = urlless
+            _block(
+                policy,
+                _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+                urlless,
+                reason="credential_name_unresolved",
+            )
+            return
     if len(matches) == 1:
         policy.resolved_credentials = matches
     elif matches:
+        policy.discovered_credentials = matches
         _block(
             policy,
             _AMBIGUOUS_URL_CREDENTIAL_QUESTION,

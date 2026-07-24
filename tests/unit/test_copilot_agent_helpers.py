@@ -124,6 +124,7 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -4802,7 +4803,12 @@ workflow_definition:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
-        credential = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
+        credential = SimpleNamespace(
+            credential_id="cred_bank",
+            name="Bank",
+            tested_url="https://bank.example/login",
+            credential_type=CredentialType.PASSWORD,
+        )
         credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
         monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
 
@@ -5453,7 +5459,12 @@ workflow_definition:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
-        bank = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
+        bank = SimpleNamespace(
+            credential_id="cred_bank",
+            name="Bank",
+            tested_url="https://bank.example/login",
+            credential_type=CredentialType.PASSWORD,
+        )
         monkeypatch.setattr(
             policy_module.app,
             "DATABASE",
