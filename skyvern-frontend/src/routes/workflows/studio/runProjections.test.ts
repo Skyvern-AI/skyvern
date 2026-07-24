@@ -239,9 +239,25 @@ describe("runHasOutputs", () => {
     ).toBe(false);
   });
 
-  test("false when extracted_information is absent from outputs", () => {
+  test("true when outputs carry a code block's returned field", () => {
     expect(
-      runHasOutputs(outputsSource({ outputs: { other_field: "x" } })),
+      runHasOutputs(
+        outputsSource({
+          outputs: {
+            get_stars_output: {
+              star_count: 22600,
+              evidence_text: "22.6k stars",
+            },
+            extracted_information: [],
+          },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("false when outputs hold only an empty extracted_information array", () => {
+    expect(
+      runHasOutputs(outputsSource({ outputs: { extracted_information: [] } })),
     ).toBe(false);
   });
 

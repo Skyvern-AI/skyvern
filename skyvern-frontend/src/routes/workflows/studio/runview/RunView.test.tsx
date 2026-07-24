@@ -789,6 +789,24 @@ describe("RunView output signals", () => {
     expect(scope.getByText("Run outputs")).not.toBeNull();
   });
 
+  test("shows a code block's returned outputs when there is no extracted information", () => {
+    seedCompletedRun({
+      outputs: {
+        get_stars_output: { star_count: 22600, evidence_text: "22.6k stars" },
+        extracted_information: [],
+      },
+    });
+
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+
+    expect(scope.queryByText("No outputs for this run")).toBeNull();
+    expect(scope.getByText("Run outputs")).not.toBeNull();
+    expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
+  });
+
   test("does not treat a user output parameter named errors as run errors", () => {
     seedCompletedRun({
       outputs: {

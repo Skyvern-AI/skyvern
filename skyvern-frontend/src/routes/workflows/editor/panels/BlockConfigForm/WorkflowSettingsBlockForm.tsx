@@ -40,6 +40,8 @@ function WorkflowSettingsBlockFormBody({
       sequentialKey: data.sequentialKey,
       persistBrowserSession: data.persistBrowserSession,
       pinSavedSessionIp: data.pinSavedSessionIp,
+      browserProfileId: data.browserProfileId,
+      browserProfileKey: data.browserProfileKey,
       extraHttpHeaders: data.extraHttpHeaders,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
