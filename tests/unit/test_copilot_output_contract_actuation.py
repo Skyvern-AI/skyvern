@@ -7,10 +7,8 @@ OSS-synced: only synthetic labels and RFC-2606 placeholder identifiers.
 
 from __future__ import annotations
 
-import hashlib
 import itertools
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -549,6 +547,7 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_reject_count_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
         output_contract_armed_directive_fingerprint_by_signature={},
+        output_contract_last_reject_fingerprint_by_signature={},
         output_contract_output_owner_directive_candidates_by_signature={},
         output_contract_actuation_by_signature={},
         output_contract_actuation_count_by_signature={},
@@ -718,6 +717,7 @@ def test_log_only_metadata_preflight_records_without_rejecting_or_consuming(
         missing_schema_paths=[],
         missing_return_paths=[],
         shape_violations=[],
+        observation_paths=set(),
     )
     monkeypatch.setattr(wu, "_impose_output_contract_envelope_after_steering", lambda *args: (args[1], args[2], False))
     monkeypatch.setattr(wu, "_scaffold_metadata_contract_for_update", lambda *args: (args[2], False))
@@ -754,6 +754,7 @@ def test_log_only_metadata_preflight_skips_run_attemptable_without_advisory(
         missing_schema_paths=[],
         missing_return_paths=[],
         shape_violations=[],
+        observation_paths=set(),
     )
     monkeypatch.setattr(wu, "_impose_output_contract_envelope_after_steering", lambda *args: (args[1], args[2], False))
     monkeypatch.setattr(wu, "_scaffold_metadata_contract_for_update", lambda *args: (args[2], False))
@@ -2761,14 +2762,11 @@ def test_ceiling_credits_uncertain_but_bound_submission() -> None:
     assert strict is not None and strict.has_deficiencies
 
     # Below the ceiling the server keeps steering: no credit, no imposition.
-    assert (
-        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
-        is None
-    )
+    assert wu._credit_or_impose_output_contract(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata) is None
 
-    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
     with capture_logs() as logs:
-        resolution = wu._credit_or_impose_output_contract_at_ceiling(
+        resolution = wu._credit_or_impose_output_contract(
             ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
         )
     assert resolution is not None
@@ -2786,6 +2784,7 @@ def test_credit_preserves_reject_streak_so_downstream_reject_keeps_ceiling() -> 
         ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None and strict.has_deficiencies
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
     ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
 
     credited = wu._credit_output_contract_submission_at_ceiling(
@@ -2797,7 +2796,9 @@ def test_credit_preserves_reject_streak_so_downstream_reject_keeps_ceiling() -> 
         ctx,
         strict.required_paths,
         reject_family="requested_output_contract_missing_output_coverage",
-        authored_structural_fingerprint="fp_downstream",
+        authored_structural_fingerprint=wu._output_contract_structural_fingerprint(
+            workflow_yaml, strict.canonical_signature
+        ),
     )
     assert downstream == wu._MAX_OUTPUT_CONTRACT_REJECTS
 
@@ -2811,17 +2812,14 @@ def test_ceiling_imposes_binding_from_scouted_observation() -> None:
     )
     assert strict is not None
     assert "output.record_id" in strict.missing_return_paths
-    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
 
     # Enforcing-mode negative: without a recorded source, the reject path stays untouched.
-    assert (
-        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
-        is None
-    )
+    assert wu._credit_or_impose_output_contract(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata) is None
 
     ctx.scouted_output_covered_paths = {"output.record_id"}
     with capture_logs() as logs:
-        resolution = wu._credit_or_impose_output_contract_at_ceiling(
+        resolution = wu._credit_or_impose_output_contract(
             ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
         )
     assert resolution is not None
@@ -2831,7 +2829,6 @@ def test_ceiling_imposes_binding_from_scouted_observation() -> None:
     )
     assert 'return {"output": {"record_id": record_id}}' in imposed_code
     assert resolution.evaluation.has_deficiencies is False
-    assert ctx.output_contract_imposed_since_last_reject_by_signature[strict.canonical_signature] is True
     assert any(log.get("event") == "copilot_output_contract_binding_imposed_at_ceiling" for log in logs)
 
 
@@ -2843,29 +2840,30 @@ def test_ceiling_abstains_when_no_binding_composable_even_with_observation() -> 
         ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None and strict.has_deficiencies
-    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
     ctx.scouted_output_covered_paths = {"output.record_id"}
 
-    assert (
-        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
-        is None
-    )
+    assert wu._credit_or_impose_output_contract(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata) is None
     assert ctx.output_contract_imposed_since_last_reject_by_signature.get(strict.canonical_signature) is None
 
 
-def test_ceiling_hook_inert_in_log_only_mode() -> None:
-    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
-    strict = wu._evaluate_output_contract_for_code_block(
-        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
-    )
-    assert strict is not None
-    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
-    ctx.author_time_gate_log_only_ids = frozenset({wu._OUTPUT_CONTRACT_ABLATION_GATE_ID})
-
-    assert (
-        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata)
-        is None
-    )
+def test_pass_path_resolves_the_same_way_under_log_only_as_when_enforcing() -> None:
+    resolutions = []
+    for log_only in (False, True):
+        ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+        if log_only:
+            ctx.author_time_gate_log_only_ids = frozenset({wu._OUTPUT_CONTRACT_ABLATION_GATE_ID})
+        strict = wu._evaluate_output_contract_for_code_block(
+            ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+        )
+        assert strict is not None
+        _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
+        resolution = wu._credit_or_impose_output_contract(
+            ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata
+        )
+        assert resolution is not None
+        resolutions.append(resolution.mode)
+    assert resolutions == ["credited", "credited"]
 
 
 def test_log_only_ablation_entry_credits_qualifying_submission_without_any_rejects() -> None:
@@ -2875,6 +2873,7 @@ def test_log_only_ablation_entry_credits_qualifying_submission_without_any_rejec
         ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None and strict.has_deficiencies
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
     assert ctx.output_contract_reject_count_by_signature == {}
 
     with capture_logs() as logs:
@@ -2883,15 +2882,11 @@ def test_log_only_ablation_entry_credits_qualifying_submission_without_any_rejec
             strict,
             workflow_yaml=workflow_yaml,
             raw_metadata=metadata,
-            actuation_entry="log_only_ablation",
         )
     assert resolution is not None
     assert resolution.mode == "credited"
     assert resolution.evaluation.has_deficiencies is False
-    credited_logs = [
-        log for log in logs if log.get("event") == "copilot_output_contract_submission_credited_at_ceiling"
-    ]
-    assert credited_logs and credited_logs[0].get("actuation_entry") == "log_only_ablation"
+    assert any(log.get("event") == "copilot_output_contract_submission_credited_at_ceiling" for log in logs)
 
 
 def test_log_only_ablation_entry_imposes_binding_from_scouted_observation() -> None:
@@ -2904,6 +2899,7 @@ def test_log_only_ablation_entry_imposes_binding_from_scouted_observation() -> N
         ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None and strict.has_deficiencies
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
     assert ctx.output_contract_reject_count_by_signature == {}
 
     with capture_logs() as logs:
@@ -2912,7 +2908,6 @@ def test_log_only_ablation_entry_imposes_binding_from_scouted_observation() -> N
             strict,
             workflow_yaml=workflow_yaml,
             raw_metadata=metadata,
-            actuation_entry="log_only_ablation",
         )
     assert resolution is not None
     assert resolution.mode == "imposed"
@@ -2920,8 +2915,7 @@ def test_log_only_ablation_entry_imposes_binding_from_scouted_observation() -> N
         wu._workflow_yaml_code_blocks_by_label(resolution.workflow_yaml)["extract_record"].get("code") or ""
     )
     assert 'return {"output": {"record_id": record_id}}' in imposed_code
-    imposed_logs = [log for log in logs if log.get("event") == "copilot_output_contract_binding_imposed_at_ceiling"]
-    assert imposed_logs and imposed_logs[0].get("actuation_entry") == "log_only_ablation"
+    assert any(log.get("event") == "copilot_output_contract_binding_imposed_at_ceiling" for log in logs)
 
 
 def test_log_only_ablation_entry_abstains_without_observation_so_draft_persists_as_today() -> None:
@@ -2934,6 +2928,7 @@ def test_log_only_ablation_entry_abstains_without_observation_so_draft_persists_
         ctx, omitted_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None and strict.has_deficiencies
+    _arm_steering_exhausted(ctx, strict.canonical_signature, omitted_yaml)
 
     assert (
         wu._credit_or_impose_output_contract(
@@ -2941,7 +2936,6 @@ def test_log_only_ablation_entry_abstains_without_observation_so_draft_persists_
             strict,
             workflow_yaml=omitted_yaml,
             raw_metadata=metadata,
-            actuation_entry="log_only_ablation",
         )
         is None
     )
@@ -2956,12 +2950,9 @@ def test_ceiling_refuses_omitted_value_without_observation_byte_identically() ->
         ctx, omitted_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None and strict.has_deficiencies
-    ctx.output_contract_reject_count_by_signature[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
+    _arm_steering_exhausted(ctx, strict.canonical_signature, omitted_yaml)
 
-    assert (
-        wu._credit_or_impose_output_contract_at_ceiling(ctx, strict, workflow_yaml=omitted_yaml, raw_metadata=metadata)
-        is None
-    )
+    assert wu._credit_or_impose_output_contract(ctx, strict, workflow_yaml=omitted_yaml, raw_metadata=metadata) is None
     credited = wu._evaluate_output_contract_for_code_block(
         ctx, omitted_yaml, metadata, enforce_value_bearing_liveness=True, credit_convergence_ceiling=True
     )
@@ -2971,51 +2962,131 @@ def test_ceiling_refuses_omitted_value_without_observation_byte_identically() ->
     assert ctx.output_contract_imposed_since_last_reject_by_signature.get(strict.canonical_signature) is None
 
 
-def test_ceiling_reached_at_final_counted_reject_not_before() -> None:
+def test_steering_exhausted_requires_an_armed_directive_the_draft_did_not_move() -> None:
     ctx, workflow_yaml, metadata = _declaration_only_root_contract()
     strict = wu._evaluate_output_contract_for_code_block(
         ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
     )
     assert strict is not None
-    counts = ctx.output_contract_reject_count_by_signature
+    assert wu._output_contract_steering_exhausted(ctx, strict, workflow_yaml) is False
 
-    counts[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 2
-    assert wu._output_contract_ceiling_reached(ctx, strict) is False
+    ctx.output_contract_actuation_count_by_signature[strict.canonical_signature] = 1
+    ctx.output_contract_last_reject_fingerprint_by_signature[strict.canonical_signature] = "fp_from_another_draft"
+    assert wu._output_contract_steering_exhausted(ctx, strict, workflow_yaml) is False
 
-    counts[strict.canonical_signature] = wu._MAX_OUTPUT_CONTRACT_REJECTS - 1
-    assert wu._output_contract_ceiling_reached(ctx, strict) is True
-
-
-_PROD_METADATA_CORPUS = Path(
-    "/Users/andrewneilson/sky/.gauntlet-cache/output-contract-binder-20260722/prod_rejected_metadata_captures.json"
-)
-_PROD_METADATA_CORPUS_SHA256 = "0f99fa0ddb8ce52ad4d6191ea307277ff373ccfed3a647caa46d80d6ee2aa060"
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
+    assert wu._output_contract_steering_exhausted(ctx, strict, workflow_yaml) is True
 
 
-def _prod_capture_binding_dimension(payload: list[dict[str, object]]) -> tuple[bool, bool]:
-    element = payload[0]
-    observations = element.get("exploration_observations") or []
-    statuses = {str(observation.get("status")) for observation in observations}
-    binding_source_on_record = len(observations) > 0
-    liveness_uncertain = bool(statuses) and statuses <= {"observed_not_verified"}
-    return binding_source_on_record, liveness_uncertain
+def test_loaded_result_evidence_claimed_by_another_contract_does_not_authorize_imposition() -> None:
+    ctx = _record_criterion_ctx()
+    ctx.scouted_output_covered_paths = set()
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")')
+    metadata = _record_contract_metadata()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None and strict.has_deficiencies
+    _arm_steering_exhausted(ctx, strict.canonical_signature, workflow_yaml)
+    ctx.latest_evaluate_result_composition_steer = loaded_result_composition_evidence_from_page(
+        {"result_containers": [{"selector": "#record", "row_count": 1, "sample_rows": ["Example record"]}]},
+        source_tool="evaluate",
+        source_url="https://example.com/results",
+    )
+    ctx.latest_evaluate_result_composition_signature = "sig_for_a_different_contract"
+
+    assert wu._output_contract_binding_source_on_record(ctx, strict, workflow_yaml) is False
+    assert wu._credit_or_impose_output_contract(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata) is None
+    assert ctx.latest_evaluate_result_composition_signature == "sig_for_a_different_contract"
+
+    ctx.latest_evaluate_result_composition_signature = None
+    assert wu._output_contract_binding_source_on_record(ctx, strict, workflow_yaml) is True
+    assert ctx.latest_evaluate_result_composition_signature == strict.canonical_signature
 
 
-@pytest.mark.skipif(not _PROD_METADATA_CORPUS.exists(), reason="prod evidence archive not present in this environment")
-def test_prod_rejected_metadata_corpus_adjudication() -> None:
-    raw = _PROD_METADATA_CORPUS.read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == _PROD_METADATA_CORPUS_SHA256
+def _steering_exhausted_evidence(**overrides: object) -> OutputContractActuationEvidence:
+    base = dict(
+        imposed_available=False,
+        click_only_spine=False,
+        observed_required_values=False,
+        prior_actuation=True,
+        prior_directive_unconsumed=True,
+        steering_exhausted=True,
+    )
+    base.update(overrides)
+    return OutputContractActuationEvidence(**base)  # type: ignore[arg-type]
 
-    captures = [
-        row["attributes"]["attributes"]["rejected_code_artifact_metadata_payload"] for row in json.loads(raw)["data"]
-    ]
-    assert len(captures) == 6
 
-    for payload in captures:
-        element = payload[0]
-        # One shared extraction block label across all captures; the exact name stays in
-        # the local evidence archive (never committed — it identifies the target site).
-        assert element["block_label"] == captures[0][0]["block_label"]
-        binding_source_on_record, liveness_uncertain = _prod_capture_binding_dimension(payload)
-        assert binding_source_on_record is True
-        assert liveness_uncertain is True
+def _arm_steering_exhausted(ctx: object, signature: str, workflow_yaml: str) -> None:
+    """Steering is exhausted once a directive is armed and the draft's canonical structural
+    fingerprint is unchanged across it — the typed replacement for a reject-count ceiling."""
+    ctx.output_contract_actuation_count_by_signature[signature] = 1
+    ctx.output_contract_last_reject_fingerprint_by_signature[signature] = wu._output_contract_structural_fingerprint(
+        workflow_yaml, signature
+    )
+
+
+def test_resolver_credits_before_imposing_once_steering_is_exhausted() -> None:
+    credit_and_impose = _steering_exhausted_evidence(credit_available=True, scouted_binding_impose_available=True)
+    assert (
+        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=credit_and_impose).kind
+        == OutputContractActuationKind.CREDIT
+    )
+
+    impose_only = _steering_exhausted_evidence(scouted_binding_impose_available=True)
+    assert (
+        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=impose_only).kind
+        == OutputContractActuationKind.IMPOSE_SCOUTED_BINDING
+    )
+
+
+def test_resolver_pass_path_preempts_the_unobservable_source_terminal() -> None:
+    would_terminal = _steering_exhausted_evidence(
+        click_only_spine=True,
+        declick_attempt_failed=True,
+        credit_available=True,
+    )
+    assert (
+        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=would_terminal).kind
+        == OutputContractActuationKind.CREDIT
+    )
+
+    without_pass_path = _steering_exhausted_evidence(click_only_spine=True, declick_attempt_failed=True)
+    assert (
+        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=without_pass_path).kind
+        == OutputContractActuationKind.BLOCKED_TERMINAL
+    )
+
+
+def test_resolver_ignores_credit_and_impose_until_steering_is_exhausted() -> None:
+    for kind_flags in ({"credit_available": True}, {"scouted_binding_impose_available": True}):
+        armed = _steering_exhausted_evidence(steering_exhausted=False, **kind_flags)
+        unarmed = _steering_exhausted_evidence(steering_exhausted=False)
+        assert (
+            resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=armed).kind
+            == resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=unarmed).kind
+        )
+
+
+def test_resolver_keeps_existing_imposition_ahead_of_the_pass_path() -> None:
+    both = _steering_exhausted_evidence(imposed_available=True, credit_available=True)
+    assert (
+        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=both).kind
+        == OutputContractActuationKind.IMPOSED
+    )
+
+
+def test_observing_one_path_does_not_authorize_imposing_a_multi_path_contract() -> None:
+    ctx = _record_criterion_ctx()
+    ctx.scouted_output_covered_paths = {"output.record_id"}
+    evaluation = SimpleNamespace(
+        observation_paths={"output.record_id", "output.record_total"},
+        required_paths={"output.record_id", "output.record_total"},
+        block_label="extract_record",
+        canonical_signature="sig_multi",
+    )
+
+    assert wu._output_contract_binding_source_on_record(ctx, evaluation, _declaration_waiver_yaml("pass")) is False
+
+    ctx.scouted_output_covered_paths = {"output.record_id", "output.record_total"}
+    assert wu._output_contract_binding_source_on_record(ctx, evaluation, _declaration_waiver_yaml("pass")) is True
