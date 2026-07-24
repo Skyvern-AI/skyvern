@@ -194,6 +194,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, reason_in_reply_shadow
+from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_churn
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
@@ -1244,6 +1245,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
             + _synthesized_block_offer_prompt(ctx)
+            + todo_list_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )
 
