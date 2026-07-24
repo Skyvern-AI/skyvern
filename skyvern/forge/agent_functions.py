@@ -766,6 +766,16 @@ class AgentFunction:
             headers.setdefault(key, value)
         return headers
 
+    async def resolve_browser_session_connect_url(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        browser_address: str | None,
+        upstream_cdp_url: str | None,
+    ) -> str | None:
+        return browser_address
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 
@@ -979,6 +989,56 @@ class AgentFunction:
     async def is_block_scoped_workflow_run(self, workflow_run: WorkflowRun) -> bool:
         """Return whether this workflow run was created for scoped block execution."""
         return workflow_run.debug_session_id is not None
+
+    async def bank_credential_profile_after_login(
+        self,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState,
+        credential_id: str | None,
+        performed_fresh_login: bool,
+        login_url: str | None,
+    ) -> None:
+        """Bank a verified login into the run's credential living-profile at login-block success.
+
+        No-op in OSS — auto-create + banking is a cloud feature. CloudAgentFunction overrides this to
+        auto-create the credential's profile on first verified sign-in and write the session (whole-dir
+        when the run was seeded from that profile, cookie-only union otherwise), behind the
+        browser_memory_engine kill-switch.
+        """
+        return None
+
+    async def bank_credential_profile_on_healthy_run(
+        self,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState,
+    ) -> None:
+        """Whole-dir write the run's credential living-profile at healthy (completed) run end, only
+        when the run was seeded from that profile (seed==sink). No-op in OSS; cloud overrides."""
+        return None
+
+    async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
+        """Whether a profile's banked-cookie sidecar should be injected at boot. Default True (OSS
+        never writes the sidecar, so this is moot there); cloud gates it on the browser_memory_engine
+        kill-switch so a rollback also stops applying previously banked login state."""
+        return True
+
+    async def should_skip_debug_profile_writeback(self, workflow_run: WorkflowRun) -> bool:
+        """Whether to skip the legacy own-memory profile write-back for a debug (Studio) play. Default
+        False keeps today's behavior in OSS and flag-off orgs; cloud returns True for debug sessions
+        once the engine is enabled, so a debug play never overwrites known-good memory."""
+        return False
+
+    async def is_browser_memory_engine_enabled(self, workflow_run: WorkflowRun) -> bool:
+        """Whether the browser-memory engine's sink-driven write-back is active for this run's org.
+        Default False in OSS and flag-off orgs keeps today's legacy own-memory write-back; cloud gates
+        on the browser_memory_engine kill-switch, so the run writes only its resolved sink profile."""
+        return False
+
+    async def is_browser_memory_engine_enabled_for_org(self, organization_id: str) -> bool:
+        """Org-scoped variant of is_browser_memory_engine_enabled for paths without a WorkflowRun (the
+        credential-delete reap). Default False in OSS and flag-off orgs so no irreversible profile
+        deletion fires until the kill-switch is on."""
+        return False
 
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
@@ -1293,6 +1353,16 @@ class AgentFunction:
         """Proactively detect and solve captchas on the current page.
         Returns True if a captcha was detected and solved.
         Cloud override provides actual solving; OSS base is a no-op."""
+        return False
+
+    async def solve_recaptcha_token(
+        self,
+        page: Page,
+        *,
+        organization_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> bool:
+        """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
 
     async def get_google_sheets_credentials(

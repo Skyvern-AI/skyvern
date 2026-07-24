@@ -262,9 +262,15 @@ class GcsStorage(BaseStorage):
             storage_class=storage_class,
             tags=tags,
         )
-        await self.async_client.upload_file_from_path(
-            profile_uri, zip_file_path, storage_class=storage_class, tags=tags
-        )
+        try:
+            await self.async_client.upload_file_from_path(
+                profile_uri, zip_file_path, storage_class=storage_class, tags=tags
+            )
+        finally:
+            # make_archive writes temp_zip_file.name + ".zip", a separate file the NamedTemporaryFile
+            # cleanup never removes; drop it so successful profile banks don't leak zips into TEMP_PATH.
+            if os.path.exists(zip_file_path):
+                os.remove(zip_file_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from GCS."""
@@ -279,12 +285,29 @@ class GcsStorage(BaseStorage):
         temp_zip_file_path = temp_zip_file.name
 
         temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
+        try:
+            unzip_files(temp_zip_file_path, temp_dir)
+        finally:
+            # The downloaded archive is a delete=False temp file; remove it so cookie-bearing zips
+            # don't accumulate in TEMP_PATH on every profile retrieve (e.g. each cookie-only bank).
+            temp_zip_file.close()
+            os.unlink(temp_zip_file_path)
         return temp_dir
 
-    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
-        """Delete a browser profile from GCS."""
+    async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
+        """Non-destructive existence check via object metadata — avoids downloading the whole archive."""
+        profile_uri = (
+            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        # Not-found returns None (-> False); transient/authz errors propagate so the has-content
+        # fail-safe treats a flaky read as existing content instead of reseeding a run to fresh and
+        # overwriting its saved archive.
+        return await self.async_client.get_object_info(profile_uri) is not None
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
+        """Delete a browser profile from GCS. hard_delete does a terminal object delete (full erasure while
+        the bucket has no object versioning/soft-delete). It does NOT purge old generations — if versioning
+        is enabled, expire noncurrent generations via a GCS lifecycle rule. Delete failures propagate."""
         profile_uri = (
             f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )

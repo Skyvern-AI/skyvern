@@ -41,8 +41,10 @@ import structlog
 from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
+from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
@@ -563,6 +565,48 @@ async def get_totp_codes(
     return codes
 
 
+async def _validate_credential_browser_profile_id(
+    browser_profile_id: str,
+    organization_id: str,
+    current_credential_id: str | None = None,
+) -> None:
+    """A credential may only link a PLAIN, unowned profile from its own org: not a workflow-managed
+    profile and not one another credential already owns (living credential profiles are auto-created,
+    never hand-linked). Raises HTTP 400 otherwise."""
+    profile = await app.DATABASE.browser_sessions.get_browser_profile(
+        profile_id=browser_profile_id, organization_id=organization_id
+    )
+    if profile is None:
+        raise HTTPException(
+            status_code=400, detail=f"Browser profile not found, browser_profile_id={browser_profile_id}"
+        )
+    if profile.is_managed or profile.workflow_permanent_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="A credential can only link a plain browser profile, not a workflow-managed one.",
+        )
+    owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+        browser_profile_id=browser_profile_id, organization_id=organization_id
+    )
+    if any(owner.credential_id != current_credential_id for owner in owners):
+        raise HTTPException(
+            status_code=400,
+            detail="This browser profile is already linked to another credential.",
+        )
+
+
+async def _update_credential_or_profile_conflict(**kwargs: Any) -> Credential:
+    """Apply a credential update, translating the one-credential-per-profile unique-constraint violation
+    — the atomic backstop when a concurrent link slips past the read-before-write ownership check — into
+    the same 400 the read-check raises."""
+    try:
+        return await app.DATABASE.credentials.update_credential(**kwargs)
+    except IntegrityError as exc:
+        if "uq_credentials_browser_profile_id" in str(getattr(exc, "orig", exc)):
+            raise HTTPException(status_code=400, detail="This browser profile is already linked to another credential.")
+        raise
+
+
 @legacy_base_router.post("/credentials")
 @legacy_base_router.post("/credentials/", include_in_schema=False)
 @base_router.post(
@@ -618,6 +662,11 @@ async def create_credential(
             organization_id=current_org.organization_id,
         )
 
+    # Validate the profile link BEFORE provisioning, so an invalid/managed/cross-org/owned profile
+    # rejects with a 400 without leaving an orphan credential (and vault secret) behind.
+    if data.browser_profile_id is not None:
+        await _validate_credential_browser_profile_id(data.browser_profile_id, current_org.organization_id)
+
     credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
 
     try:
@@ -633,6 +682,20 @@ async def create_credential(
     if credential.vault_type == CredentialVaultType.BITWARDEN:
         # Early resyncing the Bitwarden vault
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
+
+    pin_provided = "pin_saved_session_ip" in data.model_fields_set
+    bpid_provided = "browser_profile_id" in data.model_fields_set
+    if bpid_provided or pin_provided:
+        # Only pass browser_profile_id when the caller sent it, so a pin-only request never passes the
+        # omitted default (None) into the repo's unlink sentinel.
+        profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
+        credential = await _update_credential_or_profile_conflict(
+            credential_id=credential.credential_id,
+            organization_id=current_org.organization_id,
+            **profile_update,
+            # Only touch the pin when the caller sent it — supplying a profile alone must not reset it.
+            pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+        )
 
     return _convert_to_response(credential)
 
@@ -764,6 +827,16 @@ async def rename_credential(
     }
     if "name" in data.model_fields_set:
         update_kwargs["name"] = data.name
+    if "browser_profile_id" in data.model_fields_set:
+        # Explicit null unlinks (user picked Auto after attaching a profile); a non-null value still
+        # validates plain/unowned before linking. Omitted leaves the existing link untouched.
+        if data.browser_profile_id is not None:
+            await _validate_credential_browser_profile_id(
+                data.browser_profile_id, current_org.organization_id, current_credential_id=credential_id
+            )
+        update_kwargs["browser_profile_id"] = data.browser_profile_id
+    if "pin_saved_session_ip" in data.model_fields_set:
+        update_kwargs["pin_saved_session_ip"] = data.pin_saved_session_ip
     if data.tested_url is not None:
         update_kwargs["tested_url"] = data.tested_url
     if data.user_context is not None:
@@ -778,7 +851,7 @@ async def rename_credential(
         proxy_session_id=data.proxy_session_id,
         rotate_proxy_session_id=data.rotate_proxy_session_id,
     )
-    updated = await app.DATABASE.credentials.update_credential(**update_kwargs)
+    updated = await _update_credential_or_profile_conflict(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
@@ -1568,8 +1641,9 @@ async def _create_browser_profile_after_workflow(
                         proxy_location=proxy_location,
                         proxy_session_id=proxy_session_id,
                     )
-                # Bump modified_at so the status poll can tell this run's re-save actually landed.
-                await app.DATABASE.browser_sessions.touch_browser_profile(
+                # Stamp the verified login (keeps the living-profile concurrency guard coherent) and
+                # bump modified_at so the status poll can tell this run's re-save actually landed.
+                await app.DATABASE.browser_sessions.mark_verified_login(
                     profile_id=target_profile_id,
                     organization_id=organization_id,
                 )
@@ -1691,6 +1765,11 @@ async def update_credential(
             organization_id=current_org.organization_id,
         )
 
+    if data.browser_profile_id is not None:
+        await _validate_credential_browser_profile_id(
+            data.browser_profile_id, current_org.organization_id, current_credential_id=credential_id
+        )
+
     vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
     if not credential_service:
@@ -1723,6 +1802,22 @@ async def update_credential(
         background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
 
     _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
+
+    # Gate on field presence, not truthiness, so an explicit pin_saved_session_ip=false DISABLES an
+    # existing pin (a bare truthiness check would silently keep it on) — and supplying a profile alone
+    # (pin omitted) must not reset the pin.
+    pin_provided = "pin_saved_session_ip" in data.model_fields_set
+    bpid_provided = "browser_profile_id" in data.model_fields_set
+    if bpid_provided or pin_provided:
+        # Only pass browser_profile_id when the caller sent it — a pin-only update must not pass the
+        # field's omitted default (None) and unlink the profile via the repo's unlink sentinel.
+        profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
+        updated_credential = await _update_credential_or_profile_conflict(
+            credential_id=credential_id,
+            organization_id=current_org.organization_id,
+            **profile_update,
+            pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+        )
 
     return _convert_to_response(updated_credential)
 
@@ -1790,6 +1885,71 @@ async def delete_credential(
             credential.item_id,
             credential.organization_id,
         )
+
+    # Reap the credential's living browser profile so deleting a credential doesn't silently orphan
+    # its cookie-bearing archive (unbounded S3 growth). Kept if a live owner still references it. The
+    # reap hard-deletes the profile's S3 archive (irreversible, version-purging), so it rides the engine
+    # kill-switch: flag-off orgs never lose a saved profile on credential delete (v1 has no unlink to
+    # recover with), and a rollback disables it.
+    profile_id = credential.browser_profile_id
+    organization_id = current_org.organization_id
+    if profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id):
+        try:
+            # Narrow accepted race: a concurrent re-link between this check and the delete below.
+            if await app.DATABASE.browser_sessions.has_live_browser_profile_references(
+                profile_id=profile_id,
+                organization_id=organization_id,
+                exclude_credential_id=credential_id,
+            ):
+                LOG.info(
+                    "browser_memory.credential_profile_kept",
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    browser_profile_id=profile_id,
+                )
+            else:
+                # Erase the S3 archive first (idempotent, version-purging) so cookies are gone even if
+                # the DB row was already soft-deleted; then soft-delete the row for bookkeeping.
+                await app.STORAGE.delete_browser_profile(
+                    organization_id=organization_id,
+                    profile_id=profile_id,
+                    hard_delete=True,
+                )
+                try:
+                    await app.DATABASE.browser_sessions.delete_browser_profile(
+                        profile_id=profile_id,
+                        organization_id=organization_id,
+                    )
+                except BrowserProfileNotFound:
+                    pass
+                except Exception:
+                    # Erasure already succeeded; only the row soft-delete failed, leaving the row
+                    # alive with its blob gone. Log distinctly (not reap_failed) — the stale-memory
+                    # sweep reaps such rows.
+                    LOG.exception(
+                        "browser_memory.credential_profile_row_delete_failed",
+                        organization_id=organization_id,
+                        credential_id=credential_id,
+                        browser_profile_id=profile_id,
+                    )
+                LOG.info(
+                    "browser_memory.credential_profile_reaped",
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    browser_profile_id=profile_id,
+                )
+        except Exception as exc:
+            # The reap did not complete (typically the S3 hard-delete raised): the cookie-bearing archive
+            # is RETAINED and the row is left alive (the soft-delete runs only after a successful erase),
+            # so it stays discoverable for the stale-memory sweep. Never fail the user-facing delete for
+            # this (204 stands) — but log LOUD + alertable so the retained archive is not silently orphaned.
+            LOG.exception(
+                "browser_memory.credential_profile_reap_failed",
+                organization_id=organization_id,
+                credential_id=credential_id,
+                browser_profile_id=profile_id,
+                error=str(exc),
+            )
 
     _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
 
@@ -3015,6 +3175,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
@@ -3034,6 +3195,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
@@ -3050,6 +3212,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,

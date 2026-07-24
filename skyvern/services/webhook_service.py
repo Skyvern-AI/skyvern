@@ -186,6 +186,7 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> dict:
         finished_at=payload_dict.get("finished_at"),
         app_url=app_url,
         browser_session_id=payload_dict.get("browser_session_id"),
+        browser_seed_source=payload_dict.get("browser_seed_source"),
         max_screenshot_scrolls=payload_dict.get("max_screenshot_scrolls"),
         script_run=None,
         errors=payload_dict.get("errors"),
@@ -437,6 +438,7 @@ async def _build_workflow_payload(
         started_at=status_response.started_at,
         finished_at=status_response.finished_at,
         errors=status_response.errors,
+        browser_seed_source=status_response.browser_seed_source,
     )
 
     payload_dict = json.loads(

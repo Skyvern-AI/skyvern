@@ -653,6 +653,27 @@ class WorkflowsRepository(BaseRepository):
                 for workflow in workflows
             ]
 
+    @db_operation("link_workflow_browser_profile_if_unset")
+    async def link_workflow_browser_profile_if_unset(
+        self, workflow_permanent_id: str, organization_id: str, browser_profile_id: str
+    ) -> bool:
+        """Atomically set the workflow's picked browser profile only where it is currently unset — the
+        virtual-then-real materialization (B3) of a persist-ON no-pick workflow's own auto-profile on its
+        first successful engine run. Concurrent-safe: a racing first run either wins the set or no-ops
+        (the own auto-profile is a single get-or-create row, so both runs would set the same id). Returns
+        True iff this call set at least one row."""
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(WorkflowModel.browser_profile_id.is_(None))
+                .values(browser_profile_id=browser_profile_id)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
     @db_operation("update_workflow")
     async def update_workflow(
         self,

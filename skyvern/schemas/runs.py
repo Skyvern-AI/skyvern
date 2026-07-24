@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
@@ -140,6 +140,18 @@ class TaskRunRequest(BaseModel):
         description=BROWSER_SESSION_ID_DOC_STRING,
         examples=BROWSER_SESSION_ID_EXAMPLES,
     )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of a browser profile to reuse for this task",
+    )
+    start_fresh_browser: bool = Field(
+        default=False,
+        description=(
+            "When true, start this run from a fresh, empty browser and ignore any saved browser "
+            "memory — no memory is read or written. A verified sign-in during the run still updates "
+            "the credential's saved login."
+        ),
+    )
     model: dict[str, Any] | None = Field(
         default=None,
         description=MODEL_CONFIG,
@@ -226,6 +238,33 @@ class TaskRunRequest(BaseModel):
             self.engine = RunEngine.skyvern_v2
         return self
 
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_session(self) -> TaskRunRequest:
+        if self.start_fresh_browser and self.browser_session_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_session_id — "
+                "a live session is the browser for the run."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_profile(self) -> TaskRunRequest:
+        if self.start_fresh_browser and self.browser_profile_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_profile_id — "
+                "pick one: a fresh browser or a specific profile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_address(self) -> TaskRunRequest:
+        if self.start_fresh_browser and self.browser_address:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_address — "
+                "connecting to an existing remote browser reuses its session state."
+            )
+        return self
+
 
 class WorkflowRunRequest(BaseModel):
     # An agent *is* a workflow, so `agent_id` and `workflow_id` carry the same `wpid_` value. `agent_id`
@@ -267,6 +306,14 @@ class WorkflowRunRequest(BaseModel):
     browser_profile_id: str | None = Field(
         default=None,
         description="ID of a browser profile to reuse for this workflow run",
+    )
+    start_fresh_browser: bool = Field(
+        default=False,
+        description=(
+            "When true, start this run from a fresh, empty browser and ignore any saved browser "
+            "memory — no memory is read or written. A verified sign-in during the run still updates "
+            "the credential's saved login."
+        ),
     )
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
@@ -342,6 +389,33 @@ class WorkflowRunRequest(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_session(self) -> WorkflowRunRequest:
+        if self.start_fresh_browser and self.browser_session_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_session_id — "
+                "a live session is the browser for the run."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_profile(self) -> WorkflowRunRequest:
+        if self.start_fresh_browser and self.browser_profile_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_profile_id — "
+                "pick one: a fresh browser or a specific profile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_address(self) -> WorkflowRunRequest:
+        if self.start_fresh_browser and self.browser_address:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_address — "
+                "connecting to an existing remote browser reuses its session state."
+            )
+        return self
+
 
 class BlockRunRequest(WorkflowRunRequest):
     block_labels: list[str] = Field(
@@ -362,6 +436,19 @@ class BlockRunRequest(WorkflowRunRequest):
         default=None,
         description="ID of the debug session to use for this block run",
     )
+
+
+def should_suppress_memory_write(start_fresh_browser: bool | None) -> bool:
+    # Governs own-memory / healthy-run write-back only. Credential banking is unaffected
+    # (a verified fresh sign-in still banks), so do not consult this at the credential-write path.
+    return bool(start_fresh_browser)
+
+
+def resolve_start_fresh(start_fresh_browser: bool | None, override_browser_profile_id: str | None) -> bool:
+    # An explicit per-run browser_profile_id override wins over the fresh flag (the flag suppresses
+    # only BELOW the run-override level). The seed resolver ranks a raw start_fresh above the override,
+    # so this gate is the deliberate reconciliation of the two layers.
+    return bool(start_fresh_browser) and not override_browser_profile_id
 
 
 class ScriptRunResponse(BaseModel):
@@ -500,6 +587,11 @@ class WorkflowRunResponse(BaseRunResponse):
     script_id: str | None = Field(
         default=None,
         description="ID of the cached script used for this workflow run, if any.",
+    )
+    browser_seed_source: BrowserSeedSource | None = Field(
+        default=None,
+        description="Which layer of the seed-precedence chain seeded this run's browser (provenance).",
+        examples=["credential", "own_memory", "fresh"],
     )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
