@@ -1366,9 +1366,13 @@ class BitwardenService:
                 credential_type=CredentialType.PASSWORD,
                 name=name,
                 credential=PasswordCredential(
-                    username=login_item["username"] or "",
-                    password=login_item["password"] or "",
-                    totp=login_item["totp"],
+                    # Bitwarden omits the `totp` key entirely for logins without an
+                    # authenticator seed (e.g. text/SMS-delivered 2FA, totp_type="text").
+                    # Index access would raise KeyError: 'totp' and crash run-context init
+                    # before any browser opens, so read these optional fields defensively.
+                    username=login_item.get("username") or "",
+                    password=login_item.get("password") or "",
+                    totp=login_item.get("totp"),
                 ),
             )
         elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
