@@ -46,6 +46,24 @@ import {
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { Checkbox } from "@/components/ui/checkbox";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useBrowserProfileQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileQuery";
+import { useBrowserProfileUsageQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileUsageQuery";
+import { credentialAttachWarning } from "@/routes/workflows/components/browserProfileControlModel";
+import { useInfiniteBrowserProfilesQuery } from "@/routes/workflows/hooks/useInfiniteBrowserProfilesQuery";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -108,6 +126,9 @@ const TEST_STATUS_MESSAGES = [
 ];
 // Delays (ms) before advancing to the next message (last message stays forever)
 const TEST_MESSAGE_DELAYS = [15_000, 30_000, 75_000, 60_000];
+
+// Radix Select forbids an empty value, so "Automatic" (browser_profile_id = null) needs a sentinel.
+const AUTO_PROFILE_VALUE = "__automatic__";
 
 // Function to generate a unique credential name
 function generateDefaultCredentialName(existingNames: string[]): string {
@@ -215,6 +236,15 @@ function formatProxyIdentity(value?: string | null) {
   return `${value.slice(0, 3)}...${value.slice(-2)}`;
 }
 
+// The session id IS the sticky-network identity — no literal IP exists until
+// connect — so surface a recognizable prefix rather than fabricate an address.
+function formatSessionPrefix(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  return value.length > 10 ? `${value.slice(0, 10)}…` : value;
+}
+
 function CredentialsModal({
   onCredentialCreated,
   isOpen: controlledIsOpen,
@@ -306,6 +336,32 @@ function CredentialsModal({
     setEditingGroups((prev) => ({ ...prev, values: true }));
   }, []);
 
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
+  // Quick-win: optional browser profile + per-credential IP pin (flag-on).
+  const [browserProfileId, setBrowserProfileId] = useState<string | null>(null);
+  const [pinIp, setPinIp] = useState(false);
+  // The inline profile Select has no scroll pagination, so pull a large first
+  // page (unowned profiles are a small subset).
+  const { data: plainProfilesPages } = useInfiniteBrowserProfilesQuery({
+    managed: false,
+    page_size: 100,
+    enabled: browserMemoryEnabled && isEditMode,
+  });
+  const { data: attachedProfile } = useBrowserProfileQuery(
+    browserProfileId ?? undefined,
+    {
+      enabled: browserMemoryEnabled && isEditMode && Boolean(browserProfileId),
+    },
+  );
+  // F7: warn when attaching a profile agents already pick — the credential
+  // becomes its only writer and their runs stop saving into it.
+  const { data: attachUsage } = useBrowserProfileUsageQuery(
+    browserProfileId ?? undefined,
+    {
+      enabled: browserMemoryEnabled && isEditMode && Boolean(browserProfileId),
+    },
+  );
+  const attachAgentCount = attachUsage?.workflows?.length ?? 0;
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
   const [testUrl, setTestUrl] = useState("");
@@ -313,6 +369,9 @@ function CredentialsModal({
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
   const [rotateProxyPin, setRotateProxyPin] = useState(false);
   const existingProxyIdentity = formatProxyIdentity(
+    editingCredential?.proxy_session_id,
+  );
+  const existingSessionPrefix = formatSessionPrefix(
     editingCredential?.proxy_session_id,
   );
   const [testStatus, setTestStatus] = useState<
@@ -450,6 +509,8 @@ function CredentialsModal({
       ) {
         setTestAndSave(true);
       }
+      setBrowserProfileId(editingCredential.browser_profile_id ?? null);
+      setPinIp(editingCredential.pin_saved_session_ip ?? false);
       if (editingCredential.user_context) {
         setUserContext(editingCredential.user_context);
       }
@@ -514,6 +575,8 @@ function CredentialsModal({
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
     setEditingGroups({ name: false, values: false });
     setAuthenticatorSaveError(null);
+    setBrowserProfileId(null);
+    setPinIp(false);
     setTestAndSave(false);
     setTestUrl("");
     setTestStatus("idle");
@@ -821,7 +884,12 @@ function CredentialsModal({
       } = saveIntentRef.current;
 
       // Persist metadata (tested_url, user_context, save_browser_session_intent) via PATCH
+      let metadataSaved = true;
       if (editingCredential?.credential_id) {
+        // The partial-save copy below must name exactly the fields in this PATCH,
+        // so gate both on the same condition — flag-off it omits browser/IP.
+        const includesBrowserMemoryFields =
+          browserMemoryEnabled && type === CredentialModalTypes.PASSWORD;
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           await client.patch(
@@ -831,13 +899,24 @@ function CredentialsModal({
               ...(capturedTestUrl && { tested_url: capturedTestUrl }),
               user_context: capturedUserContext?.trim() || null,
               save_browser_session_intent: saveBrowserSessionIntent,
+              // The /update vault path drops these; persist them here so a
+              // profile/IP change made alongside credential values isn't lost.
+              // PASSWORD-only, matching the picker UI and the bmPatch guard.
+              ...(includesBrowserMemoryFields
+                ? {
+                    browser_profile_id: browserProfileId,
+                    pin_saved_session_ip: pinIp,
+                  }
+                : {}),
             },
           );
         } catch {
+          metadataSaved = false;
           toast({
             title: "Partial save",
-            description:
-              "Credential updated, but login instructions could not be saved. Please try editing again.",
+            description: includesBrowserMemoryFields
+              ? "Credential updated, but the login instructions, browser profile, and IP settings could not be saved. Please try editing again."
+              : "Credential updated, but login instructions could not be saved. Please try editing again.",
             variant: "destructive",
           });
         }
@@ -848,6 +927,12 @@ function CredentialsModal({
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
+
+      // The metadata PATCH failed and already surfaced a destructive toast —
+      // don't follow it with a contradictory "Credential updated" success toast.
+      if (!metadataSaved) {
+        return;
+      }
 
       if (
         shouldTestAfterSave &&
@@ -889,6 +974,8 @@ function CredentialsModal({
       proxy_location,
       proxy_session_id,
       rotate_proxy_session_id,
+      browser_profile_id,
+      pin_saved_session_ip,
     }: {
       id: string;
       name: string;
@@ -898,6 +985,8 @@ function CredentialsModal({
       proxy_location?: ProxyLocation | null;
       proxy_session_id?: string | null;
       rotate_proxy_session_id?: boolean;
+      browser_profile_id?: string | null;
+      pin_saved_session_ip?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const body: Record<string, string | boolean | ProxyLocation | null> = {
@@ -920,6 +1009,12 @@ function CredentialsModal({
       }
       if (rotate_proxy_session_id !== undefined) {
         body.rotate_proxy_session_id = rotate_proxy_session_id;
+      }
+      if (browser_profile_id !== undefined) {
+        body.browser_profile_id = browser_profile_id;
+      }
+      if (pin_saved_session_ip !== undefined) {
+        body.pin_saved_session_ip = pin_saved_session_ip;
       }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
@@ -970,9 +1065,29 @@ function CredentialsModal({
     const credentialSaveProxyPinPayload =
       !isEditMode || proxyPinChanged ? proxyPinPayload : {};
 
+    // Only PASSWORD credentials expose the browser-memory UI; card/secret must
+    // not carry these fields (they use proxy-session pinning instead).
+    const browserMemoryFields =
+      browserMemoryEnabled && type === CredentialModalTypes.PASSWORD;
+    // Browser-memory fields (flag-on) count as edits even when secrets aren't
+    // touched, so a profile-only change persists via the PATCH path instead of
+    // being dropped as a rename-only save.
+    const bmChanged =
+      browserMemoryFields &&
+      (browserProfileId !== (editingCredential?.browser_profile_id ?? null) ||
+        pinIp !== (editingCredential?.pin_saved_session_ip ?? false));
+    const bmPatch = browserMemoryFields
+      ? { browser_profile_id: browserProfileId, pin_saved_session_ip: pinIp }
+      : {};
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
-      if (!editingGroups.name && !editingGroups.values && !proxyPinChanged) {
+      if (
+        !editingGroups.name &&
+        !editingGroups.values &&
+        !proxyPinChanged &&
+        !bmChanged
+      ) {
         // Nothing was edited — close silently
         reset();
         setIsOpen(false);
@@ -983,6 +1098,7 @@ function CredentialsModal({
           id: editingCredential.credential_id,
           name,
           ...(proxyPinChanged ? proxyPinPayload : {}),
+          ...bmPatch,
         });
         return;
       }
@@ -1053,6 +1169,7 @@ function CredentialsModal({
         testUrl.trim() !== (editingCredential?.tested_url ?? "");
       saveIntentRef.current = {
         shouldTestAfterSave:
+          !browserMemoryEnabled &&
           testAndSave &&
           (testStatus !== "completed" ||
             (isEditMode && hasCompletedInlineTest)) &&
@@ -1079,6 +1196,12 @@ function CredentialsModal({
         },
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
         ...credentialSaveProxyPinPayload,
+        ...(browserMemoryEnabled
+          ? {
+              browser_profile_id: browserProfileId,
+              pin_saved_session_ip: pinIp,
+            }
+          : {}),
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
       const cardNumber = creditCardCredentialValues.cardNumber.trim();
@@ -1317,6 +1440,118 @@ function CredentialsModal({
     </div>
   );
 
+  const plainProfiles = (
+    plainProfilesPages?.pages.flatMap((p) => p) ?? []
+  ).filter((p) => !p.deleted_at && !p.is_managed && !p.linked_credential_name);
+  // The attached profile becomes credential-linked once saved, so it drops out
+  // of the plain list — surface it explicitly so the Select shows the real pick.
+  const profileOptions =
+    attachedProfile &&
+    !plainProfiles.some(
+      (p) => p.browser_profile_id === attachedProfile.browser_profile_id,
+    )
+      ? [attachedProfile, ...plainProfiles]
+      : plainProfiles;
+
+  const browserProfileModalSection = (
+    <div className="space-y-3">
+      {!isEditMode && (
+        <p className="text-xs text-muted-foreground">
+          Skyvern saves this login’s browser state after the first successful
+          sign-in and keeps it fresh automatically.
+        </p>
+      )}
+      <label className="flex cursor-pointer items-center gap-2 text-sm">
+        <Checkbox
+          checked={pinIp}
+          onCheckedChange={(checked) => setPinIp(checked === true)}
+        />
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                tabIndex={0}
+                className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Keep the same IP for this credential
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-[260px]">
+              Sign-ins with this credential use one dedicated IP, so the saved
+              session stays valid on sites that check for network changes.
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </label>
+      <p className="ml-6 text-xs text-muted-foreground">
+        Helps avoid extra 2FA, captchas, and temporary locks on sites that check
+        for network changes.
+      </p>
+      {pinIp && existingSessionPrefix && (
+        <div className="ml-6 space-y-2">
+          <div className="flex items-center gap-2">
+            <p className="text-xs text-muted-foreground">
+              IP session:{" "}
+              <span className="font-mono text-foreground">
+                {existingSessionPrefix}
+              </span>
+            </p>
+            <HelpTooltip content="This credential reuses one saved network identity so logins stay valid. Rotate to force a fresh one on the next sign-in." />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => setRotateProxyPin(true)}
+              disabled={rotateProxyPin}
+            >
+              Rotate
+            </Button>
+            {rotateProxyPin && (
+              <span className="text-xs text-muted-foreground">
+                A new IP session is created when you save.
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+      {isEditMode && (
+        <div className="space-y-1.5">
+          <Label className="text-sm font-medium">Browser profile</Label>
+          <Select
+            value={browserProfileId ?? AUTO_PROFILE_VALUE}
+            onValueChange={(value) =>
+              setBrowserProfileId(value === AUTO_PROFILE_VALUE ? null : value)
+            }
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={AUTO_PROFILE_VALUE}>
+                Automatic (created at first sign-in)
+              </SelectItem>
+              {profileOptions.map((p) => (
+                <SelectItem
+                  key={p.browser_profile_id}
+                  value={p.browser_profile_id}
+                >
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {browserProfileId && attachAgentCount > 0 && (
+            <p className="text-xs text-amber-500">
+              ⚠︎ {credentialAttachWarning(attachAgentCount)}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -1335,105 +1570,109 @@ function CredentialsModal({
           authenticatorSaveError={authenticatorSaveError}
           beforeCredentialFields={customVaultCheckbox}
           afterUrl={
-            <div className="space-y-3">
-              <div className="flex items-center gap-3">
-                <Checkbox
-                  id="test-and-save"
-                  checked={testAndSave}
-                  onCheckedChange={(checked) =>
-                    setTestAndSave(checked === true)
-                  }
-                  disabled={isTestInProgress}
-                />
-                <Label
-                  htmlFor="test-and-save"
-                  className="cursor-pointer text-sm font-medium"
-                >
-                  Save browser session for future logins
-                </Label>
-                <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
-              </div>
-
-              {testAndSave && (
-                <div className="space-y-1 pl-7">
-                  <Label
-                    htmlFor="user-context"
-                    className="text-xs text-muted-foreground"
-                  >
-                    Login instructions (optional)
-                  </Label>
-                  {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
-                  <Textarea
-                    id="user-context"
-                    value={userContext}
-                    onChange={(e) => setUserContext(e.target.value)}
-                    placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
+            browserMemoryEnabled ? (
+              browserProfileModalSection
+            ) : (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <Checkbox
+                    id="test-and-save"
+                    checked={testAndSave}
+                    onCheckedChange={(checked) =>
+                      setTestAndSave(checked === true)
+                    }
                     disabled={isTestInProgress}
-                    className="min-h-[60px] resize-y"
-                    rows={2}
-                    maxLength={500}
                   />
+                  <Label
+                    htmlFor="test-and-save"
+                    className="cursor-pointer text-sm font-medium"
+                  >
+                    Save browser session for future logins
+                  </Label>
+                  <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
                 </div>
-              )}
 
-              {isTestInProgress && (
-                <div className="space-y-1 pl-7">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <ReloadIcon className="size-4 animate-spin" />
-                    <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
-                  </div>
-                  {testWorkflowRunId && (
-                    <a
-                      href={`/runs/${testWorkflowRunId}/overview`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                {testAndSave && (
+                  <div className="space-y-1 pl-7">
+                    <Label
+                      htmlFor="user-context"
+                      className="text-xs text-muted-foreground"
                     >
-                      <ExternalLinkIcon className="size-3" />
-                      Watch Skyvern test login live
-                    </a>
-                  )}
-                </div>
-              )}
-              {testStatus === "completed" && (
-                <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
-                  <CheckCircledIcon className="size-4" />
-                  <span>
-                    {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
-                  </span>
-                </div>
-              )}
-              {testStatus === "profile_failed" && (
-                <div className="space-y-1 pl-7">
-                  <div className="flex items-center gap-2 text-sm text-destructive">
-                    <CrossCircledIcon className="size-4" />
-                    <span>Browser profile was not saved</span>
+                      Login instructions (optional)
+                    </Label>
+                    {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
+                    <Textarea
+                      id="user-context"
+                      value={userContext}
+                      onChange={(e) => setUserContext(e.target.value)}
+                      placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
+                      disabled={isTestInProgress}
+                      className="min-h-[60px] resize-y"
+                      rows={2}
+                      maxLength={500}
+                    />
                   </div>
-                  {testFailureReason && (
-                    <p className="text-xs text-destructive/70">
-                      {testFailureReason}
-                    </p>
-                  )}
-                </div>
-              )}
-              {testStatus === "failed" && (
-                <div className="space-y-1 pl-7">
-                  <div className="flex items-center gap-2 text-sm text-destructive">
-                    <CrossCircledIcon className="size-4" />
+                )}
+
+                {isTestInProgress && (
+                  <div className="space-y-1 pl-7">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <ReloadIcon className="size-4 animate-spin" />
+                      <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
+                    </div>
+                    {testWorkflowRunId && (
+                      <a
+                        href={`/runs/${testWorkflowRunId}/overview`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                      >
+                        <ExternalLinkIcon className="size-3" />
+                        Watch Skyvern test login live
+                      </a>
+                    )}
+                  </div>
+                )}
+                {testStatus === "completed" && (
+                  <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
+                    <CheckCircledIcon className="size-4" />
                     <span>
-                      {testUrl
-                        ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
-                        : "Unable to save browser session"}
+                      {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
                     </span>
                   </div>
-                  {testFailureReason && (
-                    <p className="text-xs text-destructive/70">
-                      {testFailureReason}
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
+                )}
+                {testStatus === "profile_failed" && (
+                  <div className="space-y-1 pl-7">
+                    <div className="flex items-center gap-2 text-sm text-destructive">
+                      <CrossCircledIcon className="size-4" />
+                      <span>Browser profile was not saved</span>
+                    </div>
+                    {testFailureReason && (
+                      <p className="text-xs text-destructive/70">
+                        {testFailureReason}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {testStatus === "failed" && (
+                  <div className="space-y-1 pl-7">
+                    <div className="flex items-center gap-2 text-sm text-destructive">
+                      <CrossCircledIcon className="size-4" />
+                      <span>
+                        {testUrl
+                          ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
+                          : "Unable to save browser session"}
+                      </span>
+                    </div>
+                    {testFailureReason && (
+                      <p className="text-xs text-destructive/70">
+                        {testFailureReason}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
           }
         />
       );
@@ -1540,8 +1779,11 @@ function CredentialsModal({
     });
   }, [credentialGetter]);
 
-  // Whether the Test button should be shown
+  // Whether the Test button should be shown. Gated off under browser memory —
+  // the flag-on UI has no test-login flow, so legacy test state (restored from an
+  // existing credential) must not resurface the button or run a background test.
   const showTestButton =
+    !browserMemoryEnabled &&
     testAndSave &&
     type === CredentialModalTypes.PASSWORD &&
     (!isEditMode || editingGroups.values);
@@ -1607,7 +1849,10 @@ function CredentialsModal({
           </Alert>
         )}
         {credentialContent}
-        {proxyPinContent}
+        {/* The browser-memory IP checkbox only replaces this for PASSWORD
+            credentials; card/secret keep the proxy-pin UI under the flag. */}
+        {(!browserMemoryEnabled || type !== CredentialModalTypes.PASSWORD) &&
+          proxyPinContent}
 
         <DialogFooter>
           <div className="flex w-full items-center justify-end gap-2">

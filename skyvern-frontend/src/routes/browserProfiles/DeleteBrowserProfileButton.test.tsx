@@ -54,9 +54,9 @@ afterEach(() => {
 });
 
 describe("deleteWarning copy selection", () => {
-  it("warns that a managed profile is the workflow's memory", () => {
+  it("warns that a managed profile is the agent's memory", () => {
     expect(deleteWarning(makeProfile({ is_managed: true }), usage())).toContain(
-      "clears the workflow's remembered browser",
+      "clears the agent's remembered browser",
     );
   });
 
@@ -68,7 +68,7 @@ describe("deleteWarning copy selection", () => {
     expect(warning).toContain("unlinks the saved login from Bank portal");
   });
 
-  it("warns pinned workflows will need repointing for a plain profile", () => {
+  it("warns pinned agents will need repointing for a plain profile", () => {
     const warning = deleteWarning(
       makeProfile(),
       usage({
@@ -77,7 +77,7 @@ describe("deleteWarning copy selection", () => {
         ],
       }),
     );
-    expect(warning).toContain("Workflows pinned to this profile");
+    expect(warning).toContain("Agents pinned to this profile");
   });
 
   it("falls back to a plain unrecoverable-delete warning", () => {
