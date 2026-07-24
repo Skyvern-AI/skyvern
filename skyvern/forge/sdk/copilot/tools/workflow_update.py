@@ -4096,7 +4096,12 @@ def _evaluate_output_contract_for_code_block(
     *,
     allow_static_return_advisory: bool = False,
     enforce_value_bearing_liveness: bool = False,
+    credit_convergence_ceiling: bool = False,
 ) -> _OutputContractEvaluation | None:
+    """`credit_convergence_ceiling` inverts the liveness benefit of the doubt once the steer loop
+    has consumed its budget: a root envelope the static prover reports as "unknown" is credited
+    instead of refused, and the separated-spine structure steer no longer blocks. Provably absent
+    or empty bindings and missing metadata/schema/return coverage keep rejecting unchanged."""
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
@@ -4133,24 +4138,23 @@ def _evaluate_output_contract_for_code_block(
     missing_declaration_return_paths = sorted(declaration_paths - submitted_code_paths)
     shape_violations: list[str] = []
     declaration_only_contract = bool(declaration_paths) and not observation_paths
+
+    def _root_envelope_unproved(paths: set[str]) -> bool:
+        if paths != {_VALUE_BEARING_ROOT_GUIDANCE_PATH}:
+            return False
+        state = _root_output_envelope_state(target_code)
+        return state == "absent" if credit_convergence_ceiling else state != "proven"
+
     if enforce_value_bearing_liveness:
         if contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
-            root_envelope_unproved = (
-                required_paths == {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
-                and _root_output_envelope_state(target_code) != "proven"
-            )
             if (
                 target_block is None
-                or root_envelope_unproved
+                or _root_envelope_unproved(required_paths)
                 or _statically_lacks_value_bearing_observation_paths(target_code, required_paths)
             ):
                 shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
         elif target_block is not None:
-            root_envelope_unproved = (
-                observation_paths == {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
-                and _root_output_envelope_state(target_code) != "proven"
-            )
-            if root_envelope_unproved or _statically_lacks_value_bearing_observation_paths(
+            if _root_envelope_unproved(observation_paths) or _statically_lacks_value_bearing_observation_paths(
                 target_code, observation_paths
             ):
                 shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
@@ -4158,7 +4162,7 @@ def _evaluate_output_contract_for_code_block(
         shape_violations.append("ambiguous_output_owner" if owner_labels else "missing_output_owner")
     elif target_block is None:
         shape_violations.append("missing_output_block")
-    elif required_paths and _scout_spine_requires_separated_blocks(ctx):
+    elif required_paths and not credit_convergence_ceiling and _scout_spine_requires_separated_blocks(ctx):
         synthesized = synthesize_code_block(
             ctx.scout_trajectory,
             strict_selectors=True,
@@ -5102,6 +5106,226 @@ def _stash_output_contract_reject_budget_terminal(
         block_label=block_label,
         canonical_output_contract_signature=signature,
         canonical_required_child_paths=sorted(required_paths),
+    )
+
+
+@dataclass(frozen=True)
+class _OutputContractCeilingResolution:
+    """Outcome of the impose-or-credit move at the convergence ceiling: the draft (possibly
+    rewritten server-side) plus the crediting re-evaluation that admits it."""
+
+    workflow_yaml: str
+    code_artifact_metadata: object
+    evaluation: _OutputContractEvaluation
+    mode: Literal["credited", "imposed"]
+
+
+def _output_contract_binding_source_on_record(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    workflow_yaml: str,
+) -> bool:
+    """Whether the recorded exploration already pins where the requested value lives: either the
+    scout observed the required paths, or a producible loaded-result composition anchors the
+    target block's selectors. Imposition is only justified when this is on record."""
+    binding_paths = evaluation.observation_paths or evaluation.required_paths
+    if binding_paths and _observed_required_output_values(ctx, binding_paths):
+        return True
+    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(evaluation.block_label)
+    if target_block is None:
+        return False
+    return loaded_result_source_producible(
+        ctx.latest_evaluate_result_composition_steer,
+        target_code=str(target_block.get("code") or ""),
+    )
+
+
+def _impose_output_contract_binding_at_ceiling(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    evaluation: _OutputContractEvaluation,
+) -> tuple[str, object] | None:
+    """Compose the required output binding onto the submitted draft using the same static-return
+    and metadata-scaffold composers the steer directives describe to the model. Abstains (returns
+    None) when no value-bearing envelope can be composed, leaving the reject path byte-identical."""
+    label = evaluation.block_label
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return None
+    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(label)
+    if target_block is None:
+        return None
+    target_code = str(target_block.get("code") or "")
+    contract = _output_contract_required_paths_source(ctx)
+    binding_paths = set(contract.union) or _value_bearing_directive_paths(contract)
+    if not binding_paths:
+        return None
+    keyed_code, violations = _extraction_code_with_value_bearing_static_return(
+        target_code,
+        required_paths=binding_paths,
+        declaration_paths=contract.declaration_paths,
+    )
+    if violations:
+        return None
+    imposed_yaml = workflow_yaml
+    if keyed_code != textwrap.dedent(target_code).strip():
+        applied = False
+        for block in _workflow_code_blocks(parsed):
+            if str(block.get("label") or "").strip() == label:
+                block["code"] = keyed_code.rstrip() + "\n"
+                applied = True
+                break
+        if not applied:
+            return None
+        imposed_yaml = yaml.safe_dump(parsed, sort_keys=False)
+    scaffolded_metadata = _apply_metadata_contract_scaffold(
+        ctx,
+        imposed_yaml,
+        raw_code_artifact_metadata,
+        required_paths=contract.observation_paths or (binding_paths - contract.declaration_paths),
+        source=contract.source or evaluation.source,
+        reason_code=contract.reason_code or evaluation.reason_code,
+        declaration_paths=contract.declaration_paths,
+        allow_missing_static_return=True,
+    )
+    return imposed_yaml, scaffolded_metadata
+
+
+def _output_contract_ceiling_reached(ctx: AgentContext, evaluation: _OutputContractEvaluation) -> bool:
+    if not evaluation.canonical_signature or not evaluation.block_label:
+        return False
+    if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
+        return False
+    return _output_contract_reject_count(ctx, evaluation.canonical_signature) + 1 >= _MAX_OUTPUT_CONTRACT_REJECTS
+
+
+def _credit_output_contract_submission(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    actuation_entry: str,
+) -> _OutputContractEvaluation | None:
+    """Credit move: re-adjudicate the submission with static uncertainty credited, so a draft
+    that binds the required paths but that the liveness prover can only call "unknown" ships
+    instead of looping. Returns the crediting evaluation when the strict rejection was
+    over-strict, None when the deficiency is genuine."""
+    credited = _evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        raw_metadata,
+        enforce_value_bearing_liveness=True,
+        credit_convergence_ceiling=True,
+    )
+    if credited is None or credited.has_deficiencies:
+        return None
+    LOG.info(
+        "copilot_output_contract_submission_credited_at_ceiling",
+        block_label=evaluation.block_label,
+        canonical_output_contract_signature=evaluation.canonical_signature,
+        steering_reject_count=_output_contract_reject_count(ctx, evaluation.canonical_signature),
+        credited_shape_violations=list(evaluation.shape_violations),
+        credited_missing_code_return_paths=list(evaluation.missing_return_paths),
+        actuation_entry=actuation_entry,
+    )
+    return credited
+
+
+def _credit_output_contract_submission_at_ceiling(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> _OutputContractEvaluation | None:
+    if not _output_contract_ceiling_reached(ctx, evaluation):
+        return None
+    return _credit_output_contract_submission(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        actuation_entry="reject_ceiling",
+    )
+
+
+def _credit_or_impose_output_contract_at_ceiling(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> _OutputContractCeilingResolution | None:
+    """Impose-or-credit at the convergence ceiling (SKY-12907): once steering has consumed the
+    reject budget on one canonical contract signature, the server stops asking the model."""
+    if not _output_contract_ceiling_reached(ctx, evaluation):
+        return None
+    return _credit_or_impose_output_contract(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        actuation_entry="reject_ceiling",
+    )
+
+
+def _credit_or_impose_output_contract(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    actuation_entry: str,
+) -> _OutputContractCeilingResolution | None:
+    """Credit first — is the strict rejection over-strict for this submission? Impose second —
+    when the recorded exploration pins the value's source, compose the return envelope and
+    metadata scaffold server-side from the same templates the steer directives quote. Returns
+    None when neither move is justified, leaving the caller's reject/ablation path untouched.
+    Armed by the reject ceiling in enforcing mode and by the ablation seam in log-only mode."""
+    credited = _credit_output_contract_submission(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        actuation_entry=actuation_entry,
+    )
+    if credited is not None:
+        return _OutputContractCeilingResolution(
+            workflow_yaml=workflow_yaml,
+            code_artifact_metadata=raw_metadata,
+            evaluation=credited,
+            mode="credited",
+        )
+    if not _output_contract_binding_source_on_record(ctx, evaluation, workflow_yaml):
+        return None
+    imposed = _impose_output_contract_binding_at_ceiling(ctx, workflow_yaml, raw_metadata, evaluation)
+    if imposed is None:
+        return None
+    imposed_yaml, imposed_metadata = imposed
+    reevaluated = _evaluate_output_contract_for_code_block(
+        ctx,
+        imposed_yaml,
+        imposed_metadata,
+        enforce_value_bearing_liveness=True,
+        credit_convergence_ceiling=True,
+    )
+    if reevaluated is None or reevaluated.has_deficiencies:
+        return None
+    _mark_output_contract_imposed(ctx, evaluation.canonical_signature)
+    LOG.info(
+        "copilot_output_contract_binding_imposed_at_ceiling",
+        block_label=evaluation.block_label,
+        canonical_output_contract_signature=evaluation.canonical_signature,
+        steering_reject_count=_output_contract_reject_count(ctx, evaluation.canonical_signature),
+        actuation_entry=actuation_entry,
+    )
+    return _OutputContractCeilingResolution(
+        workflow_yaml=imposed_yaml,
+        code_artifact_metadata=imposed_metadata,
+        evaluation=reevaluated,
+        mode="imposed",
     )
 
 
@@ -6829,6 +7053,18 @@ def _metadata_contract_run_preflight_reject(
         enforce_value_bearing_liveness=True,
     )
     if evaluation is None or not evaluation.has_deficiencies:
+        return None
+    if (
+        _credit_output_contract_submission_at_ceiling(
+            ctx,
+            evaluation,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=raw_code_artifact_metadata,
+        )
+        is not None
+    ):
+        # The steer loop consumed its budget on this contract and the submission satisfies it
+        # under ceiling crediting: let the run proceed instead of re-emitting the directive.
         return None
     if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations:
         _revoke_output_contract_advisory_run(ctx, evaluation.canonical_signature)
@@ -13569,7 +13805,38 @@ async def _update_workflow(
     output_contract_static_advisory_allowed = (
         output_contract_evaluation is not None and output_contract_evaluation.can_attempt_run
     )
+    output_contract_ceiling_resolution: _OutputContractCeilingResolution | None = None
     if (
+        output_contract_evaluation is not None
+        and output_contract_evaluation.has_deficiencies
+        and not output_contract_static_advisory_allowed
+    ):
+        output_contract_ceiling_resolution = _credit_or_impose_output_contract_at_ceiling(
+            ctx,
+            output_contract_evaluation,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=params.get("code_artifact_metadata"),
+        )
+        # Under log-only the reject ceiling never arms (no rejects are counted), so the deficient
+        # draft would persist as-is; arm the same composer at the ablation seam instead.
+        if output_contract_ceiling_resolution is None and copilot_author_time_gate_log_only_enabled(
+            ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID
+        ):
+            output_contract_ceiling_resolution = _credit_or_impose_output_contract(
+                ctx,
+                output_contract_evaluation,
+                workflow_yaml=workflow_yaml,
+                raw_metadata=params.get("code_artifact_metadata"),
+                actuation_entry="log_only_ablation",
+            )
+    if output_contract_ceiling_resolution is not None:
+        workflow_yaml = output_contract_ceiling_resolution.workflow_yaml
+        params["workflow_yaml"] = workflow_yaml
+        params["code_artifact_metadata"] = output_contract_ceiling_resolution.code_artifact_metadata
+        params["raw_code_artifact_metadata"] = output_contract_ceiling_resolution.code_artifact_metadata
+        ctx.raw_code_artifact_metadata = output_contract_ceiling_resolution.code_artifact_metadata
+        output_contract_evaluation = output_contract_ceiling_resolution.evaluation
+    elif (
         output_contract_evaluation is not None
         and output_contract_evaluation.has_deficiencies
         and not output_contract_static_advisory_allowed
@@ -13790,7 +14057,8 @@ async def _update_workflow(
         verified_runtime_output_paths_by_label=_verified_runtime_output_contract_paths_by_label(ctx, workflow_yaml),
         advisory_declared_output_return_shape_labels=(
             {output_contract_evaluation.block_label}
-            if output_contract_static_advisory_allowed and output_contract_evaluation is not None
+            if output_contract_evaluation is not None
+            and (output_contract_static_advisory_allowed or output_contract_ceiling_resolution is not None)
             else None
         ),
     )
