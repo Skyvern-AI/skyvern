@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import random
+import shutil
 import sys
 import textwrap
 import time
@@ -55,6 +56,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import is_temp_working_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts
 from skyvern.forge.sdk.cache import extraction_cache
@@ -63,7 +65,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_parameter_id
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
@@ -165,6 +167,8 @@ from skyvern.schemas.runs import (
     RunType,
     WorkflowRunRequest,
     WorkflowRunResponse,
+    resolve_start_fresh,
+    should_suppress_memory_write,
 )
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFallbackEpisode, ScriptStatus, WorkflowScript
 from skyvern.schemas.workflows import (
@@ -192,8 +196,10 @@ from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_w
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.session_cookies import persist_session_cookies
+from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
+from skyvern.webeye.session_cookies import persist_session_cookies, read_persisted_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -592,6 +598,29 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     suffix = f" (auto-saved: {key})"
     title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
     return f"{title}{suffix}"
+
+
+def _credential_id_from_setup_parameter(parameter: Any, parameter_values: dict[str, Any]) -> str | None:
+    """Resolve the credential id a credential-typed block parameter points at from in-memory run
+    parameters. The per-run rotation selection (keyed by parameter key) wins over the static value.
+    Only credential-typed parameters are consulted, so an unrelated string input can never be mistaken
+    for a credential id."""
+    if isinstance(parameter, CredentialParameter):
+        selected = parameter_values.get(parameter.key)
+        if isinstance(selected, str) and selected:
+            return selected
+        return parameter.credential_id
+    if (
+        isinstance(parameter, WorkflowParameter)
+        and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+    ):
+        selected = parameter_values.get(parameter.key)
+        if isinstance(selected, str) and selected:
+            return selected
+        default_value = parameter.default_value
+        if isinstance(default_value, str) and default_value:
+            return default_value
+    return None
 
 
 class WorkflowService:
@@ -1517,6 +1546,9 @@ class WorkflowService:
                 workflow_request.webhook_callback_url = workflow.webhook_callback_url
             if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
                 workflow_request.extra_http_headers = workflow.extra_http_headers
+            # Capture the caller-supplied browser_profile_id BEFORE the legacy-pin copy below, so the
+            # seed resolver can distinguish an explicit per-run override from a workflow's legacy pin.
+            explicit_request_browser_profile_id = workflow_request.browser_profile_id
             # A credential-fallback retry clears the browser handles so the replacement credential
             # gets a clean session; re-inheriting the workflow's profile/cdp headers here would
             # reconnect the retry to the failed account's persistent-browser-session profile.
@@ -1749,10 +1781,14 @@ class WorkflowService:
                     parameter_values=parameter_values,
                 )
                 parameter_values.update(rotating_credential_selections)
-                workflow_run = await self._prepare_persisted_workflow_browser_profile(
+                workflow_run = await self._resolve_and_stamp_run_seed(
                     workflow=workflow,
                     workflow_run=workflow_run,
                     parameter_values=parameter_values,
+                    explicit_request_browser_profile_id=explicit_request_browser_profile_id,
+                    start_fresh=resolve_start_fresh(
+                        workflow_request.start_fresh_browser, explicit_request_browser_profile_id
+                    ),
                     # Keyless workflows keep best-effort rotation selection; keyed workflows re-raise above.
                     allow_missing_browser_profile_key=(
                         bool(self._get_rotating_credential_parameters(workflow)) and not rotating_credential_selections
@@ -1825,20 +1861,340 @@ class WorkflowService:
             return "value cannot be null"
         return "database error while saving parameter value"
 
-    async def _prepare_persisted_workflow_browser_profile(
+    async def _resolve_and_stamp_run_seed(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        explicit_request_browser_profile_id: str | None,
+        start_fresh: bool = False,
+        allow_missing_browser_profile_key: bool = False,
+    ) -> WorkflowRun:
+        """Resolve the seed-precedence chain at run setup — before any browser creation, for every run
+        type — and stamp the resolved profile plus its provenance (browser_seed_source) on the run.
+        This is where the credential's saved profile is resolved (the mid-run login-block stamp lands
+        too late for code/cached and early-block runs)."""
+        # Resolve once: a run whose seed was already stamped is never re-resolved, so storage state or
+        # a fresh credential selection can never change a settled seed.
+        if workflow_run.browser_seed_source is not None:
+            return workflow_run
+        # A run bound to a live browser session is governed by that session: the browser manager
+        # returns the already-running session rather than loading workflow_run.browser_profile_id, so
+        # resolving/stamping a profile seed here would only record provenance for a profile that was
+        # never loaded. Leave the session (and any profile it propagated) untouched.
+        if workflow_run.browser_session_id:
+            return workflow_run
+        engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run)
+        browser_profile_id, seed_source, sink_browser_profile_id = await self._resolve_run_seed(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            parameter_values=parameter_values,
+            explicit_request_browser_profile_id=explicit_request_browser_profile_id,
+            start_fresh=start_fresh,
+            allow_missing_browser_profile_key=allow_missing_browser_profile_key,
+            engine_enabled=engine_enabled,
+        )
+        updated_workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_profile_id=browser_profile_id,
+            browser_seed_source=seed_source,
+            browser_sink_profile_id=sink_browser_profile_id,
+        )
+        LOG.info(
+            "Resolved run browser seed",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_profile_id=browser_profile_id,
+            browser_seed_source=seed_source,
+            browser_sink_profile_id=sink_browser_profile_id,
+        )
+        # "Keep the same IP" for sign-ins with a credential: if the resolved seed is some credential's
+        # profile and that credential pins its IP, apply its dedicated-IP headers to this run (covers an
+        # explicit pick of a credential profile and rotation, not just seed_source=credential). This is a
+        # new runtime effect (a proxy change), so it rides the engine kill-switch — flag-off keeps today's
+        # proxy behavior exactly and a rollback disables the pin.
+        if not engine_enabled:
+            return updated_workflow_run
+        return await self._maybe_pin_credential_profile_ip(
+            workflow=workflow,
+            workflow_run=updated_workflow_run,
+            parameter_values=parameter_values,
+            seed_profile_id=browser_profile_id,
+            organization_id=workflow_run.organization_id,
+        )
+
+    async def _resolve_run_seed(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        explicit_request_browser_profile_id: str | None,
+        start_fresh: bool = False,
+        allow_missing_browser_profile_key: bool = False,
+        engine_enabled: bool = False,
+    ) -> tuple[str | None, BrowserSeedSource, str | None]:
+        """Resolve which profile SEEDS a run and which profile the run WRITES TO (the sink), returning
+        (seed profile id, source, sink). C-semantics: an explicit pick
+        "always starts there" and never forks into a hidden own profile; template+accumulate applies
+        only when nothing is picked. The sink is None whenever no workflow write should happen (owned /
+        read-only / override / fresh). The Browser Memory engine consumes the sink (never re-derives it)."""
+        if start_fresh:
+            return None, BrowserSeedSource.fresh, None
+        if explicit_request_browser_profile_id:
+            # v32: a run-form override is a pick FOR THAT RUN — under the engine a plain override writes
+            # on success (sink = the override, like any living pick), a credential-owned / foreign override
+            # stays heal-only (no workflow sink). Flag-off keeps the legacy read-only one-run override.
+            override_sink: str | None = None
+            if engine_enabled:
+                override_role, _ = await self._resolve_picked_profile_role(
+                    browser_profile_id=explicit_request_browser_profile_id,
+                    workflow=workflow,
+                    organization_id=workflow_run.organization_id,
+                )
+                override_sink = explicit_request_browser_profile_id if override_role == "plain" else None
+            return explicit_request_browser_profile_id, BrowserSeedSource.override, override_sink
+
+        # A credential-fallback retry deliberately sheds every browser handle for a clean session
+        # (credential_fallback.py) so the fallback credential doesn't reconnect to the failed run's
+        # account. Re-seeding the workflow's config pick / own memory / credential profile here would
+        # undo that, so a fallback retry always seeds fresh.
+        if workflow_run.retried_from_workflow_run_id:
+            return None, BrowserSeedSource.fresh, None
+
+        organization_id = workflow_run.organization_id
+
+        # Explicit workflow pick (workflows.browser_profile_id) wins over browser_profile_key: a key
+        # only selects WHICH own auto-profile applies in the no-pick+persist rows, so returning here —
+        # before the persist/key branch below — makes a key sent alongside a pick deterministically
+        # ignored (the UI keeps them mutually exclusive; the backend stays deterministic).
+        pick = workflow.browser_profile_id
+        if pick:
+            role, _owner_credential_id = await self._resolve_picked_profile_role(
+                browser_profile_id=pick, workflow=workflow, organization_id=organization_id
+            )
+            if role != "missing":
+                # v32: an explicit pick is always LIVING under the engine — a plain pick is seed AND sink
+                # (writes on success); the persist toggle no longer gates the pick sink (read-only picks
+                # cease flag-on). Credential-owned, foreign-auto, and a transient-lookup "error" still take
+                # no workflow sink (heal-only / read-only preserve). Flag-off keeps the legacy persist-
+                # gated behavior byte-for-byte.
+                if engine_enabled:
+                    sink = pick if role == "plain" else None
+                else:
+                    sink = pick if (workflow.persist_browser_session and role == "plain") else None
+                return pick, BrowserSeedSource.picked, sink
+            # A genuinely deleted / cross-org pick: flag-ON falls through to the workflow's own managed
+            # memory below (v32). Flag-OFF must stay byte-for-byte legacy — it kept the configured pick as
+            # the seed and wrote the legacy session archive (sink None), never building the managed profile.
+            if not engine_enabled:
+                return pick, BrowserSeedSource.picked, None
+
+        # No pick + Save ON: the workflow's own auto-profile accumulates (the only place the
+        # credential fall-through survives). The sink is always the own profile — the run forks its own
+        # and never cross-writes the credential.
+        if workflow.persist_browser_session:
+            own_browser_profile_id = await self._ensure_managed_browser_profile(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                parameter_values=parameter_values,
+                allow_missing_browser_profile_key=allow_missing_browser_profile_key,
+            )
+            if own_browser_profile_id:
+                if await self._managed_browser_profile_has_content(
+                    browser_profile_id=own_browser_profile_id, organization_id=organization_id
+                ):
+                    return own_browser_profile_id, BrowserSeedSource.own_memory, own_browser_profile_id
+                # The first-run credential fall-through (row 5) is a flag-OFF fleet behavior change, so it
+                # is engine-gated. Flag-off resolves to the own auto-profile (fresh run 1) and the mid-run
+                # stamp keeps today's path.
+                credential_browser_profile_id = await self._resolve_setup_credential_seed(
+                    workflow=workflow,
+                    parameter_values=parameter_values,
+                    organization_id=organization_id,
+                    engine_enabled=engine_enabled,
+                )
+                if credential_browser_profile_id:
+                    return credential_browser_profile_id, BrowserSeedSource.credential, own_browser_profile_id
+                # Own memory exists but has no content yet. Engine era: seed fresh (run 1) and let the
+                # sink-driven write populate own. Flag-off (legacy compat): seed the managed profile
+                # itself so the legacy finalization writes it — today's Save & Reuse first-run behavior,
+                # byte-for-byte. Returning None flag-off would divert the write to the session archive and
+                # leave the managed profile permanently empty.
+                if not engine_enabled:
+                    return own_browser_profile_id, BrowserSeedSource.own_memory, own_browser_profile_id
+                return None, BrowserSeedSource.own_memory, own_browser_profile_id
+            # own ensure rolled back: fall through to the read-only resolution below.
+
+        # No pick + Save OFF (or own ensure failed): the login credential's profile, read-only, else
+        # fresh. No workflow sink either way (the heal engine keeps the credential profile current).
+        # Engine-gated: seeding a credential's profile at setup for a pre-login block is a flag-OFF
+        # behavior change, so flag-off falls to fresh and the preserved mid-run stamp keeps today's path.
+        credential_browser_profile_id = await self._resolve_setup_credential_seed(
+            workflow=workflow,
+            parameter_values=parameter_values,
+            organization_id=organization_id,
+            engine_enabled=engine_enabled,
+        )
+        if credential_browser_profile_id:
+            return credential_browser_profile_id, BrowserSeedSource.credential, None
+
+        return None, BrowserSeedSource.fresh, None
+
+    async def _resolve_setup_credential_seed(
+        self,
+        *,
+        workflow: Workflow,
+        parameter_values: dict[str, Any],
+        organization_id: str,
+        engine_enabled: bool,
+    ) -> str | None:
+        """Setup-time credential-profile seed, gated on the browser-memory engine. Flag-off returns None
+        so the fleet keeps today's behavior (fresh until the login block's mid-run stamp); the engine era
+        resolves it up front so code/cached and early-block runs seed correctly."""
+        if not engine_enabled:
+            return None
+        return await self._resolve_credential_browser_profile_id_for_setup(
+            workflow=workflow, parameter_values=parameter_values, organization_id=organization_id
+        )
+
+    async def _resolve_picked_profile_role(
+        self, *, browser_profile_id: str, workflow: Workflow, organization_id: str
+    ) -> tuple[str, str | None]:
+        """Classify an explicitly picked profile for the sink decision: "plain" (writable when Save is
+        ON), "credential" (a credential owns it — no workflow sink, but IP-pin may apply), "foreign_auto"
+        (another workflow's own auto — no workflow sink), "missing" (genuinely deleted / cross-org — falls
+        through), or "error" (a lookup FAILURE — the caller preserves the pick read-only rather than
+        silently rerouting an explicit pick to own-auto on a transient DB blip). Returns (role, owner)."""
+        try:
+            profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                profile_id=browser_profile_id, organization_id=organization_id
+            )
+            if not profile:
+                return "missing", None
+            owning_credentials = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+                browser_profile_id=browser_profile_id, organization_id=organization_id
+            )
+            if owning_credentials:
+                return "credential", owning_credentials[0].credential_id
+            if profile.is_managed and profile.workflow_permanent_id != workflow.workflow_permanent_id:
+                return "foreign_auto", None
+            return "plain", None
+        except Exception:
+            LOG.warning(
+                "Failed to classify picked browser profile; preserving the pick (error, not missing)",
+                browser_profile_id=browser_profile_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return "error", None
+
+    async def _resolve_active_credential_pin_for_setup(
+        self, *, workflow: Workflow, parameter_values: dict[str, Any], organization_id: str
+    ) -> tuple[str, str] | None:
+        """The run's active single-login credential's dedicated-IP pin at setup — (credential_id,
+        proxy_session_id) if that credential pins its IP, else None. Same single-unambiguous-login guard
+        as the credential-profile seed (branches / multiple logins defer). B4: this pin wins over the
+        seed profile's own pin (the site tracks IP per account)."""
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
+            return None
+        login_blocks = [b for b in all_blocks if isinstance(b, LoginBlock) and not b.skip_saved_profile]
+        if len(login_blocks) != 1:
+            return None
+        for param in login_blocks[0].parameters:
+            credential_id = _credential_id_from_setup_parameter(param, parameter_values)
+            if not credential_id:
+                continue
+            try:
+                db_cred = await app.DATABASE.credentials.get_credential(
+                    credential_id=credential_id, organization_id=organization_id
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to resolve active credential pin for setup",
+                    credential_id=credential_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    exc_info=True,
+                )
+                continue
+            if db_cred and db_cred.pin_saved_session_ip and db_cred.proxy_session_id:
+                return db_cred.credential_id, db_cred.proxy_session_id
+        return None
+
+    async def _maybe_pin_credential_profile_ip(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+        organization_id: str,
+    ) -> WorkflowRun:
+        """ "Keep the same IP" for sign-ins with a credential. B4: the run's active login credential's
+        pin WINS over the seed profile's own pin (the site tracks IP per account); if the active
+        credential isn't pinned, fall back to the seed profile's owning-credential pin. Best-effort — a
+        failure never blocks setup."""
+        try:
+            if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
+                return workflow_run
+            pin_source = "credential"
+            proxy_session_id: str | None = None
+            pinned_credential_id: str | None = None
+            active = await self._resolve_active_credential_pin_for_setup(
+                workflow=workflow, parameter_values=parameter_values, organization_id=organization_id
+            )
+            if active:
+                pinned_credential_id, proxy_session_id = active
+            elif seed_profile_id:
+                owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+                    browser_profile_id=seed_profile_id, organization_id=organization_id
+                )
+                owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
+                if owner:
+                    proxy_session_id, pinned_credential_id, pin_source = (
+                        owner.proxy_session_id,
+                        owner.credential_id,
+                        "seed_profile",
+                    )
+            if not proxy_session_id:
+                return workflow_run
+            headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
+                dict(workflow_run.extra_http_headers or {}), proxy_session_id
+            )
+            LOG.info(
+                "browser_memory.credential_ip_pin",
+                workflow_run_id=workflow_run.workflow_run_id,
+                pin_source=pin_source,
+                credential_id=pinned_credential_id,
+            )
+            return await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run.workflow_run_id,
+                extra_http_headers=headers,
+                proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to pin credential dedicated IP for run",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
+            return workflow_run
+
+    async def _ensure_managed_browser_profile(
         self,
         *,
         workflow: Workflow,
         workflow_run: WorkflowRun,
         parameter_values: dict[str, Any],
         allow_missing_browser_profile_key: bool = False,
-    ) -> WorkflowRun:
+    ) -> str | None:
+        """Get-or-create the workflow's managed browser profile (own memory), lazily seeding it from
+        the legacy Save & Reuse archive on first creation and reconciling its proxy pin. Returns the
+        profile id, or None when a freshly created row had to be rolled back (seed failed)."""
         if not workflow.persist_browser_session:
-            return workflow_run
-
-        if workflow_run.browser_profile_id:
-            return workflow_run
-
+            return None
         try:
             rendered_key = await self._render_workflow_browser_profile_key(
                 workflow=workflow,
@@ -1884,7 +2240,7 @@ class WorkflowService:
                     profile_id=profile.browser_profile_id,
                     organization_id=workflow_run.organization_id,
                 )
-                return workflow_run
+                return None
 
         await self._reconcile_managed_browser_profile_proxy_pin(
             workflow=workflow,
@@ -1894,18 +2250,81 @@ class WorkflowService:
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
         )
-        updated_workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-            workflow_run_id=workflow_run.workflow_run_id,
-            browser_profile_id=profile.browser_profile_id,
-        )
-        LOG.info(
-            "Stamped workflow run with managed browser profile",
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            browser_profile_id=profile.browser_profile_id,
-            browser_profile_key_digest=digest,
-        )
-        return updated_workflow_run
+        return profile.browser_profile_id
+
+    async def _managed_browser_profile_has_content(self, *, browser_profile_id: str, organization_id: str) -> bool:
+        """Whether the managed profile has a stored archive (a successful write happened). A row with
+        no archive does not count — the seed profile keeps seeding until content exists. Best-effort:
+        on a storage error treat as HAS-content (fail safe), since the probe (browser_profile_exists)
+        returns False on any ClientError, not just 404 — a flaky read must never reseed a Save & Reuse
+        run to fresh and overwrite its real accumulated own-memory at completion."""
+        try:
+            return await app.STORAGE.browser_profile_exists(organization_id, browser_profile_id)
+        except Exception:
+            LOG.warning(
+                "Failed to check managed browser profile content; treating as has-content (fail safe)",
+                browser_profile_id=browser_profile_id,
+                exc_info=True,
+            )
+            return True
+
+    async def _resolve_credential_browser_profile_id_for_setup(
+        self,
+        *,
+        workflow: Workflow,
+        parameter_values: dict[str, Any],
+        organization_id: str,
+    ) -> str | None:
+        """Setup-time (pre-persist) variant of the login-block credential-profile resolution: reads the
+        run's selected credential from the in-memory parameter values (rotation selections keyed by
+        parameter key) rather than the DB, so the credential's saved profile can seed the run before
+        any browser is created.
+
+        Only resolves when a single login block makes the credential unambiguous. With multiple login
+        blocks (e.g. one per conditional branch) the executing block is unknown at setup, so resolution
+        is deferred to the mid-run login-block stamp rather than risk seeding the wrong account."""
+        # Setup can't know which branch a run takes, so only seed the credential when execution of a
+        # single login is guaranteed: no conditional branching anywhere, and exactly one top-level
+        # login block. Anything else (branches, nested/multiple logins) defers to the mid-run stamp,
+        # which resolves the login that actually runs. This keeps the common linear case working while
+        # never booting the wrong account on a branch that skips the login.
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
+            return None
+        # Count over ALL blocks (not just top level): a login nested in a non-conditional container
+        # (e.g. a for-loop) still executes, so it must count toward the single-login guarantee or a
+        # top-level + nested pair would seed the wrong account instead of deferring to the mid-run stamp.
+        login_blocks = [block for block in all_blocks if isinstance(block, LoginBlock) and not block.skip_saved_profile]
+        if len(login_blocks) != 1:
+            return None
+        for param in login_blocks[0].parameters:
+            credential_id = _credential_id_from_setup_parameter(param, parameter_values)
+            if not credential_id:
+                continue
+            try:
+                db_cred = await app.DATABASE.credentials.get_credential(
+                    credential_id=credential_id,
+                    organization_id=organization_id,
+                )
+                if not (db_cred and db_cred.browser_profile_id):
+                    continue
+                # Verify the profile still exists (mirrors the mid-run resolver). Best-effort: a
+                # transient repository failure degrades to a fresh seed rather than failing setup.
+                profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=db_cred.browser_profile_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to resolve credential browser profile for setup seed",
+                    credential_id=credential_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    exc_info=True,
+                )
+                continue
+            if profile:
+                return db_cred.browser_profile_id
+        return None
 
     async def _reconcile_managed_browser_profile_proxy_pin(
         self,
@@ -3821,6 +4240,14 @@ class WorkflowService:
                         organization_id=organization_id,
                     )
 
+            await self._bank_login_block_credential_profile(
+                block=block,
+                workflow_run=workflow_run,
+                workflow_run_block_result=workflow_run_block_result,
+                block_executed_with_code=block_executed_with_code,
+                organization_id=organization_id,
+            )
+
             # Extract branch metadata for conditional blocks
             if isinstance(block, ConditionalBlock) and workflow_run_block_result:
                 branch_metadata = cast(dict[str, Any] | None, workflow_run_block_result.output_parameter_value)
@@ -4421,6 +4848,79 @@ class WorkflowService:
                 exc_info=True,
             )
 
+    async def _login_block_performed_fresh_login(
+        self,
+        *,
+        workflow_run_block_result: BlockResult,
+        organization_id: str,
+    ) -> bool:
+        """A fresh sign-in typed a credential (INPUT_TEXT) or a 2FA code (VERIFICATION_CODE); a run
+        already logged in via the seeded profile completes the check-if-logged-in goal with neither."""
+        wrb_id = workflow_run_block_result.workflow_run_block_id
+        if not wrb_id:
+            return False
+        wrb = await app.DATABASE.observer.get_workflow_run_block(
+            workflow_run_block_id=wrb_id, organization_id=organization_id
+        )
+        if not wrb or not wrb.task_id:
+            return False
+        actions = await app.DATABASE.tasks.get_task_actions(task_id=wrb.task_id, organization_id=organization_id)
+        return any(action.action_type in (ActionType.INPUT_TEXT, ActionType.VERIFICATION_CODE) for action in actions)
+
+    async def _bank_login_block_credential_profile(
+        self,
+        *,
+        block: BlockTypeVar,
+        workflow_run: WorkflowRun,
+        workflow_run_block_result: BlockResult | None,
+        block_executed_with_code: bool,
+        organization_id: str,
+    ) -> None:
+        """After an agent-executed LoginBlock completes, bank the run's selected credential profile
+        (cloud-only via AGENT_FUNCTION; no-op in OSS). Cached/code replays do not bank in v1."""
+        if (
+            not isinstance(block, LoginBlock)
+            or block_executed_with_code
+            or workflow_run_block_result is None
+            or workflow_run_block_result.status != BlockStatus.completed
+        ):
+            return
+        try:
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run.workflow_run_id)
+            if browser_state is None:
+                return
+            credential_ids = await self._resolve_login_block_credential_ids(
+                block=block,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+            )
+            if not credential_ids:
+                return
+            performed_fresh_login = await self._login_block_performed_fresh_login(
+                workflow_run_block_result=workflow_run_block_result,
+                organization_id=organization_id,
+            )
+            if performed_fresh_login:
+                # A verified sign-in this run makes its end-state authoritative: the sink write-back
+                # freshness guard then keeps the full write instead of a delta-merge.
+                browser_state.browser_artifacts.mark_run_performed_fresh_login()
+            # A login block binds one selected credential (rotation resolves to one);
+            # multi-distinct-credential blocks bank the first — revisit if that shape appears.
+            await app.AGENT_FUNCTION.bank_credential_profile_after_login(
+                workflow_run=workflow_run,
+                browser_state=browser_state,
+                credential_id=credential_ids[0],
+                performed_fresh_login=performed_fresh_login,
+                login_url=block.url,
+            )
+        except Exception:
+            LOG.warning(
+                "Credential living-profile banking after login failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
+
     async def _prepare_login_block_browser_profile(
         self,
         *,
@@ -4430,6 +4930,35 @@ class WorkflowService:
         organization_id: str,
         browser_session_id: str | None,
     ) -> WorkflowRun:
+        # An explicit per-run override wins over the login block's credential profile. Short-circuit
+        # BEFORE the credential proxy-pin so an override profile is never loaded through the credential's
+        # IP-bound proxy, and never clobbered mid-run (retries key on browser_seed_source == override).
+        # Engine-gated like the own_memory/picked guard below: flag-off keeps the legacy credential-load
+        # path byte-for-byte; the credential mid-run path stays for the other, behavior-neutral sources.
+        if (
+            workflow_run.browser_seed_source == BrowserSeedSource.override
+            and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run)
+        ):
+            return workflow_run
+
+        # A start_fresh_browser run boots empty and reads no saved memory by contract, so the mid-run
+        # login-block must not load the credential's profile. Keyed on the persisted request flag, not
+        # seed_source==fresh (which also covers ordinary no-credential and deferred multi-login runs
+        # where the mid-run load is designed). The field is new, so this holds flag-off too — no legacy
+        # run sets it.
+        if workflow_run.start_fresh_browser:
+            return workflow_run
+
+        # Engine era: the seed decision is settled at setup. A run already seeded from a real
+        # non-credential source (own memory or an explicit pick) must NOT run the mid-run credential
+        # machinery — flipping the settled seed to `credential` would re-arm the healthy-run whole-dir
+        # bank against the SHARED credential profile (a cross-profile write). Flag-off is untouched.
+        if workflow_run.browser_seed_source in (
+            BrowserSeedSource.own_memory,
+            BrowserSeedSource.picked,
+        ) and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run):
+            return workflow_run
+
         await self._apply_login_block_credential_proxy_pin(
             block=block,
             workflow_run=workflow_run,
@@ -4493,29 +5022,58 @@ class WorkflowService:
                     browser_profile_id=resolved_browser_profile_id,
                     url=block.url,
                 )
-                # Persist the browser_profile_id on the workflow_run so
-                # subsequent blocks create / reuse a browser with the
-                # saved profile (cookies, localStorage, etc.).
-                await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run_id,
-                    browser_profile_id=resolved_browser_profile_id,
-                )
-                workflow_run = (
-                    await app.DATABASE.workflow_runs.get_workflow_run(
+                # A prior block may already have opened this run's browser; get_or_create_for_workflow_run
+                # then returns that cached context and ignores browser_profile_id, so the credential
+                # profile never loads. Stamping the run credential-seeded in that case would let the
+                # healthy-run bank whole-dir the unrelated context into the shared credential profile.
+                # Only credential-seed when we will actually load the profile into a fresh browser;
+                # otherwise degrade to fresh — the credential seed holds only when its
+                # profile loaded.
+                browser_already_open = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id) is not None
+                if browser_already_open:
+                    LOG.warning(
+                        "Credential login block reached with a browser already open; running fresh login "
+                        "instead of credential-seeding to avoid banking an unrelated context",
                         workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
+                        block_label=block.label,
+                        credential_browser_profile_id=resolved_browser_profile_id,
                     )
-                    or workflow_run
-                )
+                    await app.DATABASE.workflow_runs.update_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        browser_profile_id=None,
+                        browser_seed_source=BrowserSeedSource.degraded_fresh,
+                    )
+                    # Reload so the returned object reflects the degraded_fresh downgrade (mirrors the
+                    # else-branch) — the healthy-run bank reads browser_seed_source off this object, and a
+                    # stale "credential" would bank an unrelated context into the shared credential profile.
+                    workflow_run = (
+                        await app.DATABASE.workflow_runs.get_workflow_run(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                        )
+                        or workflow_run
+                    )
+                else:
+                    # Persist the browser_profile_id on the workflow_run so subsequent blocks create /
+                    # reuse a browser with the saved profile. The seed is normally resolved at setup now;
+                    # this mid-run stamp records credential provenance.
+                    await app.DATABASE.workflow_runs.update_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        browser_profile_id=resolved_browser_profile_id,
+                        browser_seed_source=BrowserSeedSource.credential,
+                    )
+                    workflow_run = (
+                        await app.DATABASE.workflow_runs.get_workflow_run(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                        )
+                        or workflow_run
+                    )
 
-                # Create the browser with the saved profile and navigate
-                # to the login block's URL.  When a saved-profile credential
-                # is selected, the user is guided to enter the post-login
-                # target URL (e.g. homepage/dashboard) rather than the
-                # login page.  The saved cookies will authenticate the
-                # session once the page loads.
-                profile_loaded = bool(block.url)
-                if block.url:
+                # Create the browser with the saved profile and navigate to the login block's URL. The
+                # user enters the post-login target URL; the saved cookies authenticate once it loads.
+                profile_loaded = bool(block.url) and not browser_already_open
+                if block.url and not browser_already_open:
                     try:
                         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                             workflow_run=workflow_run,
@@ -4544,10 +5102,20 @@ class WorkflowService:
                             exc_info=True,
                         )
                         profile_loaded = False
-                        # Clear the profile so the normal login path doesn't reuse it
+                        # Clear the profile so the normal login path doesn't reuse it, and record the
+                        # degraded state (a resolved profile failed to load; the run continues fresh)
+                        # so the run detail can surface it instead of the old silent fallback.
                         await app.DATABASE.workflow_runs.update_workflow_run(
                             workflow_run_id=workflow_run_id,
                             browser_profile_id=None,
+                            browser_seed_source=BrowserSeedSource.degraded_fresh,
+                        )
+                        workflow_run = (
+                            await app.DATABASE.workflow_runs.get_workflow_run(
+                                workflow_run_id=workflow_run_id,
+                                organization_id=organization_id,
+                            )
+                            or workflow_run
                         )
 
                 if not profile_loaded:
@@ -4858,7 +5426,7 @@ class WorkflowService:
         """Asymmetric LoginBlock credential-profile decision: debug-session runs
         attach the visible PBS only when its saved profile matches the credential
         profile; mismatches surface a reason for downstream warning + fall-through."""
-        is_debug_run = workflow_run.debug_session_id is not None
+        is_debug_run = workflow_run.is_debug_session
         if not is_debug_run:
             return DebugSessionProfileDecision(
                 attach_browser_session_id=None,
@@ -6128,6 +6696,7 @@ class WorkflowService:
                     organization_id=organization_id,
                     browser_session_id=workflow_request.browser_session_id,
                     browser_profile_id=browser_profile_id,
+                    start_fresh_browser=workflow_request.start_fresh_browser,
                     proxy_location=workflow_request.proxy_location,
                     webhook_callback_url=workflow_request.webhook_callback_url,
                     totp_verification_url=workflow_request.totp_verification_url,
@@ -6181,13 +6750,18 @@ class WorkflowService:
                         credential_parameter_overrides=run_credential_parameter_overrides,
                         parameter_values=self._profile_key_render_values(workflow, workflow_request),
                     )
-                    forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
-                        workflow=workflow,
-                        organization_id=organization_id,
-                        workflow_request=workflow_request,
-                        effective_proxy_location=effective_proxy_location,
-                        extra_parameter_values=rotating_credential_selections,
-                    )
+                    # A start_fresh_browser run boots an empty browser and reads no saved memory, so the
+                    # forced session must not load the workflow's managed profile (an explicit per-run
+                    # override still wins over the fresh flag). Leaving forced_browser_profile_id None
+                    # creates the forced session without a profile.
+                    if not resolve_start_fresh(workflow_request.start_fresh_browser, browser_profile_id):
+                        forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
+                            workflow=workflow,
+                            organization_id=organization_id,
+                            workflow_request=workflow_request,
+                            effective_proxy_location=effective_proxy_location,
+                            extra_parameter_values=rotating_credential_selections,
+                        )
                 except Exception:
                     LOG.warning(
                         "Failed to resolve managed browser profile for forced browser session",
@@ -6245,6 +6819,7 @@ class WorkflowService:
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             browser_profile_id=browser_profile_id,
+            start_fresh_browser=workflow_request.start_fresh_browser,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
@@ -7396,6 +7971,7 @@ class WorkflowService:
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
+            browser_seed_source=workflow_run.browser_seed_source,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
@@ -7460,12 +8036,55 @@ class WorkflowService:
         close_browser_on_completion: bool,
         workflow_run_status: WorkflowRunStatus | None = None,
     ) -> None:
+        effective_workflow_run_status = workflow_run_status or workflow_run.status
+
+        if browser_state and effective_workflow_run_status == WorkflowRunStatus.completed:
+            # Credential living-profile healthy-run write (cloud-only, seed==sink only, kill-switched).
+            # Runs regardless of persist_browser_session so the zero-config credential path also banks.
+            await app.AGENT_FUNCTION.bank_credential_profile_on_healthy_run(
+                workflow_run=workflow_run,
+                browser_state=browser_state,
+            )
+
+        # A debug (Studio) play must not write back through the legacy own-memory seam and overwrite
+        # known-good memory. Gated on the browser-memory engine flag so flag-off orgs keep today's
+        # behavior until broad rollout (staged semantics); both call sites route through here.
+        if await app.AGENT_FUNCTION.should_skip_debug_profile_writeback(workflow_run):
+            LOG.info(
+                "Skipped legacy browser-session write-back for debug session (browser memory engine)",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            return
+
+        # A run that opted into a fresh browser (start_fresh_browser) boots without saved state and,
+        # by contract, writes none of its own memory back. The engine era enforces this via a NULL sink;
+        # this gate enforces the same for the flag-off legacy path. Credential banking above is
+        # deliberately unaffected (a verified fresh sign-in still banks).
+        if should_suppress_memory_write(workflow_run.start_fresh_browser):
+            return
+
+        # Engine era: the seed resolver already decided this run's sink (the picked plain profile or the
+        # workflow's own auto-profile, or None for read-only/heal-only/fresh runs). Consume it, never
+        # re-derive from the seed. Flag-off orgs fall through to the byte-for-byte legacy write-back.
+        if await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run):
+            await self._persist_run_sink_profile_if_needed(
+                workflow_run=workflow_run,
+                browser_state=browser_state,
+                close_browser_on_completion=close_browser_on_completion,
+                effective_workflow_run_status=effective_workflow_run_status,
+            )
+            await self._materialize_own_profile_pick_if_needed(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                effective_workflow_run_status=effective_workflow_run_status,
+            )
+            return
+
         if not (
             browser_state and workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir
         ):
             return
 
-        effective_workflow_run_status = workflow_run_status or workflow_run.status
         if effective_workflow_run_status != WorkflowRunStatus.completed:
             LOG.info(
                 "Skipped persisting browser session for non-completed workflow run",
@@ -7533,6 +8152,219 @@ class WorkflowService:
                 "Persisted browser session for workflow run",
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_session_storage_key=browser_session_storage_key,
+            )
+
+    async def _persist_run_sink_profile_if_needed(
+        self,
+        *,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState | None,
+        close_browser_on_completion: bool,
+        effective_workflow_run_status: WorkflowRunStatus,
+    ) -> None:
+        """Engine-era workflow write-back: whole-dir persist the run's RESOLVED sink profile
+        (workflow_run.browser_sink_profile_id — the picked plain profile with save on, or the workflow's
+        own auto-profile). A None sink means the run has no workflow sink (read-only pick, a credential
+        or foreign-workflow heal target, an API override, or fresh) and nothing is written here — the
+        credential heal engine, when it applies, already ran above."""
+        sink_profile_id = workflow_run.browser_sink_profile_id
+        if not (sink_profile_id and browser_state and browser_state.browser_artifacts.browser_session_dir):
+            return
+        if browser_state.browser_artifacts._seed_load_failed:
+            # The seed profile failed to launch (corruption/stale lock) and the run fell back to a blank
+            # dir; its end-state is not this profile's, so writing it back would erase the saved archive.
+            LOG.warning(
+                "Skipped persisting sink browser profile — seed failed to load, run used a fallback dir",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+            )
+            return
+        if effective_workflow_run_status != WorkflowRunStatus.completed:
+            LOG.info(
+                "Skipped persisting browser sink profile for non-completed workflow run",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_run_status=effective_workflow_run_status,
+            )
+            return
+        if not close_browser_on_completion:
+            await persist_session_cookies(
+                browser_state.browser_context,
+                browser_state.browser_artifacts.browser_session_dir,
+            )
+        artifacts = browser_state.browser_artifacts
+        if artifacts._seed_capture_failed and not artifacts._run_performed_fresh_login:
+            # The seed fingerprint is UNKNOWN (capture errored) and this run did not itself perform a
+            # verified login, so we can't tell whether a concurrent run moved the sink — never full-
+            # overwrite (mirrors the write-time etag-read skip). Delta-merge only our own cookie changes
+            # if a seed snapshot exists; otherwise skip the write rather than clobber a concurrent one.
+            if await self._delta_merge_sink_profile(
+                workflow_run=workflow_run, sink_profile_id=sink_profile_id, browser_state=browser_state
+            ):
+                return
+            LOG.warning(
+                "Sink profile write-back skipped — seed fingerprint uncaptured, cannot safely full-write",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+            )
+            return
+        try:
+            changed = await self._sink_profile_changed_under_run(workflow_run, sink_profile_id, browser_state)
+        except Exception:
+            # A storage error reading the current fingerprint means we can't tell whether a concurrent
+            # run wrote the profile. Skip this run's write-back — no write beats a possibly-clobbering
+            # full overwrite (delta-merge is unavailable when storage is flaky); the profile self-corrects
+            # on the next healthy run.
+            LOG.warning(
+                "Sink profile write-back skipped — storage error reading the current fingerprint",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+                exc_info=True,
+            )
+            return
+        if changed:
+            if await self._delta_merge_sink_profile(
+                workflow_run=workflow_run, sink_profile_id=sink_profile_id, browser_state=browser_state
+            ):
+                return
+            # The sink archive moved under this run (a concurrent writer) but the delta-merge was
+            # unavailable (retrieve returned None on a swallowed transient error, or an empty sidecar).
+            # A full write here would clobber that concurrent write, so skip — the profile self-corrects
+            # on the next healthy run.
+            LOG.warning(
+                "Sink profile write-back skipped — sink moved under run and merge unavailable",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+            )
+            return
+        await app.STORAGE.store_browser_profile(
+            workflow_run.organization_id,
+            profile_id=sink_profile_id,
+            directory=browser_state.browser_artifacts.browser_session_dir,
+        )
+        LOG.info(
+            "Persisted resolved sink browser profile for workflow run",
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_profile_id=sink_profile_id,
+            browser_seed_source=workflow_run.browser_seed_source,
+        )
+
+    async def _sink_profile_changed_under_run(
+        self, workflow_run: WorkflowRun, sink_profile_id: str, browser_state: BrowserState
+    ) -> bool:
+        """B2 freshness guard, part 1: did the sink profile's stored archive move since this run seeded it,
+        while this run did NOT itself perform a verified login? True means a concurrent run wrote the
+        profile (e.g. a fresher login) and our end-state may carry a stale session — so the caller must
+        merge only our own cookie changes instead of clobbering the whole archive. A verified login this
+        run, an unknown seed fingerprint, or an unchanged archive all keep the existing full write."""
+        artifacts = browser_state.browser_artifacts
+        if artifacts._run_performed_fresh_login:
+            return False
+        seed_etag = artifacts._seed_profile_etag
+        if seed_etag is None:
+            return False
+        current_etag = await app.STORAGE.get_browser_profile_etag(workflow_run.organization_id, sink_profile_id)
+        return current_etag is not None and current_etag != seed_etag
+
+    async def _delta_merge_sink_profile(
+        self, *, workflow_run: WorkflowRun, sink_profile_id: str, browser_state: BrowserState
+    ) -> bool:
+        """B2 freshness guard, part 2: contribute only the cookies THIS run changed (end-state vs our seed
+        snapshot) into the profile's CURRENT stored state, preserving the concurrent write. Returns True
+        when the merge handled the write-back (caller skips the full write); False to fall back to it."""
+        seed_cookies = browser_state.browser_artifacts._seed_cookie_snapshot
+        if seed_cookies is None:
+            return False
+        browser_context = browser_state.browser_context
+        live_cookies: list[dict] | None = None
+        try:
+            if browser_context is not None:
+                live_cookies = [dict(cookie) for cookie in await browser_context.cookies()]
+        except Exception:
+            live_cookies = None
+        if live_cookies is not None:
+            end_state_cookies = live_cookies
+        else:
+            # The context was already closed on completion (the common terminal path). close() persists
+            # the end-state session cookies to the session-dir sidecar first, so read those rather than
+            # skipping to a clobbering full write. Session cookies only — a run that changed a
+            # persistent cookie without touching a session cookie still full-writes; tighten if observed.
+            end_state_cookies = read_persisted_session_cookies(browser_state.browser_artifacts.browser_session_dir)
+            if not end_state_cookies:
+                return False
+        delta = cookie_delta(end_state_cookies, seed_cookies)
+        if not delta:
+            # Our stale session changed nothing the concurrent write didn't already carry — leave its
+            # archive intact rather than overwrite it with ours.
+            LOG.info(
+                "Sink profile moved under run with no own cookie changes; skipped write-back",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+            )
+            return True
+        current_dir = await app.STORAGE.retrieve_browser_profile(workflow_run.organization_id, sink_profile_id)
+        if not current_dir:
+            return False
+        try:
+            # base_values = our seed → per-key three-way so a fresher concurrent write to the same
+            # cookie key survives instead of being clobbered by our (stale) delta value.
+            union_cookies_into_profile_dir(delta, current_dir, base_values=seed_cookie_values(seed_cookies))
+            await app.STORAGE.store_browser_profile(
+                workflow_run.organization_id,
+                profile_id=sink_profile_id,
+                directory=current_dir,
+            )
+        finally:
+            # retrieve_browser_profile extracts a cookie-bearing archive into TEMP_PATH; drop it so a
+            # conflicting merge doesn't leak a full profile onto worker disk. Guard against LocalStorage,
+            # which returns the LIVE profile dir (outside TEMP_PATH) — never delete that.
+            if is_temp_working_dir(current_dir):
+                shutil.rmtree(current_dir, ignore_errors=True)
+        LOG.info(
+            "Delta-merged run cookie changes into concurrently-updated sink profile",
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_profile_id=sink_profile_id,
+            delta_cookie_count=len(delta),
+        )
+        return True
+
+    async def _materialize_own_profile_pick_if_needed(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        effective_workflow_run_status: WorkflowRunStatus,
+    ) -> None:
+        """B3 virtual-then-real: on the FIRST successful engine run of a persist-ON, no-pick workflow
+        whose sink is its own auto-profile, promote that profile to the workflow's real pick (set
+        workflows.browser_profile_id) so the FE's virtual "<agent>'s profile" becomes a concrete pick. No
+        backfill and no storage copy — the row and its own-memory storage already exist. Concurrent-safe
+        and idempotent (atomic set-if-unset); best-effort — a failure never blocks completion."""
+        if effective_workflow_run_status != WorkflowRunStatus.completed:
+            return
+        if workflow.browser_profile_id is not None or not workflow.persist_browser_session:
+            return
+        if workflow_run.browser_seed_source != BrowserSeedSource.own_memory:
+            return
+        sink_profile_id = workflow_run.browser_sink_profile_id
+        if not sink_profile_id:
+            return
+        try:
+            materialized = await app.DATABASE.workflows.link_workflow_browser_profile_if_unset(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow_run.organization_id,
+                browser_profile_id=sink_profile_id,
+            )
+            if materialized:
+                LOG.info(
+                    "browser_memory.own_profile_materialized",
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    browser_profile_id=sink_profile_id,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to materialize own-profile pick",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
             )
 
     async def clean_up_workflow(
@@ -7706,6 +8538,7 @@ class WorkflowService:
             screenshot_urls=workflow_run_status_response.screenshot_urls,
             failure_reason=workflow_run_status_response.failure_reason,
             app_url=app_url,
+            browser_seed_source=workflow_run.browser_seed_source,
             script_run=workflow_run_status_response.script_run,
             created_at=workflow_run_status_response.created_at,
             modified_at=workflow_run_status_response.modified_at,
@@ -7720,6 +8553,7 @@ class WorkflowService:
                 webhook_url=workflow_run.webhook_callback_url or None,
                 totp_url=workflow_run.totp_verification_url or None,
                 totp_identifier=workflow_run.totp_identifier,
+                start_fresh_browser=bool(workflow_run.start_fresh_browser),
             ),
             errors=workflow_run_status_response.errors,
             step_count=workflow_run_status_response.total_steps,
@@ -8241,6 +9075,8 @@ class WorkflowService:
                     if "pin_saved_session_ip" in request.model_fields_set
                     else existing_latest_workflow.pin_saved_session_ip,
                     browser_profile_id=request.browser_profile_id,
+                    # Inherit the configured seed profile when a client omits the field (e.g. a schema
+                    # predating it); explicit null still clears it. Matches pin_saved_session_ip above.
                     browser_profile_key=request.browser_profile_key,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,

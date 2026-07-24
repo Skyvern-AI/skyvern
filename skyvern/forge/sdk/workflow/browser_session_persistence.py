@@ -27,6 +27,19 @@ async def retrieve_persisted_workflow_browser_state_dir(
             if session_dir:
                 return session_dir
 
+    # v32 engine: a plain picked profile is the run's living sink — seed AND sink, written on success
+    # even without persist_browser_session. browser_sink_profile_id is set only when the run wrote a
+    # workflow profile, so it holds the run's saved end-state. Engine-gated: the legacy write-back never
+    # touches the pick, so a flag-off run's sink would be untouched starting state.
+    sink_profile_id = workflow_run.browser_sink_profile_id
+    if sink_profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run):
+        session_dir = await app.STORAGE.retrieve_browser_profile(
+            organization_id=organization_id,
+            profile_id=sink_profile_id,
+        )
+        if session_dir:
+            return session_dir
+
     browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
         workflow=workflow,
         workflow_run=workflow_run,

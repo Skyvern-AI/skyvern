@@ -5,7 +5,7 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
@@ -27,8 +27,21 @@ def workflow_request_body_from_existing_run(
         webhook_callback_url=workflow_run.webhook_callback_url,
         totp_verification_url=workflow_run.totp_verification_url,
         totp_identifier=workflow_run.totp_identifier,
-        browser_session_id=workflow_run.browser_session_id,
-        browser_profile_id=workflow_run.browser_profile_id,
+        # A fresh run created under FORCE_BROWSER_SESSION carries a generated PBS on browser_session_id;
+        # replaying it into the retry alongside start_fresh_browser trips the mutually-exclusive validator.
+        # Fresh intent wins — omit the session id so the retry re-resolves a fresh browser.
+        browser_session_id=(None if workflow_run.start_fresh_browser else workflow_run.browser_session_id),
+        # A retry re-resolves the seed instead of pinning a runtime-stamped profile (the old bug: a
+        # credential/own-memory profile stamped at setup would ride into the retry as a fake override,
+        # suppressing re-resolution and write-back). Only a genuine per-run override propagates. Legacy
+        # rows (seed source unknown) keep today's propagate behavior so pre-S retries don't regress.
+        browser_profile_id=(
+            workflow_run.browser_profile_id
+            if workflow_run.browser_seed_source in (None, BrowserSeedSource.override)
+            else None
+        ),
+        # The original request's fresh-browser intent propagates to the retry (re-resolves fresh).
+        start_fresh_browser=bool(workflow_run.start_fresh_browser),
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         max_elapsed_time_minutes=workflow_run.max_elapsed_time_minutes,
         extra_http_headers=workflow_run.extra_http_headers,
@@ -189,6 +202,9 @@ async def get_workflow_run_response(
         include_step_count=True,
     )
     app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
+    # A fresh run reads/writes no saved memory; its run_request echoes start_fresh_browser and drops the
+    # session/profile so it stays valid (the mutually-exclusive validators) and reflects what was asked.
+    fresh_browser = bool(workflow_run.start_fresh_browser)
     return WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -209,6 +225,7 @@ async def get_workflow_run_response(
         ai_fallback=workflow_run.ai_fallback,
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         script_run=workflow_run.script_run,
         script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
@@ -222,8 +239,9 @@ async def get_workflow_run_response(
             totp_identifier=workflow_run.totp_identifier,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             browser_address=workflow_run.browser_address,
-            browser_profile_id=workflow_run.browser_profile_id,
-            browser_session_id=workflow_run.browser_session_id,
+            browser_profile_id=None if fresh_browser else workflow_run.browser_profile_id,
+            browser_session_id=None if fresh_browser else workflow_run.browser_session_id,
+            start_fresh_browser=fresh_browser,
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,

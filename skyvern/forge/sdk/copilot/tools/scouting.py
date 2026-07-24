@@ -486,6 +486,68 @@ async def _resolve_scout_role_name(
     return "", ""
 
 
+# Attributes the one-shot probe always reads off a resolved element, recorded only when that probe
+# succeeded. An attribute absent from a fingerprint carrying this marker proves the element has none;
+# without the marker (probe failed, element gone, older record) absence stays undecidable and fails closed.
+# `label` is excluded: it is only read via `label[for=id]`, so its absence does not prove there is no label.
+_FINGERPRINT_PROBED_ATTRS = "id,name,placeholder,tag,test_id,type"
+
+
+def _element_fingerprint_expression(css_selector: str) -> str:
+    """Capture element identity fingerprint (tag, id, name, type, placeholder, data-testid, label) for
+    credential-fill resolution. Returns attributes only, never values."""
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        f"  const el = document.querySelector({sel});"
+        "  if (!el) return null;"
+        "  const attr = (name) => el.getAttribute(name) || '';"
+        "  const result = {"
+        "    tag: (el.tagName || '').toLowerCase(),"
+        "    id: attr('id'),"
+        "    name: attr('name'),"
+        "    type: attr('type'),"
+        "    placeholder: attr('placeholder'),"
+        "    test_id: attr('data-testid'),"
+        "  };"
+        "  const label = document.querySelector(`label[for=\"${attr('id')}\"]`);"
+        "  if (label) result.label = (label.textContent || '').trim().slice(0, 200);"
+        "  return result;"
+        "})()"
+    )
+
+
+async def _capture_element_fingerprint(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> dict[str, str]:
+    """Capture element identity fingerprint (id, name, type, placeholder, label, test-id, tag)
+    for credential-fill resolution. Returns empty dict on failure, never None."""
+    selector = _selector_text(selector)
+    if not selector:
+        return {}
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return {}
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _element_fingerprint_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {}
+    fingerprint = (result.get("data") or {}).get("result")
+    if not isinstance(fingerprint, dict):
+        return {}
+    captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
+    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
+    return captured
+
+
 def _capped_with_eviction_accounting(
     items: list[ScoutedInteraction],
     *,
@@ -619,6 +681,14 @@ def _record_scouted_interaction(
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
+    element_fingerprint_id: str | None = None,
+    element_fingerprint_name: str | None = None,
+    element_fingerprint_type: str | None = None,
+    element_fingerprint_placeholder: str | None = None,
+    element_fingerprint_label: str | None = None,
+    element_fingerprint_test_id: str | None = None,
+    element_fingerprint_tag: str | None = None,
+    element_fingerprint_probed: str | None = None,
     ambiguous: bool = False,
     dynamic_row_evidence: ScoutedDynamicRowEvidence | None = None,
 ) -> None:
@@ -665,6 +735,22 @@ def _record_scouted_interaction(
         artifact["credential_field"] = credential_field
     if credential_name:
         artifact["credential_name"] = credential_name
+    if element_fingerprint_id:
+        artifact["element_fingerprint_id"] = element_fingerprint_id
+    if element_fingerprint_name:
+        artifact["element_fingerprint_name"] = element_fingerprint_name
+    if element_fingerprint_type:
+        artifact["element_fingerprint_type"] = element_fingerprint_type
+    if element_fingerprint_placeholder:
+        artifact["element_fingerprint_placeholder"] = element_fingerprint_placeholder
+    if element_fingerprint_label:
+        artifact["element_fingerprint_label"] = element_fingerprint_label
+    if element_fingerprint_test_id:
+        artifact["element_fingerprint_test_id"] = element_fingerprint_test_id
+    if element_fingerprint_tag:
+        artifact["element_fingerprint_tag"] = element_fingerprint_tag
+    if element_fingerprint_probed:
+        artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
     if dynamic_row_evidence is not None:

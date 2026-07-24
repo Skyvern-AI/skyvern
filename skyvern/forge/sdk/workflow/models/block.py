@@ -23,6 +23,7 @@ import zipfile
 from collections import defaultdict, deque
 from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
+from functools import partial
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
@@ -3578,6 +3579,119 @@ class CodeBlockOTPError(Exception):
     """Sanitized OTP-primitive error: never includes the identifier, URL, code, or seed."""
 
 
+class CodeBlockCaptchaError(Exception):
+    """Sanitized CAPTCHA-primitive error with no site, selector, vendor, or token details."""
+
+
+_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
+    (
+        'input[type="checkbox"][id*="captcha" i]',
+        'input[type="checkbox"][id*="robot" i]',
+        'input[type="checkbox"][name*="captcha" i]',
+        '[role="checkbox"][aria-label*="robot" i]',
+        '[role="checkbox"][aria-label*="verify" i]',
+    )
+)
+_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR = ", ".join(
+    (
+        ".g-recaptcha",
+        ".cf-turnstile",
+        ".g-recaptcha[data-sitekey]",
+        ".cf-turnstile[data-sitekey]",
+        'iframe[src*="recaptcha" i]',
+        'iframe[src*="turnstile" i]',
+        'iframe[title*="recaptcha" i]',
+        'iframe[title*="challenge" i]',
+    )
+)
+_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR = ", ".join(
+    (
+        ".g-recaptcha",
+        '[data-sitekey][class*="recaptcha" i]',
+        'iframe[src*="recaptcha" i]',
+        'iframe[title*="recaptcha" i]',
+    )
+)
+_CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
+    (
+        "[data-challenge-state] button[type='submit']",
+        "[data-challenge-state] button.btn-primary",
+        "[data-challenge-state] [data-action='verify']",
+        "[data-captcha-widget] button[type='submit']",
+        "[data-captcha-widget] button.btn-primary",
+        "[data-captcha-widget] [data-action='verify']",
+    )
+)
+
+
+async def _bounded_code_block_locator_count(locator: Any) -> int:
+    try:
+        return await asyncio.wait_for(locator.count(), timeout=1.0)
+    except Exception:
+        return 0
+
+
+async def _code_block_solve_captcha_builtin(
+    page: Page | RecordingPage,
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> None:
+    """Solve a detected challenge through the bounded platform ladder.
+
+    The initial structural probes are intentionally cheap. Solver routes are never
+    called when neither a challenge control nor vendor marker is present.
+    """
+    checkbox = page.locator(_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR)
+    checkbox_count = await _bounded_code_block_locator_count(checkbox)
+    marker = page.locator(_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR)
+    marker_count = await _bounded_code_block_locator_count(marker)
+    if checkbox_count == 0 and marker_count == 0:
+        return
+
+    if checkbox_count == 1:
+        candidate = checkbox.first
+        try:
+            if await candidate.is_visible() and await candidate.is_enabled():
+                await candidate.click()
+                await page.wait_for_timeout(100)
+                if await candidate.is_checked() or await _bounded_code_block_locator_count(checkbox) == 0:
+                    continuation = page.locator(_CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR)
+                    if await _bounded_code_block_locator_count(continuation) == 1:
+                        continuation_candidate = continuation.first
+                        if await continuation_candidate.is_visible() and await continuation_candidate.is_enabled():
+                            await continuation_candidate.click()
+                            await page.wait_for_timeout(100)
+                            if await _bounded_code_block_locator_count(checkbox) == 0:
+                                return
+                    else:
+                        # Checkbox challenges commonly complete on the checkbox
+                        # interaction itself and expose no associated continuation.
+                        return
+        except Exception:
+            LOG.info("code block CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
+
+    try:
+        if await app.AGENT_FUNCTION.auto_solve_captchas(page):
+            return
+    except Exception:
+        LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
+
+    recaptcha = page.locator(_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR)
+    if await _bounded_code_block_locator_count(recaptcha) > 0:
+        try:
+            if await app.AGENT_FUNCTION.solve_recaptcha_token(
+                page,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+            ):
+                return
+        except Exception:
+            LOG.info("code block CAPTCHA token arm did not solve", arm="token")
+
+    raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+
+
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
     fresh_key = workflow_run_context.generate_random_secret_id()
     workflow_run_context.secrets[fresh_key] = value
@@ -3735,6 +3849,7 @@ class CodeBlock(Block):
             "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
             "otp": _code_block_otp_builtin,
+            "solve_captcha": _code_block_solve_captcha_builtin,
         }
 
     def generate_async_user_function(
@@ -3755,6 +3870,11 @@ class CodeBlock(Block):
         code = textwrap.indent(textwrap.dedent(code), "    ")
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
+        safe_vars["solve_captcha"] = partial(
+            _code_block_solve_captcha_builtin,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+        )
         parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():

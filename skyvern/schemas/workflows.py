@@ -844,8 +844,14 @@ class CodeBlockYAML(BlockYAML):
 
     code: str
     parameter_keys: list[str] | None = None
-    prompt: str | None = None
-    steps: list[CodeBlockStepYAML] | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Plain-language goal of this code block, shown as the block's Goal in the editor",
+    )
+    steps: list[CodeBlockStepYAML] | None = Field(
+        default=None,
+        description="Plain-language step outline mapped to code line ranges; derived from the code when omitted",
+    )
 
     @model_validator(mode="before")
     @classmethod

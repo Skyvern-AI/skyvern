@@ -24,6 +24,7 @@ from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
 from .mcp_hooks import _verify_scout_type_landed
 from .scouting import (
+    _capture_element_fingerprint,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
@@ -244,10 +245,17 @@ async def _fill_credential_field_impl(
     source_url = _consume_scout_source_url(copilot_ctx)
     landing_failure = await _verify_scout_type_landed(copilot_ctx, selector=selector, typed_length=len(value))
     if landing_failure is not None:
+        LOG.info(
+            "copilot fill_credential_field did not land",
+            selector=selector,
+            credential_id=credential_id,
+            field=field,
+        )
         return finish(landing_failure)
     url = await _live_working_page_url(copilot_ctx) or ""
     _mark_pending_browser_interaction_observation(copilot_ctx, tool_name="fill_credential_field", url=url)
     role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
+    fingerprint = await _capture_element_fingerprint(copilot_ctx, selector)
     _record_scouted_interaction(
         copilot_ctx,
         tool_name="fill_credential_field",
@@ -259,7 +267,21 @@ async def _fill_credential_field_impl(
         credential_id=credential_id,
         credential_field=field,
         credential_name=credential_name,
+        element_fingerprint_id=fingerprint.get("id"),
+        element_fingerprint_name=fingerprint.get("name"),
+        element_fingerprint_type=fingerprint.get("type"),
+        element_fingerprint_placeholder=fingerprint.get("placeholder"),
+        element_fingerprint_label=fingerprint.get("label"),
+        element_fingerprint_test_id=fingerprint.get("test_id"),
+        element_fingerprint_tag=fingerprint.get("tag"),
+        element_fingerprint_probed=fingerprint.get("probed"),
     )
+    if fingerprint:
+        LOG.info(
+            "element_fingerprint_captured",
+            selector=selector,
+            fingerprint_keys=list(fingerprint.keys()),
+        )
     observation_step, _ = await _register_scout_interaction_observation(
         copilot_ctx, tool_name="fill_credential_field", selector=selector, source_url=source_url, url=url
     )

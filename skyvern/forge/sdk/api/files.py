@@ -637,6 +637,17 @@ def make_temp_directory(
     return tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=temp_dir)
 
 
+def is_temp_working_dir(path: str) -> bool:
+    """A working copy under the Skyvern temp root — a fresh temp dir or a storage extraction (S3/GCS/
+    Azure) — is safe to delete. LocalStorage.retrieve_browser_profile returns the LIVE profile dir
+    (outside TEMP_PATH); deleting that erases saved state. Fail closed on any doubt — leaking a temp
+    dir beats destroying live state."""
+    try:
+        return Path(path).resolve().is_relative_to(Path(settings.TEMP_PATH).resolve())
+    except Exception:
+        return False
+
+
 def create_named_temporary_file(delete: bool = True, file_name: str | None = None) -> tempfile._TemporaryFileWrapper:
     temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)
