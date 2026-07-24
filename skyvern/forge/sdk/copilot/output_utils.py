@@ -222,7 +222,7 @@ def _summarize_extracted_data(extracted: Any) -> str:
         if not extracted:
             return "Extracted empty list."
         if isinstance(extracted[0], dict):
-            keys = sorted(extracted[0].keys())
+            keys = sorted({k for item in extracted if isinstance(item, dict) for k in item})
             return f"Extracted {len(extracted)} items. Keys: {', '.join(keys)}"
         return f"Extracted list with {len(extracted)} items."
     if isinstance(extracted, dict):
@@ -478,7 +478,7 @@ def _describe_value_shape(value: Any) -> str:
         if not value:
             return "empty list"
         if isinstance(value[0], dict):
-            keys = sorted(value[0].keys())
+            keys = sorted({k for item in value if isinstance(item, dict) for k in item})
             return f"list of {len(value)} items, keys: {', '.join(keys)}"
         return f"list of {len(value)} items"
     if isinstance(value, dict):

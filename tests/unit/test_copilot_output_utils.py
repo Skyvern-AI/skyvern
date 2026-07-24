@@ -236,6 +236,18 @@ class TestSanitization:
         assert data["action_trace_summary"] == ["click #submit failed"]
         assert data["current_url"] == "https://example.test"
 
+    def test_run_blocks_extracted_data_summary_unions_keys_across_items(self) -> None:
+        # extracted_data is summarized to a shape string; a list whose later
+        # items carry extra keys must report them all, not just item[0]'s.
+        result = {
+            "ok": True,
+            "data": {
+                "blocks": [{"label": "extract", "extracted_data": [{"a": 1}, {"a": 1, "b": 2, "c": 3}]}],
+            },
+        }
+        sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+        assert sanitized["data"]["blocks"][0]["extracted_data"] == "Extracted 2 items. Keys: a, b, c"
+
 
 class TestSummarizeToolResult:
     @staticmethod
@@ -448,6 +460,22 @@ class TestSummarizeToolResult:
             {"ok": True, "data": {"result": None}},
         )
         assert summary == "Evaluated JavaScript"
+
+    def test_evaluate_heterogeneous_list_reports_keys_from_all_items(self) -> None:
+        # Later rows often carry fields the first row lacks; the shape must
+        # union every key so the bullet does not understate the result.
+        summary = self._summarize(
+            "evaluate",
+            {
+                "ok": True,
+                "data": {"result": [{"name": "a"}, {"name": "b", "href": "x", "price": 1}]},
+            },
+        )
+        assert "list" in summary
+        assert "2" in summary
+        assert "name" in summary
+        assert "href" in summary
+        assert "price" in summary
 
     def test_failure_strips_http_headers_blob(self) -> None:
         # Failure summaries must never embed an HTTP-response-headers dict.
