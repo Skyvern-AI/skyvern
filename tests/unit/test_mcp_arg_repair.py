@@ -75,3 +75,12 @@ async def test_json_array_string_raw_arguments_is_not_masked() -> None:
     # A JSON-*array* string is not an object payload; it must still error.
     res = await _call("skyvern_block_schema", {"raw_arguments": '["navigation"]'})
     _assert_invalid_input(res, ["raw_arguments"])
+
+
+@pytest.mark.asyncio
+async def test_oversized_raw_arguments_string_is_not_parsed_at_boundary() -> None:
+    # Bound pre-validation work on remote input. Leaving the wrapper untouched
+    # makes the existing argument validator reject it as unsupported.
+    huge = '{"block_type":"' + "n" * 60_000 + '"}'
+    res = await _call("skyvern_block_schema", {"raw_arguments": huge})
+    _assert_invalid_input(res, ["raw_arguments"])

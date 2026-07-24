@@ -22,6 +22,9 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 
 LOG = structlog.get_logger(__name__)
 
+# Bound work on attacker-controlled strings before argument validation.
+_MAX_COERCE_STR_LEN = 50_000
+
 
 def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
     """Lift args wrapped in a stray *sole* ``raw_arguments`` object to the top level.
@@ -35,13 +38,15 @@ def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
     Restricted to the sole-key case on purpose: if real sibling args sit next to
     ``raw_arguments`` the call is ambiguous (the blob may be garbage, or duplicate
     a top-level arg), so it is left to error rather than merging stray keys into
-    an otherwise-valid call. A non-object ``raw_arguments`` is likewise left to
-    error instead of being silently swallowed.
+    an otherwise-valid call. A non-object or over-long ``raw_arguments`` is
+    likewise left to error instead of being silently swallowed.
     """
     if list(arguments) != ["raw_arguments"]:
         return
     raw = arguments["raw_arguments"]
     if isinstance(raw, str):
+        if len(raw) > _MAX_COERCE_STR_LEN:
+            return
         try:
             raw = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
