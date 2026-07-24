@@ -38,6 +38,7 @@ class RunStatus(StrEnum):
     terminated = "terminated"
     completed = "completed"
     canceled = "canceled"
+    paused = "paused"
 
     def is_final(self) -> bool:
         return self.value in TERMINAL_STATUSES
