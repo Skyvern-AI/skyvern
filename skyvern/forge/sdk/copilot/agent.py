@@ -102,7 +102,10 @@ from skyvern.forge.sdk.copilot.context import (
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
-from skyvern.forge.sdk.copilot.credential_literal_rebind import rebind_scouted_credential_literals
+from skyvern.forge.sdk.copilot.credential_literal_rebind import (
+    rebind_scouted_credential_literals,
+    scouted_credential_targets,
+)
 from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -3893,7 +3896,18 @@ def _inline_replace_workflow_credential_verdict(
     if inline_rebind.changed:
         workflow_yaml = inline_rebind.workflow_yaml
         action_data["workflow_yaml"] = workflow_yaml
-        LOG.info("copilot inline REPLACE_WORKFLOW rebound scouted credential literals")
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW rebound scouted credential literals",
+            credential_literals_rebound=bool(inline_rebind.rebound),
+            authored_credential_fills=[list(pair) for pair in inline_rebind.authored],
+        )
+    for skip in inline_rebind.skips:
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW credential authoring skipped",
+            stage=skip.stage,
+            selector=skip.selector,
+            targets_present=len(scouted_credential_targets(ctx.scout_trajectory)),
+        )
     raw_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         response_type=resp_type,
@@ -3904,6 +3918,14 @@ def _inline_replace_workflow_credential_verdict(
         output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
     )
     hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
+    if inline_rebind.residual_selectors and hard_block_verdict.allowed:
+        # This path bypasses the update_workflow guardrail, and the output-policy scan does not catch a bare
+        # `page.fill(sel, ...)`, so an inline secret the rebind could not neutralize would slip through here.
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW credential residual raw fill fail-closed",
+            residual_raw_credential_fill_selectors=list(inline_rebind.residual_selectors),
+        )
+        hard_block_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
     if not hard_block_verdict.allowed:
         _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, hard_block_verdict)
     return workflow_yaml, raw_verdict, hard_block_verdict

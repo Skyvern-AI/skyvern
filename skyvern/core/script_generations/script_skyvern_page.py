@@ -664,6 +664,15 @@ class ScriptSkyvernPage(SkyvernPage):
                 exc_info=True,
             )
 
+    async def capture_action_screenshot(self) -> None:
+        """Persist a SCREENSHOT_ACTION of the current page as timeline-visible evidence.
+
+        Same persistence path as the per-action hook, callable on demand so a script can
+        record a screenshot at a specific moment (e.g. a confirmed submission). The run
+        timeline renders SCREENSHOT_ACTION / SCREENSHOT_LLM only, never SCREENSHOT_FINAL.
+        """
+        await self._create_screenshot_after_execution()
+
     @classmethod
     async def _create_html_action_after_execution(cls) -> None:
         """Create an HTML_ACTION artifact after action execution.
