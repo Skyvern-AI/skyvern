@@ -476,7 +476,7 @@ function WorkflowPage() {
                             />
                           )}
                           <TableCell className="font-mono text-xs text-muted-foreground">
-                            <div className="flex min-w-0 items-center gap-2">
+                            <div className="flex flex-col gap-1">
                               <span className="min-w-0 truncate">
                                 {workflowRunId}
                               </span>
