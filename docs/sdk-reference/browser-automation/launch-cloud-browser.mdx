@@ -39,6 +39,8 @@ await browser.close();
 |-------------------|----------------|------|----------|---------|-------------|
 | `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (5–1440). |
 | `proxy_location` | `proxyLocation` | `ProxyLocation` | No | `None` / `undefined` | Geographic proxy location for browser traffic. |
+| `extensions` | `extensions` | `list[Extensions]` / `Extensions[]` | No | `None` / `undefined` | Browser extensions to install in the session. Options: `"ad-blocker"`, `"captcha-solver"`. |
+| `browser_profile_id` | `browserProfileId` | `str` / `string` | No | `None` / `undefined` | Load a [browser profile](/sdk-reference/browser-profiles/create-browser-profile) (cookies, localStorage) into the session. ID starts with `bp_`. |
 
 ## Returns `SkyvernBrowser`
 
