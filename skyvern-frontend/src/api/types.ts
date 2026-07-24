@@ -1029,6 +1029,7 @@ export type CredentialApiResponse = {
   credential_type: "password" | "credit_card" | "secret";
   name: string;
   browser_profile_id?: string | null;
+  pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
@@ -1072,6 +1073,8 @@ export type CreateCredentialRequest = {
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
   rotate_proxy_session_id?: boolean;
+  browser_profile_id?: string | null;
+  pin_saved_session_ip?: boolean;
 };
 
 export type PasswordCredential = {

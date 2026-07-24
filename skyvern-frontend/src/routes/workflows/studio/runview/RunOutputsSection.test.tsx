@@ -152,6 +152,23 @@ describe("RunOutputsSection run outputs", () => {
     // The nested block output renders the collapsible searchable tree.
     expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
   });
+
+  test("renders code-only outputs with no extracted information, files, or errors", () => {
+    render(
+      <RunOutputsSection
+        {...baseProps}
+        outputs={{
+          get_stars_output: { star_count: 22600, evidence_text: "22.6k stars" },
+          extracted_information: [],
+        }}
+      />,
+    );
+
+    // The early return must not swallow a code-only run's returned values.
+    expect(screen.getByText("Run outputs")).not.toBeNull();
+    expect(screen.getAllByText("get_stars_output").length).toBeGreaterThan(0);
+    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+  });
 });
 
 describe("RunOutputsSection task 2.0 and webhook surfaces", () => {
