@@ -4809,7 +4809,10 @@ workflow_definition:
             tested_url="https://bank.example/login",
             credential_type=CredentialType.PASSWORD,
         )
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        credentials = SimpleNamespace(
+            get_credentials=AsyncMock(return_value=[credential]),
+            get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        )
         monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
 
         async def handler(**kwargs):
