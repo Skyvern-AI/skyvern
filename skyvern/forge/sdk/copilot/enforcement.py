@@ -2022,7 +2022,7 @@ _AGGRESSIVE_PRUNE_TAIL = 7
 
 def aggressive_prune(items: list[Any]) -> list[Any]:
     """Emergency prune: drop ALL screenshots, keep original message + last ~3
-    tool call/output pairs + latest nudge."""
+    tool call/output pairs + latest nudge, prioritizing pair-valid history."""
     if not items:
         return items
 
@@ -2034,7 +2034,31 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         if len(tail) >= _AGGRESSIVE_PRUNE_TAIL:
             break
     tail.reverse()
-    return [items[0]] + tail
+    opening = items[0]
+    opening_call_id = _item_field(opening, "call_id")
+    seen_call_ids: set[str] = (
+        {opening_call_id}
+        if _item_field(opening, "type") == "function_call" and isinstance(opening_call_id, str)
+        else set()
+    )
+    retained_tail: list[Any] = []
+    orphaned_output_dropped = False
+    for item in tail:
+        item_type = _item_field(item, "type")
+        call_id = _item_field(item, "call_id")
+        if item_type == "function_call_output" and call_id not in seen_call_ids:
+            orphaned_output_dropped = True
+            continue
+        retained_tail.append(item)
+        if item_type == "function_call" and isinstance(call_id, str):
+            seen_call_ids.add(call_id)
+
+    LOG.info(
+        "copilot_aggressive_prune_pair_validity",
+        retained_tail=[_item_field(item, "type") for item in retained_tail],
+        orphaned_output_dropped=orphaned_output_dropped,
+    )
+    return [opening, *retained_tail]
 
 
 def _is_context_window_error(exc: BaseException) -> bool:

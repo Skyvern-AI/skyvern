@@ -365,11 +365,18 @@ def _default_credential_pause_timeout_seconds() -> int:
     return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
 
 
+def _default_token_budget() -> int:
+    qa_token_budget = settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET
+    if not settings.is_cloud_environment() and qa_token_budget is not None:
+        return qa_token_budget
+    return DEFAULT_TOKEN_BUDGET
+
+
 @dataclass(slots=True)
 class CopilotConfig:
     prompt_template: str = DEFAULT_PROMPT_TEMPLATE
     max_turns: int = DEFAULT_MAX_TURNS
-    token_budget: int = DEFAULT_TOKEN_BUDGET
+    token_budget: int = field(default_factory=_default_token_budget)
     security_rules: str = ""
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
