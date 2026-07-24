@@ -451,6 +451,7 @@ def _draft_only_credential_ctx() -> CopilotContext:
         allow_update_workflow=True,
         allow_run_blocks=False,
         allow_missing_credentials_in_draft=True,
+        credential_draft_deferred_explicitly=True,
         resolved_credentials=[
             SimpleNamespace(
                 credential_id="cred_missing",
