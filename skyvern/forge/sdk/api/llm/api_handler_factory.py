@@ -1835,7 +1835,9 @@ class LLMAPIHandlerFactory:
                     content = response.choices[0].message.content if response.choices else None
                     parsed_response = content or ""
                 else:
-                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                    parsed_response = parse_api_response(
+                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                    )
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -2391,7 +2393,9 @@ class LLMAPIHandlerFactory:
                     content = response.choices[0].message.content if response.choices else None
                     parsed_response = content or ""
                 else:
-                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                    parsed_response = parse_api_response(
+                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                    )
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -2992,7 +2996,9 @@ class LLMCaller:
             if raw_response:
                 return response.model_dump(exclude_none=True)
 
-            parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
+            parsed_response = parse_api_response(
+                response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
+            )
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if should_persist_llm_artifacts:
                 if _should_bundle:

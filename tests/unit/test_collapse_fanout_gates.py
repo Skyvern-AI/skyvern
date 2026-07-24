@@ -1,10 +1,12 @@
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import posthog
 import pytest
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
@@ -60,6 +62,7 @@ def _task(*, organization_id: str | None = "o_123", workflow_run_id: str | None 
         workflow_run_id=workflow_run_id,
         workflow_permanent_id="wpid_012",
         task_id="tsk_789",
+        url=None,
     )
 
 
@@ -139,6 +142,7 @@ async def test_collapse_family_flag_evaluation_includes_workflow_permanent_id(
     assert family_properties == {
         "organization_id": "o_123",
         "workflow_permanent_id": expected_wpid,
+        "script_mode": "false",
     }
     assert _umbrella_calls(provider) == []
 
@@ -405,3 +409,85 @@ async def test_collapse_umbrella_error_pins_run_to_control(monkeypatch: pytest.M
             },
         )
     ]
+
+
+async def _run_deterministic_custom_select(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: FakeExperimentationProvider,
+    logger: CaptureLogger,
+) -> None:
+    _set_provider(monkeypatch, provider)
+    monkeypatch.setattr(handler, "LOG", logger)
+    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+
+    async def _raise_before_click(element_id: str) -> Any:
+        raise RuntimeError("stop before click")
+
+    await handler._select_deterministic_custom_option(
+        target_value="Blocked",
+        get_option_candidates=lambda: [
+            {"label": "Blocked", "value": "Blocked", "element_id": "opt1", "is_choice_input": False}
+        ],
+        field_context={"field": "Status"},
+        page=MagicMock(),
+        get_skyvern_element=_raise_before_click,
+        task=_task(),
+        execute=True,
+    )
+
+
+def _custom_select_outcomes(logger: CaptureLogger) -> list[dict[str, Any]]:
+    return [kwargs for _, event, kwargs in logger.records if event == "custom_select_family_outcome"]
+
+
+@pytest.mark.asyncio
+async def test_script_mode_skips_umbrella_but_honors_family_kill_switch_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeExperimentationProvider({CUSTOM_FLAG: True}, raises_for={UMBRELLA_FLAG})
+    logger = CaptureLogger()
+
+    with skyvern_context.scoped(SkyvernContext(script_mode=True)):
+        await _run_deterministic_custom_select(monkeypatch, provider, logger)
+
+    family_calls = [call for call in provider.calls if call[1] == CUSTOM_FLAG]
+    assert family_calls and family_calls[0][3]["script_mode"] == "true"
+    assert _umbrella_calls(provider) == []
+    (outcome,) = _custom_select_outcomes(logger)
+    assert outcome["script_mode"] is True
+    assert outcome["family_gate_enabled"] is True
+    assert outcome["assigned"] is True
+    assert outcome["eligible"] is True
+    assert outcome["match_tier"] == "exact"
+    assert outcome["outcome"] == "llm_fallback_pre_click_error"
+
+
+@pytest.mark.asyncio
+async def test_script_mode_family_flag_off_still_kills_deterministic_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeExperimentationProvider({CUSTOM_FLAG: False})
+    logger = CaptureLogger()
+
+    with skyvern_context.scoped(SkyvernContext(script_mode=True)):
+        await _run_deterministic_custom_select(monkeypatch, provider, logger)
+
+    (outcome,) = _custom_select_outcomes(logger)
+    assert outcome["script_mode"] is True
+    assert outcome["family_gate_enabled"] is False
+    assert outcome["outcome"] == "llm_fallback_family_off"
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_flag_off_keeps_custom_select_llm_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = FakeExperimentationProvider({CUSTOM_FLAG: False})
+    logger = CaptureLogger()
+
+    with skyvern_context.scoped(SkyvernContext()):
+        await _run_deterministic_custom_select(monkeypatch, provider, logger)
+
+    assert [call for call in provider.calls if call[1] == CUSTOM_FLAG]
+    (outcome,) = _custom_select_outcomes(logger)
+    assert outcome["script_mode"] is False
+    assert outcome["family_gate_enabled"] is False
+    assert outcome["outcome"] == "llm_fallback_family_off"

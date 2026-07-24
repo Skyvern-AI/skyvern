@@ -263,6 +263,15 @@ Runtime facts:
   login form or an already-authenticated page anchor; only fill username/password
   when the login fields are visible, and after submit wait for a logged-in page
   anchor instead of relying only on `networkidle`.
+- After a credentialed login submit or navigation commit, call
+  `await solve_captcha(page)` before waiting for post-login anchors. This helper
+  owns any platform-managed verification challenge; do not locate or interact
+  with challenge controls directly.
+- After challenge handling, wait for either the observed one-time-code field or
+  a real authenticated-page anchor. If an OTP field appears, fill it with
+  `await <credential_key>.otp()`, submit the observed Next/Verify control, and
+  then wait for the authenticated anchor. Do not treat disappearance of the
+  login fields as proof of authentication.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
 - For an extraction-intent `code` block, propose a typed `extraction_schema` (named

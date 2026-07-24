@@ -85,7 +85,11 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
+from skyvern.forge.sdk.api.llm.exceptions import (
+    LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE,
+    LLM_PROVIDER_ERROR_TYPE,
+    LLMResponseMissingActionsError,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
@@ -240,19 +244,28 @@ class _PromptCeilingExceeded(Exception):
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
 
-# Exception types that indicate an LLM-specific step failure (context window, provider errors).
+# Exception types that indicate an LLM-specific step failure (context window, provider errors,
+# unusable responses).
 # Used by summary_failure_reason_for_max_retries to distinguish LLM failures from browser/runtime crashes.
 _LLM_STEP_EXCEPTIONS = frozenset(
     {
         "SkyvernContextWindowExceededError",
         "LLMProviderError",
         "LLMProviderErrorRetryableTask",
+        "LLMResponseMissingActionsError",
     }
 )
 
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": reasoning}]
+
+
+def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
+    actions_payload = json_response.get("actions")
+    if not isinstance(actions_payload, list):
+        raise LLMResponseMissingActionsError(list(json_response.keys()))
+    return actions_payload
 
 
 # Phrases the verifier / validator LLMs use when they rely on exact-string
@@ -2356,7 +2369,7 @@ class ForgeAgent:
                             actions = otp_actions
                         else:
                             actions = parse_actions(
-                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                                task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
                             )
 
                     if context:
@@ -5982,12 +5995,13 @@ class ForgeAgent:
                         f"The task failed because all {max_retries} retry attempts failed to generate actions. "
                         f"This is typically caused by the page content exceeding the LLM context window, "
                         f"LLM service errors during action extraction (rate limiting, service outages), "
-                        f"or oversized input data. Please reduce the page content or input data size and try again."
+                        f"a malformed model response that could not be parsed into actions, "
+                        f"or oversized input data. If the input is large, try reducing the page content or input data size."
                     ),
                     errors=[],
                     failure_categories=_llm_error_category(
                         "All retry steps failed without producing actions — "
-                        "LLM context window exceeded or provider error during action extraction."
+                        "LLM context window exceeded, malformed response, or provider error during action extraction."
                     ),
                     failure_category_source="code_level",
                 )
@@ -6395,7 +6409,9 @@ class ForgeAgent:
             json_response = await self.handle_potential_verification_code(
                 task, step, scraped_page, browser_state, json_response
             )
-            actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+            actions = parse_actions(
+                task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
+            )
             return json_response, actions
 
         if should_verify_by_magic_link:

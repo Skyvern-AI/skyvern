@@ -28,10 +28,12 @@ type Props = {
   profile: BrowserProfileApiResponse;
   // When set, render a labeled button (detail page); otherwise an icon button (list row).
   label?: string;
+  // Open the dialog on mount (detail page reached via ?refresh from the credentials fix-by-hand link).
+  autoOpen?: boolean;
 };
 
-function RefreshBrowserProfileButton({ profile, label }: Props) {
-  const [open, setOpen] = useState(false);
+function RefreshBrowserProfileButton({ profile, label, autoOpen }: Props) {
+  const [open, setOpen] = useState(autoOpen ?? false);
   const createSession = useCreateBrowserSessionMutation();
   const { data: usage, isLoading } = useBrowserProfileUsageQuery(
     profile.browser_profile_id,

@@ -920,7 +920,7 @@ browser_profile = await skyvern.browser_profiles.create_browser_profile(
 )
 print(browser_profile)
 
-# Or create from a workflow run with persist_browser_session=True
+# Or create from any workflow run that saved a browser (has a persisted archive)
 browser_profile = await skyvern.browser_profiles.create_browser_profile(
     name="My Profile",
     workflow_run_id="wr_123",
@@ -943,7 +943,7 @@ const browserProfile = await skyvern.browserProfiles.createBrowserProfile({
 });
 console.log(browserProfile);
 
-// Or create from a workflow run with persist_browser_session=True
+// Or create from any workflow run that saved a browser (has a persisted archive)
 const browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({
     name: "My Profile",
     workflow_run_id: "wr_123",

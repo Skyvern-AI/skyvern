@@ -48,6 +48,7 @@ async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.Mo
         return object(), BrowserArtifacts(), None
 
     monkeypatch.setattr(factory_module, "restore_session_cookies", AsyncMock())
+    monkeypatch.setattr(factory_module, "restore_banked_cookies", AsyncMock())
     monkeypatch.setattr(factory_module, "set_browser_console_log", lambda **_: None)
     monkeypatch.setattr(factory_module, "set_popup_video_listener", lambda **_: None)
     monkeypatch.setattr(factory_module, "set_download_file_listener", lambda **_: None)
@@ -56,6 +57,9 @@ async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.Mo
     class _FakeAgentFunction:
         async def setup_browser_context_extensions(self, **_: Any) -> None:
             return None
+
+        async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
+            return False
 
     class _FakeApp:
         AGENT_FUNCTION = _FakeAgentFunction()

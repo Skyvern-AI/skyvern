@@ -666,7 +666,9 @@ def _setup_workflow_with_rotating_credential(browser_profile_key: str | None = "
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=SimpleNamespace(parameters=[_credential_parameter(credential_ids=["cred_a", "cred_b"])]),
+        workflow_definition=SimpleNamespace(
+            parameters=[_credential_parameter(credential_ids=["cred_a", "cred_b"])], blocks=[]
+        ),
     )
 
 
@@ -675,7 +677,11 @@ def _setup_workflow_run() -> SimpleNamespace:
         workflow_run_id="wr_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        browser_session_id=None,
         browser_profile_id=None,
+        browser_seed_source=None,
+        browser_sink_profile_id=None,
+        retried_from_workflow_run_id=None,
         proxy_location=None,
     )
 
@@ -726,6 +732,7 @@ async def _attempt_setup_rotation_profile_run(
     ):
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.is_browser_memory_engine_enabled = AsyncMock(return_value=False)
         mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile = AsyncMock(
             return_value=(
                 SimpleNamespace(browser_profile_id=profile_id, is_managed=True, proxy_session_id=None),

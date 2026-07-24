@@ -61,6 +61,7 @@ def _make_workflow_run() -> SimpleNamespace:
         cached_credits_used=0,
         browser_session_id=None,
         browser_profile_id=None,
+        browser_seed_source=None,
         max_screenshot_scrolls=None,
         browser_address=None,
         run_with=None,

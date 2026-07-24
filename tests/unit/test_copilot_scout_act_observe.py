@@ -1700,6 +1700,33 @@ class TestTerminalActionObservationStampSeam:
         assert capture["credential_field"] == "totp"
         assert capture["credential_id"] == "cred_1"
 
+    def test_credential_fill_records_the_element_fingerprint_without_the_secret(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = []
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="fill_credential_field",
+            selector="#pass",
+            source_url=self._PORTAL_URL,
+            typed_length=14,
+            credential_id="cred_1",
+            credential_field="password",
+            credential_name="mock-portal-login",
+            element_fingerprint_id="pass",
+            element_fingerprint_name="password",
+            element_fingerprint_type="password",
+            element_fingerprint_placeholder="Password",
+            element_fingerprint_label="Password",
+            element_fingerprint_test_id="login-password",
+            element_fingerprint_tag="input",
+        )
+        recorded = ctx.scout_trajectory[-1]
+        assert recorded["element_fingerprint_id"] == "pass"
+        assert recorded["element_fingerprint_type"] == "password"
+        assert recorded["element_fingerprint_placeholder"] == "Password"
+        assert recorded["element_fingerprint_tag"] == "input"
+        assert "Hunter2Portal!" not in str(recorded)
+
     def test_login_only_commit_stamps_nothing(self) -> None:
         ctx = self._ctx_with(self._terminal_action_criterion())
         ctx.scout_trajectory = [

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
@@ -334,6 +334,42 @@ async def test_repo_update_credential_unset_params_not_applied() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repo_update_credential_explicit_null_browser_profile_id_unlinks() -> None:
+    # SKY-12724 item 1: choosing Auto sends browser_profile_id=null, which must unlink the profile.
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.browser_profile_id = "bp_existing"
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            browser_profile_id=None,
+        )
+
+    assert mock_credential.browser_profile_id is None
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_omitted_browser_profile_id_untouched() -> None:
+    # Omitting browser_profile_id (a rename, a pin change) must leave the existing link intact.
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.browser_profile_id = "bp_existing"
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            name="renamed",
+        )
+
+    assert mock_credential.browser_profile_id == "bp_existing"
+
+
+@pytest.mark.asyncio
 async def test_repo_update_credential_tested_url_none_preserves_existing_value() -> None:
     mock_credential = MagicMock()
     mock_credential.name = "test"
@@ -348,6 +384,47 @@ async def test_repo_update_credential_tested_url_none_preserves_existing_value()
         )
 
     assert mock_credential.tested_url == "https://example.com/existing"
+
+
+@pytest.mark.asyncio
+async def test_route_pin_only_update_does_not_pass_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-12724 regression (Codex): a pin-only POST /credentials/{id}/update must NOT pass
+    # browser_profile_id (its omitted default None) into the repo, which would unlink the saved profile.
+    existing = SimpleNamespace(
+        vault_type=CredentialVaultType.BITWARDEN,
+        item_id="item_1",
+        organization_id="o_test",
+        browser_profile_id="bp_existing",
+        credential_id="cred_1",
+    )
+    conflict = AsyncMock(return_value=existing)
+    vault_service = SimpleNamespace(update_credential=AsyncMock(return_value=existing))
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=existing))),
+        CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: vault_service},
+    )
+    monkeypatch.setattr(credentials_routes, "app", fake_app)
+    monkeypatch.setattr(credentials_routes, "_update_credential_or_profile_conflict", conflict)
+    monkeypatch.setattr(credentials_routes, "_clear_cached_totp_code_preview", lambda **kwargs: None)
+    monkeypatch.setattr(credentials_routes, "_normalize_authenticator_totp_for_organization_or_raise", AsyncMock())
+    monkeypatch.setattr(credentials_routes, "_convert_to_response", lambda c: c)
+
+    req = CreateCredentialRequest(
+        name="c",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "u@e.com", "password": "pw"},
+        pin_saved_session_ip=True,
+    )
+    await credentials_routes.update_credential(
+        background_tasks=BackgroundTasks(),
+        credential_id="cred_1",
+        data=req,
+        current_org=SimpleNamespace(organization_id="o_test"),  # type: ignore[arg-type]
+    )
+
+    conflict.assert_awaited_once()
+    assert "browser_profile_id" not in conflict.await_args.kwargs
+    assert conflict.await_args.kwargs["pin_saved_session_ip"] is True
 
 
 @pytest.mark.asyncio
@@ -611,8 +688,8 @@ async def test_browser_profile_resave_updates_proxy_pin_after_storage_write(monk
         events.append("update_profile")
         return SimpleNamespace()
 
-    async def touch_browser_profile(**_kwargs: object) -> None:
-        events.append("touch_profile")
+    async def mark_verified_login(**_kwargs: object) -> None:
+        events.append("mark_verified")
 
     async def update_credential(**_kwargs: object) -> SimpleNamespace:
         events.append("update_credential")
@@ -621,7 +698,11 @@ async def test_browser_profile_resave_updates_proxy_pin_after_storage_write(monk
     monkeypatch.setattr(
         forge_app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed, browser_profile_id=None)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status=WorkflowRunStatus.completed, browser_profile_id=None, browser_sink_profile_id=None
+            )
+        ),
     )
     monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
@@ -642,7 +723,7 @@ async def test_browser_profile_resave_updates_proxy_pin_after_storage_write(monk
         AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_existing")),
     )
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "update_browser_profile", update_browser_profile)
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "touch_browser_profile", touch_browser_profile)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "mark_verified_login", mark_verified_login)
 
     await credentials_routes._create_browser_profile_after_workflow(
         credential_id="cred_123",
@@ -655,7 +736,7 @@ async def test_browser_profile_resave_updates_proxy_pin_after_storage_write(monk
         existing_browser_profile_id="bp_existing",
     )
 
-    assert events == ["store", "update_profile", "touch_profile", "update_credential"]
+    assert events == ["store", "update_profile", "mark_verified", "update_credential"]
 
 
 @pytest.mark.asyncio
@@ -671,8 +752,8 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
         events.append("update_profile")
         return SimpleNamespace()
 
-    async def touch_browser_profile(**_kwargs: object) -> None:
-        events.append("touch_profile")
+    async def mark_verified_login(**_kwargs: object) -> None:
+        events.append("mark_verified")
 
     async def update_credential(**_kwargs: object) -> SimpleNamespace:
         events.append("update_credential")
@@ -681,7 +762,11 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
     monkeypatch.setattr(
         forge_app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed, browser_profile_id=None)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status=WorkflowRunStatus.completed, browser_profile_id=None, browser_sink_profile_id=None
+            )
+        ),
     )
     monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
@@ -697,7 +782,7 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
         AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_existing")),
     )
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "update_browser_profile", update_browser_profile)
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "touch_browser_profile", touch_browser_profile)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "mark_verified_login", mark_verified_login)
 
     await credentials_routes._create_browser_profile_after_workflow(
         credential_id="cred_123",
@@ -710,7 +795,7 @@ async def test_browser_profile_resave_leaves_existing_profile_pin_when_credentia
         existing_browser_profile_id="bp_existing",
     )
 
-    assert events == ["store", "touch_profile", "update_credential"]
+    assert events == ["store", "mark_verified", "update_credential"]
 
 
 @pytest.mark.asyncio
@@ -726,8 +811,8 @@ async def test_browser_profile_resave_preserves_different_existing_profile_pin(
         events.append("update_profile")
         return SimpleNamespace()
 
-    async def touch_browser_profile(**_kwargs: object) -> None:
-        events.append("touch_profile")
+    async def mark_verified_login(**_kwargs: object) -> None:
+        events.append("mark_verified")
 
     async def update_credential(**_kwargs: object) -> SimpleNamespace:
         events.append("update_credential")
@@ -736,7 +821,11 @@ async def test_browser_profile_resave_preserves_different_existing_profile_pin(
     monkeypatch.setattr(
         forge_app.DATABASE.workflow_runs,
         "get_workflow_run",
-        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed, browser_profile_id=None)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status=WorkflowRunStatus.completed, browser_profile_id=None, browser_sink_profile_id=None
+            )
+        ),
     )
     monkeypatch.setattr(forge_app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/session"))
     monkeypatch.setattr(forge_app.STORAGE, "store_browser_profile", store_browser_profile)
@@ -757,7 +846,7 @@ async def test_browser_profile_resave_preserves_different_existing_profile_pin(
         AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_existing", proxy_session_id="profile-pin")),
     )
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "update_browser_profile", update_browser_profile)
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "touch_browser_profile", touch_browser_profile)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "mark_verified_login", mark_verified_login)
 
     await credentials_routes._create_browser_profile_after_workflow(
         credential_id="cred_123",
@@ -770,7 +859,7 @@ async def test_browser_profile_resave_preserves_different_existing_profile_pin(
         existing_browser_profile_id="bp_existing",
     )
 
-    assert events == ["store", "touch_profile", "update_credential"]
+    assert events == ["store", "mark_verified", "update_credential"]
 
 
 @pytest.mark.asyncio
@@ -791,6 +880,7 @@ async def test_credential_browser_profile_save_reads_managed_profile_blob(
                 status=WorkflowRunStatus.completed,
                 browser_profile_id="bp_managed",
                 workflow_permanent_id="wpid_123",
+                browser_sink_profile_id=None,
             )
         ),
     )
@@ -854,6 +944,7 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
                 status=WorkflowRunStatus.completed,
                 browser_profile_id="bp_managed",
                 workflow_permanent_id="wpid_123",
+                browser_sink_profile_id=None,
             )
         ),
     )
@@ -896,6 +987,235 @@ async def test_credential_browser_profile_save_falls_back_to_legacy_archive_for_
         profile_id="bp_created",
         directory="/tmp/legacy_session",
     )
+
+
+# --- rider: credential browser_profile_id (plain/unowned validation) + pin_saved_session_ip ---
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_accepts_pin_saved_session_ip() -> None:
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.pin_saved_session_ip = False
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            pin_saved_session_ip=True,
+        )
+
+    assert mock_credential.pin_saved_session_ip is True
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_rejects_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "get_browser_profile", AsyncMock(return_value=None))
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_rejects_managed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_x")),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_rejects_other_workflow_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A plain-looking profile still owned by a workflow (workflow_permanent_id set) is rejected.
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id="wpid_other")),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_rejects_other_credential_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[SimpleNamespace(credential_id="cred_other")]),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_accepts_plain_unowned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[]),
+    )
+    # No raise.
+    await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_allows_relink_to_same_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[SimpleNamespace(credential_id="cred_self")]),
+    )
+    # Re-linking the profile a credential already owns is a no-op, not a conflict.
+    await credentials_routes._validate_credential_browser_profile_id(
+        "bp_x", "org_123", current_credential_id="cred_self"
+    )
+
+
+def _stored_credential(browser_profile_id: str | None = None, pin: bool = False) -> Credential:
+    return Credential(
+        credential_id="cred_123",
+        organization_id="org_123",
+        name="test",
+        vault_type=CredentialVaultType.AZURE_VAULT,
+        item_id="item_123",
+        credential_type=CredentialType.PASSWORD,
+        username="user@example.com",
+        card_last4=None,
+        card_brand=None,
+        secret_label=None,
+        browser_profile_id=browser_profile_id,
+        pin_saved_session_ip=pin,
+        created_at=datetime(2026, 1, 1),
+        modified_at=datetime(2026, 1, 1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_credential_links_validated_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=_stored_credential()))
+    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[]),
+    )
+    update_credential = AsyncMock(return_value=_stored_credential(browser_profile_id="bp_plain", pin=True))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "user@example.com", "password": "pw"},
+        browser_profile_id="bp_plain",
+        pin_saved_session_ip=True,
+    )
+
+    response = await credentials_routes.create_credential(
+        background_tasks=BackgroundTasks(),
+        data=data,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    update_credential.assert_awaited_once()
+    kwargs = update_credential.await_args.kwargs
+    assert kwargs["browser_profile_id"] == "bp_plain"
+    assert kwargs["pin_saved_session_ip"] is True
+    assert response.browser_profile_id == "bp_plain"
+    assert response.pin_saved_session_ip is True
+
+
+@pytest.mark.asyncio
+async def test_create_credential_rejects_managed_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    vault_create = AsyncMock(return_value=_stored_credential())
+    vault_service = SimpleNamespace(create_credential=vault_create)
+    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=True, workflow_permanent_id="wpid_x")),
+    )
+    update_credential = AsyncMock()
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "user@example.com", "password": "pw"},
+        browser_profile_id="bp_managed",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes.create_credential(
+            background_tasks=BackgroundTasks(),
+            data=data,
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+    assert exc.value.status_code == 400
+    # Validation rejects BEFORE provisioning — no orphan credential/vault item is created.
+    vault_create.assert_not_awaited()
+    update_credential.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rename_credential_sets_pin_and_validated_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
+
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=_stored_credential()),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[]),
+    )
+    update_credential = AsyncMock(return_value=_stored_credential(browser_profile_id="bp_plain", pin=True))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    data = UpdateCredentialRequest(browser_profile_id="bp_plain", pin_saved_session_ip=True)
+
+    await credentials_routes.rename_credential(
+        credential_id="cred_123",
+        data=data,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    kwargs = update_credential.await_args.kwargs
+    assert kwargs["browser_profile_id"] == "bp_plain"
+    assert kwargs["pin_saved_session_ip"] is True
 
 
 def test_credential_route_treats_null_advanced_key_as_no_explicit_identity() -> None:
@@ -974,3 +1294,208 @@ async def test_repo_update_credential_clears_proxy_session_id_with_proxy_locatio
 
     assert mock_credential.proxy_location is None
     assert mock_credential.proxy_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_update_credential_route_applies_validated_browser_profile_and_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.schemas.credentials import NonEmptyPasswordCredential
+
+    existing = _stored_credential()
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[]),
+    )
+    from skyvern.forge.forge_app import ForgeApp
+
+    vault_service = SimpleNamespace(
+        update_credential=AsyncMock(return_value=_stored_credential()),
+        post_delete_credential_item=AsyncMock(),
+    )
+    monkeypatch.setattr(ForgeApp, "CREDENTIAL_VAULT_SERVICES", {existing.vault_type: vault_service}, raising=False)
+    update_credential = AsyncMock(return_value=_stored_credential(browser_profile_id="bp_plain", pin=True))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(credentials_routes, "_clear_cached_totp_code_preview", lambda **_kwargs: None)
+
+    data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential=NonEmptyPasswordCredential(username="user@example.com", password="pw"),
+        browser_profile_id="bp_plain",
+        pin_saved_session_ip=True,
+    )
+
+    response = await credentials_routes.update_credential(
+        background_tasks=BackgroundTasks(),
+        credential_id="cred_123",
+        data=data,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    kwargs = update_credential.await_args.kwargs
+    assert kwargs["browser_profile_id"] == "bp_plain"
+    assert kwargs["pin_saved_session_ip"] is True
+    assert response.browser_profile_id == "bp_plain"
+    assert response.pin_saved_session_ip is True
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_mints_proxy_session_when_pin_turned_on() -> None:
+    # F4: turning the pin on with no proxy session provisions a residential-ISP sticky session, so the
+    # pin is not a silent no-op. The create route routes pin_saved_session_ip through this same call.
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.pin_saved_session_ip = False
+    mock_credential.proxy_location = None
+    mock_credential.proxy_session_id = None
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            pin_saved_session_ip=True,
+        )
+
+    assert mock_credential.pin_saved_session_ip is True
+    assert mock_credential.proxy_location == ProxyLocation.RESIDENTIAL_ISP.value
+    assert mock_credential.proxy_session_id is not None
+    assert is_proxy_session_id(mock_credential.proxy_session_id)
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_pin_keeps_existing_proxy_session() -> None:
+    # Turning the pin on when a proxy session already exists mints nothing new (idempotent).
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.pin_saved_session_ip = False
+    mock_credential.proxy_location = ProxyLocation.RESIDENTIAL_ISP.value
+    mock_credential.proxy_session_id = "existing-pin"
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            pin_saved_session_ip=True,
+        )
+
+    assert mock_credential.proxy_session_id == "existing-pin"
+
+
+@pytest.mark.asyncio
+async def test_repo_update_credential_disables_pin_without_reminting() -> None:
+    # H: an explicit pin_saved_session_ip=False disables the pin (and never mints a proxy session).
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.pin_saved_session_ip = True
+    mock_credential.proxy_location = ProxyLocation.RESIDENTIAL_ISP.value
+    mock_credential.proxy_session_id = "existing-pin"
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            pin_saved_session_ip=False,
+        )
+
+    assert mock_credential.pin_saved_session_ip is False
+    assert mock_credential.proxy_session_id == "existing-pin"
+
+
+@pytest.mark.asyncio
+async def test_update_credential_conflict_translates_to_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    # G: the atomic partial-unique backstop. A concurrent link that slips past the read-check hits the
+    # DB unique constraint; the route translates it into the same 400 as the friendly read-check.
+    from sqlalchemy.exc import IntegrityError
+
+    orig = Exception('duplicate key value violates unique constraint "uq_credentials_browser_profile_id"')
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "update_credential",
+        AsyncMock(side_effect=IntegrityError("UPDATE credentials", {}, orig)),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes._update_credential_or_profile_conflict(
+            credential_id="cred_123", organization_id="org_123", browser_profile_id="bp_x"
+        )
+    assert exc.value.status_code == 400
+    assert "already linked to another credential" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_update_credential_conflict_reraises_unrelated_integrity_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    orig = Exception('null value in column "name" violates not-null constraint')
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "update_credential",
+        AsyncMock(side_effect=IntegrityError("UPDATE credentials", {}, orig)),
+    )
+    with pytest.raises(IntegrityError):
+        await credentials_routes._update_credential_or_profile_conflict(
+            credential_id="cred_123", organization_id="org_123", browser_profile_id="bp_x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_browser_profile_id_relinks_when_owner_soft_deleted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # G amendment 1: a soft-deleted owner must NOT reserve the profile. The read-check queries live
+    # credentials only (get_credentials_by_browser_profile_id filters deleted_at), and the partial-unique
+    # index predicate matches (deleted_at IS NULL), so relinking is allowed.
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[]),  # the soft-deleted owner is filtered out by the repo
+    )
+    await credentials_routes._validate_credential_browser_profile_id("bp_x", "org_123")
+
+
+@pytest.mark.asyncio
+async def test_create_credential_profile_alone_does_not_reset_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # K: supplying a browser_profile_id without a pin field must NOT reset the pin — pass None (leave
+    # unchanged), not the request model's default False.
+    vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=_stored_credential()))
+    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        forge_app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, workflow_permanent_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.credentials,
+        "get_credentials_by_browser_profile_id",
+        AsyncMock(return_value=[]),
+    )
+    update_credential = AsyncMock(return_value=_stored_credential(browser_profile_id="bp_plain"))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    data = CreateCredentialRequest(
+        name="test",
+        credential_type=CredentialType.PASSWORD,
+        credential={"username": "user@example.com", "password": "pw"},
+        browser_profile_id="bp_plain",  # pin_saved_session_ip omitted
+    )
+
+    await credentials_routes.create_credential(
+        background_tasks=BackgroundTasks(),
+        data=data,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert update_credential.await_args.kwargs["pin_saved_session_ip"] is None

@@ -306,6 +306,8 @@ async def initialize_task_v2(
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
+    browser_profile_id: str | None = None,
+    start_fresh_browser: bool = False,
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
@@ -360,6 +362,8 @@ async def initialize_task_v2(
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
+                start_fresh_browser=start_fresh_browser,
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,

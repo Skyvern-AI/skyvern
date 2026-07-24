@@ -32,10 +32,12 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfileUsageWorkflow,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    FINAL_STATUSES,
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
@@ -364,6 +366,78 @@ class BrowserSessionsRepository(BaseRepository):
             await session.commit()
             return cleared_credential_ids
 
+    @db_operation("has_live_browser_profile_references")
+    async def has_live_browser_profile_references(
+        self,
+        profile_id: str,
+        organization_id: str,
+        exclude_credential_id: str | None = None,
+    ) -> bool:
+        """True if any LIVE owner still seeds from this profile: another non-deleted credential, a
+        non-deleted workflow, an in-flight workflow run (nonterminal status), or an active persistent
+        session. Terminal/historical workflow runs are ignored — every profile that ran accumulates those.
+        Guards credential-delete reaping so a shared/pinned/in-use profile is never deleted out from under a live owner."""
+        async with self.Session() as session:
+            cred_query = (
+                select(CredentialModel.browser_profile_id)
+                .filter(CredentialModel.browser_profile_id == profile_id)
+                .filter(CredentialModel.organization_id == organization_id)
+                .filter(CredentialModel.deleted_at.is_(None))
+            )
+            if exclude_credential_id is not None:
+                cred_query = cred_query.filter(CredentialModel.credential_id != exclude_credential_id)
+            if (await session.scalars(cred_query.limit(1))).first() is not None:
+                return True
+
+            workflow_query = (
+                select(WorkflowModel.browser_profile_id)
+                .filter(WorkflowModel.browser_profile_id == profile_id)
+                .filter(WorkflowModel.organization_id == organization_id)
+                .filter(WorkflowModel.deleted_at.is_(None))
+                .limit(1)
+            )
+            if (await session.scalars(workflow_query)).first() is not None:
+                return True
+
+            # In-flight runs seeded from this profile (matches ix_workflow_runs_nonterminal_status);
+            # terminal runs are historical and must NOT block, or the guard would never fire.
+            run_query = (
+                select(WorkflowRunModel.browser_profile_id)
+                .filter(WorkflowRunModel.browser_profile_id == profile_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(
+                    WorkflowRunModel.status.in_(
+                        (
+                            WorkflowRunStatus.created,
+                            WorkflowRunStatus.queued,
+                            WorkflowRunStatus.running,
+                            WorkflowRunStatus.paused,
+                        )
+                    )
+                )
+                .limit(1)
+            )
+            if (await session.scalars(run_query)).first() is not None:
+                return True
+
+            # A NULL status is a nascent session, not a terminal one — treat it as active so it blocks.
+            session_query = (
+                select(PersistentBrowserSessionModel.browser_profile_id)
+                .filter(PersistentBrowserSessionModel.browser_profile_id == profile_id)
+                .filter(PersistentBrowserSessionModel.organization_id == organization_id)
+                .filter(
+                    or_(
+                        PersistentBrowserSessionModel.status.is_(None),
+                        PersistentBrowserSessionModel.status.not_in(FINAL_STATUSES),
+                    )
+                )
+                .limit(1)
+            )
+            if (await session.scalars(session_query)).first() is not None:
+                return True
+
+        return False
+
     @db_operation("hard_delete_browser_profile")
     async def hard_delete_browser_profile(
         self,
@@ -434,6 +508,25 @@ class BrowserSessionsRepository(BaseRepository):
             if not browser_profile:
                 raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
             browser_profile.modified_at = naive_utc_now()
+            await session.commit()
+
+    @db_operation("mark_verified_login")
+    async def mark_verified_login(self, profile_id: str, organization_id: str, when: datetime | None = None) -> None:
+        """Stamp the verified-login timestamp used by the living-profile concurrency guard (a
+        healthy-run write is skipped when this is newer than the writer's seed snapshot)."""
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+                .filter(BrowserProfileModel.deleted_at.is_(None))
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            stamp = when or naive_utc_now()
+            browser_profile.last_verified_login_at = stamp
+            browser_profile.modified_at = stamp
             await session.commit()
 
     @db_operation("get_active_persistent_browser_sessions")

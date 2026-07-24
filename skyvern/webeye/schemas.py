@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -136,6 +137,13 @@ class BrowserSessionResponse(BaseModel):
             # Treat None as "oldest".
             recordings.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
 
+        browser_address = await app.AGENT_FUNCTION.resolve_browser_session_connect_url(
+            organization_id=browser_session.organization_id,
+            browser_session_id=browser_session.persistent_browser_session_id,
+            browser_address=browser_session.browser_address,
+            upstream_cdp_url=browser_session.upstream_cdp_url,
+        )
+
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
@@ -143,7 +151,7 @@ class BrowserSessionResponse(BaseModel):
             runnable_type=browser_session.runnable_type,
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
-            browser_address=browser_session.browser_address,
+            browser_address=browser_address,
             vnc_streaming_supported=bool(browser_session.ip_address or browser_session.browser_address),
             app_url=app_url,
             started_at=browser_session.started_at,

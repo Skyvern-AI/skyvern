@@ -99,10 +99,21 @@ type RunOutputSignals = Pick<
   | "webhook_failure_reason"
 >;
 
-// The pane-header indicator and RunView's Outputs tab both key off this; keep
-// them routed through here so they can't drift. The extracted_information cast
-// below is unsound on purpose — a string value must stay truthy via
-// Object.values, matching what RunOutputsSection actually renders.
+// Every outputs key but the always-appended extracted_information is a block's
+// returned value. Shared by the has-outputs gate and RunOutputsSection so they
+// can't disagree on what counts as a code-block output.
+export function outputFieldEntries(outputs: unknown): Array<[string, unknown]> {
+  if (!isRecord(outputs)) {
+    return [];
+  }
+  return Object.entries(outputs).filter(
+    ([key]) => key !== "extracted_information",
+  );
+}
+
+// RunView's Outputs tab keys off this. The extracted_information cast below is
+// unsound on purpose — a string value must stay truthy via Object.values,
+// matching what RunOutputsSection renders.
 export function runHasOutputs(
   workflowRun: RunOutputSignals | null | undefined,
 ): boolean {
@@ -119,6 +130,10 @@ export function runHasOutputs(
   const hasExtracted =
     extractedInformation != null &&
     Object.values(extractedInformation).some((value) => value !== null);
+  // Unlike the always-appended extracted_information, a block-output key exists
+  // only because a block emitted it — so its presence counts even when the value
+  // is null (the normal shape for a code-only workflow with no extraction).
+  const hasBlockOutputs = outputFieldEntries(outputs).length > 0;
   // A raw-count check, not RunView's deduped file list — dedup only ever
   // shrinks a non-empty input, never zeroes it out, so truthiness matches.
   const hasDownloads =
@@ -131,6 +146,7 @@ export function runHasOutputs(
   return (
     hasErrors ||
     hasExtracted ||
+    hasBlockOutputs ||
     hasDownloads ||
     hasObserverOutput ||
     hasWebhookFailure

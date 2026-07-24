@@ -548,6 +548,71 @@ def test_finalize_handles_invalid_json_inbound() -> None:
     assert sc.discovery_calls_made == 1
 
 
+_ENTRYPOINT_A = "http://localhost:8955/analytics_console/pathfold/?date_from=-7d"
+_ENTRYPOINT_B = "http://localhost:8955/analytics_console/other/"
+
+
+def test_structured_context_entrypoint_url_round_trips() -> None:
+    sc = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A)
+    parsed = StructuredContext.from_json_str(sc.to_json_str())
+    assert parsed.entrypoint_url == _ENTRYPOINT_A
+
+
+def test_structured_context_legacy_json_without_entrypoint_url_deserializes_to_none() -> None:
+    legacy = StructuredContext(user_goal="g").to_json_str()
+    assert '"entrypoint_url"' in legacy
+    stripped = json.loads(legacy)
+    del stripped["entrypoint_url"]
+    parsed = StructuredContext.from_json_str(json.dumps(stripped))
+    assert parsed.entrypoint_url is None
+
+
+def test_finalize_persists_resolved_entrypoint_url_on_entrypoint_only_turn() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_A,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, None)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_cancel_arm_persists_entrypoint_never_none() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_A,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, None)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_keeps_persisted_entrypoint_when_turn_resolves_nothing() -> None:
+    inbound = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A).to_json_str()
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=None,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_in_turn_entrypoint_overwrites_persisted_slot() -> None:
+    inbound = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A).to_json_str()
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_B,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_B
+
+
 def test_finalize_treats_none_ctx_as_passthrough_in_factory() -> None:
     """The factory in agent.py passes ctx=None for very-early errors (before
     CopilotContext is constructed). The finalizer itself isn't called in that

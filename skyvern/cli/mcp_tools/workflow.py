@@ -20,6 +20,7 @@ import yaml
 from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
+from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameterType,
@@ -720,6 +721,34 @@ def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_
             and block.get("label") not in existing_code_labels
         ):
             block["prompt"] = ""
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
+def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
+    """Fill `steps` from `code` on code-first blocks (non-null prompt) that carry none, using the
+    copilot's own deterministic derivation. Legacy blocks (null/absent prompt) and explicit steps
+    (even an empty outline) are left untouched, so this composes with the prompt-default injection's
+    migration guarantees; `steps: null` is the workflow-get shape for "no steps yet" and derives."""
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+    workflow_definition = raw.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
+    if not isinstance(blocks, list):
+        return definition
+
+    changed = False
+    for block in _iter_blocks_flat(blocks):
+        if block.get("block_type") != "code" or block.get("prompt") is None or block.get("steps") is not None:
+            continue
+        code = block.get("code")
+        if not isinstance(code, str):
+            continue
+        derived = derive_code_block_steps(code, block.get("prompt"))
+        if derived:
+            block["steps"] = derived
             changed = True
 
     return _dump_definition_dict(raw, parsed_format) if changed else definition
@@ -1693,8 +1722,9 @@ async def skyvern_workflow_create(
     Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
     injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
-    Code blocks that omit `prompt` are defaulted to prompt="" so they render the current code block
-    editor experience.
+    Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
+    editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
+    code block editor experience, and their `steps` outline is derived from the code when omitted.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
@@ -1721,6 +1751,7 @@ async def skyvern_workflow_create(
     # any explicit user-supplied values.
     definition = _inject_code_v2_defaults(definition, format)
     definition = _inject_code_block_prompt_defaults(definition, format, existing_code_labels=frozenset())
+    definition = _inject_code_block_derived_steps(definition, format)
     definition = _inject_missing_top_level_defaults(
         definition,
         format,
@@ -1798,6 +1829,10 @@ async def skyvern_workflow_update(
     `skyvern workflow update --id <wpid> --definition @wf.json`.
     This command replaces the whole workflow definition.
 
+    Give each code block NEW to the workflow a `prompt` (its plain-language goal, shown as the
+    block's Goal); omitted prompts on new blocks default to "" and their `steps` outline is derived
+    from the code. Existing code blocks are never migrated to those defaults.
+
     Preserve `workflow_definition.workflow_system_prompt` when updating — omitting it clears it; see
     skyvern_workflow_get for the safe get → edit → update flow and format caveats."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
@@ -1831,6 +1866,7 @@ async def skyvern_workflow_update(
         definition = await _inject_workflow_update_proxy_default(definition, format, fetch_existing)
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
         definition = await _inject_workflow_update_code_block_prompt_defaults(definition, format, fetch_existing)
+        definition = _inject_code_block_derived_steps(definition, format)
         if code_only:
             existing = await fetch_existing()
             existing_wf_def = existing.get("workflow_definition")

@@ -34,6 +34,13 @@ def count_tokens(text: str) -> int:
     return len(encoding.encode(text))
 
 
+def approx_count_tokens(text: str) -> int:
+    """Character-based token estimate. Use for coarse gating decisions where a
+    full BPE encode over large text (e.g. entire page HTML) would be wasteful;
+    reserve count_tokens for prompt-budget trimming that needs an exact count."""
+    return math.ceil(len(text) / _APPROX_CHARS_PER_TOKEN)
+
+
 def encode_tokens(text: str) -> list[int]:
     encoding = _get_encoding()
     if encoding is None:

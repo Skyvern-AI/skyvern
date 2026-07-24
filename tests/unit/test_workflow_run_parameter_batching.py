@@ -87,6 +87,9 @@ def _make_service_with_mocks(
     else:
         service.create_workflow_run_parameter = AsyncMock()  # type: ignore[method-assign]
     service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    # Seed resolution is exercised in test_seed_precedence_engine; here it is a pass-through so these
+    # setup_workflow_run tests (param batching / tagging / trigger types) don't need seed fixtures.
+    service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
     organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
     return service, organization, workflow_run
@@ -421,7 +424,7 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
     service._validate_credential_ids = AsyncMock(  # type: ignore[method-assign]
         side_effect=InvalidCredentialId("Credential not found")
     )
-    service._prepare_persisted_workflow_browser_profile = AsyncMock()  # type: ignore[method-assign]
+    service._resolve_and_stamp_run_seed = AsyncMock()  # type: ignore[method-assign]
 
     request = WorkflowRequestBody(data={"credential": "cred_missing"})
 
@@ -438,7 +441,7 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
             )
 
     service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization)
-    service._prepare_persisted_workflow_browser_profile.assert_not_awaited()
+    service._resolve_and_stamp_run_seed.assert_not_awaited()
     service.create_workflow_run_parameters.assert_not_awaited()
     service.mark_workflow_run_as_failed.assert_awaited_once()
 
