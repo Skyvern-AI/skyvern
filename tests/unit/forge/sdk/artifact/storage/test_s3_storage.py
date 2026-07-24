@@ -1224,3 +1224,41 @@ class TestS3StorageZIPArchivePure:
     test_build_uri_task_archive_has_zip_extension = (
         TestS3StorageZIPArchiveRetrieve.test_build_uri_task_archive_has_zip_extension
     )
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
+    # Regression: a confirmed not-found returns False, but transient/authz errors must PROPAGATE (not
+    # swallow to False) so _managed_browser_profile_has_content's fail-safe treats a flaky read as
+    # existing content instead of reseeding a run to fresh and overwriting its saved archive.
+    from botocore.exceptions import ClientError
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client._is_not_found_error = lambda e: e.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}
+
+    storage.async_client.get_object_info = AsyncMock(side_effect=ClientError({"Error": {"Code": "404"}}, "HeadObject"))
+    assert await storage.browser_profile_exists("o", "bp") is False
+
+    storage.async_client.get_object_info = AsyncMock(
+        side_effect=ClientError({"Error": {"Code": "InternalError"}}, "HeadObject")
+    )
+    with pytest.raises(ClientError):
+        await storage.browser_profile_exists("o", "bp")
+
+
+@pytest.mark.asyncio
+async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
+    # hard_delete must PROPAGATE an S3 failure (raise_on_error=True) so the reap can't falsely report a
+    # cookie-bearing archive erased and silently orphan it; a soft delete stays best-effort.
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+
+    storage.async_client.delete_file = AsyncMock(side_effect=RuntimeError("s3 down"))
+    with pytest.raises(RuntimeError):
+        await storage.delete_browser_profile("o", "bp", hard_delete=True)
+    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is True
+
+    storage.async_client.delete_file = AsyncMock()
+    await storage.delete_browser_profile("o", "bp", hard_delete=False)
+    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is False

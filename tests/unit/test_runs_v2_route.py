@@ -216,6 +216,8 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         totp_identifier="account@example.com",
         browser_session_id="pbs_123",
         browser_profile_id="bprof_123",
+        browser_seed_source=None,
+        start_fresh_browser=None,
         max_screenshot_scrolls=3,
         max_elapsed_time_minutes=None,
         extra_http_headers={"X-Test": "1"},
@@ -236,6 +238,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         modified_at=created_at,
         browser_session_id="pbs_123",
         browser_profile_id="bprof_123",
+        browser_seed_source=None,
         run_with="code",
         ai_fallback=True,
     )
@@ -407,6 +410,8 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         totp_identifier=None,
         browser_session_id=None,
         browser_profile_id=None,
+        browser_seed_source=None,
+        start_fresh_browser=None,
         max_screenshot_scrolls=None,
         max_elapsed_time_minutes=None,
         extra_http_headers=None,
@@ -427,6 +432,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         modified_at=now,
         browser_session_id=None,
         browser_profile_id=None,
+        browser_seed_source=None,
         run_with=None,
         ai_fallback=None,
     )
