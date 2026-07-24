@@ -93,7 +93,12 @@ from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
     normalize_block_authoring_policy,
 )
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.context import (
+    AskSubject,
+    CodeAuthoringRepairContext,
+    coerce_ask_subject,
+    parsed_ask_refs,
+)
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
@@ -121,6 +126,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     CompletionCriterion,
     RequestPolicy,
+    floor_rekeyed_requested_output_paths,
     request_policy_has_present_completion_contract,
     requested_output_path_for_field,
     schema_output_path_aliases_from_criteria,
@@ -1151,7 +1157,7 @@ def _turn_intent_can_update_and_run_without_user_input(turn_intent: Any) -> bool
     return bool(turn_intent.authority.may_run_blocks)
 
 
-def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
+def _present_completion_contract_ask_admission_base(ctx: CopilotContext) -> bool:
     request_policy = ctx.request_policy
     if not isinstance(request_policy, RequestPolicy):
         return False
@@ -1161,17 +1167,35 @@ def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
         return False
     if request_policy.clarification_reason not in (None, "none"):
         return False
-    if not _turn_intent_can_author_without_user_input(ctx.turn_intent):
+    return _turn_intent_can_author_without_user_input(ctx.turn_intent)
+
+
+def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
+    if not _present_completion_contract_ask_admission_base(ctx):
         return False
-    if ctx.has_genuine_workflow_attempt():
-        return False
-    return True
+    return not ctx.has_genuine_workflow_attempt()
 
 
 def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str, Any]) -> str | None:
     if parsed.get("type") != "ASK_QUESTION":
         return None
-    if not recycle_admits_present_completion_contract_ask(ctx):
+    ask_subject = coerce_ask_subject(parsed.get("ask_subject"))
+    if ask_subject is not None:
+        # A schema ask the contract already answers is redundant whether or not the turn has
+        # built anything yet, so it resolves on the base admission without the attempt check.
+        if _present_completion_contract_ask_admission_base(ctx):
+            auto_answer = _typed_ask_subject_auto_answer(ctx, ask_subject, parsed)
+            if auto_answer is not None:
+                return auto_answer
+    retry_admitted = recycle_admits_present_completion_contract_ask(ctx)
+    if ask_subject is not None:
+        LOG.info(
+            "copilot_ask_subject_passed_through",
+            subject=ask_subject,
+            outcome="build_first_retry" if retry_admitted else "reached_user",
+            **ctx.genuine_attempt_parity_fields(),
+        )
+    if not retry_admitted:
         return None
     LOG.info(
         "copilot.present_completion_contract_ask_retry",
@@ -1180,6 +1204,35 @@ def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str
         **ctx.genuine_attempt_parity_fields(),
     )
     return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
+def _typed_ask_subject_auto_answer(ctx: CopilotContext, ask_subject: AskSubject, parsed: dict[str, Any]) -> str | None:
+    if ask_subject != "output_schema":
+        return None
+    refs = parsed_ask_refs(parsed.get("refs"))
+    if not refs:
+        return None
+    # Reads the raw policy criteria rather than the turn-active set the other requested-output
+    # consumers use: floor-rekey annotations are baked in at request-policy build time, and what
+    # the model may cite as refs is rendered from this same set in `prompt_summary`.
+    policy = ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return None
+    criteria = policy.graded_completion_criteria()
+    requested = requested_output_paths(criteria) | floor_rekeyed_requested_output_paths(criteria)
+    if not requested or not set(refs) <= requested:
+        return None
+    resolved = sorted(set(refs))
+    LOG.info(
+        "copilot_ask_subject_auto_answered",
+        subject=ask_subject,
+        resolved_refs=resolved,
+    )
+    return (
+        "The outputs you asked to confirm are already pinned by this request's completion contract. "
+        f"Requested output paths: {', '.join(resolved)}. Author and test the workflow to produce them, "
+        "choosing a reasonable representation for each, instead of asking the user to re-confirm."
+    )
 
 
 def _nudge(config: CopilotConfig | None, key: str) -> str:
@@ -2411,18 +2464,7 @@ def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCri
 
 
 def _floor_rekeyed_requested_output_paths(ctx: AgentContext) -> set[str]:
-    """Identity of runtime-output criteria whose slot rekey cleared ``output_path``; the rekey
-    preserves it in ``floor_rekeyed_from_path``, and without it they vanish from the requested set."""
-    return {
-        criterion.floor_rekeyed_from_path
-        for criterion in _pre_run_gated_completion_criteria(ctx)
-        if criterion.requested_output_floor_rekeyed
-        and criterion.floor_rekeyed_from_path
-        and criterion.kind == "outcome"
-        and criterion.level != "definition"
-        and not criterion.method_mandated
-        and criterion.requested_output_evidence_source == "runtime_output"
-    }
+    return floor_rekeyed_requested_output_paths(_pre_run_gated_completion_criteria(ctx))
 
 
 def pre_run_gated_outputs_without_path(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import hmac
 import io
 import json
 import keyword
@@ -25,7 +24,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
     SameMonthFileMatchTransform,
@@ -68,8 +66,6 @@ _READONLY_DEFERRED_VAR = "_scout_readonly_actual"
 _MONTH_HELPER_VAR = "_scout_month_to_iso"
 _ISO_DATE_HELPER_VAR = "_scout_iso_date_to_year_month"
 _PERIOD_DATE_PATTERN_HELPER_VAR = "_scout_period_date_pattern"
-_DYNAMIC_ROW_EVIDENCE_FINGERPRINT_DOMAIN = b"skyvern.copilot.dynamic_row_evidence.v1"
-_DYNAMIC_ROW_EVIDENCE_SCRYPT_N = 1 << 14
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
@@ -102,6 +98,92 @@ CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|awai
 # Credential fields the scout must fill live before a code block reading them may persist;
 # `.otp()` resolves at runtime only, so totp never requires (or credits) a live scout fill.
 LIVE_SCOUT_CREDENTIAL_FIELDS = frozenset({"username", "password"})
+
+
+def credential_fill_source(locator_expr: str, param_key: str, field: str) -> str:
+    if field == "totp":
+        return f"await {locator_expr}.fill(await {param_key}.otp())"
+    return f"await {locator_expr}.fill({param_key}.{field})"
+
+
+def wrapped_code_ast(code: str) -> ast.AST | None:
+    body = "\n".join(f"    {line}" for line in code.splitlines())
+    if not body.strip():
+        body = "    pass"
+    try:
+        return ast.parse(f"async def __submitted_code__():\n{body}\n")
+    except SyntaxError:
+        return None
+
+
+def _credential_field_fill_argument(arg: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if (
+        isinstance(arg, ast.Attribute)
+        and arg.attr in _CREDENTIAL_FIELDS
+        and isinstance(arg.value, ast.Name)
+        and arg.value.id in credential_parameter_keys
+    ):
+        return True
+    target = arg.value if isinstance(arg, ast.Await) else arg
+    return (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Attribute)
+        and target.func.attr == "otp"
+        and isinstance(target.func.value, ast.Name)
+        and target.func.value.id in credential_parameter_keys
+    )
+
+
+def _is_credential_field_fill_call(node: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fill"
+        and bool(node.args)
+        and _credential_field_fill_argument(node.args[0], credential_parameter_keys)
+    )
+
+
+def _is_presence_guard_test(test: ast.AST) -> bool:
+    for node in ast.walk(test):
+        if isinstance(node, ast.Attribute) and node.attr in {"count", "is_visible"}:
+            return True
+        if isinstance(node, ast.Name) and node.id in _INTERNAL_SCOUT_VARS:
+            return True
+    return False
+
+
+def _credential_fill_is_presence_guarded(node: ast.AST, parents: Mapping[int, ast.AST]) -> bool:
+    current: ast.AST = node
+    while id(current) in parents:
+        parent = parents[id(current)]
+        if (
+            isinstance(parent, ast.If)
+            and any(current is stmt for stmt in parent.body)
+            and _is_presence_guard_test(parent.test)
+        ):
+            return True
+        current = parent
+    return False
+
+
+def block_has_unguarded_credential_fill(code: str, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if not credential_parameter_keys:
+        return False
+    tree = wrapped_code_ast(code)
+    if tree is None:
+        return False
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return any(
+        _is_credential_field_fill_call(node, credential_parameter_keys)
+        and not _credential_fill_is_presence_guarded(node, parents)
+        for node in ast.walk(tree)
+    )
+
+
 _CREDENTIAL_FIELD_ACCESS_RE = re.compile(
     r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
 )
@@ -775,7 +857,6 @@ def dynamic_row_evidence_fingerprint(
     period_matches: Sequence[Mapping[str, Any]],
     selected_index: int,
 ) -> str:
-    """Return a keyed integrity tag for potentially sensitive captured row evidence."""
     payload = {
         "source_url": source_url,
         "target_selector": target_selector,
@@ -786,15 +867,7 @@ def dynamic_row_evidence_fingerprint(
         "period_matches": [dict(item) for item in period_matches],
         "selected_index": selected_index,
     }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.scrypt(
-        serialized,
-        salt=_DYNAMIC_ROW_EVIDENCE_FINGERPRINT_DOMAIN + b"\x00" + settings.SECRET_KEY.encode(),
-        n=_DYNAMIC_ROW_EVIDENCE_SCRYPT_N,
-        r=8,
-        p=1,
-        dklen=32,
-    ).hex()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDynamicRowEvidence | None:
@@ -842,18 +915,16 @@ def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDy
         or selected_index < 0
         or selected_index >= row_selector_count
         or not isinstance(evidence_fingerprint, str)
-        or not hmac.compare_digest(
-            evidence_fingerprint,
-            dynamic_row_evidence_fingerprint(
-                source_url=source_url,
-                target_selector=selector,
-                row_selector=row_selector.strip(),
-                row_text=" ".join(row_text.split()),
-                row_selector_count=row_selector_count,
-                row_text_match_count=row_text_match_count,
-                period_matches=period_matches,
-                selected_index=selected_index,
-            ),
+        or evidence_fingerprint
+        != dynamic_row_evidence_fingerprint(
+            source_url=source_url,
+            target_selector=selector,
+            row_selector=row_selector.strip(),
+            row_text=" ".join(row_text.split()),
+            row_selector_count=row_selector_count,
+            row_text_match_count=row_text_match_count,
+            period_matches=period_matches,
+            selected_index=selected_index,
         )
     ):
         return None
@@ -2352,6 +2423,10 @@ def synthesize_code_block(
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
         if login_only_presence_guard_active:
+            lines.append(f"{_INDENT}try:")
+            lines.append(f'{_INDENT * 2}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
+            lines.append(f"{_INDENT}except Exception:")
+            lines.append(f"{_INDENT * 2}pass")
             lines.append(f"{_INDENT}if await {_ENTRY_TARGET_VAR}.count() == 1:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
@@ -2593,10 +2668,7 @@ def synthesize_code_block(
                 credential_param_key = _credential_param_key(interaction, used_param_keys)
                 credential_param_keys[credential_id] = credential_param_key
                 parameters.append({"key": credential_param_key, "credential_id": credential_id})
-            if credential_field == "totp":
-                lines.append(f"{action_indent}await {locator}.fill(await {credential_param_key}.otp())")
-            else:
-                lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
+            lines.append(f"{action_indent}{credential_fill_source(locator, credential_param_key, credential_field)}")
             record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
         elif tool_name == "select_option":
             emit_snapshot_recovery(trajectory_index, action_indent)
