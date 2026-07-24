@@ -45,6 +45,20 @@ class _AiStub:
     pass
 
 
+class _SelectedEngineError(Exception):
+    pass
+
+
+class _SelectedEngineTimeout(_SelectedEngineError):
+    pass
+
+
+def _selected_engine():
+    selection = MagicMock()
+    selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, _SelectedEngineTimeout)
+    return selection
+
+
 class _ScrapedPageStub:
     def __init__(self) -> None:
         self._browser_state = SimpleNamespace()
@@ -2037,7 +2051,11 @@ def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) ->
     return script_page
 
 
-def _skyvern_page_with_locator(mock_ai, locator: _RecordingLocator) -> SkyvernPage:
+def _skyvern_page_with_locator(
+    mock_ai,
+    locator: _RecordingLocator,
+    engine_selection=None,
+) -> SkyvernPage:
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
@@ -2046,6 +2064,7 @@ def _skyvern_page_with_locator(mock_ai, locator: _RecordingLocator) -> SkyvernPa
         skyvern_page = SkyvernPage(
             page=raw_page,
             ai=mock_ai,
+            engine_selection=engine_selection,
         )
     skyvern_page._working_frame = _RecordingLocatorScope(locator)
     return skyvern_page
@@ -2253,6 +2272,102 @@ async def test_selector_click_prep_opt_out_keeps_escape_retry_for_interception(m
         ("click", None),
         ("click", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_threads_browser_state_engine_selection():
+    engine_selection = _selected_engine()
+    browser_state = SimpleNamespace(
+        engine_selection=engine_selection,
+        must_get_working_page=AsyncMock(return_value=create_mock_page()),
+    )
+    scraped_page = SimpleNamespace(_browser_state=browser_state)
+
+    with (
+        patch.object(ScriptSkyvernPage, "create_scraped_page", new_callable=AsyncMock, return_value=scraped_page),
+        patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None),
+        patch("skyvern.core.script_generations.script_skyvern_page.RealSkyvernPageAi"),
+    ):
+        script_page = await ScriptSkyvernPage.create()
+
+    assert script_page.engine_selection is engine_selection
+
+
+def test_direct_constructor_defaults_engine_selection_to_none(mock_scraped_page, mock_ai):
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=create_mock_page(),
+            ai=mock_ai,
+        )
+
+    assert script_page.engine_selection is None
+
+
+@pytest.mark.asyncio
+async def test_selector_click_prep_opt_out_uses_selected_native_timeout_for_escape_gate(mock_ai):
+    locator = _RecordingLocator(click_error=_SelectedEngineTimeout("Timeout"))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, _selected_engine())
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(_SelectedEngineTimeout):
+            await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [("click", None)]
+
+
+@pytest.mark.asyncio
+async def test_selector_click_prep_opt_out_foreign_timeout_keeps_escape_retry(mock_ai):
+    locator = _RecordingLocator(click_error=PlaywrightTimeoutError("Timeout"))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, _selected_engine())
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(PlaywrightTimeoutError):
+            await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [
+        ("click", None),
+        ("click", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_selected_native_post_dispatch_timeout_skips_duplicate_click(mock_ai):
+    message = "click action done; waiting for scheduled navigations to finish"
+    locator = _RecordingLocator(click_error=_SelectedEngineTimeout(message))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, _selected_engine())
+
+    result = await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert result == "#target"
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [("click", None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine_selection", "timeout_error"),
+    [
+        pytest.param(_selected_engine(), _SelectedEngineTimeout, id="selected-native"),
+        pytest.param(None, PlaywrightTimeoutError, id="stock"),
+    ],
+)
+async def test_post_dispatch_timeout_after_escape_skips_ai_fallback(mock_ai, engine_selection, timeout_error):
+    mock_ai.ai_click = AsyncMock()
+    locator = _RecordingLocator()
+    locator.click = AsyncMock(
+        side_effect=[
+            timeout_error("<div class='overlay'></div> intercepts pointer events"),
+            timeout_error("click action done; waiting for scheduled navigations to finish"),
+        ]
+    )
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, engine_selection)
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+        result = await skyvern_page.click("#target", prompt="Click target", _skip_element_prep=True, timeout=5000)
+
+    assert result == "#target"
+    assert locator.click.await_count == 2
+    mock_ai.ai_click.assert_not_awaited()
 
 
 @pytest.mark.asyncio

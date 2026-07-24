@@ -1054,10 +1054,41 @@ async def test_create_browser_state_stamps_resolved_engine_selection() -> None:
             real_browser_manager.BrowserContextFactory,
             "create_browser_context",
             AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
-        ),
+        ) as create_browser_context,
     ):
         state = await manager._create_browser_state(workflow_run_id="wr_engine_stamp")
 
     assert state.engine_selection is selection
     assert state.pw is fake_pw
     selection.start_driver.assert_awaited_once()
+    assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+
+
+@pytest.mark.asyncio
+async def test_repair_forwards_pinned_engine_selection() -> None:
+    selection = BrowserEngineSelection(
+        name="engine-under-test",
+        start_driver=AsyncMock(),
+        error_type=_EngineUnderTestError,
+        timeout_error_type=_EngineUnderTestTimeout,
+        metadata=BrowserEngineMetadata(name="engine-under-test", version="0.0.0"),
+        selection_reason="test",
+    )
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=None,
+        engine_selection=selection,
+    )
+    context = MagicMock()
+    context.pages = []
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            AsyncMock(return_value=(context, BrowserArtifacts(), None)),
+        ) as create_browser_context,
+        patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+    ):
+        await state.check_and_fix_state()
+
+    assert create_browser_context.await_args.kwargs["engine_selection"] is selection
