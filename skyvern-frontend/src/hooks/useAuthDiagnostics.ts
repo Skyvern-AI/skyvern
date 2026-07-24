@@ -21,6 +21,20 @@ export type AuthDiagnosticsResponse = {
   api_key?: string;
 };
 
+// HTTP statuses that mean "diagnostics can't run against THIS deployment" —
+// not "the backend is down". Fail open ("ok") for these so we don't show the
+// misleading "could not reach the diagnostics endpoint / backend not running"
+// banner when the backend is clearly reachable.
+//   404 -> endpoint not registered (older / non-local backend).
+//   401/403 -> an auth layer or version-skewed image is in front of the
+//              local-only endpoint (SKY-11308: skyvern-ui:latest calling a
+//              backend that answers the diagnostics route with a 401).
+// Genuine API-key problems on a forge backend come back as a 200 with an
+// explicit AuthStatus (invalid/expired/not_found), and real failing requests
+// are still surfaced via the AuthIssue store (request_auth_error banner), so
+// failing open here never hides an actionable auth error.
+const DIAGNOSTICS_UNAVAILABLE_STATUSES = new Set([401, 403, 404]);
+
 async function fetchDiagnostics(): Promise<AuthDiagnosticsResponse> {
   const client = await getClient(null);
   try {
@@ -29,7 +43,10 @@ async function fetchDiagnostics(): Promise<AuthDiagnosticsResponse> {
     );
     return response.data;
   } catch (error) {
-    if (axios.isAxiosError(error) && error.response?.status === 404) {
+    const status = axios.isAxiosError(error)
+      ? error.response?.status
+      : undefined;
+    if (status !== undefined && DIAGNOSTICS_UNAVAILABLE_STATUSES.has(status)) {
       return { status: "ok" };
     }
     throw error;
@@ -45,4 +62,4 @@ function useAuthDiagnostics() {
   });
 }
 
-export { useAuthDiagnostics };
+export { fetchDiagnostics, useAuthDiagnostics };
