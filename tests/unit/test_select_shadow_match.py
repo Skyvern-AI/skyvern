@@ -923,8 +923,8 @@ async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPa
     assert event is not None
     expected_keys = set(
         "event log_level family workflow_run_id task_id organization_id step_id entry_action_type selection_group_id "
-        "select_depth family_gate_enabled assigned gate_error encountered eligible match_tier option_count attempted "
-        "click_attempted verified_success outcome llm_fallback_requested duration_ms".split()
+        "select_depth script_mode family_gate_enabled assigned gate_error encountered eligible match_tier "
+        "option_count attempted click_attempted verified_success outcome llm_fallback_requested duration_ms".split()
     )
     expected_outcomes = set(
         "llm_fallback_gate_error llm_fallback_eval_error llm_fallback_family_off llm_fallback_control "

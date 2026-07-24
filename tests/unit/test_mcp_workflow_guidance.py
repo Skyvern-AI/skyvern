@@ -71,6 +71,26 @@ async def test_text_prompt_block_schema_example_omits_raw_llm_key() -> None:
     assert "model" not in result["data"]["example"]
 
 
+@pytest.mark.asyncio
+async def test_code_block_schema_advertises_goal_prompt() -> None:
+    """The MCP contract must steer clients to put each code block's plain-language goal in `prompt`
+    (rendered as the block's Goal), so MCP input reaches the Goal field (SKY-12954)."""
+    result = await skyvern_block_schema(block_type="code")
+
+    assert result["ok"] is True
+    example = result["data"]["example"]
+    assert example["block_type"] == "code"
+    assert example["prompt"]
+    properties = result["data"]["schema"]["properties"]
+    assert "goal" in properties["prompt"]["description"].lower()
+    assert properties["steps"]["description"]
+
+
+def test_workflow_create_guides_code_block_goal_prompt() -> None:
+    assert "plain-language goal" in (skyvern_workflow_create.__doc__ or "")
+    assert "plain-language goal" in (skyvern_workflow_update.__doc__ or "")
+
+
 # --- Tool-routing hints in tool descriptions (mechanism (c): wrong-tool / missing-arg calls) ---
 # These guard the cross-references that steer an MCP client to the right tool. Tool names are stable
 # API identifiers, so asserting they appear in the routing docstrings is a contract check, not prose.

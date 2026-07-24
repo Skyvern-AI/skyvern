@@ -103,3 +103,194 @@ def test_extraction_goal_max_tokens_constant() -> None:
     from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
 
     assert EXTRACTION_GOAL_MAX_TOKENS == 150_000
+
+
+def test_task_run_request_rejects_start_fresh_with_session() -> None:
+    import pydantic
+
+    from skyvern.schemas.runs import TaskRunRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_session_id"):
+        TaskRunRequest(prompt="t", browser_session_id="pbs_1", start_fresh_browser=True)
+
+
+def test_task_run_request_allows_session_or_start_fresh_alone() -> None:
+    from skyvern.schemas.runs import TaskRunRequest
+
+    TaskRunRequest(prompt="t", browser_session_id="pbs_1")
+    TaskRunRequest(prompt="t", start_fresh_browser=True)
+
+
+def test_workflow_run_request_rejects_start_fresh_with_session() -> None:
+    import pydantic
+
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_session_id"):
+        WorkflowRunRequest(agent_id="wpid_1", browser_session_id="pbs_1", start_fresh_browser=True)
+
+
+def test_workflow_run_request_allows_session_or_start_fresh_alone() -> None:
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    WorkflowRunRequest(agent_id="wpid_1", browser_session_id="pbs_1")
+    WorkflowRunRequest(agent_id="wpid_1", start_fresh_browser=True)
+
+
+def test_task_run_request_rejects_start_fresh_with_address() -> None:
+    import pydantic
+
+    from skyvern.schemas.runs import TaskRunRequest
+
+    # A browser_address connects to a live remote browser with its existing cookies — that reuse
+    # violates the fresh contract, so the combination must be rejected at the request boundary.
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_address"):
+        TaskRunRequest(prompt="t", browser_address="http://1.2.3.4:9222", start_fresh_browser=True)
+
+
+def test_task_run_request_allows_address_or_start_fresh_alone() -> None:
+    from skyvern.schemas.runs import TaskRunRequest
+
+    TaskRunRequest(prompt="t", browser_address="http://1.2.3.4:9222")
+    TaskRunRequest(prompt="t", start_fresh_browser=True)
+
+
+def test_workflow_run_request_rejects_start_fresh_with_address() -> None:
+    import pydantic
+
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_address"):
+        WorkflowRunRequest(agent_id="wpid_1", browser_address="http://1.2.3.4:9222", start_fresh_browser=True)
+
+
+def test_workflow_run_request_allows_address_or_start_fresh_alone() -> None:
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    WorkflowRunRequest(agent_id="wpid_1", browser_address="http://1.2.3.4:9222")
+    WorkflowRunRequest(agent_id="wpid_1", start_fresh_browser=True)
+
+
+def test_workflow_request_body_rejects_start_fresh_with_address() -> None:
+    import pydantic
+
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_address"):
+        WorkflowRequestBody(browser_address="http://1.2.3.4:9222", start_fresh_browser=True)
+
+
+def test_login_request_rejects_start_fresh_with_session() -> None:
+    import pydantic
+
+    from skyvern.schemas.credential_type import CredentialType
+    from skyvern.schemas.run_blocks import LoginRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_session_id"):
+        LoginRequest(credential_type=CredentialType.skyvern, start_fresh_browser=True, browser_session_id="pbs_1")
+
+
+def test_login_request_allows_session_or_start_fresh_alone() -> None:
+    from skyvern.schemas.credential_type import CredentialType
+    from skyvern.schemas.run_blocks import LoginRequest
+
+    LoginRequest(credential_type=CredentialType.skyvern, browser_session_id="pbs_1")
+    LoginRequest(credential_type=CredentialType.skyvern, start_fresh_browser=True)
+
+
+def test_block_run_request_rejects_start_fresh_with_address() -> None:
+    import pydantic
+
+    from skyvern.schemas.credential_type import CredentialType
+    from skyvern.schemas.run_blocks import LoginRequest
+
+    # Without this the block routes only fail deep in execution (500 + an orphaned workflow) instead
+    # of a clean 422 at the request boundary, the way the task/workflow run models already reject it.
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_address"):
+        LoginRequest(
+            credential_type=CredentialType.skyvern,
+            browser_address="http://1.2.3.4:9222",
+            start_fresh_browser=True,
+        )
+
+
+def test_workflow_request_body_rejects_start_fresh_with_session() -> None:
+    import pydantic
+
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_session_id"):
+        WorkflowRequestBody(start_fresh_browser=True, browser_session_id="pbs_1")
+
+
+def test_workflow_request_body_allows_session_or_start_fresh_alone() -> None:
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+    WorkflowRequestBody(browser_session_id="pbs_1")
+    WorkflowRequestBody(start_fresh_browser=True)
+
+
+def test_task_run_request_rejects_start_fresh_with_profile() -> None:
+    import pydantic
+
+    from skyvern.schemas.runs import TaskRunRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_profile_id"):
+        TaskRunRequest(prompt="t", browser_profile_id="bp_1", start_fresh_browser=True)
+
+
+def test_task_run_request_allows_profile_or_start_fresh_alone() -> None:
+    from skyvern.schemas.runs import TaskRunRequest
+
+    TaskRunRequest(prompt="t", browser_profile_id="bp_1")
+    TaskRunRequest(prompt="t", start_fresh_browser=True)
+
+
+def test_workflow_run_request_rejects_start_fresh_with_profile() -> None:
+    import pydantic
+
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_profile_id"):
+        WorkflowRunRequest(agent_id="wpid_1", browser_profile_id="bp_1", start_fresh_browser=True)
+
+
+def test_workflow_run_request_allows_profile_or_start_fresh_alone() -> None:
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    WorkflowRunRequest(agent_id="wpid_1", browser_profile_id="bp_1")
+    WorkflowRunRequest(agent_id="wpid_1", start_fresh_browser=True)
+
+
+def test_login_request_rejects_start_fresh_with_profile() -> None:
+    import pydantic
+
+    from skyvern.schemas.credential_type import CredentialType
+    from skyvern.schemas.run_blocks import LoginRequest
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_profile_id"):
+        LoginRequest(credential_type=CredentialType.skyvern, start_fresh_browser=True, browser_profile_id="bp_1")
+
+
+def test_login_request_allows_profile_or_start_fresh_alone() -> None:
+    from skyvern.schemas.credential_type import CredentialType
+    from skyvern.schemas.run_blocks import LoginRequest
+
+    LoginRequest(credential_type=CredentialType.skyvern, browser_profile_id="bp_1")
+    LoginRequest(credential_type=CredentialType.skyvern, start_fresh_browser=True)
+
+
+def test_workflow_request_body_rejects_start_fresh_with_profile() -> None:
+    import pydantic
+
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+    with pytest.raises(pydantic.ValidationError, match="cannot be combined with browser_profile_id"):
+        WorkflowRequestBody(start_fresh_browser=True, browser_profile_id="bp_1")
+
+
+def test_workflow_request_body_allows_profile_or_start_fresh_alone() -> None:
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+    WorkflowRequestBody(browser_profile_id="bp_1")
+    WorkflowRequestBody(start_fresh_browser=True)
