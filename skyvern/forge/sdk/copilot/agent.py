@@ -97,7 +97,9 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     TurnNarrativePayload,
     adopt_model_authored_context,
+    coerce_ask_subject,
     finalize_discovery_counter_in_global_llm_context,
+    parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
@@ -3951,6 +3953,12 @@ async def _translate_to_agent_result(
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
+    if resp_type == "ASK_QUESTION":
+        LOG.info(
+            "copilot_ask_subject",
+            subject=coerce_ask_subject(action_data.get("ask_subject")),
+            refs=parsed_ask_refs(action_data.get("refs")),
+        )
     normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
     resp_type = normalized_scaffolding.response_type
     user_response = normalized_scaffolding.user_response or "Done."

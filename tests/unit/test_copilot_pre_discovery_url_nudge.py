@@ -12,9 +12,12 @@ untouched.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD, BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -22,6 +25,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES,
     PRE_DISCOVERY_URL_QUESTION_NUDGE,
     PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
+    _check_enforcement,
     _pre_discovery_url_question_nudge,
     _response_coverage_nudge,
 )
@@ -289,6 +293,148 @@ def test_present_completion_contract_ask_suppressed_by_genuine_attempt(marker: d
     assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
 
 
+_REQUESTED_OUTPUT_PATHS = ("output.number_of_new_signups", "output.number_of_website_visitors")
+
+
+def _output_path_contract_policy(**overrides: object) -> RequestPolicy:
+    defaults = dict(
+        user_response_policy="proceed",
+        clarification_reason="none",
+        completion_contract_status="present",
+        completion_criteria=[
+            CompletionCriterion(
+                id="visitors", outcome="The website visitor count is returned.", output_path=_REQUESTED_OUTPUT_PATHS[1]
+            ),
+            CompletionCriterion(
+                id="signups", outcome="The new signup count is returned.", output_path=_REQUESTED_OUTPUT_PATHS[0]
+            ),
+        ],
+    )
+    defaults.update(overrides)
+    return RequestPolicy(**defaults)
+
+
+def _output_schema_ask(refs: list[str]) -> dict[str, object]:
+    return {
+        "type": "ASK_QUESTION",
+        "user_response": "Should the output be website visitors and new signups as integers?",
+        "ask_subject": "output_schema",
+        "refs": refs,
+    }
+
+
+def test_output_schema_ask_with_covering_refs_auto_answers() -> None:
+    ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
+
+    assert nudge is not None
+    assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    for path in _REQUESTED_OUTPUT_PATHS:
+        assert path in nudge
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+    assert len(events) == 1
+    assert events[0]["subject"] == "output_schema"
+    assert set(events[0]["resolved_refs"]) == set(_REQUESTED_OUTPUT_PATHS)
+
+
+@pytest.mark.parametrize(
+    "refs",
+    [
+        pytest.param([], id="empty"),
+        pytest.param(["output.number_of_website_visitors", "output.unknown_field"], id="partial"),
+        pytest.param(["output.unknown_field"], id="unresolvable"),
+    ],
+)
+def test_output_schema_ask_without_full_coverage_passes_through(refs: list[str]) -> None:
+    ctx = _mid_build_ctx(_output_path_contract_policy())
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask(refs))
+
+    assert nudge is None
+    assert not [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+
+
+_CREDENTIALS_ASK = {
+    "type": "ASK_QUESTION",
+    "user_response": "Which saved credential should I use?",
+    "ask_subject": "credentials",
+}
+
+
+def test_non_output_schema_subject_ask_passes_through() -> None:
+    ctx = _mid_build_ctx(_output_path_contract_policy())
+
+    assert _response_coverage_nudge(ctx, _CREDENTIALS_ASK) is None
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        pytest.param(_CREDENTIALS_ASK, id="credentials"),
+        pytest.param({**_CREDENTIALS_ASK, "ask_subject": "other"}, id="other"),
+        pytest.param(_output_schema_ask(["output.unknown_field"]), id="output_schema_unresolvable"),
+    ],
+)
+def test_typed_subject_ask_before_a_genuine_attempt_keeps_the_legacy_retry(ask: dict[str, object]) -> None:
+    """A typed subject the contract cannot answer must not buy the ask an early exit past the
+    build-first retry; only a resolved auto-answer skips it."""
+    ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
+
+    assert _response_coverage_nudge(ctx, ask) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
+@pytest.mark.parametrize(
+    ("ctx_factory", "expected_outcome"),
+    [
+        pytest.param(
+            lambda: _present_contract_ctx(request_policy=_output_path_contract_policy()),
+            "build_first_retry",
+            id="retried",
+        ),
+        pytest.param(
+            lambda: _mid_build_ctx(_output_path_contract_policy()),
+            "reached_user",
+            id="reached_user",
+        ),
+    ],
+)
+def test_unresolved_typed_ask_logs_which_outcome_it_got(ctx_factory: Callable[[], _Ctx], expected_outcome: str) -> None:
+    with capture_logs() as logs:
+        _response_coverage_nudge(ctx_factory(), _CREDENTIALS_ASK)
+
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_passed_through"]
+    assert len(events) == 1
+    assert events[0]["outcome"] == expected_outcome
+
+
+def test_absent_subject_present_contract_ask_keeps_legacy_retry() -> None:
+    ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
+
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
+def test_definition_level_output_path_does_not_count_as_coverage() -> None:
+    policy = _output_path_contract_policy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="def_visitors",
+                outcome="The website visitor count is defined.",
+                output_path="output.number_of_website_visitors",
+                level="definition",
+            ),
+            CompletionCriterion(
+                id="signups", outcome="The new signup count is returned.", output_path="output.number_of_new_signups"
+            ),
+        ],
+    )
+    ctx = _mid_build_ctx(policy)
+
+    assert _response_coverage_nudge(ctx, _output_schema_ask(["output.number_of_website_visitors"])) is None
+
+
 def test_present_completion_contract_ask_admits_after_scout_only_marker() -> None:
     ctx = _present_contract_ctx(test_after_update_done=True)
 
@@ -320,3 +466,151 @@ def test_recycle_admission_is_superset_of_backstop_block(marker: dict[str, objec
         assert recycle_admits
     else:
         assert not recycle_admits
+
+
+def _rekeyed_criterion(criterion_id: str, outcome: str, path: str, **overrides: object) -> CompletionCriterion:
+    defaults = dict(
+        id=criterion_id,
+        outcome=outcome,
+        output_path=None,
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path=path,
+        kind="outcome",
+        level="run",
+        pinability="shapeless_valid",
+        requested_output_evidence_source="runtime_output",
+    )
+    defaults.update(overrides)
+    return CompletionCriterion(**defaults)
+
+
+def _rekeyed_contract_policy(**overrides: object) -> RequestPolicy:
+    return _output_path_contract_policy(
+        completion_criteria=[
+            _rekeyed_criterion("visitors", "The website visitor count is returned.", _REQUESTED_OUTPUT_PATHS[1]),
+            _rekeyed_criterion("signups", "The new signup count is returned.", _REQUESTED_OUTPUT_PATHS[0]),
+        ],
+        **overrides,
+    )
+
+
+def _mid_build_ctx(policy: RequestPolicy) -> _Ctx:
+    return _present_contract_ctx(request_policy=policy, update_workflow_called=True)
+
+
+def test_output_schema_ask_auto_answers_after_genuine_attempt() -> None:
+    ctx = _mid_build_ctx(_output_path_contract_policy())
+
+    nudge = _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
+
+    assert nudge is not None
+    assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    for path in _REQUESTED_OUTPUT_PATHS:
+        assert path in nudge
+
+
+def test_floor_rekeyed_contract_covers_output_schema_ask() -> None:
+    ctx = _mid_build_ctx(_rekeyed_contract_policy())
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
+
+    assert nudge is not None
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+    assert len(events) == 1
+    assert set(events[0]["resolved_refs"]) == set(_REQUESTED_OUTPUT_PATHS)
+
+
+def test_floor_rekeyed_paths_are_quotable_from_the_prompt_summary() -> None:
+    summary = _rekeyed_contract_policy().prompt_summary()
+
+    assert "requested_output_paths:" in summary
+    for path in _REQUESTED_OUTPUT_PATHS:
+        assert f"- {path}" in summary
+
+
+def test_credentials_ask_after_genuine_attempt_passes_through() -> None:
+    ctx = _mid_build_ctx(_rekeyed_contract_policy())
+    ask = {
+        "type": "ASK_QUESTION",
+        "user_response": "Which saved credential should I use?",
+        "ask_subject": "credentials",
+    }
+
+    assert _response_coverage_nudge(ctx, ask) is None
+
+
+def test_uncovered_output_schema_ask_after_genuine_attempt_passes_through() -> None:
+    ctx = _mid_build_ctx(_rekeyed_contract_policy())
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask(["output.unknown_field"]))
+
+    assert nudge is None
+    assert not [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+
+
+def test_definition_level_rekeyed_path_does_not_count_as_coverage() -> None:
+    policy = _output_path_contract_policy(
+        completion_criteria=[
+            _rekeyed_criterion(
+                "visitors",
+                "The website visitor count is defined.",
+                _REQUESTED_OUTPUT_PATHS[1],
+                level="definition",
+            ),
+        ],
+    )
+    ctx = _mid_build_ctx(policy)
+
+    assert _response_coverage_nudge(ctx, _output_schema_ask([_REQUESTED_OUTPUT_PATHS[1]])) is None
+
+
+def test_clarification_reason_keeps_output_schema_ask_with_the_user() -> None:
+    ctx = _mid_build_ctx(_rekeyed_contract_policy(clarification_reason="credentials"))
+
+    assert _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS))) is None
+
+
+def _enforcement_ctx(policy: RequestPolicy) -> CopilotContext:
+    ctx = CopilotContext(
+        organization_id="o_test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=None,
+    )
+    ctx.build_phase = BuildPhase.COMPOSING
+    ctx.request_policy = policy
+    ctx.turn_intent = _authoring_intent()
+    ctx.update_workflow_called = True
+    ctx.test_after_update_done = True
+    ctx.discovery_calls_this_turn = 1
+    return ctx
+
+
+def test_enforcement_auto_answers_rekeyed_output_schema_ask_mid_build() -> None:
+    ctx = _enforcement_ctx(_rekeyed_contract_policy())
+    result = SimpleNamespace(final_output=json.dumps(_output_schema_ask(list(_REQUESTED_OUTPUT_PATHS))))
+
+    nudge = _check_enforcement(ctx, result)
+
+    assert nudge is not None
+    for path in _REQUESTED_OUTPUT_PATHS:
+        assert path in nudge
+
+
+def test_definition_level_rekeyed_path_stays_out_of_the_prompt_summary() -> None:
+    policy = _output_path_contract_policy(
+        completion_criteria=[
+            _rekeyed_criterion(
+                "visitors",
+                "The website visitor count is defined.",
+                _REQUESTED_OUTPUT_PATHS[1],
+                level="definition",
+            ),
+        ],
+    )
+
+    assert "requested_output_paths:" not in policy.prompt_summary()
