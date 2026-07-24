@@ -1394,6 +1394,17 @@ class SkyvernPage(Page):
     async def complete(self, prompt: str | None = None) -> None:
         """Stub for complete. Override in subclasses for specific behavior."""
 
+    # Intentionally not @action_wrap-wrapped: this is internal evidence capture, not a
+    # user-facing recordable action like click/fill/complete.
+    async def capture_action_screenshot(self) -> None:
+        """Persist a screenshot of the current page as a timeline-visible run artifact.
+
+        On-demand evidence capture for a specific moment (e.g. a confirmed submission).
+        Stub; the cached-script page overrides this to persist a SCREENSHOT_ACTION for
+        the current block.
+        """
+        return
+
     @action_wrap(ActionType.DOWNLOAD_FILE)
     async def download_file(
         self,
