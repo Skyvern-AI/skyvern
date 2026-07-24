@@ -10,7 +10,6 @@ import re
 import textwrap
 import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -86,7 +85,6 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _CODE_SUBMIT_ACTION_RE,
-    _CREDENTIAL_FIELDS,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
@@ -111,9 +109,16 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _selector_refines,
     artifact_dependency_id,
     artifact_observation_ref_id,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    block_has_unguarded_credential_fill as _block_has_unguarded_credential_fill,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_input_templated_locator,
     build_same_month_file_match_locator,
     credential_scout_gap,
+    dynamic_row_evidence_fingerprint,
+    dynamic_row_period_matches_match_selected_row,
     freeze_requested_output_extraction_candidate,
     grounded_parameter_key_is_safe,
     input_correspondences_for_interaction,
@@ -134,7 +139,9 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
     uncovered_rung_records,
+    validated_dynamic_row_period_matches,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
@@ -4093,7 +4100,12 @@ def _evaluate_output_contract_for_code_block(
     *,
     allow_static_return_advisory: bool = False,
     enforce_value_bearing_liveness: bool = False,
+    credit_convergence_ceiling: bool = False,
 ) -> _OutputContractEvaluation | None:
+    """`credit_convergence_ceiling` inverts the liveness benefit of the doubt once the steer loop
+    has consumed its budget: a root envelope the static prover reports as "unknown" is credited
+    instead of refused, and the separated-spine structure steer no longer blocks. Provably absent
+    or empty bindings and missing metadata/schema/return coverage keep rejecting unchanged."""
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
@@ -4130,24 +4142,23 @@ def _evaluate_output_contract_for_code_block(
     missing_declaration_return_paths = sorted(declaration_paths - submitted_code_paths)
     shape_violations: list[str] = []
     declaration_only_contract = bool(declaration_paths) and not observation_paths
+
+    def _root_envelope_unproved(paths: set[str]) -> bool:
+        if paths != {_VALUE_BEARING_ROOT_GUIDANCE_PATH}:
+            return False
+        state = _root_output_envelope_state(target_code)
+        return state == "absent" if credit_convergence_ceiling else state != "proven"
+
     if enforce_value_bearing_liveness:
         if contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
-            root_envelope_unproved = (
-                required_paths == {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
-                and _root_output_envelope_state(target_code) != "proven"
-            )
             if (
                 target_block is None
-                or root_envelope_unproved
+                or _root_envelope_unproved(required_paths)
                 or _statically_lacks_value_bearing_observation_paths(target_code, required_paths)
             ):
                 shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
         elif target_block is not None:
-            root_envelope_unproved = (
-                observation_paths == {_VALUE_BEARING_ROOT_GUIDANCE_PATH}
-                and _root_output_envelope_state(target_code) != "proven"
-            )
-            if root_envelope_unproved or _statically_lacks_value_bearing_observation_paths(
+            if _root_envelope_unproved(observation_paths) or _statically_lacks_value_bearing_observation_paths(
                 target_code, observation_paths
             ):
                 shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
@@ -4155,7 +4166,7 @@ def _evaluate_output_contract_for_code_block(
         shape_violations.append("ambiguous_output_owner" if owner_labels else "missing_output_owner")
     elif target_block is None:
         shape_violations.append("missing_output_block")
-    elif required_paths and _scout_spine_requires_separated_blocks(ctx):
+    elif required_paths and not credit_convergence_ceiling and _scout_spine_requires_separated_blocks(ctx):
         synthesized = synthesize_code_block(
             ctx.scout_trajectory,
             strict_selectors=True,
@@ -5099,6 +5110,280 @@ def _stash_output_contract_reject_budget_terminal(
         block_label=block_label,
         canonical_output_contract_signature=signature,
         canonical_required_child_paths=sorted(required_paths),
+    )
+
+
+@dataclass(frozen=True)
+class _OutputContractCeilingResolution:
+    """Outcome of the impose-or-credit move at the convergence ceiling: the draft (possibly
+    rewritten server-side) plus the crediting re-evaluation that admits it."""
+
+    workflow_yaml: str
+    code_artifact_metadata: object
+    evaluation: _OutputContractEvaluation
+    mode: Literal["credited", "imposed"]
+
+
+def _loaded_result_source_producible_for_signature(
+    ctx: AgentContext,
+    *,
+    target_code: str,
+    signature: str,
+) -> bool:
+    """Loaded-result evidence is producible for this contract only while it is unclaimed or
+    already claimed by this signature; evidence claimed by another contract does not carry
+    over. The first contract to find it producible claims it."""
+    if not loaded_result_source_producible(ctx.latest_evaluate_result_composition_steer, target_code=target_code):
+        return False
+    claimed_signature = ctx.latest_evaluate_result_composition_signature
+    if claimed_signature not in (None, signature):
+        return False
+    ctx.latest_evaluate_result_composition_signature = signature
+    return True
+
+
+def _every_required_output_value_observed(ctx: AgentContext, required_paths: set[str]) -> bool:
+    """Imposition writes a binding for every required path, so authorization needs observation
+    coverage for every one of them — a single overlapping path would otherwise license composing
+    the rest as constants the recording never saw."""
+    if not required_paths:
+        return False
+    return all(_observed_required_output_values(ctx, {path}) for path in required_paths)
+
+
+def _output_contract_binding_source_on_record(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    workflow_yaml: str,
+) -> bool:
+    """Whether the recorded exploration already pins where the requested value lives: either the
+    scout observed every required path, or a producible loaded-result composition anchors the
+    target block's selectors. Imposition is only justified when this is on record."""
+    binding_paths = evaluation.observation_paths or evaluation.required_paths
+    if _every_required_output_value_observed(ctx, binding_paths):
+        return True
+    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(evaluation.block_label)
+    if target_block is None:
+        return False
+    return _loaded_result_source_producible_for_signature(
+        ctx,
+        target_code=str(target_block.get("code") or ""),
+        signature=evaluation.canonical_signature,
+    )
+
+
+def _impose_output_contract_binding_at_ceiling(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    evaluation: _OutputContractEvaluation,
+) -> tuple[str, object] | None:
+    """Compose the required output binding onto the submitted draft using the same static-return
+    and metadata-scaffold composers the steer directives describe to the model. Abstains (returns
+    None) when no value-bearing envelope can be composed, leaving the reject path byte-identical."""
+    label = evaluation.block_label
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return None
+    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(label)
+    if target_block is None:
+        return None
+    target_code = str(target_block.get("code") or "")
+    contract = _output_contract_required_paths_source(ctx)
+    binding_paths = set(contract.union) or _value_bearing_directive_paths(contract)
+    if not binding_paths:
+        return None
+    keyed_code, violations = _extraction_code_with_value_bearing_static_return(
+        target_code,
+        required_paths=binding_paths,
+        declaration_paths=contract.declaration_paths,
+    )
+    if violations:
+        return None
+    imposed_yaml = workflow_yaml
+    if keyed_code != textwrap.dedent(target_code).strip():
+        applied = False
+        for block in _workflow_code_blocks(parsed):
+            if str(block.get("label") or "").strip() == label:
+                block["code"] = keyed_code.rstrip() + "\n"
+                applied = True
+                break
+        if not applied:
+            return None
+        imposed_yaml = yaml.safe_dump(parsed, sort_keys=False)
+    scaffolded_metadata = _apply_metadata_contract_scaffold(
+        ctx,
+        imposed_yaml,
+        raw_code_artifact_metadata,
+        required_paths=contract.observation_paths or (binding_paths - contract.declaration_paths),
+        source=contract.source or evaluation.source,
+        reason_code=contract.reason_code or evaluation.reason_code,
+        declaration_paths=contract.declaration_paths,
+        allow_missing_static_return=True,
+    )
+    return imposed_yaml, scaffolded_metadata
+
+
+def _output_contract_steering_exhausted(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    workflow_yaml: str,
+) -> bool:
+    """Steering has stopped moving the draft: this submission came back with the same canonical
+    structural fingerprint the last reject already steered on, so re-emitting the directive cannot
+    converge. Keyed on that fingerprint rather than reject counts, which inflate, and unreachable
+    on a first submission because no prior reject fingerprint exists yet."""
+    signature = evaluation.canonical_signature
+    if not signature or not evaluation.block_label:
+        return False
+    if not _prior_output_contract_actuation(ctx, signature):
+        return False
+    steered_fingerprint = ctx.output_contract_last_reject_fingerprint_by_signature.get(signature)
+    if not steered_fingerprint:
+        return False
+    return steered_fingerprint == _output_contract_structural_fingerprint(workflow_yaml, signature)
+
+
+def _credit_output_contract_submission(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> _OutputContractEvaluation | None:
+    """Re-adjudicate the submission with static uncertainty credited, so a draft that binds the
+    required paths but that the liveness prover can only call "unknown" ships instead of looping.
+    Returns None when the deficiency is genuine."""
+    credited = _evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        raw_metadata,
+        enforce_value_bearing_liveness=True,
+        credit_convergence_ceiling=True,
+    )
+    if credited is None or credited.has_deficiencies:
+        return None
+    return credited
+
+
+def _credit_output_contract_submission_at_ceiling(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> _OutputContractEvaluation | None:
+    resolution = _credit_or_impose_output_contract(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        credit_only=True,
+    )
+    return resolution.evaluation if resolution is not None else None
+
+
+def _resolve_output_contract_pass_path(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    credit_only: bool,
+) -> OutputContractActuation:
+    """Convert the pass-path preconditions to typed evidence and let the single resolver decide.
+    Crediting and composing are probed here because the resolver is pure; probing mutates nothing
+    and abstains exactly where the strict path already rejects."""
+    credited = _credit_output_contract_submission(
+        ctx, evaluation, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata
+    )
+    impose_available = (
+        not credit_only
+        and credited is None
+        and _output_contract_binding_source_on_record(ctx, evaluation, workflow_yaml)
+        and _impose_output_contract_binding_at_ceiling(ctx, workflow_yaml, raw_metadata, evaluation) is not None
+    )
+    evidence = OutputContractActuationEvidence(
+        imposed_available=False,
+        click_only_spine=False,
+        observed_required_values=bool(evaluation.observation_paths)
+        and _observed_required_output_values(ctx, evaluation.observation_paths),
+        prior_actuation=_prior_output_contract_actuation(ctx, evaluation.canonical_signature),
+        prior_directive_unconsumed=False,
+        steering_exhausted=_output_contract_steering_exhausted(ctx, evaluation, workflow_yaml),
+        credit_available=credited is not None,
+        scouted_binding_impose_available=impose_available,
+    )
+    return resolve_output_contract_actuation(
+        family=classify_output_contract_bail_family(evaluation.shape_violations), evidence=evidence
+    )
+
+
+def _credit_or_impose_output_contract(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    credit_only: bool = False,
+) -> _OutputContractCeilingResolution | None:
+    """Resolve a submission the steer loop can no longer move: credit it when the strict prover
+    was merely uncertain, else impose the binding the recording pins. Returns None when the
+    resolver picks neither, leaving the caller's reject/ablation path untouched."""
+    actuation = _resolve_output_contract_pass_path(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        credit_only=credit_only,
+    )
+    if actuation.kind not in {
+        OutputContractActuationKind.CREDIT,
+        OutputContractActuationKind.IMPOSE_SCOUTED_BINDING,
+    }:
+        return None
+    if actuation.kind == OutputContractActuationKind.CREDIT:
+        credited = _credit_output_contract_submission(
+            ctx, evaluation, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata
+        )
+        if credited is None:
+            return None
+        LOG.info(
+            "copilot_output_contract_submission_credited_at_ceiling",
+            block_label=evaluation.block_label,
+            canonical_output_contract_signature=evaluation.canonical_signature,
+            credited_shape_violations=list(evaluation.shape_violations),
+            credited_missing_code_return_paths=list(evaluation.missing_return_paths),
+        )
+        return _OutputContractCeilingResolution(
+            workflow_yaml=workflow_yaml,
+            code_artifact_metadata=raw_metadata,
+            evaluation=credited,
+            mode="credited",
+        )
+    imposed = _impose_output_contract_binding_at_ceiling(ctx, workflow_yaml, raw_metadata, evaluation)
+    if imposed is None:
+        return None
+    imposed_yaml, imposed_metadata = imposed
+    reevaluated = _evaluate_output_contract_for_code_block(
+        ctx,
+        imposed_yaml,
+        imposed_metadata,
+        enforce_value_bearing_liveness=True,
+        credit_convergence_ceiling=True,
+    )
+    if reevaluated is None or reevaluated.has_deficiencies:
+        return None
+    LOG.info(
+        "copilot_output_contract_binding_imposed_at_ceiling",
+        block_label=evaluation.block_label,
+        canonical_output_contract_signature=evaluation.canonical_signature,
+    )
+    return _OutputContractCeilingResolution(
+        workflow_yaml=imposed_yaml,
+        code_artifact_metadata=imposed_metadata,
+        evaluation=reevaluated,
+        mode="imposed",
     )
 
 
@@ -6085,12 +6370,9 @@ def _actuate_output_contract_bail(
     click_only_spine = _output_contract_click_only_spine(target_code, declaration_paths)
     observed_required_values = _observed_required_output_values(ctx, required_paths)
     loaded_result_evidence = ctx.latest_evaluate_result_composition_steer
-    result_source_producible = loaded_result_source_producible(loaded_result_evidence, target_code=target_code)
-    claimed_signature = ctx.latest_evaluate_result_composition_signature
-    if result_source_producible and claimed_signature not in (None, signature):
-        result_source_producible = False
-    elif result_source_producible:
-        ctx.latest_evaluate_result_composition_signature = signature
+    result_source_producible = _loaded_result_source_producible_for_signature(
+        ctx, target_code=target_code, signature=signature
+    )
     if not click_only_spine or observed_required_values or result_source_producible:
         _clear_declick_attempt(ctx, signature)
     evidence = OutputContractActuationEvidence(
@@ -6826,6 +7108,18 @@ def _metadata_contract_run_preflight_reject(
         enforce_value_bearing_liveness=True,
     )
     if evaluation is None or not evaluation.has_deficiencies:
+        return None
+    if (
+        _credit_output_contract_submission_at_ceiling(
+            ctx,
+            evaluation,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=raw_code_artifact_metadata,
+        )
+        is not None
+    ):
+        # The steer loop consumed its budget on this contract and the submission satisfies it
+        # under ceiling crediting: let the run proceed instead of re-emitting the directive.
         return None
     if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations:
         _revoke_output_contract_advisory_run(ctx, evaluation.canonical_signature)
@@ -8117,6 +8411,7 @@ class _SynthesizedCodeImpositionResult:
     metadata_repair_contract: dict[str, object] | None = None
     ablation_gate_id: str | None = None
     never_captured_candidate: _NeverCapturedObligationCandidate | None = None
+    omission_digest: str | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -8334,15 +8629,31 @@ def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | No
     return True
 
 
-def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
+def _should_impose_after_update_attempt(ctx: AgentContext, *, repeated_identical_omission: bool = False) -> bool:
     target = ctx.reached_download_target
     return (
         (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
         or synthesized_persistence_reopened_after_failed_run(ctx)
         or ctx.synthesized_block_reopened_for_credential_scout
         or ctx.synthesized_block_reopened_for_capture_obligation
+        or repeated_identical_omission
         or _author_time_reject_reopens_synthesized_imposition(ctx)
     )
+
+
+def _current_draft_repeats_prior_scouted_spine_omission(workflow_yaml: str, ctx: AgentContext) -> bool:
+    """The repeated-omission imposition arm admits only when the CURRENT draft still leaves the same
+    scouted-spine rungs open: recompute this draft's omission digest and require it non-empty and equal
+    to the immediately-prior reject's digest, so A,A,B never imposes on B off a latch set by a prior draft."""
+    if not ctx.scouted_spine_repeated_identical_missing_steps:
+        return False
+    current = _pre_persist_scouted_spine_result(workflow_yaml, ctx)
+    digest = current.omission_digest if current is not None else None
+    if digest is None or digest != ctx.scouted_spine_previous_omission_digest:
+        ctx.scouted_spine_repeated_identical_missing_steps = False
+        ctx.scouted_spine_previous_omission_digest = None
+        return False
+    return True
 
 
 def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> bool:
@@ -8644,12 +8955,70 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         input_holes = provenance.get("holes")
         if not isinstance(input_holes, list) or not input_holes:
             return False
+        selector = str(provenance.get("selector") or "")
+        row_text = ""
+        if surface == "row_text":
+            source_url = provenance.get("source_url")
+            target_selector = provenance.get("target_selector")
+            row_selector = provenance.get("row_selector")
+            row_text_value = provenance.get("row_text")
+            row_selector_count = provenance.get("row_selector_count")
+            row_text_match_count = provenance.get("row_text_match_count")
+            period_matches = provenance.get("period_matches")
+            validated_period_matches = (
+                validated_dynamic_row_period_matches(period_matches, row_selector_count)
+                if isinstance(row_selector_count, int) and not isinstance(row_selector_count, bool)
+                else None
+            )
+            selected_index = provenance.get("selected_index")
+            evidence_fingerprint = provenance.get("evidence_fingerprint")
+            if (
+                not isinstance(source_url, str)
+                or not source_url.strip()
+                or not isinstance(target_selector, str)
+                or not target_selector.strip()
+                or not isinstance(row_selector, str)
+                or not row_selector.strip()
+                or not isinstance(row_text_value, str)
+                or not row_text_value.strip()
+                or isinstance(row_selector_count, bool)
+                or not isinstance(row_selector_count, int)
+                or row_selector_count < 2
+                or row_selector_count > 100
+                or isinstance(row_text_match_count, bool)
+                or not isinstance(row_text_match_count, int)
+                or row_text_match_count < 1
+                or row_text_match_count > row_selector_count
+                or validated_period_matches is None
+                or not dynamic_row_period_matches_match_selected_row(row_text_value, validated_period_matches)
+                or isinstance(selected_index, bool)
+                or not isinstance(selected_index, int)
+                or selected_index < 0
+                or selected_index >= row_selector_count
+                or not isinstance(evidence_fingerprint, str)
+                or evidence_fingerprint
+                != dynamic_row_evidence_fingerprint(
+                    source_url=source_url,
+                    target_selector=target_selector,
+                    row_selector=row_selector,
+                    row_text=row_text_value,
+                    row_selector_count=row_selector_count,
+                    row_text_match_count=row_text_match_count,
+                    period_matches=validated_period_matches,
+                    selected_index=selected_index,
+                )
+            ):
+                return False
+            selector = row_selector
+            row_text = row_text_value
         recomputed = build_input_templated_locator(
             surface=surface,
-            selector=str(provenance.get("selector") or ""),
+            selector=selector,
             role=str(provenance.get("role") or ""),
             name=str(provenance.get("name") or ""),
             holes=input_holes,
+            row_text=row_text,
+            period_matches=validated_period_matches if surface == "row_text" and validated_period_matches else (),
         )
         return recomputed is not None and recomputed == provenance.get("emitted_literal")
     if source == SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE:
@@ -8707,6 +9076,44 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         recomputed = build_same_month_file_match_locator(transform, transform.selector)
         return recomputed is not None and recomputed == provenance.get("emitted_literal")
     return False
+
+
+def _public_locator_provenance(provenance_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    public_rows: list[dict[str, Any]] = []
+    for provenance in provenance_rows:
+        if provenance.get("surface") != "row_text":
+            public_rows.append(dict(provenance))
+            continue
+        holes = provenance.get("holes")
+        input_keys: set[str] = set()
+        transforms: set[str] = set()
+        if isinstance(holes, list):
+            for hole in holes:
+                if not isinstance(hole, Mapping):
+                    continue
+                inputs = [hole]
+                equivalents = hole.get("equivalent_inputs")
+                if isinstance(equivalents, list):
+                    inputs.extend(item for item in equivalents if isinstance(item, Mapping))
+                for witness in inputs:
+                    key = str(witness.get("input_key") or "")
+                    transform = str(witness.get("transform") or "")
+                    if key:
+                        input_keys.add(key)
+                    if transform:
+                        transforms.add(transform)
+        source_url = str(provenance.get("source_url") or "")
+        public_rows.append(
+            {
+                "trajectory_index": provenance.get("trajectory_index"),
+                "source": str(provenance.get("source") or ""),
+                "surface": "row_text",
+                "source_origin": url_origin(source_url) if source_url else None,
+                "input_keys": sorted(input_keys),
+                "transforms": sorted(transforms),
+            }
+        )
+    return public_rows
 
 
 _PAGE_MUTATION_METHODS = frozenset(
@@ -9621,6 +10028,28 @@ def _synthesized_resubmission_credential_scout_requirements(
     return _credentialed_code_block_scout_gate_errors(probe_yaml, ctx)
 
 
+def _record_scouted_spine_omission_reject(ctx: AgentContext, digest: str | None) -> None:
+    if digest is not None and digest == ctx.scouted_spine_previous_omission_digest:
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+        LOG.info("copilot_scouted_spine_repeated_identical_omission", omission_digest=digest)
+    else:
+        ctx.scouted_spine_repeated_identical_missing_steps = False
+    ctx.scouted_spine_previous_omission_digest = digest
+
+
+def _scouted_spine_omission_digest(records: Sequence[Mapping[str, Any]]) -> str:
+    items = sorted(
+        (
+            str(record.get("tool_name") or ""),
+            str(record.get("method") or ""),
+            str(record.get("selector") or record.get("locator") or ""),
+            str(record.get("trajectory_index")),
+        )
+        for record in records
+    )
+    return hashlib.sha256(json.dumps(items).encode()).hexdigest()
+
+
 def _scouted_spine_under_build_result(
     workflow_yaml: str,
     *,
@@ -9684,6 +10113,7 @@ def _scouted_spine_under_build_result(
                 reason_code=_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
                 selector=str(first_uncovered.get("selector") or "") or None,
             ),
+            omission_digest=_scouted_spine_omission_digest(uncovered),
         )
     # Non-uncovered partition findings are synthesizer-side: no draft edit closes them, so a
     # repair-convergence-only site routes them to the turn-end obligation halt instead of a churn loop.
@@ -9902,74 +10332,6 @@ def _workflow_credential_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
     return keys
 
 
-def _credential_field_fill_argument(arg: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
-    if (
-        isinstance(arg, ast.Attribute)
-        and arg.attr in _CREDENTIAL_FIELDS
-        and isinstance(arg.value, ast.Name)
-        and arg.value.id in credential_parameter_keys
-    ):
-        return True
-    target = arg.value if isinstance(arg, ast.Await) else arg
-    return (
-        isinstance(target, ast.Call)
-        and isinstance(target.func, ast.Attribute)
-        and target.func.attr == "otp"
-        and isinstance(target.func.value, ast.Name)
-        and target.func.value.id in credential_parameter_keys
-    )
-
-
-def _is_credential_field_fill_call(node: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "fill"
-        and bool(node.args)
-        and _credential_field_fill_argument(node.args[0], credential_parameter_keys)
-    )
-
-
-def _is_presence_guard_test(test: ast.AST) -> bool:
-    for node in ast.walk(test):
-        if isinstance(node, ast.Attribute) and node.attr in {"count", "is_visible"}:
-            return True
-        if isinstance(node, ast.Name) and node.id in _INTERNAL_SCOUT_VARS:
-            return True
-    return False
-
-
-def _credential_fill_is_presence_guarded(node: ast.AST, parents: Mapping[int, ast.AST]) -> bool:
-    current: ast.AST = node
-    while id(current) in parents:
-        parent = parents[id(current)]
-        if (
-            isinstance(parent, ast.If)
-            and any(current is stmt for stmt in parent.body)
-            and _is_presence_guard_test(parent.test)
-        ):
-            return True
-        current = parent
-    return False
-
-
-def _block_has_unguarded_credential_fill(code: str, credential_parameter_keys: AbstractSet[str]) -> bool:
-    if not credential_parameter_keys:
-        return False
-    tree = _wrapped_code_ast(code)
-    if tree is None:
-        return False
-    parents: dict[int, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[id(child)] = node
-    return any(
-        _is_credential_field_fill_call(node, credential_parameter_keys)
-        and not _credential_fill_is_presence_guarded(node, parents)
-        for node in ast.walk(tree)
-    )
-
-
 def _freehand_surface_reject(
     workflow_yaml: str, code_blocks: list[dict[str, Any]], validation: _BrowserSurfaceValidation
 ) -> _SynthesizedCodeImpositionResult:
@@ -10163,16 +10525,6 @@ def _is_submitted_code_synthesized_only(submitted_code: str, synthesized_code: s
     submitted = textwrap.dedent(submitted_code).strip()
     synthesized = textwrap.dedent(synthesized_code).strip()
     return bool(submitted and synthesized and submitted == synthesized)
-
-
-def _wrapped_code_ast(code: str) -> ast.AST | None:
-    body = "\n".join(f"    {line}" for line in code.splitlines())
-    if not body.strip():
-        body = "    pass"
-    try:
-        return ast.parse(f"async def __submitted_code__():\n{body}\n")
-    except SyntaxError:
-        return None
 
 
 def _is_page_locator_expression(value: ast.AST) -> bool:
@@ -11399,7 +11751,12 @@ def _maybe_impose_synthesized_code_block(
     # Goal-completeness gates on the requested-output plan, which materializes mid-turn, so keying availability on
     # it would make ownership race the plan; reach is monotone in the scout's capture. Landing still closes the lane.
     spine_landing_available = reaches_goal and not ctx.synthesized_goal_complete_landed
-    if ctx.update_workflow_called and not spine_landing_available and not _should_impose_after_update_attempt(ctx):
+    repeated_identical_omission = _current_draft_repeats_prior_scouted_spine_omission(workflow_yaml, ctx)
+    if (
+        ctx.update_workflow_called
+        and not spine_landing_available
+        and not _should_impose_after_update_attempt(ctx, repeated_identical_omission=repeated_identical_omission)
+    ):
         _log_imposition_skipped_after_update(ctx)
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if ctx.update_workflow_called:
@@ -11840,7 +12197,7 @@ def _maybe_impose_synthesized_code_block(
         "source_trajectory_count": len(scout_trajectory),
         "parameter_keys": parameter_reconciliation.parameter_keys,
         "credential_parameter_keys": credential_parameter_keys,
-        "selector_provenance": diagnostics.locator_provenance,
+        "selector_provenance": _public_locator_provenance(diagnostics.locator_provenance),
         "prior_source": prior_source,
     }
     if extraction_plan is not None:
@@ -13079,6 +13436,8 @@ async def _update_workflow(
 ) -> dict[str, Any]:
     ctx.output_contract_bail_actuated_this_call = False
 
+    output_contract_imposed_signature = ""
+
     def reject(
         *,
         error: str,
@@ -13087,6 +13446,9 @@ async def _update_workflow(
         repair_context: CodeAuthoringRepairContext | None = None,
         record_repair_context_outcome: bool = True,
     ) -> dict[str, Any]:
+        # An imposition that never reached persistence must not refund the reject streak.
+        if output_contract_imposed_signature:
+            ctx.output_contract_imposed_since_last_reject_by_signature.pop(output_contract_imposed_signature, None)
         if repair_context is None:
             _clear_code_authoring_repair_context(ctx)
         elif record_repair_context_outcome:
@@ -13226,6 +13588,7 @@ async def _update_workflow(
         workflow_yaml, ctx
     )
     if typed_default_violations:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(
             error="\n".join(typed_default_violations),
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -13371,6 +13734,7 @@ async def _update_workflow(
         metadata_scrubbed_by_imposition = True
     parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
     if parameter_contract_error is not None:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(
             error=parameter_contract_error,
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -13423,21 +13787,53 @@ async def _update_workflow(
     output_contract_static_advisory_allowed = (
         output_contract_evaluation is not None and output_contract_evaluation.can_attempt_run
     )
-    if (
+    output_contract_deficient = (
         output_contract_evaluation is not None
         and output_contract_evaluation.has_deficiencies
         and not output_contract_static_advisory_allowed
-    ):
+    )
+    output_contract_ceiling_resolution: _OutputContractCeilingResolution | None = None
+    if output_contract_deficient:
+        assert output_contract_evaluation is not None
         authored_fingerprint = _output_contract_structural_fingerprint(
             workflow_yaml, output_contract_evaluation.canonical_signature
         )
-        if not _record_output_contract_ablation_event(
+        # Recorded before the pass path resolves so the gate's would-block population still
+        # counts the submissions credit-or-impose goes on to handle.
+        output_contract_ablated = _record_output_contract_ablation_event(
             ctx,
             output_contract_evaluation,
             gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
             blocked_tool="update_workflow",
             fingerprint=authored_fingerprint,
-        ):
+        )
+        output_contract_ceiling_resolution = _credit_or_impose_output_contract(
+            ctx,
+            output_contract_evaluation,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=params.get("code_artifact_metadata"),
+        )
+    if output_contract_ceiling_resolution is not None:
+        assert output_contract_evaluation is not None
+        workflow_yaml = output_contract_ceiling_resolution.workflow_yaml
+        params["workflow_yaml"] = workflow_yaml
+        params["code_artifact_metadata"] = output_contract_ceiling_resolution.code_artifact_metadata
+        params["raw_code_artifact_metadata"] = output_contract_ceiling_resolution.code_artifact_metadata
+        ctx.raw_code_artifact_metadata = output_contract_ceiling_resolution.code_artifact_metadata
+        # The pass path inherits the advisory lane's adjudication: the draft persists now, and a
+        # run that binds nothing reopens the ladder instead of shipping an unverified workflow.
+        _arm_pending_run_evidence(
+            ctx,
+            output_contract_evaluation.canonical_signature,
+            set(output_contract_evaluation.observation_paths),
+        )
+        if output_contract_ceiling_resolution.mode == "imposed":
+            _mark_output_contract_imposed(ctx, output_contract_evaluation.canonical_signature)
+            output_contract_imposed_signature = output_contract_evaluation.canonical_signature
+        output_contract_evaluation = output_contract_ceiling_resolution.evaluation
+    elif output_contract_deficient:
+        assert output_contract_evaluation is not None
+        if not output_contract_ablated:
             payload = _record_output_contract_reject(
                 ctx,
                 output_contract_evaluation,
@@ -13460,6 +13856,7 @@ async def _update_workflow(
                     payload=payload,
                     tool_name="update_workflow",
                 )
+                _record_code_authoring_guardrail_reject(ctx)
                 return reject(
                     error=str(reject_result["error"]),
                     user_facing_summary=str(
@@ -13643,7 +14040,8 @@ async def _update_workflow(
         verified_runtime_output_paths_by_label=_verified_runtime_output_contract_paths_by_label(ctx, workflow_yaml),
         advisory_declared_output_return_shape_labels=(
             {output_contract_evaluation.block_label}
-            if output_contract_static_advisory_allowed and output_contract_evaluation is not None
+            if output_contract_evaluation is not None
+            and (output_contract_static_advisory_allowed or output_contract_ceiling_resolution is not None)
             else None
         ),
     )
@@ -13867,14 +14265,17 @@ async def _update_workflow(
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
     stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
     if stale_metadata:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=_stale_block_metadata_message(stale_metadata))
 
     wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
     if wait_block_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=wait_block_error)
 
     challenge_http_error = _challenge_http_request_reject_message(ctx, workflow_yaml, ctx.workflow_yaml)
     if challenge_http_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=challenge_http_error)
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
@@ -13888,14 +14289,17 @@ async def _update_workflow(
     )
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=_banned_block_reject_message(banned_items, ctx))
 
     download_scout_error = _download_scout_required_error(ctx, workflow_yaml)
     if download_scout_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=download_scout_error)
 
     download_binding_error = _download_binding_required_error(ctx, workflow_yaml)
     if download_binding_error:
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=download_binding_error)
 
     composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
@@ -13905,6 +14309,7 @@ async def _update_workflow(
             workflow_permanent_id=ctx.workflow_permanent_id,
             target_url=workflow_target_url(workflow_yaml),
         )
+        _record_code_authoring_guardrail_reject(ctx)
         return reject(error=composition_evidence_error)
 
     # New data-write blocks default to surfacing failures rather than swallowing them.
@@ -14103,6 +14508,7 @@ async def _update_workflow(
 
     pre_persist_spine = _pre_persist_scouted_spine_result(workflow_yaml, ctx)
     if pre_persist_spine is not None:
+        _record_scouted_spine_omission_reject(ctx, pre_persist_spine.omission_digest)
         _set_code_authoring_repair_context(ctx, pre_persist_spine.repair_context)
         _record_code_authoring_guardrail_reject(ctx)
         return reject(
@@ -14188,7 +14594,10 @@ async def _update_workflow(
         ctx.workflow_yaml = workflow_yaml
         ctx.persisted_draft_browser_calls = _workflow_yaml_browser_call_pairs(workflow_yaml)
         ctx.code_authoring_guardrail_reject_count = 0
+        ctx.scouted_spine_previous_omission_digest = None
+        ctx.scouted_spine_repeated_identical_missing_steps = False
         ctx.last_code_authoring_reject_was_credential_priority = False
+        ctx.last_output_policy_reject_reason_codes = None
         ctx.metadata_reject_ladder_state = None
         _clear_code_authoring_repair_context(ctx)
         _clear_held_churn_signals(ctx)

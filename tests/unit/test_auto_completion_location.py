@@ -1003,7 +1003,7 @@ async def test_reset_autocomplete_empty_incremental_rescrapes_page_elements() ->
     skyvern_el.input_clear.assert_awaited_once()
     skyvern_el.press_fill.assert_awaited_once_with("Oakland")
     skyvern_frame.safe_wait_for_animation_end.assert_awaited_once()
-    scrape_factory.assert_called_once_with(skyvern_frame=skyvern_frame)
+    scrape_factory.assert_called_once_with(skyvern_frame=skyvern_frame, engine_selection=None)
     fallback_scrape.get_incremental_element_tree.assert_awaited_once()
     scraped_page.generate_scraped_page_without_screenshots.assert_awaited_once()
     dom_after_open.get_skyvern_element_by_id.assert_awaited_once_with("FRESH")

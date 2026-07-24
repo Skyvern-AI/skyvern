@@ -263,8 +263,12 @@ When `goal_reached` is `true`, you are asserting "the workflow I built and teste
 {
   "type": "ASK_QUESTION",
   "user_response": "A clear, specific question to ask the user — aim for 1-2 sentences (~200 characters), but never drop the observed field/control or a required part of a multi-part question to hit that length; specificity wins over brevity.",
+  "ask_subject": "One of: output_schema | credentials | target_url | disambiguation | other. The category of information the question is about.",
+  "refs": ["output.number_of_website_visitors"],
   "global_llm_context": { ...same structured object as above... }
 }
+
+`refs` are output-path identifiers copied verbatim from the `requested_output_paths` list in the request policy summary, when `ask_subject` is `output_schema`. Omit `refs` for other subjects.
 
 IMPORTANT: Always preserve and extend global_llm_context across turns using the structured JSON format above. Each slot has a specific purpose:
 - user_goal: The user's high-level objective. Set this on the first turn, update if the goal evolves.

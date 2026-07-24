@@ -40,6 +40,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -64,7 +65,10 @@ def is_element_detached_error(exc: BaseException) -> bool:
     return "not attached to the dom" in message or "frame was detached" in message
 
 
-def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
+def is_post_dispatch_click_timeout(
+    exc: BaseException,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
     """A Playwright `TimeoutError` whose message references the post-click
     auto-wait for scheduled navigations means the click was physically
     dispatched (Playwright logs ``click action done`` immediately before this
@@ -72,7 +76,10 @@ def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
     trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
     chain would duplicate the already-applied side effect.
     """
-    if not isinstance(exc, TimeoutError):
+    is_timeout = (
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+    )
+    if not is_timeout:
         return False
     return "scheduled navigation" in str(exc).lower()
 
@@ -845,6 +852,29 @@ class SkyvernElement:
         # handles the click itself (navigating) instead of toggling the control.
         try:
             return await label_locator.locator("a[href], button").count() > 0
+        except Exception:
+            return False
+
+    async def is_safe_for_checkbox_direct_click(self) -> bool:
+        # A checkbox blocker is safe to click directly only when the click cannot be
+        # intercepted by actionable content that would navigate/submit: the blocker
+        # must not itself be an <a href>/<button>, nor a <label> wrapping one. Any
+        # probe failure or anomalous result fails closed (treated as unsafe).
+        locator = self.get_locator()
+        try:
+            is_interactive = await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression="(element) => element.matches('a[href], button')",
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            return False
+        if not isinstance(is_interactive, bool) or is_interactive:
+            return False
+        if self.get_tag_name() != "label":
+            return True
+        try:
+            return await locator.locator("a[href], button").count() == 0
         except Exception:
             return False
 

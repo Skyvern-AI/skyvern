@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -207,6 +208,12 @@ class AuthorTimeGateAblationEvent:
     payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
 
 
+class ScoutedEquivalentInput(TypedDict):
+    input_key: str
+    parameter_value: str
+    transform: str
+
+
 class ScoutedInputCorrespondence(TypedDict):
     input_key: str
     matched_literal: str
@@ -214,6 +221,25 @@ class ScoutedInputCorrespondence(TypedDict):
     surface: str
     transform: str
     position: int
+    equivalent_inputs: NotRequired[list[ScoutedEquivalentInput]]
+
+
+class ScoutedDynamicRowPeriodMatch(TypedDict):
+    period: str
+    selected_row_match_count: int
+    row_match_count: int
+
+
+class ScoutedDynamicRowEvidence(TypedDict):
+    source_url: str
+    target_selector: str
+    row_selector: str
+    row_text: str
+    row_selector_count: int
+    row_text_match_count: int
+    period_matches: list[ScoutedDynamicRowPeriodMatch]
+    selected_index: int
+    evidence_fingerprint: str
 
 
 class ScoutedInteraction(TypedDict):
@@ -224,6 +250,7 @@ class ScoutedInteraction(TypedDict):
     # Grounded value-containment witnesses computed at the update_workflow confluence; drive
     # generator-owned templated locators. Empty/absent => literal replay.
     input_correspondences: NotRequired[list[ScoutedInputCorrespondence]]
+    dynamic_row_evidence: NotRequired[ScoutedDynamicRowEvidence]
     typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
@@ -278,6 +305,16 @@ class NeverCapturedObligation:
     captured_trajectory_index: int | None = None
     state: NeverCapturedObligationState = "armed"
     replay_payload: NeverCapturedReplayPayload | None = None
+
+
+@dataclass(frozen=True)
+class PostRunPagePathInteractionWindow:
+    structural_key: str
+    workflow_run_id: str
+    trajectory_anchor: int
+    admitted_attempts: int = 0
+    observation_generation: int = 0
+    observed_successful_interactions: int = 0
 
 
 @dataclass
@@ -353,6 +390,7 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    last_output_policy_reject_reason_codes: frozenset[str] | None = None
     # Climbs on each click that made no verified forward progress (failed/timed-out
     # click or a hollow post-click observe); resets on verified progress.
     consecutive_no_progress_interaction_count: int = 0
@@ -442,6 +480,8 @@ class AgentContext:
     post_run_page_observation_url: str | None = None
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
+    post_run_page_observation_generation: int = 0
+    post_run_page_path_interaction_window: PostRunPagePathInteractionWindow | None = None
     post_run_current_page_inspection_workflow_run_id: str | None = None
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
@@ -467,6 +507,8 @@ class AgentContext:
     # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
     persisted_draft_browser_calls: list[tuple[str, str]] | None = None
     scouted_spine_checkpoint_fired: bool = False
+    scouted_spine_previous_omission_digest: str | None = None
+    scouted_spine_repeated_identical_missing_steps: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
@@ -579,6 +621,12 @@ class AgentContext:
     # get_by_role(role, name, exact=True) re-anchor resolves to exactly one live element on the source
     # page; a non-unique or nameless ambiguous selector leaves this None so synthesis drops the interaction.
     pending_scout_reanchor: tuple[str, str, str] | None = None
+    # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
+    # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
+    pending_scout_dynamic_row: ScoutedDynamicRowEvidence | None = None
+    # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
+    # directly instead of silently accepting a dynamically attached dependency.
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.

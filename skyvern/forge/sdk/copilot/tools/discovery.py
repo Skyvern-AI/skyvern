@@ -18,7 +18,12 @@ except ImportError:  # pragma: no cover — bs4 is a transitive dep but discover
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop, CopilotEntrypointCandidate
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
+    CopilotToolBlockerSignal,
+)
 from skyvern.forge.sdk.copilot.build_phase import (
+    DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD,
     BuildPhase,
     advance_to_composing,
     advance_to_discovering,
@@ -26,6 +31,8 @@ from skyvern.forge.sdk.copilot.build_phase import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
 
 from ._shared import (
     _DISCOVERY_ANTI_BOT_PATTERNS,
@@ -769,6 +776,51 @@ async def _discovery_walk(
     )
 
 
+# Only pre-navigation resolution failures advance the streak; scorer-miss reasons
+# consume the per-turn budget so a retry short-circuits and never reaches the threshold.
+_DISCOVERY_ENTRY_RESOLUTION_FAILURE_REASONS = frozenset({"could_not_resolve_site_name"})
+
+
+def _build_discovery_exhausted_escape_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=(
+            "STOP: entrypoint resolution failed repeatedly this turn and no web address is available to open. "
+            "This is not repairable by retrying. Ask the user for the target URL."
+        ),
+        user_facing_reason=(
+            "I looked through your messages and the workflow draft but couldn't find a web address to open. "
+            "Tell me the URL of the site you want me to work on and I'll get started."
+        ),
+        recovery_hint="ask_user_clarifying",
+        cleared_by_tools=frozenset(),
+        renders_final_reply=True,
+        internal_reason_code=DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
+        blocked_tool="discover_workflow_entrypoint",
+    )
+
+
+def _emit_discovery_exhausted_escape(copilot_ctx: CopilotContext) -> None:
+    if copilot_ctx.turn_halt is not None:
+        return
+    signal = _build_discovery_exhausted_escape_signal()
+    claim_and_stash_blocker_signal(copilot_ctx, TurnClaimant.GENUINELY_TERMINAL, signal)
+    stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="discovery")
+
+
+def _maybe_advance_discovery_failure_streak(copilot_ctx: CopilotContext, result: Mapping[str, Any]) -> None:
+    data_payload = result.get("data")
+    data: Mapping[str, Any] = data_payload if isinstance(data_payload, Mapping) else {}
+    if (
+        data.get("failure_reason") not in _DISCOVERY_ENTRY_RESOLUTION_FAILURE_REASONS
+        or copilot_ctx.resolved_discovery_entrypoint_url
+    ):
+        return
+    copilot_ctx.discovery_failure_streak_this_turn += 1
+    if copilot_ctx.discovery_failure_streak_this_turn >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD:
+        _emit_discovery_exhausted_escape(copilot_ctx)
+
+
 async def _discover_workflow_entrypoint_impl(
     copilot_ctx: Any,
     site_or_url: str,
@@ -784,6 +836,7 @@ async def _discover_workflow_entrypoint_impl(
     def finish(result: dict[str, Any], *, site_or_url_kind: str | None = None) -> dict[str, Any]:
         _record_discovery_resolution_on_ctx(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        _maybe_advance_discovery_failure_streak(copilot_ctx, result)
         data_payload = result.get("data")
         data = data_payload if isinstance(data_payload, Mapping) else {}
         if isinstance(data_payload, dict) and input_kind == "bare_word":
@@ -825,6 +878,19 @@ async def _discover_workflow_entrypoint_impl(
             site_or_url_kind=site_or_url_kind,
         )
         return result
+
+    if (
+        copilot_ctx.turn_halt is not None
+        or copilot_ctx.discovery_failure_streak_this_turn >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD
+    ):
+        result = _discovery_build_result(
+            candidate_url=None,
+            candidate_form_fields=[],
+            evidence_trail=[],
+            confidence=0.0,
+            failure_reason=DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
+        )
+        return finish(result)
 
     authority_error = _authority_tool_error(copilot_ctx, "discover_workflow_entrypoint")
     if authority_error:

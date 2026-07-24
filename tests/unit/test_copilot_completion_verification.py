@@ -45,6 +45,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     FloorRekeyedDeliverableCredit,
     FloorRekeyedEmissionWithhold,
     RegisteredBlockerEvidence,
+    RenderedEvidenceRecord,
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
@@ -99,6 +100,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDE
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
+    AntecedentFamily,
     CompletionCriterion,
     JudgmentTruthCondition,
     RequestPolicy,
@@ -1153,8 +1155,18 @@ def test_fired_contingent_criterion_without_blocker_evidence_fails() -> None:
 def test_fired_contingent_criterion_with_blocker_evidence_can_satisfy() -> None:
     raw = {
         "verdicts": [
-            {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
-            {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+            {
+                "criterion_id": "c0",
+                "satisfied": True,
+                "reason_code": "evidence_confirms",
+                "evidence_ref": "blocker.value",
+            },
+            {
+                "criterion_id": "c1",
+                "satisfied": True,
+                "reason_code": "evidence_confirms",
+                "evidence_ref": "result.value",
+            },
         ]
     }
     result = _coerce_result(
@@ -1162,6 +1174,10 @@ def test_fired_contingent_criterion_with_blocker_evidence_can_satisfy() -> None:
         ["c0", "c1"],
         contingent_criterion_ids=["c0"],
         contingent_antecedent_output_path_by_criterion_id={"c0": "output.blocker"},
+        evidence_catalog={
+            "blocker": RenderedEvidenceRecord(value={"value": "provider requires a phone call"}),
+            "result": RenderedEvidenceRecord(value={"value": "request reported"}),
+        },
     )
 
     assert result.is_fully_satisfied() is True
@@ -1473,14 +1489,44 @@ def test_coerce_ignores_unknown_ids_and_dedupes_first_wins() -> None:
             {"criterion_id": "ghost", "satisfied": True, "reason_code": "evidence_confirms"},
         ]
     }
-    result = _coerce_result(raw, ["c0"])
+    result = _coerce_result(
+        raw,
+        ["c0"],
+        evidence_catalog={"result": RenderedEvidenceRecord(value={"ok": True}, source="runtime_output")},
+    )
     assert len(result.verdicts) == 1
-    assert result.verdicts[0].satisfied is True
+    assert result.verdicts[0].satisfied is False
+
+
+def test_coerce_rejects_satisfied_verdict_without_rendered_evidence_ref() -> None:
+    result = _coerce_result(
+        {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                }
+            ]
+        },
+        ["c0"],
+        evidence_catalog={"result": RenderedEvidenceRecord(value={"ok": True}, source="runtime_output")},
+    )
+
+    assert result.verdicts[0].state == "unsatisfied"
+    assert result.verdicts[0].reason_code == "no_evidence"
 
 
 def test_coerce_accepts_bytes_and_rejects_malformed() -> None:
-    raw_bytes = b'{"verdicts": [{"criterion_id": "c0", "satisfied": true, "reason_code": "evidence_confirms"}]}'
-    assert _coerce_result(raw_bytes, ["c0"]).is_fully_satisfied() is True
+    raw_bytes = b'{"verdicts": [{"criterion_id": "c0", "satisfied": true, "reason_code": "evidence_confirms", "evidence_ref": "result.ok"}]}'
+    assert (
+        _coerce_result(
+            raw_bytes,
+            ["c0"],
+            evidence_catalog={"result": RenderedEvidenceRecord(value={"ok": True}, source="runtime_output")},
+        ).is_fully_satisfied()
+        is True
+    )
     assert _coerce_result("not json at all", ["c0"]).status == "unavailable"
     assert _coerce_result({"no_verdicts_key": 1}, ["c0"]).status == "unavailable"
 
@@ -2617,7 +2663,16 @@ async def test_evaluate_uses_completion_judge_timeout(monkeypatch: pytest.Monkey
 
     async def handler(**_: object) -> dict[str, object]:
         await asyncio.sleep(0.05)
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     snapshot = RunEvidenceSnapshot(current_url="https://example.com/done")
     result = await evaluate_completion_criteria([_criterion("c0", "done page visible")], snapshot, handler)
@@ -2628,7 +2683,16 @@ async def test_evaluate_uses_completion_judge_timeout(monkeypatch: pytest.Monkey
 @pytest.mark.asyncio
 async def test_evaluate_happy_path_returns_evaluated() -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "confirm.count",
+                }
+            ]
+        }
 
     snapshot = RunEvidenceSnapshot(block_outputs={"confirm": {"count": 1}})
     result = await evaluate_completion_criteria([_criterion("c0", "item in cart")], snapshot, handler)
@@ -5290,7 +5354,16 @@ async def test_classifier_fallback_record_is_not_verified_without_judge(monkeypa
 @pytest.mark.asyncio
 async def test_non_fallback_judge_confirmed_run_still_fires_barrier(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _ctx_with_blocks("extraction")
@@ -5520,8 +5593,18 @@ async def test_validation_classification_incomplete_contract_abstains_without_bl
         calls += 1
         return {
             "verdicts": [
-                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
-                {"criterion_id": "c_other", "satisfied": True, "reason_code": "evidence_confirms"},
+                {
+                    "criterion_id": "c_validation",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "classify_path.path_classification",
+                },
+                {
+                    "criterion_id": "c_other",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "classify_path.path_classification",
+                },
             ]
         }
 
@@ -5923,7 +6006,16 @@ def test_artifact_health_blocks_committed_same_run_outcome() -> None:
 @pytest.mark.asyncio
 async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -5962,7 +6054,16 @@ async def test_active_run_terminal_evidence_sample_matches_current_page(
 
     async def handler(**kwargs: object) -> dict:
         captured.update(kwargs)
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "page_evidence.result_containers",
+                }
+            ]
+        }
 
     async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://example.com/cart", "Cart"
@@ -6252,7 +6353,16 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
 
     async def handler(**kwargs: object) -> dict:
         seen_prompt["prompt"] = str(kwargs.get("prompt") or "")
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation.hasProduct",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -6351,8 +6461,18 @@ async def test_page_observation_validation_classification_cannot_be_judge_approv
         handler_calls += 1
         return {
             "verdicts": [
-                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
-                {"criterion_id": "c_page", "satisfied": True, "reason_code": "evidence_confirms"},
+                {
+                    "criterion_id": "c_validation",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation.evidence_text",
+                },
+                {
+                    "criterion_id": "c_page",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation.evidence_text",
+                },
             ]
         }
 
@@ -6436,8 +6556,18 @@ async def test_page_observation_validation_classification_incomplete_contract_ab
         handler_calls += 1
         return {
             "verdicts": [
-                {"criterion_id": "c_validation", "satisfied": True, "reason_code": "evidence_confirms"},
-                {"criterion_id": "c_page", "satisfied": True, "reason_code": "evidence_confirms"},
+                {
+                    "criterion_id": "c_validation",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation.path_classification",
+                },
+                {
+                    "criterion_id": "c_page",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation.path_classification",
+                },
             ]
         }
 
@@ -6595,7 +6725,16 @@ async def test_page_observation_verification_can_upgrade_unsatisfied_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "current_page_observation.hasProduct",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -6699,7 +6838,16 @@ def test_outcome_evidence_candidate_admits_clean_run_despite_unverified_prefix()
 @pytest.mark.asyncio
 async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _ctx_unverified_prefix()
@@ -6766,7 +6914,16 @@ def test_gate_recognizes_clean_run_despite_unverified_prefix() -> None:
 @pytest.mark.asyncio
 async def test_method_mandated_criteria_excluded_from_verification(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -8461,7 +8618,16 @@ async def test_requested_output_verifier_accepts_p7_with_unfired_blocker_and_fee
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c_submit", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_submit",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "extract_profile.customer_name",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -9477,7 +9643,16 @@ async def test_requested_output_criteria_are_not_sent_to_judge(monkeypatch: pyte
     async def handler(**kwargs: object) -> dict:
         prompt = str(kwargs.get("prompt") or "")
         seen_prompts.append(prompt)
-        return {"verdicts": [{"criterion_id": "c_cart", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_cart",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "extract_profile.items",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -9513,7 +9688,16 @@ async def test_present_generic_requested_output_without_expected_value_structura
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c_submit", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_submit",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "extract_profile.customer_name",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -11432,8 +11616,18 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
         seen_prompt["prompt"] = str(kwargs.get("prompt") or "")
         return {
             "verdicts": [
-                {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
-                {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "extract_credential_details.extracted_information.credentials",
+                },
+                {
+                    "criterion_id": "c1",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "extract_credential_details.extracted_information.credentials",
+                },
             ]
         }
 
@@ -11501,7 +11695,16 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
 @pytest.mark.asyncio
 async def test_maybe_run_completion_verification_unavailable_on_low_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "confirm",
+                }
+            ]
+        }
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
@@ -12615,7 +12818,12 @@ def test_coerce_result_stamps_evidence_source_from_snapshot_sources() -> None:
     result = _coerce_result(
         raw,
         ["c_corroborator"],
-        block_output_sources={"current_page_observation": "independent_page_evidence"},
+        evidence_catalog={
+            "current_page_observation": RenderedEvidenceRecord(
+                value={"selected_highest_priority": True},
+                source="independent_page_evidence",
+            )
+        },
     )
 
     assert result.verdicts[0].evidence_source == "independent_page_evidence"
@@ -12712,7 +12920,12 @@ def test_coerce_result_stamps_evidence_source_from_bare_label_ref() -> None:
     result = _coerce_result(
         raw,
         ["c_corroborator"],
-        block_output_sources={"current_page_observation": "independent_page_evidence"},
+        evidence_catalog={
+            "current_page_observation": RenderedEvidenceRecord(
+                value={"selected_highest_priority": True},
+                source="independent_page_evidence",
+            )
+        },
     )
 
     assert result.verdicts[0].evidence_source == "independent_page_evidence"
@@ -12731,7 +12944,12 @@ def test_bare_label_corroborator_certifies_self_emitted_judgment() -> None:
             ]
         },
         ["c_judgment__requested_output_corroborator"],
-        block_output_sources={"current_page_observation": "independent_page_evidence"},
+        evidence_catalog={
+            "current_page_observation": RenderedEvidenceRecord(
+                value={"selected_highest_priority": True},
+                source="independent_page_evidence",
+            )
+        },
     ).verdicts[0]
     run_result = CompletionVerificationResult(
         status="evaluated",
@@ -13958,7 +14176,6 @@ def test_run_evidence_snapshot_preserves_registered_null_for_family_routing() ->
             ],
         }
     }
-
     snapshot = _build_run_evidence_snapshot(ctx, result)
 
     assert snapshot.registered_output_values["submit_commercial_water_request_output"] == {
@@ -13966,6 +14183,581 @@ def test_run_evidence_snapshot_preserves_registered_null_for_family_routing() ->
         "submitted": True,
     }
     assert snapshot.block_outputs["submit_commercial_water_request"]["blocker"] == "incidental runtime value"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("classification_output_key", "emitted_output"),
+    [
+        ("public_form_exists", {"public_form_exists": False}),
+        ("login_only", {"login_only": True}),
+    ],
+    ids=["correct_negative", "login_only"],
+)
+async def test_neutral_reported_boolean_accepts_evidence_without_floor_rekey_withhold(
+    classification_output_key: str,
+    emitted_output: dict[str, bool],
+) -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome=f"The run reports whether {classification_output_key.replace('_', ' ')}.",
+        antecedent_family="unconditional",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key=classification_output_key,
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    snapshot = RunEvidenceSnapshot(
+        workflow_run_id="wr_553389131952493792",
+        block_outputs={
+            "reported_summary": emitted_output,
+            "post_run_page_observation": {
+                "forms": [],
+                "result_containers": [],
+                "visible_text_excerpt": "Sign in or register to continue.",
+            },
+        },
+        block_output_sources={
+            "reported_summary": "registered_output_parameter",
+            "post_run_page_observation": "independent_page_evidence",
+        },
+        registered_output_evidence_by_request_slot_id={
+            criterion.id: (
+                RegisteredBlockerEvidence(
+                    block_label="report_outcome",
+                    output_path=f"output.{classification_output_key}",
+                    registered_output_key="reported_summary",
+                    registered_output_id="op_reported_summary",
+                    value=emitted_output[classification_output_key],
+                ),
+            )
+        },
+        run_terminal_status="completed",
+    )
+
+    async def verifier(*, prompt: str, **_: object) -> dict[str, object]:
+        assert f"classification_output_key={classification_output_key}" in prompt
+        assert json.dumps(emitted_output, sort_keys=True)[1:-1] in prompt
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "post_run_page_observation.forms",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+    result = carry_floor_rekeyed_criterion_ids(result, [criterion])
+
+    assert result.is_fully_satisfied() is True
+    assert result.floor_rekeyed_criterion_ids == []
+    assert floor_rekeyed_emission_withhold(result) is None
+    assert result.verdicts[0].reason_code == "evidence_confirms"
+    assert result.verdicts[0].evidence_source == "independent_page_evidence"
+    assert all(verdict.reason_code != "evidence_contradicts" for verdict in result.verdicts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("antecedent_family", ["unconditional", "blocker"])
+async def test_neutral_reported_boolean_rejects_its_associated_output_as_evidence(
+    antecedent_family: AntecedentFamily,
+) -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome="The run reports whether public form exists.",
+        antecedent_family=antecedent_family,
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key="public_form_exists",
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"reported_summary": {"public_form_exists": False}},
+        block_output_sources={"reported_summary": "registered_output_parameter"},
+        registered_output_evidence_by_request_slot_id={
+            criterion.id: (
+                RegisteredBlockerEvidence(
+                    block_label="report_public_form",
+                    output_path="output.public_form_exists",
+                    registered_output_key="reported_summary",
+                    registered_output_id="op_reported_summary",
+                    value=False,
+                ),
+            )
+        },
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "reported_summary.public_form_exists",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is False
+    assert result.verdicts[0].state == "unsatisfied"
+    assert result.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_outputs", "block_output_sources", "evidence_ref"),
+    [
+        (
+            {},
+            {"post_run_page_observation": "independent_page_evidence"},
+            "post_run_page_observation.forms",
+        ),
+        (
+            {"post_run_page_observation": {"result_containers": []}},
+            {"post_run_page_observation": "independent_page_evidence"},
+            "post_run_page_observation.forms",
+        ),
+        (
+            {"post_run_page_observation": {"forms": []}},
+            {"post_run_page_observation": "runtime_output"},
+            "post_run_page_observation.forms",
+        ),
+    ],
+    ids=["source_map_only", "unresolved_path", "wrong_source"],
+)
+async def test_judge_evidence_provenance_invariant(
+    block_outputs: dict[str, object],
+    block_output_sources: dict[str, EvidenceSourceKind],
+    evidence_ref: str,
+) -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome="The run reports whether a public form exists.",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key="public_form_exists",
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    snapshot = RunEvidenceSnapshot(
+        block_outputs=block_outputs,
+        block_output_sources=block_output_sources,
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": evidence_ref,
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is False
+    assert result.verdicts[0].state == "unsatisfied"
+    assert result.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence_ref",
+    [
+        "post_run_page_observation.forms[]",
+        "post_run_page_observation.forms[invalid]",
+        "post_run_page_observation.forms[-1]",
+        "post_run_page_observation.forms[1]",
+        "post_run_page_observation.forms[0].inputs[1]",
+        "post_run_page_observation.forms[0].missing",
+    ],
+    ids=[
+        "empty_index",
+        "non_numeric_index",
+        "negative_index",
+        "form_index_out_of_bounds",
+        "nested_index_out_of_bounds",
+        "remaining_path_missing",
+    ],
+)
+async def test_judge_evidence_provenance_rejects_invalid_indexed_path(evidence_ref: str) -> None:
+    criterion = CompletionCriterion(id="c0", outcome="The page contains the requested form.")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "post_run_page_observation": {"forms": [{"inputs": [{"id": "account"}]}]},
+        },
+        block_output_sources={"post_run_page_observation": "independent_page_evidence"},
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": evidence_ref,
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is False
+    assert result.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_judge_evidence_provenance_accepts_existing_indexed_element_and_remaining_path() -> None:
+    criterion = CompletionCriterion(id="c0", outcome="The page contains the requested form.")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "post_run_page_observation": {"forms": [{"inputs": [{"id": "account"}]}]},
+        },
+        block_output_sources={"post_run_page_observation": "independent_page_evidence"},
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "post_run_page_observation.forms[0].inputs[0].id",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+async def test_judge_evidence_provenance_accepts_label_for_truncated_structured_record() -> None:
+    criterion = CompletionCriterion(id="c0", outcome="The page contains the requested form.")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "post_run_page_observation": {
+                "forms": [{"inputs": [{"id": "account", "padding": "x" * 3000}]}],
+            },
+        },
+        block_output_sources={"post_run_page_observation": "independent_page_evidence"},
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "post_run_page_observation",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("antecedent_family", ["unconditional", "blocker"])
+@pytest.mark.parametrize(
+    "registered_outputs",
+    [
+        {},
+        {"reported_summary": {"public_form_exists": "false"}},
+        {"reported_summary": {"public_form_exists": False}},
+        {
+            "reported_summary": {"public_form_exists": False},
+            "duplicate_summary": {"public_form_exists": False},
+        },
+    ],
+    ids=["missing", "non_boolean", "unassociated", "ambiguous"],
+)
+async def test_neutral_reported_boolean_requires_one_registered_boolean_output(
+    registered_outputs: dict[str, object],
+    antecedent_family: AntecedentFamily,
+) -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome="The run reports whether a public form exists.",
+        antecedent_family=antecedent_family,
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key="public_form_exists",
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            **registered_outputs,
+            "post_run_page_observation": {"forms": []},
+        },
+        block_output_sources={
+            **{label: "registered_output_parameter" for label in registered_outputs},
+            "post_run_page_observation": "independent_page_evidence",
+        },
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "post_run_page_observation.forms",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is False
+    assert result.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.asyncio
+async def test_active_page_evidence_is_admissible_independent_evidence() -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome="The run reports whether a public form exists.",
+        antecedent_family="unconditional",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key="public_form_exists",
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"reported_summary": {"public_form_exists": False}},
+        block_output_sources={"reported_summary": "registered_output_parameter"},
+        registered_output_evidence_by_request_slot_id={
+            criterion.id: (
+                RegisteredBlockerEvidence(
+                    block_label="report_public_form",
+                    output_path="output.public_form_exists",
+                    registered_output_key="reported_summary",
+                    registered_output_id="op_reported_summary",
+                    value=False,
+                ),
+            )
+        },
+        page_evidence={"forms": [{"id": "service-login"}]},
+    )
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "page_evidence.forms",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is True
+    assert result.verdicts[0].evidence_source == "independent_page_evidence"
+
+
+@pytest.mark.parametrize(
+    ("reserved_label", "server_value"),
+    [
+        ("observed_end_state_url", "https://example.com/final"),
+        ("observed_end_state_page_title", "Final page"),
+        ("page_evidence", {"forms": [{"id": "service-login"}]}),
+    ],
+)
+def test_reserved_evidence_labels_fail_closed_on_runtime_collision(
+    reserved_label: str,
+    server_value: object,
+) -> None:
+    snapshot = RunEvidenceSnapshot(
+        current_url=server_value if reserved_label == "observed_end_state_url" else None,
+        page_title=server_value if reserved_label == "observed_end_state_page_title" else None,
+        page_evidence=server_value if reserved_label == "page_evidence" else {},
+        block_outputs={reserved_label: {"runtime": "ambiguous"}},
+        block_output_sources={reserved_label: "runtime_output"},
+    )
+
+    assert reserved_label not in snapshot.rendered_evidence_catalog()
+
+
+@pytest.mark.asyncio
+async def test_neutral_boolean_rejects_associated_output_beyond_rendered_catalog_cap() -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome="The run reports whether a public form exists.",
+        antecedent_family="unconditional",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key="public_form_exists",
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    padding = {f"padding_{index}": {"value": index} for index in range(19)}
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "post_run_page_observation": {"forms": [], "public_form_exists": False},
+            **padding,
+            "reported_summary": {"public_form_exists": False},
+        },
+        block_output_sources={
+            "post_run_page_observation": "independent_page_evidence",
+            **{label: "runtime_output" for label in padding},
+            "reported_summary": "registered_output_parameter",
+        },
+        registered_output_evidence_by_request_slot_id={
+            criterion.id: (
+                RegisteredBlockerEvidence(
+                    block_label="report_public_form",
+                    output_path="output.public_form_exists",
+                    registered_output_key="reported_summary",
+                    registered_output_id="op_reported_summary",
+                    value=False,
+                ),
+            )
+        },
+    )
+    assert "reported_summary" not in snapshot.rendered_evidence_catalog()
+
+    async def verifier(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "post_run_page_observation.forms",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is False
+    assert result.verdicts[0].reason_code == "no_evidence"
+
+
+@pytest.mark.parametrize("antecedent_family", ["unconditional", "blocker"])
+@pytest.mark.parametrize(
+    ("registered_block_label", "association_expected"),
+    [("report_public_form", True), ("unowned_producer", False)],
+    ids=["accepted-owner", "association-absent"],
+)
+def test_snapshot_binds_neutral_boolean_to_exact_artifact_owner_and_request_slot(
+    antecedent_family: AntecedentFamily,
+    registered_block_label: str,
+    association_expected: bool,
+) -> None:
+    criterion = CompletionCriterion(
+        id="a" * 64,
+        outcome="The run reports whether a public form exists.",
+        antecedent_family=antecedent_family,
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        kind="outcome",
+        classification_output_key="public_form_exists",
+        request_slot_id="a" * 64,
+        pinability="shapeless_valid",
+        mint_disposition="decidable",
+    )
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "report_public_form", "unowned_producer")
+    ctx.request_policy = RequestPolicy(completion_contract_status="present", completion_criteria=[criterion])
+    ctx.code_artifact_metadata = {
+        "report_public_form": {
+            "block_label": "report_public_form",
+            "claimed_outcomes": [{"goal_value_paths": ["public_form_exists"]}],
+            "completion_criteria": [{"id": "artifact:public_form_exists"}],
+        }
+    }
+    run_result = {
+        "data": {
+            "workflow_run_id": "wr_neutral_association",
+            "workflow_run_output_parameters": [
+                {
+                    "workflow_run_id": "wr_neutral_association",
+                    "output_parameter_id": "op_public_form",
+                    "output_parameter_key": "reported_summary",
+                    "block_label": registered_block_label,
+                    "block_type": "code",
+                    "value": {"public_form_exists": False},
+                }
+            ],
+        }
+    }
+
+    snapshot = _build_run_evidence_snapshot(ctx, run_result)
+
+    assert snapshot.registered_output_values["reported_summary"] == {"public_form_exists": False}
+    if not association_expected:
+        assert criterion.id not in snapshot.registered_output_evidence_by_request_slot_id
+        return
+    association = snapshot.registered_output_evidence_by_request_slot_id[criterion.id]
+    assert len(association) == 1
+    assert association[0].block_label == "report_public_form"
+    assert association[0].output_path == "output.public_form_exists"
+    assert association[0].registered_output_key == "reported_summary"
+    assert association[0].value is False
+
+
+@pytest.mark.asyncio
+async def test_judge_cannot_cite_a_path_truncated_out_of_its_prompt() -> None:
+    criterion = CompletionCriterion(id="c0", outcome="The run reaches the requested state.")
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"result": {"padding": "x" * 2200, "hidden": {"ok": True}}},
+        block_output_sources={"result": "runtime_output"},
+    )
+
+    async def verifier(*, prompt: str, **_: object) -> dict[str, object]:
+        assert '"hidden"' not in prompt
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "result.hidden.ok",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, verifier)
+
+    assert result.is_fully_satisfied() is False
+    assert result.verdicts[0].reason_code == "no_evidence"
 
 
 def test_runtime_output_named_like_registered_output_cannot_fire_blocker_family() -> None:

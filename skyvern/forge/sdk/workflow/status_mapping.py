@@ -7,15 +7,18 @@ from skyvern.schemas.workflows import BlockStatus
 
 BLOCK_STATUS_MAP: dict[WorkflowRunStatus, BlockStatus] = {
     WorkflowRunStatus.timed_out: BlockStatus.timed_out,
+    WorkflowRunStatus.failed: BlockStatus.failed,
 }
 
 TASK_STATUS_MAP: dict[WorkflowRunStatus, TaskStatus] = {
     WorkflowRunStatus.timed_out: TaskStatus.timed_out,
+    WorkflowRunStatus.failed: TaskStatus.failed,
 }
 
 # StepStatus has no timed_out; use canceled for timeout cleanup.
 STEP_STATUS_MAP: dict[WorkflowRunStatus, StepStatus] = {
     WorkflowRunStatus.timed_out: StepStatus.canceled,
+    WorkflowRunStatus.failed: StepStatus.failed,
 }
 
 _TERMINAL_BLOCK_STATUSES = {

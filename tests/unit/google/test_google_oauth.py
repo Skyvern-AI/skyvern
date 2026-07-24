@@ -239,8 +239,11 @@ async def test_google_drive_upload_does_not_retry_retryable_create_response(
         return httpx.Response(503, headers={"Retry-After": "0"}, json={"error": {"message": "try later"}})
 
     _install_google_drive_transport(monkeypatch, handler)
+    # Keep the backoff mock module-local so unrelated asyncio users cannot look like upload retries.
+    process_sleep = asyncio.sleep
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    assert asyncio.sleep is process_sleep
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -272,7 +275,7 @@ async def test_google_drive_upload_retries_connection_failures_before_request(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -301,7 +304,7 @@ async def test_google_drive_upload_does_not_retry_ambiguous_transport_failure(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -661,7 +664,7 @@ async def test_google_drive_resumable_initiation_retries_connect_error(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -692,7 +695,7 @@ async def test_google_drive_resumable_initiation_does_not_retry_read_timeout(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -793,7 +796,7 @@ async def test_google_drive_resumable_requeries_offset_after_double_transport_fa
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -879,7 +882,7 @@ async def test_google_drive_resumable_resumes_after_chunk_429(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -923,7 +926,7 @@ async def test_google_drive_resumable_resumes_after_chunk_rate_limit_403(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -1090,7 +1093,7 @@ async def test_google_drive_resumable_non_advancing_308_bails(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await asyncio.wait_for(
@@ -1131,7 +1134,7 @@ async def test_google_drive_resumable_malformed_range_after_progress_does_not_re
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -1212,7 +1215,7 @@ async def test_google_drive_resumable_exhausts_attempts_raises(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(

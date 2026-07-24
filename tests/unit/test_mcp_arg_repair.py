@@ -481,3 +481,12 @@ async def test_block_schema_wrong_tool_payload_still_errors_at_boundary() -> Non
     # SKY-12140 / SKY-12141: a full definition to block_schema must not be masked.
     res = await _call("skyvern_block_schema", {"block_json": '{"block_type":"navigation"}'})
     _assert_invalid_input(res, ["block_json"])
+
+
+@pytest.mark.asyncio
+async def test_oversized_raw_arguments_string_is_not_parsed_at_boundary() -> None:
+    # Bound pre-validation work on remote input. Leaving the wrapper untouched
+    # makes the existing argument validator reject it as unsupported.
+    huge = '{"block_type":"' + "n" * 60_000 + '"}'
+    res = await _call("skyvern_block_schema", {"raw_arguments": huge})
+    _assert_invalid_input(res, ["raw_arguments"])

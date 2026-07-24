@@ -1,7 +1,4 @@
-"""Backward-compatible re-exports from skyvern.cli.core.
-
-MCP tools import from here; the canonical implementations live in core/.
-"""
+"""Shared helpers for MCP tools: re-exports from skyvern.cli.core plus tool-surface constants."""
 
 from __future__ import annotations
 
@@ -14,6 +11,18 @@ from skyvern.client.errors import NotFoundError
 DIRECT_TARGET_DESCRIPTION = "Direct target: deterministic, 0 LLM calls."
 AI_FALLBACK_DESCRIPTION = (
     "AI fallback: costs Skyvern LLM calls, slower and nondeterministic — prefer selector when known."
+)
+CODE_ONLY_POLICY_HINT = (
+    "If you did not pass code_only=true yourself, this server enforces code-only authoring by "
+    "organization policy — the rejection is intentional, not an error. Do not pass code_only=false "
+    "to bypass it unless the user explicitly asked for agentic (non-code) blocks."
+)
+CODE_ONLY_SCHEMA_GUIDANCE = (
+    "Omit `code_only` or pass null to use this server's default; organization policy may enforce "
+    "code-only, making rejection intentional."
+)
+CODE_ONLY_FIELD_DESCRIPTION = (
+    "When true, structurally reject non-code browser/page block types (code-only mode). " + CODE_ONLY_SCHEMA_GUIDANCE
 )
 
 

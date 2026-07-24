@@ -5,6 +5,12 @@ from skyvern._version import __version__
 from skyvern.utils import setup_windows_event_loop_policy
 
 if typing.TYPE_CHECKING:
+    # Expose the server lazy-imports (runtime-gated via __getattr__ below) to type checkers so
+    # `skyvern.SkyvernPage` / `skyvern.cached` resolve to the real symbols. Without this mypy sees
+    # them only as __getattr__'s Any and flakily reports "not valid as a type" / "Any? not
+    # callable" in the generated scripts, depending on incremental-cache state.
+    from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage  # noqa: E402,F401
+    from skyvern.core.script_generations.workflow_wrappers import cached, workflow  # noqa: E402,F401
     from skyvern.library import Skyvern  # noqa: E402,F401
 
 

@@ -13,21 +13,30 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    bind_post_run_page_path_failure,
     record_build_test_outcome,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _is_positional_selector,
+    dynamic_row_evidence_fingerprint,
+    dynamic_row_period_matches_match_selected_row,
     locator_selector_literals,
     normalized_locator_expr,
     normalized_scout_selector,
     synthesize_code_block,
+    validated_dynamic_row_period_matches,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    scout_dynamic_row_evidence_expression as _scout_dynamic_row_evidence_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
@@ -63,6 +72,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
+    ScoutedDynamicRowEvidence,
     ScoutedInteraction,
     resolve_browser_state_for_context,
 )
@@ -196,7 +206,7 @@ async def _capture_accessible_role_name(
     selector = _selector_text(selector)
     if not selector:
         return None
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return None
     try:
@@ -234,7 +244,7 @@ async def _selector_live_match_count(
     selector = _selector_text(selector)
     if not selector:
         return None
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return None
     timeout = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
@@ -347,6 +357,99 @@ async def _capture_scout_ambiguity(ctx: AgentContext, selector: str | None) -> N
         return
     if await _role_name_match_count(ctx, role, name) == 1:
         ctx.pending_scout_reanchor = (selector, role, name)
+
+
+async def _capture_scout_dynamic_row(ctx: AgentContext, selector: str | None) -> None:
+    ctx.pending_scout_dynamic_row = None
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return
+    selector = _selector_text(selector)
+    source_url = (ctx.pending_scout_source_url or "").strip()
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if not selector or not _is_positional_selector(selector) or not source_url or server is None:
+        return
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _scout_dynamic_row_evidence_expression(selector)},
+            ),
+            timeout=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, dict):
+        return
+    target_selector = value.get("target_selector")
+    row_selector = value.get("row_selector")
+    row_text = value.get("row_text")
+    row_selector_count = value.get("row_selector_count")
+    row_text_match_count = value.get("row_text_match_count")
+    period_matches = value.get("period_matches")
+    validated_period_matches = (
+        validated_dynamic_row_period_matches(period_matches, row_selector_count)
+        if isinstance(row_selector_count, int) and not isinstance(row_selector_count, bool)
+        else None
+    )
+    selected_index = value.get("selected_index")
+    if (
+        target_selector != selector
+        or not isinstance(row_selector, str)
+        or not row_selector.strip()
+        or not isinstance(row_text, str)
+        or not row_text.strip()
+        or isinstance(row_selector_count, bool)
+        or not isinstance(row_selector_count, int)
+        or row_selector_count < 2
+        or row_selector_count > 100
+        or isinstance(row_text_match_count, bool)
+        or not isinstance(row_text_match_count, int)
+        or row_text_match_count < 1
+        or validated_period_matches is None
+        or not dynamic_row_period_matches_match_selected_row(row_text.strip(), validated_period_matches)
+        or isinstance(selected_index, bool)
+        or not isinstance(selected_index, int)
+        or selected_index < 0
+        or selected_index >= row_selector_count
+    ):
+        return
+    ctx.pending_scout_dynamic_row = ScoutedDynamicRowEvidence(
+        source_url=source_url,
+        target_selector=selector,
+        row_selector=row_selector.strip(),
+        row_text=row_text.strip(),
+        row_selector_count=row_selector_count,
+        row_text_match_count=row_text_match_count,
+        period_matches=validated_period_matches,
+        selected_index=selected_index,
+        evidence_fingerprint=dynamic_row_evidence_fingerprint(
+            source_url=source_url,
+            target_selector=selector,
+            row_selector=row_selector.strip(),
+            row_text=row_text.strip(),
+            row_selector_count=row_selector_count,
+            row_text_match_count=row_text_match_count,
+            period_matches=validated_period_matches,
+            selected_index=selected_index,
+        ),
+    )
+
+
+def _prenav_dynamic_row_for_selector(
+    pending: ScoutedDynamicRowEvidence | None,
+    selector: str,
+    source_url: str | None,
+) -> ScoutedDynamicRowEvidence | None:
+    if pending is None:
+        return None
+    if pending["target_selector"] != _selector_text(selector):
+        return None
+    if pending["source_url"] != (source_url or "").strip():
+        return None
+    return pending
 
 
 def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: str) -> bool:
@@ -517,6 +620,7 @@ def _record_scouted_interaction(
     credential_field: str = "",
     credential_name: str = "",
     ambiguous: bool = False,
+    dynamic_row_evidence: ScoutedDynamicRowEvidence | None = None,
 ) -> None:
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -563,6 +667,8 @@ def _record_scouted_interaction(
         artifact["credential_name"] = credential_name
     if ambiguous:
         artifact["ambiguous"] = True
+    if dynamic_row_evidence is not None:
+        artifact["dynamic_row_evidence"] = dynamic_row_evidence
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -593,6 +699,8 @@ def _record_scouted_interaction(
         selector=selector or None,
         source_url=artifact.get("source_url"),
         role=role or None,
+        credential_field=credential_field or None,
+        credential_id=credential_id or None,
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
@@ -913,6 +1021,7 @@ async def _register_scout_interaction_observation(
             record_scouted_output_coverage(
                 ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
             )
+            _mark_post_run_page_observed(ctx, source_tool="evaluate", url=url, page_evidence=parsed)
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
@@ -1348,7 +1457,7 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     data = result.get("data")
     if not isinstance(data, dict):
         return False
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return False
     selector = target["selector"]
@@ -1641,14 +1750,41 @@ async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, u
     )
 
 
-def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
+def _mark_post_run_page_observed(
+    ctx: AgentContext,
+    *,
+    source_tool: str,
+    url: str,
+    page_evidence: dict[str, Any] | None = None,
+) -> None:
     run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     if not isinstance(run_id, str) or not run_id:
         return
     ctx.post_run_page_observation_tool = source_tool
     ctx.post_run_page_observation_url = url
     ctx.post_run_page_observation_workflow_run_id = run_id
-    ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+    latest_outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    authoritative_unsatisfied = (
+        isinstance(latest_outcome, RecordedBuildTestOutcome)
+        and latest_outcome.is_authoritative
+        and latest_outcome.phase == "persisted_block_run"
+        and latest_outcome.reason_code == "outcome_not_demonstrated"
+        and latest_outcome.workflow_run_id == run_id
+    )
+    ctx.post_run_page_observation_after_failed_test = (
+        getattr(ctx, "last_test_ok", None) is False or authoritative_unsatisfied
+    )
+    if page_evidence is not None and ctx.post_run_page_observation_after_failed_test:
+        bound_evidence = {
+            **page_evidence,
+            "workflow_run_id": run_id,
+            "observed_after_workflow_run": True,
+            "current_url": url,
+        }
+        if bind_post_run_page_path_failure(ctx, bound_evidence):
+            ctx.post_run_page_observation_generation = (
+                getattr(ctx, "post_run_page_observation_generation", 0) or 0
+            ) + 1
     evidence = _workflow_verification_evidence(ctx)
     evidence.live_page_state_verified = True
     evidence.verified_from_current_browser_state = True

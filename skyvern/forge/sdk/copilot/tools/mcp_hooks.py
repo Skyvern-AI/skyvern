@@ -47,6 +47,7 @@ from .scouting import (
     _actionable_targets_for_result,
     _attach_scout_page_summary,
     _capture_scout_ambiguity,
+    _capture_scout_dynamic_row,
     _capture_scout_role_name,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
@@ -56,6 +57,7 @@ from .scouting import (
     _mark_pending_browser_interaction_observation,
     _maybe_attach_reached_download_target,
     _prenav_ambiguity_for_selector,
+    _prenav_dynamic_row_for_selector,
     _prenav_role_name_for_selector,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
@@ -304,6 +306,7 @@ async def _click_pre_hook(
     ctx.pending_scout_role_name = None
     ctx.pending_scout_click_selector = None
     ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_dynamic_row = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -328,6 +331,8 @@ async def _click_pre_hook(
         }
     await _capture_scout_role_name(ctx, selector)
     await _capture_scout_ambiguity(ctx, selector)
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        await _capture_scout_dynamic_row(ctx, selector)
     return None
 
 
@@ -466,6 +471,10 @@ async def _click_post_hook(
     ctx.pending_scout_ambiguous = None
     pending_reanchor = ctx.pending_scout_reanchor
     ctx.pending_scout_reanchor = None
+    pending_dynamic_row = ctx.pending_scout_dynamic_row
+    ctx.pending_scout_dynamic_row = None
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        pending_dynamic_row = None
     attempted_selector = ctx.pending_scout_click_selector
     ctx.pending_scout_click_selector = None
     if result.get("ok") and result.get("data"):
@@ -483,6 +492,7 @@ async def _click_post_hook(
         if navigated and not (role and accessible_name):
             role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
         ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
+        dynamic_row_evidence = _prenav_dynamic_row_for_selector(pending_dynamic_row, selector, source_url)
         if ambiguous:
             role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
         result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
@@ -494,6 +504,7 @@ async def _click_post_hook(
             role=role,
             accessible_name=accessible_name,
             ambiguous=ambiguous,
+            dynamic_row_evidence=dynamic_row_evidence,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="click", selector=selector, source_url=source_url, url=url

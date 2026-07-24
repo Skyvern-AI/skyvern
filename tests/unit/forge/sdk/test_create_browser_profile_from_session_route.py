@@ -22,6 +22,7 @@ from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile, CreateBro
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.webeye.browser_profile_utils import operator_profile_generation, write_operator_profile_marker
 
 _default_profile_template_candidates = browser_profiles_route._default_browser_profile_template_candidates
 
@@ -267,14 +268,16 @@ def test_create_empty_profile_uses_latest_versioned_default_profile(
     tmp_path: Path,
 ) -> None:
     client, mocks = _build_client(monkeypatch)
+    monkeypatch.setattr(browser_profiles_route.settings, "DEFAULT_BROWSER_PROFILE_DIR", str(tmp_path))
     _make_default_profile_template(tmp_path, name="chrome_100", marker="old-template")
-    _make_default_profile_template(tmp_path, name="chrome_200", marker="new-template")
+    operator_template = _make_default_profile_template(tmp_path, name="chrome", marker="operator-template")
+    generation = operator_profile_generation(str(operator_template))
+    write_operator_profile_marker(str(tmp_path), "chrome", generation or "")
 
     async def _store_profile(**kwargs: str) -> None:
         directory = Path(kwargs["directory"])
-        assert (directory / "Default" / "template-marker.txt").read_text(encoding="utf-8") == "new-template"
+        assert (directory / "Default" / "template-marker.txt").read_text(encoding="utf-8") == "old-template"
 
-    monkeypatch.setattr(browser_profiles_route.settings, "DEFAULT_BROWSER_PROFILE_DIR", str(tmp_path))
     monkeypatch.setattr(
         browser_profiles_route,
         "_default_browser_profile_template_candidates",
@@ -284,8 +287,30 @@ def test_create_empty_profile_uses_latest_versioned_default_profile(
 
     response = client.post("/v1/browser_profiles/", json={"name": "fresh profile"})
 
+    marker_file = operator_template / "Default" / "template-marker.txt"
+    marker_file.write_text("repaired-template-with-new-size")
+
     assert response.status_code == 200
-    mocks.store_profile.assert_awaited_once()
+    assert browser_profiles_route._is_valid_browser_profile_template(operator_template)
+
+
+def test_empty_profile_seed_rejects_template_changed_during_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _make_default_profile_template(tmp_path, name="chrome")
+    profile_dir = tmp_path / "seed"
+    profile_dir.mkdir()
+    copy_template = browser_profiles_route._copy_browser_profile_template
+
+    def _copy_then_change(source: Path, destination: Path) -> None:
+        copy_template(source, destination)
+        (source / "Default" / "template-marker.txt").write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(browser_profiles_route, "_copy_browser_profile_template", _copy_then_change)
+    browser_profiles_route._seed_empty_browser_profile_directory(profile_dir)
+
+    assert (profile_dir / "Default" / "Preferences").read_text(encoding="utf-8") == "{}"
+    assert not (profile_dir / "Default" / "template-marker.txt").exists()
 
 
 def test_create_empty_profile_falls_back_to_minimal_seed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -348,7 +348,6 @@ def _record_composition_page_observation(
 ) -> int | None:
     if not url:
         return None
-    _mark_post_run_page_observed(ctx, source_tool=source_tool, url=url)
     if title:
         _workflow_verification_evidence(ctx).page_title = title[:160]
     existing = ctx.composition_page_evidence
@@ -382,6 +381,12 @@ def _record_composition_page_observation(
     if isinstance(run_id, str) and run_id:
         evidence["workflow_run_id"] = run_id
         evidence["observed_after_workflow_run"] = True
+    _mark_post_run_page_observed(
+        ctx,
+        source_tool=source_tool,
+        url=url,
+        page_evidence=evidence if has_bounded_page_schema(evidence) else None,
+    )
 
     observation_step: int | None = None
     if append_to_flow and has_bounded_page_schema(evidence):

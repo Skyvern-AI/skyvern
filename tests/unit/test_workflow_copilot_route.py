@@ -24,6 +24,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog.testing
 from fastapi import HTTPException
 from PIL import Image
 
@@ -410,6 +411,57 @@ async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
     assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
     assert persisted_payload["terminalEnvelope"]["next_state"] != "completed"
     assert persisted_payload["terminalEnvelope"]["response_kind"] == "stopped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_enabled", [True, False], ids=["flag-on", "flag-off"])
+async def test_finalise_normal_turn_logs_render_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    flag_enabled: bool,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=flag_enabled),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    with structlog.testing.capture_logs() as logs:
+        await workflow_copilot_route._finalise_normal_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=original_workflow,
+            chat_request=_make_chat_request(),
+            agent_result=agent_result,
+        )
+
+    decisions = [entry for entry in logs if entry["event"] == "copilot_terminal_render_decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["flag_enabled"] is flag_enabled
+    # This fixture's envelope is a stopped/stopped shape, so flag-on replaces.
+    assert decisions[0]["replaced"] is flag_enabled
+    assert decisions[0]["next_state"] == "stopped"
+    assert decisions[0]["response_kind"] == "stopped"
 
 
 @pytest.mark.asyncio

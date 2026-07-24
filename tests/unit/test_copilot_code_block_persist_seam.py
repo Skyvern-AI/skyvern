@@ -451,6 +451,7 @@ def _draft_only_credential_ctx() -> CopilotContext:
         allow_update_workflow=True,
         allow_run_blocks=False,
         allow_missing_credentials_in_draft=True,
+        credential_draft_deferred_explicitly=True,
         resolved_credentials=[
             SimpleNamespace(
                 credential_id="cred_missing",
@@ -22069,6 +22070,128 @@ def test_input_templated_provenance_rejects_tamper() -> None:
     assert not workflow_update_module._locator_provenance_is_self_validating(missing_holes)
 
 
+def test_input_templated_provenance_rejects_dropping_distinct_iso_projection() -> None:
+    selector = 'a[data-date="2026-05-01"][href="/statements/2026-05.pdf"]'
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": selector},
+        {"billing_start_date": "2026-05-01"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="selector", selector=selector, role="", name="", holes=holes
+    )
+    provenance = {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "selector",
+        "selector": selector,
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+    assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+
+    tampered = dict(provenance)
+    tampered["holes"] = [dict(holes[0])]
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+
+def test_dynamic_selection_row_input_templated_provenance_recomputes_and_rejects_capture_tamper() -> None:
+    selector = "div.statement-row >> nth=2"
+    row_evidence = {
+        "source_url": "https://example.com/statements",
+        "target_selector": selector,
+        "row_selector": "div.statement-row",
+        "row_text": "Statement May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+    }
+    row_evidence["evidence_fingerprint"] = code_block_synthesis_module.dynamic_row_evidence_fingerprint(**row_evidence)
+    interaction = {
+        "tool_name": "click",
+        "selector": selector,
+        "source_url": "https://example.com/statements",
+        "dynamic_row_evidence": row_evidence,
+    }
+    interaction["input_correspondences"] = workflow_update_module.input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = code_block_synthesis_module.synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    provenance = next(
+        record for record in synthesized.diagnostics.locator_provenance if record.get("surface") == "row_text"
+    )
+    assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+
+    tampered = dict(provenance)
+    tampered["row_text_match_count"] = 2
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+    tampered_period = json.loads(json.dumps(provenance))
+    tampered_period["period_matches"][0]["row_match_count"] = 2
+    tampered_period["evidence_fingerprint"] = code_block_synthesis_module.dynamic_row_evidence_fingerprint(
+        source_url=tampered_period["source_url"],
+        target_selector=tampered_period["target_selector"],
+        row_selector=tampered_period["row_selector"],
+        row_text=tampered_period["row_text"],
+        row_selector_count=tampered_period["row_selector_count"],
+        row_text_match_count=tampered_period["row_text_match_count"],
+        period_matches=tampered_period["period_matches"],
+        selected_index=tampered_period["selected_index"],
+    )
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered_period)
+
+
+def test_dynamic_selection_public_provenance_omits_page_text_query_and_credentials() -> None:
+    provenance = {
+        "trajectory_index": 2,
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "row_text",
+        "source_url": "https://user:password@example.com/statements?token=secret#private",
+        "target_selector": "div.row >> nth=2",
+        "row_selector": "div.row",
+        "row_text": "Customer Alice secret account text May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+        "emitted_literal": "page.locator('div.row')",
+        "holes": [
+            {
+                "input_key": "download_start_date",
+                "matched_literal": "2026-05",
+                "parameter_value": "2026-05-01",
+                "transform": "iso_date_to_year_month",
+                "position": 35,
+            }
+        ],
+    }
+
+    public = workflow_update_module._public_locator_provenance([provenance])
+
+    serialized = json.dumps(public)
+    assert public == [
+        {
+            "trajectory_index": 2,
+            "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+            "surface": "row_text",
+            "source_origin": "https://example.com",
+            "input_keys": ["download_start_date"],
+            "transforms": ["iso_date_to_year_month"],
+        }
+    ]
+    for secret in ("Alice", "secret", "password", "token", "2026-05-01"):
+        assert secret not in serialized
+
+    tampered = dict(provenance)
+    tampered["source_url"] = "https://other.example.org/statements"
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+
 def test_confluence_stamps_and_clears_input_correspondences() -> None:
     ctx = _code_only_ctx()
     ctx.scout_trajectory = [
@@ -23861,3 +23984,146 @@ class TestDefinitionContractRecordedPacketReplay:
             "I kept the workflow draft, but it does not yet satisfy the required workflow definition. "
             "Complete the missing definition requirements before trying again."
         )
+
+
+class TestScoutedSpineRepeatedOmissionSeam:
+    @staticmethod
+    def _uncovered_record(selector: str) -> dict[str, object]:
+        return {"tool_name": "click", "method": "click", "selector": selector, "trajectory_index": 1}
+
+    def test_two_consecutive_identical_omissions_set_repeated_flag(self) -> None:
+        ctx = _code_only_ctx()
+        digest = workflow_update_module._scouted_spine_omission_digest([self._uncovered_record("#submit")])
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert ctx.scouted_spine_previous_omission_digest == digest
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+
+    def test_changed_omission_clears_repeated_flag(self) -> None:
+        ctx = _code_only_ctx()
+        first = workflow_update_module._scouted_spine_omission_digest([self._uncovered_record("#a")])
+        second = workflow_update_module._scouted_spine_omission_digest([self._uncovered_record("#b")])
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, first)
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, first)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, second)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert ctx.scouted_spine_previous_omission_digest == second
+
+    def test_repeated_flag_reopens_imposition_for_attempt_three(self) -> None:
+        ctx = _code_only_ctx()
+        assert workflow_update_module._should_impose_after_update_attempt(ctx) is False
+        assert workflow_update_module._should_impose_after_update_attempt(ctx, repeated_identical_omission=True) is True
+
+    @staticmethod
+    def _omitting_draft() -> str:
+        return _freehand_block_yaml('print(await page.locator("body").inner_text())')
+
+    def test_two_consecutive_rejections_at_seam_force_attempt_three_impose_or_name(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        draft = self._omitting_draft()
+
+        first = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert first is not None
+        assert "#search-submit" in first.violations[0]
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, first.omission_digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+
+        second = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert second is not None
+        assert second.omission_digest == first.omission_digest
+        workflow_update_module._record_scouted_spine_omission_reject(ctx, second.omission_digest)
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(draft, ctx) is True
+        assert workflow_update_module._should_impose_after_update_attempt(ctx, repeated_identical_omission=True) is True
+        third = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert third is not None
+        assert "#search-submit" in third.violations[0]
+
+    @pytest.mark.asyncio
+    async def test_third_differing_draft_not_admitted_after_two_identical_omissions(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#b",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 1,
+            },
+        ]
+        omitting = _freehand_block_yaml('await page.goto("https://example.com/records", wait_until="domcontentloaded")')
+        ctx.update_workflow_called = True
+
+        first = await _update_workflow({"workflow_yaml": omitting}, ctx)
+        assert first["ok"] is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+
+        second = await _update_workflow({"workflow_yaml": omitting}, ctx)
+        assert second["ok"] is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is True
+        latched_digest = ctx.scouted_spine_previous_omission_digest
+        assert latched_digest is not None
+
+        differing = _freehand_block_yaml('await page.locator("#a").fill("x")')
+        assert ctx.scouted_spine_previous_omission_digest == latched_digest
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(omitting, ctx) is True
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(differing, ctx) is False
+
+        third = await _update_workflow({"workflow_yaml": differing}, ctx)
+        assert third["ok"] is False
+        assert ctx.spine_imposition_owned_attempt is False
+        assert ctx.scouted_spine_previous_omission_digest != latched_digest
+
+    def test_returning_omission_after_differing_draft_does_not_misfire_imposition(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#b",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 1,
+            },
+        ]
+        omitting = _freehand_block_yaml('await page.goto("https://example.com/records", wait_until="domcontentloaded")')
+        differing = _freehand_block_yaml('await page.locator("#a").fill("x")')
+        omitting_result = workflow_update_module._pre_persist_scouted_spine_result(omitting, ctx)
+        assert omitting_result is not None
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+        ctx.scouted_spine_previous_omission_digest = omitting_result.omission_digest
+
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(differing, ctx) is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(omitting, ctx) is False
+
+    def test_identical_resubmission_no_op_still_names_at_persist_seam(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        draft = self._omitting_draft()
+        ctx.update_workflow_called = True
+        ctx.last_workflow_yaml = draft
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+
+        imposition = workflow_update_module._maybe_impose_synthesized_code_block(draft, ctx)
+        assert ctx.spine_imposition_owned_attempt is False
+        assert imposition.violations == []
+
+        naming = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert naming is not None
+        assert "#search-submit" in naming.violations[0]

@@ -51,7 +51,7 @@ from skyvern.schemas.workflows import (
     WorkflowTriggerBlockYAML,
 )
 
-from ._common import ErrorCode, make_error, make_result
+from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
 
@@ -490,9 +490,9 @@ async def skyvern_block_validate(
         Field(description="JSON string of a single block definition to validate"),
     ],
     code_only: Annotated[
-        bool,
-        Field(description="When true, structurally reject non-code browser/page block types (code-only mode)"),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
     it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
@@ -540,7 +540,7 @@ async def skyvern_block_validate(
                     ErrorCode.INVALID_INPUT,
                     f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
                     "In code-only mode, use a `code` block for durable browser/page work instead of "
-                    "task/navigation/extraction/etc.",
+                    "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
                 ),
             )
 
