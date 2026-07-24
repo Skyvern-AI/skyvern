@@ -164,16 +164,17 @@ async def test_finalise_normal_turn_finalizes_terminal_envelope_without_auto_acc
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
     assert response_frame.terminal_envelope is not None
     assert response_frame.terminal_envelope["workflow_applied"] is False
-    assert response_frame.terminal_envelope["next_state"] != "completed"
-    assert response_frame.terminal_envelope["response_kind"] == "stopped"
+    # Verified fix, not auto-accepted: a pending proposal for the review gate, not stopped.
+    assert response_frame.terminal_envelope["next_state"] == "proposal_pending"
+    assert response_frame.terminal_envelope["response_kind"] == "update"
 
     persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
         "narrative_payload"
     ]
     assert persisted_payload is not None
     assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
-    assert persisted_payload["terminalEnvelope"]["next_state"] != "completed"
-    assert persisted_payload["terminalEnvelope"]["response_kind"] == "stopped"
+    assert persisted_payload["terminalEnvelope"]["next_state"] == "proposal_pending"
+    assert persisted_payload["terminalEnvelope"]["response_kind"] == "update"
 
 
 @pytest.mark.asyncio
@@ -2190,9 +2191,13 @@ async def test_proposed_workflow_cleared_on_restore(
 
 
 @pytest.mark.asyncio
-async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept_off(
+async def test_verified_code_only_fix_stays_pending_without_auto_accept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # With auto_accept off, a verified CODE_ONLY_BROWSER fix (auto_applicable + staged)
+    # must stay a pending proposal: no canonical commit, proposal persisted, terminal
+    # frame reports workflow_applied False. ``apply_without_review`` is set truthy only
+    # to prove that attribute can no longer force an auto-apply on its own.
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
     captured = install_fake_create(monkeypatch)
@@ -2271,10 +2276,11 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
     await handler(stream)
 
     restore_mock.assert_not_awaited()
-    workflow_service.update_workflow_definition.assert_awaited_once()
+    workflow_service.update_workflow_definition.assert_not_awaited()
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
-    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None] == []
-    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    proposed_writes = [c.kwargs["proposed_workflow"] for c in update_calls if "proposed_workflow" in c.kwargs]
+    assert proposed_writes, "expected the pending proposal to be persisted"
+    assert all(w is not None for w in proposed_writes), "verified fix must stay pending, not be cleared"
 
     response_frames = [
         call.args[0]
@@ -2282,7 +2288,7 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
         if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
     ]
     assert len(response_frames) == 1
-    assert response_frames[0].workflow_applied is True
+    assert response_frames[0].workflow_applied is False
     assert response_frames[0].updated_workflow == {"workflow_id": "wf-applied"}
 
 
@@ -2643,7 +2649,6 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         clear_proposed_workflow=False,
         proposal_disposition="review_tested",
         cancelled=False,
-        apply_without_review=False,
         output_policy_diagnostics=None,
         canonical_was_persisted_due_to_param_change=False,
     )
@@ -2663,7 +2668,6 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
         clear_proposed_workflow=False,
         proposal_disposition="review_untested",
         cancelled=False,
-        apply_without_review=False,
         output_policy_diagnostics=None,
     )
     fields.update(overrides)
@@ -2835,9 +2839,9 @@ async def test_persist_state_auto_accept_stale_unvalidated_still_clears_without_
 async def test_persist_state_staged_commit_clears_stale_proposal_despite_keep_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A later turn's own auto-commit (chat.auto_accept, not apply_without_review)
-    # supersedes an earlier bypassed proposal even when the client asked to keep
-    # it — the committed canonical workflow already moved past it.
+    # A later turn's own auto-accept commit (chat.auto_accept) supersedes an
+    # earlier pending proposal even when the client asked to keep it — the
+    # committed canonical workflow already moved past it.
     chat = SimpleNamespace(
         organization_id="org-1",
         workflow_copilot_chat_id="chat-1",

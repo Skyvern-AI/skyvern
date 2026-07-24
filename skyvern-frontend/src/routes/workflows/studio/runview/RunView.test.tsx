@@ -330,7 +330,44 @@ describe("RunView view toggles", () => {
     expect(scope.queryByText("Credits")).toBeNull();
   });
 
-  test("Inputs view shows the run's input metadata", () => {
+  test("Inputs view shows the run's input metadata, including TOTP diagnostics", () => {
+    seedCompletedRun({
+      webhook_callback_url: "https://example.test/hook",
+      totp_verification_url: "https://example.test/totp",
+      totp_identifier: "totp-identifier-1",
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("Webhook URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/hook")).not.toBeNull();
+    expect(scope.getByText("TOTP URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/totp")).not.toBeNull();
+    expect(scope.getByText("TOTP identifier")).not.toBeNull();
+    expect(scope.getByText("totp-identifier-1")).not.toBeNull();
+  });
+
+  test("Inputs view sources TOTP from task_v2 when the top-level run omits it", () => {
+    seedCompletedRun({
+      totp_verification_url: null,
+      totp_identifier: null,
+      task_v2: {
+        totp_verification_url: "https://example.test/totp-v2",
+        totp_identifier: "totp-identifier-v2",
+      },
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("TOTP URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/totp-v2")).not.toBeNull();
+    expect(scope.getByText("TOTP identifier")).not.toBeNull();
+    expect(scope.getByText("totp-identifier-v2")).not.toBeNull();
+  });
+
+  test("Inputs view omits TOTP rows when the run carries no TOTP config", () => {
     seedCompletedRun({
       webhook_callback_url: "https://example.test/hook",
     });
@@ -339,7 +376,8 @@ describe("RunView view toggles", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
     expect(scope.getByText("Webhook URL")).not.toBeNull();
-    expect(scope.getByText("https://example.test/hook")).not.toBeNull();
+    expect(scope.queryByText("TOTP URL")).toBeNull();
+    expect(scope.queryByText("TOTP identifier")).toBeNull();
   });
 
   test("Code view renders the shared WorkflowRunCode surface", () => {

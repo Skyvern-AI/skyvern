@@ -403,10 +403,15 @@ def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
 
 
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """Only auto-applicable proposals may honor ``auto_accept=True``."""
+    """Only auto-applicable proposals may honor ``auto_accept=True``.
+
+    Auto-apply requires the chat's explicit ``auto_accept`` opt-in — a verified
+    build never commits on the user's behalf; it lands as a pending proposal for
+    the review gate.
+    """
     if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
         return False
-    return auto_accept is True or getattr(agent_result, "apply_without_review", False) is True
+    return auto_accept is True
 
 
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
@@ -513,6 +518,7 @@ def _finalized_terminal_envelope(
         finalized = finalize_applied_state(
             TerminalOutcomeEnvelope.model_validate(payload),
             applied=workflow_applied and proposal_present,
+            proposal_present=proposal_present,
         )
         payload = finalized.model_dump(mode="json")
     except Exception:
@@ -725,18 +731,13 @@ async def _persist_proposed_workflow_state(
         (restored and not keep_pending_proposal)
         or agent_result.clear_proposed_workflow
         or _should_commit_staged_workflow(chat.auto_accept, agent_result)
-        or (
-            getattr(agent_result, "apply_without_review", False) is True
-            and auto_accept_effective
-            and not _output_policy_blocked_final_response(agent_result)
-        )
     ):
         # Null any persisted proposed_workflow the assistant just invalidated
         # so a reload does not resurrect a stale Accept/Reject card. Runs
         # under both auto_accept values — a stale proposal can survive an
         # auto-accept toggle. The staged-commit clause always wins over
-        # keep_pending_proposal: this turn's own auto-commit already
-        # overwrote canonical, so an earlier bypassed proposal is now stale
+        # keep_pending_proposal: this turn's own auto-accept commit already
+        # overwrote canonical, so an earlier pending proposal is now stale
         # regardless of the client's preservation request.
         await _clear_proposed_workflow(chat)
     elif (

@@ -1962,8 +1962,6 @@ def _make_agent_result(
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None and result.turn_outcome is not None:
         result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
-    if ctx is not None and not result.apply_without_review:
-        result.apply_without_review = _should_apply_code_only_success_without_review(ctx, result.proposal_disposition)
     if ctx is not None and result.completion_criteria_turn_state is None:
         result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     if ctx is not None and result.code_artifact_metadata is None:
@@ -1976,19 +1974,6 @@ def _make_agent_result(
         elif isinstance(ctx_metadata, dict) and ctx_metadata:
             result.code_artifact_metadata = ctx_metadata
     return result
-
-
-def _should_apply_code_only_success_without_review(ctx: CopilotContext, disposition: object) -> bool:
-    return (
-        disposition == "auto_applicable"
-        and verified_goal_claim_authorized(ctx)
-        and ctx.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-        and ctx.last_test_ok is True
-        and ctx.last_full_workflow_test_ok is True
-        and not ctx.last_test_suspicious_success
-        and ctx.has_staged_proposal
-        and ctx.staged_workflow is not None
-    )
 
 
 def _build_outcome_adjudication_payload(ctx: CopilotContext) -> NarrativeOutcomeAdjudication | None:

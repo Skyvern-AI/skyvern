@@ -830,6 +830,8 @@ export type WorkflowRunStatusApiResponse = {
   status: Status;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
   queued_at: string | null;
@@ -871,6 +873,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   status: Status;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
   queued_at: string | null;
