@@ -391,7 +391,7 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
     expect(screen.queryByText("1 proposal pending · Review")).toBeNull();
   });
 
-  it("clears a stale bypassed gate when a later turn auto-applies (stale Accept can't reapply over the newer canvas)", async () => {
+  it("clears a stale pending gate when a later turn is auto-applied (stale Accept can't reapply over the newer canvas)", async () => {
     flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
@@ -403,7 +403,7 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
     });
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
 
-    // Bypass: this follow-up comes back auto-applied instead of another gate.
+    // Always-accept echo: this follow-up comes back auto-applied instead of another gate.
     await submit("actually just fix the typo directly");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(streamCalls[1]!.body.keep_pending_proposal).toBe(true);

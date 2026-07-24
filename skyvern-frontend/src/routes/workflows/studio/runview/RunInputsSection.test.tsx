@@ -187,6 +187,31 @@ describe("RunInputsSection", () => {
     );
   });
 
+  test("renders Other inputs meta rows as copyable label/value pairs, including TOTP", () => {
+    render(
+      <RunInputsSection
+        {...emptyProps}
+        meta={[
+          { label: "TOTP URL", value: "https://example.test/totp" },
+          { label: "TOTP identifier", value: "totp-identifier-1" },
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText("Other inputs")).not.toBeNull();
+    // Run inputs / Block prompts sections stay absent when only meta is present.
+    expect(screen.queryByText("Run inputs")).toBeNull();
+    expect(screen.queryByText("Block prompts")).toBeNull();
+    expect(screen.queryByText("TOTP URL")).not.toBeNull();
+    expect(screen.queryByText("https://example.test/totp")).not.toBeNull();
+    expect(screen.queryByText("TOTP identifier")).not.toBeNull();
+    expect(screen.queryByText("totp-identifier-1")).not.toBeNull();
+    // Every meta row exposes a copy button wired to its value.
+    expect(
+      screen.getAllByRole("button", { name: "Copy to clipboard" }),
+    ).toHaveLength(2);
+  });
+
   test("renders the whole prompt as one wrapped block, not per-line rows", () => {
     // Prose keeps the entire prompt in the DOM and clamps height via CSS; the
     // old code inset sliced hidden lines out, so a collapsed multi-line prompt

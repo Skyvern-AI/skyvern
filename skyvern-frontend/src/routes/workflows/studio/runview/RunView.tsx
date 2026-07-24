@@ -339,6 +339,16 @@ export function RunView({
       });
     };
     pushMeta("Webhook URL", workflowRun?.webhook_callback_url);
+    // Task 2.0 runs store TOTP config on task_v2, not the top-level run.
+    pushMeta(
+      "TOTP URL",
+      workflowRun?.totp_verification_url ??
+        workflowRun?.task_v2?.totp_verification_url,
+    );
+    pushMeta(
+      "TOTP identifier",
+      workflowRun?.totp_identifier ?? workflowRun?.task_v2?.totp_identifier,
+    );
     pushMeta("Proxy", workflowRun?.proxy_location);
     pushMeta("Extra HTTP headers", workflowRun?.extra_http_headers);
     pushMeta("Browser session", workflowRun?.browser_session_id);
