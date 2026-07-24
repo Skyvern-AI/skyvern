@@ -36,10 +36,10 @@ For most deployments, configure a single provider using `LLM_KEY`. Skyvern also 
 
 | Provider | Primary Model | Secondary Model | Notes |
 |----------|--------------|-----------------|-------|
-| **Anthropic** | `ANTHROPIC_CLAUDE4.7_OPUS` | `ANTHROPIC_CLAUDE4.6_SONNET` | Most capable |
+| **Anthropic** | `ANTHROPIC_CLAUDE5_FABLE` | `ANTHROPIC_CLAUDE4.6_SONNET` | Most capable |
 | **OpenAI** | `OPENAI_GPT5_5` | `OPENAI_GPT5_4` | Latest |
 | **Google** | `GEMINI_3_PRO` | `GEMINI_3.0_FLASH` | Latest |
-| **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Latest Claude |
+| **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Latest Claude |
 
 ---
 
@@ -100,15 +100,19 @@ Claude models from [anthropic.com](https://www.anthropic.com/).
 ```bash .env
 ENABLE_ANTHROPIC=true
 ANTHROPIC_API_KEY=sk-ant-...
-LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
+LLM_KEY=ANTHROPIC_CLAUDE5_FABLE
 ```
 
 ### Available models
 
 | LLM_KEY | Notes |
 |---------|-------|
+| **Claude 5** | |
+| `ANTHROPIC_CLAUDE5_FABLE` | Latest, most capable |
+| **Claude 4.8** | |
+| `ANTHROPIC_CLAUDE4.8_OPUS` | |
 | **Claude 4.7** | |
-| `ANTHROPIC_CLAUDE4.7_OPUS` | Latest, most capable |
+| `ANTHROPIC_CLAUDE4.7_OPUS` | |
 | **Claude 4.6** | |
 | `ANTHROPIC_CLAUDE4.6_OPUS` | |
 | `ANTHROPIC_CLAUDE4.6_SONNET` | Recommended for secondary use |
@@ -119,15 +123,6 @@ LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 | **Claude 4** | |
 | `ANTHROPIC_CLAUDE4_OPUS` | |
 | `ANTHROPIC_CLAUDE4_SONNET` | |
-| **Claude 3.7** | |
-| `ANTHROPIC_CLAUDE3.7_SONNET` | |
-| **Claude 3.5** | |
-| `ANTHROPIC_CLAUDE3.5_SONNET` | |
-| `ANTHROPIC_CLAUDE3.5_HAIKU` | |
-| **Claude 3 (Legacy)** | |
-| `ANTHROPIC_CLAUDE3_OPUS` | |
-| `ANTHROPIC_CLAUDE3_SONNET` | |
-| `ANTHROPIC_CLAUDE3_HAIKU` | |
 
 ---
 
@@ -250,7 +245,7 @@ Run Anthropic Claude through your AWS account.
 
 ```bash .env
 ENABLE_BEDROCK=true
-LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE
+LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE
 AWS_REGION=us-west-2
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
@@ -261,7 +256,7 @@ AWS_SECRET_ACCESS_KEY=...
 1. Create an IAM user with `AmazonBedrockFullAccess` policy
 2. Generate access keys for the IAM user
 3. In the [Bedrock console](https://console.aws.amazon.com/bedrock/), go to **Model Access**
-4. Enable access to Claude Opus 4.7
+4. Enable access to the Claude model you plan to use (e.g. Claude Fable 5)
 
 ### Available models
 
@@ -270,8 +265,12 @@ AWS_SECRET_ACCESS_KEY=...
 | **Amazon Nova (AWS Native)** | |
 | `BEDROCK_AMAZON_NOVA_PRO` | |
 | `BEDROCK_AMAZON_NOVA_LITE` | |
+| **Claude 5** | |
+| `BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE` | Cross-region, latest |
+| **Claude 4.8** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.8_OPUS_INFERENCE_PROFILE` | Cross-region |
 | **Claude 4.7** | |
-| `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | Cross-region, latest |
+| `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | Cross-region |
 | **Claude 4.6** | |
 | `BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE` | Cross-region |
 | `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Cross-region |
@@ -281,17 +280,6 @@ AWS_SECRET_ACCESS_KEY=...
 | **Claude 4** | |
 | `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE` | Cross-region |
 | `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE` | Cross-region |
-| **Claude 3.7** | |
-| `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE` | Cross-region |
-| **Claude 3.5** | |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET` | v2 |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1` | |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE` | Cross-region |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_HAIKU` | |
-| **Claude 3 (Legacy)** | |
-| `BEDROCK_ANTHROPIC_CLAUDE3_OPUS` | |
-| `BEDROCK_ANTHROPIC_CLAUDE3_SONNET` | |
-| `BEDROCK_ANTHROPIC_CLAUDE3_HAIKU` | |
 
 <Note>
 Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inference and require `AWS_REGION` only. No access keys needed if running on an IAM-authenticated instance.
@@ -526,7 +514,7 @@ Configure a cheaper model for lightweight operations:
 
 ```bash .env
 # Main model for complex decisions
-LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
+LLM_KEY=ANTHROPIC_CLAUDE5_FABLE
 # or: OPENAI_GPT5_5
 # or: GEMINI_3_PRO
 
@@ -538,7 +526,7 @@ SECONDARY_LLM_KEY=ANTHROPIC_CLAUDE4.6_SONNET
 
 <Tip>
 **Recommended primary models (latest):**
-- **Anthropic Claude 4.7 Opus** (`ANTHROPIC_CLAUDE4.7_OPUS`) - Most capable
+- **Anthropic Claude Fable 5** (`ANTHROPIC_CLAUDE5_FABLE`) - Most capable
 - **OpenAI GPT-5.5** (`OPENAI_GPT5_5`) - Latest
 - **Google Gemini 3 Pro** (`GEMINI_3_PRO`) - Latest
 
@@ -577,7 +565,7 @@ SECONDARY_LLM_KEY=OPENAI_GPT5_4
 ### "Context window exceeded"
 
 The page content is too large for the model's context window. Options:
-- Use a model with larger context support (GPT-5.5, Gemini 2.5 Pro, or Claude 4.7 Opus)
+- Use a model with larger context support (GPT-5.5, Gemini 2.5 Pro, or Claude Fable 5)
 - Simplify your prompt to require less page analysis
 - Start from a more specific URL with less content
 
