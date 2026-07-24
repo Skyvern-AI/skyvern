@@ -695,6 +695,18 @@ class RequestPolicy:
             lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
+        graded_criteria = self.graded_completion_criteria()
+        requested_output_path_literals = sorted(
+            {
+                criterion.output_path
+                for criterion in graded_criteria
+                if criterion.output_path and criterion.level != "definition"
+            }
+            | floor_rekeyed_requested_output_paths(graded_criteria)
+        )
+        if requested_output_path_literals:
+            lines.append("requested_output_paths:")
+            lines += [f"- {path}" for path in requested_output_path_literals]
         validation_classification_criteria = [
             criterion
             for criterion in self.graded_completion_criteria()
@@ -725,6 +737,23 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     if request_policy is None:
         return False
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def floor_rekeyed_requested_output_paths(
+    criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion],
+) -> set[str]:
+    """Identity of runtime-output criteria whose slot rekey cleared ``output_path``; the rekey
+    preserves it in ``floor_rekeyed_from_path``, and without it they vanish from the requested set."""
+    return {
+        criterion.floor_rekeyed_from_path
+        for criterion in criteria
+        if criterion.requested_output_floor_rekeyed
+        and criterion.floor_rekeyed_from_path
+        and criterion.kind == "outcome"
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.requested_output_evidence_source == "runtime_output"
+    }
 
 
 def is_defer_authoring_durable_fill_criterion(criterion: CompletionCriterion) -> bool:
@@ -4589,6 +4618,7 @@ def _can_defer_unresolved_credential_name_for_draft(
     policy: RequestPolicy,
     *,
     global_llm_context: str,
+    user_message: str,
 ) -> bool:
     if policy.clarification_reason != "credential_name_unresolved":
         return False
@@ -4597,7 +4627,7 @@ def _can_defer_unresolved_credential_name_for_draft(
     # anchoring before the name can enter resolved_credentials and authorize a run.
     if policy.credential_refs:
         return True
-    if _has_resolvable_credential_scope(policy):
+    if _has_resolvable_credential_scope(policy, user_message):
         return True
     if _previous_credential_clarification_was_asked(global_llm_context):
         return True
@@ -4608,13 +4638,14 @@ def _should_defer_repeated_unresolved_credential_question(
     policy: RequestPolicy,
     *,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
+    user_message: str,
 ) -> bool:
     if not _last_assistant_message_was_saved_credential_question(chat_history):
         return False
     return (
         policy.credential_input_kind in ("none", "credential_name")
         and policy.clarification_reason == "credential_name_unresolved"
-        and not _has_resolvable_credential_scope(policy)
+        and not _has_resolvable_credential_scope(policy, user_message)
     )
 
 
@@ -4988,6 +5019,7 @@ async def build_request_policy(
                 and not _can_defer_unresolved_credential_name_for_draft(
                     policy,
                     global_llm_context=global_llm_context,
+                    user_message=user_message,
                 )
             ):
                 policy.requires_user_clarification = True
@@ -4999,6 +5031,7 @@ async def build_request_policy(
     if _should_defer_repeated_unresolved_credential_question(
         policy,
         chat_history=chat_history,
+        user_message=user_message,
     ):
         policy.requires_user_clarification = False
         policy.allow_update_workflow = True
