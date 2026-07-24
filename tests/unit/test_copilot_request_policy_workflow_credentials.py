@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import textwrap
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -16,18 +17,25 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
     _LOGIN_CREDENTIAL_QUESTION,
     _SAVED_CREDENTIAL_NAME_QUESTION,
+    _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX,
     _STORED_CREDENTIAL_URL_QUESTION,
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
     RequestPolicy,
+    _can_defer_unresolved_credential_name_for_draft,
     _classification_from_raw,
     _resolve_credentials,
+    _should_defer_repeated_unresolved_credential_question,
     _workflow_credential_inputs_unbound,
     build_request_policy,
     credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
 from skyvern.forge.sdk.schemas.credentials import CredentialType
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+)
 
 
 def _yaml(body: str) -> str:
@@ -568,6 +576,47 @@ async def _resolve_direct(
     ):
         await _resolve_credentials(policy, "o_test", user_message=user_message)
     return load_mock, by_ids_mock
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    ["Use credential ID cred_current.", "Use the saved credential named current-login."],
+)
+def test_draft_deferral_recognizes_current_turn_credential_scope(user_message: str) -> None:
+    policy = RequestPolicy(
+        credential_input_kind="none",
+        clarification_reason="credential_name_unresolved",
+    )
+
+    assert _can_defer_unresolved_credential_name_for_draft(
+        policy,
+        global_llm_context="",
+        user_message=user_message,
+    )
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    ["Use credential ID cred_current.", "Use the saved credential named current-login."],
+)
+def test_repeated_question_deferral_preserves_current_turn_credential_scope(user_message: str) -> None:
+    policy = RequestPolicy(
+        credential_input_kind="none",
+        clarification_reason="credential_name_unresolved",
+    )
+    history = [
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.AI,
+            content=_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX,
+            created_at=datetime.now(UTC),
+        )
+    ]
+
+    assert not _should_defer_repeated_unresolved_credential_question(
+        policy,
+        chat_history=history,
+        user_message=user_message,
+    )
 
 
 @pytest.mark.asyncio
