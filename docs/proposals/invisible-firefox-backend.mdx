@@ -1,0 +1,24 @@
+---
+title: "Firefox-based stealth backend (proposal)"
+description: "Draft proposal for a stealth-firefox BROWSER_TYPE option using invisible_playwright"
+---
+
+> Draft proposal, opened to gauge interest before building. Tracking discussion: TBD
+
+## What it would be
+
+A new `BROWSER_TYPE=stealth-firefox` option for `skyvern/webeye/browser_factory.py`, parallel to the `stealth-chromium` option being proposed in PR #5340 (CloakBrowser). Optional dependency, only imported when selected.
+
+## Backend
+
+- patched Firefox 150, stealth applied at the C++ source level (no JS shims to detect)
+- source: https://github.com/feder-cr/invisible_firefox (MPL-2, same license as Firefox upstream)
+- Python wrapper: https://github.com/feder-cr/invisible_playwright
+
+## Why a Firefox option alongside Chromium
+
+Firefox is differentiated for some target sites where Chromium UA gets flagged by default. A Firefox-stealth path gives users a fallback browser engine without changing the rest of the Skyvern stack.
+
+## Maintenance
+
+Issues against the backend route to feder-cr/invisible_playwright. Only ask of this repo would be the small browser_factory hook and an env example.
