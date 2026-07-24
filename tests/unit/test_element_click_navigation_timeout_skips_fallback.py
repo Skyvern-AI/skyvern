@@ -19,6 +19,20 @@ _NAVIGATION_TIMEOUT_MSG = (
 )
 
 
+class SelectedEngineError(Exception):
+    pass
+
+
+class SelectedEngineTimeout(SelectedEngineError):
+    pass
+
+
+def _selected_engine():
+    selection = MagicMock()
+    selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, SelectedEngineTimeout)
+    return selection
+
+
 class TestPostDispatchTimeoutClassifier:
     def test_timeout_with_scheduled_navigation_message_is_post_dispatch(self) -> None:
         assert is_post_dispatch_click_timeout(PlaywrightTimeoutError(_NAVIGATION_TIMEOUT_MSG))
@@ -44,6 +58,17 @@ class TestPostDispatchTimeoutClassifier:
 
     def test_classifier_is_case_insensitive(self) -> None:
         assert is_post_dispatch_click_timeout(PlaywrightTimeoutError("Scheduled Navigation never completed"))
+
+    def test_selected_native_timeout_is_post_dispatch(self) -> None:
+        assert is_post_dispatch_click_timeout(SelectedEngineTimeout(_NAVIGATION_TIMEOUT_MSG), _selected_engine())
+
+    def test_foreign_timeout_is_not_post_dispatch_for_selected_engine(self) -> None:
+        assert (
+            is_post_dispatch_click_timeout(PlaywrightTimeoutError(_NAVIGATION_TIMEOUT_MSG), _selected_engine()) is False
+        )
+
+    def test_selected_native_timeout_without_scheduled_navigation_is_not_post_dispatch(self) -> None:
+        assert is_post_dispatch_click_timeout(SelectedEngineTimeout("Timeout"), _selected_engine()) is False
 
 
 def _make_element() -> SkyvernElement:

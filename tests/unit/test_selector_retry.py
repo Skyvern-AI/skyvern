@@ -14,6 +14,20 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 
+class SelectedEngineError(Exception):
+    pass
+
+
+class SelectedEngineTimeout(SelectedEngineError):
+    pass
+
+
+def _selected_engine():
+    selection = MagicMock()
+    selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, SelectedEngineTimeout)
+    return selection
+
+
 def _mock_skyvern_context(code_version=2):
     """Create a mock SkyvernContext with the given code_version."""
     ctx = MagicMock()
@@ -31,6 +45,7 @@ def mock_page():
 
     page = MagicMock(spec=SkyvernPage)
     page._locator_scope = MagicMock()
+    page.engine_selection = None
 
     # Bind the real method to our mock
     page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
@@ -143,6 +158,66 @@ async def test_zero_retries_fails_immediately(mock_page):
         )
 
     assert mock_page._locator_scope.locator.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_selected_engine_native_timeout_is_retried(mock_page):
+    locator_miss = _make_locator(wait_for_side_effect=SelectedEngineTimeout("Timeout"))
+    locator_hit = _make_locator()
+    mock_page.engine_selection = _selected_engine()
+    mock_page._locator_scope.locator.side_effect = [locator_miss, locator_hit]
+
+    result = await mock_page._wait_for_selector_with_retry(
+        "#target",
+        timeout=1000,
+        max_retries=1,
+        retry_interval=0.01,
+    )
+
+    assert result is locator_hit
+
+
+@pytest.mark.asyncio
+async def test_selected_engine_foreign_timeout_is_not_retried(mock_page):
+    locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
+    mock_page.engine_selection = _selected_engine()
+    mock_page._locator_scope.locator.return_value = locator
+
+    with pytest.raises(PlaywrightTimeoutError):
+        await mock_page._wait_for_selector_with_retry(
+            "#target",
+            timeout=1000,
+            max_retries=1,
+            retry_interval=0.01,
+        )
+
+    assert mock_page._locator_scope.locator.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_context_error_remains_transient_with_selected_engine(mock_page):
+    locator_miss = _make_locator(wait_for_side_effect=RuntimeError("Execution context was destroyed"))
+    locator_hit = _make_locator()
+    mock_page.engine_selection = _selected_engine()
+    mock_page._locator_scope.locator.side_effect = [locator_miss, locator_hit]
+
+    result = await mock_page._wait_for_selector_with_retry(
+        "#target",
+        timeout=1000,
+        max_retries=1,
+        retry_interval=0.01,
+    )
+
+    assert result is locator_hit
+
+
+def test_engine_selection_is_available_on_skyvern_page_spec():
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+    page = MagicMock(spec=SkyvernPage)
+    page.engine_selection = _selected_engine()
+
+    assert page.engine_selection is not None
 
 
 @pytest.mark.asyncio
