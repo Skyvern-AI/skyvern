@@ -269,6 +269,13 @@ def current_turn_owner(ctx: AgentContext) -> PrecedenceClaim | None:
     return min(live, key=lambda claim: _PRECEDENCE_RANK[claim.claimant])
 
 
+def claim_would_succeed(ctx: AgentContext, claimant: TurnClaimant) -> bool:
+    """Read-only mirror of claim_turn's yield check: True iff a claim by ``claimant`` would be
+    owned rather than yielded against the current live owner. Mutates no ctx state."""
+    owner = current_turn_owner(ctx)
+    return owner is None or owner.claimant is claimant or claimant_outranks(claimant, owner.claimant)
+
+
 def claim_turn(
     ctx: AgentContext,
     claimant: TurnClaimant,
