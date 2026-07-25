@@ -2070,7 +2070,7 @@ workflow_definition:
 
 
 @pytest.mark.asyncio
-async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_secret() -> None:
+async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_admit_raw_secret() -> None:
     guarded_tools = {
         tool.name: tool for tool in NATIVE_TOOLS if tool.name in {"update_workflow", "update_and_run_blocks"}
     }
@@ -2082,7 +2082,7 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
     ctx.failed_tool_step_tracker = {"sentinel": 2}
 
-    rejected_yaml = """
+    raw_secret_yaml = """
 workflow_definition:
   blocks:
     - block_type: navigation
@@ -2095,16 +2095,18 @@ workflow_definition:
                 context=ctx,
                 tool_name="update_and_run_blocks",
                 tool_call_id="call-1",
-                tool_arguments=json.dumps({"workflow_yaml": rejected_yaml}),
+                tool_arguments=json.dumps({"workflow_yaml": raw_secret_yaml}),
             ),
             agent=SimpleNamespace(),
         )
     )
 
-    assert result.behavior["type"] == "reject_content"
-    assert "raw_secret_leak" in result.behavior["message"]
+    # A raw credential on an authoring argument is admitted here — the log and persistence seams own it —
+    # so the turn survives and no failed-tool boundary is recorded.
+    assert result.behavior["type"] == "allow"
     assert ctx.consecutive_tool_tracker == [
-        tool_step_identity("update_and_run_blocks", {"workflow_yaml": rejected_yaml})
+        tool_step_identity("update_workflow"),
+        tool_step_identity("update_workflow"),
     ]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
