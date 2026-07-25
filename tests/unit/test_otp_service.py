@@ -504,6 +504,81 @@ class TestParseOtpLogin:
                 assert "424242" not in str(value)
 
     @pytest.mark.asyncio
+    async def test_charges_for_parse_even_when_no_code_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        async def no_code_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"reasoning": "no code present", "otp_type": None, "otp_value_found": False, "otp_value": None}
+
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", no_code_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content="raw email body with no code inside it", organization_id="o_test")
+
+        assert result is None
+        charge.assert_awaited_once_with("o_test")
+
+    @pytest.mark.asyncio
+    async def test_does_not_charge_when_llm_call_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+        from skyvern.services import otp_service
+
+        async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise LLMProviderError("gemini-2.5-flash")
+
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", failing_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        with pytest.raises(LLMProviderError):
+            await parse_otp_login(content="raw email body that exceeds ten chars", organization_id="o_test")
+
+        charge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_llm_and_charge_when_out_of_credits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        llm_handler = AsyncMock()
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", llm_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=False),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content="raw email body with OTP 424242 inside", organization_id="o_test")
+
+        assert result is None
+        llm_handler.assert_not_awaited()
+        charge.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_backend_provider_error_propagates_not_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
         from skyvern.services import otp_service
