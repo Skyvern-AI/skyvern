@@ -170,6 +170,7 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_and_stash_blocker_signal,
     claim_turn,
+    claim_would_succeed,
     claimant_outranks,
     current_turn_owner,
     emit_blocker_signal_payload,
@@ -627,6 +628,29 @@ def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
     return nudge
 
 
+def _code_authoring_reject_count_resets(repeated_outcome: bool | None, frontier_unchanged: bool) -> bool:
+    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
+    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
+    return repeated_outcome is False and not frontier_unchanged
+
+
+def code_authoring_churn_stop_would_claim(ctx: AgentContext, *, frontier_unchanged: bool = False) -> bool:
+    """Read-only predicate: would recording one more plain (non-credential) guardrail reject reach
+    the churn ceiling AND win the turn? Mirrors _record_code_authoring_guardrail_reject's threshold,
+    terminal-defer, and claim precedence without mutating ctx."""
+    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
+    base = (
+        0
+        if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged)
+        else ctx.code_authoring_guardrail_reject_count
+    )
+    if base + 1 < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
+        return False
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return False
+    return claim_would_succeed(ctx, TurnClaimant.CODE_AUTHORING_CHURN)
+
+
 def _record_code_authoring_guardrail_reject(
     ctx: AgentContext,
     *,
@@ -636,9 +660,7 @@ def _record_code_authoring_guardrail_reject(
 ) -> None:
     # Callers record the current build-test outcome first so repeat detection compares that key to history.
     repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
-    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
-    if repeated_outcome is False and not frontier_unchanged:
+    if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged):
         ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop

@@ -7,6 +7,7 @@ OSS-synced: only synthetic labels and RFC-2606 placeholder identifiers.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 from types import SimpleNamespace
@@ -3090,3 +3091,130 @@ def test_observing_one_path_does_not_authorize_imposing_a_multi_path_contract() 
 
     ctx.scouted_output_covered_paths = {"output.record_id", "output.record_total"}
     assert wu._output_contract_binding_source_on_record(ctx, evaluation, _declaration_waiver_yaml("pass")) is True
+
+
+# ---------------------------------------------------------------------------
+# The code-authoring guardrail give-up consults the ceiling actuation.
+# ---------------------------------------------------------------------------
+
+
+def _guardrail_impose_ctx() -> tuple[CopilotContext, str, list[dict[str, object]]]:
+    ctx = _record_criterion_ctx()
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")')
+    metadata = _record_contract_metadata()
+    ctx.scouted_output_covered_paths = {"output.record_id"}
+    ctx.code_authoring_guardrail_reject_count = enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    return ctx, workflow_yaml, metadata
+
+
+def test_guardrail_ceiling_consult_imposes_before_stop_under_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+    ctx, workflow_yaml, metadata = _guardrail_impose_ctx()
+
+    with capture_logs() as logs:
+        resolution = wu._guardrail_ceiling_actuation_resolution(
+            ctx, workflow_yaml=workflow_yaml, raw_metadata=metadata, frontier_unchanged=False
+        )
+
+    assert resolution is not None
+    assert resolution.mode == "imposed"
+    events = [log.get("event") for log in logs]
+    assert "copilot_guardrail_ceiling_actuation_consulted" in events
+    assert events.index("copilot_guardrail_ceiling_actuation_consulted") < events.index(
+        "copilot_output_contract_binding_imposed_at_ceiling"
+    )
+    assert ctx.blocker_signal is None
+    assert ctx.code_authoring_guardrail_reject_count == enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    assert ctx.output_contract_reject_count_by_signature.get(resolution.evaluation.canonical_signature) in (None, 0)
+
+
+def test_ceiling_bookkeeping_imposed_arms_evidence_and_marks_imposed() -> None:
+    seed_ctx, workflow_yaml, metadata = _guardrail_impose_ctx()
+    resolution = wu._guardrail_ceiling_actuation_resolution(
+        seed_ctx, workflow_yaml=workflow_yaml, raw_metadata=metadata, frontier_unchanged=True
+    )
+    assert resolution is not None and resolution.mode == "imposed"
+    signature = resolution.evaluation.canonical_signature
+    observation_paths = sorted(resolution.evaluation.observation_paths)
+    assert observation_paths
+
+    ctx = _record_criterion_ctx()
+    returned = wu._apply_output_contract_ceiling_bookkeeping(ctx, resolution)
+
+    assert returned == signature
+    assert ctx.output_contract_pending_run_evidence.get(signature) == observation_paths
+    assert ctx.output_contract_imposed_since_last_reject_by_signature.get(signature) is True
+
+
+def test_ceiling_bookkeeping_credited_arms_evidence_without_marking_imposed() -> None:
+    seed_ctx, workflow_yaml, metadata = _guardrail_impose_ctx()
+    imposed = wu._guardrail_ceiling_actuation_resolution(
+        seed_ctx, workflow_yaml=workflow_yaml, raw_metadata=metadata, frontier_unchanged=True
+    )
+    assert imposed is not None
+    credited = dataclasses.replace(imposed, mode="credited")
+    signature = credited.evaluation.canonical_signature
+    observation_paths = sorted(credited.evaluation.observation_paths)
+    assert observation_paths
+
+    ctx = _record_criterion_ctx()
+    returned = wu._apply_output_contract_ceiling_bookkeeping(ctx, credited)
+
+    assert returned == ""
+    assert ctx.output_contract_pending_run_evidence.get(signature) == observation_paths
+    assert ctx.output_contract_imposed_since_last_reject_by_signature == {}
+
+
+def test_guardrail_ceiling_consult_abstains_without_recorded_observation() -> None:
+    ctx = _record_criterion_ctx()
+    workflow_yaml = _declaration_waiver_yaml('await page.click("#next")\nreturn "done"')
+    metadata = _record_contract_metadata()
+    ctx.code_authoring_guardrail_reject_count = enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+
+    with capture_logs() as logs:
+        resolution = wu._guardrail_ceiling_actuation_resolution(ctx, workflow_yaml=workflow_yaml, raw_metadata=metadata)
+
+    assert resolution is None
+    assert not any(log.get("event") == "copilot_guardrail_ceiling_actuation_consulted" for log in logs)
+    assert ctx.blocker_signal is None
+    assert ctx.code_authoring_guardrail_reject_count == enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    assert ctx.output_contract_imposed_since_last_reject_by_signature == {}
+
+
+def test_guardrail_ceiling_consult_skipped_below_churn_ceiling() -> None:
+    ctx, workflow_yaml, metadata = _guardrail_impose_ctx()
+    ctx.code_authoring_guardrail_reject_count = enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+
+    with capture_logs() as logs:
+        resolution = wu._guardrail_ceiling_actuation_resolution(ctx, workflow_yaml=workflow_yaml, raw_metadata=metadata)
+
+    assert resolution is None
+    assert not any(log.get("event") == "copilot_guardrail_ceiling_actuation_consulted" for log in logs)
+
+
+def test_guardrail_ceiling_consult_yields_to_stronger_live_owner() -> None:
+    ctx, workflow_yaml, metadata = _guardrail_impose_ctx()
+    ctx.output_contract_actuation_by_signature = {"sig": OutputContractAdvisoryState.GRANTED}
+
+    with capture_logs() as logs:
+        resolution = wu._guardrail_ceiling_actuation_resolution(ctx, workflow_yaml=workflow_yaml, raw_metadata=metadata)
+
+    assert resolution is None
+    assert not any(log.get("event") == "copilot_guardrail_ceiling_actuation_consulted" for log in logs)
+    assert ctx.blocker_signal is None
+
+
+def test_guardrail_exhaustion_evidence_reaches_the_pass_path() -> None:
+    ctx, workflow_yaml, metadata = _guardrail_impose_ctx()
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None
+
+    assert wu._credit_or_impose_output_contract(ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata) is None
+
+    resolution = wu._credit_or_impose_output_contract(
+        ctx, strict, workflow_yaml=workflow_yaml, raw_metadata=metadata, steering_exhausted=True
+    )
+    assert resolution is not None
+    assert resolution.mode == "imposed"

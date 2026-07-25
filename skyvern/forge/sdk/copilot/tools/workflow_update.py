@@ -161,6 +161,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _record_code_authoring_guardrail_reject,
     _scouted_spine_open_obligation,
     arm_credential_scout_reopen,
+    code_authoring_churn_stop_would_claim,
     download_satisfied_requested_output_paths,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
@@ -5290,10 +5291,14 @@ def _resolve_output_contract_pass_path(
     workflow_yaml: str,
     raw_metadata: object,
     credit_only: bool,
+    steering_exhausted: bool = False,
 ) -> OutputContractActuation:
     """Convert the pass-path preconditions to typed evidence and let the single resolver decide.
     Crediting and composing are probed here because the resolver is pure; probing mutates nothing
-    and abstains exactly where the strict path already rejects."""
+    and abstains exactly where the strict path already rejects.
+
+    ``steering_exhausted`` lets a caller contribute its own lane's exhaustion evidence — the
+    code-authoring churn ceiling is the same fact reached by a different lane."""
     credited = _credit_output_contract_submission(
         ctx, evaluation, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata
     )
@@ -5310,7 +5315,7 @@ def _resolve_output_contract_pass_path(
         and _observed_required_output_values(ctx, evaluation.observation_paths),
         prior_actuation=_prior_output_contract_actuation(ctx, evaluation.canonical_signature),
         prior_directive_unconsumed=False,
-        steering_exhausted=_output_contract_steering_exhausted(ctx, evaluation, workflow_yaml),
+        steering_exhausted=steering_exhausted or _output_contract_steering_exhausted(ctx, evaluation, workflow_yaml),
         credit_available=credited is not None,
         scouted_binding_impose_available=impose_available,
     )
@@ -5326,6 +5331,7 @@ def _credit_or_impose_output_contract(
     workflow_yaml: str,
     raw_metadata: object,
     credit_only: bool = False,
+    steering_exhausted: bool = False,
 ) -> _OutputContractCeilingResolution | None:
     """Resolve a submission the steer loop can no longer move: credit it when the strict prover
     was merely uncertain, else impose the binding the recording pins. Returns None when the
@@ -5336,6 +5342,7 @@ def _credit_or_impose_output_contract(
         workflow_yaml=workflow_yaml,
         raw_metadata=raw_metadata,
         credit_only=credit_only,
+        steering_exhausted=steering_exhausted,
     )
     if actuation.kind not in {
         OutputContractActuationKind.CREDIT,
@@ -5385,6 +5392,53 @@ def _credit_or_impose_output_contract(
         evaluation=reevaluated,
         mode="imposed",
     )
+
+
+def _consult_guardrail_ceiling_actuation(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> _OutputContractCeilingResolution | None:
+    """At the code-authoring guardrail give-up, re-evaluate the live local draft and, when the
+    requested output's binding is already on record, consult the existing ceiling actuation (credit
+    or impose) before any stopped envelope. Side-effect-free until the actuation itself resolves."""
+    evaluation = _evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        raw_metadata,
+        enforce_value_bearing_liveness=True,
+    )
+    if evaluation is None or not evaluation.canonical_signature or not evaluation.block_label:
+        return None
+    if not _output_contract_binding_source_on_record(ctx, evaluation, workflow_yaml):
+        return None
+    LOG.info(
+        "copilot_guardrail_ceiling_actuation_consulted",
+        reject_count=ctx.code_authoring_guardrail_reject_count,
+        block_label=evaluation.block_label,
+        canonical_output_contract_signature=evaluation.canonical_signature,
+        binding_source_on_record=True,
+    )
+    return _credit_or_impose_output_contract(
+        ctx,
+        evaluation,
+        workflow_yaml=workflow_yaml,
+        raw_metadata=raw_metadata,
+        steering_exhausted=True,
+    )
+
+
+def _guardrail_ceiling_actuation_resolution(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    raw_metadata: object,
+    frontier_unchanged: bool = False,
+) -> _OutputContractCeilingResolution | None:
+    if not code_authoring_churn_stop_would_claim(ctx, frontier_unchanged=frontier_unchanged):
+        return None
+    return _consult_guardrail_ceiling_actuation(ctx, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata)
 
 
 def _capture_rejected_code_artifact_metadata(ctx: AgentContext) -> None:
@@ -6273,6 +6327,21 @@ def _arm_pending_run_evidence(ctx: AgentContext, signature: str, required_paths:
     ctx.output_contract_pending_run_evidence[signature] = sorted(required_paths)
     ctx.output_contract_run_output_observed_by_signature.pop(signature, None)
     ctx.output_contract_run_bound_required_path_by_signature.pop(signature, None)
+
+
+def _apply_output_contract_ceiling_bookkeeping(ctx: AgentContext, resolution: _OutputContractCeilingResolution) -> str:
+    """Arm pending-run evidence for a credited/imposed ceiling draft so a run that binds nothing
+    reopens the ladder, and for an imposed draft mark the imposition so a later reject in the same
+    call refunds the streak. Returns the imposed signature (empty when credited)."""
+    _arm_pending_run_evidence(
+        ctx,
+        resolution.evaluation.canonical_signature,
+        set(resolution.evaluation.observation_paths),
+    )
+    if resolution.mode == "imposed":
+        _mark_output_contract_imposed(ctx, resolution.evaluation.canonical_signature)
+        return resolution.evaluation.canonical_signature
+    return ""
 
 
 def _registered_output_paths(result: object) -> set[str]:
@@ -13813,6 +13882,12 @@ async def _update_workflow(
             workflow_yaml=workflow_yaml,
             raw_metadata=params.get("code_artifact_metadata"),
         )
+        if output_contract_ceiling_resolution is None:
+            output_contract_ceiling_resolution = _guardrail_ceiling_actuation_resolution(
+                ctx,
+                workflow_yaml=workflow_yaml,
+                raw_metadata=params.get("code_artifact_metadata"),
+            )
     if output_contract_ceiling_resolution is not None:
         assert output_contract_evaluation is not None
         workflow_yaml = output_contract_ceiling_resolution.workflow_yaml
@@ -14321,38 +14396,57 @@ async def _update_workflow(
         code_artifact_metadata=getattr(ctx, "code_artifact_metadata", None),
     )
     if convergence_reject is not None:
-        block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-        _record_author_time_reject_outcome(
+        frontier_unchanged = convergence_reject.reason == "frontier_unchanged"
+        convergence_ceiling_resolution = _guardrail_ceiling_actuation_resolution(
             ctx,
-            reason_code="unchanged_after_recorded_outcome",
-            summary="The authored code and output structure are unchanged after the last recorded test outcome.",
-            structural_payload={
-                "reason_code": "unchanged_after_recorded_outcome",
-                "authored_structure_signature": convergence_reject.authored_structure_signature,
-                "block_labels": block_labels,
-            },
-            authored_structure_signature=convergence_reject.authored_structure_signature,
-            block_labels=block_labels,
+            workflow_yaml=workflow_yaml,
+            raw_metadata=params.get("code_artifact_metadata"),
+            frontier_unchanged=frontier_unchanged,
         )
-        _record_code_authoring_guardrail_reject(
-            ctx, frontier_unchanged=convergence_reject.reason == "frontier_unchanged"
-        )
-        LOG.info(
-            "copilot recorded outcome convergence behavior",
-            convergence_reason=convergence_reject.reason,
-            commit_early_terminal=convergence_reject.commit_early_terminal,
-            block_labels=block_labels,
-        )
-        if convergence_reject.commit_early_terminal:
-            _commit_recorded_outcome_early_terminal(ctx)
-        return reject(
-            error=(
-                "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
-                "Revise the code block or output metadata that owns that frontier before testing again."
-            ),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
-        )
+        if convergence_ceiling_resolution is not None:
+            imposed_code_artifact_metadata = convergence_ceiling_resolution.code_artifact_metadata
+            workflow_yaml = convergence_ceiling_resolution.workflow_yaml
+            params["workflow_yaml"] = workflow_yaml
+            params["code_artifact_metadata"] = imposed_code_artifact_metadata
+            params["raw_code_artifact_metadata"] = imposed_code_artifact_metadata
+            ctx.raw_code_artifact_metadata = imposed_code_artifact_metadata
+            if isinstance(imposed_code_artifact_metadata, dict):
+                ctx.code_artifact_metadata = imposed_code_artifact_metadata
+            output_contract_imposed_signature = (
+                _apply_output_contract_ceiling_bookkeeping(ctx, convergence_ceiling_resolution)
+                or output_contract_imposed_signature
+            )
+        else:
+            block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+            _record_author_time_reject_outcome(
+                ctx,
+                reason_code="unchanged_after_recorded_outcome",
+                summary="The authored code and output structure are unchanged after the last recorded test outcome.",
+                structural_payload={
+                    "reason_code": "unchanged_after_recorded_outcome",
+                    "authored_structure_signature": convergence_reject.authored_structure_signature,
+                    "block_labels": block_labels,
+                },
+                authored_structure_signature=convergence_reject.authored_structure_signature,
+                block_labels=block_labels,
+            )
+            _record_code_authoring_guardrail_reject(ctx, frontier_unchanged=frontier_unchanged)
+            LOG.info(
+                "copilot recorded outcome convergence behavior",
+                convergence_reason=convergence_reject.reason,
+                commit_early_terminal=convergence_reject.commit_early_terminal,
+                block_labels=block_labels,
+            )
+            if convergence_reject.commit_early_terminal:
+                _commit_recorded_outcome_early_terminal(ctx)
+            return reject(
+                error=(
+                    "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
+                    "Revise the code block or output metadata that owns that frontier before testing again."
+                ),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data=_code_repair_progress_data(),
+            )
 
     recorded_output_paths_required = output_path_coverage_source == "recorded_outcome"
     recorded_missing_output_paths = (

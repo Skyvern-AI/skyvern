@@ -947,6 +947,18 @@ class Settings(BaseSettings):
                 "label": "Anthropic Claude Fable 5",
             }
 
+        # Anthropic Claude Opus 5: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-opus-5"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Opus 5",
+            }
+        else:
+            mapping["claude-opus-5"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5_OPUS",
+                "label": "Anthropic Claude Opus 5",
+            }
+
         try:
             from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415
                 get_custom_llm_model_mappings,
