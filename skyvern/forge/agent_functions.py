@@ -990,6 +990,14 @@ class AgentFunction:
         """Return whether this workflow run was created for scoped block execution."""
         return workflow_run.debug_session_id is not None
 
+    async def has_sufficient_credit_for_otp_parse(self, organization_id: str) -> bool:
+        """Gate the paid OTP extraction before the LLM call. OSS has no billing."""
+        return True
+
+    async def charge_for_otp_parse(self, organization_id: str) -> None:
+        """Bill one OTP-code extraction. OSS builds have no billing and no-op."""
+        return None
+
     async def bank_credential_profile_after_login(
         self,
         workflow_run: WorkflowRun,
