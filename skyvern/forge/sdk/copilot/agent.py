@@ -192,7 +192,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     cache_copilot_author_time_gate_log_only_ids,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import SECRET_KEYWORD_ASSIGNMENT_PATTERN
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
@@ -4090,6 +4090,7 @@ async def _translate_to_agent_result(
                     organization_id=organization_id,
                     workflow_yaml=workflow_yaml,
                     settings_fallback_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml,
+                    credential_scrub_values=registered_scrub_values(ctx),
                 )
                 last_workflow_yaml = workflow_yaml
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:

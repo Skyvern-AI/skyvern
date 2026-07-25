@@ -1,5 +1,6 @@
 """Copilot workflow-YAML normalization, chain repair, and Workflow conversion."""
 
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
 
@@ -365,17 +366,54 @@ def _yaml_pin_saved_session_ip(workflow_yaml: str | None) -> bool | None:
     return _yaml_bool_setting(workflow_yaml, "pin_saved_session_ip")
 
 
+def _redact_credentials_before_persistence(
+    workflow_yaml: str, workflow_permanent_id: str, credential_values: Collection[str]
+) -> str:
+    """Last line of defence before a workflow reaches the database.
+
+    A credential value should already have been rebound to a parameter reference upstream; reaching
+    here with a live value means that failed, so redact rather than store it. The redacted workflow
+    will not run as authored — that is the intended trade, and the error line is the signal to fix
+    the upstream rebind.
+
+    ``credential_values`` must be scoped to the authoring session. Replacing values registered by
+    other sessions would let one org's short secret rewrite another org's stored workflow.
+    """
+    from skyvern.forge.sdk.copilot.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
+
+    redactable = {
+        value for value in credential_values if isinstance(value, str) and len(value) >= MIN_PERSISTED_REDACTION_LENGTH
+    }
+    redacted_count = 0
+    # Longest first so an overlapping shorter value never splits a longer one.
+    for secret in sorted(redactable, key=len, reverse=True):
+        if secret in workflow_yaml:
+            redacted_count += workflow_yaml.count(secret)
+            workflow_yaml = workflow_yaml.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+    if redacted_count:
+        LOG.error(
+            "copilot redacted a raw credential value at the workflow persistence seam",
+            workflow_permanent_id=workflow_permanent_id,
+            redacted_occurrences=redacted_count,
+        )
+    return workflow_yaml
+
+
 async def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
     organization_id: str,
     workflow_yaml: str,
     settings_fallback_yaml: str | None = None,
+    credential_scrub_values: Collection[str] = (),
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
     # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
     # fallbacks would otherwise surface "No steps yet").
+    workflow_yaml = _redact_credentials_before_persistence(
+        workflow_yaml, workflow_permanent_id, credential_scrub_values
+    )
     workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
 

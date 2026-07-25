@@ -24,6 +24,24 @@ _SESSION_SCRUB_VALUES: dict[str, list[str]] = {}
 # No deterministic per-session teardown exists, so FIFO-evict to bound worker memory.
 _MAX_SCRUB_SESSIONS = 1024
 
+# Substring-replacing a short value into stored content corrupts it: a six-digit OTP occurs by
+# chance inside ports, counts, and ids. Rewrites that persist apply this floor; log redaction does
+# not, because over-redacting a log line is cheap and leaking a secret into one is not.
+MIN_PERSISTED_REDACTION_LENGTH = 8
+
+_ALL_VALUES_CACHE: tuple[tuple[int, int], list[str]] | None = None
+
+
+def _registry_fingerprint() -> tuple[int, int]:
+    """Cheap key that changes on any registry mutation, including a direct one.
+
+    Values are append-only and deduped per session, so the total count moves whenever a value is
+    added and the session count moves whenever one is added or dropped. Deriving the key from the
+    data rather than a hand-maintained counter means a caller that mutates the dict directly cannot
+    be served a stale list.
+    """
+    return len(_SESSION_SCRUB_VALUES), sum(len(values) for values in _SESSION_SCRUB_VALUES.values())
+
 
 def _session_id(ctx: AgentContext) -> str | None:
     session_id = getattr(ctx, "browser_session_id", None)
@@ -50,6 +68,32 @@ def register_secret_scrub_value(ctx: AgentContext, value: str | None) -> None:
 def clear_session_scrub_values(session_id: str | None) -> None:
     if isinstance(session_id, str):
         _SESSION_SCRUB_VALUES.pop(session_id, None)
+
+
+def all_registered_secret_values() -> list[str]:
+    """Every credential value registered by any session in this process, longest first.
+
+    The log seam has no ``AgentContext`` to scope against — a credential value must never reach
+    log output regardless of which session filled it. Callers that rewrite persisted content must
+    use ``registered_scrub_values`` instead: replacing across sessions there would let one session's
+    short value corrupt another's stored data.
+    """
+    global _ALL_VALUES_CACHE
+    fingerprint = _registry_fingerprint()
+    cached = _ALL_VALUES_CACHE
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    merged: set[str] = set()
+    for values in _SESSION_SCRUB_VALUES.values():
+        merged.update(value for value in values if isinstance(value, str) and value)
+    computed = sorted(merged, key=len, reverse=True)
+    _ALL_VALUES_CACHE = (fingerprint, computed)
+    return computed
+
+
+def registered_scrub_values(ctx: AgentContext) -> list[str]:
+    """This turn's and this session's registered values, longest first."""
+    return _registered_scrub_values(ctx)
 
 
 def _registered_scrub_values(ctx: AgentContext) -> list[str]:
