@@ -10302,7 +10302,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -10681,7 +10681,8 @@
                 "type": "null"
               }
             ],
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "Plain-language goal of this code block, shown as the block's Goal in the editor"
           },
           "steps": {
             "anyOf": [
@@ -10695,7 +10696,8 @@
                 "type": "null"
               }
             ],
-            "title": "Steps"
+            "title": "Steps",
+            "description": "Plain-language step outline mapped to code line ranges; derived from the code when omitted"
           }
         },
         "type": "object",
@@ -17615,7 +17617,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -21079,7 +21081,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -24870,7 +24872,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
