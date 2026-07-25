@@ -1,3 +1,5 @@
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.Skyvern-AI%2Fskyvern.svg)](https://mcptoplist.com/server/io.github.Skyvern-AI%2Fskyvern)
+
 <!-- DOCTOC SKIP -->
 
 <h1 align="center">
