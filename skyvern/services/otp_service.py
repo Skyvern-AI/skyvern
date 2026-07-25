@@ -78,6 +78,11 @@ async def parse_otp_login(
     organization_id: str,
     enforced_otp_type: OTPType | None = None,
 ) -> OTPValue | None:
+    # Gate the paid extraction before spending on the LLM: an org that is out of
+    # credits should not incur the secondary-LLM cost only to be charged for it.
+    if not await app.AGENT_FUNCTION.has_sufficient_credit_for_otp_parse(organization_id):
+        LOG.info("Skipping OTP parse; organization has insufficient credits", organization_id=organization_id)
+        return None
     prompt = prompt_engine.load_prompt(
         "parse-otp-login",
         content=content,
@@ -86,6 +91,9 @@ async def parse_otp_login(
     resp = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, prompt_name="parse-otp-login", organization_id=organization_id
     )
+    # The LLM call succeeded, so the extraction work is billable regardless of
+    # whether a code is ultimately found. Charging is best-effort and never raises.
+    await app.AGENT_FUNCTION.charge_for_otp_parse(organization_id)
     try:
         otp_result = OTPResultParsedByLLM.model_validate(resp)
     except ValidationError as e:
