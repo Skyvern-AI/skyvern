@@ -56,6 +56,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     SCREENSHOT_PLACEHOLDER,
     CopilotNonRetriableNavError,
     _check_enforcement,
+    _code_authoring_reject_count_resets,
     _is_context_window_error,
     _maybe_raise_non_retriable_nav,
     _needs_inspect_before_repair_nudge,
@@ -64,6 +65,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _recover_from_context_overflow,
     _scouted_spine_missing_text,
     _strip_input_images,
+    code_authoring_churn_stop_would_claim,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
     synthesized_trajectory_reaches_goal,
@@ -970,3 +972,79 @@ def test_same_omission_spine_violation_still_refused_after_change() -> None:
     assert result.repair_context is not None
     assert result.repair_context.reason_code == "scouted_spine_under_build"
     assert "#search-submit" in result.violations[0]
+
+
+def test_reject_count_resets_only_on_non_repeat_without_frontier_unchanged() -> None:
+    assert _code_authoring_reject_count_resets(False, False) is True
+    assert _code_authoring_reject_count_resets(False, True) is False
+    assert _code_authoring_reject_count_resets(None, False) is False
+    assert _code_authoring_reject_count_resets(True, False) is False
+
+
+def test_churn_stop_would_claim_true_at_ceiling_and_mutates_nothing() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+
+    assert code_authoring_churn_stop_would_claim(ctx) is True
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    assert ctx.blocker_signal is None
+
+
+def test_churn_stop_would_claim_false_below_ceiling() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+
+    assert code_authoring_churn_stop_would_claim(ctx) is False
+
+
+def test_churn_stop_would_claim_false_when_terminal_blocker_held() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="A site verification challenge blocked the run.",
+        user_facing_reason="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+    )
+
+    assert code_authoring_churn_stop_would_claim(ctx) is False
+
+
+def test_churn_stop_would_claim_yields_to_stronger_live_owner_and_mutates_nothing() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    ctx.output_contract_actuation_by_signature = {"sig": OutputContractAdvisoryState.GRANTED}
+
+    assert code_authoring_churn_stop_would_claim(ctx) is False
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    assert ctx.blocker_signal is None
+
+
+def test_churn_stop_would_claim_matches_recorder_claim_at_ceiling() -> None:
+    predicate_ctx = _fresh_context()
+    predicate_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    recorder_ctx = _fresh_context()
+    recorder_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+
+    would_claim = code_authoring_churn_stop_would_claim(predicate_ctx)
+    _record_code_authoring_guardrail_reject(recorder_ctx)
+
+    assert would_claim is True
+    claimed = recorder_ctx.blocker_signal
+    assert isinstance(claimed, CopilotToolBlockerSignal)
+    assert claimed.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def test_churn_stop_would_claim_matches_recorder_no_claim_below_ceiling() -> None:
+    predicate_ctx = _fresh_context()
+    predicate_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+    recorder_ctx = _fresh_context()
+    recorder_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+
+    would_claim = code_authoring_churn_stop_would_claim(predicate_ctx)
+    _record_code_authoring_guardrail_reject(recorder_ctx)
+
+    assert would_claim is False
+    assert recorder_ctx.blocker_signal is None
