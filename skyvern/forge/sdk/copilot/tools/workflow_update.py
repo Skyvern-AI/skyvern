@@ -233,6 +233,7 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
     merge_schema_incompatibilities,
     render_schema_incompatibility_agent_steer,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -14635,6 +14636,7 @@ async def _update_workflow(
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
             settings_fallback_yaml=prior_yaml,
+            credential_scrub_values=registered_scrub_values(ctx),
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 

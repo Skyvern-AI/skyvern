@@ -4,6 +4,7 @@ import re
 import sys
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import structlog
 from structlog.typing import EventDict
@@ -165,6 +166,38 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
 
     event_dict["msg"] = msg_field
 
+    return event_dict
+
+
+def redact_registered_secrets(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Redact credential values the copilot filled during a turn from every string in the event dict.
+
+    Imported lazily: this module is imported far earlier in boot than the copilot package.
+    """
+    from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, all_registered_secret_values
+
+    secrets = all_registered_secret_values()
+    if not secrets:
+        return event_dict
+
+    def scrub(node: Any) -> Any:
+        # Nested values are folded into `msg` by add_kv_pairs_to_msg further down the chain, so a
+        # secret carried only inside a nested kwarg reaches the log line unless we recurse here.
+        if isinstance(node, str):
+            for secret in secrets:
+                if secret in node:
+                    node = node.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+            return node
+        if isinstance(node, dict):
+            return {key: scrub(item) for key, item in node.items()}
+        if isinstance(node, list):
+            return [scrub(item) for item in node]
+        if isinstance(node, tuple):
+            return tuple(scrub(item) for item in node)
+        return node
+
+    for key, value in list(event_dict.items()):
+        event_dict[key] = scrub(value)
     return event_dict
 
 
@@ -441,6 +474,7 @@ def setup_logger() -> None:
     additional_processors = (
         [
             redact_bearer_tokens,
+            redact_registered_secrets,
             compact_action_objects,
             structlog.processors.EventRenamer("msg"),
             add_kv_pairs_to_msg,
@@ -457,6 +491,7 @@ def setup_logger() -> None:
         if settings.JSON_LOGGING
         else [
             redact_bearer_tokens,
+            redact_registered_secrets,
             compact_action_objects,
             structlog.processors.CallsiteParameterAdder(
                 {
