@@ -1,6 +1,5 @@
 """Tests for the open-tabs context section and CLOSE_PAGE gate in extract-action prompts."""
 
-import re
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -77,8 +76,8 @@ class TestOpenTabsContextSection:
         assert "Open browser tabs" in rendered
         assert "tab_index" in rendered
         assert "[current]" in rendered
-        assert re.search(r"https://main\.test", rendered) is not None
-        assert re.search(r"https://pdf\.test/viewer", rendered) is not None
+        assert "https://main.test" in rendered
+        assert "https://pdf.test/viewer" in rendered
 
     @pytest.mark.parametrize("template", ["extract-action", "extract-action-dynamic"])
     def test_omits_tab_listing_when_no_context(self, template: str) -> None:
