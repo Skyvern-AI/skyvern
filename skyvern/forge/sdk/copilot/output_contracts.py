@@ -23,6 +23,8 @@ class OutputContractBailFamily(StrEnum):
 
 class OutputContractActuationKind(StrEnum):
     IMPOSED = "imposed"
+    CREDIT = "credit"
+    IMPOSE_SCOUTED_BINDING = "impose_scouted_binding"
     STRUCTURE_DIRECTIVE = "structure_directive"
     ADVISORY_RUN = "advisory_run"
     BLOCKED_TERMINAL = "blocked_terminal"
@@ -63,6 +65,11 @@ class OutputContractActuationEvidence:
     consumed_run_bound_required_path: bool = False
     consumed_run_carried_page_extraction: bool = False
     loaded_result_source_producible: bool = False
+    # Steering produced no structural movement: the canonical structural fingerprint did not
+    # change across the consumed directives. Never a reject count — counts inflate.
+    steering_exhausted: bool = False
+    credit_available: bool = False
+    scouted_binding_impose_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,9 +97,17 @@ def resolve_output_contract_actuation(
     page-source extraction, and that it still bound no required path. A consumed run whose output was
     observed but bound nothing without a page-source extraction on board is not exhaustion evidence —
     it re-enters the ladder once so the stronger page-source imposition can bind the on-screen values a
-    code static-return provably cannot key."""
+    code static-return provably cannot key. Once steering is exhausted the server resolves the
+    submission itself — crediting a draft the strict prover can only call uncertain, else imposing the
+    binding the recording pins — so a satisfiable submission has a reachable pass path instead of only
+    a terminal; both inherit the advisory lane's post-run adjudication."""
     if evidence.imposed_available:
         return OutputContractActuation(OutputContractActuationKind.IMPOSED, family)
+    if evidence.steering_exhausted:
+        if evidence.credit_available:
+            return OutputContractActuation(OutputContractActuationKind.CREDIT, family)
+        if evidence.scouted_binding_impose_available:
+            return OutputContractActuation(OutputContractActuationKind.IMPOSE_SCOUTED_BINDING, family)
     grantable_source = (
         evidence.advisory_run_grantable and evidence.advisory_state != OutputContractAdvisoryState.CONSUMED
     )

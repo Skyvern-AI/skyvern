@@ -4,7 +4,7 @@ values are not carriers, and a category without one is untrusted."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Any
 
@@ -103,11 +103,13 @@ ANTI_BOT_ARTIFACT_MARKER_VALUES: frozenset[str] = frozenset(
 _MAX_ARTIFACT_FLAG_DEPTH = 5
 
 
-def interactive_challenge_controls(challenge_controls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+def interactive_challenge_controls(
+    challenge_controls: Sequence[object] | None,
+) -> list[Mapping[str, Any]]:
     return [
         control
         for control in challenge_controls or []
-        if isinstance(control, dict) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
+        if isinstance(control, Mapping) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
     ]
 
 

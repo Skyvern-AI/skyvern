@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { ExternalLinkIcon, ReloadIcon, TrashIcon } from "@radix-ui/react-icons";
+import {
+  ExternalLinkIcon,
+  ReloadIcon,
+  TrashIcon,
+  UpdateIcon,
+} from "@radix-ui/react-icons";
+import { GoogleOAuthCredential } from "@/api/types";
 import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { Button } from "@/components/ui/button";
 import {
@@ -60,6 +66,7 @@ const integrations = [
 
 function Integrations() {
   const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [reconnectingId, setReconnectingId] = useState<string | null>(null);
   const {
     credentials,
     isFetching,
@@ -82,6 +89,23 @@ function Integrations() {
       window.location.assign(response.authorize_url);
     } finally {
       setConnectingId(null);
+    }
+  };
+
+  // Re-authenticate an existing connection in place. Passing credential_id keeps
+  // the connection's identity so workflows referencing it keep working — the
+  // backend re-requests the scopes originally granted to this credential.
+  const reconnect = async (credential: GoogleOAuthCredential) => {
+    setReconnectingId(credential.id);
+    try {
+      const response = await startAuthorize({
+        redirect_uri: buildGoogleOAuthRedirectUri(),
+        app_origin: getGoogleOAuthAppOrigin(),
+        credential_id: credential.id,
+      });
+      window.location.assign(response.authorize_url);
+    } finally {
+      setReconnectingId(null);
     }
   };
 
@@ -155,68 +179,93 @@ function Integrations() {
             </div>
           ) : (
             <div className="divide-y">
-              {credentials.map((credential) => (
-                <div
-                  key={credential.id}
-                  className="flex items-center justify-between gap-4 p-4"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium">
-                      {credential.credential_name}
+              {credentials.map((credential) => {
+                const isActive = isGoogleOAuthCredentialActive(credential);
+                const isReconnecting = reconnectingId === credential.id;
+                return (
+                  <div
+                    key={credential.id}
+                    className="flex items-center justify-between gap-4 p-4"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium">
+                        {credential.credential_name}
+                      </div>
+                      <div
+                        className={
+                          isActive
+                            ? "text-xs text-muted-foreground"
+                            : "text-xs font-medium text-amber-600 dark:text-amber-400"
+                        }
+                      >
+                        {isActive ? "Active" : "Needs reconnect"}
+                      </div>
                     </div>
-                    <div className="text-xs text-muted-foreground">
-                      {isGoogleOAuthCredentialActive(credential)
-                        ? "Active"
-                        : "Needs reconnect"}
-                    </div>
-                  </div>
-                  <Dialog>
-                    <DialogTrigger asChild>
+                    <div className="flex items-center gap-2">
                       <Button
                         type="button"
-                        variant="outline"
+                        variant={isActive ? "outline" : "default"}
                         size="sm"
                         className="gap-2"
-                        disabled={isDeletingCredential}
+                        disabled={isReconnecting || isStartingAuthorize}
+                        onClick={() => void reconnect(credential)}
                       >
-                        <TrashIcon className="h-4 w-4" />
-                        Disconnect
+                        {isReconnecting ? (
+                          <ReloadIcon className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <UpdateIcon className="h-4 w-4" />
+                        )}
+                        Reconnect
                       </Button>
-                    </DialogTrigger>
-                    <DialogContent>
-                      <DialogTitle>Disconnect Google account?</DialogTitle>
-                      <DialogDescription>
-                        Workflows using{" "}
-                        <span className="font-medium text-foreground">
-                          {credential.credential_name}
-                        </span>{" "}
-                        will lose access to this Google account.
-                      </DialogDescription>
-                      <DialogFooter>
-                        <DialogClose asChild>
+                      <Dialog>
+                        <DialogTrigger asChild>
                           <Button
                             type="button"
-                            variant="secondary"
+                            variant="outline"
+                            size="sm"
+                            className="gap-2"
                             disabled={isDeletingCredential}
                           >
-                            Cancel
-                          </Button>
-                        </DialogClose>
-                        <DialogClose asChild>
-                          <Button
-                            type="button"
-                            variant="destructive"
-                            disabled={isDeletingCredential}
-                            onClick={() => deleteCredential(credential.id)}
-                          >
+                            <TrashIcon className="h-4 w-4" />
                             Disconnect
                           </Button>
-                        </DialogClose>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
-                </div>
-              ))}
+                        </DialogTrigger>
+                        <DialogContent>
+                          <DialogTitle>Disconnect Google account?</DialogTitle>
+                          <DialogDescription>
+                            Workflows using{" "}
+                            <span className="font-medium text-foreground">
+                              {credential.credential_name}
+                            </span>{" "}
+                            will lose access to this Google account.
+                          </DialogDescription>
+                          <DialogFooter>
+                            <DialogClose asChild>
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                disabled={isDeletingCredential}
+                              >
+                                Cancel
+                              </Button>
+                            </DialogClose>
+                            <DialogClose asChild>
+                              <Button
+                                type="button"
+                                variant="destructive"
+                                disabled={isDeletingCredential}
+                                onClick={() => deleteCredential(credential.id)}
+                              >
+                                Disconnect
+                              </Button>
+                            </DialogClose>
+                          </DialogFooter>
+                        </DialogContent>
+                      </Dialog>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </CardContent>

@@ -8,7 +8,7 @@ stays at the route/repository seam; everything here is side-effect free.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 
@@ -45,8 +45,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _normalize_deliverable_kind,
     is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
+    is_neutral_reported_boolean_criterion,
     is_presence_only_requested_output_criterion,
     judgment_truth_condition_key,
+    normalize_neutral_reported_boolean_criterion,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
     resolve_mint_degrade,
@@ -153,6 +155,7 @@ class PersistencePlan:
 def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for criterion in criteria:
+        criterion = normalize_neutral_reported_boolean_criterion(criterion)
         item = {
             "id": criterion.id,
             "outcome": criterion.outcome,
@@ -204,12 +207,17 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
     return items
 
 
-def criterion_authority_projection(criterion: CompletionCriterion) -> dict[str, Any]:
+def criterion_authority_projection(
+    criterion: CompletionCriterion,
+    *,
+    stored_item: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
     """Canonical values for persisted fields that can change grading authority.
 
     Repository admission compares only fields present in a stored row, preserving
     omitted legacy defaults while rejecting values the tolerant decoder normalized.
     """
+    criterion = normalize_neutral_reported_boolean_criterion(criterion)
     item = criteria_to_json([criterion])[0]
     floor_rekeyed, floor_rekeyed_from_path = _normalize_floor_rekeyed_association(
         criterion.requested_output_floor_rekeyed,
@@ -236,6 +244,17 @@ def criterion_authority_projection(criterion: CompletionCriterion) -> dict[str, 
             "mint_disposition": criterion.mint_disposition,
         }
     )
+    if (
+        stored_item is not None
+        and is_neutral_reported_boolean_criterion(criterion)
+        and stored_item.get("requested_output_floor_rekeyed") is True
+        and stored_item.get("floor_rekeyed_from_path") == f"output.{criterion.classification_output_key}"
+    ):
+        # The one historical coherent neutral tuple normalizes to the current unmarked tuple.
+        # Preserve its exact marker pair only for stored-authority comparison so malformed
+        # variants remain non-adoptable instead of being blessed by tolerant decoding.
+        item["requested_output_floor_rekeyed"] = True
+        item["floor_rekeyed_from_path"] = stored_item["floor_rekeyed_from_path"]
     return item
 
 
@@ -347,49 +366,47 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             or stored_method_mandated
         ):
             deliverable_confirmation_criterion_id = None
-        criteria.append(
-            CompletionCriterion(
-                id=criterion_id,
-                outcome=outcome,
-                contingent_on=contingent_on,
-                contingent_antecedent_output_path=contingent_antecedent_output_path,
-                antecedent_family=antecedent_family,
-                deliverable_kind=stored_deliverable_kind,
-                deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
-                declared_deliverable_kind=_normalize_deliverable_kind(item.get("declared_deliverable_kind")),
-                implicit=bool(item.get("implicit")),
-                method_mandated=stored_method_mandated,
-                level=stored_level,  # type: ignore[arg-type]
-                output_path=stored_output_path,
-                expected_output_value=stored_expected_output_value,
-                expected_output_shape=stored_expected_output_shape,
-                requested_output_evidence_source=cast(RequestedOutputEvidenceSource, requested_output_evidence_source),
-                requested_output_path_mint_source=requested_output_path_mint_source,
-                kind=cast(CriterionKind, kind),
-                terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
-                terminal_action_verification_mode=cast(
-                    TerminalActionVerificationMode, terminal_action_verification_mode
-                ),
-                classification_output_key=classification_output_key,
-                expected_classification=expected_classification,
-                requested_output_corroborator=bool(item.get("requested_output_corroborator")),
-                requested_output_floor_rekeyed=requested_output_floor_rekeyed,
-                floor_rekeyed_from_path=floor_rekeyed_from_path,
-                mint_degrade=resolve_mint_degrade(
-                    item.get("mint_degrade"), contingent_on, contingent_antecedent_output_path
-                ),
-                judgment_truth_condition=_coerce_judgment_truth_condition(
-                    item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
-                ),
-                request_slot_id=request_slot_id,
-                pinability=cast(Pinability | None, pinability),
-                mint_disposition=cast(MintDisposition, mint_disposition),
-            )
+        criterion = CompletionCriterion(
+            id=criterion_id,
+            outcome=outcome,
+            contingent_on=contingent_on,
+            contingent_antecedent_output_path=contingent_antecedent_output_path,
+            antecedent_family=antecedent_family,
+            deliverable_kind=stored_deliverable_kind,
+            deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
+            declared_deliverable_kind=_normalize_deliverable_kind(item.get("declared_deliverable_kind")),
+            implicit=bool(item.get("implicit")),
+            method_mandated=stored_method_mandated,
+            level=stored_level,  # type: ignore[arg-type]
+            output_path=stored_output_path,
+            expected_output_value=stored_expected_output_value,
+            expected_output_shape=stored_expected_output_shape,
+            requested_output_evidence_source=cast(RequestedOutputEvidenceSource, requested_output_evidence_source),
+            requested_output_path_mint_source=requested_output_path_mint_source,
+            kind=cast(CriterionKind, kind),
+            terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
+            terminal_action_verification_mode=cast(TerminalActionVerificationMode, terminal_action_verification_mode),
+            classification_output_key=classification_output_key,
+            expected_classification=expected_classification,
+            requested_output_corroborator=bool(item.get("requested_output_corroborator")),
+            requested_output_floor_rekeyed=requested_output_floor_rekeyed,
+            floor_rekeyed_from_path=floor_rekeyed_from_path,
+            mint_degrade=resolve_mint_degrade(
+                item.get("mint_degrade"), contingent_on, contingent_antecedent_output_path
+            ),
+            judgment_truth_condition=_coerce_judgment_truth_condition(
+                item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
+            ),
+            request_slot_id=request_slot_id,
+            pinability=cast(Pinability | None, pinability),
+            mint_disposition=cast(MintDisposition, mint_disposition),
         )
+        criteria.append(normalize_neutral_reported_boolean_criterion(criterion))
     return tuple(criteria)
 
 
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
+    criterion = normalize_neutral_reported_boolean_criterion(criterion)
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     antecedent_family_key = criterion.antecedent_family or ""
@@ -415,6 +432,13 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     floor_rekeyed_key = (
         f"\x1ffloor_rekeyed:{str(floor_rekeyed).lower()}\x1ffloor_rekeyed_from_path:{floor_rekeyed_from_path or ''}"
     )
+    neutral_reported_boolean_key = ""
+    if is_neutral_reported_boolean_criterion(criterion):
+        neutral_reported_boolean_key = (
+            f"\x1fneutral_reported_boolean_key:{criterion.classification_output_key}"
+            f"\x1fneutral_expected_output_shape:{criterion.expected_output_shape}"
+            f"\x1fneutral_evidence_source:{criterion.requested_output_evidence_source}"
+        )
     if criterion.output_path:
         return (
             f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
@@ -447,6 +471,7 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
         f"\x1fkind:{criterion.kind}"
         f"\x1fterminal_action_verification_mode:{terminal_action_verification_mode_key}"
         f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
+        f"{neutral_reported_boolean_key}"
         f"{floor_rekeyed_key}"
     )
 

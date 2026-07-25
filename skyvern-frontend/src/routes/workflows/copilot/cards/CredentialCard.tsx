@@ -60,6 +60,10 @@ export interface CredentialCardProps {
   // id = the user picked an already-stored credential (chip or dropdown).
   onConnect: (credentialId?: string) => void;
   onSkip: () => void;
+  // Terminal connect auto-sends a "continue" turn; the receipt says so instead
+  // of the plain "added". Defaults false so inline-pause and every other caller
+  // keep the existing copy.
+  continued?: boolean;
 }
 
 const SIGN_IN_WHY_LINE =
@@ -174,6 +178,7 @@ export function CredentialCard({
   resolvedOutcome,
   onConnect,
   onSkip,
+  continued = false,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -197,11 +202,18 @@ export function CredentialCard({
           (credential) =>
             credential.credentialId === resolvedOutcome.credentialId,
         )?.name;
+        const heading = continued
+          ? name
+            ? `Continuing with '${name}'…`
+            : "Continuing…"
+          : name
+            ? `Credential '${name}' added`
+            : "Credential added";
         return (
           <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
             <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
               <span className="text-success">✓</span>
-              {name ? `Credential '${name}' added` : "Credential added"}
+              {heading}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               Stored encrypted · used to sign in on your behalf · never enters
@@ -248,6 +260,11 @@ export function CredentialCard({
             <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
               {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
             </p>
+            {mode === "terminal" ? (
+              <p className="mt-1 text-[11px] font-medium leading-relaxed text-foreground">
+                Connect a credential and I&apos;ll continue.
+              </p>
+            ) : null}
           </div>
           {countdownActive ? (
             <>

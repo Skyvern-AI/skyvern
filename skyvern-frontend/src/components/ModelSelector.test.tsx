@@ -82,6 +82,7 @@ describe("ModelSelector in a read-only comparison scope", () => {
           "claude-opus-4-6": "Anthropic Claude 4.6 Opus",
           "claude-opus-4-7": "Anthropic Claude 4.7 Opus",
           "claude-opus-4-8": "Anthropic Claude 4.8 Opus",
+          "claude-opus-5": "Anthropic Claude Opus 5",
         },
       },
     });
@@ -92,7 +93,8 @@ describe("ModelSelector in a read-only comparison scope", () => {
     expect(await screen.findByText("Anthropic Claude 4.6 Opus")).toBeTruthy();
     expect(await screen.findByText("Anthropic Claude 4.7 Opus")).toBeTruthy();
     expect(await screen.findByText("Anthropic Claude 4.8 Opus")).toBeTruthy();
-    expect(screen.getAllByText("Enterprise")).toHaveLength(4);
+    expect(await screen.findByText("Anthropic Claude Opus 5")).toBeTruthy();
+    expect(screen.getAllByText("Enterprise")).toHaveLength(5);
   });
 
   test("marks selected deprecated Claude Opus 4.5 as enterprise-only", async () => {

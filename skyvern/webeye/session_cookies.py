@@ -7,13 +7,11 @@ import os
 import structlog
 from playwright.async_api import BrowserContext
 
+from skyvern.webeye.profile_cookie_merge import _ALLOWED_COOKIE_KEYS, BANKED_COOKIES_FILENAME
+
 LOG = structlog.get_logger()
 
 SESSION_COOKIES_FILENAME = ".skyvern_session_cookies.json"
-
-# Keys accepted by Playwright's add_cookies; drop anything else (e.g. partitionKey)
-# so one unexpected field can't reject the whole batch.
-_ALLOWED_COOKIE_KEYS = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
 
 # A session cookie reports expires -1 (Playwright) or 0 (patchright/stealth-chromium fork); persistent
 # cookies carry a real future timestamp and re-hydrate from the snapshot on their own.
@@ -52,6 +50,47 @@ async def persist_session_cookies(browser_context: BrowserContext | None, user_d
         LOG.warning("Failed to persist session cookies", exc_info=True)
 
 
+def read_persisted_session_cookies(user_data_dir: str | None) -> list[dict]:
+    """Read the end-state session cookies that ``close()`` persisted to the sidecar, for callers that
+    need them after the live context is gone (the delta-merge freshness guard on a completed run whose
+    browser was already closed). Only session cookies are captured here — persistent cookies live in the
+    encrypted Chromium store — but those are the login-relevant ones the guard protects."""
+    if not user_data_dir:
+        return []
+    path = os.path.join(user_data_dir, SESSION_COOKIES_FILENAME)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            cookies = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [{k: v for k, v in c.items() if k in _ALLOWED_COOKIE_KEYS} for c in cookies if isinstance(c, dict)]
+
+
+async def _add_cookies_with_fallback(browser_context: BrowserContext, cookies: list[dict], kind: str) -> None:
+    """add_cookies as one batch, falling back to per-cookie so a single bad cookie can't drop the rest."""
+    try:
+        await browser_context.add_cookies(cookies)
+        LOG.info("Restored cookies into browser profile", kind=kind, cookie_count=len(cookies), sampling=True)
+    except Exception:
+        restored = 0
+        for cookie in cookies:
+            try:
+                await browser_context.add_cookies([cookie])
+                restored += 1
+            except Exception:
+                LOG.debug("Skipped a cookie during restore", kind=kind, name=cookie.get("name"), exc_info=True)
+                continue
+        LOG.warning(
+            "Batch cookie restore failed; restored individually",
+            kind=kind,
+            restored=restored,
+            failed=len(cookies) - restored,
+            total=len(cookies),
+        )
+
+
 async def restore_session_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
     """Re-inject session cookies captured by ``persist_session_cookies`` if a sidecar exists."""
     try:
@@ -71,23 +110,36 @@ async def restore_session_cookies(browser_context: BrowserContext | None, user_d
         ]
         if not sanitized:
             return
-        try:
-            await browser_context.add_cookies(sanitized)
-            LOG.info("Restored session cookies into browser profile", cookie_count=len(sanitized), sampling=True)
-        except Exception:
-            restored = 0
-            for cookie in sanitized:
-                try:
-                    await browser_context.add_cookies([cookie])
-                    restored += 1
-                except Exception:
-                    LOG.debug("Skipped a cookie during restore", name=cookie.get("name"), exc_info=True)
-                    continue
-            LOG.warning(
-                "Batch cookie restore failed; restored individually",
-                restored=restored,
-                failed=len(sanitized) - restored,
-                total=len(sanitized),
-            )
+        await _add_cookies_with_fallback(browser_context, sanitized, "session")
     except Exception:
         LOG.warning("Failed to restore session cookies", exc_info=True)
+
+
+async def restore_banked_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
+    """Re-inject cookies unioned by ``profile_cookie_merge.union_cookies_into_profile_dir``.
+
+    Called AFTER ``restore_session_cookies`` so a verified-login heal wins over the profile's own
+    older session sidecar on a (domain, name, path) clash. Persistent expiries are preserved;
+    session expiries (-1/0) are pinned to -1 for the same patchright reason as restore_session_cookies.
+    """
+    try:
+        if browser_context is None or not user_data_dir or not os.path.isdir(user_data_dir):
+            return
+        path = os.path.join(user_data_dir, BANKED_COOKIES_FILENAME)
+        if not os.path.exists(path):
+            return
+        with open(path) as f:
+            cookies = json.load(f)
+        sanitized = [
+            {
+                **{k: v for k, v in cookie.items() if k in _ALLOWED_COOKIE_KEYS},
+                **({"expires": -1} if cookie.get("expires", -1) in _SESSION_COOKIE_EXPIRES else {}),
+            }
+            for cookie in cookies
+            if cookie.get("name") and cookie.get("domain")
+        ]
+        if not sanitized:
+            return
+        await _add_cookies_with_fallback(browser_context, sanitized, "banked")
+    except Exception:
+        LOG.warning("Failed to restore banked cookies", exc_info=True)

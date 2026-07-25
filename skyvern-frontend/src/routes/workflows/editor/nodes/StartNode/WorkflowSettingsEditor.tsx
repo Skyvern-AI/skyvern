@@ -1,7 +1,7 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserProfileSelector";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -36,6 +36,9 @@ import { Switch } from "@/components/ui/switch";
 import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+
+import { BrowserProfileSettingsSection } from "./BrowserProfileSettingsSection";
 
 import { placeholders } from "../../helpContent";
 import { useUpdate } from "../../useUpdate";
@@ -88,11 +91,12 @@ function WorkflowSettingsEditorBody({
   blockId: string;
   data: WorkflowStartNodeData;
 }) {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const update = useUpdate<StartNode["data"]>({ id: blockId, editable: true });
   const studioEnabled = useWorkflowStudioEnabled();
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   // Self-healing is restricted to copilot-authored workflows; hide the toggle
   // elsewhere so it never reads as a switch that silently does nothing.
@@ -318,22 +322,32 @@ function WorkflowSettingsEditorBody({
         )}
       </div>
       <div className="space-y-2">
-        <div className="flex items-center gap-2">
-          <Label>Save &amp; Reuse Session</Label>
-          <HelpTooltip content="Persist session information across agent runs" />
-          <Switch
-            className="ml-auto"
-            checked={data.persistBrowserSession}
-            onCheckedChange={(value) =>
-              update({
-                persistBrowserSession: value,
-                pinSavedSessionIp: value ? data.pinSavedSessionIp : false,
-                browserProfileKey: value ? data.browserProfileKey : null,
-              })
-            }
+        {!browserMemoryEnabled && (
+          <div className="flex items-center gap-2">
+            <Label>Save &amp; reuse browser profile</Label>
+            <HelpTooltip content="Persist session information across agent runs" />
+            <Switch
+              className="ml-auto"
+              checked={data.persistBrowserSession}
+              onCheckedChange={(value) =>
+                update({
+                  persistBrowserSession: value,
+                  pinSavedSessionIp: value ? data.pinSavedSessionIp : false,
+                  browserProfileKey: value ? data.browserProfileKey : null,
+                })
+              }
+            />
+          </div>
+        )}
+        {browserMemoryEnabled && (
+          <BrowserProfileSettingsSection
+            blockId={blockId}
+            data={data}
+            update={update}
+            agentName={workflow?.title ?? undefined}
           />
-        </div>
-        {data.persistBrowserSession && (
+        )}
+        {!browserMemoryEnabled && data.persistBrowserSession && (
           <div className="flex flex-col gap-3 rounded-md bg-slate-elevation4 p-4 pl-4">
             <div className="flex items-center gap-2">
               <Label>Keep Same IP Across Runs</Label>
@@ -384,61 +398,65 @@ function WorkflowSettingsEditorBody({
             </div>
           </div>
         )}
-        {data.persistBrowserSession && workflowPermanentId && (
-          <Dialog
-            open={isResetProfileDialogOpen}
-            onOpenChange={setIsResetProfileDialogOpen}
-          >
-            <DialogTrigger asChild>
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                className="nopan"
-              >
-                <ReloadIcon className="mr-2 h-3 w-3" />
-                Reset Saved Profile
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Reset saved profile?</DialogTitle>
-                <DialogDescription>
-                  Clears the default saved browser profile for this agent. The
-                  next unsegmented run starts from a fresh browser state.
-                  Segmented saved profiles are kept.
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter>
-                <DialogClose asChild>
-                  <Button variant="secondary">Cancel</Button>
-                </DialogClose>
+        {!browserMemoryEnabled &&
+          data.persistBrowserSession &&
+          workflowPermanentId && (
+            <Dialog
+              open={isResetProfileDialogOpen}
+              onOpenChange={setIsResetProfileDialogOpen}
+            >
+              <DialogTrigger asChild>
                 <Button
-                  variant="destructive"
-                  onClick={() => resetProfileMutation.mutate()}
-                  disabled={resetProfileMutation.isPending}
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  className="nopan"
                 >
-                  {resetProfileMutation.isPending && (
-                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                  )}
+                  <ReloadIcon className="mr-2 h-3 w-3" />
                   Reset Saved Profile
                 </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        )}
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Reset saved profile?</DialogTitle>
+                  <DialogDescription>
+                    Clears the default saved browser profile for this agent. The
+                    next unsegmented run starts from a fresh browser state.
+                    Segmented saved profiles are kept.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button variant="secondary">Cancel</Button>
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    onClick={() => resetProfileMutation.mutate()}
+                    disabled={resetProfileMutation.isPending}
+                  >
+                    {resetProfileMutation.isPending && (
+                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Reset Saved Profile
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
       </div>
-      <div className="space-y-2">
-        <div className="flex items-center gap-2">
-          <Label>Starting Browser Profile</Label>
-          <HelpTooltip content="Optional browser profile to load at run start. Leave this empty when you want saved-session persistence to decide the browser state." />
+      {!browserMemoryEnabled && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label>Starting Browser Profile</Label>
+            <HelpTooltip content="Optional browser profile to load at run start. Leave this empty when you want saved-session persistence to decide the browser state." />
+          </div>
+          <BrowserProfileSelector
+            value={data.browserProfileId}
+            onChange={(value) => update({ browserProfileId: value })}
+            compact
+          />
         </div>
-        <BrowserProfileSelector
-          value={data.browserProfileId}
-          onChange={(value) => update({ browserProfileId: value })}
-          compact
-        />
-      </div>
+      )}
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Label>Extra HTTP Headers</Label>

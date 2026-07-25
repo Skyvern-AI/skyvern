@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 import urllib.parse
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from io import BytesIO
 from typing import TYPE_CHECKING, Any
@@ -14,10 +16,10 @@ from opentelemetry import trace as otel_trace
 from PIL import Image
 from playwright._impl._errors import Error as PlaywrightError
 from playwright._impl._errors import TimeoutError
-from playwright.async_api import ElementHandle, Frame, Page
+from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
-from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.exceptions import FailedToTakeScreenshot, SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
@@ -66,6 +68,24 @@ async def build_open_tabs_context(
     return "\n".join(lines)
 
 
+_JS_TOP_LEVEL_DECL_RE = re.compile(
+    r"^(?:async\s+function|function|class|let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+    re.MULTILINE,
+)
+
+
+def _wrap_js_in_isolated_scope(script: str) -> str:
+    # page.evaluate runs string scripts through a sloppy indirect eval, which hoists
+    # top-level declarations into the page's global scope and throws
+    # "Identifier 'X' has already been declared" when the site's own JS holds a global
+    # lexical binding with the same name. Scope the script in an IIFE and export via
+    # property writes, which never collide; typeof guards drop names the column-0 regex
+    # matched inside block comments.
+    names = sorted(set(_JS_TOP_LEVEL_DECL_RE.findall(script)))
+    exports = "\n".join(f'if (typeof {name} !== "undefined") globalThis.{name} = {name};' for name in names)
+    return f"(() => {{\n{script}\n{exports}\n}})();"
+
+
 def load_js_script() -> str:
     # TODO: Handle file location better. This is a hacky way to find the file location.
     path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
@@ -73,7 +93,7 @@ def load_js_script() -> str:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
         with open(path, encoding="utf-8") as f:
-            return f.read()
+            return _wrap_js_in_isolated_scope(f.read())
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)
         raise e
@@ -87,6 +107,8 @@ _NAVIGATION_SETTLE_TIMEOUT_MS = 3000
 
 def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Execution context was destroyed" in error_msg:
+        return True
+    if "Cannot find context with specified id" in error_msg:
         return True
     return "ReferenceError" in error_msg and "is not defined" in error_msg
 
@@ -248,6 +270,28 @@ async def _current_viewpoint_screenshot_helper(
             error=str(e),
             exc_info=True,
         )
+        raise FailedToTakeScreenshot(error_message=str(e)) from e
+
+
+async def take_element_screenshot(
+    locator: Locator,
+    timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+) -> bytes:
+    try:
+        page = locator.page
+    except AssertionError as e:
+        raise FailedToTakeScreenshot(error_message="Page is unavailable") from e
+
+    if page.is_closed():
+        raise FailedToTakeScreenshot(error_message="Page is closed")
+    try:
+        return await locator.screenshot(timeout=timeout, animations="disabled")
+    except TimeoutError:
+        try:
+            return await locator.screenshot(timeout=timeout, animations="allow")
+        except PlaywrightError as retry_error:
+            raise FailedToTakeScreenshot(error_message=str(retry_error)) from retry_error
+    except PlaywrightError as e:
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
@@ -462,9 +506,26 @@ class SkyvernFrame:
         arg: Any | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> Any:
+        async def evaluate_expression() -> Any:
+            return await _dispatch_evaluate(frame, expression, arg)
+
+        return await SkyvernFrame._evaluate_expression(
+            frame=frame,
+            expression=expression,
+            evaluate_expression=evaluate_expression,
+            timeout_ms=timeout_ms,
+        )
+
+    @staticmethod
+    async def _evaluate_expression(
+        frame: Page | Frame,
+        expression: str,
+        evaluate_expression: Callable[[], Awaitable[Any]],
+        timeout_ms: float,
+    ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
-                return await _dispatch_evaluate(frame, expression, arg)
+                return await evaluate_expression()
         except PlaywrightError as e:
             error_msg = str(e)
             if not _is_navigation_context_lost(error_msg):
@@ -472,7 +533,7 @@ class SkyvernFrame:
             return await SkyvernFrame._evaluate_with_navigation_recovery(
                 frame=frame,
                 expression=expression,
-                arg=arg,
+                evaluate_expression=evaluate_expression,
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
             )
@@ -485,21 +546,21 @@ class SkyvernFrame:
             return await SkyvernFrame._evaluate_with_navigation_recovery(
                 frame=frame,
                 expression=expression,
-                arg=arg,
+                evaluate_expression=evaluate_expression,
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as error:
             # Re-raised and handled by the caller (scrape retries / failure classification),
             # so this is not the failure boundary; log without a traceback at warning.
             LOG.warning("Skyvern timed out trying to analyze the page", expression=expression)
-            raise TimeoutError("Skyvern timed out trying to analyze the page")
+            raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
 
     @staticmethod
     async def _evaluate_with_navigation_recovery(
         frame: Page | Frame,
         expression: str,
-        arg: Any | None,
+        evaluate_expression: Callable[[], Awaitable[Any]],
         timeout_ms: float,
         initial_error: str,
     ) -> Any:
@@ -522,7 +583,7 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
 
             LOG.warning(
                 "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
@@ -539,18 +600,18 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(inject_budget):
                     # Same dispatch helper so a prefixed Page re-injects
                     # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
                     await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
                 LOG.exception(
                     "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except (PlaywrightError, RuntimeError) as inject_err:
                 last_error_msg = str(inject_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
@@ -567,13 +628,13 @@ class SkyvernFrame:
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    return await _dispatch_evaluate(frame, expression, arg)
-            except asyncio.TimeoutError:
+                    return await evaluate_expression()
+            except asyncio.TimeoutError as error:
                 LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
-                raise TimeoutError("Skyvern timed out trying to analyze the page")
+                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except (PlaywrightError, RuntimeError) as retry_err:
                 last_error_msg = str(retry_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
@@ -862,9 +923,20 @@ class SkyvernFrame:
         js_script = "(element) => isScrollable(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
-    async def get_element_visible(self, element: ElementHandle) -> bool:
+    async def get_element_visible(self, locator: Locator) -> bool:
         js_script = "(element) => isElementVisible(element) && !isHidden(element)"
-        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+
+        async def evaluate_expression() -> bool:
+            if await locator.count() == 0:
+                return False
+            return await locator.evaluate(js_script)
+
+        return await self._evaluate_expression(
+            frame=self.frame,
+            expression=js_script,
+            evaluate_expression=evaluate_expression,
+            timeout_ms=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
 
     async def get_disabled_from_style(self, element: ElementHandle) -> bool:
         js_script = "(element) => checkDisabledFromStyle(element)"
@@ -1076,7 +1148,7 @@ class SkyvernFrame:
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
             _span.set_attribute("animation_result", "finished")
-        except (TimeoutError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
             _span.set_attribute("animation_result", "timeout")
             LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
             return
@@ -1126,7 +1198,7 @@ class SkyvernFrame:
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
                 loading_indicator_result = "timeout"
                 LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
             except Exception:
@@ -1159,7 +1231,7 @@ class SkyvernFrame:
             _ds_span.set_attribute("stable_ms", dom_stable_ms)
             try:
                 await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
                 dom_stability_result = "timeout"
                 LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
             except Exception:

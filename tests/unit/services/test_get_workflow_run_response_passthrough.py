@@ -7,7 +7,7 @@ import pytest
 
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import RunStatus, ScriptRunResponse
-from skyvern.services.workflow_service import get_workflow_run_response
+from skyvern.services.workflow_service import get_workflow_run_response, workflow_request_body_from_existing_run
 
 
 @pytest.mark.asyncio
@@ -74,3 +74,80 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.step_count == 4
     assert resp.run_request is not None
     assert resp.run_request.browser_session_id == "pbs_123"
+
+
+def _fresh_run(*, start_fresh: bool, session_id: str | None) -> WorkflowRun:
+    now = datetime.now(timezone.utc)
+    return WorkflowRun(
+        workflow_run_id="wr_f",
+        workflow_id="w_f",
+        workflow_permanent_id="wpid_f",
+        organization_id="o_f",
+        status=WorkflowRunStatus.failed,
+        browser_session_id=session_id,
+        start_fresh_browser=start_fresh,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def test_retry_omits_session_id_for_fresh_run() -> None:
+    # A fresh run created under FORCE_BROWSER_SESSION carries a generated PBS; the retry must omit it,
+    # or the start_fresh + browser_session_id validator rejects the reconstruction.
+    body = workflow_request_body_from_existing_run(_fresh_run(start_fresh=True, session_id="pbs_forced"))
+    assert body.start_fresh_browser is True
+    assert body.browser_session_id is None
+
+
+def test_retry_keeps_session_id_when_not_fresh() -> None:
+    body = workflow_request_body_from_existing_run(_fresh_run(start_fresh=False, session_id="pbs_keep"))
+    assert body.browser_session_id == "pbs_keep"
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_run_response_echoes_fresh_and_drops_session() -> None:
+    # A fresh run's run_request echoes start_fresh_browser and drops the session/profile so it stays
+    # valid under the mutually-exclusive validators (a FORCE_BROWSER_SESSION run has a generated PBS).
+    now = datetime.now(timezone.utc)
+    workflow_run = WorkflowRun(
+        workflow_run_id="wr_f",
+        workflow_id="w_f",
+        workflow_permanent_id="wpid_f",
+        organization_id="o_f",
+        status=WorkflowRunStatus.completed,
+        browser_session_id="pbs_forced",
+        start_fresh_browser=True,
+        created_at=now,
+        modified_at=now,
+    )
+    status_resp = MagicMock(
+        outputs={},
+        downloaded_files=None,
+        recording_url=None,
+        screenshot_urls=None,
+        failure_reason=None,
+        workflow_title="T",
+        parameters={},
+        errors=None,
+        total_steps=1,
+    )
+    with (
+        patch(
+            "skyvern.services.workflow_service.app.DATABASE.workflow_runs.get_workflow_run",
+            new_callable=AsyncMock,
+            return_value=workflow_run,
+        ),
+        patch(
+            "skyvern.services.workflow_service.app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id",
+            new_callable=AsyncMock,
+            return_value=status_resp,
+        ),
+    ):
+        resp = await get_workflow_run_response("wr_f", organization_id="o_f")
+
+    assert resp is not None
+    assert resp.run_request is not None
+    assert resp.run_request.start_fresh_browser is True
+    assert resp.run_request.browser_session_id is None
+    # The top-level field still surfaces the actual session the run used.
+    assert resp.browser_session_id == "pbs_forced"

@@ -257,7 +257,7 @@ function WorkflowRowContextMenu({
           <ContextMenuSeparator />
           <ContextMenuItem onSelect={() => clone()} disabled={isMultiSelect}>
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone
+            Duplicate Agent
           </ContextMenuItem>
           <ContextMenuItem
             onSelect={() => toggleTemplate()}

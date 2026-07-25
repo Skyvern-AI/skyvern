@@ -174,6 +174,81 @@ def selector_match_count_expression(css_selector: str) -> str:
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
 
 
+def scout_dynamic_row_evidence_expression(selector: str) -> str:
+    """Capture a bounded, source-page row identity for an exact positional click target.
+
+    Period capture intentionally recognizes English ``Month D, YYYY`` labels only. Keep this browser
+    parser in lockstep with ``_ROW_PERIOD_DATE_RE`` when adding formats; do not add site-specific cases.
+    """
+    sel = json.dumps(selector)
+    return (
+        "(() => {"
+        f"  const targetSelector = {sel};"
+        "  const text = (value) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, 500);"
+        "  const months = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, "
+        "july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };"
+        "  const daysInMonth = (year, month) => month === 2 ? "
+        "(year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28) : "
+        "([4, 6, 9, 11].includes(month) ? 30 : 31);"
+        "  const periods = (value) => {"
+        "    const found = [];"
+        "    const pattern = /\\b(January|February|March|April|May|June|July|August|September|October|November|December)\\s+(0?[1-9]|[12][0-9]|3[01]),\\s+([0-9]{4})\\b/gi;"
+        "    for (const match of String(value || '').matchAll(pattern)) {"
+        "      const month = months[match[1].toLowerCase()];"
+        "      const day = Number(match[2]); const year = Number(match[3]);"
+        "      if (year >= 1 && day <= daysInMonth(year, month)) "
+        "found.push(match[3] + '-' + String(month).padStart(2, '0'));"
+        "    }"
+        "    return found;"
+        "  };"
+        "  const escapeCss = (value) => window.CSS && CSS.escape ? CSS.escape(value) : "
+        "String(value).replace(/[^A-Za-z0-9_-]/g, (ch) => '\\\\' + ch);"
+        "  let target = null;"
+        "  let indexed = null;"
+        "  try {"
+        "    if (/^\\s*(xpath=|\\(?\\/)/.test(targetSelector)) {"
+        "      const xpath = targetSelector.replace(/^\\s*xpath=/, '');"
+        "      const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
+        "      target = result ? result.singleNodeValue : null;"
+        "    } else {"
+        "      indexed = targetSelector.match(/^(.*)\\s*>>\\s*nth=(\\d+)\\s*$/);"
+        "      if (indexed) target = document.querySelectorAll(indexed[1].trim())[Number(indexed[2])] || null;"
+        "      else target = document.querySelector(targetSelector);"
+        "    }"
+        "  } catch (e) { return null; }"
+        "  if (!target || !target.tagName) return null;"
+        "  const tag = target.tagName.toLowerCase();"
+        "  const id = target.getAttribute('id') || '';"
+        "  const classes = Array.from(target.classList || []).map(String).filter(Boolean);"
+        "  let rowSelector = indexed ? indexed[1].trim() : '';"
+        "  if (!rowSelector && id) rowSelector = '#' + escapeCss(id);"
+        "  else if (!rowSelector && classes.length) "
+        "rowSelector = tag + classes.map((name) => '.' + escapeCss(name)).join('');"
+        "  else if (!rowSelector) rowSelector = tag;"
+        "  let rows = [];"
+        "  try { rows = Array.from(document.querySelectorAll(rowSelector)); } catch (e) { return null; }"
+        "  if (rows.length < 2 || rows.length > 100) return null;"
+        "  const selectedIndex = rows.indexOf(target);"
+        "  if (selectedIndex < 0) return null;"
+        "  const rowText = text(target.textContent);"
+        "  if (!rowText) return null;"
+        "  const rowTextMatchCount = rows.reduce((count, row) => count + (text(row.textContent) === rowText ? 1 : 0), 0);"
+        "  const rowPeriods = rows.map((row) => periods(text(row.textContent)));"
+        "  const selectedPeriods = rowPeriods[selectedIndex];"
+        "  const uniqueSelectedPeriods = Array.from(new Set(selectedPeriods)).sort();"
+        "  if (uniqueSelectedPeriods.length > 20) return null;"
+        "  const periodMatches = uniqueSelectedPeriods.map((period) => ({"
+        "    period,"
+        "    selected_row_match_count: selectedPeriods.filter((candidate) => candidate === period).length,"
+        "    row_match_count: rowPeriods.filter((candidates) => candidates.includes(period)).length"
+        "  }));"
+        "  return { target_selector: targetSelector, row_selector: rowSelector, row_text: rowText, "
+        "row_selector_count: rows.length, row_text_match_count: rowTextMatchCount, period_matches: periodMatches, "
+        "selected_index: selectedIndex };"
+        "})()"
+    )
+
+
 # Read only the readonly/disabled control-state booleans for a CSS or XPath selector; never reads the
 # element's value. An unresolvable selector or non-CSS/XPath engine returns null (UNKNOWN editability).
 def scout_control_state_expression(selector: str) -> str:
@@ -411,7 +486,10 @@ for (const form of document.querySelectorAll('form')) {
   const submitControls = [];
   for (const node of form.querySelectorAll('input,select,textarea,button')) {
     const tag = (node.tagName || '').toLowerCase();
-    const fieldType = lower(attr(node, 'type') || tag || 'text');
+    const declaredType = lower(attr(node, 'type'));
+    const fieldType = tag === 'button'
+      ? (['button', 'reset', 'submit'].includes(declaredType) ? declaredType : 'submit')
+      : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
       submitControls.push({ text: nodeText(node) || attr(node, 'value'), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
@@ -449,6 +527,12 @@ const clickableSelector = (el) => {
   return '';
 };
 const clickableText = (el) => nodeText(el) || attr(el, 'aria-label') || attr(el, 'value') || attr(el, 'title');
+const elementVisible = (node) => {
+  if (!node || !node.getBoundingClientRect) return false;
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
+};
 const usedClickableSelectors = new Set();
 for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.selector) usedClickableSelectors.add(sc.selector);
 for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
@@ -458,6 +542,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
   const tag = (el.tagName || '').toLowerCase();
   if (SKIP_TAGS.has(tag)) continue;
+  if (!elementVisible(el)) continue;
   if (el.closest && el.closest('form')) continue;
   const text = clickableText(el);
   const selector = clickableSelector(el);
@@ -477,12 +562,6 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
 const resultContainers = [];
 let resultContainersTruncated = false;
 const selectorMatchCount = (selector) => { if (!selector) return 0; try { return document.querySelectorAll(selector).length; } catch (e) { return 0; } };
-const elementVisible = (node) => {
-  if (!node || !node.getBoundingClientRect) return false;
-  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
-  const rect = node.getBoundingClientRect();
-  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
-};
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
   return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
@@ -594,15 +673,28 @@ for (const node of all) {
 
 const challengeControls = [];
 const seenChallenge = new Set();
+const challengeIdentity = (node) => {
+  const tag = (node.tagName || '').toLowerCase();
+  return [tag, attr(node, 'id'), attr(node, 'name'), classesFor(node).join(' '), attr(node, 'src'), attr(node, 'type'), attr(node, 'data-sitekey'), attr(node, 'data-callback'), attr(node, 'data-expired-callback'), attr(node, 'data-error-callback'), attr(node, 'aria-label'), attr(node, 'title')].join(' ').toLowerCase();
+};
+const insideChallengeCarrier = (node) => {
+  for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    const identity = challengeIdentity(ancestor);
+    if (ANTI_BOT_PATTERNS.some((p) => identity.includes(p))) return true;
+  }
+  return false;
+};
 for (const node of all) {
   if (challengeControls.length >= MAX_CHALLENGE_CONTROLS) break;
+  if (!elementVisible(node)) continue;
   const tag = (node.tagName || '').toLowerCase();
-  const identity = [tag, attr(node, 'id'), attr(node, 'name'), '', attr(node, 'src'), attr(node, 'type'), attr(node, 'data-sitekey'), attr(node, 'data-callback'), attr(node, 'data-expired-callback'), attr(node, 'data-error-callback'), attr(node, 'aria-label'), attr(node, 'title')].join(' ').toLowerCase();
-  if (!ANTI_BOT_PATTERNS.some((p) => identity.includes(p))) continue;
+  const identity = challengeIdentity(node);
+  const interactiveDescendant = ['a', 'button', 'input', 'select', 'textarea'].includes(tag) && insideChallengeCarrier(node);
+  if (!ANTI_BOT_PATTERNS.some((p) => identity.includes(p)) && !interactiveDescendant) continue;
   const selector = selectorFor(node);
   if (seenChallenge.has(selector)) continue;
   seenChallenge.add(selector);
-  const entry = { tag: tag, id: attr(node, 'id'), name: attr(node, 'name'), class: classesFor(node), type: attr(node, 'type'), selector: selector, text: nodeText(node) || attr(node, 'aria-label') };
+  const entry = { tag: tag, id: attr(node, 'id'), name: attr(node, 'name'), class: classesFor(node), type: attr(node, 'type'), selector: selector, text: nodeText(node) || attr(node, 'value') || attr(node, 'aria-label'), checked: !!node.checked, disabled: controlDisabled(node) };
   for (const k of ['src', 'title', 'data-sitekey', 'data-callback', 'data-expired-callback', 'data-error-callback']) {
     const v = attr(node, k);
     if (v) entry[k.split('-').join('_')] = v;

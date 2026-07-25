@@ -40,6 +40,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -56,7 +57,18 @@ def is_incompatible_text_input_error(exc: BaseException) -> bool:
     return "is not an" in str(exc).lower()
 
 
-def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
+def is_element_detached_error(exc: BaseException) -> bool:
+    # "Element is not attached to the DOM" (ElementHandle ops on a replaced node) and
+    # "Frame was detached" (ops routed through a frame that navigated or was removed)
+    # both mean the resolved target no longer exists in the live page.
+    message = str(exc).lower()
+    return "not attached to the dom" in message or "frame was detached" in message
+
+
+def is_post_dispatch_click_timeout(
+    exc: BaseException,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
     """A Playwright `TimeoutError` whose message references the post-click
     auto-wait for scheduled navigations means the click was physically
     dispatched (Playwright logs ``click action done`` immediately before this
@@ -64,7 +76,10 @@ def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
     trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
     chain would duplicate the already-applied side effect.
     """
-    if not isinstance(exc, TimeoutError):
+    is_timeout = (
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+    )
+    if not is_timeout:
         return False
     return "scheduled navigation" in str(exc).lower()
 
@@ -95,7 +110,23 @@ async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css:
         if frame_handler is None:
             raise NoneFrameError(frame_id=child_frame)
 
-        content_frame = await frame_handler.content_frame()
+        try:
+            content_frame = await frame_handler.content_frame()
+        except PlaywrightError as exc:
+            if not is_element_detached_error(exc):
+                raise
+            # The iframe node detached between query_selector and content_frame (page
+            # mutation). Re-query once for a fresh handle; if it is gone or detaches
+            # again, classify as a missing element instead of leaking the raw error.
+            frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+            if frame_handler is None:
+                raise MissingElement(element_id=child_frame) from exc
+            try:
+                content_frame = await frame_handler.content_frame()
+            except PlaywrightError as retry_exc:
+                if not is_element_detached_error(retry_exc):
+                    raise
+                raise MissingElement(element_id=child_frame) from retry_exc
         if content_frame is None:
             raise NoneFrameError(frame_id=child_frame)
         current_frame = content_frame
@@ -335,6 +366,18 @@ class SkyvernElement:
             or style_disabled
         )
 
+    async def wait_until_enabled(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout / 1000
+
+        while await self.is_disabled(dynamic=True):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.1, remaining))
+
+        return True
+
     async def is_readonly(self, dynamic: bool = False) -> bool:
         # if attr not exist, return None
         # if attr is like 'readonly', return empty string or True
@@ -381,7 +424,7 @@ class SkyvernElement:
         if not must_visible_style:
             return True
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-        return await skyvern_frame.get_element_visible(await self.get_element_handler())
+        return await skyvern_frame.get_element_visible(self.get_locator())
 
     async def is_editable(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         try:
@@ -812,6 +855,29 @@ class SkyvernElement:
         except Exception:
             return False
 
+    async def is_safe_for_checkbox_direct_click(self) -> bool:
+        # A checkbox blocker is safe to click directly only when the click cannot be
+        # intercepted by actionable content that would navigate/submit: the blocker
+        # must not itself be an <a href>/<button>, nor a <label> wrapping one. Any
+        # probe failure or anomalous result fails closed (treated as unsafe).
+        locator = self.get_locator()
+        try:
+            is_interactive = await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression="(element) => element.matches('a[href], button')",
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            return False
+        if not isinstance(is_interactive, bool) or is_interactive:
+            return False
+        if self.get_tag_name() != "label":
+            return True
+        try:
+            return await locator.locator("a[href], button").count() == 0
+        except Exception:
+            return False
+
     async def find_bound_label_by_attr_id(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> Locator | None:
         if self.get_tag_name() == "label":
             return None
@@ -942,15 +1008,68 @@ class SkyvernElement:
     async def focus(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().focus(timeout=timeout)
 
+    async def refresh_locator_if_stale(self) -> None:
+        """Re-resolve via the tag-name xpath (same fallback as get_skyvern_element_by_id)
+        when the scraped css selector is missing or ambiguous after a page mutation.
+        Best-effort for missing targets; ambiguous targets must resolve uniquely or fail."""
+        match_count = await self._safe_match_count(self.get_locator())
+        if match_count == 1:
+            return
+        xpath: str | None = self.get_element_dict().get("xpath")
+        if xpath:
+            fresh_locator = self.get_frame().locator(f"xpath={xpath}")
+            if await self._safe_match_count(fresh_locator) == 1:
+                LOG.info(
+                    "Re-resolved stale or ambiguous element locator by xpath",
+                    element_id=self.get_id(),
+                    xpath=xpath,
+                    previous_match_count=match_count,
+                )
+                self.locator = fresh_locator
+                return
+
+        if match_count > 1:
+            raise MultipleElementsFound(
+                num=match_count,
+                selector=str(self.get_locator()),
+                element_id=self.get_id(),
+            )
+
+    async def _safe_match_count(self, locator: Locator) -> int:
+        # count() itself raises when the locator's frame detached; that means 0 matches
+        # here, not a new error to surface.
+        try:
+            return await locator.count()
+        except PlaywrightError as exc:
+            if is_element_detached_error(exc):
+                return 0
+            raise
+
+    async def _classify_typing_timeout(self, exc: TimeoutError) -> None:
+        """Raise MissingElement when the typing target vanished mid-action; otherwise
+        return so the caller re-raises the original timeout (a readiness problem)."""
+        if await self._safe_match_count(self.get_locator()) == 0:
+            raise MissingElement(element_id=self.get_id()) from exc
+
     async def input_sequentially(self, text: str, default_timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
+        await self.refresh_locator_if_stale()
+        try:
+            await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
+        except TimeoutError as exc:
+            await self._classify_typing_timeout(exc)
+            raise
 
     async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.refresh_locator_if_stale()
         locator = self.get_locator()
-        await EventStrategyFactory.type_text(locator.page, locator, text)
+        try:
+            await EventStrategyFactory.type_text(locator.page, locator, text)
+        except TimeoutError as exc:
+            await self._classify_typing_timeout(exc)
+            raise
 
     async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:
@@ -1090,7 +1209,7 @@ class SkyvernElement:
         incremental_page: IncrementalScrapePage | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        if await self.is_disabled(dynamic=True):
+        if not await self.wait_until_enabled(timeout=timeout):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
         try:

@@ -69,6 +69,10 @@ class _SetFailingMemoryCache:
 
 
 class _FakeLocator:
+    @property
+    def page(self) -> Any:
+        return SimpleNamespace(is_closed=lambda: False)
+
     async def count(self) -> int:
         return 1
 

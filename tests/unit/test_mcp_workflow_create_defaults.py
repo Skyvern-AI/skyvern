@@ -2,14 +2,20 @@
 
 import json
 
+import pytest
 import yaml
 
 from skyvern.cli.mcp_tools.workflow import (
+    _inject_code_block_derived_steps,
+    _inject_code_block_prompt_defaults,
     _inject_code_v2_defaults,
     _inject_missing_top_level_defaults,
+    _inject_workflow_update_code_block_prompt_defaults,
     _parse_definition,
 )
 from skyvern.schemas.runs import ProxyLocation
+
+_ACTION_CODE = 'await page.goto("https://example.com")\nawait page.click("button.submit")'
 
 
 def _minimal_workflow_json(**overrides: object) -> str:
@@ -122,6 +128,269 @@ def test_invalid_json_passthrough() -> None:
     bad_json = "not valid json {"
     result = _inject_code_v2_defaults(bad_json, "json")
     assert result == bad_json
+
+
+def _code_workflow_json(blocks: list[dict[str, object]]) -> str:
+    return json.dumps(
+        {
+            "title": "Test Workflow",
+            "workflow_definition": {"parameters": [], "blocks": blocks},
+        }
+    )
+
+
+def test_code_block_prompt_defaulted_on_create() -> None:
+    """A code block without a prompt key gets prompt "" (the editor's new-block default)."""
+    definition = _code_workflow_json([{"block_type": "code", "label": "step1", "code": "x = 1"}])
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert blocks[0]["prompt"] == ""
+
+
+def test_code_block_explicit_prompt_preserved() -> None:
+    definition = _code_workflow_json([{"block_type": "code", "label": "step1", "code": "x = 1", "prompt": "Do X"}])
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert blocks[0]["prompt"] == "Do X"
+
+
+def test_code_block_explicit_null_prompt_preserved() -> None:
+    """An explicit null prompt (e.g. a legacy block round-tripped through workflow get) stays null."""
+    definition = _code_workflow_json([{"block_type": "code", "label": "step1", "code": "x = 1", "prompt": None}])
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert blocks[0]["prompt"] is None
+
+
+def test_code_block_prompt_not_defaulted_for_existing_label() -> None:
+    """On update, an existing code block resubmitted without a prompt key is not migrated."""
+    definition = _code_workflow_json(
+        [
+            {"block_type": "code", "label": "old_block", "code": "x = 1"},
+            {"block_type": "code", "label": "new_block", "code": "y = 2"},
+        ]
+    )
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset({"old_block"}))
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert "prompt" not in blocks[0]
+    assert blocks[1]["prompt"] == ""
+
+
+def test_code_block_prompt_defaulted_inside_for_loop() -> None:
+    definition = _code_workflow_json(
+        [
+            {
+                "block_type": "for_loop",
+                "label": "loop",
+                "loop_over_parameter_key": "items",
+                "loop_blocks": [{"block_type": "code", "label": "inner", "code": "x = 1"}],
+            }
+        ]
+    )
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    loop = json.loads(result)["workflow_definition"]["blocks"][0]
+    assert loop["loop_blocks"][0]["prompt"] == ""
+
+
+def test_non_code_blocks_untouched_by_prompt_default() -> None:
+    definition = _minimal_workflow_json()
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert "prompt" not in blocks[0]
+
+
+def test_code_block_prompt_defaulted_for_yaml() -> None:
+    yaml_str = """
+title: Test
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: step1
+      code: x = 1
+"""
+    result = _inject_code_block_prompt_defaults(yaml_str, "yaml", existing_code_labels=frozenset())
+    parsed = yaml.safe_load(result)
+    assert parsed["workflow_definition"]["blocks"][0]["prompt"] == ""
+
+
+def test_code_block_prompt_invalid_json_passthrough() -> None:
+    bad_json = "not valid json {"
+    result = _inject_code_block_prompt_defaults(bad_json, "json", existing_code_labels=frozenset())
+    assert result == bad_json
+
+
+@pytest.mark.asyncio
+async def test_update_wrapper_excludes_existing_code_labels_including_nested() -> None:
+    existing = {
+        "workflow_definition": {
+            "blocks": [
+                {"block_type": "code", "label": "old_top", "code": "x = 1"},
+                {
+                    "block_type": "for_loop",
+                    "label": "loop",
+                    "loop_blocks": [{"block_type": "code", "label": "old_nested", "code": "y = 2"}],
+                },
+            ]
+        }
+    }
+
+    async def fetch_existing() -> dict[str, object]:
+        return existing
+
+    definition = _code_workflow_json(
+        [
+            {"block_type": "code", "label": "old_top", "code": "x = 1"},
+            {"block_type": "code", "label": "old_nested", "code": "y = 2"},
+            {"block_type": "code", "label": "brand_new", "code": "z = 3"},
+        ]
+    )
+    result = await _inject_workflow_update_code_block_prompt_defaults(definition, "json", fetch_existing)
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert "prompt" not in blocks[0]
+    assert "prompt" not in blocks[1]
+    assert blocks[2]["prompt"] == ""
+
+
+def test_code_block_steps_derived_for_code_first_block() -> None:
+    """A code-first block (non-null prompt) without steps gets them derived from its code."""
+    definition = _code_workflow_json(
+        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "Open the page and submit"}]
+    )
+    result = _inject_code_block_derived_steps(definition, "json")
+    steps = json.loads(result)["workflow_definition"]["blocks"][0]["steps"]
+    assert [step["action_type"] for step in steps] == ["goto_url", "click"]
+    assert [(step["line_start"], step["line_end"]) for step in steps] == [(1, 1), (2, 2)]
+    assert all(step["description"] for step in steps)
+
+
+def test_code_block_steps_derived_for_yaml() -> None:
+    yaml_str = """
+title: Test
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: step1
+      prompt: ""
+      code: |
+        await page.goto("https://example.com")
+"""
+    result = _inject_code_block_derived_steps(yaml_str, "yaml")
+    steps = yaml.safe_load(result)["workflow_definition"]["blocks"][0]["steps"]
+    assert [step["action_type"] for step in steps] == ["goto_url"]
+
+
+def test_code_block_steps_not_derived_without_prompt() -> None:
+    """Blocks without a prompt (missing key or explicit null) are legacy and get no steps."""
+    for prompt_fields in ({}, {"prompt": None}):
+        definition = _code_workflow_json(
+            [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, **prompt_fields}]
+        )
+        result = _inject_code_block_derived_steps(definition, "json")
+        assert result == definition
+
+
+def test_code_block_explicit_steps_preserved() -> None:
+    explicit = [{"description": "Author step", "action_type": "click", "line_start": 1, "line_end": 1}]
+    definition = _code_workflow_json(
+        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "", "steps": explicit}]
+    )
+    result = _inject_code_block_derived_steps(definition, "json")
+    assert json.loads(result)["workflow_definition"]["blocks"][0]["steps"] == explicit
+
+
+def test_code_block_explicit_empty_steps_preserved() -> None:
+    """An explicitly-supplied `steps: []` is an authored empty outline, not absence."""
+    definition = _code_workflow_json(
+        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "", "steps": []}]
+    )
+    result = _inject_code_block_derived_steps(definition, "json")
+    assert json.loads(result)["workflow_definition"]["blocks"][0]["steps"] == []
+
+
+def test_code_block_null_steps_derived() -> None:
+    """`steps: null` is the workflow-get shape for blocks without steps, so a get -> edit -> update
+    round trip must derive it like an omitted key."""
+    definition = _code_workflow_json(
+        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "", "steps": None}]
+    )
+    result = _inject_code_block_derived_steps(definition, "json")
+    steps = json.loads(result)["workflow_definition"]["blocks"][0]["steps"]
+    assert [step["action_type"] for step in steps] == ["goto_url", "click"]
+
+
+def test_code_block_actionless_code_unchanged() -> None:
+    """Code with no browser actions derives no steps; the definition passes through untouched."""
+    definition = _code_workflow_json([{"block_type": "code", "label": "step1", "code": "x = 1", "prompt": ""}])
+    result = _inject_code_block_derived_steps(definition, "json")
+    assert result == definition
+
+
+def test_code_block_steps_derived_inside_for_loop() -> None:
+    definition = _code_workflow_json(
+        [
+            {
+                "block_type": "for_loop",
+                "label": "loop",
+                "loop_over_parameter_key": "items",
+                "loop_blocks": [{"block_type": "code", "label": "inner", "code": _ACTION_CODE, "prompt": ""}],
+            }
+        ]
+    )
+    result = _inject_code_block_derived_steps(definition, "json")
+    inner = json.loads(result)["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+    assert [step["action_type"] for step in inner["steps"]] == ["goto_url", "click"]
+
+
+def test_code_block_steps_invalid_json_passthrough() -> None:
+    bad_json = "not valid json {"
+    assert _inject_code_block_derived_steps(bad_json, "json") == bad_json
+
+
+def test_create_pipeline_defaults_prompt_then_derives_steps() -> None:
+    """The create-path composition: an omitted prompt defaults to "" and steps are then derived."""
+    definition = _code_workflow_json([{"block_type": "code", "label": "step1", "code": _ACTION_CODE}])
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    result = _inject_code_block_derived_steps(result, "json")
+    block = json.loads(result)["workflow_definition"]["blocks"][0]
+    assert block["prompt"] == ""
+    assert [step["action_type"] for step in block["steps"]] == ["goto_url", "click"]
+
+
+def test_create_explicit_null_prompt_block_round_trips_unchanged() -> None:
+    """AC3 on create: a legacy block cloned via workflow get (prompt: null) gets neither prompt nor steps."""
+    definition = _code_workflow_json([{"block_type": "code", "label": "legacy", "code": _ACTION_CODE, "prompt": None}])
+    result = _inject_code_block_prompt_defaults(definition, "json", existing_code_labels=frozenset())
+    result = _inject_code_block_derived_steps(result, "json")
+    assert json.loads(result) == json.loads(definition)
+
+
+@pytest.mark.asyncio
+async def test_update_existing_old_code_block_round_trips_unchanged() -> None:
+    """AC3 on update: an existing old code block resubmitted as-is gets neither prompt nor steps,
+    while a brand-new block in the same update gets both."""
+    existing = {
+        "workflow_definition": {
+            "blocks": [{"block_type": "code", "label": "old_block", "code": _ACTION_CODE}],
+        }
+    }
+
+    async def fetch_existing() -> dict[str, object]:
+        return existing
+
+    definition = _code_workflow_json(
+        [
+            {"block_type": "code", "label": "old_block", "code": _ACTION_CODE},
+            {"block_type": "code", "label": "brand_new", "code": _ACTION_CODE},
+        ]
+    )
+    result = await _inject_workflow_update_code_block_prompt_defaults(definition, "json", fetch_existing)
+    result = _inject_code_block_derived_steps(result, "json")
+    blocks = json.loads(result)["workflow_definition"]["blocks"]
+    assert blocks[0] == {"block_type": "code", "label": "old_block", "code": _ACTION_CODE}
+    assert blocks[1]["prompt"] == ""
+    assert [step["action_type"] for step in blocks[1]["steps"]] == ["goto_url", "click"]
 
 
 def test_parse_definition_unaffected() -> None:

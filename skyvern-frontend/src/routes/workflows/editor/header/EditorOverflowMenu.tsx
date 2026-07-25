@@ -4,7 +4,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
@@ -47,7 +47,7 @@ export function EditorOverflowMenu({
   // fast timing; standalone (legacy header) brings a local one.
   embedded?: boolean;
 } = {}) {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const { data: workflowRun } = useWorkflowRunQuery();
   const isTemplate = workflow?.is_template ?? false;

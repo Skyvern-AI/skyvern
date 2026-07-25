@@ -36,6 +36,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import (
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     credential_response_cache_key,
     encode_credential_response,
     maybe_credential_pause,
+    preflight_credential_pause,
     resolve_credential_pause,
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -64,7 +66,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _elapsed_run_seconds,
     run_with_enforcement,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, credential_prompt_reason
+from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
+    RequestPolicy,
+    credential_prompt_reason,
+)
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.routes.workflow_copilot import (
     WorkflowCopilotCredentialResponseRequest,
@@ -1833,3 +1839,228 @@ async def test_non_shared_cache_never_pauses(monkeypatch: pytest.MonkeyPatch) ->
 def test_credential_pause_resolution_defaults_credential_to_none() -> None:
     resolution = CredentialPauseResolution(action="skip")
     assert resolution.credential is None
+
+
+def _blocked_login_policy() -> RequestPolicy:
+    """A policy shaped the way build_request_policy leaves an unresolved login ask."""
+    return RequestPolicy(
+        login_intent=True,
+        clarification_reason="login_credentials_unresolved",
+        clarification_question="Connect a saved credential to sign in.",
+        requires_user_clarification=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+    )
+
+
+def _preflight_ctx() -> CopilotContext:
+    ctx = make_copilot_context()
+    ctx.organization_id = "org-1"
+    ctx.turn_id = "turn-1"
+    ctx.workflow_copilot_chat_id = "chat-1"
+    ctx.client_supports_credential_pause = True
+    ctx.request_policy = _blocked_login_policy()
+    return ctx
+
+
+def test_reason_fires_on_unresolved_login_credentials() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _blocked_login_policy()
+
+    assert credential_pause_module.credential_pause_reason(ctx) == "login_credentials_unresolved"
+
+
+def test_reason_does_not_fire_for_a_login_ask_that_resolved_to_a_credential() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = RequestPolicy(login_intent=True, clarification_reason="none")
+
+    assert credential_pause_module.credential_pause_reason(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_preflight_connect_binds_the_credential_and_clears_the_clarification_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _preflight_ctx()
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
+        "connected", "cred_1"
+    )
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    credential = _make_credential()
+    monkeypatch.setattr(
+        credential_pause_module.app,
+        "DATABASE",
+        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
+    )
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    stream = _make_stream()
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    resolution = await preflight_credential_pause(ctx, stream, config)
+
+    assert resolution is not None and resolution.action == "connected"
+    assert ctx.credential_pause_outcome == "connected"
+    policy = ctx.request_policy
+    assert policy.resolved_credentials == [credential]
+    assert policy.allow_run_blocks is True
+    assert policy.clarification_reason == "none"
+    assert policy.user_response_policy == "proceed"
+    assert policy.allow_update_workflow is True
+    assert policy.requires_user_clarification is False
+    sent_types = [call.args[0].type for call in stream.send.await_args_list]
+    assert sent_types == [WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED]
+
+
+@pytest.mark.asyncio
+async def test_preflight_connect_preserves_an_explicit_defer_authoring_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _preflight_ctx()
+    ctx.request_policy.authoring_intent = "defer_authoring"
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
+        "connected", "cred_1"
+    )
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    credential = _make_credential()
+    monkeypatch.setattr(
+        credential_pause_module.app,
+        "DATABASE",
+        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
+    )
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    resolution = await preflight_credential_pause(ctx, _make_stream(), config)
+
+    assert resolution is not None and resolution.action == "connected"
+    policy = ctx.request_policy
+    assert policy.user_response_policy == "proceed"
+    assert policy.resolved_credentials == [credential]
+    assert policy.allow_update_workflow is False
+    assert policy.allow_run_blocks is False
+
+
+def _preflight_policy_inputs() -> RequestPolicyGuardrailInputs:
+    return RequestPolicyGuardrailInputs(
+        user_message="Log in to https://portal.example.com/login and download the invoices.",
+        workflow_yaml="",
+        chat_history_text="",
+        chat_history_messages=[],
+        global_llm_context="",
+        organization_id="org-1",
+        request_policy_handler=None,
+        turn_intent_handler=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_connect_re_derives_run_authority_onto_the_turn_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _preflight_ctx()
+    policy_inputs = _preflight_policy_inputs()
+    _derive_turn_intent_on_context(ctx, ctx.request_policy, policy_inputs)
+    assert ctx.turn_intent.mode is TurnIntentMode.CLARIFY
+    assert ctx.turn_intent.authority.may_update_workflow is False
+
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
+        "connected", "cred_1"
+    )
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(
+        credential_pause_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[_make_credential()]))
+        ),
+    )
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    resolution = await preflight_credential_pause(ctx, _make_stream(), config)
+    assert resolution is not None and resolution.action == "connected"
+    _derive_turn_intent_on_context(ctx, ctx.request_policy, policy_inputs)
+
+    assert ctx.request_policy.clarification_reason == "none"
+    assert ctx.turn_intent.mode is not TurnIntentMode.CLARIFY
+    assert ctx.turn_intent.authority.may_update_workflow is True
+    assert ctx.turn_intent.authority.may_run_blocks is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_skip_clears_the_reason_so_the_declined_turn_shows_no_card_cta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale login_credentials_unresolved would still route through
+    CREDENTIAL_PROMPT_CLARIFICATION_REASONS and stamp a credential CTA on the
+    reply for a turn the user explicitly declined."""
+    ctx = _preflight_ctx()
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response("skip", None)
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    stream = _make_stream()
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    resolution = await preflight_credential_pause(ctx, stream, config)
+
+    assert resolution is not None and resolution.action == "skip"
+    policy = ctx.request_policy
+    assert policy.clarification_reason == "none"
+    assert policy.clarification_reason not in CREDENTIAL_PROMPT_CLARIFICATION_REASONS
+    assert policy.requires_user_clarification is False
+    assert policy.allow_missing_credentials_in_draft is True
+    assert policy.user_response_policy == "proceed"
+    assert policy.allow_update_workflow is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_timeout_leaves_the_clarification_block_for_the_terminal_clarify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _preflight_ctx()
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", _FakeCache(), raising=False)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    stream = _make_stream()
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=0)
+
+    resolution = await preflight_credential_pause(ctx, stream, config)
+
+    assert resolution is None
+    assert ctx.credential_pause_outcome == "timeout"
+    policy = ctx.request_policy
+    assert policy.user_response_policy == "ask_clarification"
+    assert policy.clarification_reason == "login_credentials_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_preflight_declines_when_the_client_cannot_render_the_card() -> None:
+    ctx = _preflight_ctx()
+    ctx.client_supports_credential_pause = False
+    stream = _make_stream()
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    assert await preflight_credential_pause(ctx, stream, config) is None
+    stream.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preflight_consumes_the_one_pause_per_turn_latch(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _preflight_ctx()
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response("skip", None)
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    stream = _make_stream()
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    await preflight_credential_pause(ctx, stream, config)
+    assert ctx.credential_pause_used is True
+
+    ctx.request_policy = _blocked_login_policy()
+    assert await maybe_credential_pause(ctx, _fake_result(), stream, config) is None
+    assert len(stream.send.await_args_list) == 1

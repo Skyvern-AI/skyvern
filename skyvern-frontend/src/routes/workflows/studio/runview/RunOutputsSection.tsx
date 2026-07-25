@@ -7,7 +7,10 @@ import {
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 
+import { outputFieldEntries } from "../runProjections";
 import { OverviewCodeBlock } from "./OverviewCodeBlock";
+import { OverviewField } from "./OverviewField";
+import { RunFieldValue } from "./RunFieldValue";
 
 export type RunOutputFile = { url: string; filename: string };
 export type RunOutputError = Record<string, unknown>;
@@ -173,18 +176,21 @@ export function RunOutputsSection({
     extractedInformation != null &&
     Object.values(extractedInformation).some((value) => value !== null);
   const hasErrors = hasRenderableErrors(errors);
-  if (
-    !hasExtracted &&
-    files.length === 0 &&
-    !hasErrors &&
-    observerOutput == null &&
-    !webhookFailureReason
-  ) {
+  // extracted_information renders in its own section, so the remaining keys are the
+  // per-block returned values. Gate the run-outputs block on real per-field content
+  // or a persisted summary — an empty header + Summarize would render over nothing.
+  const outputFields = outputFieldEntries(outputs);
+  const hasAgentRunOutputs = outputFields.length > 0 || summary !== null;
+  const hasAnyOutput =
+    hasExtracted ||
+    files.length > 0 ||
+    hasErrors ||
+    observerOutput != null ||
+    Boolean(webhookFailureReason) ||
+    hasAgentRunOutputs;
+  if (!hasAnyOutput) {
     return null;
   }
-
-  const hasAgentRunOutputs =
-    outputs !== null && Object.keys(outputs).length > 0;
 
   return (
     <div className="flex flex-col gap-5">
@@ -245,10 +251,15 @@ export function RunOutputsSection({
               {summary}
             </div>
           ) : null}
-          <OverviewCodeBlock
-            value={JSON.stringify(outputs, null, 2)}
-            maxHeight="320px"
-          />
+          {outputFields.length > 0 ? (
+            <div className="flex flex-col gap-4">
+              {outputFields.map(([key, value]) => (
+                <OverviewField key={key} label={key}>
+                  <RunFieldValue value={value} label={key} />
+                </OverviewField>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {files.length > 0 ? (

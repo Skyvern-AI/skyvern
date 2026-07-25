@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -9,12 +10,13 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     FailedToTakeScreenshot,
     NoElementFound,
     ScrapingFailed,
     ScrapingFailedBlankPage,
+    SkyvernPageAnalysisTimeout,
     UnknownElementTreeFormat,
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
@@ -23,7 +25,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import (
@@ -34,7 +36,10 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapeExcludeFunc,
     json_to_html,
 )
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
+
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
 
@@ -72,6 +77,27 @@ async def build_scraping_failed_reason(
     if safe_landed and safe_landed != safe_requested and safe_landed not in {"about:blank", ""}:
         return f"{base} Requested URL: {safe_requested}. Current URL: {safe_landed}."
     return f"{base} URL: {safe_requested}."
+
+
+def _is_page_analysis_timeout(engine_selection: "BrowserEngineSelection | None", error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout attributable to THIS run's selected browser engine.
+
+    The Skyvern-owned analyzer deadline (``SkyvernPageAnalysisTimeout``) is always a page-analysis
+    timeout; otherwise the driver-native decision routes through the per-run engine selection so a run
+    pinned to a non-Playwright engine recognizes its native timeout while a foreign driver's timeout is
+    rejected. Falls back to the stock Playwright timeout identity when no engine is pinned (callers or
+    states built outside the per-run engine seam).
+    """
+    if isinstance(error, SkyvernPageAnalysisTimeout):
+        return True
+    if engine_selection is not None:
+        return engine_selection.is_engine_timeout_error(error)
+    return isinstance(error, TimeoutError)
+
+
+def _scrape_timed_out(browser_state: BrowserState, error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout from THIS run's selected browser engine."""
+    return _is_page_analysis_timeout(browser_state.engine_selection, error)
 
 
 RESERVED_ATTRIBUTES = {
@@ -135,19 +161,6 @@ BASE64_INCLUDE_ATTRIBUTES = {
     "srcset",
     "icon",
 }
-
-
-def load_js_script() -> str:
-    # TODO: Handle file location better. This is a hacky way to find the file location.
-    path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
-    try:
-        # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
-        # This will allow our code to be type safe.
-        with open(path) as f:
-            return f.read()
-    except FileNotFoundError as e:
-        LOG.exception("Failed to load the JS script", path=path)
-        raise e
 
 
 JS_FUNCTION_DEFS = load_js_script()
@@ -267,7 +280,9 @@ async def scrape_website(
                 raise e
             else:
                 raise ScrapingFailed(
-                    reason=await build_scraping_failed_reason(browser_state, url, timed_out=isinstance(e, TimeoutError))
+                    reason=await build_scraping_failed_reason(
+                        browser_state, url, timed_out=_scrape_timed_out(browser_state, e)
+                    )
                 ) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
         await asyncio.sleep(0.5)
@@ -467,7 +482,7 @@ async def scrape_web_unsafe(
         element_tree_trimmed_html_str = "".join(
             json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
         )
-        token_count = count_tokens(element_tree_trimmed_html_str)
+        token_count = approx_count_tokens(element_tree_trimmed_html_str)
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
 
@@ -722,13 +737,20 @@ async def get_interactable_element_tree(
 
 
 class IncrementalScrapePage(ElementTreeBuilder):
-    def __init__(self, skyvern_frame: SkyvernFrame) -> None:
+    def __init__(
+        self,
+        skyvern_frame: SkyvernFrame,
+        engine_selection: "BrowserEngineSelection | None" = None,
+    ) -> None:
         self.id_to_element_dict: dict[str, dict] = dict()
         self.id_to_css_dict: dict[str, str] = dict()
         self.elements: list[dict] = list()
         self.element_tree: list[dict] = list()
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
+        # The logical run's pinned engine, so the wait-until-finished retry recognizes THIS engine's
+        # native analysis timeout; None (default) preserves the stock Playwright timeout identity.
+        self.engine_selection = engine_selection
         self.last_used_element_tree_html: str | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
@@ -751,7 +773,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
             incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
                 wait_until_finished=True
             )
-        except TimeoutError:
+        except Exception as e:
+            if not _is_page_analysis_timeout(self.engine_selection, e):
+                raise
             LOG.warning(
                 "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
             )

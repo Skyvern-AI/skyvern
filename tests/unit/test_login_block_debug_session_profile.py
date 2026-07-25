@@ -12,11 +12,13 @@ fresh browser, no PBS attach. The decision lives in
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 
 
@@ -26,6 +28,7 @@ def _workflow_run(*, debug_session_id: str | None) -> SimpleNamespace:
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
         debug_session_id=debug_session_id,
+        is_debug_session=debug_session_id is not None,
         browser_session_id="pbs_test" if debug_session_id else None,
         browser_profile_id=None,
         parent_workflow_run_id=None,
@@ -211,3 +214,31 @@ class TestDebugSessionProfileWarningCode:
         assert DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE == "debug_session_profile_incompatible"
         assert DEBUG_SESSION_PROFILE_REASON_NO_PROFILE == "pbs_no_profile"
         assert DEBUG_SESSION_PROFILE_REASON_DIFFERENT == "pbs_different_profile"
+
+
+class TestWorkflowRunIsDebugSession:
+    """``WorkflowRun.is_debug_session`` is the run-level write guard for browser
+    memory: debug/Studio runs must never bank a browser profile (a debugging
+    session is not a known-good state), so the credential banking gate skips on
+    this predicate.
+    """
+
+    @staticmethod
+    def _run(*, debug_session_id: str | None) -> WorkflowRun:
+        now = datetime.now(timezone.utc)
+        return WorkflowRun(
+            workflow_run_id="wr_test",
+            workflow_id="wf_test",
+            workflow_permanent_id="wpid_test",
+            organization_id="o_test",
+            status=WorkflowRunStatus.running,
+            debug_session_id=debug_session_id,
+            created_at=now,
+            modified_at=now,
+        )
+
+    def test_true_when_debug_session_id_set(self) -> None:
+        assert self._run(debug_session_id="ds_test").is_debug_session is True
+
+    def test_false_when_debug_session_id_none(self) -> None:
+        assert self._run(debug_session_id=None).is_debug_session is False

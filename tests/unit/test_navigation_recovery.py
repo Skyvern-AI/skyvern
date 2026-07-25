@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import ANY, AsyncMock
 
 import pytest
 from playwright._impl._errors import Error as PlaywrightError
 
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.utils.page import (
     SkyvernFrame,
     _is_navigation_context_lost,
@@ -23,6 +25,14 @@ class TestIsNavigationContextLost:
 
     def test_reference_error_not_defined(self) -> None:
         assert _is_navigation_context_lost("Page.evaluate: ReferenceError: scrollToXY is not defined") is True
+
+    def test_missing_protocol_context(self) -> None:
+        assert (
+            _is_navigation_context_lost(
+                "Page.evaluate: Protocol error (DOM.describeNode): Cannot find context with specified id"
+            )
+            is True
+        )
 
     def test_unrelated_error(self) -> None:
         assert _is_navigation_context_lost("Page.evaluate: TypeError: Cannot read properties of null") is False
@@ -67,6 +77,32 @@ def _reference_error() -> PlaywrightError:
 
 
 class TestEvaluateWithNavigationRecovery:
+    @pytest.mark.asyncio
+    async def test_evaluate_timeout_raises_skyvern_page_analysis_timeout(self) -> None:
+        frame = AsyncMock()
+        source_error = asyncio.TimeoutError()
+        frame.evaluate = AsyncMock(side_effect=source_error)
+
+        with pytest.raises(
+            SkyvernPageAnalysisTimeout, match="Skyvern timed out trying to analyze the page"
+        ) as exc_info:
+            await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=30000)
+
+        assert exc_info.value.__cause__ is source_error
+
+    @pytest.mark.asyncio
+    async def test_navigation_recovery_deadline_raises_skyvern_page_analysis_timeout(self) -> None:
+        frame = AsyncMock()
+
+        with pytest.raises(SkyvernPageAnalysisTimeout, match="Skyvern timed out trying to analyze the page"):
+            await SkyvernFrame._evaluate_with_navigation_recovery(
+                frame=frame,
+                expression="() => 42",
+                evaluate_expression=AsyncMock(),
+                timeout_ms=0,
+                initial_error="execution context destroyed",
+            )
+
     @pytest.mark.asyncio
     async def test_recovers_after_one_context_destroyed(self) -> None:
         """First eval fails, re-inject + retry succeeds."""
@@ -147,3 +183,77 @@ class TestEvaluateWithNavigationRecovery:
 
         await SkyvernFrame.evaluate(frame=frame, expression="() => 1", timeout_ms=30000)
         frame.wait_for_load_state.assert_awaited_once_with("networkidle", timeout=ANY)
+
+
+class TestGetElementVisible:
+    @pytest.mark.asyncio
+    async def test_stale_locator_context_reinjects_and_reresolves(self) -> None:
+        frame = AsyncMock()
+        frame.evaluate = AsyncMock(return_value=None)
+        frame.wait_for_load_state = AsyncMock()
+        locator = AsyncMock()
+        locator.count = AsyncMock(return_value=1)
+        locator.evaluate = AsyncMock(
+            side_effect=[
+                PlaywrightError(
+                    "Locator.evaluate: Protocol error (DOM.describeNode): Cannot find context with specified id"
+                ),
+                True,
+            ]
+        )
+
+        result = await SkyvernFrame(frame).get_element_visible(locator)
+
+        assert result is True
+        assert locator.evaluate.await_count == 2
+        frame.evaluate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_helpers_reinjects_and_reresolves(self) -> None:
+        frame = AsyncMock()
+        frame.evaluate = AsyncMock(return_value=None)
+        frame.wait_for_load_state = AsyncMock()
+        locator = AsyncMock()
+        locator.count = AsyncMock(return_value=1)
+        locator.evaluate = AsyncMock(
+            side_effect=[
+                PlaywrightError("Locator.evaluate: ReferenceError: isElementVisible is not defined"),
+                True,
+            ]
+        )
+
+        result = await SkyvernFrame(frame).get_element_visible(locator)
+
+        assert result is True
+        assert locator.evaluate.await_count == 2
+        frame.evaluate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_uses_locator_evaluation_instead_of_stale_handle_marshalling(self) -> None:
+        frame = AsyncMock()
+        frame.evaluate = AsyncMock(
+            side_effect=PlaywrightError(
+                "Page.evaluate: Protocol error (DOM.describeNode): Cannot find context with specified id"
+            )
+        )
+        locator = AsyncMock()
+        locator.count = AsyncMock(return_value=1)
+        locator.evaluate = AsyncMock(return_value=True)
+
+        result = await SkyvernFrame(frame).get_element_visible(locator)
+
+        assert result is True
+        locator.evaluate.assert_awaited_once_with("(element) => isElementVisible(element) && !isHidden(element)")
+        frame.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_locator_no_longer_resolves(self) -> None:
+        frame = AsyncMock()
+        locator = AsyncMock()
+        locator.count = AsyncMock(return_value=0)
+
+        result = await SkyvernFrame(frame).get_element_visible(locator)
+
+        assert result is False
+        locator.evaluate.assert_not_awaited()
+        frame.evaluate.assert_not_awaited()

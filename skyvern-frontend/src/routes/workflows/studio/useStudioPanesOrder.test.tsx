@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, expect, test } from "vitest";
 
 import { type StudioPaneId } from "./panes";
@@ -75,5 +75,32 @@ describe("useStudioPanes setPanesOrder", () => {
     fireEvent.click(screen.getByText("set-order"));
 
     expect(screen.getByTestId("panes").textContent).toBe("browser,copilot");
+  });
+});
+
+function RunRouteProbe() {
+  const { panes } = useStudioPanes();
+  return <output data-testid="panes">{panes.join(",")}</output>;
+}
+
+function renderAtRunRoute(entry: string) {
+  return render(
+    <MemoryRouter initialEntries={[entry]}>
+      <Routes>
+        <Route path="/runs/:runId/*" element={<RunRouteProbe />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("useStudioPanes under the short run URL", () => {
+  test("/runs/{wr} opens the run layout from the path, not the edit default", () => {
+    renderAtRunRoute("/runs/wr_1");
+    expect(screen.getByTestId("panes").textContent).toBe("browser,overview");
+  });
+
+  test("an explicit ?panes= still wins under the short run URL", () => {
+    renderAtRunRoute("/runs/wr_1?panes=copilot");
+    expect(screen.getByTestId("panes").textContent).toBe("copilot");
   });
 });

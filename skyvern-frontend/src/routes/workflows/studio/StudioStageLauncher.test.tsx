@@ -9,13 +9,28 @@ import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioStageLauncher } from "./StudioStageLauncher";
 
-const { runSignalsMock } = vi.hoisted(() => ({
-  runSignalsMock: vi.fn(),
+vi.mock("../hooks/useWorkflowRunsQuery", () => ({
+  useWorkflowRunsQuery: () => ({ data: [] }),
 }));
 
-vi.mock("./useStudioRunSignals", () => ({
-  useStudioRunSignals: () => runSignalsMock(),
+vi.mock("../hooks/useInfiniteWorkflowRunsQuery", () => ({
+  useInfiniteWorkflowRunsQuery: () => ({
+    data: { pages: [[]] },
+    isError: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
 }));
+
+// Radix Popover positioning observes the anchor; jsdom has no ResizeObserver.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
 
 const initialBrowserState = useStudioBrowserStore.getState();
 
@@ -43,38 +58,32 @@ function currentPanes(): string | null {
 afterEach(cleanup);
 beforeEach(() => {
   useStudioBrowserStore.setState(initialBrowserState, true);
-  runSignalsMock.mockReturnValue({
-    hasRun: false,
-    runStatus: undefined,
-    knownHasRuns: false,
-  });
 });
 
 describe("StudioStageLauncher", () => {
   test("offers every pane as a labeled button", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Overview"]) {
+    for (const label of ["Copilot", "Editor", "Browser", "Past Runs"]) {
       expect(
         screen.getByRole("button", { name: new RegExp(`^${label}`) }),
       ).toBeTruthy();
     }
   });
 
-  test("keeps the Overview launcher gated until a run exists, with the reason readable", () => {
+  test("the Past Runs tile is enabled even with no runs", () => {
     renderAt();
-    const timeline = screen.getByRole("button", { name: /no runs yet/ });
-    expect((timeline as HTMLButtonElement).disabled).toBe(true);
+    const tile = screen.getByRole("button", {
+      name: /^Past Runs/,
+    }) as HTMLButtonElement;
+    expect(tile.disabled).toBe(false);
   });
 
-  test("enables the Overview launcher once a run exists", () => {
-    runSignalsMock.mockReturnValue({
-      hasRun: true,
-      runStatus: undefined,
-      knownHasRuns: true,
-    });
+  test("clicking the Past Runs tile opens the selector, not the pane", async () => {
     renderAt();
-    const timeline = screen.getByRole("button", { name: "Overview" });
-    expect((timeline as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: /^Past Runs/ }));
+    // The selector popover opens; the run pane isn't opened directly.
+    expect(await screen.findByText("Past runs")).toBeTruthy();
+    expect(currentPanes()).toBe("");
   });
 
   test("opens the clicked pane", () => {

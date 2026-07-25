@@ -19,6 +19,7 @@ export function ViewToggle({
   compact,
   title,
   ariaLabel,
+  disabled,
 }: {
   active: boolean;
   onClick: () => void;
@@ -29,17 +30,20 @@ export function ViewToggle({
   // Overrides the accessible name without changing the visible label, e.g. to
   // append a badge's state ("Outputs, new output") to a screen reader only.
   ariaLabel?: string;
+  disabled?: boolean;
 }) {
   const tip = title ?? (compact ? (ariaLabel ?? label) : undefined);
   const button = (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       aria-label={ariaLabel ?? label}
       aria-pressed={active}
       className={cn(
         "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium",
         "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "disabled:pointer-events-none disabled:opacity-40",
         active
           ? "bg-accent text-foreground"
           : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",

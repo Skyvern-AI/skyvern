@@ -4,10 +4,11 @@ import inspect
 
 import pytest
 
+import skyvern.cli.mcp_tools._common as mcp_common
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.cli.mcp_tools.inspection import skyvern_get_html
-from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT
+from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT, EXTRACT_DATA_CONTENT
 from skyvern.cli.mcp_tools.session import skyvern_browser_session_create, skyvern_browser_session_list
 from skyvern.cli.mcp_tools.workflow import (
     skyvern_workflow_create,
@@ -39,6 +40,19 @@ def test_mcp_instructions_guide_text_prompt_defaults() -> None:
     assert "skyvern_observe" in mcp.instructions
 
 
+def test_workflow_create_guides_code_only_policy() -> None:
+    assert mcp_common.CODE_ONLY_SCHEMA_GUIDANCE in (skyvern_workflow_create.__doc__ or "")
+
+
+def test_mcp_instructions_guide_code_only_policy() -> None:
+    assert mcp_common.CODE_ONLY_SCHEMA_GUIDANCE in mcp.instructions
+
+
+def test_workflow_prompts_guide_code_only_policy_at_each_authoring_surface() -> None:
+    assert BUILD_WORKFLOW_CONTENT.count(mcp_common.CODE_ONLY_SCHEMA_GUIDANCE) == 2
+    assert EXTRACT_DATA_CONTENT.count(mcp_common.CODE_ONLY_SCHEMA_GUIDANCE) == 1
+
+
 @pytest.mark.asyncio
 async def test_expected_prompts_registered() -> None:
     prompts = await mcp.list_prompts()
@@ -55,6 +69,26 @@ async def test_text_prompt_block_schema_example_omits_raw_llm_key() -> None:
     assert result["ok"] is True
     assert "llm_key" not in result["data"]["example"]
     assert "model" not in result["data"]["example"]
+
+
+@pytest.mark.asyncio
+async def test_code_block_schema_advertises_goal_prompt() -> None:
+    """The MCP contract must steer clients to put each code block's plain-language goal in `prompt`
+    (rendered as the block's Goal), so MCP input reaches the Goal field (SKY-12954)."""
+    result = await skyvern_block_schema(block_type="code")
+
+    assert result["ok"] is True
+    example = result["data"]["example"]
+    assert example["block_type"] == "code"
+    assert example["prompt"]
+    properties = result["data"]["schema"]["properties"]
+    assert "goal" in properties["prompt"]["description"].lower()
+    assert properties["steps"]["description"]
+
+
+def test_workflow_create_guides_code_block_goal_prompt() -> None:
+    assert "plain-language goal" in (skyvern_workflow_create.__doc__ or "")
+    assert "plain-language goal" in (skyvern_workflow_update.__doc__ or "")
 
 
 # --- Tool-routing hints in tool descriptions (mechanism (c): wrong-tool / missing-arg calls) ---

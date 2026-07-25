@@ -144,6 +144,8 @@ function renderTimeline(
   activeItem: WorkflowRunOverviewActiveElement,
   options: {
     enableSearch?: boolean;
+    elapsed?: string;
+    elapsedTitle?: string;
     onBlockItemSelected?: (block: WorkflowRunBlock) => void;
   } = {},
 ) {
@@ -151,6 +153,8 @@ function renderTimeline(
     <WorkflowRunTimeline
       activeItem={activeItem}
       enableSearch={options.enableSearch}
+      elapsed={options.elapsed}
+      elapsedTitle={options.elapsedTitle}
       onLiveStreamSelected={noop}
       onActionItemSelected={noop}
       onBlockItemSelected={options.onBlockItemSelected ?? noop}
@@ -451,6 +455,45 @@ describe("WorkflowRunTimeline", () => {
       "block_8",
       "tail_block",
     ]);
+  });
+});
+
+describe("timeline header elapsed", () => {
+  function seed() {
+    mocks.workflowRun = {
+      status: Status.Completed,
+      total_steps: 0,
+      credits_used: 0,
+      cached_credits_used: 0,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({ workflow_run_block_id: "wrb_a", label: "A" }),
+      ),
+    ];
+  }
+
+  it("shows the elapsed duration with the timestamp breakdown on its tooltip", () => {
+    seed();
+
+    renderTimeline(null, {
+      elapsed: "18m 55s",
+      elapsedTitle: "Created Jun 30\nStarted Jul 1",
+    });
+
+    const el = screen.getByText("· 18m 55s");
+    expect(el.getAttribute("title")).toContain("Created");
+  });
+
+  it("renders no duration when elapsed is omitted (legacy parity)", () => {
+    seed();
+
+    renderTimeline(null);
+
+    expect(screen.queryByText(/· \d+m/)).toBeNull();
   });
 });
 

@@ -6,6 +6,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _OUTPUT_CONTRACT_TERMINAL_REASON_CODES,
+    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
@@ -81,6 +82,10 @@ def _signal(
             TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
         ),
         (_signal(internal_reason_code="probable_site_block_stop"), TurnHaltKind.PROBABLE_SITE_BLOCK),
+        (
+            _signal(internal_reason_code=METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE),
+            TurnHaltKind.METADATA_REJECT_SAME_KEY,
+        ),
     ],
 )
 def test_terminal_blockers_map_to_halts(signal: CopilotToolBlockerSignal, expected_kind: TurnHaltKind) -> None:

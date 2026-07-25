@@ -34,6 +34,7 @@ const {
   credentialsData,
   credsFail,
   modalOverrideType,
+  modalDefaultTestUrl,
   toastFn,
   flagMap,
 } = vi.hoisted(() => {
@@ -93,6 +94,7 @@ const {
     credentialsData: creds,
     credsFail: fail,
     modalOverrideType: { current: undefined as string | undefined },
+    modalDefaultTestUrl: { current: undefined as string | undefined },
     toastFn: vi.fn(),
     flagMap: { current: {} as Record<string, boolean> },
   };
@@ -119,17 +121,20 @@ vi.mock("@/routes/credentials/CredentialsModal", () => ({
     isOpen,
     onCredentialCreated,
     overrideType,
+    defaultTestUrl,
   }: {
     isOpen?: boolean;
-    onCredentialCreated?: (id: string) => void;
+    onCredentialCreated?: (id: string, name?: string) => void;
     overrideType?: string;
+    defaultTestUrl?: string;
   }) => {
     modalOverrideType.current = overrideType;
+    modalDefaultTestUrl.current = defaultTestUrl;
     return isOpen ? (
       <button
         type="button"
         data-testid="mock-create-credential"
-        onClick={() => onCredentialCreated?.("new-cred-1")}
+        onClick={() => onCredentialCreated?.("new-cred-1", "New Login")}
       >
         create credential
       </button>
@@ -317,6 +322,7 @@ beforeEach(() => {
   credentialsData.current = [];
   credsFail.current = false;
   modalOverrideType.current = undefined;
+  modalDefaultTestUrl.current = undefined;
   flagMap.current = {};
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
@@ -574,6 +580,102 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
       screen.queryByRole("button", { name: "Connect credential" }),
     ).toBeNull();
     expect(screen.queryByRole("button", { name: "Skip for now" })).toBeNull();
+  });
+
+  it("terminal connect via the modal auto-continues once and morphs the receipt", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect credential" }),
+      );
+    });
+    const createBtn = await screen.findByTestId("mock-create-credential");
+    await act(async () => {
+      fireEvent.click(createBtn);
+    });
+    // A fresh turn is sent (exactly one) referencing the connected credential.
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toContain(
+      "I've connected the credential 'New Login'",
+    );
+    expect(streamCalls[1]!.body.message).toContain("continue");
+    expect(credentialResponsePosts()).toHaveLength(0);
+    expect(
+      await screen.findByText("Continuing with 'New Login'…"),
+    ).toBeTruthy();
+  });
+
+  it("does not auto-continue while a turn is still in flight", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    // Emit the terminal card but never resolve the stream — isLoading stays
+    // true, so the connect must not fire a fresh turn.
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect credential" }),
+      );
+    });
+    const createBtn = await screen.findByTestId("mock-create-credential");
+    await act(async () => {
+      fireEvent.click(createBtn);
+    });
+    expect(
+      await screen.findByText("Credential 'New Login' added"),
+    ).toBeTruthy();
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the pause frame's login URL to the modal as defaultTestUrl", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect credential" }),
+      );
+    });
+    await screen.findByTestId("mock-create-credential");
+    expect(modalDefaultTestUrl.current).toBe(
+      "https://news.ycombinator.com/login",
+    );
+  });
+
+  it("passes no defaultTestUrl for a terminal card (frame carries no URL)", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect credential" }),
+      );
+    });
+    await screen.findByTestId("mock-create-credential");
+    expect(modalDefaultTestUrl.current).toBeUndefined();
   });
 });
 

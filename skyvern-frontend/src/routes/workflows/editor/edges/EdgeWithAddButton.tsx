@@ -7,7 +7,7 @@ import {
   useNodes,
 } from "@xyflow/react";
 import { useRef } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import {
   BranchContext,
@@ -45,7 +45,7 @@ function EdgeWithAddButton({
   markerEnd,
 }: EdgeProps) {
   const isReadOnly = useWorkflowScopeReadOnly();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes();
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,

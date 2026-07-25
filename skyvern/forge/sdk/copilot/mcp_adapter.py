@@ -35,9 +35,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.enforcement import (
+    post_run_page_path_interaction_allowed,
     register_no_progress_interaction_click,
     synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
+    try_admit_post_run_page_path_interaction,
 )
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
@@ -68,6 +70,8 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_browser_interaction_observation",
     "scouted_interactions",
     "scout_trajectory",
+    "never_captured_obligation",
+    "synthesized_block_reopened_for_capture_obligation",
     "pending_scout_source_url",
     "pending_scout_typed_value",
     "pending_scout_role_name",
@@ -79,6 +83,9 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "post_run_page_observation_tool",
     "post_run_page_observation_url",
     "post_run_page_observation_workflow_run_id",
+    "post_run_page_observation_after_failed_test",
+    "post_run_page_observation_generation",
+    "latest_recorded_build_test_outcome",
     "code_only_target_page_evidence_seen",
     "last_evaluate_actionable_signature",
     "last_evaluate_actionable_url",
@@ -91,6 +98,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "synthesized_block_offered",
     "synthesized_block_offered_trajectory_len",
     "synthesized_block_offered_goal_complete",
+    "synthesized_business_required_parameter_keys",
     "scouted_output_covered_paths",
     "scout_observed_terminal_criterion_ids",
     "scout_observation_contract",
@@ -453,7 +461,12 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         refresh_held_loop_blocker_evidence(copilot_ctx)
-        if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS:
+        post_run_page_path_allowed = post_run_page_path_interaction_allowed(
+            copilot_ctx,
+            tool_name,
+            arguments,
+        )
+        if not post_run_page_path_allowed and tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS:
             terminal_challenge_payload = _stash_and_emit_current_page_terminal_challenge_blocker(
                 copilot_ctx,
                 tool_name,
@@ -465,7 +478,11 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
                 return _copilot_to_call_tool_result({"ok": False, "error": terminal_challenge_payload})
 
-        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name)
+        persistence_signal = (
+            None
+            if post_run_page_path_allowed
+            else synthesized_block_persistence_signal(copilot_ctx, tool_name, arguments)
+        )
         if persistence_signal is not None:
             LOG.warning(
                 "Synthesized block persistence required before MCP tool",
@@ -505,6 +522,18 @@ class SkyvernOverlayMCPServer(MCPServer):
             if hook_result is not None:
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
+
+        if post_run_page_path_allowed and not try_admit_post_run_page_path_interaction(
+            copilot_ctx,
+            tool_name,
+            arguments,
+        ):
+            persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name, arguments)
+            if persistence_signal is not None:
+                payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
+                result = {"ok": False, "error": payload}
+                record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
+                return _copilot_to_call_tool_result(result)
 
         mcp_name = self._alias_map.get(tool_name, tool_name)
         mcp_args = _transform_args(arguments, overlay)

@@ -212,6 +212,7 @@ class WorkflowRunsRepository(BaseRepository):
         fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        start_fresh_browser: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -223,6 +224,7 @@ class WorkflowRunsRepository(BaseRepository):
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 browser_profile_id=browser_profile_id,
+                start_fresh_browser=start_fresh_browser,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
                 webhook_callback_url=webhook_callback_url,
@@ -284,6 +286,8 @@ class WorkflowRunsRepository(BaseRepository):
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_seed_source: str | None | object = _UNSET,
+        browser_sink_profile_id: str | None | object = _UNSET,
         proxy_location: ProxyLocationInput | object = _UNSET,
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -348,6 +352,10 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.verification_code_polling_started_at = None
                 if browser_profile_id is not _UNSET:
                     workflow_run.browser_profile_id = browser_profile_id
+                if browser_seed_source is not _UNSET:
+                    workflow_run.browser_seed_source = typing_cast(str | None, browser_seed_source)
+                if browser_sink_profile_id is not _UNSET:
+                    workflow_run.browser_sink_profile_id = typing_cast(str | None, browser_sink_profile_id)
                 if proxy_location is not _UNSET:
                     workflow_run.proxy_location = serialize_proxy_location(
                         typing_cast(ProxyLocationInput, proxy_location)
@@ -401,6 +409,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
         terminal state. Returns the updated row, or ``None`` when the row was
@@ -424,6 +433,8 @@ class WorkflowRunsRepository(BaseRepository):
             values["failure_reason"] = failure_reason
         if run_with is not None:
             values["run_with"] = run_with
+        if failure_category is not None:
+            values["failure_category"] = failure_category
 
         async with self.Session() as session:
             result = await session.execute(

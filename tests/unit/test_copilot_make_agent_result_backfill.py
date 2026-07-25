@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,7 +16,12 @@ from PIL import Image, PngImagePlugin
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _make_agent_result
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, DeliveredUnverifiedPublicOutputs
+from skyvern.forge.sdk.copilot.context import (
+    AgentResult,
+    CopilotContext,
+    DeliveredUnverifiedPublicOutputs,
+    StructuredContext,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
@@ -875,3 +881,12 @@ def test_delivered_unverified_image_data_url_is_canonicalized_without_metadata()
         result.narrative_payload["deliveredUnverifiedObservedOutputs"]["result"]["image"], validate=True
     )
     assert secret.encode() not in published
+
+
+def test_make_agent_result_records_resolved_credentials_as_durable_approval() -> None:
+    ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[SimpleNamespace(credential_id="cred_portal")]))
+
+    result = _result(ctx, narrative_payload=_payload())
+
+    approved = StructuredContext.from_json_str(result.global_llm_context).approved_credentials
+    assert [record.credential_id for record in approved] == ["cred_portal"]

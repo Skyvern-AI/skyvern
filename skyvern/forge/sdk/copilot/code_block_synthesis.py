@@ -26,8 +26,12 @@ import structlog
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
+    SameMonthFileMatchTransform,
     authoring_parameter_binding_fingerprint,
+    same_month_file_match_transform_fingerprint,
+    same_month_file_match_transform_is_valid,
 )
+from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     FrozenRequestedOutputExtractionCandidate,
@@ -37,7 +41,13 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     output_path_segments,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.runtime import ScoutedInputCorrespondence
+from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
+from skyvern.forge.sdk.copilot.runtime import (
+    ScoutedDynamicRowEvidence,
+    ScoutedDynamicRowPeriodMatch,
+    ScoutedEquivalentInput,
+    ScoutedInputCorrespondence,
+)
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -46,6 +56,8 @@ _MAX_STEPS = 60
 _INDENT = "    "
 _DOMCONTENTLOADED = "domcontentloaded"
 _ENTRY_TARGET_VAR = "_scout_entry_target"
+_DOWNLOAD_TARGET_VAR = "_scout_download_target"
+_SAME_MONTH_HELPER_VAR = "_scout_same_month_iso"
 _ENTRY_REUSED_VAR = "_scout_entry_reused_current_page"
 _ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
 _ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
@@ -53,9 +65,12 @@ _ENTRY_OPENER_VAR = "_scout_entry_opener"
 _OPTIONAL_DISMISSAL_VAR = "_scout_optional_dismissal"
 _READONLY_DEFERRED_VAR = "_scout_readonly_actual"
 _MONTH_HELPER_VAR = "_scout_month_to_iso"
+_ISO_DATE_HELPER_VAR = "_scout_iso_date_to_year_month"
+_PERIOD_DATE_PATTERN_HELPER_VAR = "_scout_period_date_pattern"
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
+    _DOWNLOAD_TARGET_VAR,
     _ENTRY_REUSED_VAR,
     _ENTRY_RESUME_AFTER_AUTH_VAR,
     _ENTRY_RESUME_TARGET_VAR,
@@ -63,6 +78,9 @@ _INTERNAL_SCOUT_VARS = (
     _OPTIONAL_DISMISSAL_VAR,
     _READONLY_DEFERRED_VAR,
     _MONTH_HELPER_VAR,
+    _SAME_MONTH_HELPER_VAR,
+    _ISO_DATE_HELPER_VAR,
+    _PERIOD_DATE_PATTERN_HELPER_VAR,
 )
 
 # Base name for the download var bound by `async with page.expect_download() as <name>:`.
@@ -81,6 +99,92 @@ CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|awai
 # Credential fields the scout must fill live before a code block reading them may persist;
 # `.otp()` resolves at runtime only, so totp never requires (or credits) a live scout fill.
 LIVE_SCOUT_CREDENTIAL_FIELDS = frozenset({"username", "password"})
+
+
+def credential_fill_source(locator_expr: str, param_key: str, field: str) -> str:
+    if field == "totp":
+        return f"await {locator_expr}.fill(await {param_key}.otp())"
+    return f"await {locator_expr}.fill({param_key}.{field})"
+
+
+def wrapped_code_ast(code: str) -> ast.AST | None:
+    body = "\n".join(f"    {line}" for line in code.splitlines())
+    if not body.strip():
+        body = "    pass"
+    try:
+        return ast.parse(f"async def __submitted_code__():\n{body}\n")
+    except SyntaxError:
+        return None
+
+
+def _credential_field_fill_argument(arg: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if (
+        isinstance(arg, ast.Attribute)
+        and arg.attr in _CREDENTIAL_FIELDS
+        and isinstance(arg.value, ast.Name)
+        and arg.value.id in credential_parameter_keys
+    ):
+        return True
+    target = arg.value if isinstance(arg, ast.Await) else arg
+    return (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Attribute)
+        and target.func.attr == "otp"
+        and isinstance(target.func.value, ast.Name)
+        and target.func.value.id in credential_parameter_keys
+    )
+
+
+def _is_credential_field_fill_call(node: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fill"
+        and bool(node.args)
+        and _credential_field_fill_argument(node.args[0], credential_parameter_keys)
+    )
+
+
+def _is_presence_guard_test(test: ast.AST) -> bool:
+    for node in ast.walk(test):
+        if isinstance(node, ast.Attribute) and node.attr in {"count", "is_visible"}:
+            return True
+        if isinstance(node, ast.Name) and node.id in _INTERNAL_SCOUT_VARS:
+            return True
+    return False
+
+
+def _credential_fill_is_presence_guarded(node: ast.AST, parents: Mapping[int, ast.AST]) -> bool:
+    current: ast.AST = node
+    while id(current) in parents:
+        parent = parents[id(current)]
+        if (
+            isinstance(parent, ast.If)
+            and any(current is stmt for stmt in parent.body)
+            and _is_presence_guard_test(parent.test)
+        ):
+            return True
+        current = parent
+    return False
+
+
+def block_has_unguarded_credential_fill(code: str, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if not credential_parameter_keys:
+        return False
+    tree = wrapped_code_ast(code)
+    if tree is None:
+        return False
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return any(
+        _is_credential_field_fill_call(node, credential_parameter_keys)
+        and not _credential_fill_is_presence_guarded(node, parents)
+        for node in ast.walk(tree)
+    )
+
+
 _CREDENTIAL_FIELD_ACCESS_RE = re.compile(
     r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
 )
@@ -146,6 +250,31 @@ def first_matched_post_fill_submit_index(
             continue
         return index
     return None
+
+
+def _captcha_boundary_indices(trajectory: Sequence[Mapping[str, Any]]) -> set[int]:
+    """Return typed challenge points plus credential-associated submit boundaries."""
+    boundaries = {
+        index for index, interaction in enumerate(trajectory) if composition_challenge_carrier(interaction) is not None
+    }
+    latest_credential_fill_by_source: dict[str, int] = {}
+    for index, interaction in enumerate(trajectory):
+        if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        if str(interaction.get("credential_field") or "").strip() not in _CREDENTIAL_FIELDS:
+            continue
+        source_url = str(interaction.get("source_url") or "").strip()
+        if source_url:
+            latest_credential_fill_by_source[source_url] = index
+    for source_url, latest_fill_index in latest_credential_fill_by_source.items():
+        submit_index = first_matched_post_fill_submit_index(
+            trajectory,
+            latest_fill_index,
+            frozenset({source_url}),
+        )
+        if submit_index is not None:
+            boundaries.add(submit_index)
+    return boundaries
 
 
 def credential_scout_gap(
@@ -233,6 +362,7 @@ _RESERVED_PARAM_NAMES = frozenset(
         "totp",
         "totp_identifier",
         "otp",
+        "solve_captcha",
         "print",
         "len",
         "range",
@@ -264,6 +394,8 @@ _RESERVED_PARAM_NAMES = frozenset(
         _ENTRY_RESUME_TARGET_VAR,
         _ENTRY_OPENER_VAR,
         _MONTH_HELPER_VAR,
+        _ISO_DATE_HELPER_VAR,
+        _PERIOD_DATE_PATTERN_HELPER_VAR,
         _DOWNLOAD_VAR_BASE,
         f"{_DOWNLOAD_VAR_BASE}_file",
         _DOWNLOAD_FILENAME_VAR_BASE,
@@ -300,6 +432,8 @@ class SynthesisDiagnostics:
     # Post-download-cut trajectory indices recorded before the emission loop, so the partition obligation
     # can detect a truncation-break index that lands in no record lane instead of silently losing it.
     retained_trajectory_indices: list[int] = field(default_factory=list)
+    # May contain bounded source-row text for in-memory fingerprint validation. The only public boundary
+    # is `_public_locator_provenance`, which emits origin/input metadata and omits the captured text.
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
@@ -557,6 +691,7 @@ def _get_by_role_expr_strict(role: str, name: str) -> str:
 
 LOCATOR_WITNESS_PARAM_SOURCE = "locator_witness"
 INPUT_TEMPLATED_PROVENANCE_SOURCE = "input_templated"
+SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE = "same_month_file_match"
 _SCOUT_MONTH_HELPER_NAME = _MONTH_HELPER_VAR
 _WITNESS_MIN_VALUE_LEN = 3
 _WITNESS_SAFE_CHARSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
@@ -575,6 +710,18 @@ _WITNESS_MONTH_TO_ISO = {
     "november": "11",
     "december": "12",
 }
+_PERIOD_DAY_PATTERN_BY_MAX = {
+    28: r"(?:0?[1-9]|1[0-9]|2[0-8])",
+    29: r"(?:0?[1-9]|1[0-9]|2[0-9])",
+    30: r"(?:0?[1-9]|[12][0-9]|30)",
+    31: r"(?:0?[1-9]|[12][0-9]|3[01])",
+}
+# Intentionally scoped to the English "Month D, YYYY" labels this grounded route can witness.
+# Additional formats must preserve Python/browser parity instead of adding website-specific parsing.
+_ROW_PERIOD_DATE_RE = re.compile(
+    r"\b(" + "|".join(_WITNESS_MONTH_TO_ISO) + r")\s+(0?[1-9]|[12][0-9]|3[01]),\s+([0-9]{4})\b",
+    re.IGNORECASE,
+)
 
 
 class _InputTemplatingPlan(NamedTuple):
@@ -583,6 +730,7 @@ class _InputTemplatingPlan(NamedTuple):
     role: str
     name: str
     holes: list[Mapping[str, Any]]
+    dynamic_row_evidence: ScoutedDynamicRowEvidence | None
 
 
 def _witness_key_is_safe(key: str) -> bool:
@@ -606,12 +754,218 @@ def _month_name_to_iso(value: str) -> str | None:
     return f"{year}-{month}"
 
 
+def _days_in_month(year: int, month: int) -> int:
+    if month == 2:
+        return 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28
+    return 30 if month in (4, 6, 9, 11) else 31
+
+
+def _iso_date_to_year_month(value: str) -> str | None:
+    parts = value.split("-")
+    if len(parts) != 3:
+        return None
+    year_text, month_text, day_text = parts
+    if (
+        len(year_text) != 4
+        or len(month_text) != 2
+        or len(day_text) != 2
+        or not year_text.isdigit()
+        or not month_text.isdigit()
+        or not day_text.isdigit()
+    ):
+        return None
+    year, month, day = int(year_text), int(month_text), int(day_text)
+    if year < 1 or month < 1 or month > 12 or day < 1 or day > _days_in_month(year, month):
+        return None
+    return f"{year_text}-{month_text}"
+
+
 def _witness_observed_forms(value: str) -> list[tuple[str, str]]:
     forms: list[tuple[str, str]] = [("identity", value)]
     iso = _month_name_to_iso(value)
     if iso is not None and iso != value:
         forms.append(("month_name_to_iso", iso))
+    year_month = _iso_date_to_year_month(value)
+    if year_month is not None and year_month != value:
+        forms.append(("iso_date_to_year_month", year_month))
     return forms
+
+
+def _row_period_tokens(row_text: str) -> list[tuple[str, int]]:
+    normalized = " ".join(row_text.split())
+    periods: list[tuple[str, int]] = []
+    for match in _ROW_PERIOD_DATE_RE.finditer(normalized):
+        month_name = match.group(1).lower()
+        month = _WITNESS_MONTH_TO_ISO.get(month_name)
+        if month is None:
+            continue
+        day = int(match.group(2))
+        year = match.group(3)
+        year_number = int(year)
+        if year_number < 1 or day < 1 or day > _days_in_month(year_number, int(month)):
+            continue
+        periods.append((f"{year}-{month}", match.start()))
+    return periods
+
+
+def _strict_period_date_pattern(period: str) -> re.Pattern[str] | None:
+    parts = period.split("-")
+    if (
+        len(parts) != 2
+        or len(parts[0]) != 4
+        or not parts[0].isdigit()
+        or int(parts[0]) < 1
+        or len(parts[1]) != 2
+        or not parts[1].isdigit()
+        or not 1 <= int(parts[1]) <= 12
+    ):
+        return None
+    month_names = tuple(name.title() for name in _WITNESS_MONTH_TO_ISO)
+    max_day = _days_in_month(int(parts[0]), int(parts[1]))
+    day = _PERIOD_DAY_PATTERN_BY_MAX[max_day]
+    return re.compile(
+        rf"\b{re.escape(month_names[int(parts[1]) - 1])}\s+{day},\s+{re.escape(parts[0])}\b",
+        re.IGNORECASE,
+    )
+
+
+def validated_dynamic_row_period_matches(
+    value: Any, row_selector_count: int
+) -> list[ScoutedDynamicRowPeriodMatch] | None:
+    if not isinstance(value, list) or len(value) > 20:
+        return None
+    result: list[ScoutedDynamicRowPeriodMatch] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"period", "selected_row_match_count", "row_match_count"}:
+            return None
+        period = item.get("period")
+        selected_count = item.get("selected_row_match_count")
+        row_count = item.get("row_match_count")
+        if (
+            not isinstance(period, str)
+            or _strict_period_date_pattern(period) is None
+            or isinstance(selected_count, bool)
+            or not isinstance(selected_count, int)
+            or selected_count < 1
+            or selected_count > 20
+            or isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count < 1
+            or row_count > row_selector_count
+        ):
+            return None
+        result.append(
+            ScoutedDynamicRowPeriodMatch(
+                period=period,
+                selected_row_match_count=selected_count,
+                row_match_count=row_count,
+            )
+        )
+    if [item["period"] for item in result] != sorted({str(item["period"]) for item in result}):
+        return None
+    return result
+
+
+def dynamic_row_period_matches_match_selected_row(row_text: str, period_matches: Sequence[Mapping[str, Any]]) -> bool:
+    selected_counts: dict[str, int] = {}
+    for period, _ in _row_period_tokens(row_text):
+        selected_counts[period] = selected_counts.get(period, 0) + 1
+    return selected_counts == {str(item["period"]): int(item["selected_row_match_count"]) for item in period_matches}
+
+
+def dynamic_row_evidence_fingerprint(
+    *,
+    source_url: str,
+    target_selector: str,
+    row_selector: str,
+    row_text: str,
+    row_selector_count: int,
+    row_text_match_count: int,
+    period_matches: Sequence[Mapping[str, Any]],
+    selected_index: int,
+) -> str:
+    payload = {
+        "source_url": source_url,
+        "target_selector": target_selector,
+        "row_selector": row_selector,
+        "row_text": row_text,
+        "row_selector_count": row_selector_count,
+        "row_text_match_count": row_text_match_count,
+        "period_matches": [dict(item) for item in period_matches],
+        "selected_index": selected_index,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDynamicRowEvidence | None:
+    evidence = interaction.get("dynamic_row_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    source_url = str(interaction.get("source_url") or "").strip()
+    selector = str(interaction.get("selector") or "").strip()
+    row_source_url = evidence.get("source_url")
+    target_selector = evidence.get("target_selector")
+    row_selector = evidence.get("row_selector")
+    row_text = evidence.get("row_text")
+    row_selector_count = evidence.get("row_selector_count")
+    row_text_match_count = evidence.get("row_text_match_count")
+    period_matches = (
+        validated_dynamic_row_period_matches(evidence.get("period_matches"), row_selector_count)
+        if isinstance(row_selector_count, int) and not isinstance(row_selector_count, bool)
+        else None
+    )
+    selected_index = evidence.get("selected_index")
+    evidence_fingerprint = evidence.get("evidence_fingerprint")
+    if (
+        not source_url
+        or row_source_url != source_url
+        or target_selector != selector
+        or not isinstance(row_selector, str)
+        or not row_selector.strip()
+        or _is_positional_selector(row_selector)
+        or _is_bare_ambiguous_selector(row_selector)
+        or not isinstance(row_text, str)
+        or not row_text.strip()
+        or len(row_text) > 500
+        or isinstance(row_selector_count, bool)
+        or not isinstance(row_selector_count, int)
+        or row_selector_count < 2
+        or row_selector_count > 100
+        or isinstance(row_text_match_count, bool)
+        or not isinstance(row_text_match_count, int)
+        or row_text_match_count < 1
+        or row_text_match_count > row_selector_count
+        or period_matches is None
+        or not dynamic_row_period_matches_match_selected_row(" ".join(row_text.split()), period_matches)
+        or isinstance(selected_index, bool)
+        or not isinstance(selected_index, int)
+        or selected_index < 0
+        or selected_index >= row_selector_count
+        or not isinstance(evidence_fingerprint, str)
+        or evidence_fingerprint
+        != dynamic_row_evidence_fingerprint(
+            source_url=source_url,
+            target_selector=selector,
+            row_selector=row_selector.strip(),
+            row_text=" ".join(row_text.split()),
+            row_selector_count=row_selector_count,
+            row_text_match_count=row_text_match_count,
+            period_matches=period_matches,
+            selected_index=selected_index,
+        )
+    ):
+        return None
+    return ScoutedDynamicRowEvidence(
+        source_url=source_url,
+        target_selector=selector,
+        row_selector=row_selector.strip(),
+        row_text=" ".join(row_text.split()),
+        row_selector_count=row_selector_count,
+        row_text_match_count=row_text_match_count,
+        period_matches=period_matches,
+        selected_index=selected_index,
+        evidence_fingerprint=evidence_fingerprint,
+    )
 
 
 def _quoted_content_spans(selector: str) -> list[tuple[int, int]]:
@@ -657,37 +1011,163 @@ def _boundary_delimited_positions(haystack: str, needle: str, allowed_spans: Seq
 
 def _resolve_non_competing_correspondences(raw: list[dict[str, Any]]) -> list[ScoutedInputCorrespondence]:
     result: list[ScoutedInputCorrespondence] = []
-    for surface in ("selector", "accessible_name"):
-        entries = sorted((entry for entry in raw if entry["surface"] == surface), key=lambda entry: entry["_position"])
-        key_counts: dict[str, int] = {}
+    for surface in ("selector", "accessible_name", "row_text"):
+        entries = sorted(
+            (entry for entry in raw if entry["surface"] == surface),
+            key=lambda entry: (entry["_position"], entry["matched_literal"], entry["input_key"]),
+        )
+        key_counts: dict[tuple[str, str, str], int] = {}
         for entry in entries:
-            key_counts[entry["input_key"]] = key_counts.get(entry["input_key"], 0) + 1
+            occurrence = (entry["input_key"], entry["matched_literal"], entry["transform"])
+            key_counts[occurrence] = key_counts.get(occurrence, 0) + 1
+        groups: list[list[dict[str, Any]]] = []
+        for entry in entries:
+            if groups and (groups[-1][0]["_position"], groups[-1][0]["matched_literal"]) == (
+                entry["_position"],
+                entry["matched_literal"],
+            ):
+                groups[-1].append(entry)
+            else:
+                groups.append([entry])
         bad: set[int] = set()
-        for a_index, a_entry in enumerate(entries):
-            if key_counts[a_entry["input_key"]] > 1:
+        for a_index, a_group in enumerate(groups):
+            if any(
+                key_counts[(entry["input_key"], entry["matched_literal"], entry["transform"])] > 1 for entry in a_group
+            ):
                 bad.add(a_index)
-            a_start = a_entry["_position"]
-            a_end = a_start + len(a_entry["matched_literal"])
-            for b_index in range(a_index + 1, len(entries)):
-                b_start = entries[b_index]["_position"]
-                b_end = b_start + len(entries[b_index]["matched_literal"])
+            a_start = a_group[0]["_position"]
+            a_end = a_start + len(a_group[0]["matched_literal"])
+            for b_index in range(a_index + 1, len(groups)):
+                b_start = groups[b_index][0]["_position"]
+                b_end = b_start + len(groups[b_index][0]["matched_literal"])
                 if a_start < b_end and b_start < a_end:
                     bad.add(a_index)
                     bad.add(b_index)
-        for index, entry in enumerate(entries):
+        for index, group in enumerate(groups):
             if index in bad:
                 continue
-            result.append(
-                {
-                    "input_key": entry["input_key"],
-                    "matched_literal": entry["matched_literal"],
-                    "parameter_value": entry["parameter_value"],
-                    "surface": entry["surface"],
-                    "transform": entry["transform"],
-                    "position": entry["_position"],
-                }
+            ordered = sorted(group, key=lambda entry: entry["input_key"])
+            canonical = ordered[0]
+            correspondence = ScoutedInputCorrespondence(
+                input_key=canonical["input_key"],
+                matched_literal=canonical["matched_literal"],
+                parameter_value=canonical["parameter_value"],
+                surface=canonical["surface"],
+                transform=canonical["transform"],
+                position=canonical["_position"],
             )
+            if len(ordered) > 1:
+                correspondence["equivalent_inputs"] = [
+                    ScoutedEquivalentInput(
+                        input_key=entry["input_key"],
+                        parameter_value=entry["parameter_value"],
+                        transform=entry["transform"],
+                    )
+                    for entry in ordered[1:]
+                ]
+            result.append(correspondence)
     return result
+
+
+def _input_correspondences_for_surfaces(
+    *,
+    selector: str,
+    name: str,
+    declared_params: Mapping[str, str],
+    dynamic_row: ScoutedDynamicRowEvidence | None = None,
+) -> list[ScoutedInputCorrespondence]:
+    selector_spans = _quoted_content_spans(selector)
+    name_spans = [(0, len(name))] if name else []
+    row_periods = _row_period_tokens(dynamic_row["row_text"]) if dynamic_row is not None else []
+    licensed_periods = {
+        str(item["period"])
+        for item in (dynamic_row["period_matches"] if dynamic_row is not None else [])
+        if item["selected_row_match_count"] == 1 and item["row_match_count"] == 1
+    }
+    raw: list[dict[str, Any]] = []
+    for key in sorted(declared_params):
+        value = declared_params[key]
+        if not value or value != value.strip() or len(value) < _WITNESS_MIN_VALUE_LEN:
+            continue
+        if not _WITNESS_SAFE_CHARSET_RE.fullmatch(value):
+            continue
+        if not _witness_key_is_safe(key):
+            continue
+        identity_selector_positions = _boundary_delimited_positions(selector, value, selector_spans)
+        identity_name_positions = _boundary_delimited_positions(name, value, name_spans)
+        for transform, observed in _witness_observed_forms(value):
+            if len(observed) < _WITNESS_MIN_VALUE_LEN or not _WITNESS_SAFE_CHARSET_RE.fullmatch(observed):
+                continue
+            selector_positions = (
+                identity_selector_positions
+                if transform == "identity"
+                else _boundary_delimited_positions(selector, observed, selector_spans)
+            )
+            name_positions = (
+                identity_name_positions
+                if transform == "identity"
+                else _boundary_delimited_positions(name, observed, name_spans)
+            )
+            if transform != "identity":
+                selector_positions = [
+                    position
+                    for position in selector_positions
+                    if not any(
+                        exact_position <= position and position + len(observed) <= exact_position + len(value)
+                        for exact_position in identity_selector_positions
+                    )
+                ]
+                name_positions = [
+                    position
+                    for position in name_positions
+                    if not any(
+                        exact_position <= position and position + len(observed) <= exact_position + len(value)
+                        for exact_position in identity_name_positions
+                    )
+                ]
+            if len(selector_positions) + len(name_positions) == 1:
+                if selector_positions:
+                    surface, position = "selector", selector_positions[0]
+                else:
+                    surface, position = "accessible_name", name_positions[0]
+                raw.append(
+                    {
+                        "surface": surface,
+                        "input_key": key,
+                        "matched_literal": observed,
+                        "parameter_value": value,
+                        "transform": transform,
+                        "_position": position,
+                    }
+                )
+            matching_row_periods = [
+                (period, position)
+                for period, position in row_periods
+                if period == observed and period in licensed_periods
+            ]
+            if len(matching_row_periods) == 1:
+                raw.append(
+                    {
+                        "surface": "row_text",
+                        "input_key": key,
+                        "matched_literal": observed,
+                        "parameter_value": value,
+                        "transform": transform,
+                        "_position": matching_row_periods[0][1],
+                    }
+                )
+    return _resolve_non_competing_correspondences(raw)
+
+
+def input_correspondences_for_selector(
+    selector: str,
+    declared_params: Mapping[str, str],
+) -> list[ScoutedInputCorrespondence]:
+    return _input_correspondences_for_surfaces(
+        selector=selector.strip(),
+        name="",
+        declared_params=declared_params,
+    )
 
 
 def input_correspondences_for_interaction(
@@ -699,41 +1179,12 @@ def input_correspondences_for_interaction(
     value and literal, whitespace-normalized, and name-safe."""
     if str(interaction.get("tool_name") or "") != "click":
         return []
-    selector = str(interaction.get("selector") or "").strip()
-    name = str(interaction.get("accessible_name") or "").strip()
-    selector_spans = _quoted_content_spans(selector)
-    name_spans = [(0, len(name))] if name else []
-    raw: list[dict[str, Any]] = []
-    for key in sorted(declared_params):
-        value = declared_params[key]
-        if not value or value != value.strip() or len(value) < _WITNESS_MIN_VALUE_LEN:
-            continue
-        if not _WITNESS_SAFE_CHARSET_RE.fullmatch(value):
-            continue
-        if not _witness_key_is_safe(key):
-            continue
-        for transform, observed in _witness_observed_forms(value):
-            if len(observed) < _WITNESS_MIN_VALUE_LEN or not _WITNESS_SAFE_CHARSET_RE.fullmatch(observed):
-                continue
-            selector_positions = _boundary_delimited_positions(selector, observed, selector_spans)
-            name_positions = _boundary_delimited_positions(name, observed, name_spans)
-            if len(selector_positions) + len(name_positions) != 1:
-                continue
-            if selector_positions:
-                surface, position = "selector", selector_positions[0]
-            else:
-                surface, position = "accessible_name", name_positions[0]
-            raw.append(
-                {
-                    "surface": surface,
-                    "input_key": key,
-                    "matched_literal": observed,
-                    "parameter_value": value,
-                    "transform": transform,
-                    "_position": position,
-                }
-            )
-    return _resolve_non_competing_correspondences(raw)
+    return _input_correspondences_for_surfaces(
+        selector=str(interaction.get("selector") or "").strip(),
+        name=str(interaction.get("accessible_name") or "").strip(),
+        declared_params=declared_params,
+        dynamic_row=_validated_dynamic_row_evidence(interaction),
+    )
 
 
 def _escape_fstring_literal_segment(value: str) -> str:
@@ -756,21 +1207,54 @@ def _interpolate_holes(raw: str, holes: Sequence[Mapping[str, Any]]) -> str | No
             return None
         segments.append(_escape_fstring_literal_segment(raw[cursor:idx]))
         key = str(hole.get("input_key") or "")
-        if str(hole.get("transform") or "identity") == "month_name_to_iso":
-            segments.append("{" + _SCOUT_MONTH_HELPER_NAME + "(" + key + ")}")
-        else:
-            segments.append("{" + key + "}")
+        expression = _witness_transform_expression(key, str(hole.get("transform") or "identity"))
+        if expression is None:
+            return None
+        segments.append("{" + expression + "}")
         cursor = idx + len(matched_literal)
     segments.append(_escape_fstring_literal_segment(raw[cursor:]))
     return "".join(segments)
 
 
+def _witness_transform_expression(key: str, transform: str) -> str | None:
+    if transform == "identity":
+        return key
+    if transform == "month_name_to_iso":
+        return f"{_SCOUT_MONTH_HELPER_NAME}({key})"
+    if transform == "iso_date_to_year_month":
+        return f"{_ISO_DATE_HELPER_VAR}({key})"
+    return None
+
+
+def _input_templated_holes_are_self_validating(holes: Sequence[Mapping[str, Any]]) -> bool:
+    for hole in holes:
+        matched_literal = str(hole.get("matched_literal") or "")
+        inputs = _correspondence_inputs(hole)
+        keys = [witness["input_key"] for witness in inputs]
+        if not matched_literal or not keys or keys != sorted(set(keys)):
+            return False
+        for witness in inputs:
+            if not _witness_key_is_safe(witness["input_key"]):
+                return False
+            forms = _witness_observed_forms(witness["parameter_value"])
+            if (witness["transform"], matched_literal) not in forms:
+                return False
+    return True
+
+
 def build_input_templated_locator(
-    *, surface: str, selector: str, role: str, name: str, holes: Sequence[Mapping[str, Any]]
+    *,
+    surface: str,
+    selector: str,
+    role: str,
+    name: str,
+    holes: Sequence[Mapping[str, Any]],
+    row_text: str = "",
+    period_matches: Sequence[Mapping[str, Any]] = (),
 ) -> str | None:
     """Single source for the templated locator literal, used at emission AND re-derived byte-for-byte at
     the admissibility seam so a tampered or reordered provenance record fails the recompute equality check."""
-    if not holes:
+    if not holes or not _input_templated_holes_are_self_validating(holes):
         return None
     if surface == "selector":
         body = _interpolate_holes(selector, holes)
@@ -784,6 +1268,27 @@ def build_input_templated_locator(
         if body is None:
             return None
         return f'page.get_by_role({_py_str(role)}, name=f"{body}", exact=True)'
+    if surface == "row_text":
+        if len(holes) != 1 or not selector or not row_text:
+            return None
+        hole = holes[0]
+        matched_literal = str(hole.get("matched_literal") or "")
+        if (
+            len([period for period, _ in _row_period_tokens(row_text) if period == matched_literal]) != 1
+            or _strict_period_date_pattern(matched_literal) is None
+            or not any(
+                item.get("period") == matched_literal
+                and item.get("selected_row_match_count") == 1
+                and item.get("row_match_count") == 1
+                for item in period_matches
+            )
+        ):
+            return None
+        key = str(hole.get("input_key") or "")
+        transformed = _witness_transform_expression(key, str(hole.get("transform") or "identity"))
+        if transformed is None:
+            return None
+        return f"page.locator({_py_str(selector)}).filter(has_text={_PERIOD_DATE_PATTERN_HELPER_VAR}({transformed}))"
     return None
 
 
@@ -799,7 +1304,13 @@ def templated_selection_locator_binding(interaction: Mapping[str, Any]) -> tuple
     if not key:
         return None
     expr = build_input_templated_locator(
-        surface=plan.surface, selector=plan.selector, role=plan.role, name=plan.name, holes=plan.holes
+        surface=plan.surface,
+        selector=plan.selector,
+        role=plan.role,
+        name=plan.name,
+        holes=plan.holes,
+        row_text=plan.dynamic_row_evidence["row_text"] if plan.dynamic_row_evidence is not None else "",
+        period_matches=plan.dynamic_row_evidence["period_matches"] if plan.dynamic_row_evidence is not None else (),
     )
     if expr is None:
         return None
@@ -840,7 +1351,18 @@ def _input_templating_plan(interaction: Mapping[str, Any]) -> _InputTemplatingPl
     name = str(interaction.get("accessible_name") or "").strip()
     selector_holes = [c for c in correspondences if isinstance(c, Mapping) and c.get("surface") == "selector"]
     name_holes = [c for c in correspondences if isinstance(c, Mapping) and c.get("surface") == "accessible_name"]
+    row_holes = [c for c in correspondences if isinstance(c, Mapping) and c.get("surface") == "row_text"]
     parsed = _parse_role_name(selector) if selector else None
+    dynamic_row = _validated_dynamic_row_evidence(interaction)
+    if row_holes and dynamic_row is not None and len(row_holes) == 1:
+        return _InputTemplatingPlan(
+            surface="row_text",
+            selector=dynamic_row["row_selector"],
+            role="",
+            name="",
+            holes=row_holes,
+            dynamic_row_evidence=dynamic_row,
+        )
     if (
         selector_holes
         and selector
@@ -850,13 +1372,27 @@ def _input_templating_plan(interaction: Mapping[str, Any]) -> _InputTemplatingPl
     ):
         ordered = _ordered_holes(selector, selector_holes)
         if ordered is not None:
-            return _InputTemplatingPlan(surface="selector", selector=selector, role="", name="", holes=ordered)
+            return _InputTemplatingPlan(
+                surface="selector",
+                selector=selector,
+                role="",
+                name="",
+                holes=ordered,
+                dynamic_row_evidence=None,
+            )
     if name_holes and role and name:
         ambiguous_role = parsed is not None and not parsed[1]
         if not selector or _is_bare_ambiguous_selector(selector) or ambiguous_role:
             ordered = _ordered_holes(name, name_holes)
             if ordered is not None:
-                return _InputTemplatingPlan(surface="accessible_name", selector="", role=role, name=name, holes=ordered)
+                return _InputTemplatingPlan(
+                    surface="accessible_name",
+                    selector="",
+                    role=role,
+                    name=name,
+                    holes=ordered,
+                    dynamic_row_evidence=None,
+                )
     return None
 
 
@@ -870,7 +1406,13 @@ def _maybe_input_templated_locator(
     if plan is None:
         return None
     expr = build_input_templated_locator(
-        surface=plan.surface, selector=plan.selector, role=plan.role, name=plan.name, holes=plan.holes
+        surface=plan.surface,
+        selector=plan.selector,
+        role=plan.role,
+        name=plan.name,
+        holes=plan.holes,
+        row_text=plan.dynamic_row_evidence["row_text"] if plan.dynamic_row_evidence is not None else "",
+        period_matches=plan.dynamic_row_evidence["period_matches"] if plan.dynamic_row_evidence is not None else (),
     )
     if expr is None:
         return None
@@ -887,33 +1429,76 @@ def _maybe_input_templated_locator(
                     "parameter_value": str(hole.get("parameter_value") or ""),
                     "transform": str(hole.get("transform") or "identity"),
                     "position": hole.get("position"),
+                    **(
+                        {"equivalent_inputs": [dict(equivalent) for equivalent in hole["equivalent_inputs"]]}
+                        if isinstance(hole.get("equivalent_inputs"), list)
+                        else {}
+                    ),
                 }
                 for hole in plan.holes
             ],
         }
         if plan.surface == "selector":
             record["selector"] = plan.selector
-        else:
+        elif plan.surface == "accessible_name":
             record["role"] = plan.role
             record["name"] = plan.name
+        elif plan.dynamic_row_evidence is not None:
+            record.update(plan.dynamic_row_evidence)
         diagnostics.locator_provenance.append(record)
     return expr
 
 
-def _prescan_input_templating(trajectory: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
+def _correspondence_inputs(hole: Mapping[str, Any]) -> list[dict[str, str]]:
+    inputs = [
+        {
+            "input_key": str(hole.get("input_key") or ""),
+            "parameter_value": str(hole.get("parameter_value") or ""),
+            "transform": str(hole.get("transform") or "identity"),
+        }
+    ]
+    equivalents = hole.get("equivalent_inputs")
+    if isinstance(equivalents, list):
+        for equivalent in equivalents:
+            if not isinstance(equivalent, Mapping):
+                continue
+            inputs.append(
+                {
+                    "input_key": str(equivalent.get("input_key") or ""),
+                    "parameter_value": str(equivalent.get("parameter_value") or ""),
+                    "transform": str(equivalent.get("transform") or "identity"),
+                }
+            )
+    return inputs
+
+
+def _prescan_input_templating(
+    trajectory: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], bool, bool, bool, list[list[dict[str, str]]]]:
     keys: list[str] = []
     needs_month = False
+    needs_iso_date = False
+    needs_period_helpers = False
+    collision_groups: list[list[dict[str, str]]] = []
     for interaction in trajectory:
         plan = _input_templating_plan(interaction)
         if plan is None:
             continue
+        if plan.surface == "row_text":
+            needs_period_helpers = True
         for hole in plan.holes:
-            key = str(hole.get("input_key") or "")
-            if key and key not in keys:
-                keys.append(key)
-            if str(hole.get("transform") or "identity") == "month_name_to_iso":
-                needs_month = True
-    return keys, needs_month
+            inputs = _correspondence_inputs(hole)
+            if len(inputs) > 1:
+                collision_groups.append(inputs)
+            for witness in inputs:
+                key = witness["input_key"]
+                if key and key not in keys:
+                    keys.append(key)
+                if witness["transform"] == "month_name_to_iso":
+                    needs_month = True
+                elif witness["transform"] == "iso_date_to_year_month":
+                    needs_iso_date = True
+    return keys, needs_month, needs_iso_date, needs_period_helpers, collision_groups
 
 
 def _scout_month_helper_lines() -> list[str]:
@@ -929,6 +1514,42 @@ def _scout_month_helper_lines() -> list[str]:
     ]
 
 
+def _scout_iso_date_helper_lines() -> list[str]:
+    return [
+        f"{_INDENT}def {_ISO_DATE_HELPER_VAR}(_value):",
+        f"{_INDENT * 2}_parts = str(_value).split('-')",
+        f"{_INDENT * 2}if not (len(_parts) == 3 and len(_parts[0]) == 4 and len(_parts[1]) == 2 "
+        f"and len(_parts[2]) == 2 and all(_part.isdigit() for _part in _parts)):",
+        f'{_INDENT * 3}raise Exception("unrecognized ISO date for grounded parameter")',
+        f"{_INDENT * 2}_year, _month, _day = int(_parts[0]), int(_parts[1]), int(_parts[2])",
+        f"{_INDENT * 2}_leap = _year % 4 == 0 and (_year % 100 != 0 or _year % 400 == 0)",
+        f"{_INDENT * 2}_days = (31, 29 if _leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)",
+        f"{_INDENT * 2}if _year < 1 or _month < 1 or _month > 12 or _day < 1 or _day > _days[_month - 1]:",
+        f'{_INDENT * 3}raise Exception("unrecognized ISO date for grounded parameter")',
+        f"{_INDENT * 2}return _parts[0] + '-' + _parts[1]",
+    ]
+
+
+def _scout_period_helper_lines() -> list[str]:
+    month_names = "(" + ", ".join(f'"{name.title()}"' for name in _WITNESS_MONTH_TO_ISO) + ")"
+    day_patterns = repr(_PERIOD_DAY_PATTERN_BY_MAX)
+    return [
+        f"{_INDENT}def {_PERIOD_DATE_PATTERN_HELPER_VAR}(_period):",
+        f"{_INDENT * 2}_parts = str(_period).split('-')",
+        f"{_INDENT * 2}if not (len(_parts) == 2 and len(_parts[0]) == 4 and _parts[0].isdigit() "
+        f"and len(_parts[1]) == 2 and _parts[1].isdigit() and int(_parts[0]) >= 1 "
+        f"and 1 <= int(_parts[1]) <= 12):",
+        f'{_INDENT * 3}raise Exception("unrecognized grounded period")',
+        f"{_INDENT * 2}_months = {month_names}",
+        f"{_INDENT * 2}_year, _month = int(_parts[0]), int(_parts[1])",
+        f"{_INDENT * 2}_leap = _year % 4 == 0 and (_year % 100 != 0 or _year % 400 == 0)",
+        f"{_INDENT * 2}_max_day = (31, 29 if _leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[_month - 1]",
+        f"{_INDENT * 2}_day = {day_patterns}[_max_day]",
+        f'{_INDENT * 2}return re.compile(r"\\b" + re.escape(_months[int(_parts[1]) - 1]) + r"\\s+" '
+        f'+ _day + r",\\s+" + re.escape(_parts[0]) + r"\\b", re.IGNORECASE)',
+    ]
+
+
 def _witness_charset_guard_lines(key: str) -> list[str]:
     return [
         f"{_INDENT}if not (isinstance({key}, str) and {key} == {key}.strip() and {key}[:1].isalnum() "
@@ -937,15 +1558,104 @@ def _witness_charset_guard_lines(key: str) -> list[str]:
     ]
 
 
-def witness_prelude_lines(keys: Sequence[str], *, include_month_helper: bool) -> list[str]:
+def witness_prelude_lines(
+    keys: Sequence[str],
+    *,
+    include_month_helper: bool,
+    include_iso_date_helper: bool = False,
+    include_period_helpers: bool = False,
+    collision_groups: Sequence[Sequence[Mapping[str, str]]] = (),
+) -> list[str]:
     """Top-of-body guards (fail closed before any interpolation) plus the reserved month helper def.
     Reinjected into every separated browser stage because each stage is an independent CodeBlock."""
     lines: list[str] = []
     if include_month_helper:
         lines.extend(_scout_month_helper_lines())
+    if include_iso_date_helper:
+        lines.extend(_scout_iso_date_helper_lines())
+    if include_period_helpers:
+        lines.extend(_scout_period_helper_lines())
     for key in keys:
         lines.extend(_witness_charset_guard_lines(key))
+    for group in collision_groups:
+        transformed = [_witness_transform_expression(witness["input_key"], witness["transform"]) for witness in group]
+        if not transformed or any(expression is None for expression in transformed):
+            continue
+        canonical = transformed[0]
+        peers = transformed[1:]
+        if not peers:
+            continue
+        comparison = " and ".join(f"{canonical} == {peer}" for peer in peers)
+        lines.append(f"{_INDENT}if not ({comparison}):")
+        lines.append(f'{_INDENT * 2}raise Exception("grounded parameters do not resolve to one period")')
     return lines
+
+
+def _same_month_helper_lines() -> list[str]:
+    return [
+        f"{_INDENT}def {_SAME_MONTH_HELPER_VAR}(_start_value, _end_value):",
+        f"{_INDENT * 2}def _parse_iso_date(_value):",
+        f"{_INDENT * 3}_parts = str(_value).split({_py_str('-')})",
+        f"{_INDENT * 3}if not (len(_parts) == 3 and len(_parts[0]) == 4 and len(_parts[1]) == 2 "
+        f"and len(_parts[2]) == 2 and all(_part.isdigit() for _part in _parts)):",
+        f'{_INDENT * 4}raise Exception("invalid full date for grounded file match")',
+        f"{_INDENT * 3}_year = int(_parts[0])",
+        f"{_INDENT * 3}_month = int(_parts[1])",
+        f"{_INDENT * 3}_day = int(_parts[2])",
+        f"{_INDENT * 3}if _year < 1 or _month < 1 or _month > 12:",
+        f'{_INDENT * 4}raise Exception("invalid full date for grounded file match")',
+        f"{_INDENT * 3}_leap = _year % 4 == 0 and (_year % 100 != 0 or _year % 400 == 0)",
+        f"{_INDENT * 3}_days = (31, 29 if _leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)",
+        f"{_INDENT * 3}if _day < 1 or _day > _days[_month - 1]:",
+        f'{_INDENT * 4}raise Exception("invalid full date for grounded file match")',
+        f"{_INDENT * 3}return (_year, _month, _day)",
+        f"{_INDENT * 2}_start = _parse_iso_date(_start_value)",
+        f"{_INDENT * 2}_end = _parse_iso_date(_end_value)",
+        f"{_INDENT * 2}if _start[0] != _end[0] or _start[1] != _end[1]:",
+        f'{_INDENT * 3}raise Exception("grounded file match dates must share one calendar month")',
+        f"{_INDENT * 2}return str(_start[0]).zfill(4) + {_py_str('-')} + str(_start[1]).zfill(2)",
+    ]
+
+
+def build_same_month_file_match_locator(transform: SameMonthFileMatchTransform, selector: str) -> str | None:
+    if (
+        transform.selector != selector
+        or transform.date_format_id != "iso_date_to_year_month"
+        or not transform.holes
+        or not same_month_file_match_transform_is_valid(transform)
+    ):
+        return None
+    keys: set[str] = set()
+    cursor = 0
+    segments: list[str] = []
+    date_holes = 0
+    quoted_spans = _quoted_content_spans(selector)
+    for hole in transform.holes:
+        if (
+            hole.position < cursor
+            or not hole.matched_literal
+            or selector[hole.position : hole.position + len(hole.matched_literal)] != hole.matched_literal
+            or _boundary_delimited_positions(selector, hole.matched_literal, quoted_spans) != [hole.position]
+            or not hole.declared_keys
+            or any(not grounded_parameter_key_is_safe(key) or key in keys for key in hole.declared_keys)
+        ):
+            return None
+        keys.update(hole.declared_keys)
+        segments.append(_escape_fstring_literal_segment(selector[cursor : hole.position]))
+        if hole.format_id == "identity" and len(hole.declared_keys) == 1:
+            segments.append("{" + hole.declared_keys[0] + "}")
+        elif hole.format_id == "iso_date_to_year_month" and hole.declared_keys == transform.date_keys:
+            date_holes += 1
+            segments.append(
+                "{" + _SAME_MONTH_HELPER_VAR + "(" + transform.date_keys[0] + ", " + transform.date_keys[1] + ")}"
+            )
+        else:
+            return None
+        cursor = hole.position + len(hole.matched_literal)
+    if date_holes != 1 or set(transform.date_keys) - keys:
+        return None
+    segments.append(_escape_fstring_literal_segment(selector[cursor:]))
+    return 'page.locator(f"' + "".join(segments) + '")'
 
 
 def _locator_expr(
@@ -972,6 +1682,27 @@ def _locator_expr(
     templated = _maybe_input_templated_locator(interaction, diagnostics=diagnostics, trajectory_index=trajectory_index)
     if templated is not None:
         return templated
+
+    correspondences = interaction.get("input_correspondences")
+    has_stamped_row_license = isinstance(correspondences, list) and any(
+        isinstance(item, Mapping) and item.get("surface") == "row_text" for item in correspondences
+    )
+
+    if strict_selectors and (
+        has_stamped_row_license
+        or ("dynamic_row_evidence" in interaction and _validated_dynamic_row_evidence(interaction) is None)
+    ):
+        notes.append("dropped an interaction whose dynamic-row relation did not validate")
+        if diagnostics is not None:
+            diagnostics.dropped_interactions.append(
+                {
+                    "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                    "tool_name": tool_name,
+                    "selector": selector,
+                    "reason_code": "invalid_dynamic_row_evidence",
+                }
+            )
+        return ""
 
     if strict_selectors:
         if not selector:
@@ -1358,6 +2089,7 @@ def synthesize_code_block(
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
+    file_match_transform: SameMonthFileMatchTransform | None = None,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
@@ -1393,6 +2125,40 @@ def synthesize_code_block(
         and not reached_download_target.already_registered
         and bool(reached_download_target.selector)
     )
+    file_match_locator = ""
+    file_match_keys: list[str] = []
+    if file_match_transform is not None:
+        if file_match_transform.provenance_fingerprint != same_month_file_match_transform_fingerprint(
+            file_match_transform
+        ):
+            return None
+        if not compile_download_target or reached_download_target is None:
+            LOG.info(
+                "copilot_spine_same_month_file_match_transform_dropped",
+                reason_code="download_target_unavailable",
+                selector_matches_transform=False,
+            )
+            file_match_transform = None
+        else:
+            file_match_locator = (
+                build_same_month_file_match_locator(
+                    file_match_transform,
+                    reached_download_target.selector,
+                )
+                or ""
+            )
+            if not file_match_locator:
+                LOG.info(
+                    "copilot_spine_same_month_file_match_transform_dropped",
+                    reason_code="locator_build_failed",
+                    selector_matches_transform=file_match_transform.selector == reached_download_target.selector,
+                )
+                file_match_transform = None
+        if file_match_transform is not None:
+            for file_match_hole in file_match_transform.holes:
+                for key in file_match_hole.declared_keys:
+                    if key not in file_match_keys:
+                        file_match_keys.append(key)
     if compile_download_target and reached_download_target is not None:
         trajectory, dropped_trailing = _trajectory_prefix_at_anchor(
             trajectory, reached_download_target.trajectory_anchor
@@ -1407,32 +2173,84 @@ def synthesize_code_block(
             )
     diagnostics.retained_trajectory_indices = list(range(len(trajectory)))
 
-    input_templated_keys, input_templated_needs_month = _prescan_input_templating(trajectory)
+    (
+        input_templated_keys,
+        input_templated_needs_month,
+        input_templated_needs_iso_date,
+        input_templated_needs_period_helpers,
+        input_templated_collision_groups,
+    ) = _prescan_input_templating(trajectory)
     minted_input_witness_keys: set[str] = set()
     for interaction in trajectory:
         plan = _input_templating_plan(interaction)
         if plan is None:
             continue
         for hole in plan.holes:
-            key = str(hole.get("input_key") or "")
-            if not key or key in minted_input_witness_keys:
-                continue
-            minted_input_witness_keys.add(key)
-            parameters.append(
-                {
-                    "key": key,
-                    "default_value": str(hole.get("parameter_value") or ""),
-                    "source": LOCATOR_WITNESS_PARAM_SOURCE,
-                }
-            )
+            for witness in _correspondence_inputs(hole):
+                key = witness["input_key"]
+                if not key or key in minted_input_witness_keys:
+                    continue
+                minted_input_witness_keys.add(key)
+                parameter = {"key": key, "source": LOCATOR_WITNESS_PARAM_SOURCE}
+                # A file-match witness proves usage, not a safe persisted default; the submitted declaration owns it.
+                if key not in file_match_keys:
+                    parameter["default_value"] = witness["parameter_value"]
+                parameters.append(parameter)
     for key in input_templated_keys:
         used_param_keys.add(key)
-    if input_templated_keys:
-        lines.extend(witness_prelude_lines(input_templated_keys, include_month_helper=input_templated_needs_month))
+    for key in file_match_keys:
+        used_param_keys.add(key)
+        if key not in minted_input_witness_keys:
+            parameters.append({"key": key})
+    prelude_keys = [*input_templated_keys, *(key for key in file_match_keys if key not in input_templated_keys)]
+    if prelude_keys:
+        lines.extend(
+            witness_prelude_lines(
+                prelude_keys,
+                include_month_helper=input_templated_needs_month,
+                include_iso_date_helper=input_templated_needs_iso_date,
+                include_period_helpers=input_templated_needs_period_helpers,
+                collision_groups=input_templated_collision_groups,
+            )
+        )
         LOG.info(
             "copilot_spine_input_templated_prelude",
-            witness_keys=input_templated_keys,
+            witness_keys=prelude_keys,
             month_helper=input_templated_needs_month,
+            iso_date_helper=input_templated_needs_iso_date,
+            period_helpers=input_templated_needs_period_helpers,
+        )
+    if file_match_locator and file_match_transform is not None:
+        lines.extend(_same_month_helper_lines())
+        lines.append(f"{_INDENT}{_DOWNLOAD_TARGET_VAR} = {file_match_locator}")
+        LOG.info(
+            "copilot_spine_same_month_file_match_transform_applied",
+            provenance_source=SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE,
+            parameter_keys=list(file_match_transform.expected_declared_keys),
+        )
+        diagnostics.locator_provenance.append(
+            {
+                "trajectory_index": reached_download_target.trajectory_anchor
+                if reached_download_target is not None and reached_download_target.trajectory_anchor is not None
+                else -1,
+                "selector": reached_download_target.selector if reached_download_target is not None else "",
+                "emitted_literal": file_match_locator,
+                "source": SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE,
+                "date_keys": list(file_match_transform.date_keys),
+                "expected_declared_keys": list(file_match_transform.expected_declared_keys),
+                "provenance_fingerprint": file_match_transform.provenance_fingerprint,
+                "date_format_id": file_match_transform.date_format_id,
+                "holes": [
+                    {
+                        "declared_keys": list(hole.declared_keys),
+                        "matched_literal": hole.matched_literal,
+                        "position": hole.position,
+                        "format_id": hole.format_id,
+                        "source_values": list(hole.source_values),
+                    }
+                    for hole in file_match_transform.holes
+                ],
+            }
         )
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
@@ -1500,7 +2318,9 @@ def synthesize_code_block(
             else 0
         )
         download_entry_target = (
-            f"page.locator({_py_str(reached_download_target.selector)})"
+            _DOWNLOAD_TARGET_VAR
+            if file_match_locator
+            else f"page.locator({_py_str(reached_download_target.selector)})"
             if compile_download_target and reached_download_target is not None
             else ""
         )
@@ -1630,6 +2450,10 @@ def synthesize_code_block(
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
         if login_only_presence_guard_active:
+            lines.append(f"{_INDENT}try:")
+            lines.append(f'{_INDENT * 2}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
+            lines.append(f"{_INDENT}except Exception:")
+            lines.append(f"{_INDENT * 2}pass")
             lines.append(f"{_INDENT}if await {_ENTRY_TARGET_VAR}.count() == 1:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
@@ -1649,6 +2473,7 @@ def synthesize_code_block(
         return _INDENT
 
     snapshot_recovery_emitted = False
+    captcha_boundary_indices = _captcha_boundary_indices(trajectory)
 
     def emit_snapshot_recovery(trajectory_index: int, action_indent: str) -> None:
         nonlocal snapshot_recovery_emitted
@@ -1728,6 +2553,8 @@ def synthesize_code_block(
                 lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
                 record_emission(trajectory_index, tool_name, "press", "page.keyboard", line_start=line_start)
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+            if trajectory_index in captcha_boundary_indices:
+                lines.append(f"{action_indent}await solve_captcha(page)")
             append_step(f"Press {key}", "keypress", line_start)
             emitted += 1
             continue
@@ -1787,8 +2614,17 @@ def synthesize_code_block(
                     lane="optional_dismissal",
                 )
             else:
+                templating_plan = _input_templating_plan(interaction)
+                if templating_plan is not None and templating_plan.surface == "row_text":
+                    lines.append(f"{action_indent}if await {locator}.count() != 1:")
+                    lines.append(
+                        f"{action_indent}{_INDENT}raise Exception("
+                        f"{_py_str('grounded statement row did not resolve uniquely')})"
+                    )
                 lines.append(f"{action_indent}await {locator}.click()")
                 lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+                if trajectory_index in captcha_boundary_indices:
+                    lines.append(f"{action_indent}await solve_captcha(page)")
                 record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
@@ -1864,10 +2700,7 @@ def synthesize_code_block(
                 credential_param_key = _credential_param_key(interaction, used_param_keys)
                 credential_param_keys[credential_id] = credential_param_key
                 parameters.append({"key": credential_param_key, "credential_id": credential_id})
-            if credential_field == "totp":
-                lines.append(f"{action_indent}await {locator}.fill(await {credential_param_key}.otp())")
-            else:
-                lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
+            lines.append(f"{action_indent}{credential_fill_source(locator, credential_param_key, credential_field)}")
             record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
         elif tool_name == "select_option":
             emit_snapshot_recovery(trajectory_index, action_indent)
@@ -1984,7 +2817,12 @@ def synthesize_code_block(
         download_obj = _unique_key(f"{download_var}_file", used_download_vars)
         download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
         lines.append(f"{_INDENT}async with page.expect_download() as {download_var}:")
-        lines.append(f"{_INDENT * 2}await page.locator({_py_str(reached_download_target.selector)}).click()")
+        download_click_target = (
+            _DOWNLOAD_TARGET_VAR
+            if file_match_locator
+            else (f"page.locator({_py_str(reached_download_target.selector)})")
+        )
+        lines.append(f"{_INDENT * 2}await {download_click_target}.click()")
         lines.append(f"{_INDENT}{download_obj} = await {download_var}.value")
         lines.append(f"{_INDENT}{download_filename} = {download_obj}.suggested_filename")
         lines.append(f"{_INDENT}await {download_obj}.path()")
@@ -2507,16 +3345,41 @@ def _table_group_read_lines(
     return lines
 
 
+def _returned_output_segments_by_binding(
+    bindings: list[LiveReadBinding],
+) -> dict[str, tuple[tuple[str, bool], ...]]:
+    """Segments each extracted value is returned under, keyed by output path. A slot identity is a
+    digest, so the matched label names the field and an already-taken name is suffixed."""
+    segments_by_path: dict[str, tuple[tuple[str, bool], ...]] = {}
+    used_names: set[str] = set()
+    for binding in bindings:
+        if not (is_canonical_request_slot_path(binding.output_path) and binding.relation_label.strip()):
+            segments = output_path_segments(binding.output_path)
+            used_names.update(name for name, _is_array in segments[1:])
+            segments_by_path[binding.output_path] = segments
+            continue
+        base = _slug(binding.relation_label)
+        name = base
+        suffix = 2
+        while name in used_names:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        used_names.add(name)
+        segments_by_path[binding.output_path] = (("output", False), (name, False))
+    return segments_by_path
+
+
 def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> SynthesizedExtractionSuffix | None:
     if not plan.live_reads:
         return None
     lines: list[str] = []
     return_root = _ExtractionReturnNode()
     scalar_bindings = [binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE]
+    segments_by_path = _returned_output_segments_by_binding(scalar_bindings)
     for index, binding in enumerate(scalar_bindings):
         variable = f"_extraction_value_{index}"
         lines.extend(_key_value_scalar_read_statements(binding, variable, guard_empty=False))
-        _set_return_expression(return_root, output_path_segments(binding.output_path), variable)
+        _set_return_expression(return_root, segments_by_path[binding.output_path], variable)
 
     table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
     for binding in plan.live_reads:
@@ -2762,6 +3625,7 @@ def synthesize_code_block_with_extraction(
     strict_selectors: bool = False,
     reached_download_target: ReachedDownloadTarget | None = None,
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
+    file_match_transform: SameMonthFileMatchTransform | None = None,
 ) -> SynthesizedCodeBlock | None:
     if not _trajectory_contains_reveal(trajectory, extraction_plan):
         return None
@@ -2770,6 +3634,7 @@ def synthesize_code_block_with_extraction(
         strict_selectors=strict_selectors,
         reached_download_target=reached_download_target,
         parameter_binding_snapshot=parameter_binding_snapshot,
+        file_match_transform=file_match_transform,
     )
     suffix = synthesize_extraction_suffix(extraction_plan)
     if interaction is None or suffix is None:

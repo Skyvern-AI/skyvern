@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
@@ -24,18 +24,21 @@ const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
   codeGenerating: false,
+  isPlaceholderData: false,
 }));
 
 vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => ({
     data: mocks.workflowRun,
     isLoading: false,
+    isPlaceholderData: mocks.isPlaceholderData,
   }),
 }));
 vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({
     data: mocks.timeline,
     isLoading: false,
+    isPlaceholderData: mocks.isPlaceholderData,
   }),
 }));
 vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
@@ -248,7 +251,16 @@ function renderRunView(
           <StudioPaneCompactContext.Provider value={compact}>
             <RunPaneViewToggles />
           </StudioPaneCompactContext.Provider>
-          <RunView workflowRunId="wr_1" {...props} />
+          {initialEntry.startsWith("/runs/") ? (
+            <Routes>
+              <Route
+                path="/runs/:runId"
+                element={<RunView workflowRunId="wr_1" {...props} />}
+              />
+            </Routes>
+          ) : (
+            <RunView workflowRunId="wr_1" {...props} />
+          )}
         </TooltipProvider>
         <LocationSpy />
       </MemoryRouter>
@@ -263,6 +275,7 @@ afterEach(() => {
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
   mocks.codeGenerating = false;
+  mocks.isPlaceholderData = false;
 });
 beforeEach(() => {
   useRunViewStore.getState().reset();
@@ -317,7 +330,44 @@ describe("RunView view toggles", () => {
     expect(scope.queryByText("Credits")).toBeNull();
   });
 
-  test("Inputs view shows the run's input metadata", () => {
+  test("Inputs view shows the run's input metadata, including TOTP diagnostics", () => {
+    seedCompletedRun({
+      webhook_callback_url: "https://example.test/hook",
+      totp_verification_url: "https://example.test/totp",
+      totp_identifier: "totp-identifier-1",
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("Webhook URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/hook")).not.toBeNull();
+    expect(scope.getByText("TOTP URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/totp")).not.toBeNull();
+    expect(scope.getByText("TOTP identifier")).not.toBeNull();
+    expect(scope.getByText("totp-identifier-1")).not.toBeNull();
+  });
+
+  test("Inputs view sources TOTP from task_v2 when the top-level run omits it", () => {
+    seedCompletedRun({
+      totp_verification_url: null,
+      totp_identifier: null,
+      task_v2: {
+        totp_verification_url: "https://example.test/totp-v2",
+        totp_identifier: "totp-identifier-v2",
+      },
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("TOTP URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/totp-v2")).not.toBeNull();
+    expect(scope.getByText("TOTP identifier")).not.toBeNull();
+    expect(scope.getByText("totp-identifier-v2")).not.toBeNull();
+  });
+
+  test("Inputs view omits TOTP rows when the run carries no TOTP config", () => {
     seedCompletedRun({
       webhook_callback_url: "https://example.test/hook",
     });
@@ -326,7 +376,8 @@ describe("RunView view toggles", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
     expect(scope.getByText("Webhook URL")).not.toBeNull();
-    expect(scope.getByText("https://example.test/hook")).not.toBeNull();
+    expect(scope.queryByText("TOTP URL")).toBeNull();
+    expect(scope.queryByText("TOTP identifier")).toBeNull();
   });
 
   test("Code view renders the shared WorkflowRunCode surface", () => {
@@ -337,6 +388,11 @@ describe("RunView view toggles", () => {
     expect(scope.queryByTestId("workflow-run-code")).toBeNull();
     fireEvent.click(scope.getByRole("button", { name: "Code" }));
     expect(scope.queryByTestId("workflow-run-code")).not.toBeNull();
+    // The Code toggle exposes aria-pressed once it's the active view, matching
+    // the sibling view toggles (defends the shared ViewToggle disabled-prop add).
+    expect(
+      scope.getByRole("button", { name: "Code", pressed: true }),
+    ).not.toBeNull();
   });
 
   test("the Code toggle shows a spinner while cached code is generating", () => {
@@ -420,6 +476,13 @@ describe("RunView cold-open selection", () => {
     expect(getByTestId("location-search").textContent).toContain("active=");
   });
 
+  test("a terminal /runs/{wr} short link with no ?active= selects the last item", () => {
+    seedTerminalRunWithActions();
+    renderRunView({}, "/runs/wr_1");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
+  });
+
   test("an explicit ?active= deep link wins over the last-item default", () => {
     seedTerminalRunWithActions();
     renderRunView({}, "/?wr=wr_1&active=act_1");
@@ -439,6 +502,23 @@ describe("RunView cold-open selection", () => {
     renderRunView({}, "/?wr=wr_1&bl=goto-block");
 
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+  });
+
+  test("does not auto-pin from the previous run's placeholder frames on a run switch", () => {
+    // Mid-switch to wr_2: keepPreviousData still serves the OLD run's finalized
+    // data + frames, flagged placeholder. Auto-pin must wait for wr_2's real
+    // payload rather than lock this run's one-shot to the stale last frame.
+    seedTerminalRunWithActions();
+    mocks.isPlaceholderData = true;
+    const view = renderRunView({ workflowRunId: "wr_2" }, "/?wr=wr_2");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+
+    // Real data arrives (no longer placeholder): now the one-shot decides.
+    mocks.isPlaceholderData = false;
+    view.rerenderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
   });
 });
 
@@ -717,9 +797,7 @@ describe("RunView output signals", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    // This run has outputs, so the toggle's accessible name carries the new-
-    // output indicator suffix; match by prefix since that's not under test here.
-    fireEvent.click(scope.getByRole("button", { name: /^Outputs/ }));
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
 
     expect(scope.getByText("Run errors")).not.toBeNull();
     expect(scope.getAllByText("E_INVOICE_MISSING").length).toBeGreaterThan(0);
@@ -743,11 +821,28 @@ describe("RunView output signals", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    // This run has outputs, so the toggle name carries the new-output suffix.
-    fireEvent.click(scope.getByRole("button", { name: /^Outputs/ }));
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
 
     expect(scope.getByText("Extracted information")).not.toBeNull();
     expect(scope.getByText("Run outputs")).not.toBeNull();
+  });
+
+  test("shows a code block's returned outputs when there is no extracted information", () => {
+    seedCompletedRun({
+      outputs: {
+        get_stars_output: { star_count: 22600, evidence_text: "22.6k stars" },
+        extracted_information: [],
+      },
+    });
+
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+
+    expect(scope.queryByText("No outputs for this run")).toBeNull();
+    expect(scope.getByText("Run outputs")).not.toBeNull();
+    expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {
@@ -774,52 +869,5 @@ describe("RunView output signals", () => {
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
     expect(scope.queryByText("Run errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
-  });
-});
-
-describe("RunView output indicator", () => {
-  test("the Outputs toggle carries a new-output indicator when unviewed output exists", () => {
-    seedCompletedRun({ errors: [{ error_code: "E1", reasoning: "x" }] });
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    expect(
-      scope.getByRole("button", { name: "Outputs, content available" }),
-    ).not.toBeNull();
-  });
-
-  test("the indicator clears once the Outputs view is active", () => {
-    seedCompletedRun({ errors: [{ error_code: "E1", reasoning: "x" }] });
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    fireEvent.click(
-      scope.getByRole("button", { name: "Outputs, content available" }),
-    );
-    expect(scope.getByRole("button", { name: "Outputs" })).not.toBeNull();
-    expect(
-      scope.queryByRole("button", { name: "Outputs, content available" }),
-    ).toBeNull();
-  });
-
-  test("no indicator when the run has no output signals", () => {
-    seedCompletedRun();
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    expect(scope.getByRole("button", { name: "Outputs" })).not.toBeNull();
-    expect(
-      scope.queryByRole("button", { name: "Outputs, content available" }),
-    ).toBeNull();
-  });
-
-  test("the indicator survives the header collapsing to icon-only", () => {
-    seedCompletedRun({ errors: [{ error_code: "E1", reasoning: "x" }] });
-    const { container } = renderRunView({}, "/", true);
-    const scope = within(container);
-
-    expect(
-      scope.getByRole("button", { name: "Outputs, content available" }),
-    ).not.toBeNull();
   });
 });

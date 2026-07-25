@@ -30,6 +30,22 @@ ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "other"]
+COPILOT_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
+
+
+def coerce_ask_subject(value: object) -> AskSubject | None:
+    for subject in COPILOT_ASK_SUBJECTS:
+        if value == subject:
+            return subject
+    return None
+
+
+def parsed_ask_refs(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [ref for ref in value if isinstance(ref, str) and ref]
+
 
 class DeliveredUnverifiedPublicOutputs(dict[str, Any]):
     """Run-output values explicitly selected for terminal presentation.
@@ -90,6 +106,7 @@ class TurnNarrativePayload(TypedDict):
     proposalDisposition: NotRequired[ProposalDisposition]
     # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
+    terminalEnvelope: NotRequired[dict[str, Any]]
     # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):
     # True only when outcome evidence authorizes a tested-success claim.
     verifiedSuccess: NotRequired[bool]
@@ -118,6 +135,7 @@ class TurnNarrativePayload(TypedDict):
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
+        MetadataRejectLadderState,
         RecordedBuildTestOutcome,
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
@@ -127,10 +145,11 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentClassifierResult
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -149,6 +168,10 @@ class CredentialCheck(BaseModel):
     credential_name: str = ""
     credential_id: str | None = None
     found: bool = False
+
+
+class ApprovedCredential(BaseModel):
+    credential_id: str
 
 
 class ObservedPage(BaseModel):
@@ -245,6 +268,7 @@ class StructuredContext(BaseModel):
     urls_visited: list[UrlVisit] = Field(default_factory=list)
     fields_filled: list[FieldFilled] = Field(default_factory=list)
     credentials_checked: list[CredentialCheck] = Field(default_factory=list)
+    approved_credentials: list[ApprovedCredential] = Field(default_factory=list)
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
     # Per-chat discovery budget. Survives turn boundaries via
@@ -255,6 +279,7 @@ class StructuredContext(BaseModel):
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
     loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
     fill_carry: list[FillCarry] = Field(default_factory=list)
+    entrypoint_url: str | None = None
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
@@ -559,6 +584,8 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
     scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
     raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    raw_entrypoint_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    resolved_entrypoint_url = raw_entrypoint_url if isinstance(raw_entrypoint_url, str) else None
     fill_carry = _fill_carry_from_scout_trajectory(
         [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
         credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
@@ -570,9 +597,12 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
         and not flow_evidence
         and not loaded_result_targets
         and not fill_carry
+        and not resolved_entrypoint_url
     ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
+    if resolved_entrypoint_url:
+        sc.entrypoint_url = resolved_entrypoint_url
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
@@ -586,6 +616,50 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
             field_count=len(fill_carry),
         )
     return sc.to_json_str()
+
+
+_MAX_APPROVED_CREDENTIALS = 20
+
+
+def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
+    """Persist resolved credentials as durable cross-turn approval. Records only from
+    resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
+    holds by construction.
+    """
+    policy = ctx.request_policy
+    if policy is None or not policy.resolved_credentials:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    existing_ids = {record.credential_id for record in sc.approved_credentials}
+    for credential in policy.resolved_credentials:
+        if credential.credential_id in existing_ids:
+            continue
+        sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
+        existing_ids.add(credential.credential_id)
+    if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
+        sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
+    return sc.to_json_str()
+
+
+def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
+    """Take the model's context but keep `approved_credentials` server-owned.
+
+    Approval is recorded only from server-resolved credentials; an entry the model
+    supplied would be promoted into `resolved_credentials` on the next turn and clear
+    the unapproved-credential gate for a credential the user never named. Membership
+    of the org is not evidence the user named it.
+    """
+    trusted = StructuredContext.from_json_str(trusted_raw)
+    structured = trusted
+    if isinstance(model_raw, dict):
+        try:
+            structured = StructuredContext.model_validate(model_raw)
+        except Exception:
+            structured = trusted
+    elif isinstance(model_raw, str):
+        structured = StructuredContext.from_json_str(model_raw)
+    structured.approved_credentials = list(trusted.approved_credentials)
+    return structured
 
 
 @dataclass
@@ -610,15 +684,14 @@ class AgentResult:
     cancelled: bool = False
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
-    # Successful code-only build turns can be applied without requiring the
-    # chat's sticky "Always accept" setting.
-    apply_without_review: bool = False
     output_policy_diagnostics: dict[str, Any] | None = None
     turn_outcome: TurnOutcome | None = None
     turn_id: str | None = None
     narrative_summary: str | None = None
     # Persisted on the assistant chat message so the bubble survives a reload.
     narrative_payload: TurnNarrativePayload | None = None
+    # Shadow-only typed terminal-state envelope persisted and streamed on terminal frames.
+    terminal_envelope: dict[str, Any] | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
@@ -678,6 +751,9 @@ class CopilotContext(AgentContext):
     impose_synthesized_code_block: bool = False
     target_block_label: str | None = None
     turn_intent: TurnIntent | None = None
+    # Retained so a policy mutated after the pre-flight credential pause can be
+    # re-derived into an authority envelope without re-running the classifier.
+    turn_intent_classifier_result: TurnIntentClassifierResult | None = None
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
@@ -748,6 +824,11 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
+    # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
+    # (the same source that powers run_outcome SSE frames). Append-only across
+    # per-run pointer resets (``last_run_outcome = None``); cleared only by the
+    # workflow-edit evidence reset, which invalidates pre-edit run evidence.
+    terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
     delivered_unverified_terminal: bool = False
     delivered_unverified_workflow_run_id: str | None = None
     delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=DeliveredUnverifiedPublicOutputs)
@@ -803,6 +884,7 @@ class CopilotContext(AgentContext):
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    metadata_reject_ladder_state: MetadataRejectLadderState | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
@@ -874,6 +956,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     discovery_entrypoint_url_question_nudge_count: int = 0
     pre_discovery_url_question_nudge_count: int = 0
+    discovery_failure_streak_this_turn: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None
@@ -904,6 +987,32 @@ class CopilotContext(AgentContext):
     block_ended_at_map: dict[str, str] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+
+    def __post_init__(self) -> None:
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+        if isinstance(self.last_run_outcome, RecordedRunOutcome):
+            super().__setattr__("terminal_envelope_run_outcomes", [self.last_run_outcome])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name != "last_run_outcome":
+            return
+        from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+        if not isinstance(value, RecordedRunOutcome):
+            # ``last_run_outcome = None`` is a per-run pointer reset, not an
+            # evidence reset — the trace survives so a later run in the same
+            # turn cannot mask an earlier honest not_demonstrated.
+            return
+        outcomes = getattr(self, "terminal_envelope_run_outcomes", None)
+        if isinstance(outcomes, list):
+            outcomes.append(value)
+        else:
+            super().__setattr__("terminal_envelope_run_outcomes", [value])
 
     def has_genuine_workflow_attempt(self) -> bool:
         """This turn persisted a workflow proposal or executed a real build-test run; excludes

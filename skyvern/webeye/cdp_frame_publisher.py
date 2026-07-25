@@ -26,6 +26,28 @@ LOG = structlog.get_logger()
 
 DEFAULT_CAPTURE_INTERVAL_SECONDS: float = 1.0
 
+_TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
+_TEARDOWN_ERROR_MESSAGES = (
+    "Connection closed while reading from the driver",
+    "Target page, context or browser has been closed",
+)
+
+
+def _is_cdp_session_teardown_error(exc: BaseException) -> bool:
+    """True iff opening a CDP session failed because the browser/driver was tearing down.
+
+    Matches ``TargetClosedError`` by type *name*, not identity: ``scripts/patch_browser.sh``
+    rewrites ``playwright`` imports to ``patchright`` in every module except
+    ``cloud/persistent_browsers``, so the two packages expose distinct ``TargetClosedError``
+    classes and an ``isinstance`` check against either would miss the other. The driver-pipe
+    drop surfaces as a base ``Error`` carrying a distinctive message, so it is matched on
+    text. Anything else is treated as an unexpected failure worth a warning.
+    """
+    if type(exc).__name__ == _TARGET_CLOSED_ERROR_TYPE:
+        return True
+    message = str(exc)
+    return any(needle in message for needle in _TEARDOWN_ERROR_MESSAGES)
+
 
 def _write_frame_atomically(temp_dir: Path, stream_key: str, data: bytes) -> None:
     """Atomic tempfile+``os.replace`` write; intended to run on a worker thread."""
@@ -79,10 +101,17 @@ class CDPFramePublisher:
         self._stopped = asyncio.Event()
         self._cdp_session: CDPSession | None = None
         self._attached_page: Page | None = None
+        # Whether an unexpected (non-teardown) session-open failure has already warned in
+        # the current unhealthy streak. Re-armed by a successful attach so each streak
+        # warns once instead of flooding warnings every tick.
+        self._warned_unexpected_cdp_open_failure = False
         # Digest of the last frame whose write + upload both succeeded. Lets us
         # dedupe identical frames without losing a retry on transient upload
         # failure.
         self._last_published_digest: bytes | None = None
+        # Warn once per publisher on unexpected gate errors so a miswired hook is
+        # visible instead of silently reverting to unconditional publishing.
+        self._warned_gate_failure = False
 
     @property
     def stream_key(self) -> str:
@@ -174,6 +203,10 @@ class CDPFramePublisher:
             return False
 
     async def _publish_one_frame(self) -> None:
+        # Gate before capture: skipping the CDP screenshot saves browser CPU, not
+        # just the upload. Fail-open — a broken gate must not blank the live view.
+        if not await self._viewer_wants_frames():
+            return
         page = await self._browser_state.get_working_page()
         if page is None:
             return
@@ -182,17 +215,13 @@ class CDPFramePublisher:
             await self._detach_cdp_session()
             try:
                 self._cdp_session = await page.context.new_cdp_session(page)
-            except Exception:
-                LOG.warning(
-                    "Could not open CDP session for frame publishing",
-                    stream_key=self._stream_key,
-                    organization_id=self._organization_id,
-                    exc_info=True,
-                )
+            except Exception as exc:
                 self._cdp_session = None
                 self._attached_page = None
+                self._log_cdp_open_failure(exc)
                 return
             self._attached_page = page
+            self._warned_unexpected_cdp_open_failure = False
             self._last_published_digest = None
             LOG.info(
                 "CDP frame publisher attached to page",
@@ -244,8 +273,50 @@ class CDPFramePublisher:
             # transient upload failure retries instead of getting deduped away.
             self._last_published_digest = digest
 
+    async def _viewer_wants_frames(self) -> bool:
+        try:
+            return bool(
+                await app.AGENT_FUNCTION.should_publish_streaming_frame(self._organization_id, self._stream_key)
+            )
+        except Exception:
+            if not self._warned_gate_failure:
+                self._warned_gate_failure = True
+                LOG.warning(
+                    "Streaming gate check failed; publishing unconditionally",
+                    stream_key=self._stream_key,
+                    organization_id=self._organization_id,
+                    exc_info=True,
+                )
+            return True
+
+    def _log_cdp_open_failure(self, exc: BaseException) -> None:
+        """Log a ``new_cdp_session`` failure at the severity its cause warrants.
+
+        A teardown race (target/context/browser closed, or the driver pipe dropped) is the
+        expected, benign case and stays at debug. Any other failure -- e.g. a browser/CDP/
+        proxy incompatibility while the page is still live -- stays at warning so a
+        persistently blank live stream remains explainable, but only the first occurrence
+        per unhealthy streak warns; subsequent failures in the same unhealthy streak drop to
+        debug so a stuck publisher cannot flood warning ingestion at the ~1 Hz capture cadence.
+        """
+        if _is_cdp_session_teardown_error(exc) or self._warned_unexpected_cdp_open_failure:
+            LOG.debug(
+                "Could not open CDP session for frame publishing",
+                stream_key=self._stream_key,
+                organization_id=self._organization_id,
+                exc_info=True,
+            )
+            return
+        self._warned_unexpected_cdp_open_failure = True
+        LOG.warning(
+            "Could not open CDP session for frame publishing",
+            stream_key=self._stream_key,
+            organization_id=self._organization_id,
+            exc_info=True,
+        )
+
     async def _write_frame(self, data: bytes) -> bool:
-        """Persist one frame; True iff both the local write and the upload succeeded."""
+        """Persist one frame; True iff the local write and a real (non-gated) upload both succeeded."""
         temp_dir = Path(get_skyvern_temp_dir()) / self._organization_id
         try:
             # Blocking I/O runs on a worker thread so a large flush does not
@@ -263,7 +334,7 @@ class CDPFramePublisher:
         # Local-disk storage reads the temp file directly; remote object-storage
         # backends need an explicit upload.
         try:
-            await app.STORAGE.save_streaming_file(self._organization_id, self._stream_key)
+            upload_result = await app.STORAGE.save_streaming_file(self._organization_id, self._stream_key)
         except Exception:
             LOG.debug(
                 "save_streaming_file failed; will retry on next iteration",
@@ -271,6 +342,10 @@ class CDPFramePublisher:
                 organization_id=self._organization_id,
                 exc_info=True,
             )
+            return False
+        # A gate skip (False) is a normal no-viewer outcome, not a failure: don't advance the
+        # dedupe digest, or an unchanged page could be suppressed when a viewer later attaches.
+        if upload_result is False:
             return False
         return True
 

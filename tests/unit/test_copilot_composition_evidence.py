@@ -170,6 +170,28 @@ def test_composition_parse_html_extracts_labeled_fields_and_submit_controls() ->
     assert parsed["source_tool"] == "inspect_page_for_composition"
 
 
+def test_composition_parse_html_records_effective_button_submit_types() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <form>
+            <input type="password" id="password" />
+            <button id="sign-in">Sign in</button>
+            <button id="delete-account" type="button">Delete account</button>
+            <button id="reset" type="reset">Reset</button>
+          </form>
+        </body></html>
+        """,
+        inspected_url="https://example.com/login",
+        current_url="https://example.com/login",
+    )
+
+    controls_by_id = {control["id"]: control for control in parsed["forms"][0]["submit_controls"]}
+    assert controls_by_id["sign-in"]["type"] == "submit"
+    assert controls_by_id["delete-account"]["type"] == "button"
+    assert controls_by_id["reset"]["type"] == "reset"
+
+
 def test_composition_parse_html_excludes_css_hidden_text_from_visible_excerpt() -> None:
     parsed = parse_composition_html(
         """
@@ -656,6 +678,37 @@ def test_composition_parse_html_excludes_challenge_controls_inside_hidden_ancest
     assert parsed["challenge_state"]["requires_human_verification"] is True
     assert parsed["challenge_state"]["evidence_source"] == "challenge_state"
     assert composition_challenge_carrier(parsed) == ChallengeEvidenceSource.CHALLENGE_STATE
+
+
+def test_composition_parse_html_surfaces_interactive_descendants_of_challenge_carrier() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Login Confirmation</title></head><body>
+          <div data-challenge-state="captcha_pending" data-captcha-widget="login-confirmation"
+               aria-label="Login confirmation challenge">
+            <h1>Login Confirmation</h1>
+            <div class="challenge">
+              <input type="checkbox" id="notRobot" />
+              <label for="notRobot">I'm not a robot</label>
+            </div>
+            <button class="btn-primary">Continue</button>
+            <button class="goback">Go back to login</button>
+            <button id="disabled" disabled>Verify</button>
+            <span style="display: none"><button id="hidden">Continue</button></span>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/challenge",
+        current_url="https://example.com/challenge",
+    )
+
+    selectors = {control["selector"] for control in parsed["challenge_controls"]}
+    assert {"#notRobot", "button.btn-primary", "button.goback"}.issubset(selectors)
+    assert "#hidden" not in selectors
+    assert (
+        next(control for control in parsed["challenge_controls"] if control["selector"] == "#disabled")["disabled"]
+        is True
+    )
 
 
 def test_composition_parse_html_passed_challenge_markup_escalates_without_assertion() -> None:
@@ -2968,6 +3021,70 @@ async def test_structured_extractor_matches_html_parser_on_live_dom() -> None:
     assert structured["forms"] and structured["challenge_controls"]
     assert structured["anti_bot_indicators"] and structured["challenge_state"]["detected"] is True
     assert any(overlay["selector"] == "#signup" for overlay in structured["modal_overlays"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_records_effective_button_submit_types() -> None:
+    url = "https://test.example.com/login"
+    html = """
+    <html><body>
+      <form>
+        <input type="password" id="password" />
+        <button id="sign-in">Sign in</button>
+        <button id="delete-account" type="button">Delete account</button>
+        <button id="reset" type="reset">Reset</button>
+      </form>
+    </body></html>
+    """
+    raw, content = await _capture_live_dom(url, html, "#sign-in")
+
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    html_parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    structured_types = {control["id"]: control["type"] for control in structured["forms"][0]["submit_controls"]}
+    html_types = {control["id"]: control["type"] for control in html_parsed["forms"][0]["submit_controls"]}
+    assert (
+        structured_types
+        == html_types
+        == {
+            "sign-in": "submit",
+            "delete-account": "button",
+            "reset": "reset",
+        }
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_matches_class_only_challenge_carrier_controls() -> None:
+    url = "https://test.example.com/challenge"
+    html = """
+    <html><head><title>Verify</title></head><body>
+      <div class="captcha-container">
+        <input id="human" type="checkbox" />
+        <button id="continue">Continue</button>
+        <input id="verify" type="submit" value="Verify" />
+        <button id="disabled" disabled>Verify</button>
+        <span style="display: none"><button id="hidden">Continue</button></span>
+      </div>
+    </body></html>
+    """
+    raw, content = await _capture_live_dom(url, html, "#continue")
+
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    html_parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert _ac_projection(structured) == _ac_projection(html_parsed)
+    selectors = {control["selector"] for control in structured["challenge_controls"]}
+    assert {"#human", "#continue", "#verify", "#disabled"}.issubset(selectors)
+    assert "#hidden" not in selectors
+    assert (
+        next(control for control in structured["challenge_controls"] if control["selector"] == "#disabled")["disabled"]
+        is True
+    )
 
 
 _HEAVY_URL = "https://test.example.com/cart"

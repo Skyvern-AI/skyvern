@@ -48,3 +48,18 @@ class TestDomScrapeCrashGuards:
             timeout=30,
         )
         assert result.returncode == 0, f"Failed:\n{result.stdout}\n{result.stderr}"
+
+    def test_injection_scope_isolation(self, tmp_path):
+        from skyvern.webeye.utils.page import load_js_script
+
+        script = Path(__file__).parent / "test_domutils_injection_scope.js"
+        assert script.exists(), f"Missing {script}"
+        loaded_path = tmp_path / "loaded_domutils.js"
+        loaded_path.write_text(load_js_script(), encoding="utf-8")
+        result = subprocess.run(
+            [_NODE, str(script), str(_DOMUTILS), str(loaded_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"Failed:\n{result.stdout}\n{result.stderr}"

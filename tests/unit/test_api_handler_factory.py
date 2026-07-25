@@ -323,8 +323,10 @@ def test_normalize_llm_model_strips_provider_prefix() -> None:
         "anthropic/claude-opus-4-7",
         "anthropic/claude-opus-4-8",
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
         "anthropic-claude-opus-4-8",
         "anthropic-claude-fable-5",
+        "anthropic-claude-opus-5",
     ],
 )
 def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str) -> None:
@@ -336,6 +338,7 @@ def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str)
     [
         "bedrock/us.anthropic.claude-opus-4-8",
         "bedrock/us.anthropic.claude-fable-5",
+        "bedrock/us.anthropic.claude-opus-5",
         "anthropic/claude-sonnet-4-6",
         None,
     ],
@@ -349,6 +352,7 @@ def test_requires_adaptive_thinking_does_not_rewrite_other_providers(model_name:
     [
         "anthropic/claude-opus-4-8",
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
     ],
 )
 def test_apply_anthropic_thinking_optimization_uses_adaptive_shape(model_name: str) -> None:

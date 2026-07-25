@@ -1694,20 +1694,57 @@ def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
 
 def _challenge_control_entry(node: Any) -> dict[str, Any]:
     tag_name = str(getattr(node, "name", "") or "").lower()
+    control_type = _attr_value(node, "type")[:40]
     entry: dict[str, Any] = {
         "tag": tag_name,
         "id": _attr_value(node, "id")[:120],
         "name": _attr_value(node, "name")[:120],
         "class": " ".join(_classes_for(node)[:5])[:160],
-        "type": _attr_value(node, "type")[:40],
+        "type": control_type,
         "selector": _selector_for(node)[:160],
-        "text": _schema_text(_node_text(node) or _attr_value(node, "aria-label"), 200),
+        "text": _schema_text(
+            _node_text(node) or _attr_value(node, "value") or _attr_value(node, "aria-label"),
+            200,
+        ),
     }
+    if tag_name == "input" and control_type.casefold() in {"checkbox", "radio"}:
+        entry["checked"] = node.has_attr("checked")
+    if _control_disabled(node):
+        entry["disabled"] = True
     for key in ("src", "title", "data-sitekey", "data-callback", "data-expired-callback", "data-error-callback"):
         value = _attr_value(node, key)
         if value:
             entry[key.replace("-", "_")] = value[:300]
     return {key: value for key, value in entry.items() if value}
+
+
+def _challenge_identity(node: Any) -> str:
+    return " ".join(
+        str(value or "")
+        for value in (
+            getattr(node, "name", ""),
+            _attr_value(node, "id"),
+            _attr_value(node, "name"),
+            " ".join(_classes_for(node)),
+            _attr_value(node, "src"),
+            _attr_value(node, "type"),
+            _attr_value(node, "data-sitekey"),
+            _attr_value(node, "data-callback"),
+            _attr_value(node, "data-expired-callback"),
+            _attr_value(node, "data-error-callback"),
+            _attr_value(node, "aria-label"),
+            _attr_value(node, "title"),
+        )
+    ).lower()
+
+
+def _is_interactive_challenge_descendant(node: Any) -> bool:
+    if str(getattr(node, "name", "") or "").lower() not in {"a", "button", "input", "select", "textarea"}:
+        return False
+    return any(
+        any(pattern in _challenge_identity(ancestor) for pattern in _ANTI_BOT_PATTERNS)
+        for ancestor in getattr(node, "parents", [])
+    )
 
 
 def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
@@ -1716,24 +1753,9 @@ def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
     for node in soup.find_all(True):
         if len(controls) >= _MAX_CHALLENGE_CONTROLS:
             break
-        identity = " ".join(
-            str(value or "")
-            for value in (
-                getattr(node, "name", ""),
-                _attr_value(node, "id"),
-                _attr_value(node, "name"),
-                _attr_value(node, "class"),
-                _attr_value(node, "src"),
-                _attr_value(node, "type"),
-                _attr_value(node, "data-sitekey"),
-                _attr_value(node, "data-callback"),
-                _attr_value(node, "data-expired-callback"),
-                _attr_value(node, "data-error-callback"),
-                _attr_value(node, "aria-label"),
-                _attr_value(node, "title"),
-            )
-        ).lower()
-        if not any(pattern in identity for pattern in _ANTI_BOT_PATTERNS):
+        if not any(pattern in _challenge_identity(node) for pattern in _ANTI_BOT_PATTERNS) and not (
+            _is_interactive_challenge_descendant(node)
+        ):
             continue
         # A widget inside a hidden ancestor (solved/stale challenge markup) may
         # trigger the visual fallback but must not read as a rendered control.
@@ -1933,7 +1955,12 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         submit_controls: list[dict[str, Any]] = []
         for node in form.find_all(["input", "select", "textarea", "button"]):
             tag_name = str(getattr(node, "name", "") or "").lower()
-            field_type = str(node.get("type") or tag_name or "text").lower()
+            declared_type = str(node.get("type") or "").strip().lower()
+            field_type = (
+                (declared_type if declared_type in {"button", "reset", "submit"} else "submit")
+                if tag_name == "button"
+                else (declared_type or tag_name or "text")
+            )
             if tag_name == "input" and field_type in {"hidden", "reset"}:
                 continue
             if tag_name == "button" or field_type in {"submit", "button"}:
@@ -2377,6 +2404,10 @@ def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
             "selector": _structured_str(node.get("selector"))[:160],
             "text": _schema_text(_structured_str(node.get("text")), 200),
         }
+        if node.get("checked") is True:
+            entry["checked"] = True
+        if node.get("disabled") is True:
+            entry["disabled"] = True
         for key in ("src", "title", "data_sitekey", "data_callback", "data_expired_callback", "data_error_callback"):
             field_value = _structured_str(node.get(key)).strip()
             if field_value:

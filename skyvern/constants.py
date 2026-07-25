@@ -16,6 +16,10 @@ INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
+# Independent budget for disabling the download interceptor during close(). Kept well below
+# BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly
+# and can never consume the budget the paid-provider cleanup phase needs.
+BROWSER_INTERCEPTOR_DISABLE_TIMEOUT = 30  # 30 seconds
 BROWSER_DOWNLOAD_MAX_WAIT_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_TIMEOUT = 600  # 10 minute

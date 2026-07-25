@@ -213,7 +213,11 @@ describe("applyNarrativeEvent — client_block_actions", () => {
     expect(block.recordedActionsAt).toBe(1_000);
   });
 
-  it("carries recordedActions through a response event that hydrates from a real narrative_payload", () => {
+  it("restores the run-block id and carries recordedActions when the terminal payload omits workflowRunBlockId (real BE shape)", () => {
+    // The BE NarrativeBlock TypedDict has no workflowRunBlockId field, so a
+    // hydrated terminal block arrives with "". The terminal frame re-associates
+    // it with the live block by label, restoring the real id AND the recorded
+    // actions. Fails on the id-only reducer (which dropped both).
     const withActions = reduce([
       ...oneBlockRunning,
       blockActions({
@@ -239,7 +243,6 @@ describe("applyNarrativeEvent — client_block_actions", () => {
         terminal: "response",
         blocks: [
           {
-            workflowRunBlockId: "wrb_open_search",
             label: "open_search",
             blockType: "code",
             state: "completed",
@@ -253,8 +256,218 @@ describe("applyNarrativeEvent — client_block_actions", () => {
     };
     const after = applyNarrativeEvent(withActions, responseEvent);
     const block = after.blocks.find((b) => b.label === "open_search")!;
+    expect(block.workflowRunBlockId).toBe("wrb_open_search");
     expect(block.recordedActions).toHaveLength(1);
     expect(block.recordedActionsAt).toBe(1_000);
+  });
+
+  it("drops recorded actions at hydration when the label is ambiguous (loop iterations share it)", () => {
+    // Two run-block ids, same label — the payload can't tell them apart once it
+    // omits the id, so the safe outcome is today's drop, not mis-attribution.
+    const withActions = reduce([
+      turnStart(),
+      blockProgress({ block_label: "iterate", status: "running" }),
+      blockProgress({ block_label: "iterate", status: "completed" }),
+    ]);
+    // Second same-label block with a distinct id, plus its recorded actions.
+    const twoIds: TurnNarrativeState = {
+      ...withActions,
+      blocks: [
+        ...withActions.blocks,
+        {
+          ...withActions.blocks[0]!,
+          workflowRunBlockId: "wrb_iterate_2",
+        },
+      ],
+    };
+    const withBoth = applyNarrativeEvent(
+      twoIds,
+      blockActions({
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_iterate",
+            actions: [recordedAction({ actionId: "a1" })],
+          },
+          {
+            workflowRunBlockId: "wrb_iterate_2",
+            actions: [recordedAction({ actionId: "a2" })],
+          },
+        ],
+      }),
+    );
+    const responseEvent: WorkflowCopilotStreamResponseUpdate = {
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "Done",
+      response_time: "2026-06-10T00:01:00Z",
+      proposal_disposition: "no_proposal",
+      turn_id: "turn-1",
+      narrative_payload: {
+        turnId: "turn-1",
+        turnIndex: 0,
+        mode: "build",
+        terminal: "response",
+        blocks: [
+          {
+            label: "iterate",
+            blockType: "code",
+            state: "completed",
+            lastSeenIteration: 0,
+            activity: [],
+            startedAt: "2026-06-10T00:00:04Z",
+            endedAt: "2026-06-10T00:01:00Z",
+          },
+          {
+            label: "iterate",
+            blockType: "code",
+            state: "completed",
+            lastSeenIteration: 0,
+            activity: [],
+            startedAt: "2026-06-10T00:00:04Z",
+            endedAt: "2026-06-10T00:01:00Z",
+          },
+        ],
+      },
+    };
+    const after = applyNarrativeEvent(withBoth, responseEvent);
+    expect(after.blocks.every((b) => b.recordedActions === undefined)).toBe(
+      true,
+    );
+  });
+
+  it("does not mis-attribute when only the hydrated side duplicates a label", () => {
+    // One recorded source block with a unique label, but the terminal payload
+    // carries two blocks under that same label. Uniqueness must hold on BOTH
+    // sides, so the ambiguous hydrated pair drops rather than both copying the
+    // single source block's actions.
+    const withActions = reduce([
+      turnStart(),
+      blockProgress({ block_label: "extract", status: "running" }),
+      blockProgress({ block_label: "extract", status: "completed" }),
+      blockActions({
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_extract",
+            actions: [recordedAction({ actionId: "a1" })],
+          },
+        ],
+      }),
+    ]);
+    const dupBlock = {
+      label: "extract",
+      blockType: "code",
+      state: "completed",
+      lastSeenIteration: 0,
+      activity: [],
+      startedAt: "2026-06-10T00:00:04Z",
+      endedAt: "2026-06-10T00:01:00Z",
+    };
+    const responseEvent: WorkflowCopilotStreamResponseUpdate = {
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "Done",
+      response_time: "2026-06-10T00:01:00Z",
+      proposal_disposition: "no_proposal",
+      turn_id: "turn-1",
+      narrative_payload: {
+        turnId: "turn-1",
+        turnIndex: 0,
+        mode: "build",
+        terminal: "response",
+        blocks: [dupBlock, { ...dupBlock }],
+      },
+    };
+    const after = applyNarrativeEvent(withActions, responseEvent);
+    expect(after.blocks.every((b) => b.recordedActions === undefined)).toBe(
+      true,
+    );
+  });
+
+  const terminalResponse = (): WorkflowCopilotStreamResponseUpdate => ({
+    type: "response",
+    workflow_copilot_chat_id: "chat_1",
+    message: "Done",
+    response_time: "2026-06-10T00:01:00Z",
+    proposal_disposition: "no_proposal",
+    turn_id: "turn-1",
+    narrative_payload: {
+      turnId: "turn-1",
+      turnIndex: 0,
+      mode: "build",
+      terminal: "response",
+      blocks: [
+        {
+          label: "open_search",
+          blockType: "code",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-06-10T00:00:04Z",
+          endedAt: "2026-06-10T00:01:00Z",
+        },
+      ],
+    },
+  });
+
+  it("re-attaches a post-terminal fetch by the run-block id the terminal frame restored", () => {
+    // The recorded-actions fetch resolves AFTER the terminal frame froze the
+    // narrative. The terminal frame restored the real run-block id from the live
+    // block, so the late fetch matches by id (no label fallback needed).
+    const frozen = applyNarrativeEvent(
+      reduce(oneBlockRunning),
+      terminalResponse(),
+    );
+    expect(frozen.blocks[0]!.workflowRunBlockId).toBe("wrb_open_search");
+    const after = applyNarrativeEvent(
+      frozen,
+      blockActions({
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_open_search",
+            actions: [recordedAction({ actionId: "a1" })],
+          },
+        ],
+      }),
+    );
+    const block = after.blocks.find((b) => b.label === "open_search")!;
+    expect(block.recordedActions).toHaveLength(1);
+    expect(block.recordedActions![0]!.actionId).toBe("a1");
+  });
+
+  it("does not graft a later run's actions onto a prior turn's frozen block with the same label (P1)", () => {
+    // A prior turn's frozen block keeps its restored id and its own actions. A
+    // new run reuses the label but has a different id, so its fetch matches by
+    // id and never touches the prior turn.
+    const frozen = applyNarrativeEvent(
+      reduce([
+        ...oneBlockRunning,
+        blockActions({
+          blocks: [
+            {
+              workflowRunBlockId: "wrb_open_search",
+              actions: [recordedAction({ actionId: "a1" })],
+            },
+          ],
+        }),
+      ]),
+      terminalResponse(),
+    );
+    expect(frozen.blocks[0]!.workflowRunBlockId).toBe("wrb_open_search");
+    const after = applyNarrativeEvent(
+      frozen,
+      blockActions({
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_open_search_run2",
+            actions: [recordedAction({ actionId: "b1" })],
+          },
+        ],
+      }),
+    );
+    expect(after).toBe(frozen);
+    expect(after.blocks[0]!.recordedActions!.map((a) => a.actionId)).toEqual([
+      "a1",
+    ]);
   });
 
   it("staggers a second block's reveal start past the first block's own schedule total", () => {

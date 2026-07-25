@@ -235,6 +235,16 @@ class CreateCredentialRequest(BaseModel):
         default=False,
         description="Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
     )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="Optional plain browser profile to link as this credential's saved profile. Must be "
+        "an unmanaged profile in your organization that no other credential already owns.",
+    )
+    pin_saved_session_ip: bool = Field(
+        default=False,
+        description="Keep the same IP across sign-ins that reuse this credential's saved profile.",
+    )
+    tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
 
     @field_validator("proxy_location", mode="before")
     @classmethod
@@ -261,6 +271,10 @@ class CredentialResponse(BaseModel):
         description="Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')",
     )
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    pin_saved_session_ip: bool = Field(
+        default=False,
+        description="Whether sign-ins reusing this credential's saved profile keep the same IP",
+    )
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
     user_context: str | None = Field(
         default=None,
@@ -356,6 +370,10 @@ class Credential(BaseModel):
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    pin_saved_session_ip: bool = Field(
+        default=False,
+        description="Whether sign-ins reusing this credential's saved profile keep the same IP",
+    )
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
     user_context: str | None = Field(
         default=None,
@@ -427,6 +445,15 @@ class UpdateCredentialRequest(BaseModel):
     rotate_proxy_session_id: bool = Field(
         default=False,
         description="Rotate the Skyvern-managed proxy sticky-session id for this credential.",
+    )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="Plain browser profile to link as this credential's saved profile. Must be an "
+        "unmanaged profile in your organization that no other credential already owns.",
+    )
+    pin_saved_session_ip: bool | None = Field(
+        default=None,
+        description="Keep the same IP across sign-ins that reuse this credential's saved profile.",
     )
 
     @field_validator("user_context", mode="before")

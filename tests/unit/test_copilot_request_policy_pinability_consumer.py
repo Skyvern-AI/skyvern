@@ -17,17 +17,28 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     criteria_to_json,
     reconcile_completion_criteria,
 )
+from skyvern.forge.sdk.copilot.completion_output_grounding import floor_rekeyed_path_backing
 from skyvern.forge.sdk.copilot.completion_verification import RunEvidenceSnapshot, evaluate_completion_criteria
 from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    CriterionLevel,
+    ExpectedOutputShape,
+    RequestPolicy,
+    TrustedRequestSlotDatumBindingV1,
     _accept_request_slot_anchor_correction,
     _anchor_correction_rejection_capture,
     _apply_request_slot_datum_bindings,
+    _bind_criterion_to_request_slot,
     _classification_from_raw,
     _classify_request,
+    _interrogative_slot_classification_output_key,
+    _omitted_request_slot_datum_binding_targets,
+    _parse_fresh_request_slot_criteria,
     schema_output_path_aliases_from_criteria,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_PROMPT_NAME
 from skyvern.forge.sdk.copilot.request_slots import (
+    CanonicalRequestSlotV1,
     RequestSlotAntecedentFamily,
     RequestSlotDatumBindingDeclarationV1,
     RequestSlotDatumDeclineDeclarationV1,
@@ -80,6 +91,55 @@ P8_LIVE_ORIGINAL_PAYLOAD_FIXTURE = (
 P8_CLEAN_RETRY_CUSTODY_GAP_FIXTURE = (
     Path(__file__).parent / "fixtures" / "copilot" / "request_policy" / "sky_12671_p8_clean_retry_custody_gap.json"
 )
+
+
+def test_legacy_interrogative_key_synthesis_still_omits_path_subject() -> None:
+    assert _interrogative_slot_classification_output_key("whether the path is login-only") == "login_only"
+
+
+def test_direct_interrogative_slot_preserves_producer_undecidable_disposition() -> None:
+    source_quote = "whether the path is login-only"
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=f"Return {source_quote}.",
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote=source_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNDECIDABLE,
+                ),
+            ),
+        ),
+    )
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run classifies whether the path is login-only.",
+            kind="validation_classification",
+            classification_output_key="login_only",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        ),
+        slot=contract.slots[0],
+        source_quote=source_quote,
+    )
+
+    assert criterion.antecedent_family == "undecidable"
+    assert criterion.classification_output_key is None
+    assert criterion.mint_disposition == "degraded"
 
 
 def _recorded_p8_original_payload_bytes() -> bytes:
@@ -314,7 +374,10 @@ async def test_independent_request_slot_producer_recovers_primary_classifier_omi
     assert len(policy.completion_criteria) == 1
     criterion = policy.completion_criteria[0]
     assert criterion.outcome == source_quote
-    assert criterion.antecedent_family == "blocker"
+    assert criterion.antecedent_family == "undecidable"
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
     assert criterion.request_slot_id is not None
 
 
@@ -470,6 +533,472 @@ def _fresh_payload() -> dict[str, Any]:
             },
         ],
     }
+
+
+def _reported_boolean_contract(
+    pinability: RequestSlotPinability,
+) -> tuple[RequestSlotProducerInputV1, CanonicalRequestSlotV1]:
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request="Return a structured summary showing whether a public form exists.",
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="whether a public form exists",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=pinability,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+        ),
+    )
+    return request, contract.slots[0]
+
+
+def test_neutral_reported_boolean_mints_keyed_polarity_neutral_outcome() -> None:
+    _request_input, slot = _reported_boolean_contract(RequestSlotPinability.SHAPELESS_VALID)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            output_path="output.public_form_exists",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="whether a public form exists",
+    )
+
+    assert criterion.outcome == "The run reports whether public form exists."
+    assert criterion.kind == "outcome"
+    assert criterion.output_path is None
+    assert criterion.expected_output_value is None
+    assert criterion.expected_classification is None
+    assert criterion.expected_output_shape == "goal_judgment_boolean"
+    assert criterion.requested_output_evidence_source == "independent_run_evidence"
+    assert criterion.classification_output_key == "public_form_exists"
+    assert criterion.request_slot_id == slot.slot_id
+    assert criterion.pinability == "shapeless_valid"
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.mint_degrade is None
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+    trace = RequestPolicy(completion_criteria=[criterion]).to_trace_data()
+    assert trace["neutral_reported_boolean_criterion_count"] == 1
+    assert trace["neutral_reported_boolean_criterion_0_id"] == slot.slot_id
+    assert trace["neutral_reported_boolean_criterion_0_classification_output_key"] == "public_form_exists"
+    assert trace["neutral_reported_boolean_criterion_0_request_slot_id"] == slot.slot_id
+    assert trace["neutral_reported_boolean_criterion_0_mint_disposition"] == "decidable"
+    assert trace["neutral_reported_boolean_criterion_0_expected_output_value"] is None
+    assert trace["neutral_reported_boolean_criterion_0_expected_classification"] is None
+    assert trace["neutral_reported_boolean_criterion_0_requested_output_floor_rekeyed"] is False
+    assert trace["neutral_reported_boolean_criterion_0_floor_rekeyed_from_path"] is None
+
+
+def test_assertive_positive_reported_boolean_keeps_expected_polarity() -> None:
+    _request_input, slot = _reported_boolean_contract(RequestSlotPinability.PINNED)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            output_path="output.public_form_exists",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="whether a public form exists",
+    )
+
+    assert criterion.outcome == "A public form exists."
+    assert criterion.output_path == "output.public_form_exists"
+    assert criterion.expected_output_value is True
+    assert criterion.classification_output_key is None
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+    assert criterion.pinability == "pinned"
+    assert criterion.mint_disposition == "pending"
+
+
+def test_assertive_shapeless_boolean_degrades_instead_of_becoming_neutral() -> None:
+    _request_input, slot = _reported_boolean_contract(RequestSlotPinability.SHAPELESS_VALID)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            output_path="output.public_form_exists",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="a public form exists",
+    )
+
+    assert criterion.classification_output_key is None
+    assert criterion.expected_output_value is None
+    assert criterion.expected_output_shape is None
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+@pytest.mark.parametrize("binding_count", [0, 1, 2], ids=["association-absent", "associated", "association-ambiguous"])
+def test_omitted_public_form_row_preserves_neutral_output_binding(binding_count: int) -> None:
+    source_quote = "whether a public form exists"
+    criterion_outcome_sha256 = hashlib.sha256(b"The run classifies whether public form exists.").hexdigest()
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=f"Return a structured summary showing {source_quote}.",
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+        datum_targets=(
+            RequestSlotDatumTargetV1(
+                criterion_index=0,
+                datum_field="classification_output_key",
+                datum_value="public_form_exists",
+                criterion_outcome_sha256=criterion_outcome_sha256,
+            ),
+        ),
+    )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote=source_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+            datum_bindings=(
+                RequestSlotDatumBindingDeclarationV1(
+                    criterion_index=0,
+                    datum_field="classification_output_key",
+                    declined=False,
+                    source_id="u0",
+                    source_quote=source_quote,
+                ),
+            ),
+        ),
+    )
+    canonical_binding = contract.datum_bindings[0]
+    binding = TrustedRequestSlotDatumBindingV1(
+        version="1",
+        criterion_index=canonical_binding.criterion_index,
+        datum_field=canonical_binding.datum_field,
+        datum_value=canonical_binding.datum_value,
+        criterion_outcome_sha256=canonical_binding.criterion_outcome_sha256,
+        source_id=canonical_binding.source_id,
+        source_quote=canonical_binding.source_quote,
+        slot_id=canonical_binding.slot_id,
+    )
+
+    criterion = _parse_fresh_request_slot_criteria(
+        [],
+        request_slot_request=request,
+        request_slot_contract=contract,
+        trusted_datum_bindings=(binding,) * binding_count,
+    )[0]
+    backing = floor_rekeyed_path_backing(
+        SimpleNamespace(
+            code_artifact_metadata={
+                "validate_riverbend_public_service_path": {
+                    "claimed_outcomes": [{"goal_value_paths": ["public_form_exists"]}],
+                }
+            },
+            workflow_verification_evidence=None,
+            last_workflow_yaml=None,
+            workflow_yaml=None,
+        ),
+        [criterion],
+        {"validate_riverbend_public_service_path": {"public_form_exists": False}},
+        {"validate_riverbend_public_service_path": "registered_output_parameter"},
+        {"validate_riverbend_public_service_path": "code"},
+    )
+
+    if binding_count == 1:
+        assert criterion.outcome == "The run reports whether public form exists."
+        assert criterion.classification_output_key == "public_form_exists"
+        assert criterion.expected_output_shape == "goal_judgment_boolean"
+        assert criterion.requested_output_evidence_source == "independent_run_evidence"
+        assert criterion.requested_output_floor_rekeyed is False
+        assert criterion.floor_rekeyed_from_path is None
+        assert backing == {}
+    else:
+        assert criterion.classification_output_key is None
+        assert criterion.mint_disposition == "degraded"
+        assert criterion.requested_output_floor_rekeyed is False
+        assert criterion.floor_rekeyed_from_path is None
+        assert backing == {}
+
+
+def test_anchored_criterion_counts_as_representing_slot_without_datum_binding() -> None:
+    source_quote = "whether a public form exists"
+    request, slot = _reported_boolean_contract(RequestSlotPinability.SHAPELESS_VALID)
+    raw = [
+        {
+            "outcome": "The run reports whether public form exists.",
+            "request_slot_source_id": "u0",
+            "request_slot_source_quote": source_quote,
+        }
+    ]
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote=source_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+        ),
+    )
+
+    assert contract.slots[0].slot_id == slot.slot_id
+    assert (
+        _omitted_request_slot_datum_binding_targets(
+            raw,
+            request_slot_request=request,
+            request_slot_contract=contract,
+            existing_targets=(),
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_classify_request_mints_neutral_boolean_when_primary_omits_interrogative_row() -> None:
+    request_text = "Return a structured summary showing whether a public form exists."
+    source_quote = "whether a public form exists"
+    primary = {
+        "testing_intent": "require_test",
+        "credential_input_kind": "none",
+        "requires_user_clarification": False,
+        "completion_criteria": [],
+    }
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+            ),
+        ),
+    )
+    calls: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        calls.append(prompt_name)
+        if prompt_name != REQUEST_SLOT_PROMPT_NAME:
+            return primary
+        marker = "Datum targets from the immutable request-policy payload:\n```"
+        targets = json.loads(prompt.split(marker, 1)[1].split("```", 1)[0])
+        if not targets:
+            return envelope.model_dump(mode="json")
+        return _request_slot_envelope_with_target_bindings(
+            prompt,
+            envelope,
+            anchors_by_index={0: ("u0", source_quote)},
+        )
+
+    policy = await _classify_request(request_text, "", [], "", handler)
+
+    assert calls == [
+        "workflow-copilot-request-policy",
+        REQUEST_SLOT_PROMPT_NAME,
+        REQUEST_SLOT_PROMPT_NAME,
+        REQUEST_SLOT_PROMPT_NAME,
+        REQUEST_SLOT_PROMPT_NAME,
+    ]
+    assert policy.request_slot_failure_kind is None
+    assert len(policy.completion_criteria) == 1
+    criterion = policy.completion_criteria[0]
+    assert criterion.outcome == "The run reports whether public form exists."
+    assert criterion.classification_output_key == "public_form_exists"
+    assert criterion.expected_output_shape == "goal_judgment_boolean"
+    assert criterion.requested_output_evidence_source == "independent_run_evidence"
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+    assert criterion.mint_disposition == "decidable"
+
+
+@pytest.mark.parametrize(
+    ("slot_plane", "criterion_level"),
+    [
+        (RequestSlotPlane.DEFINITION, "run"),
+        (RequestSlotPlane.RUN, "definition"),
+    ],
+    ids=["definition_slot", "definition_criterion"],
+)
+def test_neutral_reported_boolean_requires_run_plane_slot_and_criterion(
+    slot_plane: RequestSlotPlane,
+    criterion_level: CriterionLevel,
+) -> None:
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request="Return a structured summary showing whether a public form exists.",
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    slot = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="whether a public form exists",
+                    plane=slot_plane,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
+                ),
+            ),
+        ),
+    ).slots[0]
+
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            level=criterion_level,
+            output_path="output.public_form_exists",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="whether a public form exists",
+    )
+
+    assert criterion.classification_output_key is None
+    assert criterion.expected_output_shape is None
+    assert criterion.requested_output_evidence_source == "independent_run_evidence"
+
+
+@pytest.mark.parametrize("output_path", [None, "output.review.public_form_exists"])
+def test_malformed_neutral_boolean_without_one_top_level_output_binding_stays_fail_closed(
+    output_path: str | None,
+) -> None:
+    _request_input, slot = _reported_boolean_contract(RequestSlotPinability.SHAPELESS_VALID)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            output_path=output_path,
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="whether a public form exists",
+    )
+
+    assert criterion.classification_output_key is None
+    assert criterion.expected_output_shape is None
+    assert criterion.expected_output_value is None
+    assert criterion.antecedent_family == "undecidable"
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+@pytest.mark.parametrize(
+    ("output_path", "classification_output_key"),
+    [
+        ("output.public_form_exists", "login_only"),
+        (None, "public.form.exists"),
+    ],
+)
+def test_malformed_neutral_boolean_with_conflicting_or_invalid_bindings_stays_fail_closed(
+    output_path: str | None,
+    classification_output_key: str,
+) -> None:
+    _request_input, slot = _reported_boolean_contract(RequestSlotPinability.SHAPELESS_VALID)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            output_path=output_path,
+            expected_output_value=True,
+            classification_output_key=classification_output_key,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="whether a public form exists",
+    )
+
+    assert criterion.classification_output_key is None
+    assert criterion.antecedent_family == "undecidable"
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+@pytest.mark.parametrize(
+    ("expected_output_value", "expected_output_shape", "expected_classification"),
+    [
+        (True, "goal_judgment_boolean", None),
+        (True, None, False),
+        (None, "goal_judgment_boolean", True),
+    ],
+)
+def test_malformed_neutral_boolean_with_multiple_boolean_signals_stays_fail_closed(
+    expected_output_value: bool | None,
+    expected_output_shape: ExpectedOutputShape | None,
+    expected_classification: bool | None,
+) -> None:
+    _request_input, slot = _reported_boolean_contract(RequestSlotPinability.SHAPELESS_VALID)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="A public form exists.",
+            output_path="output.public_form_exists",
+            expected_output_value=expected_output_value,
+            expected_output_shape=expected_output_shape,
+            expected_classification=expected_classification,
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        ),
+        slot=slot,
+        source_quote="whether a public form exists",
+    )
+
+    assert criterion.classification_output_key is None
+    assert criterion.expected_output_shape is None
+    assert criterion.expected_output_value is None
+    assert criterion.expected_classification is None
+    assert criterion.antecedent_family == "undecidable"
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
 
 
 def test_fresh_contract_consumes_declared_pinability_without_guessed_polarity() -> None:

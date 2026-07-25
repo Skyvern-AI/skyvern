@@ -855,7 +855,12 @@ async def _inspect_page_for_composition_impl(
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if isinstance(run_id, str) and run_id:
         evidence = store_post_run_page_evidence(copilot_ctx, evidence, run_id=run_id, current_url=current_url)
-        _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
+        _mark_post_run_page_observed(
+            copilot_ctx,
+            source_tool="inspect_page_for_composition",
+            url=current_url,
+            page_evidence=evidence,
+        )
     else:
         copilot_ctx.composition_page_evidence = evidence
 

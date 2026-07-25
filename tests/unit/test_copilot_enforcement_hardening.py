@@ -21,12 +21,18 @@ from typing import Any
 
 import pytest
 
+from skyvern.forge.sdk.copilot.agent import (
+    _finalize_result_with_blocker_override,
+    _with_scouted_spine_missing_steps,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_terminal_evidence_on_workflow_edit,
     maybe_clear_blocker_signal_on_tool_success,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.code_block_synthesis import UNFORGIVEN_DROP_FINDING, ObligationFinding
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -50,13 +56,16 @@ from skyvern.forge.sdk.copilot.enforcement import (
     SCREENSHOT_PLACEHOLDER,
     CopilotNonRetriableNavError,
     _check_enforcement,
+    _code_authoring_reject_count_resets,
     _is_context_window_error,
     _maybe_raise_non_retriable_nav,
     _needs_inspect_before_repair_nudge,
     _prune_input_list,
     _record_code_authoring_guardrail_reject,
     _recover_from_context_overflow,
+    _scouted_spine_missing_text,
     _strip_input_images,
+    code_authoring_churn_stop_would_claim,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
     synthesized_trajectory_reaches_goal,
@@ -64,12 +73,14 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
+from skyvern.forge.sdk.copilot.tools.workflow_update import _pre_persist_scouted_spine_result
 from skyvern.forge.sdk.copilot.turn_halt import (
     ADVISORY_DISPATCH_STALLED_REASON_CODE,
     CopilotTurnHalt,
     TurnHaltKind,
     expire_output_contract_ladder_at_turn_end,
 )
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant
 from tests.unit.conftest import make_copilot_context as _fresh_context
 
 # ---------------------------------------------------------------------------
@@ -847,3 +858,193 @@ def test_single_captured_interaction_trajectory_never_reaches_goal() -> None:
     ]
 
     assert synthesized_trajectory_reaches_goal(ctx) is False
+
+
+def test_scouted_spine_missing_text_renders_non_uncovered_families() -> None:
+    dropped = ObligationFinding(
+        kind=UNFORGIVEN_DROP_FINDING,
+        record={"tool_name": "fill_credential_field", "reason_code": "strict_selector", "trajectory_index": 2},
+    )
+    text = _scouted_spine_missing_text([dropped])
+    assert text
+    assert "fill_credential_field" in text
+
+
+def test_missing_steps_listed_on_give_up_offer_and_anchored_in_held_signal() -> None:
+    ctx = _fresh_context()
+    ctx.has_staged_proposal = True
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="The repair made no progress.",
+        user_facing_reason="I kept the draft.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="repair_ceiling_reached",
+        blocked_tool="update_workflow",
+    )
+    reply = _with_scouted_spine_missing_steps(ctx, "I kept the draft.", "`fill` on '#totp'")
+    assert "`fill` on '#totp'" in reply
+    assert "`fill` on '#totp'" in ctx.blocker_signal.user_facing_reason
+
+
+def test_missing_steps_not_appended_without_staged_proposal() -> None:
+    ctx = _fresh_context()
+    ctx.has_staged_proposal = False
+    assert _with_scouted_spine_missing_steps(ctx, "base", "`fill` on '#totp'") == "base"
+
+
+def _unrelated_owner_give_up_ctx(internal_reason_code: str) -> tuple[CopilotContext, str]:
+    ctx = _fresh_context()
+    ctx.has_staged_proposal = True
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.impose_synthesized_code_block = True
+    ctx.persisted_draft_browser_calls = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/search",
+            "trajectory_index": 0,
+        }
+    ]
+    unrelated_reason = "I couldn't finish this after several attempts. Tell me what to change and I'll try again."
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="An unrelated blocker owns the turn.",
+        user_facing_reason=unrelated_reason,
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=internal_reason_code,
+        blocked_tool="update_workflow",
+    )
+    ctx.blocker_signal_claimant = TurnClaimant.OUTPUT_CONTRACT_ACTUATION
+    return ctx, unrelated_reason
+
+
+def test_finalizer_names_missing_steps_when_unrelated_blocker_renders_give_up() -> None:
+    ctx, unrelated_reason = _unrelated_owner_give_up_ctx("output_contract_actuation_exhausted")
+    result = AgentResult(user_response="agent prose", updated_workflow=None, global_llm_context=None)
+
+    overridden = _finalize_result_with_blocker_override(ctx, result, exit_site="test")
+
+    assert "#search-submit" in overridden.user_response
+    assert ctx.blocker_signal.user_facing_reason == unrelated_reason
+    assert ctx.blocker_signal_claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
+
+
+@pytest.mark.parametrize(
+    "internal_reason_code",
+    ["repair_ceiling_reached", "completion_contract_unsatisfied", "output_contract_actuation_exhausted"],
+)
+def test_finalizer_render_exit_names_missing_steps_per_owner(internal_reason_code: str) -> None:
+    ctx, unrelated_reason = _unrelated_owner_give_up_ctx(internal_reason_code)
+    result = AgentResult(user_response="agent prose", updated_workflow=None, global_llm_context=None)
+
+    overridden = _finalize_result_with_blocker_override(ctx, result, exit_site="test")
+
+    assert "#search-submit" in overridden.user_response
+    assert overridden.user_response.count("This draft is still missing steps you demonstrated:") == 1
+    assert ctx.blocker_signal.user_facing_reason == unrelated_reason
+    assert ctx.blocker_signal_claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
+
+
+def test_same_omission_spine_violation_still_refused_after_change() -> None:
+    ctx = _fresh_context()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.impose_synthesized_code_block = True
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/search",
+            "trajectory_index": 0,
+        }
+    ]
+    omitting_draft = (
+        "title: t\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: report_only\n"
+        "    code: |\n"
+        '      print(await page.locator("body").inner_text())\n'
+    )
+    result = _pre_persist_scouted_spine_result(omitting_draft, ctx)
+    assert result is not None
+    assert result.repair_context is not None
+    assert result.repair_context.reason_code == "scouted_spine_under_build"
+    assert "#search-submit" in result.violations[0]
+
+
+def test_reject_count_resets_only_on_non_repeat_without_frontier_unchanged() -> None:
+    assert _code_authoring_reject_count_resets(False, False) is True
+    assert _code_authoring_reject_count_resets(False, True) is False
+    assert _code_authoring_reject_count_resets(None, False) is False
+    assert _code_authoring_reject_count_resets(True, False) is False
+
+
+def test_churn_stop_would_claim_true_at_ceiling_and_mutates_nothing() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+
+    assert code_authoring_churn_stop_would_claim(ctx) is True
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    assert ctx.blocker_signal is None
+
+
+def test_churn_stop_would_claim_false_below_ceiling() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+
+    assert code_authoring_churn_stop_would_claim(ctx) is False
+
+
+def test_churn_stop_would_claim_false_when_terminal_blocker_held() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="A site verification challenge blocked the run.",
+        user_facing_reason="The site's verification challenge blocked the run.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+    )
+
+    assert code_authoring_churn_stop_would_claim(ctx) is False
+
+
+def test_churn_stop_would_claim_yields_to_stronger_live_owner_and_mutates_nothing() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    ctx.output_contract_actuation_by_signature = {"sig": OutputContractAdvisoryState.GRANTED}
+
+    assert code_authoring_churn_stop_would_claim(ctx) is False
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    assert ctx.blocker_signal is None
+
+
+def test_churn_stop_would_claim_matches_recorder_claim_at_ceiling() -> None:
+    predicate_ctx = _fresh_context()
+    predicate_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    recorder_ctx = _fresh_context()
+    recorder_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+
+    would_claim = code_authoring_churn_stop_would_claim(predicate_ctx)
+    _record_code_authoring_guardrail_reject(recorder_ctx)
+
+    assert would_claim is True
+    claimed = recorder_ctx.blocker_signal
+    assert isinstance(claimed, CopilotToolBlockerSignal)
+    assert claimed.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def test_churn_stop_would_claim_matches_recorder_no_claim_below_ceiling() -> None:
+    predicate_ctx = _fresh_context()
+    predicate_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+    recorder_ctx = _fresh_context()
+    recorder_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+
+    would_claim = code_authoring_churn_stop_would_claim(predicate_ctx)
+    _record_code_authoring_guardrail_reject(recorder_ctx)
+
+    assert would_claim is False
+    assert recorder_ctx.blocker_signal is None

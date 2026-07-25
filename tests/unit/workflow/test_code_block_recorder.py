@@ -506,6 +506,26 @@ async def test_create_task_and_step_from_code_block_maps_goal_to_task(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_create_task_and_step_from_code_block_maps_empty_goal_to_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt-less code block stores navigation_goal NULL, not "", so action-plan lookups stay consistent."""
+    create_task = AsyncMock(return_value=_FakeTask())
+    monkeypatch.setattr(app.DATABASE.tasks, "get_last_task_for_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.tasks, "create_task", create_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task", AsyncMock(return_value=_FakeTask()))
+    monkeypatch.setattr(app.DATABASE.tasks, "create_step", AsyncMock(return_value=_FakeStep()))
+
+    block = _make_code_block("x = 1", goal="")
+    await ForgeAgent().create_task_and_step_from_code_block(
+        code_block=block,
+        organization_id="o_test",
+        workflow_run_id="wr_test",
+        task_url="https://example.com/login",
+    )
+
+    assert create_task.await_args.kwargs["navigation_goal"] is None
+
+
+@pytest.mark.asyncio
 async def test_create_task_and_step_from_code_block_fails_partial_task_on_step_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

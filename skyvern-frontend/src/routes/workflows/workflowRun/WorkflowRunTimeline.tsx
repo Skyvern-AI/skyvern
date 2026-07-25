@@ -56,6 +56,11 @@ type Props = {
   // Opt-in label search + jump-to-block; off by default so the legacy run
   // view renders no search UI and stays unchanged.
   enableSearch?: boolean;
+  // Studio surfaces the run's elapsed time here, next to the counts, with the
+  // created/queued/started/finished breakdown on its hover tooltip. Legacy
+  // passes neither and renders no duration.
+  elapsed?: string;
+  elapsedTitle?: string;
   onLiveStreamSelected: () => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
@@ -226,6 +231,8 @@ function WorkflowRunTimeline({
   workflowRunId,
   hideLiveBadge = false,
   enableSearch = false,
+  elapsed,
+  elapsedTitle,
   onLiveStreamSelected,
   onActionItemSelected,
   onBlockItemSelected,
@@ -394,6 +401,14 @@ function WorkflowRunTimeline({
         <span className="font-medium text-foreground dark:text-slate-200">
           Timeline
         </span>
+        {elapsed ? (
+          <span
+            className="text-muted-foreground dark:text-slate-500"
+            title={elapsedTitle || undefined}
+          >
+            · {elapsed}
+          </span>
+        ) : null}
         {totalBlocks > 0 && (
           <span
             className="text-muted-foreground dark:text-slate-500"

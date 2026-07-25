@@ -16,6 +16,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -56,7 +57,7 @@ class AgentStepRig:
     action_handler: AsyncMock
     update_statuses: list[StepStatus | None] = field(default_factory=list)
 
-    async def run(self) -> tuple[Step, DetailedAgentStepOutput]:
+    async def run(self, task_block: BaseTaskBlock | None = None) -> tuple[Step, DetailedAgentStepOutput]:
         skyvern_context.set(self.context)
         try:
             return await self.agent.agent_step(
@@ -64,6 +65,7 @@ class AgentStepRig:
                 step=self.step,
                 browser_state=self.browser_state,
                 organization=self.organization,
+                task_block=task_block,
             )
         finally:
             skyvern_context.reset()
@@ -210,6 +212,15 @@ async def test_injected_actions_from_prepare_step_execution_skip_llm(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_agent_step_wires_file_download_false_click_eligibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[_click()])
+
+    await rig.run(task_block=FileDownloadBlock.model_construct(label="test", complete_on_download=False))
+
+    assert rig.action_handler.await_args.kwargs["file_download_false_click_eligible"] is True
+
+
+@pytest.mark.asyncio
 async def test_no_generated_actions_marks_step_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = make_agent_step_rig(monkeypatch, parsed_actions=[])
 
@@ -300,6 +311,25 @@ async def test_failed_action_with_continue_flag_executes_remaining(monkeypatch: 
     assert handler.await_count == 2
     assert output.actions_and_results is not None
     assert [action for action, _ in output.actions_and_results] == [first, second]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("skip", "expected_calls"), [(True, 1), (False, 2)])
+async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
+    monkeypatch: pytest.MonkeyPatch, skip: bool, expected_calls: int
+) -> None:
+    first, duplicate = _click("node-1"), _click("node-1")
+    failure = ActionFailure(Exception("unverified click"))
+    failure.skip_remaining_actions = skip
+    action_handler = AsyncMock(return_value=[failure])
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[first, duplicate], action_handler=action_handler)
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert action_handler.await_count == expected_calls
+    assert output.actions_and_results is not None
+    assert [action for action, _ in output.actions_and_results] == ([first] if skip else [first, duplicate])
 
 
 @pytest.mark.asyncio

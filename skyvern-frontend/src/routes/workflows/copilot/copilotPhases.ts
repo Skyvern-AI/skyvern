@@ -137,13 +137,20 @@ function lastAuthoringToolName(
   return undefined;
 }
 
-function countAuthoringToolCalls(designActivity: ActivityEntry[]): number {
+// Raw designActivity count of tool_calls in `tools` — drives the Draft
+// "N drafts" (AUTHORING_TOOLS) and Test-run "N runs" (RUN_TOOLS) stubs, since
+// each update_workflow / update_and_run_blocks / run_blocks_and_collect_debug
+// call lands in designActivity.
+function countToolCalls(
+  designActivity: ActivityEntry[],
+  tools: Set<string>,
+): number {
   let count = 0;
   for (const entry of designActivity) {
     if (
       entry.kind === "tool_call" &&
       entry.toolName &&
-      AUTHORING_TOOLS.has(entry.toolName)
+      tools.has(entry.toolName)
     ) {
       count += 1;
     }
@@ -301,7 +308,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
       // count: it spans update_workflow (draft bucket) AND
       // update_and_run_blocks (test bucket), so there's no single
       // condensed bucket to count against the way the explore stub does.
-      const drafts = countAuthoringToolCalls(turn.designActivity);
+      const drafts = countToolCalls(turn.designActivity, AUTHORING_TOOLS);
       return drafts >= 2 ? `${base} · ${drafts} drafts` : base;
     }
     // test
@@ -314,7 +321,15 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
         ? `${pluralize(latestBlocks.length, "block")} · stopped`
         : "stopped";
     }
-    if (anyNotDemonstrated) return "· not confirmed";
+    if (anyNotDemonstrated) {
+      // Surface how many test runs the redraft loop actually made — otherwise a
+      // 6-run "not confirmed" turn looks identical to a 1-run one. Omit at 1 to
+      // keep today's look (meaningful-or-nothing).
+      const runs = countToolCalls(turn.designActivity, RUN_TOOLS);
+      return runs >= 2
+        ? `${pluralize(runs, "run")} · not confirmed`
+        : "· not confirmed";
+    }
     const { start, end } = spanIso(latestBlocks);
     const elapsed = formatElapsed(start, end);
     return elapsed

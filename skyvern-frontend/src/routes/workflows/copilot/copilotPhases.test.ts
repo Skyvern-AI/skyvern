@@ -12,6 +12,7 @@ import {
   BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
+  toolActivityDisplayLabel,
 } from "./narrativeState";
 
 const entry = (
@@ -63,6 +64,21 @@ describe("AUTHORING_TOOLS / RUN_TOOLS", () => {
   it("run_blocks_and_collect_debug is a run tool only, not authoring", () => {
     expect(RUN_TOOLS.has("run_blocks_and_collect_debug")).toBe(true);
     expect(AUTHORING_TOOLS.has("run_blocks_and_collect_debug")).toBe(false);
+  });
+});
+
+describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
+  it("labels discover_workflow_entrypoint and inspect_page_for_composition", () => {
+    expect(toolActivityDisplayLabel("discover_workflow_entrypoint")).toBe(
+      "Finding the entry page",
+    );
+    expect(toolActivityDisplayLabel("inspect_page_for_composition")).toBe(
+      "Inspecting the page",
+    );
+  });
+
+  it("still falls back to Working for unmapped tools", () => {
+    expect(toolActivityDisplayLabel("some_unmapped_tool")).toBe("Working");
   });
 });
 
@@ -595,5 +611,34 @@ describe("derivePhases — redraft re-activation (SKY-11970 pin)", () => {
     const rows = derivePhases(t);
     expect(phase(rows, "test").status).toBe("active");
     expect(phase(rows, "draft").status).not.toBe("active");
+  });
+});
+
+describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)", () => {
+  const notConfirmedTurn = (runToolNames: string[]): TurnNarrativeState =>
+    turn({
+      terminal: "response",
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [block({ state: "completed", outcome: "not_demonstrated" })],
+      designActivity: runToolNames.map((toolName, i) =>
+        entry({ id: `r${i}`, kind: "tool_call", toolName }),
+      ),
+    });
+
+  it("surfaces the run count on a multi-run redraft loop (else 6 runs read as 1)", () => {
+    const rows = derivePhases(
+      notConfirmedTurn([
+        "update_and_run_blocks",
+        "update_and_run_blocks",
+        "run_blocks_and_collect_debug",
+      ]),
+    );
+    expect(phase(rows, "test").stub).toBe("3 runs · not confirmed");
+  });
+
+  it("omits the count for a single run, keeping today's look", () => {
+    const rows = derivePhases(notConfirmedTurn(["update_and_run_blocks"]));
+    expect(phase(rows, "test").stub).toBe("· not confirmed");
   });
 });

@@ -64,7 +64,8 @@ def _patch_workflow_context(monkeypatch: pytest.MonkeyPatch, workflow_context: _
         SimpleNamespace(
             WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
                 get_workflow_run_context=lambda _workflow_run_id: workflow_context,
-            )
+            ),
+            BROWSER_MANAGER=SimpleNamespace(get_for_task=lambda *_args, **_kwargs: None),
         ),
     )
 
@@ -313,7 +314,7 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
         InputTextAction(element_id="otp", text=workflow_context.placeholder),
         MagicMock(),
         scraped_page,
-        SimpleNamespace(workflow_run_id="wr_test"),
+        SimpleNamespace(workflow_run_id="wr_test", task_id="task_test"),
         MagicMock(),
     )
 

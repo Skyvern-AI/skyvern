@@ -85,7 +85,11 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
+from skyvern.forge.sdk.api.llm.exceptions import (
+    LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE,
+    LLM_PROVIDER_ERROR_TYPE,
+    LLMResponseMissingActionsError,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
@@ -117,6 +121,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
     CodeBlock,
+    FileDownloadBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -170,7 +175,10 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
+from skyvern.webeye.cdp_download_interceptor import (
+    download_filename_from_suffix,
+    settle_browser_downloads_for_context,
+)
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
@@ -236,19 +244,28 @@ class _PromptCeilingExceeded(Exception):
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
 
-# Exception types that indicate an LLM-specific step failure (context window, provider errors).
+# Exception types that indicate an LLM-specific step failure (context window, provider errors,
+# unusable responses).
 # Used by summary_failure_reason_for_max_retries to distinguish LLM failures from browser/runtime crashes.
 _LLM_STEP_EXCEPTIONS = frozenset(
     {
         "SkyvernContextWindowExceededError",
         "LLMProviderError",
         "LLMProviderErrorRetryableTask",
+        "LLMResponseMissingActionsError",
     }
 )
 
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": reasoning}]
+
+
+def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
+    actions_payload = json_response.get("actions")
+    if not isinstance(actions_payload, list):
+        raise LLMResponseMissingActionsError(list(json_response.keys()))
+    return actions_payload
 
 
 # Phrases the verifier / validator LLMs use when they rely on exact-string
@@ -513,7 +530,11 @@ class ForgeAgent:
             )
             list_files_after = list_files_after + browser_session_downloaded_files_after
 
-        files_to_rename = list(set(list_files_after) - set(list_files_before))
+        files_to_rename = [
+            file
+            for file in set(list_files_after) - set(list_files_before)
+            if Path(file).suffix != BROWSER_DOWNLOADING_SUFFIX
+        ]
         if not files_to_rename:
             return []
         for file in files_to_rename:
@@ -712,7 +733,7 @@ class ForgeAgent:
             task = await app.DATABASE.tasks.create_task(
                 url=task_url,
                 title=code_block.label,
-                navigation_goal=code_block.prompt,
+                navigation_goal=code_block.prompt or None,
                 data_extraction_goal=None,
                 navigation_payload=None,
                 organization_id=organization_id,
@@ -1650,6 +1671,7 @@ class ForgeAgent:
                 detailed_agent_step_output=detailed_agent_step_output,
                 pdf_auto_download_src=pdf_auto_download_src,
                 pdf_auto_download_used_bytes=pdf_auto_download_used_bytes,
+                file_download_false_click_eligible=isinstance(task_block, FileDownloadBlock),
                 _step_span=_step_span,
                 artifact_tracker=artifact_tracker,
             )
@@ -1725,6 +1747,7 @@ class ForgeAgent:
         detailed_agent_step_output: DetailedAgentStepOutput,
         pdf_auto_download_src: str | None,
         pdf_auto_download_used_bytes: bool,
+        file_download_false_click_eligible: bool,
         _step_span: otel_trace.Span,
         artifact_tracker: _BackgroundArtifactTaskTracker,
     ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
@@ -1885,6 +1908,7 @@ class ForgeAgent:
                 step=step,
                 page=current_page,
                 action=action,
+                file_download_false_click_eligible=file_download_false_click_eligible,
             )
             await app.AGENT_FUNCTION.post_action_execution(action)
             detailed_agent_step_output.actions_and_results[action_idx] = (
@@ -1987,7 +2011,9 @@ class ForgeAgent:
                     action_result=results,
                 )
             else:
-                if action_node.next is not None:
+                # A failure that set skip_remaining_actions must not fall through to the duplicate
+                # element id, or the action it was protecting against gets replayed anyway.
+                if action_node.next is not None and (not results or not results[-1].skip_remaining_actions):
                     LOG.warning(
                         "Action failed, but have duplicated element id in the action list. Continue excuting.",
                         step_order=step.order,
@@ -2343,7 +2369,7 @@ class ForgeAgent:
                             actions = otp_actions
                         else:
                             actions = parse_actions(
-                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                                task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
                             )
 
                     if context:
@@ -4095,6 +4121,8 @@ class ForgeAgent:
                 template = "single-upload-action"
             elif action_type == ActionType.SELECT_OPTION:
                 template = "single-select-action"
+            elif action_type == ActionType.HOVER:
+                template = "single-hover-action"
             else:
                 raise UnsupportedActionType(action_type=action_type)
 
@@ -4791,7 +4819,11 @@ class ForgeAgent:
                     # Keep both finalize and save inside a single timeout budget so a hung
                     # finalize call cannot block persistence forever; accept the trade-off
                     # that a very slow finalize on many files could crowd out save.
+                    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+                    browser_context = browser_state.browser_context if browser_state is not None else None
                     async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                        async with settle_browser_downloads_for_context(browser_context):
+                            pass
                         if download_suffix and list_files_before is not None:
                             await self._finalize_downloaded_files_for_task(
                                 task,
@@ -5368,6 +5400,20 @@ class ForgeAgent:
                 "User goal verification failed in parallel mode, will continue with next step",
                 step_id=step.step_id,
                 exc_info=True,
+            )
+            complete_action = None
+
+        if isinstance(complete_action, CompleteAction) and not await app.AGENT_FUNCTION.gate_step_completion(
+            task=task,
+            step=step,
+            task_block=task_block,
+            page=page,
+            browser_state=browser_state,
+        ):
+            LOG.info(
+                "Step completion vetoed by completion gate; continuing with next step",
+                task_id=task.task_id,
+                step_id=step.step_id,
             )
             complete_action = None
 
@@ -5949,12 +5995,13 @@ class ForgeAgent:
                         f"The task failed because all {max_retries} retry attempts failed to generate actions. "
                         f"This is typically caused by the page content exceeding the LLM context window, "
                         f"LLM service errors during action extraction (rate limiting, service outages), "
-                        f"or oversized input data. Please reduce the page content or input data size and try again."
+                        f"a malformed model response that could not be parsed into actions, "
+                        f"or oversized input data. If the input is large, try reducing the page content or input data size."
                     ),
                     errors=[],
                     failure_categories=_llm_error_category(
                         "All retry steps failed without producing actions — "
-                        "LLM context window exceeded or provider error during action extraction."
+                        "LLM context window exceeded, malformed response, or provider error during action extraction."
                     ),
                     failure_category_source="code_level",
                 )
@@ -6168,7 +6215,28 @@ class ForgeAgent:
                     task_block=task_block,
                 )
 
-        if step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal)):
+        goal_achieved = step.is_goal_achieved(has_navigation_goal=bool(task.navigation_goal))
+        # A decisive COMPLETE action skips parallel verification, so this is the other place a
+        # completion is accepted — gate it too, or the veto is bypassed whenever the agent emits
+        # complete directly.
+        if (
+            goal_achieved
+            and browser_state is not None
+            and not await app.AGENT_FUNCTION.gate_step_completion(
+                task=task,
+                step=step,
+                task_block=task_block,
+                page=page,
+                browser_state=browser_state,
+            )
+        ):
+            LOG.info(
+                "Decisive step completion vetoed by completion gate; continuing with next step",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            goal_achieved = False
+        if goal_achieved:
             LOG.info(
                 "Step completed and goal achieved, marking task as completed",
                 step_order=step.order,
@@ -6341,7 +6409,9 @@ class ForgeAgent:
             json_response = await self.handle_potential_verification_code(
                 task, step, scraped_page, browser_state, json_response
             )
-            actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+            actions = parse_actions(
+                task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
+            )
             return json_response, actions
 
         if should_verify_by_magic_link:

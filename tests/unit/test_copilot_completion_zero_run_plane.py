@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _should_apply_code_only_success_without_review
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     CompletionCriteriaTurnState,
     note_adjudication_on_turn_state,
@@ -16,7 +15,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     combine_verification_results,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -112,7 +110,16 @@ async def test_all_method_mandated_floor_fallback_gate_fires(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_fallback_with_real_run_plane_criterion_does_not_fire(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(**_: object) -> dict:
-        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "observed_end_state_url",
+                }
+            ]
+        }
 
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
@@ -348,18 +355,3 @@ def test_rollback_anchor_not_recorded_for_definition_only_contract() -> None:
     note_adjudication_on_turn_state(turn_state, verification, fully_satisfied_workflow_yaml="x: y")
 
     assert turn_state.fully_satisfied_workflow_yaml is None
-
-
-def test_gated_state_does_not_auto_apply_code_only_success() -> None:
-    ctx = _ctx()
-    ctx.request_policy = RequestPolicy(completion_criteria=[], classifier_status="fallback")
-    ctx.completion_verification_result = CompletionVerificationResult(
-        status="evaluated", criterion_ids=[], verdicts=[], no_gradeable_run_plane=True
-    )
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.has_staged_proposal = True
-    ctx.staged_workflow = SimpleNamespace()  # type: ignore[assignment]
-    ctx.last_test_ok = True
-    ctx.last_full_workflow_test_ok = False
-
-    assert _should_apply_code_only_success_without_review(ctx, "auto_applicable") is False

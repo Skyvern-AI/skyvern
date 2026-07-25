@@ -10,7 +10,7 @@ Rules:
 - If you cannot tell from the evidence, set satisfied=false and reason_code=unknown.
 - A criterion may include [contingent_on=...] and [contingent_antecedent_output_path=output.<field>]. The server handles whether the antecedent fired from structured run output; you must grade the listed outcome normally against the produced evidence. Use evidence_confirms only when the consequent is shown, no_evidence when the required blocker/report evidence is missing, and evidence_contradicts when the evidence refutes it.
 - For an implicit constraint (e.g. "added exactly once"), check the end-state value (e.g. a cart quantity), not whether an add step ran.
-- evidence_ref: a short pointer to the specific evidence you used (a block label or the observed URL), or null.
+- evidence_ref: when satisfied=true, use an exact evidence label shown above, optionally followed by a dotted/indexed path into that record (for example `confirm_cart.items[0].quantity` or `observed_end_state_url`). Never return a literal URL. If a structured record is truncated so its nested path is not completely visible, cite the record label without a path. Use null only when satisfied=false.
 
 reason_code is one of: evidence_confirms (satisfied=true), no_evidence, evidence_contradicts, unknown.
 

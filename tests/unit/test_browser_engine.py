@@ -30,6 +30,12 @@ from skyvern.webeye.browser_engine import (
     UnknownBrowserEngine,
     resolve_browser_engine,
 )
+from skyvern.webeye.browser_errors import (
+    BrowserAutomationError,
+    BrowserEngineErrorFamilies,
+    BrowserErrorFamiliesConfigError,
+    BrowserTimeoutError,
+)
 
 
 class _EngineAError(Exception):
@@ -264,6 +270,107 @@ def test_oss_module_only_references_oss_safe_driver_packages():
     driver_packages = set(re.findall(r"from (\w+)\.async_api", source))
     assert driver_packages <= {"playwright", "rustwright"}, driver_packages
     assert browser_engine.REGISTRY.names() >= {STOCK_ENGINE_NAME, browser_engine.RUSTWRIGHT_ENGINE_NAME}
+
+
+def test_selection_binds_base_timeout_error_families_from_engine_identities():
+    # The selection owns an immutable BrowserEngineErrorFamilies built from the exact package
+    # identities the spec loaded lazily at select() time (base + timeout only — the stable public
+    # identities every driver exposes).
+    sel = browser_engine.REGISTRY.get(STOCK_ENGINE_NAME).select(selection_reason="test")
+    assert isinstance(sel.error_families, BrowserEngineErrorFamilies)
+    assert sel.error_families.base_error_types == (PlaywrightError,)
+    assert sel.error_families.timeout_types == (PlaywrightTimeoutError,)
+
+
+def test_selection_classify_error_maps_native_timeout_and_base_preserving_cause():
+    sel = browser_engine.REGISTRY.get(STOCK_ENGINE_NAME).select(selection_reason="test")
+
+    native_timeout = PlaywrightTimeoutError("navigation timed out")
+    classified_timeout = sel.classify_error(native_timeout)
+    assert type(classified_timeout) is BrowserTimeoutError
+    assert classified_timeout.__cause__ is native_timeout
+
+    native_base = PlaywrightError("generic driver failure")
+    classified_base = sel.classify_error(native_base)
+    assert type(classified_base) is BrowserAutomationError
+    assert classified_base.__cause__ is native_base
+
+
+def test_selection_classify_error_returns_none_for_foreign_and_unknown():
+    # A foreign engine's native error and an unrelated stdlib error are both invisible to this
+    # engine's families, so the caller must re-raise them (None, never swallowed).
+    sel = browser_engine.REGISTRY.get(STOCK_ENGINE_NAME).select(selection_reason="test")
+    assert sel.classify_error(_EngineAError("foreign engine error")) is None
+    assert sel.classify_error(ValueError("unrelated")) is None
+
+
+def test_selection_classify_error_is_bound_to_its_own_engine_identity():
+    # Adapter-bound: a selection classifies only its own driver family, not another engine's, even
+    # when the two engines' class names/hierarchies mirror each other.
+    sel_a = _selection("engine-a", _EngineAError, _EngineATimeout)
+    assert type(sel_a.classify_error(_EngineATimeout("slow"))) is BrowserTimeoutError
+    assert type(sel_a.classify_error(_EngineAError("boom"))) is BrowserAutomationError
+    assert sel_a.classify_error(_EngineBError("other engine")) is None
+    assert sel_a.classify_error(_EngineBTimeout("other engine slow")) is None
+
+
+def test_directly_constructed_selection_derives_error_families_and_stays_helper_compatible():
+    # A selection built without an explicit families object (as the existing constructors do) still
+    # derives its families, and the derivation does not disturb the is_engine_* helpers.
+    sel = _selection("engine-a", _EngineAError, _EngineATimeout)
+    assert sel.error_families.base_error_types == (_EngineAError,)
+    assert sel.error_families.timeout_types == (_EngineATimeout,)
+    assert sel.is_engine_error(_EngineAError())
+    assert sel.is_engine_timeout_error(_EngineATimeout())
+    assert not sel.is_engine_error(_EngineBError())
+
+
+def test_same_class_base_and_timeout_derives_single_family_and_classifies_as_timeout():
+    # Compatibility branch: an engine (or fake) that reports the SAME class for both its base and
+    # timeout identity must not trip the one-type-per-family guard. The shared class lands only in the
+    # timeout family (the more-specific view classification checks first), base_error_types is empty,
+    # and the class still classifies — as a timeout, with __cause__ preserved. The is_engine_* helpers
+    # stay true because they check the raw identities, independent of the derived families.
+    class SharedError(Exception):
+        pass
+
+    sel = _selection("engine-shared", SharedError, SharedError)
+    assert sel.error_families.base_error_types == ()
+    assert sel.error_families.timeout_types == (SharedError,)
+
+    original = SharedError("shared native error")
+    classified = sel.classify_error(original)
+    assert type(classified) is BrowserTimeoutError
+    assert classified.__cause__ is original
+
+    assert sel.is_engine_error(SharedError())
+    assert sel.is_engine_timeout_error(SharedError())
+
+
+def test_reverse_hierarchy_timeout_over_base_rejects_construction():
+    # If the base error subclasses the timeout (reverse of every real driver), a plain base error
+    # would classify as a timeout and is_engine_error/is_engine_timeout_error would disagree. The
+    # selection must fail loudly at construction rather than bind a misleading engine.
+    class _Parent(Exception):
+        pass
+
+    class _Child(_Parent):
+        pass
+
+    with pytest.raises(BrowserErrorFamiliesConfigError):
+        _selection("engine-reverse", error_type=_Child, timeout_type=_Parent)
+
+
+def test_unrelated_base_and_timeout_identities_reject_construction():
+    # Unrelated identities would leave a timeout outside the engine's error family; reject them.
+    class _Base(Exception):
+        pass
+
+    class _Unrelated(Exception):
+        pass
+
+    with pytest.raises(BrowserErrorFamiliesConfigError):
+        _selection("engine-unrelated", error_type=_Base, timeout_type=_Unrelated)
 
 
 async def _ok_start():

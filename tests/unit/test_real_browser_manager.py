@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -557,8 +559,10 @@ async def test_popup_video_listener_registers_pre_existing_pages() -> None:
     browser_context.pages = [initial_page]
     set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
 
-    # Let the ensure_future tasks run
-    await asyncio.sleep(0)
+    # Let the ensure_future tasks run to completion (registration spans multiple loop turns)
+    async with asyncio.timeout(1):
+        while not artifacts.video_artifacts:
+            await asyncio.sleep(0)
 
     paths = [va.video_path for va in artifacts.video_artifacts]
     assert paths == ["/tmp/videos/initial.webm"]
@@ -1019,3 +1023,74 @@ async def test_pbs_recovery_falls_through_to_get_or_create_page_when_fresh_state
     assert create_call.kwargs.get("url") == "https://example.com"
     # We never re-attempted navigate_to_url on the fresh state (no page to use).
     fresh.navigate_to_url.assert_not_awaited()
+
+
+class _EngineUnderTestError(Exception):
+    pass
+
+
+class _EngineUnderTestTimeout(_EngineUnderTestError):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_stamps_resolved_engine_selection() -> None:
+    """The exact BrowserEngineSelection resolved at the manager's ownership boundary
+    (get_or_resolve_engine_selection) must be the identical object pinned on the constructed
+    RealBrowserState, so a run's recovery/classification code binds to THIS run's engine identity
+    rather than a rebuilt or dropped selection."""
+    manager = RealBrowserManager()
+    fake_pw = MagicMock()
+    selection = BrowserEngineSelection(
+        name="engine-under-test",
+        start_driver=AsyncMock(return_value=fake_pw),
+        error_type=_EngineUnderTestError,
+        timeout_error_type=_EngineUnderTestTimeout,
+        metadata=BrowserEngineMetadata(name="engine-under-test", version="0.0.0"),
+        selection_reason="test",
+    )
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ) as create_browser_context,
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_engine_stamp")
+
+    assert state.engine_selection is selection
+    assert state.pw is fake_pw
+    selection.start_driver.assert_awaited_once()
+    assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+
+
+@pytest.mark.asyncio
+async def test_repair_forwards_pinned_engine_selection() -> None:
+    selection = BrowserEngineSelection(
+        name="engine-under-test",
+        start_driver=AsyncMock(),
+        error_type=_EngineUnderTestError,
+        timeout_error_type=_EngineUnderTestTimeout,
+        metadata=BrowserEngineMetadata(name="engine-under-test", version="0.0.0"),
+        selection_reason="test",
+    )
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=None,
+        engine_selection=selection,
+    )
+    context = MagicMock()
+    context.pages = []
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            AsyncMock(return_value=(context, BrowserArtifacts(), None)),
+        ) as create_browser_context,
+        patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+    ):
+        await state.check_and_fix_state()
+
+    assert create_browser_context.await_args.kwargs["engine_selection"] is selection

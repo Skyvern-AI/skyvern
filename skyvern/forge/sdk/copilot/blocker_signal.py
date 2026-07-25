@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ RecoveryHint = Literal[
 ]
 
 LOG = structlog.get_logger()
+METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE = "metadata_reject_same_key_terminal"
 
 
 # Matched case-insensitively. Imperative variants are narrow ("do not run" etc.) so plain "do not worry" prose doesn't false-positive.
@@ -147,6 +149,52 @@ class CopilotToolBlockerSignal(BaseModel):
     @field_serializer("extra")
     def _serialize_extra(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
+
+
+def build_metadata_reject_same_key_terminal_signal(
+    *,
+    structural_key: str,
+    reject_family: Literal[
+        "missing_code_artifact_metadata",
+        "metadata_normalization",
+        "recorded_outcome_output_candidate",
+        "recorded_outcome_output_coverage",
+    ],
+    missing_fields_by_label: Mapping[str, list[str]],
+) -> CopilotToolBlockerSignal:
+    exact_fields = {label: list(fields) for label, fields in missing_fields_by_label.items()}
+    rendered_fields = json.dumps(exact_fields, sort_keys=True, separators=(",", ":"))
+    user_facing_reason = (
+        "I couldn't satisfy the code_artifact_metadata gate after repeated identical submissions. "
+        f"missing_fields_by_label={rendered_fields}. I've kept the draft so those exact fields can be added."
+    )
+    try:
+        assert_clean_user_facing_text(user_facing_reason, blocked_tool="update_and_run_blocks")
+    except ValueError:
+        user_facing_reason = (
+            "I couldn't satisfy the required output metadata after repeated identical submissions. "
+            "I've kept the draft so the missing fields can be added."
+        )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=(
+            "The same structural metadata rejection reached its terminal rung. Preserve the draft and report "
+            f"the code_artifact_metadata gate with missing_fields_by_label={rendered_fields}."
+        ),
+        user_facing_reason=user_facing_reason,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
+        blocked_tool="update_and_run_blocks",
+        extra={
+            "reject_family": reject_family,
+            "structural_key": structural_key,
+            "gate_id": "code_artifact_metadata",
+            "missing_fields_by_label": exact_fields,
+        },
+    )
 
 
 def build_output_source_unobservable_blocker_signal(
@@ -275,6 +323,7 @@ class TerminalEvidence:
 @dataclass(frozen=True)
 class LoopBlockerEvidence(TerminalEvidence):
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+    output_policy_reject_reason_codes: frozenset[str] | None = None
 
 
 class _LoopEvidenceCtx(Protocol):
@@ -287,6 +336,7 @@ class _LoopEvidenceCtx(Protocol):
     staged_workflow_yaml: str | None
     has_staged_proposal: bool
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None
+    last_output_policy_reject_reason_codes: frozenset[str] | None
 
 
 class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
@@ -306,6 +356,7 @@ class _TerminalEvidenceResetCtx(Protocol):
     last_run_blocks_block_labels: list[str]
     last_run_outcome: RecordedRunOutcome | None
     last_run_outcome_block_labels: list[str]
+    terminal_envelope_run_outcomes: list[RecordedRunOutcome]
     last_outcome_gate_reason: str | None
     last_outcome_gate_workflow_run_id: str | None
     last_test_anti_bot: str | None
@@ -342,6 +393,7 @@ def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> 
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None
     ctx.last_run_outcome_block_labels = []
+    ctx.terminal_envelope_run_outcomes = []
     ctx.last_outcome_gate_reason = None
     ctx.last_outcome_gate_workflow_run_id = None
     ctx.last_test_anti_bot = None
@@ -356,6 +408,7 @@ def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence
     evidence = terminal_evidence_from_ctx(ctx)
     # Older context snapshots may not carry fields added after the snapshot was created.
     result_steer = getattr(ctx, "latest_evaluate_result_composition_steer", None)
+    reject_reason_codes = getattr(ctx, "last_output_policy_reject_reason_codes", None)
     return LoopBlockerEvidence(
         outcome_gate_reason=evidence.outcome_gate_reason,
         outcome_gate_workflow_run_id=evidence.outcome_gate_workflow_run_id,
@@ -364,6 +417,7 @@ def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence
         anti_bot_blocked=evidence.anti_bot_blocked,
         has_draft=evidence.has_draft,
         latest_evaluate_result_composition_steer=result_steer,
+        output_policy_reject_reason_codes=reject_reason_codes if isinstance(reject_reason_codes, frozenset) else None,
     )
 
 
@@ -395,6 +449,7 @@ RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
 DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE = "definition_contract_unsatisfied"
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE = "output_contract_reject_budget_exhausted"
+DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE = "loop_detected_discovery_exhausted_no_entry_url"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -420,6 +475,8 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         "advisory_dispatch_stalled",
         DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
         "repair_ceiling_reached",
+        METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
+        DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
 
@@ -545,6 +602,14 @@ _LOOP_CREDENTIAL_TEMPLATE = (
 )
 CREDENTIAL_SCOUT_VERIFY_REPLY = (
     "I need to verify the saved-credential login in the browser before I can save or run this code."
+)
+# Mirrors OutputPolicyReason.RAW_SECRET_LEAK.value; kept local because output_policy imports this
+# module, so importing back would be circular.
+RAW_SECRET_LEAK_REASON_CODE = "raw_secret_leak"
+RAW_SECRET_EMBED_REFUSAL_REPLY = (
+    "I couldn't save this because the login code kept embedding the credential's secret value directly "
+    "instead of referencing your saved credential. Your draft is preserved — tell me to reference the "
+    "saved credential and I'll try again."
 )
 _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     "loop_detected_repeated_failed_step": (
@@ -701,6 +766,9 @@ def compose_loop_blocker_user_facing_reason(
     if internal_reason_code == "loop_detected_credential_or_parameter_misconfig":
         return _LOOP_CREDENTIAL_TEMPLATE, draft_tier
     if internal_reason_code == "credential_priority_authoring_churn":
+        reject_reason_codes = evidence.output_policy_reject_reason_codes if evidence is not None else None
+        if reject_reason_codes == frozenset({RAW_SECRET_LEAK_REASON_CODE}):
+            return RAW_SECRET_EMBED_REFUSAL_REPLY, draft_tier
         return CREDENTIAL_SCOUT_VERIFY_REPLY, draft_tier
     framing, ask = _LOOP_BRANCH_COPY.get(internal_reason_code or "", _LOOP_BRANCH_COPY["loop_detected_generic"])
     result_steer = evidence.latest_evaluate_result_composition_steer if evidence is not None else None

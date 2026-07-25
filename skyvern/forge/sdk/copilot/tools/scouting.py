@@ -13,16 +13,30 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    RecordedBuildTestOutcome,
+    bind_post_run_page_path_failure,
     record_build_test_outcome,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import normalized_scout_selector
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _is_positional_selector,
+    dynamic_row_evidence_fingerprint,
+    dynamic_row_period_matches_match_selected_row,
+    locator_selector_literals,
+    normalized_locator_expr,
+    normalized_scout_selector,
+    synthesize_code_block,
+    validated_dynamic_row_period_matches,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    scout_dynamic_row_evidence_expression as _scout_dynamic_row_evidence_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
@@ -58,6 +72,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
+    ScoutedDynamicRowEvidence,
     ScoutedInteraction,
     resolve_browser_state_for_context,
 )
@@ -191,7 +206,7 @@ async def _capture_accessible_role_name(
     selector = _selector_text(selector)
     if not selector:
         return None
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return None
     try:
@@ -229,7 +244,7 @@ async def _selector_live_match_count(
     selector = _selector_text(selector)
     if not selector:
         return None
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return None
     timeout = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
@@ -344,6 +359,99 @@ async def _capture_scout_ambiguity(ctx: AgentContext, selector: str | None) -> N
         ctx.pending_scout_reanchor = (selector, role, name)
 
 
+async def _capture_scout_dynamic_row(ctx: AgentContext, selector: str | None) -> None:
+    ctx.pending_scout_dynamic_row = None
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return
+    selector = _selector_text(selector)
+    source_url = (ctx.pending_scout_source_url or "").strip()
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if not selector or not _is_positional_selector(selector) or not source_url or server is None:
+        return
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _scout_dynamic_row_evidence_expression(selector)},
+            ),
+            timeout=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, dict):
+        return
+    target_selector = value.get("target_selector")
+    row_selector = value.get("row_selector")
+    row_text = value.get("row_text")
+    row_selector_count = value.get("row_selector_count")
+    row_text_match_count = value.get("row_text_match_count")
+    period_matches = value.get("period_matches")
+    validated_period_matches = (
+        validated_dynamic_row_period_matches(period_matches, row_selector_count)
+        if isinstance(row_selector_count, int) and not isinstance(row_selector_count, bool)
+        else None
+    )
+    selected_index = value.get("selected_index")
+    if (
+        target_selector != selector
+        or not isinstance(row_selector, str)
+        or not row_selector.strip()
+        or not isinstance(row_text, str)
+        or not row_text.strip()
+        or isinstance(row_selector_count, bool)
+        or not isinstance(row_selector_count, int)
+        or row_selector_count < 2
+        or row_selector_count > 100
+        or isinstance(row_text_match_count, bool)
+        or not isinstance(row_text_match_count, int)
+        or row_text_match_count < 1
+        or validated_period_matches is None
+        or not dynamic_row_period_matches_match_selected_row(row_text.strip(), validated_period_matches)
+        or isinstance(selected_index, bool)
+        or not isinstance(selected_index, int)
+        or selected_index < 0
+        or selected_index >= row_selector_count
+    ):
+        return
+    ctx.pending_scout_dynamic_row = ScoutedDynamicRowEvidence(
+        source_url=source_url,
+        target_selector=selector,
+        row_selector=row_selector.strip(),
+        row_text=row_text.strip(),
+        row_selector_count=row_selector_count,
+        row_text_match_count=row_text_match_count,
+        period_matches=validated_period_matches,
+        selected_index=selected_index,
+        evidence_fingerprint=dynamic_row_evidence_fingerprint(
+            source_url=source_url,
+            target_selector=selector,
+            row_selector=row_selector.strip(),
+            row_text=row_text.strip(),
+            row_selector_count=row_selector_count,
+            row_text_match_count=row_text_match_count,
+            period_matches=validated_period_matches,
+            selected_index=selected_index,
+        ),
+    )
+
+
+def _prenav_dynamic_row_for_selector(
+    pending: ScoutedDynamicRowEvidence | None,
+    selector: str,
+    source_url: str | None,
+) -> ScoutedDynamicRowEvidence | None:
+    if pending is None:
+        return None
+    if pending["target_selector"] != _selector_text(selector):
+        return None
+    if pending["source_url"] != (source_url or "").strip():
+        return None
+    return pending
+
+
 def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: str) -> bool:
     """Return the stashed ambiguity verdict only when the recorded selector matches the probed one, so a
     navigating click's verdict is never applied to a different element."""
@@ -376,6 +484,68 @@ async def _resolve_scout_role_name(
     if captured is not None:
         return captured
     return "", ""
+
+
+# Attributes the one-shot probe always reads off a resolved element, recorded only when that probe
+# succeeded. An attribute absent from a fingerprint carrying this marker proves the element has none;
+# without the marker (probe failed, element gone, older record) absence stays undecidable and fails closed.
+# `label` is excluded: it is only read via `label[for=id]`, so its absence does not prove there is no label.
+_FINGERPRINT_PROBED_ATTRS = "id,name,placeholder,tag,test_id,type"
+
+
+def _element_fingerprint_expression(css_selector: str) -> str:
+    """Capture element identity fingerprint (tag, id, name, type, placeholder, data-testid, label) for
+    credential-fill resolution. Returns attributes only, never values."""
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        f"  const el = document.querySelector({sel});"
+        "  if (!el) return null;"
+        "  const attr = (name) => el.getAttribute(name) || '';"
+        "  const result = {"
+        "    tag: (el.tagName || '').toLowerCase(),"
+        "    id: attr('id'),"
+        "    name: attr('name'),"
+        "    type: attr('type'),"
+        "    placeholder: attr('placeholder'),"
+        "    test_id: attr('data-testid'),"
+        "  };"
+        "  const label = document.querySelector(`label[for=\"${attr('id')}\"]`);"
+        "  if (label) result.label = (label.textContent || '').trim().slice(0, 200);"
+        "  return result;"
+        "})()"
+    )
+
+
+async def _capture_element_fingerprint(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> dict[str, str]:
+    """Capture element identity fingerprint (id, name, type, placeholder, label, test-id, tag)
+    for credential-fill resolution. Returns empty dict on failure, never None."""
+    selector = _selector_text(selector)
+    if not selector:
+        return {}
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return {}
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _element_fingerprint_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {}
+    fingerprint = (result.get("data") or {}).get("result")
+    if not isinstance(fingerprint, dict):
+        return {}
+    captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
+    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
+    return captured
 
 
 def _capped_with_eviction_accounting(
@@ -411,6 +581,87 @@ def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
     return highest + 1 if highest >= 0 else len(trajectory)
 
 
+def _maybe_complete_never_captured_obligation(
+    ctx: AgentContext, *, interaction: ScoutedInteraction, trajectory_index: int
+) -> None:
+    obligation = getattr(ctx, "never_captured_obligation", None)
+    if obligation is None or obligation.state != "armed":
+        return
+    if obligation.turn_id != str(getattr(ctx, "turn_id", "")):
+        return
+    tool_name = str(interaction.get("tool_name") or "")
+    if tool_name != obligation.expected_tool_name or trajectory_index <= obligation.armed_after_trajectory_index:
+        return
+    # Bare locator obligations can reject unrelated same-tool events without paying for a full
+    # trajectory synthesis. Non-bare canonical locators still fall through to the exact emitted
+    # interaction comparison below.
+    if obligation.normalized_receiver.startswith("page.locator("):
+        expected_selectors = {
+            normalized_scout_selector(candidate)
+            for candidate in locator_selector_literals(obligation.normalized_receiver)
+        }
+        captured_selector = str(interaction.get("selector") or "").strip()
+        if normalized_scout_selector(captured_selector) not in expected_selectors:
+            return
+    expected_argument = obligation.expected_argument_literal
+    if expected_argument is not None:
+        if tool_name == "press_key":
+            captured_argument = str(interaction.get("key") or "")
+        elif tool_name == "select_option":
+            captured_argument = str(interaction.get("value") or "")
+        elif tool_name == "type_text":
+            captured_argument = str(interaction.get("raw_typed_value") or interaction.get("typed_value") or "")
+        else:
+            captured_argument = ""
+        if captured_argument != expected_argument:
+            return
+    synthesized = synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+    if synthesized is None:
+        return
+    current_position = next(
+        (
+            position
+            for position, item in enumerate(ctx.scout_trajectory)
+            if item.get("trajectory_index") == trajectory_index
+        ),
+        None,
+    )
+    if current_position is None:
+        return
+    emitted = next(
+        (
+            record
+            for record in synthesized.diagnostics.emitted_interactions
+            if record.get("trajectory_index") == current_position
+        ),
+        None,
+    )
+    if emitted is None:
+        return
+    method = str(emitted.get("method") or "")
+    locator = normalized_locator_expr(str(emitted.get("locator") or ""))
+    if method != obligation.method or locator != obligation.normalized_receiver:
+        return
+    ctx.never_captured_obligation = replace(
+        obligation,
+        captured_trajectory_index=trajectory_index,
+        state="captured",
+    )
+    ctx.synthesized_block_reopened_for_capture_obligation = True
+    LOG.info(
+        "copilot_never_captured_obligation_completed",
+        identity_digest=obligation.identity_digest,
+        turn_id=obligation.turn_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        draft_fingerprint=obligation.draft_fingerprint,
+        block_label=obligation.block_label,
+        site=obligation.site,
+        trajectory_index=trajectory_index,
+        method=method,
+        locator=locator,
+    )
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -430,7 +681,16 @@ def _record_scouted_interaction(
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
+    element_fingerprint_id: str | None = None,
+    element_fingerprint_name: str | None = None,
+    element_fingerprint_type: str | None = None,
+    element_fingerprint_placeholder: str | None = None,
+    element_fingerprint_label: str | None = None,
+    element_fingerprint_test_id: str | None = None,
+    element_fingerprint_tag: str | None = None,
+    element_fingerprint_probed: str | None = None,
     ambiguous: bool = False,
+    dynamic_row_evidence: ScoutedDynamicRowEvidence | None = None,
 ) -> None:
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -475,8 +735,26 @@ def _record_scouted_interaction(
         artifact["credential_field"] = credential_field
     if credential_name:
         artifact["credential_name"] = credential_name
+    if element_fingerprint_id:
+        artifact["element_fingerprint_id"] = element_fingerprint_id
+    if element_fingerprint_name:
+        artifact["element_fingerprint_name"] = element_fingerprint_name
+    if element_fingerprint_type:
+        artifact["element_fingerprint_type"] = element_fingerprint_type
+    if element_fingerprint_placeholder:
+        artifact["element_fingerprint_placeholder"] = element_fingerprint_placeholder
+    if element_fingerprint_label:
+        artifact["element_fingerprint_label"] = element_fingerprint_label
+    if element_fingerprint_test_id:
+        artifact["element_fingerprint_test_id"] = element_fingerprint_test_id
+    if element_fingerprint_tag:
+        artifact["element_fingerprint_tag"] = element_fingerprint_tag
+    if element_fingerprint_probed:
+        artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
+    if dynamic_row_evidence is not None:
+        artifact["dynamic_row_evidence"] = dynamic_row_evidence
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -495,6 +773,11 @@ def _record_scouted_interaction(
     trajectory_artifact["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(trajectory_artifact)
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
+    _maybe_complete_never_captured_obligation(
+        ctx,
+        interaction=trajectory_artifact,
+        trajectory_index=trajectory_artifact["trajectory_index"],
+    )
 
     LOG.info(
         "copilot_scout_interaction_captured",
@@ -502,6 +785,8 @@ def _record_scouted_interaction(
         selector=selector or None,
         source_url=artifact.get("source_url"),
         role=role or None,
+        credential_field=credential_field or None,
+        credential_id=credential_id or None,
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
@@ -822,6 +1107,7 @@ async def _register_scout_interaction_observation(
             record_scouted_output_coverage(
                 ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
             )
+            _mark_post_run_page_observed(ctx, source_tool="evaluate", url=url, page_evidence=parsed)
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
@@ -1257,7 +1543,7 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     data = result.get("data")
     if not isinstance(data, dict):
         return False
-    server = getattr(ctx, "discovery_mcp_server", None)
+    server = ctx.discovery_mcp_server
     if server is None:
         return False
     selector = target["selector"]
@@ -1550,14 +1836,41 @@ async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, u
     )
 
 
-def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
+def _mark_post_run_page_observed(
+    ctx: AgentContext,
+    *,
+    source_tool: str,
+    url: str,
+    page_evidence: dict[str, Any] | None = None,
+) -> None:
     run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     if not isinstance(run_id, str) or not run_id:
         return
     ctx.post_run_page_observation_tool = source_tool
     ctx.post_run_page_observation_url = url
     ctx.post_run_page_observation_workflow_run_id = run_id
-    ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+    latest_outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    authoritative_unsatisfied = (
+        isinstance(latest_outcome, RecordedBuildTestOutcome)
+        and latest_outcome.is_authoritative
+        and latest_outcome.phase == "persisted_block_run"
+        and latest_outcome.reason_code == "outcome_not_demonstrated"
+        and latest_outcome.workflow_run_id == run_id
+    )
+    ctx.post_run_page_observation_after_failed_test = (
+        getattr(ctx, "last_test_ok", None) is False or authoritative_unsatisfied
+    )
+    if page_evidence is not None and ctx.post_run_page_observation_after_failed_test:
+        bound_evidence = {
+            **page_evidence,
+            "workflow_run_id": run_id,
+            "observed_after_workflow_run": True,
+            "current_url": url,
+        }
+        if bind_post_run_page_path_failure(ctx, bound_evidence):
+            ctx.post_run_page_observation_generation = (
+                getattr(ctx, "post_run_page_observation_generation", 0) or 0
+            ) + 1
     evidence = _workflow_verification_evidence(ctx)
     evidence.live_page_state_verified = True
     evidence.verified_from_current_browser_state = True

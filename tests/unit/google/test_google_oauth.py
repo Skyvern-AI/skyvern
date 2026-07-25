@@ -2,7 +2,7 @@ import asyncio
 import datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, MagicMock, call
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -239,8 +239,11 @@ async def test_google_drive_upload_does_not_retry_retryable_create_response(
         return httpx.Response(503, headers={"Retry-After": "0"}, json={"error": {"message": "try later"}})
 
     _install_google_drive_transport(monkeypatch, handler)
+    # Keep the backoff mock module-local so unrelated asyncio users cannot look like upload retries.
+    process_sleep = asyncio.sleep
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    assert asyncio.sleep is process_sleep
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -272,7 +275,7 @@ async def test_google_drive_upload_retries_connection_failures_before_request(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -301,7 +304,7 @@ async def test_google_drive_upload_does_not_retry_ambiguous_transport_failure(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -661,7 +664,7 @@ async def test_google_drive_resumable_initiation_retries_connect_error(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -692,7 +695,7 @@ async def test_google_drive_resumable_initiation_does_not_retry_read_timeout(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -793,7 +796,7 @@ async def test_google_drive_resumable_requeries_offset_after_double_transport_fa
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -879,7 +882,7 @@ async def test_google_drive_resumable_resumes_after_chunk_429(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -923,7 +926,7 @@ async def test_google_drive_resumable_resumes_after_chunk_rate_limit_403(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -1090,7 +1093,7 @@ async def test_google_drive_resumable_non_advancing_308_bails(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await asyncio.wait_for(
@@ -1131,7 +1134,7 @@ async def test_google_drive_resumable_malformed_range_after_progress_does_not_re
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -1212,7 +1215,7 @@ async def test_google_drive_resumable_exhausts_attempts_raises(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -2026,6 +2029,42 @@ async def test_config_route_handlers_return_404_when_org_config_disabled(monkeyp
     assert delete_exc_info.value.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    start_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleAuthorizationStart(authorize_url="https://auth", state="st")
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "start_authorization", start_mock)
+
+    request = CreateGoogleOAuthAuthorizeRequest(redirect_uri="https://x/cb", credential_id="goac_existing")
+    response = await google_oauth_routes.google_oauth_authorize(
+        request=request,
+        current_org=SimpleNamespace(organization_id="org_1"),
+    )
+
+    assert response.authorize_url == "https://auth"
+    assert start_mock.await_args.kwargs["credential_id"] == "goac_existing"
+
+
+@pytest.mark.asyncio
+async def test_authorize_route_returns_404_when_credential_not_reauthorizable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "start_authorization",
+        AsyncMock(side_effect=google_oauth_service.CredentialNotReauthorizableError("nope")),
+    )
+
+    request = CreateGoogleOAuthAuthorizeRequest(redirect_uri="https://x/cb", credential_id="goac_missing")
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_authorize(
+            request=request,
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+    assert exc_info.value.status_code == 404
+
+
 def test_build_authorize_url_includes_required_params(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
@@ -2190,6 +2229,186 @@ async def test_start_authorization_refuses_without_encryption(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_start_authorization_reconnect_reauthorizes_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    id_mock = MagicMock(return_value="goac_should_not_be_used")
+    monkeypatch.setattr(google_oauth_service, "generate_google_oauth_credential_id", id_mock)
+
+    reauth_scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    reauth_mock = AsyncMock(
+        return_value=SimpleNamespace(id="goac_existing", scopes_requested=reauth_scopes),
+    )
+    insert_mock = AsyncMock()
+    fake_repo = SimpleNamespace(begin_reauthorization=reauth_mock, insert_pending_credential=insert_mock)
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=fake_repo, organizations=organizations),
+        raising=False,
+    )
+
+    result = await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        credential_id="goac_existing",
+    )
+
+    assert result.authorize_url.startswith(google_oauth_service.GOOGLE_AUTHORIZE_ENDPOINT)
+    # Re-auth reuses the existing row; it must not mint a new id or insert a new pending row.
+    insert_mock.assert_not_awaited()
+    id_mock.assert_not_called()
+    reauth_mock.assert_awaited_once()
+    kwargs = reauth_mock.await_args.kwargs
+    assert kwargs["credential_id"] == "goac_existing"
+    assert kwargs["consent_nonce"] == result.state
+    assert kwargs["client_id"] == "cid"
+    # The originally granted scopes are re-requested so the reconnected credential stays usable.
+    assert "scope=" in result.authorize_url
+
+
+@pytest.mark.asyncio
+async def test_start_authorization_reconnect_falls_back_to_legacy_granted_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    gmail_scope = "https://www.googleapis.com/auth/gmail.readonly"
+    reauth_mock = AsyncMock(
+        return_value=SimpleNamespace(
+            id="goac_existing",
+            scopes_requested=[],
+            scopes_granted=[gmail_scope],
+        ),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(begin_reauthorization=reauth_mock),
+            organizations=organizations,
+        ),
+        raising=False,
+    )
+
+    result = await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        credential_id="goac_existing",
+    )
+
+    assert parse_qs(urlparse(result.authorize_url).query)["scope"] == [gmail_scope]
+    assert reauth_mock.await_args.kwargs["fallback_scopes"] == list(google_oauth_service.GOOGLE_SHEETS_SCOPES)
+
+
+@pytest.mark.asyncio
+async def test_start_authorization_reconnect_raises_when_not_reauthorizable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    fake_repo = SimpleNamespace(begin_reauthorization=AsyncMock(return_value=None))
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=fake_repo, organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(google_oauth_service.CredentialNotReauthorizableError):
+        await google_oauth_service.start_authorization(
+            organization_id="org_1",
+            redirect_uri="https://x/cb",
+            credential_id="goac_missing",
+        )
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_wraps_transient_google_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from google.auth.exceptions import TransportError
+
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "secret", raising=False)
+
+    class _FakeCreds:
+        def __init__(self, **_kwargs) -> None:
+            self.token = None
+            self.expiry = None
+
+        def refresh(self, _request) -> None:
+            raise TransportError("connection reset")
+
+    monkeypatch.setattr(google_oauth_service, "Credentials", _FakeCreds)
+
+    # A transient transport error is NOT an expired token — it must stay a plain
+    # MissingAccessTokenError so callers don't wrongly flip the credential to needs-reconnect.
+    with pytest.raises(google_oauth_service.MissingAccessTokenError, match="refresh failed") as excinfo:
+        await google_oauth_service.refresh_access_token("rt-1")
+    assert not isinstance(excinfo.value, google_oauth_service.ExpiredRefreshTokenError)
+
+
+@pytest.mark.asyncio
+async def test_mark_credential_expired_flips_and_invalidates_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    mark_mock = AsyncMock(return_value="goac_1")
+    fake_repo = SimpleNamespace(mark_needs_reconnect=mark_mock)
+    monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
+    fake_cache = SimpleNamespace(set=AsyncMock())
+    monkeypatch.setattr(google_oauth_service.app, "CACHE", fake_cache, raising=False)
+
+    credential_version = datetime.datetime(2026, 4, 20)
+    await google_oauth_service.mark_credential_expired(
+        "org_1",
+        "goac_1",
+        expected_version=credential_version,
+    )
+
+    mark_mock.assert_awaited_once()
+    assert mark_mock.await_args.kwargs["credential_id"] == "goac_1"
+    assert mark_mock.await_args.kwargs["expected_version"] == credential_version
+    fake_cache.set.assert_awaited_once()
+    assert fake_cache.set.await_args.args[0] == google_oauth_service.google_access_token_cache_key("org_1", "goac_1")
+
+
+@pytest.mark.asyncio
+async def test_mark_credential_expired_noop_when_not_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    mark_mock = AsyncMock(return_value=None)
+    fake_repo = SimpleNamespace(mark_needs_reconnect=mark_mock)
+    monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
+    fake_cache = SimpleNamespace(set=AsyncMock())
+    monkeypatch.setattr(google_oauth_service.app, "CACHE", fake_cache, raising=False)
+
+    await google_oauth_service.mark_credential_expired("org_1", "goac_1")
+
+    mark_mock.assert_awaited_once()
+    # Nothing flipped ⇒ no cache churn.
+    fake_cache.set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     encrypt_mock = AsyncMock(return_value="ENC::rt")
@@ -2199,6 +2418,8 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     promote_mock = AsyncMock(return_value=promoted_schema)
     fake_repo = SimpleNamespace(promote_pending_to_active=promote_mock)
     monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
+    fake_cache = SimpleNamespace(set=AsyncMock())
+    monkeypatch.setattr(google_oauth_service.app, "CACHE", fake_cache, raising=False)
 
     result = await google_oauth_service.promote_pending_credential(
         organization_id="org_1",
@@ -2216,6 +2437,10 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     assert kwargs["encrypted_refresh_token"] == "ENC::rt"
     assert kwargs["encrypted_method"] == EncryptMethod.AES
     assert kwargs["scopes_granted"] == ["https://a", "https://b"]
+    # A re-auth reuses the credential id, so a token cached before rotation must be dropped.
+    fake_cache.set.assert_awaited_once()
+    cache_key = fake_cache.set.await_args.args[0]
+    assert cache_key == google_oauth_service.google_access_token_cache_key("org_1", "goac_1")
 
 
 @pytest.mark.asyncio
@@ -2495,11 +2720,13 @@ async def test_revoke_google_endpoint_swallows_errors(monkeypatch: pytest.Monkey
 async def test_load_credential_secrets_decrypts_repo_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.db.repositories.google_oauth import ActiveCredentialCiphertext
 
+    credential_version = datetime.datetime(2026, 4, 20)
     payload = ActiveCredentialCiphertext(
         encrypted_refresh_token="ENC::rt",
         encrypted_method=EncryptMethod.AES,
         scopes_granted=["https://a", "https://b"],
         client_id="client-1",
+        credential_version=credential_version,
     )
     fake_repo = SimpleNamespace(load_active_ciphertext=AsyncMock(return_value=payload))
     monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
@@ -2515,6 +2742,7 @@ async def test_load_credential_secrets_decrypts_repo_payload(monkeypatch: pytest
     assert secrets.refresh_token == "refresh-123"
     assert secrets.scopes == ["https://a", "https://b"]
     assert secrets.client_id == "client-1"
+    assert secrets.credential_version == credential_version
     decrypt_mock.assert_awaited_once_with("ENC::rt", EncryptMethod.AES)
 
 
@@ -2835,8 +3063,34 @@ async def test_refresh_access_token_wraps_google_auth_error(monkeypatch: pytest.
 
     monkeypatch.setattr(google_oauth_service, "Credentials", _FakeCreds)
 
-    with pytest.raises(google_oauth_service.MissingAccessTokenError, match="refresh failed"):
+    # invalid_grant surfaces as a RefreshError; classify it as an expired refresh token so callers
+    # can flip the credential to "needs reconnect" rather than treat it as a transient failure.
+    with pytest.raises(google_oauth_service.ExpiredRefreshTokenError, match="rejected the refresh token"):
         await google_oauth_service.refresh_access_token("rt-bad")
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_does_not_expire_credential_for_invalid_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.auth.exceptions import RefreshError
+
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "secret", raising=False)
+
+    class _FakeCreds:
+        def __init__(self, **_kwargs) -> None:
+            self.token = None
+            self.expiry = None
+
+        def refresh(self, _request) -> None:
+            raise RefreshError("invalid_client: client authentication failed", {"error": "invalid_client"})
+
+    monkeypatch.setattr(google_oauth_service, "Credentials", _FakeCreds)
+
+    with pytest.raises(google_oauth_service.MissingAccessTokenError, match="refresh failed") as excinfo:
+        await google_oauth_service.refresh_access_token("rt-valid")
+    assert not isinstance(excinfo.value, google_oauth_service.ExpiredRefreshTokenError)
 
 
 @pytest.mark.asyncio
@@ -2851,12 +3105,15 @@ async def test_credentials_from_secrets_wraps_google_auth_error(monkeypatch: pyt
             self.token = None
 
         def refresh(self, _request) -> None:
-            raise RefreshError("token revoked")
+            raise RefreshError(
+                "invalid_grant: Token has been expired or revoked.",
+                {"error": "invalid_grant"},
+            )
 
     monkeypatch.setattr(google_oauth_service, "Credentials", _FakeCreds)
 
     secrets = google_oauth_service.GoogleCredentialSecrets(refresh_token="rt-1", scopes=["https://a"])
-    with pytest.raises(google_oauth_service.MissingAccessTokenError, match="refresh failed"):
+    with pytest.raises(google_oauth_service.ExpiredRefreshTokenError, match="rejected the refresh token"):
         await google_oauth_service.credentials_from_secrets(secrets)
 
 

@@ -10,11 +10,13 @@ import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
+    DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES as GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
     blocker_signal_is_genuinely_terminal,
@@ -62,6 +64,7 @@ class TurnHaltKind(StrEnum):
     OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
     DELIVERED_UNVERIFIED = "delivered_unverified"
     DEFINITION_CONTRACT_UNSATISFIED = "definition_contract_unsatisfied"
+    METADATA_REJECT_SAME_KEY = "metadata_reject_same_key"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -78,6 +81,7 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
         "loop_detected_no_forward_progress_interaction",
+        DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
@@ -101,6 +105,7 @@ _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
     }
 )
 _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES = frozenset({DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE})
+_METADATA_REJECT_SAME_KEY_REASON_CODES = frozenset({METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE})
 
 # Halts the agent did not choose: a verified outcome may suppress these.
 # ACTIVE_TERMINAL_CHALLENGE is voluntary and is deliberately excluded so a
@@ -113,6 +118,7 @@ _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
         TurnHaltKind.SCHEMA_INCOMPATIBILITY,
         TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE,
         TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED,
+        TurnHaltKind.METADATA_REJECT_SAME_KEY,
     }
 )
 _INVOLUNTARY_BLOCKER_REASON_CODES = (
@@ -121,6 +127,7 @@ _INVOLUNTARY_BLOCKER_REASON_CODES = (
     | _SCHEMA_INCOMPATIBILITY_REASON_CODES
     | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
     | _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES
+    | _METADATA_REJECT_SAME_KEY_REASON_CODES
     | frozenset({REPAIR_CEILING_REASON_CODE})
 )
 _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
@@ -157,6 +164,8 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
     if reason in _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES:
         return TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED
+    if reason in _METADATA_REJECT_SAME_KEY_REASON_CODES:
+        return TurnHaltKind.METADATA_REJECT_SAME_KEY
     return None
 
 

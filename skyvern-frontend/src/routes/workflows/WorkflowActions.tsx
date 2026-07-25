@@ -89,7 +89,7 @@ function WorkflowActions({
           ) : null}
           <DropdownMenuItem onSelect={() => clone()} className="p-2">
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone Agent
+            Duplicate Agent
           </DropdownMenuItem>
           <DropdownMenuItem
             onSelect={() => toggleTemplate()}

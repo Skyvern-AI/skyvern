@@ -88,6 +88,32 @@ export type BlockOutcome =
   | "not_demonstrated"
   | "not_evaluated";
 
+export interface TerminalEnvelopeFacts {
+  runVerdict: BlockOutcome | null;
+  runDisplayReason: string | null;
+}
+
+// Envelope dicts are backend model_dump output, so keys stay snake_case.
+// The backend anchors run_verdict from final outcomes only, so "evaluating"
+// is not a wire value here and parses to null like any unknown.
+export function parseTerminalEnvelope(
+  raw: unknown,
+): TerminalEnvelopeFacts | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const v = obj.run_verdict;
+  return {
+    runVerdict:
+      v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
+        ? v
+        : null,
+    runDisplayReason:
+      typeof obj.run_display_reason === "string"
+        ? obj.run_display_reason
+        : null,
+  };
+}
+
 export interface BlockState {
   workflowRunBlockId: string;
   label: string;
@@ -154,6 +180,10 @@ export interface TurnNarrativeState {
   // Outcome-evidence verdict authorizing tested-success claims (ADR 0005).
   // Null means unknown (legacy/grafted rows) — distinct from false.
   verifiedSuccess: boolean | null;
+  // Run-outcome facts from the backend-finalized terminal envelope carried
+  // in the narrative payload. Authoritative once runVerdict is set; null on
+  // rows persisted before the envelope existed.
+  terminalEnvelope: TerminalEnvelopeFacts | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -223,6 +253,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   proposalDisposition: null,
   responseKind: null,
   verifiedSuccess: null,
+  terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -334,6 +365,8 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   navigate_browser: "Opening page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
+  discover_workflow_entrypoint: "Finding the entry page",
+  inspect_page_for_composition: "Inspecting the page",
 };
 
 export function toolActivityDisplayLabel(toolName?: string | null): string {
@@ -521,6 +554,39 @@ function appendActivity(
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  // A run tool's result must rejoin its call's bucket. The run flips the active
+  // block between the call and the result, so routing the result to the live
+  // active block would split the call/result pair across buckets and it could
+  // never fold (mirrors the backend NarratorState._activity_bucket_label fix).
+  if (
+    entry.kind === "tool_result" &&
+    entry.toolName !== undefined &&
+    RUN_TOOLS.has(entry.toolName)
+  ) {
+    const callId = `tc-${toolCallIdOf(entry) ?? ""}`;
+    if (designActivity.some((e) => e.id === callId)) {
+      return {
+        blocks,
+        designActivity: appendCapped(
+          designActivity,
+          entry,
+          MAX_DESIGN_ACTIVITY_ENTRIES,
+        ),
+      };
+    }
+    const callBlockIdx = blocks.findIndex((b) =>
+      b.activity.some((e) => e.id === callId),
+    );
+    if (callBlockIdx !== -1) {
+      const nextBlocks = blocks.slice();
+      const callBlock = nextBlocks[callBlockIdx]!;
+      nextBlocks[callBlockIdx] = {
+        ...callBlock,
+        activity: appendCapped(callBlock.activity, entry, MAX_ACTIVITY_ENTRIES),
+      };
+      return { blocks: nextBlocks, designActivity };
+    }
+  }
   const activeIdx = blocks.findIndex((b) => b.state === "running");
   if (activeIdx === -1) {
     return {
@@ -573,6 +639,21 @@ export function isBlockOk(
     block.outcome === "demonstrated" ||
     block.outcome === "not_evaluated"
   );
+}
+
+// Labels that occur exactly once in the given set — the only labels safe to
+// key recorded actions on when the run-block id is missing (the terminal
+// narrative_payload drops workflowRunBlockId). Loop iterations reuse a label,
+// so an ambiguous label falls back to today's drop rather than mis-attributing.
+function uniqueLabelSet(labels: Array<string | undefined>): Set<string> {
+  const counts = new Map<string, number>();
+  for (const label of labels) {
+    if (!label) continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const unique = new Set<string>();
+  for (const [label, n] of counts) if (n === 1) unique.add(label);
+  return unique;
 }
 
 export function applyNarrativeEvent(
@@ -728,6 +809,10 @@ export function applyNarrativeEvent(
       // visibly wrong, re-merge matched actionIds instead of skipping them.
       let carry = 0;
       let changed = false;
+      // Match by run-block id only. A terminal frame restores each block's real
+      // id from the live blocks (see the `response` case), so a post-terminal
+      // fetch still matches by id — and a different run's ids never collide with
+      // this turn's, keeping late fetches from cross-contaminating prior turns.
       const blocks = prev.blocks.map((b) => {
         const match = event.blocks.find(
           (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
@@ -840,24 +925,44 @@ export function applyNarrativeEvent(
     case "response": {
       const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
       if (hydrated) {
-        // The backend payload never carries recordedActions/recordedActionsAt
-        // (client-only replay data); carry them over from the prior live
-        // blocks so a fetch that resolved before this terminal frame
-        // survives hydration instead of being silently dropped.
-        const recordedById = new Map(
+        // The BE narrative_payload drops workflowRunBlockId and the client-only
+        // recordedActions. Re-associate each hydrated block with the live block
+        // of the same label to restore its real run-block id (and carry any
+        // recordedActions). Restoring the real id keeps this frozen turn keyed
+        // by id, so a later test run that reuses a label matches by id and can't
+        // graft its actions onto this turn. Unique labels only — loop iterations
+        // reuse a label and can't be told apart without the id.
+        const liveById = new Map(
           prev.blocks
-            .filter((b) => b.recordedActions !== undefined)
+            .filter((b) => b.workflowRunBlockId !== "")
             .map((b) => [b.workflowRunBlockId, b] as const),
         );
+        const uniqueLiveLabels = uniqueLabelSet(
+          prev.blocks.map((b) => b.label),
+        );
+        const uniqueHydratedLabels = uniqueLabelSet(
+          hydrated.blocks.map((b) => b.label),
+        );
+        const liveByLabel = new Map(
+          prev.blocks
+            .filter((b) => uniqueLiveLabels.has(b.label))
+            .map((b) => [b.label, b] as const),
+        );
         const blocks = hydrated.blocks.map((b) => {
-          const carried = recordedById.get(b.workflowRunBlockId);
-          return carried
-            ? {
-                ...b,
-                recordedActions: carried.recordedActions,
-                recordedActionsAt: carried.recordedActionsAt,
-              }
-            : b;
+          const live =
+            (b.workflowRunBlockId !== ""
+              ? liveById.get(b.workflowRunBlockId)
+              : undefined) ??
+            (b.workflowRunBlockId === "" && uniqueHydratedLabels.has(b.label)
+              ? liveByLabel.get(b.label)
+              : undefined);
+          if (!live) return b;
+          return {
+            ...b,
+            workflowRunBlockId: live.workflowRunBlockId,
+            recordedActions: live.recordedActions,
+            recordedActionsAt: live.recordedActionsAt,
+          };
         });
         return {
           ...hydrated,
@@ -1101,6 +1206,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.verifiedSuccess === "boolean"
         ? payload.verifiedSuccess
         : null,
+    terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
     draft,
@@ -1186,7 +1292,7 @@ export function formatElapsed(
 export interface TurnSummary {
   headline: string;
   stats: string[];
-  accent: "ok" | "fail" | "qa";
+  accent: "ok" | "fail" | "qa" | "warn";
   glyph: string;
   isFail: boolean;
   isQA: boolean;
@@ -1225,6 +1331,49 @@ interface AdjudicatedParts {
   glyph: string;
 }
 
+export interface NotConfirmedOutcome {
+  verdict: "not_demonstrated";
+  displayReason: string | null;
+}
+
+export function notConfirmedOutcome(
+  turn: Pick<
+    TurnNarrativeState,
+    "terminalEnvelope" | "lastRunOutcome" | "blocks"
+  >,
+): NotConfirmedOutcome | null {
+  // The backend-finalized envelope is authoritative once it carries a run
+  // verdict; the pointer/block inference below only covers rows persisted
+  // before the envelope existed (or envelopes from run-less turns).
+  const envelope = turn.terminalEnvelope;
+  if (envelope !== null && envelope.runVerdict !== null) {
+    return envelope.runVerdict === "not_demonstrated"
+      ? {
+          verdict: "not_demonstrated",
+          displayReason: envelope.runDisplayReason,
+        }
+      : null;
+  }
+  if (turn.lastRunOutcome !== null) {
+    return turn.lastRunOutcome.verdict === "not_demonstrated"
+      ? {
+          verdict: "not_demonstrated",
+          displayReason: turn.lastRunOutcome.displayReason,
+        }
+      : null;
+  }
+  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
+    const block = turn.blocks[i]!;
+    if (block.outcome === "not_demonstrated") {
+      return {
+        verdict: "not_demonstrated",
+        displayReason: block.outcomeReason ?? null,
+      };
+    }
+  }
+  return null;
+}
+
 // Headline parts from the typed terminal adjudication. Returns null when the
 // turn predates the typed signal; a build kind without a verdict also falls
 // back to the legacy inference chain so genuinely-tested historical turns
@@ -1250,15 +1399,20 @@ function adjudicatedSummaryParts(
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (turn.responseKind !== "build") {
+    if (turn.responseKind === "refuse") {
+      return { headline: "Declined", accent: "qa", glyph: "✦" };
+    }
+    if (turn.responseKind === "diagnose") {
+      return { headline: "Answered", accent: "qa", glyph: "✦" };
+    }
+    if (
+      turn.responseType !== "ASK_QUESTION" &&
+      notConfirmedOutcome(turn)?.verdict === "not_demonstrated"
+    ) {
+      return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
+    }
     return {
-      headline:
-        turn.responseKind === "refuse"
-          ? "Declined"
-          : turn.responseKind === "diagnose"
-            ? "Answered"
-            : uxV1
-              ? "Needs your input"
-              : "Question",
+      headline: uxV1 ? "Needs your input" : "Question",
       accent: "qa",
       glyph: "✦",
     };
@@ -1269,6 +1423,13 @@ function adjudicatedSummaryParts(
   }
   if (flags.needsTestedProposalReview) {
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
+  }
+  if (turn.responseType === "ASK_QUESTION") {
+    return {
+      headline: uxV1 ? "Needs your input" : "Question",
+      accent: "qa",
+      glyph: "✦",
+    };
   }
   if (!turn.verifiedSuccess) {
     if (flags.hasCleanCompletedBuild) {

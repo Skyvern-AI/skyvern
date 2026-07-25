@@ -10,14 +10,23 @@ import {
   test,
   vi,
 } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import { type BlockSearchTarget } from "./blockSearch";
-import { EditorPaneBlockSearch } from "./EditorPaneHeader";
+import {
+  EditorPaneBlockSearch,
+  EditorPaneModeToggle,
+} from "./EditorPaneHeader";
 
 // cmdk and Radix Popover need ResizeObserver and scrollIntoView, which jsdom
 // lacks. Install them for this suite only and restore afterward.
@@ -81,6 +90,8 @@ beforeEach(() => {
   focusBlock.mockReset();
   useWorkflowBlockSearchStore.getState().registerHandle(null);
   useWorkflowYamlEditorStore.getState().close();
+  useWorkflowYamlEditorStore.getState().registerEnterYamlMode(null);
+  useWorkflowYamlEditorStore.getState().registerCommit(null);
 });
 
 describe("EditorPaneBlockSearch", () => {
@@ -173,5 +184,95 @@ describe("EditorPaneBlockSearch", () => {
     const reopened = openSearch();
     expect((reopened as HTMLInputElement).value).toBe("");
     expect(screen.getAllByRole("option")).toHaveLength(3);
+  });
+});
+
+describe("EditorPaneModeToggle", () => {
+  function renderToggle() {
+    return render(
+      <TooltipProvider delayDuration={0}>
+        <EditorPaneModeToggle />
+      </TooltipProvider>,
+    );
+  }
+
+  test("renders nothing until a canvas registers the YAML entry point", () => {
+    renderToggle();
+    expect(screen.queryByRole("button", { name: "Visual" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "YAML" })).toBeNull();
+  });
+
+  test("shows the Visual/YAML pair once registered, defaulting to Visual", () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    renderToggle();
+
+    const visual = screen.getByRole("button", { name: "Visual" });
+    const yaml = screen.getByRole("button", { name: "YAML" });
+    expect(visual.getAttribute("aria-pressed")).toBe("true");
+    expect(yaml.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  test("YAML enters yaml mode; Visual commits back out", async () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    store.registerCommit(async () => {
+      useWorkflowYamlEditorStore.getState().close();
+      return true;
+    });
+    renderToggle();
+
+    fireEvent.click(screen.getByRole("button", { name: "YAML" }));
+    expect(useWorkflowYamlEditorStore.getState().active).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "YAML", pressed: true }),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Visual" }));
+    await waitFor(() =>
+      expect(useWorkflowYamlEditorStore.getState().active).toBe(false),
+    );
+    expect(
+      screen.getByRole("button", { name: "Visual", pressed: true }),
+    ).not.toBeNull();
+  });
+
+  test("clicking the already-active segment does not re-fire its action", () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    const enterYaml = vi.fn(() => store.open("blocks: []"));
+    const commit = vi.fn(async () => {
+      useWorkflowYamlEditorStore.getState().close();
+      return true;
+    });
+    store.registerEnterYamlMode(enterYaml);
+    store.registerCommit(commit);
+    renderToggle();
+
+    // Visual mode: clicking the active Visual segment must not commit.
+    fireEvent.click(screen.getByRole("button", { name: "Visual" }));
+    expect(commit).not.toHaveBeenCalled();
+
+    // Clicking the now-active YAML segment must not re-enter — reserializing
+    // the canvas would discard the in-progress YAML draft.
+    fireEvent.click(screen.getByRole("button", { name: "YAML" }));
+    expect(enterYaml).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "YAML" }));
+    expect(enterYaml).toHaveBeenCalledTimes(1);
+  });
+
+  test("both toggles are disabled while a commit is in flight", () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    store.registerEnterYamlMode(() => store.open("blocks: []"));
+    store.setCommitting(true);
+    renderToggle();
+
+    expect(
+      (screen.getByRole("button", { name: "Visual" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "YAML" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 });

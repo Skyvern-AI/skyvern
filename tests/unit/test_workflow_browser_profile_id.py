@@ -306,13 +306,22 @@ def _make_workflow_update_service(
 
 def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        browser_profile_id=None,
+        browser_seed_source=None,
+        proxy_location=None,
+    )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
     service.get_workflow_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     service.create_workflow_run_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    # These tests assert the request-level browser_profile_id copy, not seed resolution.
+    service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
     organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
     return service, organization, workflow_run
@@ -326,17 +335,21 @@ def _make_workflow_stub(
         workflow_id="wf_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        title="test",
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_profile_id=browser_profile_id,
+        browser_profile_key=None,
         persist_browser_session=False,
+        pin_saved_session_ip=False,
         max_elapsed_time_minutes=max_elapsed_time_minutes,
         run_with="agent",
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
 
 

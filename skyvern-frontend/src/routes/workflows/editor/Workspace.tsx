@@ -25,6 +25,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   useEdgesState,
   useNodesState,
@@ -358,7 +359,8 @@ function Workspace({
   embedded = false,
   workflow,
 }: Props) {
-  const { blockLabel, workflowPermanentId } = useParams();
+  const { blockLabel } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
   const studioPaneWidths = useStudioShellStore((s) => s.paneWidths);

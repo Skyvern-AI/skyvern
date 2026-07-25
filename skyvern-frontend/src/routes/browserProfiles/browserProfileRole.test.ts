@@ -5,7 +5,12 @@ import type {
   BrowserProfileUsage,
 } from "@/api/types";
 
-import { getBrowserProfileRole } from "./browserProfileRole";
+import {
+  BROWSER_PROFILE_ROLE_BADGE,
+  BROWSER_PROFILE_ROLE_TOOLTIP,
+  deleteWarning,
+  getBrowserProfileRole,
+} from "./browserProfileRole";
 
 const managed = { is_managed: true } as Pick<
   BrowserProfileApiResponse,
@@ -59,5 +64,35 @@ describe("getBrowserProfileRole", () => {
   it("is plain for a non-managed profile with no credential link", () => {
     expect(getBrowserProfileRole(plain, usage())).toBe("plain");
     expect(getBrowserProfileRole(plain, undefined)).toBe("plain");
+  });
+});
+
+describe("role badges + delete copy", () => {
+  it("badges are the bare agent/credential/user nouns", () => {
+    expect(BROWSER_PROFILE_ROLE_BADGE).toEqual({
+      workflow_memory: "agent",
+      credential: "credential",
+      plain: "user",
+    });
+  });
+
+  it("every role has an explanatory tooltip", () => {
+    expect(BROWSER_PROFILE_ROLE_TOOLTIP.workflow_memory).toContain("agent");
+    expect(BROWSER_PROFILE_ROLE_TOOLTIP.credential).toContain("credential");
+    expect(BROWSER_PROFILE_ROLE_TOOLTIP.plain).toContain("you");
+  });
+
+  it("delete warnings use the agent noun, never workflow", () => {
+    expect(deleteWarning(managed, usage())).toContain("agent");
+    expect(deleteWarning(managed, usage())).not.toMatch(/workflow/i);
+    const pinned = deleteWarning(
+      plain,
+      usage({
+        workflows: [
+          { workflow_permanent_id: "w", title: "T", via: "browser_profile_id" },
+        ],
+      }),
+    );
+    expect(pinned).toContain("Agents pinned");
   });
 });

@@ -51,14 +51,14 @@ from skyvern.forge.sdk.services import (
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
@@ -647,7 +647,9 @@ async def _convert_css_shape_to_string(
                 return None
 
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
-            screenshot = await locater.screenshot(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, animations="disabled")
+            # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below,
+            # which drops the element from future scrape passes and aborts the conversion.
+            screenshot = await take_element_screenshot(locater, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today
@@ -764,6 +766,16 @@ class AgentFunction:
             headers.setdefault(key, value)
         return headers
 
+    async def resolve_browser_session_connect_url(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        browser_address: str | None,
+        upstream_cdp_url: str | None,
+    ) -> str | None:
+        return browser_address
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 
@@ -803,6 +815,20 @@ class AgentFunction:
         Cloud overrides this to consult its experimentation provider; OSS has no flex
         routers so the default returns False."""
         return False
+
+    async def mark_streaming_viewer_active(self, organization_id: str, file_name: str) -> None:
+        """Record that a live-view consumer is currently polling this stream key.
+
+        Cloud overrides this with a TTL'd presence marker that frame publishers
+        consult via should_publish_streaming_frame. OSS no-op: frames always publish."""
+        return None
+
+    async def should_publish_streaming_frame(self, organization_id: str, file_name: str) -> bool:
+        """Whether a frame publisher should capture+upload a frame for this stream key.
+
+        Cloud gates this on viewer presence so unwatched runs skip uploads entirely.
+        OSS default keeps the historical always-publish behavior."""
+        return True
 
     async def resolve_recording_video_size(
         self,
@@ -964,6 +990,56 @@ class AgentFunction:
         """Return whether this workflow run was created for scoped block execution."""
         return workflow_run.debug_session_id is not None
 
+    async def bank_credential_profile_after_login(
+        self,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState,
+        credential_id: str | None,
+        performed_fresh_login: bool,
+        login_url: str | None,
+    ) -> None:
+        """Bank a verified login into the run's credential living-profile at login-block success.
+
+        No-op in OSS — auto-create + banking is a cloud feature. CloudAgentFunction overrides this to
+        auto-create the credential's profile on first verified sign-in and write the session (whole-dir
+        when the run was seeded from that profile, cookie-only union otherwise), behind the
+        browser_memory_engine kill-switch.
+        """
+        return None
+
+    async def bank_credential_profile_on_healthy_run(
+        self,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState,
+    ) -> None:
+        """Whole-dir write the run's credential living-profile at healthy (completed) run end, only
+        when the run was seeded from that profile (seed==sink). No-op in OSS; cloud overrides."""
+        return None
+
+    async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
+        """Whether a profile's banked-cookie sidecar should be injected at boot. Default True (OSS
+        never writes the sidecar, so this is moot there); cloud gates it on the browser_memory_engine
+        kill-switch so a rollback also stops applying previously banked login state."""
+        return True
+
+    async def should_skip_debug_profile_writeback(self, workflow_run: WorkflowRun) -> bool:
+        """Whether to skip the legacy own-memory profile write-back for a debug (Studio) play. Default
+        False keeps today's behavior in OSS and flag-off orgs; cloud returns True for debug sessions
+        once the engine is enabled, so a debug play never overwrites known-good memory."""
+        return False
+
+    async def is_browser_memory_engine_enabled(self, workflow_run: WorkflowRun) -> bool:
+        """Whether the browser-memory engine's sink-driven write-back is active for this run's org.
+        Default False in OSS and flag-off orgs keeps today's legacy own-memory write-back; cloud gates
+        on the browser_memory_engine kill-switch, so the run writes only its resolved sink profile."""
+        return False
+
+    async def is_browser_memory_engine_enabled_for_org(self, organization_id: str) -> bool:
+        """Org-scoped variant of is_browser_memory_engine_enabled for paths without a WorkflowRun (the
+        credential-delete reap). Default False in OSS and flag-off orgs so no irreversible profile
+        deletion fires until the kill-switch is on."""
+        return False
+
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
     MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (
@@ -1109,6 +1185,26 @@ class AgentFunction:
     async def post_step_execution(self, task: Task, step: Step) -> None:
         if step.status == StepStatus.completed:
             await self._maybe_close_magic_link_page(task)
+
+    async def gate_step_completion(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        task_block: BaseTaskBlock | None,
+        page: Page | None,
+        browser_state: BrowserState,
+    ) -> bool:
+        """Gate whether an agent completion verdict for this step is accepted.
+
+        Called once the parallel verifier has produced a CompleteAction, before the step
+        and task are marked completed. Return True to accept; False to reject, which makes
+        the agent keep going and fail safe at max steps rather than falsely completing.
+        OSS accepts everything; a deployment may override to hold specific blocks (e.g. a
+        submit block whose AI fallback would otherwise complete without a deterministic
+        confirmation check) to a stricter gate.
+        """
+        return True
 
     async def _maybe_close_magic_link_page(self, task: Task) -> None:
         """Close a magic-link confirmation page if it shows close/return signals.
@@ -1259,6 +1355,16 @@ class AgentFunction:
         Cloud override provides actual solving; OSS base is a no-op."""
         return False
 
+    async def solve_recaptcha_token(
+        self,
+        page: Page,
+        *,
+        organization_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> bool:
+        """Solve and apply a reCAPTCHA token. OSS has no solver client."""
+        return False
+
     async def get_google_sheets_credentials(
         self,
         organization_id: str,
@@ -1281,6 +1387,13 @@ class AgentFunction:
                 "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
                 organization_id=organization_id,
                 credential_id=credential_id,
+            )
+            return None
+        except google_oauth_service.ExpiredRefreshTokenError:
+            await google_oauth_service.mark_credential_expired(
+                organization_id,
+                credential_id,
+                expected_version=secrets.credential_version,
             )
             return None
         except Exception:
@@ -1353,6 +1466,13 @@ class AgentFunction:
                 "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
                 organization_id=organization_id,
                 credential_id=credential_id,
+            )
+            return None
+        except google_oauth_service.ExpiredRefreshTokenError:
+            await google_oauth_service.mark_credential_expired(
+                organization_id,
+                credential_id,
+                expected_version=secrets.credential_version,
             )
             return None
         except Exception:
@@ -1871,6 +1991,10 @@ class AgentFunction:
         """Return a request-scoped workflow copilot config override."""
         del organization_id
         return self.get_copilot_config(code_block_mode)
+
+    async def should_render_copilot_terminal_from_envelope(self, organization_id: str | None = None) -> bool:
+        del organization_id
+        return settings.WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.

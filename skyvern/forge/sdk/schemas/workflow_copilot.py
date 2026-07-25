@@ -282,6 +282,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         None,
         description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
     )
+    terminal_envelope: dict[str, Any] | None = Field(
+        None,
+        description="Shadow-only terminal outcome envelope for end-of-turn typed-state validation.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):
@@ -453,6 +457,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "workflow_credential_inputs_unbound",
         "missing_credential_run_failure",
         "credential_deferred_draft",
+        "login_credentials_unresolved",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")

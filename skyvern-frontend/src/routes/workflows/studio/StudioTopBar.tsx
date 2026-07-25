@@ -8,12 +8,8 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  Link,
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -64,7 +60,7 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
   const { title, setTitle } = useWorkflowTitleStore();
   const setHasChanges = useWorkflowHasChangesStore((s) => s.setHasChanges);
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const canEdit = editable && !isRecording;
   return (
     <div className="flex min-w-0 max-w-[19rem] items-center gap-1">
@@ -78,12 +74,19 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
         inputClassName="px-2 text-base"
         renderIdle={({ startEditing }) => (
           <>
-            <Link
-              to={`/agents/${workflowPermanentId}/runs`}
-              className="min-w-0 truncate px-2 text-base hover:underline hover:underline-offset-2"
+            {/* min-w-0 shrink overrides ControlTooltip's default shrink-0 (cn/twMerge
+                drops shrink-0) so the wrapper stays shrinkable and the Link truncates. */}
+            <ControlTooltip
+              content="View past runs"
+              wrapperClassName="min-w-0 shrink"
             >
-              {title}
-            </Link>
+              <Link
+                to={`/agents/${workflowPermanentId}/runs`}
+                className="min-w-0 truncate px-2 text-base hover:text-blue-700 hover:underline hover:underline-offset-2 dark:hover:text-blue-400"
+              >
+                {title}
+              </Link>
+            </ControlTooltip>
             {canEdit && (
               <ControlTooltip content="Click to edit title">
                 <button
@@ -261,7 +264,7 @@ function PanelToggle({
 // land here and must be stoppable — render Stop when active, nothing otherwise.
 export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const navigate = useNavigate();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const runId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -385,8 +388,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
               <DialogTitle>Start a full run?</DialogTitle>
               <DialogDescription>
                 A block run is still executing. It will keep running — you can
-                watch it in the Browser pane while the Overview pane switches to
-                the new full run.
+                watch it in the Browser pane while the Run pane switches to the
+                new full run.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -438,7 +441,8 @@ export function StudioTopBar() {
       <div className="min-w-3 flex-1" />
       {workflowDeletedAt ? (
         // Legacy run-header tag idiom; every workflow-mutating action (save,
-        // schedule, inputs, run) is gone with the agent.
+        // schedule, inputs, run) is gone with the agent. Run history stays
+        // reachable from the Past Runs rail tab.
         <span
           title={basicTimeFormat(workflowDeletedAt)}
           className="shrink-0 text-xs text-muted-foreground"

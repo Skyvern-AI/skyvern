@@ -40,6 +40,9 @@ class TurnClaimant(StrEnum):
     CREDENTIAL_PRIORITY_CHURN = "credential_priority_authoring_churn"
     METADATA_RUN_PREFLIGHT_REJECT = "metadata_run_preflight_reject"
     ACTUATION_OBLIGATION_FILL = "actuation_obligation_fill"
+    ACTUATION_OBLIGATION_LOGIN_COMPLETION = "actuation_obligation_login_completion"
+    POST_RUN_PAGE_PATH_INTERACTION = "post_run_page_path_interaction"
+    CAPTURE_OBLIGATION_REOPEN = "capture_obligation_reopen"
     CREDENTIAL_SCOUT_REOPEN = "credential_scout_reopen"
     UNCOVERED_OUTPUT_RESCOUT_STEER = "uncovered_output_rescout_steer"
     RECORDED_OUTCOME_GROUNDING = "recorded_outcome_grounding"
@@ -70,6 +73,13 @@ _PRECEDENCE_ORDER: tuple[TurnClaimant, ...] = (
     # Actuation-obligation fill carve-out admits the required fill tool through the persistence
     # gate; predicate-gated at its call site, never an unconditional rank flip.
     TurnClaimant.ACTUATION_OBLIGATION_FILL,
+    # Login-completion carve-out admits the submit and 2FA-confirm interactions the admitted fills
+    # began; predicate-gated at its call site and bounded by the post-credential commit.
+    TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
+    # Post-run page-path repair admits only its outcome-bound click/Enter window.
+    TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION,
+    # A never-captured obligation admits only the exact canonical interaction that can satisfy it.
+    TurnClaimant.CAPTURE_OBLIGATION_REOPEN,
     # One-shot credential-scout reopen admits evaluate through the persistence gate;
     # predicate-gated at its call site.
     TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
@@ -98,6 +108,9 @@ CLAIMANT_REASON_CODE_FAMILIES: dict[TurnClaimant, frozenset[str]] = {
     TurnClaimant.CREDENTIAL_PRIORITY_CHURN: frozenset({"credential_priority_authoring_churn"}),
     TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT: frozenset(),
     TurnClaimant.ACTUATION_OBLIGATION_FILL: frozenset(),
+    TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION: frozenset(),
+    TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION: frozenset(),
+    TurnClaimant.CAPTURE_OBLIGATION_REOPEN: frozenset(),
     TurnClaimant.CREDENTIAL_SCOUT_REOPEN: frozenset(),
     TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER: frozenset({UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE}),
     TurnClaimant.RECORDED_OUTCOME_GROUNDING: frozenset({RECORDED_OUTCOME_GROUNDING_REASON_CODE}),
@@ -126,6 +139,9 @@ _TRANSIENT_CLAIMANTS = frozenset(
     {
         TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT,
         TurnClaimant.ACTUATION_OBLIGATION_FILL,
+        TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
+        TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION,
+        TurnClaimant.CAPTURE_OBLIGATION_REOPEN,
         TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
     }
 )
@@ -251,6 +267,13 @@ def current_turn_owner(ctx: AgentContext) -> PrecedenceClaim | None:
     if not live:
         return None
     return min(live, key=lambda claim: _PRECEDENCE_RANK[claim.claimant])
+
+
+def claim_would_succeed(ctx: AgentContext, claimant: TurnClaimant) -> bool:
+    """Read-only mirror of claim_turn's yield check: True iff a claim by ``claimant`` would be
+    owned rather than yielded against the current live owner. Mutates no ctx state."""
+    owner = current_turn_owner(ctx)
+    return owner is None or owner.claimant is claimant or claimant_outranks(claimant, owner.claimant)
 
 
 def claim_turn(

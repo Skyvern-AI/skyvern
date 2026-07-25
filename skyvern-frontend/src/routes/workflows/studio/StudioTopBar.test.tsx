@@ -3,7 +3,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from "vitest";
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -38,6 +47,22 @@ import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
+
+// jsdom lacks ResizeObserver, which Radix's tooltip popper constructs once a
+// tooltip opens. Install it for this suite only and restore afterward.
+class MockResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+beforeAll(() => {
+  vi.stubGlobal("ResizeObserver", MockResizeObserver);
+});
+
+afterAll(() => {
+  vi.unstubAllGlobals();
+});
 
 function LocationProbe() {
   const location = useLocation();
@@ -402,6 +427,21 @@ describe("TitleSection title link + edit affordance", () => {
     renderTitleSection();
     const link = screen.getByRole("link", { name: "My Workflow" });
     expect(link.getAttribute("href")).toBe("/agents/wpid_abc/runs");
+  });
+
+  test("cues the title as a link and tooltips its runs destination", async () => {
+    renderTitleSection();
+    const link = screen.getByRole("link", { name: "My Workflow" });
+    expect(link.getAttribute("href")).toBe("/agents/wpid_abc/runs");
+    // jsdom can't evaluate :hover; pin the color cue (mirrors WorkflowScriptsPage's runs link).
+    expect(link.className).toContain("hover:text-blue-700");
+    expect(link.className).toContain("dark:hover:text-blue-400");
+    // Radix mounts the tooltip content on focus (visible + a11y copies), so
+    // assert the destination label appears rather than a single node.
+    fireEvent.focusIn(link);
+    expect(
+      (await screen.findAllByText("View past runs")).length,
+    ).toBeGreaterThan(0);
   });
 
   test("enters the shared rename input from the edit button and commits into the title + dirty stores", () => {

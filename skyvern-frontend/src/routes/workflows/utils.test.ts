@@ -4,9 +4,10 @@ import {
   ProxyLocation,
   type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
-import type { WorkflowParameter } from "./types/workflowTypes";
+import type { Parameter, WorkflowParameter } from "./types/workflowTypes";
 import {
   getInitialValues,
+  getOrderedRunParameters,
   getRerunNavigationState,
   normalizeJsonParameterFormValue,
   parseJsonWorkflowParameterValue,
@@ -162,5 +163,58 @@ describe("validateJsonWorkflowParameterValue", () => {
     expect(validateJsonWorkflowParameterValue("{not json")).toBe(
       "Invalid JSON",
     );
+  });
+});
+
+describe("getOrderedRunParameters", () => {
+  it("orders by the workflow definition, then appends definition-less extras", () => {
+    const definitionParameters = [
+      { parameter_type: "workflow", key: "first", description: "First field" },
+      { parameter_type: "workflow", key: "second", description: null },
+    ] as unknown as Parameter[];
+    const runParameters = { second: "b", first: "a", extra: "c" };
+
+    const result = getOrderedRunParameters(definitionParameters, runParameters);
+
+    expect(result.map(([key]) => key)).toEqual(["first", "second", "extra"]);
+    expect(result.map(([, value]) => value)).toEqual(["a", "b", "c"]);
+    // The matched definition rides along per key.
+    expect(result.map(([, , def]) => def?.description ?? null)).toEqual([
+      "First field",
+      null,
+      null,
+    ]);
+    // Extras (absent from the definition) carry no definition object.
+    expect(result[2]?.[2]).toBeUndefined();
+  });
+
+  it("never surfaces credential/secret parameter definitions", () => {
+    const definitionParameters = [
+      {
+        parameter_type: "workflow",
+        key: "invoice_url",
+        description: "Invoice",
+      },
+      {
+        parameter_type: "credential",
+        key: "login",
+        credential_id: "cred_secret_123",
+      },
+    ] as unknown as Parameter[];
+    const runParameters = { invoice_url: "https://x.test" };
+
+    const result = getOrderedRunParameters(definitionParameters, runParameters);
+
+    // Only the workflow parameter is surfaced; the credential key is absent...
+    expect(result.map(([key]) => key)).toEqual(["invoice_url"]);
+    // ...and no credential-definition metadata leaks into any entry.
+    expect(JSON.stringify(result)).not.toContain("cred_secret_123");
+  });
+
+  it("falls back to Object.entries ordering without a definition", () => {
+    expect(getOrderedRunParameters(undefined, { b: 2, a: 1 })).toEqual([
+      ["b", 2, undefined],
+      ["a", 1, undefined],
+    ]);
   });
 });

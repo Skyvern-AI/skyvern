@@ -2490,6 +2490,7 @@ class Skyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -2517,6 +2518,9 @@ class Skyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2550,6 +2554,7 @@ class Skyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -2565,6 +2570,7 @@ class Skyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -2595,6 +2601,9 @@ class Skyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2630,6 +2639,7 @@ class Skyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -6678,6 +6688,7 @@ class AsyncSkyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -6705,6 +6716,9 @@ class AsyncSkyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6746,6 +6760,7 @@ class AsyncSkyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -6761,6 +6776,7 @@ class AsyncSkyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -6791,6 +6807,9 @@ class AsyncSkyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6834,6 +6853,7 @@ class AsyncSkyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data

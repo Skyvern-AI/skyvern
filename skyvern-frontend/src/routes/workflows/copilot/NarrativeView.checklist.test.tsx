@@ -35,6 +35,8 @@ const runningBlock = (overrides: Partial<BlockState> = {}): BlockState => ({
   endedAt: null,
   ...overrides,
 });
+const LONG_OUTCOME_REASON =
+  "The verification challenge kept reappearing after submit, and each retry landed back on the same gate instead of the requested destination page.";
 
 const liveExploreTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
@@ -225,6 +227,99 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     fireEvent.click(testRow);
     expect(testRow.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByTitle("Highlight block_1 on canvas")).toBeTruthy();
+  });
+
+  it("shows a truncated not-demonstrated reason in the collapsed block row and hides it without the verdict", () => {
+    const notConfirmedBlock = runningBlock({
+      state: "completed",
+      outcome: "not_demonstrated",
+      endedAt: "2026-06-10T00:00:10Z",
+    });
+    const turnWithVerdict: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-3",
+      turnIndex: 0,
+      mode: "build",
+      designStarted: true,
+      designEnded: true,
+      terminal: "response",
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [notConfirmedBlock],
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: LONG_OUTCOME_REASON,
+        activitySeqAtVerdict: 4,
+      },
+      designActivity: [],
+    };
+    const expectedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    const { rerender } = render(<NarrativeView turn={turnWithVerdict} uxV1 />);
+    const testRow = screen.getByRole("button", { name: /Test-run/ });
+    fireEvent.click(testRow);
+    expect(
+      screen.getByText(
+        (text) =>
+          text.includes("run finished without showing the goal was met") &&
+          text.includes(expectedPreview),
+      ),
+    ).toBeTruthy();
+
+    rerender(
+      <NarrativeView
+        turn={{ ...turnWithVerdict, lastRunOutcome: null }}
+        uxV1
+      />,
+    );
+    const rerenderedTestRow = screen.getByRole("button", { name: /Test-run/ });
+    if (rerenderedTestRow.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(rerenderedTestRow);
+    }
+    expect(screen.queryByText(expectedPreview)).toBeNull();
+  });
+
+  it("uses hydrated block outcomeReason for the collapsed block-row preview when lastRunOutcome is absent", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-4",
+      turnIndex: 0,
+      mode: "build",
+      responseType: "REPLY",
+      designStarted: true,
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "block_1",
+          blockType: "task",
+          state: "completed",
+          outcome: "not_demonstrated",
+          outcomeReason: LONG_OUTCOME_REASON,
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-06-10T00:00:00Z",
+          endedAt: "2026-06-10T00:00:10Z",
+        },
+      ],
+      terminal: "response",
+      terminalMessage: "Built and tested the workflow.",
+      narrativeSummary: "Built and tested the workflow.",
+      priorBlockCount: null,
+      designActivity: [],
+      startedAt: "2026-06-10T00:00:00Z",
+      endedAt: "2026-06-10T00:00:10Z",
+    })!;
+    expect(hydrated.lastRunOutcome).toBeNull();
+    const expectedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    render(<NarrativeView turn={hydrated} uxV1 />);
+    const testRow = screen.getByRole("button", { name: /Test-run/ });
+    fireEvent.click(testRow);
+    expect(
+      screen.getByText(
+        (text) =>
+          text.includes("run finished without showing the goal was met") &&
+          text.includes(expectedPreview),
+      ),
+    ).toBeTruthy();
   });
 
   it("hydration no-replay pin: a reloaded terminal build turn renders all stubs — zero spinners, zero open nests, no pending timers", () => {

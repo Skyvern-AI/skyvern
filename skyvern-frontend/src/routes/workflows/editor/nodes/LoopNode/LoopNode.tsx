@@ -8,6 +8,7 @@ import {
   type Node,
 } from "@xyflow/react";
 import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -37,7 +38,8 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     throw new Error("Node not found"); // not possible
   }
   const { editable, label } = data;
-  const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
+  const { blockLabel: urlBlockLabel } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);

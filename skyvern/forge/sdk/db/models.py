@@ -686,6 +686,7 @@ class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
     __table_args__ = (
         Index("idx_workflow_runs_org_created", "organization_id", "created_at"),
+        Index("idx_workflow_runs_wpid_created", "workflow_permanent_id", "created_at"),
         Index(
             "ix_workflow_runs_nonterminal_status",
             "status",
@@ -717,6 +718,9 @@ class WorkflowRunModel(Base):
     organization_id = Column(String, nullable=False, index=True)
     browser_session_id = Column(String, nullable=True, index=True)
     browser_profile_id = Column(String, nullable=True, index=True)
+    browser_seed_source = Column(String, nullable=True)
+    browser_sink_profile_id = Column(String, nullable=True)
+    start_fresh_browser = Column(Boolean, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -1308,8 +1312,8 @@ class PersistentBrowserSessionModel(Base):
     ip_address = Column(String, nullable=True)
     ecs_task_arn = Column(String, nullable=True)
     # Server-side CDP routing. browser_address stays the client-facing proxy URL; these name the
-    # upstream the proxy dials and the adapter that dials it. Never a credential — connect-time
-    # credentials come from env — and never returned to clients (BrowserSessionResponse.
+    # upstream the proxy dials and the adapter that dials it. Never a long-lived operator
+    # credential; may carry a session-scoped token. Never returned to clients (BrowserSessionResponse.
     # from_browser_session allowlists the client-facing fields).
     upstream_cdp_url = Column(String, nullable=True)
     browser_vendor = Column(String, nullable=True)
@@ -1370,6 +1374,7 @@ class BrowserProfileModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+    last_verified_login_at = Column(DateTime, nullable=True)
 
 
 class TaskRunModel(Base):
@@ -1480,7 +1485,16 @@ class CredentialFolderModel(Base):
 
 class CredentialModel(Base):
     __tablename__ = "credentials"
-    __table_args__ = (Index("credential_folder_id_idx", "folder_id"),)
+    __table_args__ = (
+        Index("credential_folder_id_idx", "folder_id"),
+        Index(
+            "uq_credentials_browser_profile_id",
+            "browser_profile_id",
+            unique=True,
+            postgresql_where=text("browser_profile_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("browser_profile_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
+    )
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
@@ -1499,6 +1513,7 @@ class CredentialModel(Base):
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
+    pin_saved_session_ip = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)

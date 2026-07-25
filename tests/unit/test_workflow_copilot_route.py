@@ -20,22 +20,26 @@ import json
 from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog.testing
 from fastapi import HTTPException
 from PIL import Image
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.context import DeliveredUnverifiedPublicOutputs
+from skyvern.forge.sdk.copilot.context import AgentResult, DeliveredUnverifiedPublicOutputs
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SchemaIncompatibility,
     render_schema_incompatibility_user_reason,
 )
+from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
@@ -61,6 +65,15 @@ from tests.unit.copilot_route_test_support import install_fake_create, setup_new
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
+@pytest.fixture(autouse=True)
+def _default_terminal_envelope_render_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=False),
+    )
+
+
 def _make_chat_request(
     mode: str | None = None, code_block: bool | None = None, keep_pending_proposal: bool = False
 ) -> WorkflowCopilotChatRequest:
@@ -75,6 +88,745 @@ def _make_chat_request(
         code_block=code_block,
         keep_pending_proposal=keep_pending_proposal,
     )
+
+
+def _terminal_payload(*, verified: bool, workflow_applied: bool) -> dict[str, Any]:
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=verified,
+        workflow_applied=workflow_applied,
+        proposal_disposition="no_proposal",
+        run_outcomes=[],
+        blocker_reason=None,
+        halt_kind=None,
+        attempted="Attempted full run.",
+        workflow_mutated=True,
+        turn_outcome_response_kind="build",
+    )
+    assert envelope is not None
+    return envelope.model_dump(mode="json")
+
+
+def _narrative_payload() -> dict[str, Any]:
+    return {
+        "turnId": "turn-1",
+        "turnIndex": 0,
+        "mode": "build",
+        "designStarted": True,
+        "designEnded": True,
+        "draft": None,
+        "blocks": [],
+        "terminal": "response",
+        "terminalMessage": "done",
+        "narrativeSummary": "done",
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": None,
+        "endedAt": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_finalizes_terminal_envelope_without_auto_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["workflow_applied"] is False
+    # Verified fix, not auto-accepted: a pending proposal for the review gate, not stopped.
+    assert response_frame.terminal_envelope["next_state"] == "proposal_pending"
+    assert response_frame.terminal_envelope["response_kind"] == "update"
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
+    assert persisted_payload["terminalEnvelope"]["next_state"] == "proposal_pending"
+    assert persisted_payload["terminalEnvelope"]["response_kind"] == "update"
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_finalizes_terminal_envelope_with_auto_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["workflow_applied"] is True
+    assert response_frame.terminal_envelope["next_state"] == "completed"
+    assert response_frame.terminal_envelope["response_kind"] == "update"
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalEnvelope"]["workflow_applied"] is True
+    assert persisted_payload["terminalEnvelope"]["next_state"] == "completed"
+    assert persisted_payload["terminalEnvelope"]["response_kind"] == "update"
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_envelope_not_applied_without_proposal_on_auto_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    # No proposal at all, and proposal_disposition left at the AgentResult
+    # default (auto_applicable) — the shape ASK_QUESTION/answer builders emit.
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["workflow_applied"] is False
+    assert response_frame.terminal_envelope["next_state"] != "completed"
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
+    assert persisted_payload["terminalEnvelope"]["next_state"] != "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_flag_off_keeps_legacy_message_and_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.message == "done"
+    assert response_frame.narrative_payload is not None
+    assert response_frame.narrative_payload["terminalMessage"] == "done"
+    assert response_frame.narrative_payload["narrativeSummary"] == "done"
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope.get("rendered_from_envelope") in {None, False}
+
+    persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
+    assert persisted_writes[-1].kwargs["content"] == "done"
+    persisted_payload = persisted_writes[-1].kwargs["narrative_payload"]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalMessage"] == "done"
+    assert persisted_payload["narrativeSummary"] == "done"
+    assert persisted_payload["terminalEnvelope"].get("rendered_from_envelope") in {None, False}
+
+
+def test_with_rendered_terminal_text_overwrites_distinct_summary() -> None:
+    payload = {
+        **_narrative_payload(),
+        "terminalMessage": "legacy terminal prose",
+        "narrativeSummary": "Concise legacy summary.",
+    }
+    out = workflow_copilot_route._with_rendered_terminal_text(payload, rendered_message="rendered truth")
+    assert out is not None
+    assert out["terminalMessage"] == "rendered truth"
+    assert out["narrativeSummary"] == "rendered truth"
+
+
+def test_chat_history_preserves_terminal_envelope() -> None:
+    now = datetime.now(timezone.utc)
+    payload = {
+        **_narrative_payload(),
+        "terminalEnvelope": {
+            **_terminal_payload(verified=False, workflow_applied=False),
+            "rendered_from_envelope": True,
+        },
+    }
+    history = convert_to_history_messages(
+        [
+            WorkflowCopilotChatMessage(
+                workflow_copilot_chat_message_id="message-1",
+                workflow_copilot_chat_id="chat-1",
+                sender=WorkflowCopilotChatSender.AI,
+                content="done",
+                narrative_payload=payload,
+                created_at=now,
+                modified_at=now,
+            )
+        ]
+    )
+    served = history[0].narrative_payload
+    assert served is not None
+    assert served["terminalEnvelope"]["run_verdict"] is None
+    assert served["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    agent_result = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        cancelled=True,
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=True),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        user_message="stop",
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.cancelled is True
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["workflow_applied"] is False
+    assert response_frame.terminal_envelope["next_state"] != "completed"
+    assert response_frame.terminal_envelope["response_kind"] == "stopped"
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
+    assert persisted_payload["terminalEnvelope"]["next_state"] != "completed"
+    assert persisted_payload["terminalEnvelope"]["response_kind"] == "stopped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_enabled", [True, False], ids=["flag-on", "flag-off"])
+async def test_finalise_normal_turn_logs_render_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    flag_enabled: bool,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=flag_enabled),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    with structlog.testing.capture_logs() as logs:
+        await workflow_copilot_route._finalise_normal_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=original_workflow,
+            chat_request=_make_chat_request(),
+            agent_result=agent_result,
+        )
+
+    decisions = [entry for entry in logs if entry["event"] == "copilot_terminal_render_decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["flag_enabled"] is flag_enabled
+    # This fixture's envelope is a stopped/stopped shape, so flag-on replaces.
+    assert decisions[0]["replaced"] is flag_enabled
+    assert decisions[0]["next_state"] == "stopped"
+    assert decisions[0]["response_kind"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_flag_on_stopped_envelope_renders_terminal_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    expected = "I stopped without confirming the goal was met."
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.message == expected
+    assert response_frame.narrative_summary == expected
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["rendered_from_envelope"] is True
+    assert response_frame.narrative_payload is not None
+    assert response_frame.narrative_payload["terminalMessage"] == expected
+    assert response_frame.narrative_payload["narrativeSummary"] == expected
+
+    persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
+    assert persisted_writes[-1].kwargs["content"] == expected
+    persisted_payload = persisted_writes[-1].kwargs["narrative_payload"]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalMessage"] == expected
+    assert persisted_payload["narrativeSummary"] == expected
+    assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_flag_on_completed_envelope_keeps_message_but_sets_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.message == "done"
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["next_state"] == "completed"
+    assert response_frame.terminal_envelope["rendered_from_envelope"] is True
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finalizer", ["normal", "cancel"], ids=["normal-turn", "cancel-turn"])
+async def test_terminal_envelope_finalization_failure_omits_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    finalizer: str,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=(finalizer == "cancel"),
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done" if finalizer == "normal" else "Cancelled by user.",
+        updated_workflow=updated_workflow if finalizer == "normal" else None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        cancelled=(finalizer == "cancel"),
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    def _raise(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("finalize failed")
+
+    monkeypatch.setattr(workflow_copilot_route, "finalize_applied_state", _raise)
+
+    if finalizer == "normal":
+        await workflow_copilot_route._finalise_normal_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=original_workflow,
+            chat_request=_make_chat_request(),
+            agent_result=agent_result,
+        )
+    else:
+        await workflow_copilot_route._persist_cancel_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=original_workflow,
+            user_message="stop",
+            agent_result=agent_result,
+        )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.terminal_envelope is None
+    if finalizer == "cancel":
+        assert response_frame.cancelled is True
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    assert "terminalEnvelope" not in persisted_payload
+
+
+@pytest.mark.asyncio
+async def test_get_debug_run_info_bounds_visible_elements_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    max_chars = workflow_copilot_route.WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS
+    html = "HEAD_MARKER" + ("x" * (max_chars * 2)) + "TAIL_MARKER"
+    artifact = SimpleNamespace()
+    block = SimpleNamespace(
+        label="block-1",
+        block_type=SimpleNamespace(name="task"),
+        status="failed",
+        failure_reason="timed out",
+    )
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "_get_debug_artifact",
+        AsyncMock(return_value=artifact),
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "observer",
+        SimpleNamespace(get_workflow_run_blocks=AsyncMock(return_value=[block])),
+    )
+    monkeypatch.setattr(
+        app,
+        "ARTIFACT_MANAGER",
+        SimpleNamespace(retrieve_artifact=AsyncMock(return_value=html.encode("utf-8"))),
+    )
+
+    run_info = await workflow_copilot_route._get_debug_run_info("org-1", "wr-1")
+
+    assert run_info is not None
+    assert run_info.html is not None
+    assert len(run_info.html) < len(html)
+    assert len(run_info.html) <= max_chars + 100
+    assert "HEAD_MARKER" in run_info.html
+    assert "TAIL_MARKER" in run_info.html
+    assert "truncated by Skyvern" in run_info.html
+
+
+@pytest.mark.asyncio
+async def test_terminal_envelope_finalization_failure_flag_on_fails_closed_to_legacy_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    def _raise(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("finalize failed")
+
+    monkeypatch.setattr(workflow_copilot_route, "finalize_applied_state", _raise)
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.message == "done"
+    assert response_frame.terminal_envelope is None
+    persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
+    assert persisted_writes[-1].kwargs["content"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_agent_result_flag_on_marks_envelope_but_keeps_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    agent_result = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        cancelled=True,
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=True),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        user_message="stop",
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.message == "Cancelled by user."
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["rendered_from_envelope"] is True
+    persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
+    assert persisted_writes[-1].kwargs["content"] == "Cancelled by user."
+    persisted_payload = persisted_writes[-1].kwargs["narrative_payload"]
+    assert persisted_payload is not None
+    assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_path_keeps_literal_cancelled_by_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, SimpleNamespace())
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        user_message="stop",
+        agent_result=None,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
+    assert response_frame.message == "Cancelled by user."
+    assert response_frame.terminal_envelope is None
+    persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
+    assert persisted_writes[-1].kwargs["content"] == "Cancelled by user."
+
+
+@pytest.mark.asyncio
+async def test_agent_functions_oss_terminal_envelope_render_resolver_uses_settings_toggle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolver = AgentFunction()
+
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER", False)
+    assert await resolver.should_render_copilot_terminal_from_envelope("org-1") is False
+
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER", True)
+    assert await resolver.should_render_copilot_terminal_from_envelope("org-1") is True
 
 
 @pytest.mark.asyncio
@@ -1439,9 +2191,13 @@ async def test_proposed_workflow_cleared_on_restore(
 
 
 @pytest.mark.asyncio
-async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept_off(
+async def test_verified_code_only_fix_stays_pending_without_auto_accept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # With auto_accept off, a verified CODE_ONLY_BROWSER fix (auto_applicable + staged)
+    # must stay a pending proposal: no canonical commit, proposal persisted, terminal
+    # frame reports workflow_applied False. ``apply_without_review`` is set truthy only
+    # to prove that attribute can no longer force an auto-apply on its own.
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
     captured = install_fake_create(monkeypatch)
@@ -1520,10 +2276,11 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
     await handler(stream)
 
     restore_mock.assert_not_awaited()
-    workflow_service.update_workflow_definition.assert_awaited_once()
+    workflow_service.update_workflow_definition.assert_not_awaited()
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
-    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None] == []
-    assert [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    proposed_writes = [c.kwargs["proposed_workflow"] for c in update_calls if "proposed_workflow" in c.kwargs]
+    assert proposed_writes, "expected the pending proposal to be persisted"
+    assert all(w is not None for w in proposed_writes), "verified fix must stay pending, not be cleared"
 
     response_frames = [
         call.args[0]
@@ -1531,7 +2288,7 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
         if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
     ]
     assert len(response_frames) == 1
-    assert response_frames[0].workflow_applied is True
+    assert response_frames[0].workflow_applied is False
     assert response_frames[0].updated_workflow == {"workflow_id": "wf-applied"}
 
 
@@ -1892,7 +2649,6 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         clear_proposed_workflow=False,
         proposal_disposition="review_tested",
         cancelled=False,
-        apply_without_review=False,
         output_policy_diagnostics=None,
         canonical_was_persisted_due_to_param_change=False,
     )
@@ -1912,7 +2668,6 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
         clear_proposed_workflow=False,
         proposal_disposition="review_untested",
         cancelled=False,
-        apply_without_review=False,
         output_policy_diagnostics=None,
     )
     fields.update(overrides)
@@ -2084,9 +2839,9 @@ async def test_persist_state_auto_accept_stale_unvalidated_still_clears_without_
 async def test_persist_state_staged_commit_clears_stale_proposal_despite_keep_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A later turn's own auto-commit (chat.auto_accept, not apply_without_review)
-    # supersedes an earlier bypassed proposal even when the client asked to keep
-    # it — the committed canonical workflow already moved past it.
+    # A later turn's own auto-accept commit (chat.auto_accept) supersedes an
+    # earlier pending proposal even when the client asked to keep it — the
+    # committed canonical workflow already moved past it.
     chat = SimpleNamespace(
         organization_id="org-1",
         workflow_copilot_chat_id="chat-1",
