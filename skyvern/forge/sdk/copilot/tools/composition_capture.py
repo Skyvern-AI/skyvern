@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.forge.sdk.copilot.build_test_outcome import maybe_satisfy_recorded_outcome_grounding_requirement
+from skyvern.forge.sdk.copilot.challenge_evidence import challenge_evidence_unsettled
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     RunEvidenceSnapshot,
@@ -65,6 +66,7 @@ from .scouting import (
     _consume_pending_browser_interaction_observation,
     _mark_page_inspected,
     _mark_post_run_page_observed,
+    solve_challenge_when_evidence_settles,
 )
 
 LOG = structlog.get_logger()
@@ -122,6 +124,9 @@ async def _active_run_terminal_evidence_sample(
         inspected_url=current_url,
         current_url=current_url,
         active_run_terminal_sample=True,
+        # The executor is still driving this page; solving here would act on a run this turn
+        # does not own, and spend the turn's attempts on a sample.
+        solve_challenges=False,
     )
     if html_error is not None or evidence is None:
         LOG.info(
@@ -608,12 +613,17 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
     return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
+def _composition_capture_settled(evidence: dict[str, Any]) -> bool:
+    return has_bounded_page_schema(evidence) and not challenge_evidence_unsettled(evidence)
+
+
 async def _capture_composition_evidence(
     copilot_ctx: Any,
     *,
     inspected_url: str,
     current_url: str,
     active_run_terminal_sample: bool = False,
+    solve_challenges: bool = True,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
     evidence: dict[str, Any] | None = None
@@ -627,11 +637,16 @@ async def _capture_composition_evidence(
         if structured is not None:
             evidence = structured
             used_structured = True
-            if has_bounded_page_schema(evidence):
+            if _composition_capture_settled(evidence):
                 break
             if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
                 await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
                 continue
+        # get_html reads body only, so re-parsing cannot see a title-derived challenge signal.
+        # Guard the reparse itself, not one route to it: re-looks may be exhausted, or the
+        # extractor may have blinked on a later attempt while a signalled packet is in hand.
+        if used_structured and challenge_evidence_unsettled(evidence):
+            break
         html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
             if evidence is not None:
@@ -644,7 +659,7 @@ async def _capture_composition_evidence(
             skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         used_structured = False
-        if has_bounded_page_schema(evidence):
+        if _composition_capture_settled(evidence):
             break
         if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
@@ -659,6 +674,12 @@ async def _capture_composition_evidence(
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+    # Off for a capture that only reads a run's page: solving there would mutate the page being
+    # diagnosed and spend on a session this turn is not driving.
+    if solve_challenges:
+        await solve_challenge_when_evidence_settles(
+            copilot_ctx, evidence, url=current_url, observed_after_interaction=False
+        )
     return evidence, None
 
 

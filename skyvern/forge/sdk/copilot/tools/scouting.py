@@ -19,6 +19,14 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_EVIDENCE_SOURCE_KEY,
+    ChallengeEvidenceSource,
+    challenge_evidence_unsettled,
+    challenge_signal_regressed,
+    composition_challenge_carrier,
+    interactive_challenge_controls,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _is_positional_selector,
     dynamic_row_evidence_fingerprint,
@@ -76,6 +84,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     resolve_browser_state_for_context,
 )
+from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -793,6 +802,125 @@ def _record_scouted_interaction(
     record_reached_terminal_action_observation(ctx)
 
 
+_MAX_CHALLENGE_SOLVE_ATTEMPTS = 3
+
+
+def _challenge_identity(evidence: dict[str, Any]) -> str:
+    """Identify the challenge, not the page, so a later distinct one still gets attempts.
+
+    Deliberately ignores ``src``: the common widgets carry a per-render cache-buster there, so
+    keying on it would mint a fresh identity on every re-render and never reach the cap.
+    """
+    marks = []
+    for control in interactive_challenge_controls(evidence.get("challenge_controls")):
+        mark = control.get("data_sitekey") or control.get("selector") or control.get("id")
+        if mark:
+            marks.append(str(mark))
+    return "|".join(sorted(marks)) or str(evidence.get("current_url") or "")
+
+
+def _record_challenge_encounter(
+    ctx: AgentContext,
+    carrier: ChallengeEvidenceSource,
+    *,
+    outcome: str,
+) -> None:
+    """Record on the interaction that met the challenge, whether or not it was passed.
+
+    Synthesis derives boundaries from ``composition_challenge_carrier`` over the recorded
+    interaction itself, so the carrier has to ride on a tool_name it already emits for; a
+    standalone solve_captcha interaction has no emitter and would be dropped.
+    """
+    trajectory = list(ctx.scout_trajectory)
+    if not trajectory:
+        return
+    entry = trajectory[-1]
+    challenge_state = dict(entry.get("challenge_state") or {})
+    challenge_state[CHALLENGE_EVIDENCE_SOURCE_KEY] = carrier.value
+    challenge_state["outcome"] = outcome
+    stamped = dict(entry)
+    stamped["challenge_state"] = challenge_state
+    trajectory[-1] = cast(ScoutedInteraction, stamped)
+    ctx.scout_trajectory = trajectory
+
+
+async def solve_challenge_when_evidence_settles(
+    ctx: AgentContext,
+    evidence: dict[str, Any] | None,
+    *,
+    url: str | None,
+    observed_after_interaction: bool,
+) -> bool:
+    """Try the shared solve routes on a challenge in just-settled evidence; True if it passed.
+
+    Call from a capture exit, never a tool hook: a settled packet describes the page as it now
+    is, and ``observed_after_interaction`` follows from the seam — the act-observe capture runs
+    after a recorded interaction, an inspection capture has none to attribute.
+    """
+    if not evidence:
+        return False
+    carrier = composition_challenge_carrier(evidence)
+    if carrier is None:
+        return False
+
+    # Record on detection rather than on success: an unsolved challenge is a fact the draft
+    # carries forward, and exploration continues either way. Nothing below terminates the turn.
+    if observed_after_interaction:
+        _record_challenge_encounter(ctx, carrier, outcome="detected")
+
+    # Cost gate, deliberately after the record above: a challenge that cannot be solved must stop
+    # being paid for, but must never stop being reported to synthesis.
+    # Counted before the attempt, so a transient failure spends one too — deliberate, because the
+    # alternative lets a route that keeps erroring retry without bound.
+    identity = _challenge_identity(evidence)
+    attempts = ctx.challenge_solve_attempts.get(identity, 0)
+    if attempts >= _MAX_CHALLENGE_SOLVE_ATTEMPTS:
+        return False
+    ctx.challenge_solve_attempts[identity] = attempts + 1
+
+    # Read once so the handlers below report a failure without touching the context again.
+    organization_id = ctx.organization_id
+    try:
+        # Resolving the browser is inside the guard because it can raise, and a challenge the
+        # scout merely failed to solve must never be what ends exploration.
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return False
+        page = await browser_state.get_working_page()
+        if page is None:
+            return False
+        # In-DOM checkbox, then the Turnstile extension, then the reCAPTCHA token route.
+        await _code_block_solve_captcha_builtin(page, organization_id=organization_id)
+    except CodeBlockCaptchaError:
+        LOG.info(
+            "copilot_scout_captcha_solve_failed",
+            url=url,
+            organization_id=organization_id,
+        )
+        if observed_after_interaction:
+            _record_challenge_encounter(ctx, carrier, outcome="unsolved")
+        return False
+    except Exception:
+        LOG.warning(
+            "copilot_scout_captcha_solve_exception",
+            url=url,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+    # "attempted", not "solved": the routes return normally when their probes match nothing, so a
+    # carrier asserted by challenge_state alone can complete here without anything being solved.
+    if observed_after_interaction:
+        _record_challenge_encounter(ctx, carrier, outcome="attempted")
+    LOG.info(
+        "copilot_scout_captcha_solved",
+        url=url,
+        organization_id=organization_id,
+    )
+    return True
+
+
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:
     if isinstance(value, dict):
         if value.get("selector") == selector:
@@ -1000,7 +1128,9 @@ def _mint_current_loaded_result_source(
     return loaded_results
 
 
-async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
+async def _scout_act_observe_page_evidence(
+    ctx: AgentContext, *, url: str, observed_after_interaction: bool = False
+) -> dict[str, Any] | None:
     """Run the bounded page-side extractor right after a scout interaction.
 
     Degrades to None on timeout or error so the interaction result is never
@@ -1022,8 +1152,9 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         outcome = "error"
     else:
         outcome = _scout_act_observe_capture_outcome(parsed, started=started, timeout_seconds=timeout_seconds)
-        if outcome == "hollow" and parsed is not None:
-            first_hollow = parsed
+        if parsed is not None and (outcome == "hollow" or challenge_evidence_unsettled(parsed)):
+            first_packet = parsed
+            first_outcome = outcome
             remaining_seconds = timeout_seconds - (time.monotonic() - started)
             if remaining_seconds <= 0:
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
@@ -1040,15 +1171,15 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                         ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
                     )
                 except Exception:
-                    parsed = first_hollow
-                    outcome = "hollow"
+                    parsed = first_packet
+                    outcome = first_outcome
                     ctx.last_scout_act_observe_recapture_result = (
                         "timeout" if time.monotonic() - started >= timeout_seconds else "error"
                     )
                 else:
                     if recaptured is None:
-                        parsed = first_hollow
-                        outcome = "hollow"
+                        parsed = first_packet
+                        outcome = first_outcome
                         ctx.last_scout_act_observe_recapture_result = _scout_act_observe_no_payload_result(
                             started=started, timeout_seconds=timeout_seconds
                         )
@@ -1056,8 +1187,17 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                         recaptured_outcome = _scout_act_observe_capture_outcome(
                             recaptured, started=started, timeout_seconds=timeout_seconds
                         )
-                        parsed = recaptured
-                        outcome = recaptured_outcome
+                        # Never trade down: a page that navigated mid-recapture would otherwise
+                        # lose the form the first capture proved, or erase the challenge signal
+                        # that justified re-looking while still reporting a bounded schema.
+                        if (
+                            first_outcome == "attached" and recaptured_outcome != "attached"
+                        ) or challenge_signal_regressed(first_packet, recaptured):
+                            parsed = first_packet
+                            outcome = first_outcome
+                        else:
+                            parsed = recaptured
+                            outcome = recaptured_outcome
                         ctx.last_scout_act_observe_recapture_result = recaptured_outcome
     ctx.last_scout_act_observe_outcome = outcome
     ctx.last_scout_act_observe_packet = parsed
@@ -1070,6 +1210,9 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
+    )
+    await solve_challenge_when_evidence_settles(
+        ctx, parsed, url=url, observed_after_interaction=observed_after_interaction
     )
     return parsed
 
@@ -1094,7 +1237,7 @@ async def _register_scout_interaction_observation(
         evidence["interaction_source_url"] = source_url.strip()
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
-        parsed = await _scout_act_observe_page_evidence(ctx, url=url)
+        parsed = await _scout_act_observe_page_evidence(ctx, url=url, observed_after_interaction=True)
         # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
         # that rendered witnessed value content is bindable even when it exposes no actionable schema.
         if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
@@ -1577,6 +1720,10 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
         role=role,
         accessible_name=accessible_name,
     )
+    # This path records its click after the capture, so the encounter is attributed here instead.
+    auto_act_carrier = composition_challenge_carrier(post_evidence) if post_evidence else None
+    if auto_act_carrier is not None:
+        _record_challenge_encounter(ctx, auto_act_carrier, outcome="detected")
 
     for key in ("next_action", "next_action_reason", "actionable_targets"):
         data.pop(key, None)

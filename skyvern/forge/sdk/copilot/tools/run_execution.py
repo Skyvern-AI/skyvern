@@ -1293,7 +1293,9 @@ async def _capture_and_store_post_run_page(
     evidence: dict[str, Any] | None = None
     try:
         evidence, _ = await asyncio.wait_for(
-            _capture_composition_evidence(ctx, inspected_url=current_url, current_url=current_url),
+            _capture_composition_evidence(
+                ctx, inspected_url=current_url, current_url=current_url, solve_challenges=False
+            ),
             timeout=_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS,
         )
     except Exception:
