@@ -6074,8 +6074,10 @@ async def test_active_run_terminal_evidence_sample_matches_current_page(
         inspected_url: str,
         current_url: str,
         active_run_terminal_sample: bool = False,
+        solve_challenges: bool = True,
     ) -> tuple[dict, None]:
         captured["active_run_terminal_sample"] = active_run_terminal_sample
+        captured["solve_challenges"] = solve_challenges
         return (
             {
                 "inspected_url": inspected_url,
@@ -6117,6 +6119,8 @@ async def test_active_run_terminal_evidence_sample_matches_current_page(
     assert sample.current_url == "https://example.com/cart"
     assert sample.page_evidence["observed_during_active_workflow_run"] is True
     assert captured["active_run_terminal_sample"] is True
+    # The executor still owns this page; sampling it must never drive a challenge solve.
+    assert captured["solve_challenges"] is False
     assert "PART-001-TEST" in str(captured["prompt"])
 
 
