@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from skyvern.config import settings
 if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
 
+    from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, RuntimeOriginAuthority
+    from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
     # Deferred import: skyvern_context.py sits below the service layer and
@@ -29,6 +32,14 @@ MAX_RECENT_DIALOG_MESSAGES = 5
 # Per-message length cap so a single pathological alert (multi-KB page-stack
 # trace, etc.) cannot dominate the prompt budget.
 MAX_DIALOG_MESSAGE_CHARS = 500
+
+
+def _unwired_authority() -> RuntimeOriginAuthority:
+    # Same deferred-import reason as the TYPE_CHECKING block above: the policy core pulls the action
+    # models, which this module must not import at module load.
+    from skyvern.forge.sdk.browser_action_policy import UNWIRED_AUTHORITY
+
+    return UNWIRED_AUTHORITY
 
 
 class DialogEntry(TypedDict):
@@ -96,7 +107,9 @@ class SkyvernContext:
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
-    downloaded_pdf_sources: set[str] = field(default_factory=set)
+    # builtins.set, not set: the module-level `set` context setter below shadows the
+    # builtin for anything that resolves the name after import.
+    downloaded_pdf_sources: set[str] = field(default_factory=builtins.set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -156,7 +169,7 @@ class SkyvernContext:
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
     is_static_script: bool = False
-    sensitive_values: set[str] = field(default_factory=set)
+    sensitive_values: set[str] = field(default_factory=builtins.set)
     ai_mode_override: str | None = None
     script_llm_call_count: int = 0
     last_classify_result: str | None = None
@@ -199,7 +212,7 @@ class SkyvernContext:
 
     # Track task_ids where proactive captcha injection has already been attempted,
     # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
-    proactive_captcha_task_ids: set[str] = field(default_factory=set)
+    proactive_captcha_task_ids: set[str] = field(default_factory=builtins.set)
 
     # Circuit breaker: consecutive captcha solve timeouts for this workflow run.
     # When this reaches the threshold, further captcha solve attempts are short-circuited.
@@ -219,6 +232,34 @@ class SkyvernContext:
     # Deferred file chooser listener — survives across steps so a popup-intercepted upload
     # can be completed when a subsequent click triggers the actual file chooser.
     pending_file_chooser: PendingFileChooserListener | None = None
+
+    # Browser action firewall (SKY-12873). Bound from the resolved workflow version before the run's
+    # browser exists; None means unenrolled, which is the only state standalone SDK actions can be
+    # in. Never copied from a parent context — a child workflow binds its own version's policy.
+    #
+    # Deliberately a plain attribute and not a property: the value must already be resolved before
+    # the browser existed, and an accessor would invite lazy loading that reads it mid-run, letting
+    # a control-plane replacement change a live run's authority.
+    #
+    # This is a CEILING, not the complete authority. It answers "is this run protected, and what did
+    # an operator authorize at most" — not "what may this action reach right now". A consumer must
+    # not treat within-the-enrolled-set as sufficient to allow.
+    browser_action_policy: BrowserActionPolicy | None = None
+
+    # What the run may reach *right now* (SKY-12874). The ceiling above says what an operator
+    # authorized at most; this says what ADR-0011's task-URL-derived authority grants at this
+    # moment, and an origin-gated action needs both.
+    #
+    # It is UNWIRED_AUTHORITY on every run today, because nothing derives an authority yet:
+    # SKY-12883, SKY-12884 and SKY-12886 are the tickets that fill this slot. Until they land, no
+    # code in this repository implements ADR-0011's "block until authority is established" or its
+    # "permanently invalidate on loss or rotation after a browser context is bound". Enrollment
+    # cannot stand in for either — a static origin set never goes missing and never rotates.
+    browser_action_authority: RuntimeOriginAuthority = field(default_factory=_unwired_authority)
+
+    # Newest accepted scrape (SKY-12874). Advanced by the scrape itself; actions are stamped with
+    # the epoch they were planned under so an observation cannot vouch for a plan built before it.
+    browser_observation_epoch: ObservationEpoch | None = None
 
     def set_enrich_tree_mode(self, mode: Any) -> None:
         self.enrich_tree_mode = parse_enrich_tree_mode(mode)

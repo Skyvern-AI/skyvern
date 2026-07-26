@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import exists, func, or_, select, update
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
+from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db._soft_delete import exclude_deleted
@@ -32,6 +33,13 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.tag_filters import workflow_tag_wpid_subqueries
 from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
+from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
+    carried_policy,
+    read_policy,
+    serialize_policy,
+    stored_policy_version,
+    with_policy,
+)
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -86,6 +94,26 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
 class WorkflowsRepository(BaseRepository):
     """Database operations for workflow management."""
 
+    async def _policy_of_latest_version(
+        self, session: Any, workflow_permanent_id: str, organization_id: str | None
+    ) -> object | None:
+        """Deliberately does NOT exclude soft-deleted rows, unlike the read used at bind time.
+
+        `create_workflow_from_request` numbers the new version off this same row set
+        (`filter_deleted=False`), so "previous version" has to mean the same thing here. Skipping
+        deleted rows would let deleting the enrolled version silently unenroll the next save — a
+        clear, which no ordinary save is allowed to perform.
+        """
+        query = (
+            select(WorkflowModel.workflow_definition)
+            .filter_by(workflow_permanent_id=workflow_permanent_id)
+            .order_by(WorkflowModel.version.desc())
+            .limit(1)
+        )
+        if organization_id:
+            query = query.filter_by(organization_id=organization_id)
+        return carried_policy(await session.scalar(query))
+
     @db_operation("create_workflow")
     async def create_workflow(
         self,
@@ -124,11 +152,18 @@ class WorkflowsRepository(BaseRepository):
         edited_by: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
+            # Policy is never taken from the caller's definition: a new version inherits exactly what
+            # the previous one stored, so no save path can add, widen or clear an enrollment.
+            carried = (
+                await self._policy_of_latest_version(session, workflow_permanent_id, organization_id)
+                if workflow_permanent_id
+                else None
+            )
             workflow = WorkflowModel(
                 organization_id=organization_id,
                 title=title,
                 description=description,
-                workflow_definition=workflow_definition,
+                workflow_definition=with_policy(workflow_definition, carried),
                 proxy_location=serialize_proxy_location(proxy_location),
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
@@ -182,6 +217,58 @@ class WorkflowsRepository(BaseRepository):
             await session.commit()
             await session.refresh(workflow)
             return convert_to_workflow(workflow, self.debug_enabled)
+
+    @db_operation("get_browser_action_policy")
+    async def get_browser_action_policy(
+        self, workflow_id: str, organization_id: str | None = None
+    ) -> BrowserActionPolicy | None:
+        """The workflow version's enrolled policy, or None. Raises ValueError on corrupt stored data
+        so an unreadable enrollment fails the run instead of silently unenrolling it."""
+        query = exclude_deleted(
+            select(WorkflowModel.workflow_definition).filter_by(workflow_id=workflow_id), WorkflowModel
+        )
+        if organization_id:
+            query = query.filter_by(organization_id=organization_id)
+        async with self.Session() as session:
+            return read_policy(await session.scalar(query))
+
+    @db_operation("set_browser_action_policy")
+    async def set_browser_action_policy(
+        self,
+        workflow_id: str,
+        organization_id: str,
+        allowed_origin_urls: list[str] | None,
+    ) -> BrowserActionPolicy | None:
+        """Replace (or, with `allowed_origin_urls=None`, clear) the version's policy.
+
+        The policy version is minted here, inside the read-modify-write, so concurrent replacements
+        cannot mint the same one. It advances for the life of an enrollment and restarts after a
+        clear — a clear is an operator de-enrolling the version, not an edit to a live policy.
+
+        Runs already past binding keep the policy they resolved; only subsequent runs see this.
+        """
+        async with self.Session() as session:
+            query = exclude_deleted(
+                select(WorkflowModel).filter_by(workflow_id=workflow_id, organization_id=organization_id),
+                WorkflowModel,
+            ).with_for_update()
+            workflow = (await session.scalars(query)).first()
+            if not workflow:
+                raise NotFoundError("Workflow not found")
+
+            definition: dict[str, Any] = workflow.workflow_definition or {}
+            policy: BrowserActionPolicy | None = None
+            if allowed_origin_urls is not None:
+                policy = declare_policy(
+                    owner_id=organization_id,
+                    origin_urls=allowed_origin_urls,
+                    version=stored_policy_version(definition) + 1,
+                )
+            workflow.workflow_definition = with_policy(
+                definition, serialize_policy(policy) if policy is not None else None
+            )
+            await session.commit()
+            return policy
 
     @db_operation("soft_delete_workflow_by_id")
     async def soft_delete_workflow_by_id(self, workflow_id: str, organization_id: str) -> None:
@@ -721,7 +808,9 @@ class WorkflowsRepository(BaseRepository):
                 if description is not None:
                     workflow.description = description
                 if workflow_definition is not None:
-                    workflow.workflow_definition = workflow_definition
+                    workflow.workflow_definition = with_policy(
+                        workflow_definition, carried_policy(workflow.workflow_definition)
+                    )
                 if version is not None:
                     workflow.version = version
                 if run_with is not None:
@@ -1076,7 +1165,9 @@ class WorkflowsRepository(BaseRepository):
                 # not depend on caller-side object identity between the
                 # top-level parameters list and each block's field.
                 _align_block_output_parameters(workflow_definition)
-                workflow.workflow_definition = workflow_definition.model_dump(mode="json")
+                workflow.workflow_definition = with_policy(
+                    workflow_definition.model_dump(mode="json"), carried_policy(workflow.workflow_definition)
+                )
             if version is not None:
                 workflow.version = version
             if run_with is not None:

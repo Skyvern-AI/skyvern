@@ -21,6 +21,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
+from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
@@ -568,6 +569,8 @@ async def scrape_web_unsafe(
         id_to_frame_dict=id_to_frame_dict,
         empty_page_retry=empty_page_retry,
     )
+
+    advance_observation_epoch(page, main_frame_url=page.main_frame.url, element_hashes=id_to_element_hash.values())
 
     return ScrapedPage(
         elements=elements,

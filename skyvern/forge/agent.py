@@ -97,6 +97,12 @@ from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_
 from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.browser_action_preflight import (
+    observed_page,
+    preflight_action,
+    preflight_batch,
+    stamp_parsed_actions,
+)
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
@@ -1778,6 +1784,10 @@ class ForgeAgent:
                     actions=actions,
                 )
 
+        # The complete batch is evaluated here — after WAIT filtering, and before any of it is
+        # persisted, reported through a callback, slept on or executed.
+        preflight_batch(actions, site="step_action_batch")
+
         # initialize list of tuples and set actions as the first element of each tuple so that in the case
         # of an exception, we can still see all the actions
         detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
@@ -1829,6 +1839,10 @@ class ForgeAgent:
                     step_order=step.order,
                     action_order=action_idx,
                 )
+                # The reload it follows happened after the last scrape, so it carries no
+                # observation of the page it is about to act on. Unstamped by construction: only
+                # _generate_step_actions stamps, and this action never went through it.
+                preflight_action(action, observed_page(), site="internal_refresh")
                 detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
                 action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
                 artifact_tracker.task = asyncio.create_task(
@@ -2201,6 +2215,10 @@ class ForgeAgent:
         pdf_auto_download_src: str | None = None
         pdf_auto_download_used_bytes = False
         actions: list[Action]
+        # Provenance is opt-in per branch, so a branch added later is unstamped until someone
+        # decides it was derived from the scrape. A blanket stamp at the end of this method had the
+        # opposite default and silently gave runtime-synthesized actions provenance they never had.
+        derived_from_scrape = False
         # If prepare_step_execution injected actions (e.g. proactive captcha solving),
         # skip LLM entirely and use the injected actions directly.
         if injected_actions is not None:
@@ -2212,6 +2230,7 @@ class ForgeAgent:
             )
             actions = injected_actions
         elif engine == RunEngine.openai_cua:
+            derived_from_scrape = True
             actions, new_cua_response = await self._generate_cua_actions(
                 task=task,
                 step=step,
@@ -2222,6 +2241,7 @@ class ForgeAgent:
             detailed_agent_step_output.cua_response = new_cua_response
         elif engine == RunEngine.anthropic_cua:
             assert llm_caller is not None
+            derived_from_scrape = True
             actions = await self._generate_anthropic_actions(
                 task=task,
                 step=step,
@@ -2234,6 +2254,7 @@ class ForgeAgent:
             properties={"organization_id": task.organization_id},
         ):
             assert llm_caller is not None
+            derived_from_scrape = True
             actions = await self._generate_ui_tars_actions(
                 task=task,
                 step=step,
@@ -2242,6 +2263,7 @@ class ForgeAgent:
             )
         elif engine == RunEngine.yutori_navigator:
             assert llm_caller is not None
+            derived_from_scrape = True
             actions = await self._generate_yutori_navigator_actions(
                 task=task,
                 step=step,
@@ -2251,6 +2273,7 @@ class ForgeAgent:
 
         else:
             if is_extraction_task:
+                derived_from_scrape = True
                 actions = [
                     await self.create_extract_action(
                         task,
@@ -2343,6 +2366,8 @@ class ForgeAgent:
                             )
                             download_url = pdf_src
 
+                        # The PDF src came out of the scraped element tree.
+                        derived_from_scrape = True
                         actions = [
                             DownloadFileAction(
                                 reasoning="Downloading the file from the PDF viewer.",
@@ -2368,6 +2393,7 @@ class ForgeAgent:
                             detailed_agent_step_output.llm_response = otp_json_response
                             actions = otp_actions
                         else:
+                            derived_from_scrape = True
                             actions = parse_actions(
                                 task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
                             )
@@ -2424,6 +2450,11 @@ class ForgeAgent:
                         screenshots=scraped_page.screenshots,
                     )
                     speculative_llm_metadata = None
+        if derived_from_scrape:
+            # Only actions the scrape produced may carry its provenance. Everything else here —
+            # actions injected before the scrape ran, a magic-link navigation aimed at a page nobody
+            # scraped, a TOTP timeout terminate — stays unstamped and is judged on that.
+            stamp_parsed_actions(actions)
         return actions, pdf_auto_download_src, pdf_auto_download_used_bytes
 
     async def _generate_cua_actions(
@@ -6412,6 +6443,10 @@ class ForgeAgent:
             actions = parse_actions(
                 task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
             )
+            # Parsed from the current scrape, so stamped here rather than by the caller: this return
+            # shares its shape with the magic-link one below, which is runtime-derived and must stay
+            # unstamped. Distinguishing them at the caller would mean guessing which branch ran.
+            stamp_parsed_actions(actions)
             return json_response, actions
 
         if should_verify_by_magic_link:

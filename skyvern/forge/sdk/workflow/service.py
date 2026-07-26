@@ -38,6 +38,7 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILE
 from skyvern.exceptions import (
     BlockedHost,
     BlockNotFound,
+    BrowserActionPolicyNotEnforceable,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
@@ -59,6 +60,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts
+from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
@@ -81,6 +83,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import bind_policy_to_context, rejection_reasons
 from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
     build_workflow_browser_session_storage_key,
@@ -1718,6 +1721,19 @@ class WorkflowService:
                     log_context={"workflow_run_id": workflow_run.workflow_run_id},
                 )
 
+                # Bind the resolved version's browser action policy onto the run's own context.
+                # execute_workflow re-binds because a Temporal worker boots a fresh context; this
+                # binding covers the paths that drive the run in-process from here.
+                try:
+                    await self.bind_browser_action_policy(workflow, run_with=workflow_request.run_with)
+                except BrowserActionPolicyNotEnforceable as e:
+                    # The row already exists, so fail it rather than leave a run stuck in `created`.
+                    await self.mark_workflow_run_as_failed(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        failure_reason=get_user_facing_exception_message(e),
+                    )
+                    raise
+
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
             try:
@@ -2962,6 +2978,33 @@ class WorkflowService:
                     need_call_webhook=need_call_webhook,
                 )
                 return workflow_run
+
+        # Bind before anything can open a browser or a code worker. Re-bound here rather than
+        # inherited from setup: a Temporal worker boots a fresh context, and a run must always
+        # execute under the policy of the exact version stamped on it.
+        try:
+            await self.bind_browser_action_policy(workflow, run_with=workflow_run.run_with)
+        except BrowserActionPolicyNotEnforceable as e:
+            LOG.warning(
+                "Workflow version cannot run under its browser action policy",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                policy_rejection_reasons=list(e.reasons),
+            )
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run_id,
+                failure_reason=get_user_facing_exception_message(e),
+            )
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
+                need_call_webhook=need_call_webhook,
+            )
+            return workflow_run
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
@@ -10155,6 +10198,64 @@ class WorkflowService:
                 workflow_permanent_id=workflow.workflow_permanent_id,
             )
 
+    async def bind_browser_action_policy(
+        self,
+        workflow: Workflow,
+        *,
+        run_with: str | None,
+    ) -> BrowserActionPolicy | None:
+        """Bind the exact resolved workflow version's policy to the current run.
+
+        Every path that executes a workflow version calls this before the run's browser can exist.
+        Raises BrowserActionPolicyNotEnforceable when the version is enrolled but configured in a
+        way the action-level firewall cannot cover.
+        """
+        policy = await app.DATABASE.workflows.get_browser_action_policy(
+            workflow_id=workflow.workflow_id,
+            organization_id=workflow.organization_id,
+        )
+        bind_policy_to_context(policy, workflow, run_with=run_with)
+        return policy
+
+    async def replace_browser_action_policy(
+        self,
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+        allowed_origin_urls: list[str] | None,
+    ) -> BrowserActionPolicy | None:
+        """Control-plane enrollment: replace (or, with None, clear) the latest version's policy.
+
+        The only writer of policy. Enrolling a version the firewall cannot cover is refused here so
+        an operator learns at enrollment time rather than when the next run fails.
+        """
+        workflow = await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if workflow is None:
+            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
+        if allowed_origin_urls is not None:
+            reasons = rejection_reasons(workflow, run_with=None)
+            if reasons:
+                raise BrowserActionPolicyNotEnforceable(reasons)
+
+        policy = await app.DATABASE.workflows.set_browser_action_policy(
+            workflow_id=workflow.workflow_id,
+            organization_id=organization_id,
+            allowed_origin_urls=allowed_origin_urls,
+        )
+        LOG.info(
+            "Browser action policy replaced",
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow.workflow_id,
+            workflow_version=workflow.version,
+            organization_id=organization_id,
+            policy_version=policy.version if policy else None,
+            allowed_origin_count=len(policy.allowed_origins) if policy else 0,
+        )
+        return policy
+
     async def should_run_script(
         self,
         workflow: Workflow,
@@ -10168,6 +10269,12 @@ class WorkflowService:
         an upgraded run has no matching script for a non-eligible workflow
         and so degrades cleanly to agent per block.
         """
+        context = skyvern_context.current()
+        if context and context.browser_action_policy is not None:
+            # An enrolled run must not reach script execution: generated code drives the browser
+            # without passing an action sink, so the flag-gated upgrade below would silently
+            # produce a run the firewall cannot see.
+            return False
         if workflow_run.run_with is not None:
             intended_code = workflow_run.run_with == "code"
         else:
