@@ -19,6 +19,28 @@ def setup_forge_app():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_llm_settings():
+    """Every test below mutates three pieces of process-global state --
+    SettingsManager's active settings instance, LLMConfigRegistry's
+    registered configs, and config_registry's own module-level `settings`
+    binding (rebound on every `importlib.reload`, and read directly by
+    get_config()'s synthesis fallback) -- without restoring any of them,
+    which can leak into (or be leaked into by) unrelated tests depending on
+    execution order. Snapshot and restore all three around every test in
+    this module.
+    """
+    previous_settings = SettingsManager.get_settings()
+    # Shallow copy is safe: LLMConfig/LLMRouterConfig values are frozen dataclasses.
+    previous_configs = dict(config_registry.LLMConfigRegistry._configs)
+    previous_module_settings = config_registry.settings
+    yield
+    SettingsManager.set_settings(previous_settings)
+    config_registry.LLMConfigRegistry._configs.clear()
+    config_registry.LLMConfigRegistry._configs.update(previous_configs)
+    config_registry.settings = previous_module_settings
+
+
 class DummyResponse(dict):
     def __init__(self, content: str):
         super().__init__({"choices": [{"message": {"content": content}}], "usage": {}})
@@ -60,12 +82,21 @@ async def test_openrouter_basic_completion(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_openrouter_dynamic_model(monkeypatch):
-    # Update settings via monkeypatch to ensure config_registry sees them
-
-    monkeypatch.setattr(config.settings, "ENABLE_OPENROUTER", True)
-    monkeypatch.setattr(config.settings, "OPENROUTER_API_KEY", "key")
-    monkeypatch.setattr(config.settings, "OPENROUTER_MODEL", "base-model")
-    monkeypatch.setattr(config.settings, "OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+    # config_registry's module-level registration reads skyvern.config.settings
+    # directly, while LLMConfigBase.get_missing_env_vars() reads through
+    # SettingsManager.get_settings() -- normally the same object, but any test
+    # (including siblings in this file) that calls SettingsManager.set_settings()
+    # without restoring it breaks that identity. Point both at one new object so
+    # this test doesn't depend on which one happened to run last.
+    settings = Settings(
+        ENABLE_OPENROUTER=True,
+        OPENROUTER_API_KEY="key",
+        OPENROUTER_MODEL="base-model",
+        OPENROUTER_API_BASE="https://openrouter.ai/api/v1",
+        LLM_KEY="OPENROUTER",
+    )
+    SettingsManager.set_settings(settings)
+    monkeypatch.setattr(config, "settings", settings)
 
     # Clear existing configs before reload
     config_registry.LLMConfigRegistry._configs.clear()
@@ -90,6 +121,42 @@ async def test_openrouter_dynamic_model(monkeypatch):
     assert result == {"status": "ok"}
     called_model = async_mock.call_args.kwargs.get("model")
     assert called_model == "other-model"
+
+
+def test_isolate_llm_settings_restores_module_level_settings_binding():
+    """Regression: config_registry does `from skyvern.config import settings`, so
+    importlib.reload(config_registry) while skyvern.config.settings is monkeypatched
+    rebinds config_registry's own module-level `settings` name to that patched
+    object. The monkeypatch fixture only restores skyvern.config.settings itself,
+    not this separate binding, and get_config()'s synthesis fallback reads it
+    directly -- a leak here silently affects any later test's synthesized configs.
+    """
+    # __wrapped__ recovers the undecorated generator function -- an implementation
+    # detail of pytest's fixture wrapper, not public API, but stable since pytest 3.
+    gen = _isolate_llm_settings.__wrapped__()
+    next(gen)  # run the fixture's setup half, snapshotting current state
+
+    original_module_settings = config_registry.settings
+    fake_settings = Settings(
+        ENABLE_OPENROUTER=True,
+        OPENROUTER_API_KEY="leaked-key",
+        OPENROUTER_MODEL="base-model",
+        OPENROUTER_API_BASE="https://openrouter.ai/api/v1",
+        LLM_KEY="OPENROUTER",
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        # Registration reads config_registry's module-level settings (patched below);
+        # validate_config's get_missing_env_vars() reads through SettingsManager --
+        # both must point at the same object or registration itself raises.
+        SettingsManager.set_settings(fake_settings)
+        mp.setattr(config, "settings", fake_settings)
+        importlib.reload(config_registry)
+        assert config_registry.settings is fake_settings  # sanity: reload really did rebind it
+
+    with pytest.raises(StopIteration):
+        next(gen)  # run the fixture's teardown half
+
+    assert config_registry.settings is original_module_settings
 
 
 @pytest.mark.asyncio
