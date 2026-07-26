@@ -1095,6 +1095,7 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
             CodeBlock.is_safe_code(code)
         except SyntaxError as exc:
             errors.append(f"Code block `{label}` is not valid Python: {exc}")
+            continue
         except InsecureCodeDetected as exc:
             errors.append(
                 f"Code block `{label}` failed the sandbox safety check: {exc}. Rewrite without import "
