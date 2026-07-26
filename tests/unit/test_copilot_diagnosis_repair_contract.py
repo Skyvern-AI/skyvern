@@ -2538,7 +2538,7 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
     captured.pop("workflow_run_id", None)
 
     async def fake_capture(
-        _ctx: CopilotContext, *, inspected_url: str, current_url: str
+        _ctx: CopilotContext, *, inspected_url: str, current_url: str, solve_challenges: bool = True
     ) -> tuple[dict[str, object], None]:
         return dict(captured), None
 
@@ -2588,7 +2588,9 @@ async def test_failed_seam_capture_neutralizes_non_matching_evidence(
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.composition_page_evidence = stale
 
-    async def fake_capture(_ctx: CopilotContext, *, inspected_url: str, current_url: str) -> tuple[None, None]:
+    async def fake_capture(
+        _ctx: CopilotContext, *, inspected_url: str, current_url: str, solve_challenges: bool = True
+    ) -> tuple[None, None]:
         return None, None
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
@@ -2610,7 +2612,9 @@ async def test_failed_seam_capture_preserves_clean_matching_evidence(
     clean["workflow_run_id"] = "wr_failed"
     ctx.composition_page_evidence = clean
 
-    async def fake_capture(_ctx: CopilotContext, *, inspected_url: str, current_url: str) -> tuple[None, None]:
+    async def fake_capture(
+        _ctx: CopilotContext, *, inspected_url: str, current_url: str, solve_challenges: bool = True
+    ) -> tuple[None, None]:
         return None, None
 
     monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
