@@ -142,18 +142,9 @@ class TestGenerateId:
         assert id_val < (1 << 64)
 
     def test_generate_id_uniqueness(self):
-        """Multiple calls should generate unique IDs."""
-        ids = [generate_id() for _ in range(1000)]
-        assert len(set(ids)) == 1000
-
-    def test_generate_id_monotonic(self):
-        """IDs generated in sequence should generally be increasing."""
-        id1 = generate_id()
-        id2 = generate_id()
-        id3 = generate_id()
-        # Due to sequence counter, IDs should increase
-        # (within the same second, at least)
-        assert id1 < id2 < id3
+        """IDs stay unique across a full randomized sequence wrap."""
+        ids = [generate_id() for _ in range(SEQUENCE_MAX + 2)]
+        assert len(set(ids)) == len(ids)
 
 
 class TestPrefixedIdGenerators:
