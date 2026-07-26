@@ -87,6 +87,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
@@ -2352,6 +2353,9 @@ class ActionHandler:
         _action_span.set_attribute("step_order", step.order)
         if getattr(action, "element_id", None):
             _action_span.set_attribute("element_id", action.element_id)
+        # Re-evaluated here, against the page as it is now, before anything downstream looks up a
+        # browser, chooses the download-capturing path or persists a row.
+        preflight_action(action, page, site="handle_action")
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
@@ -3288,6 +3292,7 @@ async def handle_click_action(
             element_id=action.element_id,
             file_url=action.file_url,
         )
+        preflight_derived_action(upload_file_action, page, parent=action, site="click_to_upload")
         return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
         incremental_scraped: IncrementalScrapePage | None = None
@@ -4634,6 +4639,8 @@ async def handle_upload_file_action(
         LOG.info("Taking UploadFileAction. Found non file input tag", action=action)
         # treat it as a click action
         action.is_upload_file_tag = False
+        # The action itself changed shape; re-project it before it takes the click path.
+        preflight_action(action, page, site="upload_to_click")
         return await chain_click(
             task,
             scraped_page,
@@ -4753,6 +4760,7 @@ async def handle_select_option_action(
             return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
         click_action = ClickAction(element_id=action.element_id)
         action.set_has_mini_agent()
+        preflight_derived_action(click_action, page, parent=action, site="select_option_to_click")
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     if not await skyvern_element.is_selectable():
@@ -4895,6 +4903,7 @@ async def handle_select_option_action(
         )
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
         action.set_has_mini_agent()
+        preflight_derived_action(check_action, page, parent=action, site="select_option_to_checkbox")
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
     if await skyvern_element.is_radio():
@@ -4904,6 +4913,7 @@ async def handle_select_option_action(
         )
         click_action = ClickAction(element_id=action.element_id)
         action.set_has_mini_agent()
+        preflight_derived_action(click_action, page, parent=action, site="select_option_to_click")
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     # FIXME: maybe there's a case where <input type="button"> could trigger dropdown menu?
@@ -4914,6 +4924,7 @@ async def handle_select_option_action(
         )
         click_action = ClickAction(element_id=action.element_id)
         action.set_has_mini_agent()
+        preflight_derived_action(click_action, page, parent=action, site="select_option_to_click")
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     LOG.info(
@@ -5276,6 +5287,9 @@ async def handle_complete_action(
             step_order=action.step_order,
             action_order=action.action_order,
         )
+        # Before the terminate runs, not after the rewrite below: once `action_type` is reassigned
+        # in place the original projection is gone, and it is the TerminateAction that executes.
+        preflight_derived_action(terminate_action, page, parent=action, site="complete_to_terminate")
         results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
         action.action_type = ActionType.TERMINATE
         action.reasoning = terminate_action.reasoning
