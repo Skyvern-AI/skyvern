@@ -5076,3 +5076,34 @@ class TestScoutedSpineOmissionDigest:
     def test_digest_is_cross_process_stable_sha256_not_salted_hash(self) -> None:
         digest = _scouted_spine_omission_digest([self._record("#search-submit", 0)])
         assert digest == "8065b147a155c4e35cab8b3b35da9beab958cddc9c355b6200bac957878954ec"
+
+
+def _captcha_click(challenge_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    click: dict[str, Any] = {
+        "tool_name": "click",
+        "selector": "button.btn--login",
+        "source_url": "https://example.com/login",
+        "trajectory_index": 0,
+    }
+    if challenge_state is not None:
+        click["challenge_state"] = challenge_state
+    return click
+
+
+def test_stamped_challenge_carrier_emits_solve_captcha_after_the_click() -> None:
+    result = synthesize_code_block(
+        [_captcha_click({"evidence_source": "challenge_state"})],
+        strict_selectors=True,
+    )
+    assert result is not None
+    lines = [line.strip() for line in result.code.splitlines() if line.strip()]
+    click_index = next(i for i, line in enumerate(lines) if ".click()" in line)
+    solve_index = next(i for i, line in enumerate(lines) if line == "await solve_captcha(page)")
+    assert solve_index > click_index
+    assert lines[click_index + 1 : solve_index] == ['await page.wait_for_load_state("domcontentloaded")']
+
+
+def test_unstamped_click_emits_no_solve_captcha() -> None:
+    result = synthesize_code_block([_captcha_click()], strict_selectors=True)
+    assert result is not None
+    assert "solve_captcha" not in result.code
