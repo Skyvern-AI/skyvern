@@ -64,12 +64,10 @@ async def test_import_is_blocked_by_code_safety_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_page_evaluate_is_blocked_by_security_denylist() -> None:
+async def test_page_evaluate_is_not_blocked_by_security_denylist() -> None:
     result = await skyvern_code_block_lint(code='await page.evaluate("1+1")')
 
-    assert result["ok"] is False
-    assert result["data"]["lint_ok"] is False
-    assert _has_security_error(result, reason_code="AUTHOR_PAGE_EVALUATE", surface="page.evaluate")
+    assert result["data"]["security_errors"] == []
 
 
 @pytest.mark.asyncio

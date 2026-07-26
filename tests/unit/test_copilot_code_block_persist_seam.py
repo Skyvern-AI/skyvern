@@ -837,21 +837,27 @@ class TestCodeSafetySeam:
     def test_safe_code_passes(self) -> None:
         assert _code_block_safety_errors(_SAFE_CODE_YAML, None) == []
 
+    def test_unparseable_code_block_reports_one_syntax_error(self) -> None:
+        errors = _code_block_safety_errors(_code_yaml("text = await page.evaluate("), None)
+
+        assert len(errors) == 1
+        assert "is not valid Python" in errors[0]
+
     @pytest.mark.asyncio
     async def test_denied_page_api_attribute_is_repairable_preflight_error_without_duplicate_generic_message(
         self,
     ) -> None:
         result = await _update_workflow(
-            {"workflow_yaml": _code_yaml("text = await page.evaluate('() => document.body.innerText')")},
+            {"workflow_yaml": _code_yaml("state = await page.context.storage_state()")},
             _standard_ctx(),
         )
 
         assert result["ok"] is False
         joined = result["error"]
-        assert "AUTHOR_PAGE_EVALUATE" in joined
+        assert "AUTHOR_PAGE_CONTEXT" in joined
         assert "failed the generated-code preflight check" in joined
         assert joined.count("failed the sandbox safety check") == 0
-        assert joined.count("page.evaluate is not allowed") == 1
+        assert joined.count("page.context is not allowed") == 1
 
     def test_unresolved_sandbox_names_are_seam_errors(self) -> None:
         errors = _code_block_safety_errors(
@@ -1208,7 +1214,7 @@ class TestCodeSafetySeam:
         "workflow_yaml",
         [
             _code_yaml("import os\nprint(provider_query)"),
-            _code_yaml("await page.evaluate(provider_query)"),
+            _code_yaml("await page.request.get(provider_query)"),
         ],
     )
     @pytest.mark.asyncio
@@ -3677,7 +3683,7 @@ class TestCodeRepairProgressClassification:
             "_code_block_safety_errors",
             lambda workflow_yaml, prior_yaml: [
                 "Code block `search_registry` failed the generated-code preflight check: "
-                "AUTHOR_PAGE_EVALUATE: page.evaluate is not allowed."
+                "AUTHOR_PAGE_REQUEST: page.request is not allowed."
             ],
         )
         ctx = _code_only_ctx()
@@ -3715,7 +3721,7 @@ class TestCodeRepairProgressClassification:
         payload = _code_safety_reject_payload(
             [
                 "Code block `search_registry` failed the generated-code preflight check: "
-                "AUTHOR_PAGE_EVALUATE: page.evaluate is not allowed."
+                "AUTHOR_PAGE_REQUEST: page.request is not allowed."
             ]
         )
 
