@@ -118,6 +118,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
@@ -3697,38 +3698,34 @@ def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value:
     workflow_run_context.secrets[fresh_key] = value
 
 
-async def _resolve_code_block_otp(
-    credential_parameter_key: str,
+class OTPResult(str):
+    """A fetched OTP that still knows whether it is a code to type or a link to open.
+
+    Subclasses ``str`` so it can be typed into a field directly, while ``is_link`` lets
+    authored code branch without pattern-matching the value.
+    """
+
+    otp_type: OTPType
+
+    def __new__(cls, value: str, otp_type: OTPType) -> OTPResult:
+        result = super().__new__(cls, value)
+        result.otp_type = otp_type
+        return result
+
+    @property
+    def is_link(self) -> bool:
+        return self.otp_type is OTPType.MAGIC_LINK
+
+
+async def _poll_code_block_otp(
+    totp_identifier: str,
     organization_id: str | None,
-    workflow_run_id: str | None,
+    workflow_run_id: str,
+    workflow_run_context: WorkflowRunContext,
     *,
     budget_seconds: int,
-) -> str:
-    """Resolve a fresh OTP at call time for one credential: re-mint its TOTP (the staleness
-    fix) or poll its email/SMS/magic-link, registering the value as a secret before return.
-    The run context is re-resolved from workflow_run_id, never captured in the bound method's
-    closure, so user code cannot reach the seed through the method's cells."""
-    if not workflow_run_id:
-        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
-
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    if workflow_run_context is None:
-        raise CodeBlockOTPError("OTP is unavailable: the workflow run context could not be resolved.")
-
-    otp_value = otp_service.try_generate_totp_for_credential(
-        workflow_run_context, credential_parameter_key, workflow_run_id
-    )
-    if otp_value is not None:
-        _register_code_block_secret(workflow_run_context, otp_value.value)
-        return otp_value.value
-
-    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
-    if not totp_identifier:
-        raise CodeBlockOTPError(
-            "No OTP source is configured for this credential. "
-            "Add a TOTP secret or an email/SMS identifier to the credential."
-        )
-
+    subject: str,
+) -> otp_service.OTPValue:
     if not organization_id:
         raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
 
@@ -3752,13 +3749,83 @@ async def _resolve_code_block_otp(
     except asyncio.TimeoutError:
         raise CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
     except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
-        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+        raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
     if polled is None:
-        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+        raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
     _register_code_block_secret(workflow_run_context, polled.value)
+    return polled
+
+
+def _code_block_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if workflow_run_context is None:
+        raise CodeBlockOTPError("OTP is unavailable: the workflow run context could not be resolved.")
+    return workflow_run_context
+
+
+async def _resolve_code_block_otp(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> str:
+    """Resolve a fresh OTP at call time for one credential: re-mint its TOTP (the staleness
+    fix) or poll its email/SMS/magic-link, registering the value as a secret before return.
+    The run context is re-resolved from workflow_run_id, never captured in the bound method's
+    closure, so user code cannot reach the seed through the method's cells."""
+    if not workflow_run_id:
+        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
+    workflow_run_context = _code_block_workflow_run_context(workflow_run_id)
+
+    otp_value = otp_service.try_generate_totp_for_credential(
+        workflow_run_context, credential_parameter_key, workflow_run_id
+    )
+    if otp_value is not None:
+        _register_code_block_secret(workflow_run_context, otp_value.value)
+        return otp_value.value
+
+    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
+    if not totp_identifier:
+        raise CodeBlockOTPError(
+            "No OTP source is configured for this credential. "
+            "Add a TOTP secret or an email/SMS identifier to the credential."
+        )
+
+    polled = await _poll_code_block_otp(
+        totp_identifier,
+        organization_id,
+        workflow_run_id,
+        workflow_run_context,
+        budget_seconds=budget_seconds,
+        subject="this credential",
+    )
     return polled.value
+
+
+async def _resolve_code_block_otp_for_identifier(
+    totp_identifier: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> OTPResult:
+    """Resolve a fresh OTP for a bare email/SMS identifier, with no credential in play."""
+    if not workflow_run_id:
+        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
+    workflow_run_context = _code_block_workflow_run_context(workflow_run_id)
+
+    polled = await _poll_code_block_otp(
+        totp_identifier,
+        organization_id,
+        workflow_run_id,
+        workflow_run_context,
+        budget_seconds=budget_seconds,
+        subject="this address",
+    )
+    return OTPResult(polled.value, polled.get_otp_type())
 
 
 def _bind_code_block_otp(
@@ -3780,11 +3847,25 @@ def _bind_code_block_otp(
     return otp
 
 
-async def _code_block_otp_builtin(credential: object) -> str:
-    """Top-level ``await otp(credential)`` sugar that forwards to the credential's bound otp()."""
+async def _code_block_otp_builtin(
+    credential: object,
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> str:
+    """Top-level ``await otp(...)`` sugar. Given a credential it forwards to that credential's
+    bound otp(); given a bare email/SMS address it resolves against the address alone and
+    returns an OTPResult that still knows whether it is a code or a link."""
+    if isinstance(credential, str):
+        return await _resolve_code_block_otp_for_identifier(
+            credential,
+            organization_id,
+            workflow_run_id,
+            budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+        )
     bound = getattr(credential, "otp", None)
     if not callable(bound):
-        raise CodeBlockOTPError("otp() expects a credential with an OTP source.")
+        raise CodeBlockOTPError("otp() expects a credential with an OTP source, or an email address.")
     return await bound()
 
 
@@ -3872,6 +3953,11 @@ class CodeBlock(Block):
         safe_vars = self.build_safe_vars()
         safe_vars["solve_captcha"] = partial(
             _code_block_solve_captcha_builtin,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+        )
+        safe_vars["otp"] = partial(
+            _code_block_otp_builtin,
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
         )
