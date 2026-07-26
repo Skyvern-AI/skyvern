@@ -251,7 +251,7 @@ async def _current_viewpoint_screenshot_helper(
         )
         return screenshot
     except TimeoutError as e:
-        LOG.error(
+        LOG.warning(
             "Screenshot timeout",
             timeout_ms=timeout,
             url=url,

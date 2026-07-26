@@ -283,6 +283,9 @@ class ScoutedInteraction(TypedDict):
     element_fingerprint_test_id: NotRequired[str]
     element_fingerprint_tag: NotRequired[str]
     element_fingerprint_probed: NotRequired[str]
+    # Stamped when exploration met a challenge here; read back by composition_challenge_carrier
+    # so synthesis emits solve_captcha(page) at this boundary.
+    challenge_state: NotRequired[dict[str, Any]]
 
 
 NeverCapturedObligationState: TypeAlias = Literal["armed", "captured", "consumed"]
@@ -507,6 +510,9 @@ class AgentContext:
     # preserves repeats and ordering so code_block_synthesis can emit a faithful
     # linear Playwright trajectory.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    # Solve attempts already spent per challenge. A challenge that never passes is precisely the
+    # one re-observed on every later capture, so cost otherwise grows with how stuck the turn is.
+    challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
     # One exact `never_captured` mutation may reopen scouting within this turn. The obligation is
     # completed only by a later generator-emitted canonical interaction, never by selector text alone.
     never_captured_obligation: NeverCapturedObligation | None = None
