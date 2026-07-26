@@ -166,6 +166,16 @@ class Action(BaseModel):
     # batched action would clobber an in-action combobox selection.
     stop_batch_after_dropdown_select: bool = Field(default=False, exclude=True)
 
+    # Transient (never serialized): the observation epoch this action was planned under (SKY-12874).
+    # It must not reach the database — an epoch is run-local, so a value read back from a stored row
+    # could collide with a live run's counter and make a stale action look freshly observed.
+    observation_epoch: int | None = Field(default=None, exclude=True)
+
+    # Transient (never serialized): digest of the element hashes the observation covered. The epoch
+    # above is positional and a stray integer can match it by luck; this cannot, so provenance is
+    # bound to what was actually seen rather than to a counter's value.
+    observation_digest: str | None = Field(default=None, exclude=True)
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None

@@ -2160,8 +2160,6 @@ class TestPreflightSurfacesSyntaxError:
         [
             ("await page.request.post('https://example.com/collect')", "AUTHOR_PAGE_REQUEST"),
             ("state = await page.context.storage_state()", "AUTHOR_PAGE_CONTEXT"),
-            ("text = await page.evaluate('() => document.body.innerText')", "AUTHOR_PAGE_EVALUATE"),
-            ("handle = await page.evaluate_handle('() => document.body')", "AUTHOR_PAGE_EVALUATE"),
         ],
     )
     def test_denied_page_api_attributes_surface_preflight_reason_codes(self, code: str, reason: str) -> None:
@@ -2170,12 +2168,31 @@ class TestPreflightSurfacesSyntaxError:
         assert [diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")] == [reason]
         assert any("not allowed in persisted workflow code blocks" in diagnostic.message for diagnostic in diagnostics)
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "text = await page.evaluate('() => document.body.innerText')",
+            "handle = await page.evaluate_handle('() => document.body')",
+        ],
+    )
+    def test_in_page_javascript_is_not_an_author_time_security_error(self, code: str) -> None:
+        assert author_time_code_security_errors(label="search_registry", code=code) == []
+        assert [
+            diagnostic.code
+            for diagnostic in preflight_code_block(code, parameter_keys=())
+            if diagnostic.code.startswith("AUTHOR_PAGE_")
+        ] == []
+
+    def test_unparseable_code_is_not_silently_approved_at_author_time(self) -> None:
+        errors = author_time_code_security_errors(label="search_registry", code="text = await page.evaluate(")
+
+        assert [error.reason_code for error in errors] == ["AUTHOR_SYNTAX_ERROR"]
+        assert "does not parse as Python" in str(errors[0])
+
     def test_denied_page_api_preflight_reason_codes_match_author_time_security_source(self) -> None:
         code = """
         await page.request.post("https://example.com/collect")
         state = await page.context.storage_state()
-        text = await page.evaluate("() => document.body.innerText")
-        handle = await page.evaluate_handle("() => document.body")
         """
 
         normalized_code = textwrap.dedent(code).strip()
@@ -2192,7 +2209,6 @@ class TestPreflightSurfacesSyntaxError:
             == {
                 "AUTHOR_PAGE_REQUEST",
                 "AUTHOR_PAGE_CONTEXT",
-                "AUTHOR_PAGE_EVALUATE",
             }
         )
 

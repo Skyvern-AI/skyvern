@@ -4,6 +4,7 @@ import re
 import sys
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import structlog
 from structlog.typing import EventDict
@@ -168,6 +169,38 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def redact_registered_secrets(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Redact credential values the copilot filled during a turn from every string in the event dict.
+
+    Imported lazily: this module is imported far earlier in boot than the copilot package.
+    """
+    from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, all_registered_secret_values
+
+    secrets = all_registered_secret_values()
+    if not secrets:
+        return event_dict
+
+    def scrub(node: Any) -> Any:
+        # Nested values are folded into `msg` by add_kv_pairs_to_msg further down the chain, so a
+        # secret carried only inside a nested kwarg reaches the log line unless we recurse here.
+        if isinstance(node, str):
+            for secret in secrets:
+                if secret in node:
+                    node = node.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+            return node
+        if isinstance(node, dict):
+            return {key: scrub(item) for key, item in node.items()}
+        if isinstance(node, list):
+            return [scrub(item) for item in node]
+        if isinstance(node, tuple):
+            return tuple(scrub(item) for item in node)
+        return node
+
+    for key, value in list(event_dict.items()):
+        event_dict[key] = scrub(value)
+    return event_dict
+
+
 def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """Redact Bearer JWTs from any string value in the event dict.
 
@@ -180,6 +213,17 @@ def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: E
     return event_dict
 
 
+def _compact_action(action: Any) -> Any:
+    """The few fields a log line needs to correlate. Anything else belongs in the database."""
+    if isinstance(action, (str, int, float, bool, dict, list, type(None))):
+        return action
+    return {
+        "id": getattr(action, "action_id", None),
+        "type": str(getattr(action, "action_type", type(action).__name__)),
+        "element_id": getattr(action, "element_id", None),
+    }
+
+
 def compact_action_objects(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """Compact verbose Action / ActionResult kwargs to a few key fields.
 
@@ -187,15 +231,24 @@ def compact_action_objects(logger: logging.Logger, method_name: str, event_dict:
     Action dataclass dumps 25+ attributes including LLM-generated reasoning /
     intention / response strings. Full action data is persisted to the DB and
     queryable there; logs only need enough to correlate.
+
+    ``actions=`` is handled the same way for the same reason: a batch of ten renders ten full
+    reprs. It happens to keep a signed ``file_url`` out of that one shape, but this is a LOG VOLUME
+    control and NOT a redaction control — it inspects two fixed keys and nothing else, so no part of
+    it should be relied on to keep credentials out of logs. Credential redaction across the logging
+    stack is a separate concern with its own ticket.
     """
     action = event_dict.get("action")
     if action is not None and not isinstance(action, (str, int, float, bool, dict, list, type(None))):
         try:
-            event_dict["action"] = {
-                "id": getattr(action, "action_id", None),
-                "type": str(getattr(action, "action_type", type(action).__name__)),
-                "element_id": getattr(action, "element_id", None),
-            }
+            event_dict["action"] = _compact_action(action)
+        except Exception:
+            pass
+
+    actions = event_dict.get("actions")
+    if isinstance(actions, (list, tuple)) and actions:
+        try:
+            event_dict["actions"] = [_compact_action(item) for item in actions]
         except Exception:
             pass
 
@@ -441,6 +494,7 @@ def setup_logger() -> None:
     additional_processors = (
         [
             redact_bearer_tokens,
+            redact_registered_secrets,
             compact_action_objects,
             structlog.processors.EventRenamer("msg"),
             add_kv_pairs_to_msg,
@@ -457,6 +511,7 @@ def setup_logger() -> None:
         if settings.JSON_LOGGING
         else [
             redact_bearer_tokens,
+            redact_registered_secrets,
             compact_action_objects,
             structlog.processors.CallsiteParameterAdder(
                 {

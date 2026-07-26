@@ -61,7 +61,7 @@ async def skyvern_code_block_lint(
     """Lint a Workflow Copilot `code` block with the copilot's own deterministic gates.
 
     Runs CodeBlock.is_safe_code(), the security denylist
-    (page.request/context/evaluate/evaluate_handle), the sandbox unresolved-name analysis,
+    (page.request/page.context), the sandbox unresolved-name analysis,
     static preflight, and author-time AST diagnostics. Returns a structured pass/fail result.
     No browser session or API call required.
     """

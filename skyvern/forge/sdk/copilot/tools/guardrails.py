@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.credential_literal_rebind import (
 from skyvern.forge.sdk.copilot.enforcement import _record_code_authoring_guardrail_reject
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
+    OutputPolicyReason,
     OutputPolicyVerdict,
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -96,6 +97,11 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
         workflow_yaml=effective_yaml,
         tool_arguments=tool_arguments or raw_arguments,
     )
+    # The credential here is the user's own, bound for the site they named, inside their own workflow,
+    # so a raw value on an authoring argument is not grounds to kill the turn. Enforcement for it lives
+    # at the log seam (`redact_registered_secrets`) and the persistence seam; final-output surfaces
+    # still hard-block on RAW_SECRET_LEAK via `_FINAL_OUTPUT_HARD_BLOCK_REASONS`.
+    verdict.remove(OutputPolicyReason.RAW_SECRET_LEAK)
     trace_data = output_policy_verdict_to_trace_data(
         verdict,
         surface="tool_input",
@@ -103,28 +109,10 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
     )
     residual_selectors = rebind_result.residual_selectors if rebind_result is not None else ()
     if verdict.allowed and residual_selectors:
-        # A scouted credential selector still holds a non-parameter value the rebind could not neutralize,
-        # and the output-policy scan does not catch every such shape. Fail closed rather than persist it.
-        trace_data = {
-            **trace_data,
-            "allowed": False,
-            "residual_raw_credential_fill_selectors": list(residual_selectors),
-        }
-        LOG.info("copilot output policy credential residual raw fill fail-closed", **trace_data)
-        error = (
-            "A credential value could not be safely bound to a workflow parameter for selector(s) "
-            f"{', '.join(residual_selectors)}. Fill these fields with `<credential_key>.username` / "
-            "`<credential_key>.password` (or `await <credential_key>.otp()`) rather than an inline value."
-        )
-        tool_name = getattr(tool_context, "tool_name", None)
-        if isinstance(tool_name, str) and tool_name:
-            record_consecutive_tool_result_boundary_for_ctx(
-                getattr(tool_context, "context", None),
-                tool_name,
-                {"ok": False, "error": error},
-                arguments=tool_arguments,
-            )
-        return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
+        # The rebind could not bind these selectors to a parameter. That used to reject the turn; the
+        # persistence seam now redacts anything still carrying a credential, so surface it and continue.
+        trace_data = {**trace_data, "residual_raw_credential_fill_selectors": list(residual_selectors)}
+        LOG.warning("copilot output policy credential residual raw fill admitted", **trace_data)
     if verdict.allowed:
         if applied and rebind_result is not None:
             trace_data = {

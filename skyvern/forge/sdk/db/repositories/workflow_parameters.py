@@ -1037,4 +1037,7 @@ class WorkflowParametersRepository(BaseRepository):
             )
 
             actions = (await session.scalars(query)).all()
-            return [Action.model_validate(action) for action in actions]
+            # hydrate_action, not Action.model_validate: the base model has no action_json merge, so
+            # validating the row directly drops every subclass field a cached action was recorded
+            # with. Matches every other retrieval site.
+            return [hydrate_action(action) for action in actions]

@@ -17,12 +17,16 @@ from skyvern.forge.sdk.copilot import mcp_adapter, secret_scrub
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    MIN_PERSISTED_REDACTION_LENGTH,
     REDACTED_SECRET_PLACEHOLDER,
+    all_registered_secret_values,
     clear_session_scrub_values,
     register_secret_scrub_value,
+    registered_scrub_values,
     scrub_secrets_from_structure,
     scrub_secrets_from_text,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _redact_credentials_before_persistence
 
 _FAKE_PASSWORD = "fake-pa55w0rd-7x9"
 _FAKE_OTP = "392817"
@@ -303,3 +307,72 @@ class TestCrossTurnSessionScrub:
         recorded_text = json.dumps(recorded)
         assert _FAKE_PASSWORD not in recorded_text
         assert _FAKE_OTP not in recorded_text
+
+
+class TestPersistenceSeam:
+    """The workflow persistence seam is the last point before a credential could reach the database."""
+
+    def test_redacts_a_registered_credential_value_carried_in_the_workflow(self) -> None:
+        ctx = _agent_ctx()
+        register_secret_scrub_value(ctx, _FAKE_PASSWORD)
+        workflow_yaml = (
+            "workflow_definition:\n"
+            "  blocks:\n"
+            "    - block_type: code\n"
+            f'      code: |\n        await page.fill("#password", "{_FAKE_PASSWORD}")\n'
+        )
+
+        redacted = _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
+
+        assert _FAKE_PASSWORD not in redacted
+        assert REDACTED_SECRET_PLACEHOLDER in redacted
+
+    def test_leaves_a_parameter_referenced_workflow_untouched(self) -> None:
+        ctx = _agent_ctx()
+        register_secret_scrub_value(ctx, _FAKE_PASSWORD)
+        workflow_yaml = (
+            "workflow_definition:\n"
+            "  blocks:\n"
+            "    - block_type: code\n"
+            '      code: |\n        await page.fill("#password", my_login.password)\n'
+        )
+
+        assert (
+            _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
+            == workflow_yaml
+        )
+
+    def test_another_sessions_secret_never_rewrites_this_workflow(self) -> None:
+        """Scoping guard: a value registered by a different session must not touch this workflow."""
+        foreign = _agent_ctx("pbs_other")
+        register_secret_scrub_value(foreign, _FAKE_PASSWORD)
+        authoring = _agent_ctx("pbs_mine")
+        workflow_yaml = f'code: await page.fill("#note", "{_FAKE_PASSWORD}")\n'
+
+        assert (
+            _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(authoring))
+            == workflow_yaml
+        )
+
+    def test_a_short_value_is_not_substring_replaced(self) -> None:
+        """Corruption guard: a six-digit OTP occurs by chance inside ids and counts."""
+        ctx = _agent_ctx()
+        register_secret_scrub_value(ctx, _FAKE_OTP)
+        assert len(_FAKE_OTP) < MIN_PERSISTED_REDACTION_LENGTH
+        workflow_yaml = f"code: await page.goto('https://example.com/orders/{_FAKE_OTP}')\n"
+
+        assert (
+            _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
+            == workflow_yaml
+        )
+
+    def test_registered_values_are_visible_across_sessions(self) -> None:
+        register_secret_scrub_value(_agent_ctx("pbs_a"), _FAKE_PASSWORD)
+        register_secret_scrub_value(_agent_ctx("pbs_b"), _FAKE_OTP)
+
+        assert set(all_registered_secret_values()) == {_FAKE_PASSWORD, _FAKE_OTP}
+
+    def test_no_registered_values_leaves_the_workflow_alone(self) -> None:
+        workflow_yaml = f'code: await page.fill("#password", "{_FAKE_PASSWORD}")\n'
+
+        assert _redact_credentials_before_persistence(workflow_yaml, "wpid_1", ()) == workflow_yaml

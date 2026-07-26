@@ -125,6 +125,7 @@ def _patch_execute_workflow_deps(
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
