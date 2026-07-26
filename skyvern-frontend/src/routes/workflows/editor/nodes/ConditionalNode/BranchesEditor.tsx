@@ -42,7 +42,7 @@ type Props = {
 function BranchesEditor({ nodeId, data }: Props) {
   const id = nodeId;
   const nodes = useNodes<AppNode>();
-  const { setNodes, setEdges } = useReactFlow();
+  const { setNodes, setEdges, updateNodeData } = useReactFlow();
   const { beginInternalUpdate, endInternalUpdate } =
     useWorkflowHasChangesStore();
   // Track pending endInternalUpdate timer from handleSelectBranch so we can
@@ -247,18 +247,19 @@ function BranchesEditor({ nodeId, data }: Props) {
 
   const handleSelectBranch = useCallback(
     (branchId: string) => {
-      if (!data.editable) {
-        return;
-      }
-      // Mark as internal update to prevent triggering "unsaved changes" dialog
-      // Switching branches is UI state, not actual workflow data changes
-      // Cancel any pending timer from a previous rapid call to keep the counter balanced
+      // Switching branches only toggles which branch's nodes are visible; it is
+      // view state, not a workflow data change. It must therefore work even in
+      // read-only/comparison canvases (version history, copilot review), so we
+      // write activeBranchId directly rather than through the editability-gated
+      // `update` helper.
+      // Mark as internal update to prevent triggering "unsaved changes" dialog.
+      // Cancel any pending timer from a previous rapid call to keep the counter balanced.
       if (branchSelectTimerRef.current !== null) {
         clearTimeout(branchSelectTimerRef.current);
         endInternalUpdate();
       }
       beginInternalUpdate();
-      update({ activeBranchId: branchId });
+      updateNodeData(id, { activeBranchId: branchId });
       // Clear the flag after layout completes (layout uses setTimeout(10))
       // Store timer in ref so it can be cleaned up on unmount
       branchSelectTimerRef.current = setTimeout(() => {
@@ -266,7 +267,7 @@ function BranchesEditor({ nodeId, data }: Props) {
         endInternalUpdate();
       }, 50);
     },
-    [data.editable, beginInternalUpdate, update, endInternalUpdate],
+    [id, updateNodeData, beginInternalUpdate, endInternalUpdate],
   );
 
   const handleRemoveBranch = (branchId: string) => {
@@ -445,7 +446,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                     !branch.is_default &&
                     nonDefaultBranches.length > 1;
 
-                  const canReorder = !branch.is_default;
+                  const canReorder = data.editable && !branch.is_default;
                   const branchIndexInNonDefault = nonDefaultBranches.findIndex(
                     (b) => b.id === branch.id,
                   );
@@ -473,7 +474,6 @@ function BranchesEditor({ nodeId, data }: Props) {
                           },
                         )}
                         onClick={() => handleSelectBranch(branch.id)}
-                        disabled={!data.editable}
                       >
                         {getConditionLabel(branch, index)}
                       </Button>
@@ -553,7 +553,6 @@ function BranchesEditor({ nodeId, data }: Props) {
                         variant="ghost"
                         size="sm"
                         className="h-auto gap-1 rounded-full border border-transparent bg-slate-elevation5 p-0 px-3 py-1 text-xs font-normal text-tertiary-foreground transition-colors hover:bg-slate-elevation4 hover:text-tertiary-foreground"
-                        disabled={!data.editable}
                       >
                         {overflowBranches.length} More
                         <ChevronDownIcon className="size-3" />
