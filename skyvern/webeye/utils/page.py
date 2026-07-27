@@ -699,33 +699,37 @@ class SkyvernFrame:
             settle_ms = min(_NAVIGATION_SETTLE_TIMEOUT_MS, _remaining_seconds() * 1000)
             await _wait_for_navigation_settle(frame, timeout_ms=settle_ms)
 
-            inject_budget = min(per_attempt_seconds, _remaining_seconds())
-            if inject_budget <= 0:
-                LOG.error(
-                    "Skyvern timed out trying to analyze the page after navigation recovery",
-                    expression=expression,
-                )
-                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
-            try:
-                async with asyncio.timeout(inject_budget):
-                    # Same dispatch helper so a prefixed Page re-injects
-                    # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
-                    await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
-            except asyncio.TimeoutError as error:
-                LOG.exception(
-                    "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
-                    expression=expression,
-                )
-                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
-            except (PlaywrightError, RuntimeError) as inject_err:
-                last_error_msg = str(inject_err)
-                if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
-                    LOG.warning(
-                        "Re-injection of domUtils.js also failed, page may still be navigating",
-                        attempts=attempt,
+            # The bootstrap call already IS the domUtils.js injection, so the retry below
+            # re-injects it anyway; a separate injection pass would spend a second attempt
+            # budget on identical work and halve the attempts that fit in the deadline.
+            if expression != JS_FUNCTION_DEFS:
+                inject_budget = min(per_attempt_seconds, _remaining_seconds())
+                if inject_budget <= 0:
+                    LOG.error(
+                        "Skyvern timed out trying to analyze the page after navigation recovery",
+                        expression=expression,
                     )
-                    raise
-                continue
+                    raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
+                try:
+                    async with asyncio.timeout(inject_budget):
+                        # Same dispatch helper so a prefixed Page re-injects
+                        # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
+                        await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
+                except asyncio.TimeoutError as error:
+                    LOG.exception(
+                        "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
+                        expression=expression,
+                    )
+                    raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
+                except (PlaywrightError, RuntimeError) as inject_err:
+                    last_error_msg = str(inject_err)
+                    if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
+                        LOG.warning(
+                            "Re-injection of domUtils.js also failed, page may still be navigating",
+                            attempts=attempt,
+                        )
+                        raise
+                    continue
 
             retry_budget = min(per_attempt_seconds, _remaining_seconds())
             if retry_budget <= 0:
