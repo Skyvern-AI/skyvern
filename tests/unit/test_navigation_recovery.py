@@ -8,6 +8,7 @@ from playwright._impl._errors import Error as PlaywrightError
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.utils.page import (
+    JS_FUNCTION_DEFS,
     SkyvernFrame,
     _is_navigation_context_lost,
     _wait_for_navigation_settle,
@@ -183,6 +184,18 @@ class TestEvaluateWithNavigationRecovery:
 
         await SkyvernFrame.evaluate(frame=frame, expression="() => 1", timeout_ms=30000)
         frame.wait_for_load_state.assert_awaited_once_with("networkidle", timeout=ANY)
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_injection_is_not_evaluated_twice_per_attempt(self) -> None:
+        """SKY-13012: recovering the domUtils.js bootstrap must not re-inject it before retrying it."""
+        frame = AsyncMock()
+        frame.evaluate = AsyncMock(side_effect=[_context_destroyed_error(), "injected"])
+        frame.wait_for_load_state = AsyncMock()
+
+        result = await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS, timeout_ms=30000)
+
+        assert result == "injected"
+        assert frame.evaluate.await_count == 2
 
 
 class TestGetElementVisible:
