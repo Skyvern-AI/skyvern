@@ -212,6 +212,40 @@ def grade_requested_output_criteria(
             continue
         if match_state == "present" and evidence_ref is not None:
             present_source = _evidence_source_for_ref(accepted_output_sources, evidence_ref)
+            present_values = _runtime_output_path_present_values(accepted_runtime_outputs, path, projection_roots)
+            emitting_label = _evidence_ref_label(evidence_ref)
+            # A registered output is keyed ``<block_label>_output`` while ``failed_block_labels`` holds
+            # the bare block label, so resolve the producer label before the failed-block check.
+            failed_block_labels = set(snapshot.failed_block_labels)
+            emitting_block_succeeded = emitting_label is not None and not (
+                emitting_label in failed_block_labels or emitting_label.removesuffix("_output") in failed_block_labels
+            )
+            independent_evidence_satisfied = (
+                effective_evidence_source != "independent_run_evidence"
+                or present_source in _INDEPENDENT_EVIDENCE_SOURCES
+            )
+            credit_by_presence = (
+                expected_shape == "value_present"
+                and not judgment_grounding_bars_self_emission
+                and emitting_block_succeeded
+                and independent_evidence_satisfied
+                and any(not _is_error_shaped_value(value) for value in present_values)
+            )
+            if credit_by_presence:
+                # value_present verifies delivery, not an exact value: a real value present at the
+                # declared path, emitted by a block that did not fail, is the verification (a missing
+                # value, failed block, error-shaped value, or unmet independent-evidence bar abstains).
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="satisfied",
+                        reason_code="requested_output_present",
+                        evidence_ref=evidence_ref,
+                        evidence_source=present_source,
+                        **{**trace_fields, "grounding_mode": "presence"},
+                    )
+                )
+                continue
             verdicts.append(
                 CriterionVerdict(
                     criterion_id=criterion.id,
@@ -1096,6 +1130,60 @@ def _runtime_output_path_presence(
         evidence_ref = f"block_outputs:{label}.{source_path}"
         return "present", evidence_ref
     return "missing", None
+
+
+# A block that fails to extract a value commonly returns a not-found sentinel string rather than
+# an empty value, so presence alone must not verify one for the value_present shape.
+_NOT_FOUND_SENTINELS: frozenset[str] = frozenset(
+    {
+        "n/a",
+        "n.a.",
+        "na",
+        "none",
+        "null",
+        "nil",
+        "unknown",
+        "not found",
+        "not available",
+        "not applicable",
+        "no data",
+        "no result",
+        "no results",
+        "tbd",
+        "-",
+        "--",
+    }
+)
+
+
+def _is_not_found_sentinel(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().casefold() in _NOT_FOUND_SENTINELS
+
+
+_ERROR_PAYLOAD_KEYS: frozenset[str] = frozenset({"error", "errors", "exception", "traceback"})
+
+
+def _is_error_shaped_value(value: Any) -> bool:
+    # A value_present credit must not verify a value that reports failure: a not-found sentinel, or a
+    # structured payload keyed by error/exception, is not a delivered value.
+    if _is_not_found_sentinel(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(isinstance(key, str) and key.strip().casefold() in _ERROR_PAYLOAD_KEYS for key in value)
+    return False
+
+
+def _runtime_output_path_present_values(
+    block_outputs: Mapping[str, Any], path: str, projection_roots: set[str] | None = None
+) -> list[Any]:
+    parts = _path_parts(path)
+    if not parts:
+        return []
+    for payload in block_outputs.values():
+        values, _source_path = _runtime_present_path_values(payload, parts, path, projection_roots or set())
+        if values:
+            return values
+    return []
 
 
 def _runtime_path_values(

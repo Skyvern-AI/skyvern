@@ -800,3 +800,134 @@ async def test_dispatched_packet_carries_static_disabled_submit_control(monkeypa
     challenge_state = packet["challenge_state"]
     assert challenge_state["gates_submit_controls"] is False
     assert challenge_state["gated_submit_controls"] == []
+
+
+def _star_ctx() -> _GroundingCtx:
+    # Authored output contract declares the extraction's output path, so the block label is accepted.
+    ctx = _GroundingCtx()
+    ctx.code_artifact_metadata = {
+        "extract_star_count": {"claimed_outcomes": [{"goal_value_paths": ["output.star_count"]}]}
+    }
+    return ctx
+
+
+def _value_present_criterion() -> object:
+    return make_completion_criterion(
+        "c_star",
+        "the number of stars for https://example.com/example-org/example-repo is retrieved",
+        output_path="output.star_count",
+        expected_output_shape="value_present",
+    )
+
+
+# block_outputs shape is copied from a real live code-only run (wr_555210248334407824): the
+# extraction block nests its value under an ``output`` key beside ``evidence_text``.
+def _star_snapshot(value: object = 22600) -> RunEvidenceSnapshot:
+    return RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "22.6k stars", "output": {"star_count": value}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+
+
+def test_value_present_requested_output_credited_by_presence() -> None:
+    verdicts = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], _star_snapshot())
+    assert len(verdicts) == 1
+    verdict = verdicts[0]
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "requested_output_present"
+
+
+def test_value_present_requested_output_reaches_full_satisfaction() -> None:
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], _star_snapshot())[0]
+    result = CompletionVerificationResult(status="evaluated", criterion_ids=["c_star"], verdicts=[verdict])
+    assert result.is_fully_satisfied() is True
+
+
+def test_value_present_requested_output_abstains_when_value_missing() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "no count found", "output": {}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_typed_shape_without_expected_value_still_abstains() -> None:
+    # A shape that is NOT value_present (e.g. numeric_identifier) must keep abstaining on a present
+    # value with no exact expected_output_value to prove -- the fix is scoped to value_present only.
+    criterion = make_completion_criterion(
+        "c_star",
+        "the star count is retrieved",
+        output_path="output.star_count",
+        expected_output_shape="numeric_identifier",
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [criterion], _star_snapshot())[0]
+    assert verdict.state != "satisfied"
+
+
+@pytest.mark.parametrize("sentinel", ["N/A", "unknown", "Not Found", "  none  ", "-", "TBD"])
+def test_value_present_not_found_sentinel_abstains(sentinel: str) -> None:
+    # A failed extraction that returns a not-found sentinel instead of an empty value must not
+    # verify: presence of "N/A"/"unknown" abstains rather than crediting delivery.
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "no count", "output": {"star_count": sentinel}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_abstains_when_emitting_block_failed() -> None:
+    # Positive success signal: a value emitted by a block that failed is not a verified delivery.
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "22.6k stars", "output": {"star_count": 22600}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+        failed_block_labels=["extract_star_count"],
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_abstains_on_structured_error_payload() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"output": {"star_count": {"error": "extraction failed"}}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_credit_uses_presence_grounding_mode() -> None:
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], _star_snapshot())[0]
+    assert verdict.state == "satisfied"
+    assert verdict.grounding_mode == "presence"
+
+
+def test_value_present_requiring_independent_evidence_abstains_on_self_emitted() -> None:
+    # A value_present criterion that requests independent evidence is not certified by a self-emitted
+    # (runtime_output) block value; the independence bar is preserved.
+    criterion = make_completion_criterion(
+        "c_star",
+        "the number of stars for https://example.com/example-org/example-repo is retrieved",
+        output_path="output.star_count",
+        expected_output_shape="value_present",
+        requested_output_evidence_source="independent_run_evidence",
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [criterion], _star_snapshot())[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_abstains_when_registered_output_producer_block_failed() -> None:
+    # The value resolves via the <label>_output registered-output key, but its producer block failed;
+    # the failed-block guard resolves the bare producer label so this still abstains.
+    ctx = _GroundingCtx()
+    ctx.code_artifact_metadata = {
+        "extract_star_count_output": {"claimed_outcomes": [{"goal_value_paths": ["output.star_count"]}]}
+    }
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count_output": {"output": {"star_count": 22600}}},
+        block_output_sources={"extract_star_count_output": "registered_output_parameter"},
+        failed_block_labels=["extract_star_count"],
+    )
+    verdict = grade_requested_output_criteria(ctx, [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
