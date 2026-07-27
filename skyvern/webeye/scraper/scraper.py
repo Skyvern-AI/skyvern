@@ -467,13 +467,15 @@ async def scrape_web_unsafe(
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-    elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
+    elements, element_tree, destinations = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
     empty_page_retry = False
     if not elements and not support_empty_page:
         LOG.warning("No elements found on the page, wait and retry")
         await empty_page_retry_wait()
         empty_page_retry = True
-        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
+        elements, element_tree, destinations = await get_interactable_element_tree(
+            page, scrape_exclude, must_included_tags
+        )
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
@@ -570,7 +572,9 @@ async def scrape_web_unsafe(
         empty_page_retry=empty_page_retry,
     )
 
-    advance_observation_epoch(page, main_frame_url=page.main_frame.url, element_hashes=id_to_element_hash.values())
+    advance_observation_epoch(
+        page, main_frame_url=page.main_frame.url, element_hashes=id_to_element_hash, destinations=destinations
+    )
 
     return ScrapedPage(
         elements=elements,
@@ -646,6 +650,7 @@ async def add_frame_interactable_elements(
     frame_index: int,
     elements: list[dict],
     element_tree: list[dict],
+    destinations: dict[str, dict],
     must_included_tags: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -676,9 +681,10 @@ async def add_frame_interactable_elements(
         skyvern_frame = await SkyvernFrame.create_instance(frame)
         await _wait_for_scrape_ready(skyvern_frame)
 
-        frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
+        frame_elements, frame_element_tree, frame_destinations = await skyvern_frame.build_tree_from_body(
             frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags
         )
+        destinations.update(frame_destinations)
 
         for element in elements:
             if element["id"] == skyvern_id:
@@ -696,15 +702,16 @@ async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     must_included_tags: list[str] | None = None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict[str, dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
-    :return: Tuple containing the element tree and a map of element IDs to elements.
+    :return: Tuple of the interactable elements, the element tree, and the per-element
+        destination-facts sidecar stripped out of them at the SkyvernFrame boundary.
     """
     # main page index is 0
     skyvern_page = await SkyvernFrame.create_instance(page)
-    elements, element_tree = await skyvern_page.build_tree_from_body(
+    elements, element_tree, destinations = await skyvern_page.build_tree_from_body(
         frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
     )
 
@@ -728,6 +735,7 @@ async def get_interactable_element_tree(
             frame_index,
             elements,
             element_tree,
+            destinations,
             must_included_tags,
         )
 
@@ -736,7 +744,7 @@ async def get_interactable_element_tree(
     # element tree only — never ``elements`` — so they can never become a click target.
     element_tree.extend(placeholder_nodes)
 
-    return elements, element_tree
+    return elements, element_tree, destinations
 
 
 class IncrementalScrapePage(ElementTreeBuilder):
