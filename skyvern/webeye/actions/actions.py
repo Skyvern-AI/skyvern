@@ -166,6 +166,11 @@ class Action(BaseModel):
     # batched action would clobber an in-action combobox selection.
     stop_batch_after_dropdown_select: bool = Field(default=False, exclude=True)
 
+    # Transient (never serialized): opts an INPUT_TEXT into the type-to-filter path for a wrapper-marked
+    # combobox. Lives on the base Action (like the flags above) because handle_input_text_action runs with
+    # hydrated/replayed base Action objects, not only InputTextAction — reading it must never raise.
+    prefilter_typeahead: bool = Field(default=False, exclude=True)
+
     # Transient (never serialized): the observation epoch this action was planned under (SKY-12874).
     # It must not reach the database — an epoch is run-local, so a value read back from a stored row
     # could collide with a live run's counter and make a stale action look freshly observed.
