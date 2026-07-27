@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import textwrap
@@ -580,6 +581,16 @@ def _resolve_first_block_url(
     except Exception:
         LOG.warning("Failed to resolve first block URL for proxy selection", exc_info=True)
     return None
+
+
+_RUN_SIGNATURE_CACHE_KEY_RE = re.compile(r"""cache_key\s*=\s*(['"])(?P<key>.+?)\1""")
+
+
+def _run_signature_cache_key(run_signature: str | None) -> str | None:
+    if not run_signature:
+        return None
+    match = _RUN_SIGNATURE_CACHE_KEY_RE.search(run_signature)
+    return match.group("key") if match else None
 
 
 def _truncate_managed_browser_profile_part(value: str, max_length: int) -> str:
@@ -3668,6 +3679,30 @@ class WorkflowService:
                                     pinned_ctx = skyvern_context.current()
                                     if pinned_ctx:
                                         pinned_ctx.is_static_script = True
+                                    # Static (marker) pins re-import the live platform module, so a
+                                    # block persisted against a cached function that module no longer
+                                    # defines would cache-miss and run the agent with the placeholder
+                                    # goal "Static script: <cache_key>" instead of the block's real
+                                    # prompt. Drop those stale blocks so they fall through to a
+                                    # normal agent block, matching how a fresh pin resolves them
+                                    # today. hasattr mirrors ensure_static_script's pin-time check.
+                                    for stale_label in [
+                                        label
+                                        for label, sb in script_blocks_by_label.items()
+                                        if not sb.requires_agent
+                                        and (ck := _run_signature_cache_key(sb.run_signature)) is not None
+                                        and not hasattr(loaded_script_module, ck)
+                                    ]:
+                                        LOG.info(
+                                            "Dropping stale static-script block; cached function no "
+                                            "longer exists, block will run via agent",
+                                            block_label=stale_label,
+                                            cache_key=_run_signature_cache_key(
+                                                script_blocks_by_label[stale_label].run_signature
+                                            ),
+                                            script_id=script.script_id,
+                                        )
+                                        del script_blocks_by_label[stale_label]
                                 LOG.info(
                                     "Successfully loaded script module",
                                     sampling=True,
