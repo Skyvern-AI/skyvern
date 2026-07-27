@@ -18,7 +18,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
+from skyvern.forge.sdk.copilot.context import (
+    StructuredContext,
+    prior_signin_email_from_context,
+    sanitize_global_llm_context_for_prompt,
+)
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
@@ -37,6 +41,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.signin_email import connected_gmail_address, is_email_address
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
@@ -98,12 +103,15 @@ ClarificationReason = Literal[
     "missing_target_context",
     "workflow_credential_inputs_unbound",
     "login_credentials_unresolved",
+    "signin_email_unresolved",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
 # Only deterministic post-resolution code may mint these; a classifier emission would
 # skip the concrete-target and credential-reachability checks the reason stands for.
-_DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset({"login_credentials_unresolved"})
+_DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"login_credentials_unresolved", "signin_email_unresolved"}
+)
 # Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
@@ -162,6 +170,7 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
+_SIGNIN_EMAIL_QUESTION = "Which email address should I sign in with?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
@@ -543,6 +552,12 @@ class RequestPolicy:
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
     login_intent: bool = False
+    # Sign-in that identifies the user by email address instead of a stored password, so
+    # resolving *which address* is the whole credential question — there is no password to find.
+    email_signin_intent: bool = False
+    signin_email_candidates: list[str] = field(default_factory=list)
+    resolved_signin_email: str | None = None
+    resolved_signin_host: str | None = None
     requires_user_clarification: bool = False
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
@@ -583,6 +598,8 @@ class RequestPolicy:
             "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
             "login_intent": self.login_intent,
+            "email_signin_intent": self.email_signin_intent,
+            "signin_email_resolved": bool(self.resolved_signin_email),
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
@@ -695,6 +712,8 @@ class RequestPolicy:
             lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
+        if self.resolved_signin_email:
+            lines.append(f"resolved_signin_email: {self.resolved_signin_email}")
         graded_criteria = self.graded_completion_criteria()
         requested_output_path_literals = sorted(
             {
@@ -981,6 +1000,10 @@ def build_transcript_context(
 
 def _clean_list(values: list[Any]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _clean_email_list(values: list[Any]) -> list[str]:
+    return [value for value in _clean_list(values) if is_email_address(value)]
 
 
 def _credential_ids(text: str) -> list[str]:
@@ -2276,6 +2299,8 @@ def _classification_from_raw(
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         login_intent=bool(raw.get("login_intent")),
+        email_signin_intent=bool(raw.get("email_signin_intent")),
+        signin_email_candidates=_clean_email_list(raw.get("signin_email_candidates") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
         completion_criteria=completion_criteria,
@@ -4522,6 +4547,10 @@ def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, work
     """
     if not policy.login_intent or policy.raw_secret_detected:
         return False
+    if _is_passwordless_email_signin(policy):
+        # Nothing a password credential could satisfy: _resolve_signin_email owns this shape,
+        # and asking for a saved credential here is unanswerable on an email-only site.
+        return False
     if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
         return False
     if policy.clarification_reason not in _LOGIN_CREDENTIAL_OVERRIDABLE_REASONS:
@@ -4529,6 +4558,55 @@ def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, work
     if not _login_target_is_concrete(policy, user_message, workflow_yaml):
         return False
     return not (policy.resolved_credentials or policy.discovered_credentials or policy.existing_workflow_credential_ids)
+
+
+def _signin_target_hosts(policy: RequestPolicy, user_message: str) -> list[str]:
+    return [parts[1] for url in _login_url_candidates(policy, user_message) if (parts := _url_parts(url))]
+
+
+def _is_passwordless_email_signin(policy: RequestPolicy) -> bool:
+    """Email-address sign-in with no credential material referenced anywhere in the request."""
+    return (
+        (policy.email_signin_intent or bool(policy.resolved_signin_email))
+        and policy.login_intent
+        and not policy.raw_secret_detected
+        and policy.credential_input_kind == "none"
+        and not policy.credential_refs
+    )
+
+
+async def _resolve_signin_email(
+    policy: RequestPolicy,
+    organization_id: str,
+    *,
+    user_message: str,
+    workflow_yaml: str,
+) -> None:
+    """Settle which address signs in, or ask for one — never ask for a password credential."""
+    if not _is_passwordless_email_signin(policy):
+        return
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return
+    # Same first-touch rule the password path uses: with no site yet, the address is not
+    # the question the user still owes.
+    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
+        return
+    # A clarification already on the policy is a different question the user still owes;
+    # _block would overwrite it and lose it, so this ask waits for a later turn. A question
+    # without a reason set counts, which is why this checks the flag and not just the reason.
+    if policy.requires_user_clarification or policy.clarification_reason != "none":
+        return
+
+    named = next(iter(policy.signin_email_candidates), None)
+    if named:
+        # An explicit instruction outranks both a carried identity and the connected account.
+        policy.resolved_signin_email = named
+    elif not policy.resolved_signin_email:
+        policy.resolved_signin_email = await connected_gmail_address(organization_id)
+    if not policy.resolved_signin_email:
+        _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
+        return
+    policy.resolved_signin_host = next(iter(_signin_target_hosts(policy, user_message)), None)
 
 
 def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
@@ -4751,7 +4829,11 @@ async def _resolve_credentials(
     message_url_candidates = _clean_list(
         [candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)]
     )
-    current_turn_login_authorized = policy.login_intent or bool(_EXPLICIT_LOGIN_ACTION_RE.search(user_message))
+    # A passwordless turn must not reach the URL credential tiers below: a host match there
+    # asks for a saved credential under a different reason, which is the same dead end.
+    current_turn_login_authorized = (
+        policy.login_intent or bool(_EXPLICIT_LOGIN_ACTION_RE.search(user_message))
+    ) and not _is_passwordless_email_signin(policy)
     url_candidates: list[str] = []
     allow_host_fallback = False
     if (
@@ -4991,6 +5073,12 @@ async def build_request_policy(
             exc_info=True,
         )
     _prioritize_credential_clarification(policy)
+    # Before credential resolution, so a carried sign-in identity also keeps this turn out of
+    # the URL credential tiers.
+    carried = prior_signin_email_from_context(global_llm_context, _signin_target_hosts(policy, user_message))
+    policy.resolved_signin_email = policy.resolved_signin_email or (
+        carried if carried and is_email_address(carried) else None
+    )
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
         policy.testing_intent = "skip_test"
@@ -5102,6 +5190,24 @@ async def build_request_policy(
         policy.user_response_policy = "proceed"
         policy.clarification_reason = "none"
         policy.clarification_question = None
+
+    try:
+        await _resolve_signin_email(
+            policy,
+            organization_id,
+            user_message=user_message,
+            workflow_yaml=workflow_yaml,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy sign-in email resolution failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        # The credential requirement is already lifted for this shape, so falling through
+        # would build a login with no identity and no question asked.
+        if _is_passwordless_email_signin(policy) and not policy.requires_user_clarification:
+            _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
 
     if _login_credentials_unresolved(policy, user_message, workflow_yaml):
         if policy.clarification_reason == "none":
