@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, select, tuple_, update
+from sqlalchemy import and_, delete, func, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -300,11 +300,14 @@ class TasksRepository(BaseRepository):
         where s.task_id in task_ids
         """
         async with self.Session() as session:
-            query = (
-                select(func.count(distinct(tuple_(StepModel.task_id, StepModel.order))))
+            unique_step_orders = (
+                select(StepModel.task_id, StepModel.order)
                 .where(StepModel.task_id.in_(task_ids))
                 .where(StepModel.organization_id == organization_id)
+                .distinct()
+                .subquery()
             )
+            query = select(func.count()).select_from(unique_step_orders)
             return (await session.execute(query)).scalar()
 
     @db_operation("get_task_step_models")
