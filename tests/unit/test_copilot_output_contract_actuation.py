@@ -2192,8 +2192,8 @@ def test_canonically_bound_shapeless_valid_criterion_stays_dispatchable() -> Non
     )
 
     assert bound.request_slot_id == slot.slot_id
-    assert bound.output_path is None
-    assert bound.floor_rekeyed_from_path == "output.visible_action_label"
+    assert bound.output_path == "output.visible_action_label"
+    assert bound.expected_output_shape == "value_present"
     assert bound.mint_disposition != "degraded"
     assert bound.mint_degrade is None
 
