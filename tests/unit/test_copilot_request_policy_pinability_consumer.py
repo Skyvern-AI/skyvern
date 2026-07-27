@@ -32,7 +32,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classification_from_raw,
     _classify_request,
     _interrogative_slot_classification_output_key,
+    _minted_path_has_typed_child,
     _omitted_request_slot_datum_binding_targets,
+    _parse_completion_criterion_entries,
     _parse_fresh_request_slot_criteria,
     schema_output_path_aliases_from_criteria,
 )
@@ -3058,7 +3060,9 @@ async def test_unanchored_requested_output_uses_producer_consensus_and_mints_dec
     ]
     criterion = policy.completion_criteria[0]
     assert policy.request_slot_failure_kind is None
-    assert criterion.floor_rekeyed_from_path == "output.confirmation_code"
+    assert criterion.output_path == "output.confirmation_code"
+    assert criterion.expected_output_shape == "value_present"
+    assert criterion.requested_output_floor_rekeyed is False
     assert criterion.mint_disposition == "decidable"
     assert criterion.mint_degrade is None
 
@@ -3246,7 +3250,8 @@ async def test_producer_consensus_replaces_invalid_primary_source_identity() -> 
     ]
     criterion = policy.completion_criteria[0]
     assert policy.request_slot_failure_kind is None
-    assert criterion.floor_rekeyed_from_path == "output.confirmation_code"
+    assert criterion.output_path == "output.confirmation_code"
+    assert criterion.expected_output_shape == "value_present"
     assert criterion.request_slot_id is not None
     assert criterion.mint_disposition == "decidable"
 
@@ -3313,3 +3318,250 @@ async def test_fresh_non_output_request_accepts_agreed_empty_request_slot_contra
     assert policy.completion_criteria[0].outcome == "The application is submitted."
     assert policy.completion_criteria[0].mint_degrade is None
     assert calls == ["workflow-copilot-request-policy", REQUEST_SLOT_PROMPT_NAME, REQUEST_SLOT_PROMPT_NAME]
+
+
+def _single_value_extraction_slot(
+    source_quote: str,
+    *,
+    pinability: RequestSlotPinability = RequestSlotPinability.SHAPELESS_VALID,
+    antecedent_family: RequestSlotAntecedentFamily = RequestSlotAntecedentFamily.UNCONDITIONAL,
+) -> CanonicalRequestSlotV1:
+    request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=f"Go to example.test and get {source_quote}.",
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+    )
+    contract = canonicalize_request_slots(
+        request=request,
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote=source_quote,
+                    plane=RequestSlotPlane.RUN,
+                    pinability=pinability,
+                    antecedent_family=antecedent_family,
+                ),
+            ),
+        ),
+    )
+    return contract.slots[0]
+
+
+def test_plain_single_value_extraction_mints_requested_output_criterion() -> None:
+    source_quote = "the number of stars"
+    slot = _single_value_extraction_slot(source_quote)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run returns the number of stars.",
+            classification_output_key="star_count",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.pinability == "shapeless_valid"
+    assert criterion.output_path == "output.star_count"
+    assert criterion.expected_output_shape == "value_present"
+    assert criterion.expected_output_value is None
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.mint_degrade is None
+    assert criterion.kind == "outcome"
+    assert criterion.classification_output_key is None
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+    trace = RequestPolicy(completion_criteria=[criterion]).to_trace_data()
+    assert trace["requested_output_criteria_count"] == 1
+    assert trace["requested_output_criterion_0_output_path"] == "output.star_count"
+    assert trace["requested_output_criterion_0_pinability"] == "shapeless_valid"
+    assert trace["requested_output_criterion_0_expected_output_shape"] == "value_present"
+
+    (round_tripped,) = criteria_from_json(criteria_to_json([criterion]))
+    assert round_tripped.output_path == "output.star_count"
+    assert round_tripped.expected_output_shape == "value_present"
+    assert round_tripped.pinability == "shapeless_valid"
+    assert round_tripped.mint_disposition == "decidable"
+
+
+def test_extraction_output_path_without_classification_key_mints_requested_output_criterion() -> None:
+    source_quote = "the number of stars"
+    slot = _single_value_extraction_slot(source_quote)
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run returns the number of stars.",
+            output_path="output.star_count",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.pinability == "shapeless_valid"
+    assert criterion.output_path == "output.star_count"
+    assert criterion.expected_output_shape == "value_present"
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.mint_degrade is None
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+    trace = RequestPolicy(completion_criteria=[criterion]).to_trace_data()
+    assert trace["requested_output_criteria_count"] == 1
+    assert trace["requested_output_criterion_0_output_path"] == "output.star_count"
+    assert trace["requested_output_criterion_0_expected_output_shape"] == "value_present"
+
+
+def test_unpinnable_ask_with_output_path_still_degrades_without_minting() -> None:
+    source_quote = "everything relevant"
+    slot = _single_value_extraction_slot(
+        source_quote,
+        pinability=RequestSlotPinability.UNPINNABLE,
+        antecedent_family=RequestSlotAntecedentFamily.UNDECIDABLE,
+    )
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run summarizes everything relevant.",
+            output_path="output.summary",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.pinability == "unpinnable"
+    assert criterion.output_path is None
+    assert criterion.expected_output_shape != "value_present"
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+def test_blocker_antecedent_single_value_extraction_mints_requested_output_criterion() -> None:
+    source_quote = "the confirmation code"
+    slot = _single_value_extraction_slot(
+        source_quote,
+        antecedent_family=RequestSlotAntecedentFamily.BLOCKER,
+    )
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run returns the confirmation code.",
+            classification_output_key="confirmation_code",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.pinability == "shapeless_valid"
+    assert criterion.output_path == "output.confirmation_code"
+    assert criterion.expected_output_shape == "value_present"
+    assert criterion.mint_disposition == "decidable"
+
+
+def test_open_ended_unpinnable_request_is_not_minted_and_degrades_honestly() -> None:
+    source_quote = "everything relevant"
+    slot = _single_value_extraction_slot(
+        source_quote,
+        pinability=RequestSlotPinability.UNPINNABLE,
+        antecedent_family=RequestSlotAntecedentFamily.UNDECIDABLE,
+    )
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run summarizes everything relevant.",
+            classification_output_key="summary",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.pinability == "unpinnable"
+    assert criterion.output_path is None
+    assert criterion.expected_output_shape is None
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+def test_undecidable_antecedent_single_value_is_not_minted_and_degrades() -> None:
+    source_quote = "the result"
+    slot = _single_value_extraction_slot(
+        source_quote,
+        antecedent_family=RequestSlotAntecedentFamily.UNDECIDABLE,
+    )
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run returns the result.",
+            classification_output_key="result",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.output_path is None
+    assert criterion.expected_output_shape is None
+    assert criterion.mint_disposition == "degraded"
+
+
+def test_pinned_without_exact_requirement_is_not_minted_and_degrades() -> None:
+    source_quote = "the number of stars"
+    slot = _single_value_extraction_slot(
+        source_quote,
+        pinability=RequestSlotPinability.PINNED,
+    )
+    criterion = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c0",
+            outcome="The run returns the number of stars.",
+            classification_output_key="star_count",
+        ),
+        slot=slot,
+        source_quote=source_quote,
+    )
+
+    assert criterion.output_path is None
+    assert criterion.expected_output_shape != "value_present"
+    assert criterion.mint_disposition == "degraded"
+
+
+def test_classifier_supplied_value_present_shape_is_stripped_at_parse() -> None:
+    # value_present is minted by the policy only; a classifier-supplied one would otherwise be
+    # credited by presence and bypass the exact-value bar, so it is dropped at parse.
+    ((_item, criterion),) = _parse_completion_criterion_entries(
+        [{"outcome": "The run returns the NPI.", "output_path": "output.npi", "expected_output_shape": "value_present"}]
+    )
+    assert criterion.expected_output_shape is None
+    # A legitimate typed classifier shape is preserved.
+    ((_item2, typed),) = _parse_completion_criterion_entries(
+        [
+            {
+                "outcome": "The run returns the NPI.",
+                "output_path": "output.npi",
+                "expected_output_shape": "numeric_identifier",
+            }
+        ]
+    )
+    assert typed.expected_output_shape == "numeric_identifier"
+
+
+def test_typed_child_suppression_canonicalizes_output_prefix() -> None:
+    # A collection parent is suppressed even when a child path is written without the output. prefix.
+    assert _minted_path_has_typed_child("output.locations", frozenset({"locations[].address"}))
+    assert _minted_path_has_typed_child("output.locations", frozenset({"output.locations[].status"}))
+    # A leaf scalar with no nested sibling still mints.
+    assert not _minted_path_has_typed_child("output.star_count", frozenset({"output.forks"}))
+
+
+def test_requested_output_mint_state_treats_value_present_as_decidable() -> None:
+    from skyvern.forge.sdk.copilot.request_policy import _requested_output_mint_state
+
+    assert _requested_output_mint_state(None, "value_present", None) == ("decidable", None)
+    # A shapeless criterion with no typed shape still degrades.
+    assert _requested_output_mint_state(None, None, None) == ("decidable", None)
+    assert _requested_output_mint_state(None, "status_label", None) == ("degraded", "undecidable_judgment")

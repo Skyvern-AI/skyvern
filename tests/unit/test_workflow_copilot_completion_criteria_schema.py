@@ -413,3 +413,33 @@ async def test_snapshot_absorbs_adopted_row_criteria_decode_failure(monkeypatch:
     snapshot = await _load_completion_criteria_snapshot(chat)
 
     assert snapshot == StoredCriteriaSnapshot(active=None, next_epoch=3)
+
+
+@pytest.mark.asyncio
+async def test_loader_admits_value_present_requested_output_criterion() -> None:
+    request_slot_id = "a" * 64
+    criteria = [
+        {
+            "id": request_slot_id,
+            "outcome": "The run returns the number of stars.",
+            "antecedent_family": "unconditional",
+            "expected_output_shape": "value_present",
+            "requested_output_evidence_source": "runtime_output",
+            "kind": "outcome",
+            "output_path": "output.star_count",
+            "request_slot_id": request_slot_id,
+            "pinability": "shapeless_valid",
+            "mint_disposition": "decidable",
+        }
+    ]
+
+    loaded = await _load_latest(_make_row(criteria=criteria))
+
+    assert not isinstance(loaded, NonAdoptableCriteriaSet)
+    (criterion,) = criteria_from_json(loaded.criteria)
+    assert criterion.output_path == "output.star_count"
+    assert criterion.expected_output_shape == "value_present"
+    assert criterion.pinability == "shapeless_valid"
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.classification_output_key is None
+    assert criterion.requested_output_floor_rekeyed is False
