@@ -4104,6 +4104,12 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+    # Set when the typeahead prefilter (below) types the target into the field. If that pre-input
+    # selection does not commit, the terminal fill must clear first so the typed-but-uncommitted value
+    # is not doubled. `prefilter_attempted` stays set even when the typing raises mid-dispatch (leaving a
+    # dirty prefix), so the terminal clear still fires on the ArrowDown fall-through path.
+    prefilter_typeahead: bool = False
+    prefilter_attempted: bool = False
 
     input_or_select_context = await _get_input_or_select_context(
         action=action,
@@ -4155,15 +4161,33 @@ async def handle_input_text_action(
                 element_id=skyvern_element.get_id(),
             )
 
-        try:
-            await skyvern_element.press_key("ArrowDown")
-        except TimeoutError:
-            # sometimes we notice `press_key()` raise a timeout but actually the dropdown is opened.
-            LOG.info(
-                "Timeout to press ArrowDown to open dropdown, ignore the timeout and continue to execute the action",
-                element_id=skyvern_element.get_id(),
-                action=action,
-            )
+        # When the deployment's Setup flagged this action (a wrapper-marked typeahead), type the target to
+        # filter the listbox before matching instead of the unfiltered ArrowDown probe. Fall back to the
+        # ArrowDown probe when the flag is off, the text is empty/date-related, or the prefilter typing fails.
+        prefilter_typeahead = bool(text) and not input_or_select_context.is_date_related and action.prefilter_typeahead
+        if prefilter_typeahead:
+            # Mark before typing: a mid-dispatch failure can leave a dirty prefix, and the terminal clear
+            # gate must still fire even after prefilter_typeahead is reset for the ArrowDown fall-through.
+            prefilter_attempted = True
+            try:
+                await skyvern_element.input_sequentially(text)
+            except Exception:
+                LOG.info(
+                    "Failed to pre-filter typeahead combobox by typing the target, falling back to ArrowDown probe",
+                    element_id=skyvern_element.get_id(),
+                )
+                prefilter_typeahead = False
+
+        if not prefilter_typeahead:
+            try:
+                await skyvern_element.press_key("ArrowDown")
+            except TimeoutError:
+                # sometimes we notice `press_key()` raise a timeout but actually the dropdown is opened.
+                LOG.info(
+                    "Timeout to press ArrowDown to open dropdown, ignore the timeout and continue to execute the action",
+                    element_id=skyvern_element.get_id(),
+                    action=action,
+                )
 
         wait_sec = 0
         if has_onclick_attr:
@@ -4343,7 +4367,9 @@ async def handle_input_text_action(
     #   1.1. the element has a value attribute
     #   1.2. the element is not editable and not common input tag
     if not await skyvern_element.is_spinbtn_input() and (
-        current_text or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
+        current_text
+        or prefilter_attempted
+        or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
     ):
         is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
         try:
