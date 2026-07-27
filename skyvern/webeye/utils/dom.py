@@ -750,7 +750,7 @@ class SkyvernElement:
 
         return None
 
-    def find_deepest_interactable_descendant_in_single_chain(self) -> str | None:
+    def find_deepest_interactable_descendant_in_single_chain(self, *, include_disabled: bool = False) -> str | None:
         children = self.__static_element.get("children")
         if not isinstance(children, list):
             return None
@@ -775,7 +775,8 @@ class SkyvernElement:
                     continue
                 attrs = item.get("attributes")
                 # Static children expose attrs only; CSS style-disabled is caught by the later dynamic check.
-                if isinstance(attrs, dict) and self._disabled_attrs_indicate_disabled(attrs):
+                # include_disabled keeps a statically-disabled candidate for callers that wait_until_enabled it.
+                if not include_disabled and isinstance(attrs, dict) and self._disabled_attrs_indicate_disabled(attrs):
                     grandchildren = item.get("children")
                     if isinstance(grandchildren, list):
                         _walk(grandchildren, child_path)
@@ -1208,6 +1209,7 @@ class SkyvernElement:
         dom: DomUtil | None = None,
         incremental_page: IncrementalScrapePage | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
         if not await self.wait_until_enabled(timeout=timeout):
             raise InteractWithDisabledElement(element_id=self.get_id())
@@ -1222,7 +1224,7 @@ class SkyvernElement:
             return
         except Exception as exc:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
-            if is_post_dispatch_click_timeout(exc):
+            if is_post_dispatch_click_timeout(exc, engine_selection):
                 LOG.info(
                     "Click side effect detected via navigation-wait timeout — skipping fallback chain",
                     element_id=self.get_id(),
@@ -1238,7 +1240,13 @@ class SkyvernElement:
                     LOG.debug("Find the blocking element", element_id=blocking_element.get_id())
                     await blocking_element.get_locator().click(timeout=timeout)
                     return
-            except Exception:
+            except Exception as exc:
+                if is_post_dispatch_click_timeout(exc, engine_selection):
+                    LOG.info(
+                        "Blocking-element click side effect detected via navigation-wait timeout — skipping fallback chain",
+                        element_id=self.get_id(),
+                    )
+                    return
                 LOG.info("Failed to click on the blocking element", exc_info=True, element_id=self.get_id())
 
         try:

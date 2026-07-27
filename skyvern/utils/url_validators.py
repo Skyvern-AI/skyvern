@@ -1,8 +1,10 @@
 import ipaddress
 import socket
 from http import HTTPStatus
+from typing import Any
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
+import httpx
 from pydantic import HttpUrl, ValidationError
 
 from skyvern.config import settings
@@ -258,6 +260,43 @@ def validate_redirect_url_with_resolved_ips(url: str, location: str) -> tuple[st
 
 def validate_redirect_url(url: str, location: str) -> str:
     return validate_redirect_url_with_resolved_ips(url, location)[0]
+
+
+class _PinnedIPTransport(httpx.AsyncHTTPTransport):
+    """Connect only to already-validated IPs, keeping SNI, Host, and cert verification on the hostname.
+
+    httpx resolves again at connect time, so a rebinding host can answer with a private
+    address after validation passed. Addresses are tried in resolution order so a host
+    whose first address is unreachable still behaves like an unpinned client.
+    """
+
+    def __init__(self, resolved_ips: tuple[str, ...], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._resolved_ips = resolved_ips
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original_url = request.url
+        request.extensions = {**request.extensions, "sni_hostname": original_url.host}
+        last_index = len(self._resolved_ips) - 1
+        for index, ip in enumerate(self._resolved_ips):
+            request.url = original_url.copy_with(host=ip)
+            try:
+                return await super().handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if index == last_index:
+                    raise
+        raise httpx.ConnectError(f"No validated address for {original_url.host} could be reached")
+
+
+def pinned_ip_client(resolved_ips: tuple[str, ...] | None, **kwargs: Any) -> httpx.AsyncClient:
+    """Client pinned to the IPs a caller already validated, so DNS cannot be re-answered at connect time.
+
+    Pass the IPs from `validate_fetch_url_with_resolved_ips`. Without them this is a plain
+    client with no rebinding protection.
+    """
+    if not resolved_ips:
+        return httpx.AsyncClient(**kwargs)
+    return httpx.AsyncClient(transport=_PinnedIPTransport(resolved_ips), **kwargs)
 
 
 def encode_url(url: str) -> str:

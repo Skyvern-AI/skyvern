@@ -120,4 +120,68 @@ check("loaded script is re-injectable and exports all entry points", () => {
   }
 });
 
+// SKY-12875 M2: exports must not be interceptable. `globalThis.x = x` invokes a page-installed
+// setter and hands it our genuine function, which let a page serve a wrapper from a getter and
+// drive our own builder with arguments we never passed (forcing destination capture on while the
+// policy was disabled). These drive the real generated script, not its source text.
+
+check("a page setter never receives an exported function", () => {
+  const ctx = makeContext();
+  vm.runInContext(
+    `globalThis.__stolen = null;
+     Object.defineProperty(globalThis, "buildTreeFromBody", {
+       configurable: true,
+       get() { return globalThis.__stolen; },
+       set(value) { globalThis.__stolen = value; },
+     });`,
+    ctx,
+  );
+  indirectEval(ctx, wrappedScript);
+  assert.strictEqual(
+    ctx.__stolen,
+    null,
+    "the page's setter was invoked by the export",
+  );
+  assert.strictEqual(
+    typeof ctx.buildTreeFromBody,
+    "function",
+    "the export did not install our function",
+  );
+});
+
+check("a non-configurable writable global does not break the export", () => {
+  // This is the descriptor a real page's top-level `var element = 1` produces, and several
+  // exported names are ordinary words — so it is ordinary sites, not attack, and refusing it
+  // would break scraping everywhere. Written as an explicit descriptor because `var` inside a vm
+  // context is configurable, unlike a browser's; the real-browser case is covered by a Chromium
+  // probe.
+  const ctx = makeContext();
+  vm.runInContext(
+    `Object.defineProperty(globalThis, "buildTreeFromBody", {
+       value: 1, writable: true, enumerable: true, configurable: false,
+     });`,
+    ctx,
+  );
+  indirectEval(ctx, wrappedScript);
+  assert.strictEqual(typeof ctx.buildTreeFromBody, "function");
+});
+
+check("a locked accessor on an exported global fails injection loudly", () => {
+  const ctx = makeContext();
+  vm.runInContext(
+    `Object.defineProperty(globalThis, "buildTreeFromBody", {
+       configurable: false,
+       get() { return undefined; },
+       set(value) { globalThis.__stolen = value; },
+     });`,
+    ctx,
+  );
+  assert.throws(
+    () => indirectEval(ctx, wrappedScript),
+    /refusing to export over locked global/,
+    "injection must refuse rather than run through an interposed global",
+  );
+  assert.strictEqual(ctx.__stolen, undefined, "the page captured our function");
+});
+
 process.exit(failures ? 1 : 0);

@@ -20,6 +20,7 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, SkyvernPageAnalysisTimeout
+from skyvern.forge.sdk.browser_action_preflight import policy_observation_enabled, record_observed_tabs
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
@@ -51,6 +52,9 @@ async def build_open_tabs_context(
     if working_page is None:
         return None
     pages = await browser_state.list_valid_pages()
+    # Recorded before the single-tab early return: a SWITCH_TAB judged against a stale record from
+    # an earlier multi-tab prompt is exactly the mismatch the record exists to surface.
+    record_observed_tabs([p.url for p in pages])
     if len(pages) <= 1:
         return None
     # Fetch titles concurrently so a few slow tabs don't add N×timeout latency to every iteration.
@@ -83,9 +87,37 @@ def _wrap_js_in_isolated_scope(script: str) -> str:
     # lexical binding with the same name. Scope the script in an IIFE and export via
     # property writes, which never collide; typeof guards drop names the column-0 regex
     # matched inside block comments.
+    # Export via defineProperty, never a bare assignment. A page that installs a setter on one of
+    # these globals BEFORE injection has `globalThis.x = x` hand it our genuine function
+    # synchronously, letting it serve a wrapper from a getter and drive our own builder with
+    # arguments we never passed (SKY-12875 M2: forcing destination capture on in disabled mode).
+    # defineProperty redefines the slot instead of invoking a setter.
     names = sorted(set(_JS_TOP_LEVEL_DECL_RE.findall(script)))
-    exports = "\n".join(f'if (typeof {name} !== "undefined") globalThis.{name} = {name};' for name in names)
-    return f"(() => {{\n{script}\n{exports}\n}})();"
+    exporter = """
+const __skyvernExport = (name, value) => {
+  const existing = Object.getOwnPropertyDescriptor(globalThis, name);
+  if (existing && !existing.configurable) {
+    // A page's own top-level `var element = ...` makes a non-configurable WRITABLE data property,
+    // and several exported names are ordinary words — so this case is ordinary pages, not attack,
+    // and a plain write is correct there (a data property has no setter to invoke). A locked
+    // ACCESSOR is the interposition this export exists to refuse, and a locked read-only slot
+    // would silently leave the page's value in place; both fail loudly instead.
+    if (existing.get || existing.set || !existing.writable) {
+      throw new Error("skyvern: refusing to export over locked global " + name);
+    }
+    globalThis[name] = value;
+    return;
+  }
+  Object.defineProperty(globalThis, name, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+};
+"""
+    exports = "\n".join(f'if (typeof {name} !== "undefined") __skyvernExport("{name}", {name});' for name in names)
+    return f"(() => {{\n{script}\n{exporter}\n{exports}\n}})();"
 
 
 def load_js_script() -> str:
@@ -431,11 +463,11 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
 
 # FileReader keeps the payload binary-safe without arrayBuffer/Uint8Array
 # transcoding back across CDP.
-_BLOB_FETCH_JS = """
+_SAME_ORIGIN_FETCH_JS = """
 async (args) => {
     try {
-        const { blobUrl, maxSizeBytes } = args;
-        const response = await fetch(blobUrl);
+        const { url, maxSizeBytes } = args;
+        const response = await fetch(url);
         if (!response.ok) {
             return { ok: false, status: response.status };
         }
@@ -486,8 +518,8 @@ def _frame_origin(frame_url: str | None) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
-    """Return frames whose origin matches the blob's origin, main frame first."""
+def _frames_for_origin(page: Page, origin: str) -> list[Frame]:
+    """Return frames whose origin matches the given origin, main frame first."""
     seen: set[int] = set()
     matches: list[Frame] = []
     candidates: list[Frame] = [page.main_frame, *page.frames]
@@ -500,9 +532,14 @@ def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
             frame_url = frame.url
         except Exception:
             continue
-        if _frame_origin(frame_url) == blob_origin:
+        if _frame_origin(frame_url) == origin:
             matches.append(frame)
     return matches
+
+
+def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
+    """Return frames whose origin matches the blob's origin, main frame first."""
+    return _frames_for_origin(page, blob_origin)
 
 
 def _all_page_frames(page: Page) -> list[Frame]:
@@ -516,6 +553,54 @@ def _all_page_frames(page: Page) -> list[Frame]:
         seen.add(frame_id)
         frames.append(frame)
     return frames
+
+
+def pop_destination_facts(nodes: object) -> dict[str, dict]:
+    """Strip SKY-12875 destination facts out of scraper payloads, in place, at the JS->Python
+    boundary. Every downstream consumer — element hashes and cached-action matching, persisted
+    skyvern_element_data (DB rows and the public SDK Action type), the element-tree artifact,
+    prompt building, incremental dropdown dedup — then sees dicts byte-identical to a build that
+    never captured facts.
+
+    Only a MAPPING-valued ``destination`` is ours. ``<div destination="shipping">`` is ordinary
+    markup on ordinary sites, and every attribute is collected verbatim into ``attributes``, so a
+    key-name-only match deleted page content — changing hashes, cached matching, prompts and
+    persisted rows on pages that have nothing to do with this feature, and in disabled mode it
+    also let the page seed the sidecar with an arbitrary id. DOM attribute values are always
+    strings, so the page cannot forge the mapping shape through that channel; our facts are always
+    mappings.
+
+    The walk is DEEP: every nested dict and list at any depth is visited, because a hostile
+    wrapper around the page-global builder can relocate a fact into a nested position (an
+    attribute value, a grandchild) where a children-only walk would miss it. A wrapper that
+    RENAMES the key is fabricating arbitrary payload content, which was possible before facts
+    existed and is out of this strip's scope. The strip itself stays unconditional in both policy
+    modes — it is protection against wrapper INJECTION, not capture cost — while capture is
+    flag-gated so disabled mode does no fact work. The sidecar is keyed by element id and is
+    consumed only by the observation epoch; the payload is page-controlled, so any shape is
+    tolerated and cycles (reconstructable via Playwright's ref protocol) terminate via the
+    seen-set instead of hanging the worker.
+    """
+    facts: dict[str, dict] = {}
+    stack = list(nodes) if isinstance(nodes, list) else []
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, list):
+            stack.extend(node)
+            continue
+        if not isinstance(node, dict):
+            continue
+        if isinstance(node.get("destination"), dict):
+            destination = node.pop("destination")
+            element_id = node.get("id")
+            if isinstance(element_id, str) and element_id:
+                facts[element_id] = destination
+        stack.extend(node.values())
+    return facts
 
 
 class SkyvernFrame:
@@ -614,33 +699,37 @@ class SkyvernFrame:
             settle_ms = min(_NAVIGATION_SETTLE_TIMEOUT_MS, _remaining_seconds() * 1000)
             await _wait_for_navigation_settle(frame, timeout_ms=settle_ms)
 
-            inject_budget = min(per_attempt_seconds, _remaining_seconds())
-            if inject_budget <= 0:
-                LOG.error(
-                    "Skyvern timed out trying to analyze the page after navigation recovery",
-                    expression=expression,
-                )
-                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
-            try:
-                async with asyncio.timeout(inject_budget):
-                    # Same dispatch helper so a prefixed Page re-injects
-                    # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
-                    await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
-            except asyncio.TimeoutError as error:
-                LOG.exception(
-                    "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
-                    expression=expression,
-                )
-                raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
-            except (PlaywrightError, RuntimeError) as inject_err:
-                last_error_msg = str(inject_err)
-                if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
-                    LOG.warning(
-                        "Re-injection of domUtils.js also failed, page may still be navigating",
-                        attempts=attempt,
+            # The bootstrap call already IS the domUtils.js injection, so the retry below
+            # re-injects it anyway; a separate injection pass would spend a second attempt
+            # budget on identical work and halve the attempts that fit in the deadline.
+            if expression != JS_FUNCTION_DEFS:
+                inject_budget = min(per_attempt_seconds, _remaining_seconds())
+                if inject_budget <= 0:
+                    LOG.error(
+                        "Skyvern timed out trying to analyze the page after navigation recovery",
+                        expression=expression,
                     )
-                    raise
-                continue
+                    raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
+                try:
+                    async with asyncio.timeout(inject_budget):
+                        # Same dispatch helper so a prefixed Page re-injects
+                        # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
+                        await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
+                except asyncio.TimeoutError as error:
+                    LOG.exception(
+                        "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
+                        expression=expression,
+                    )
+                    raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
+                except (PlaywrightError, RuntimeError) as inject_err:
+                    last_error_msg = str(inject_err)
+                    if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
+                        LOG.warning(
+                            "Re-injection of domUtils.js also failed, page may still be navigating",
+                            attempts=attempt,
+                        )
+                        raise
+                    continue
 
             retry_budget = min(per_attempt_seconds, _remaining_seconds())
             if retry_budget <= 0:
@@ -697,7 +786,7 @@ class SkyvernFrame:
             return None
 
         # blob.size is checked in-page against this before the payload is serialized.
-        blob_arg = {"blobUrl": blob_url, "maxSizeBytes": max_size_bytes}
+        blob_arg = {"url": blob_url, "maxSizeBytes": max_size_bytes}
         main_frame = page.main_frame
         for frame in frames:
             try:
@@ -705,9 +794,9 @@ class SkyvernFrame:
                 # context-level main-world prefix stays attached; sub-frames use
                 # frame.evaluate (main-world prefixes are page-scoped).
                 if frame is main_frame:
-                    result = await evaluate_in_main_world(page, _BLOB_FETCH_JS, blob_arg)
+                    result = await evaluate_in_main_world(page, _SAME_ORIGIN_FETCH_JS, blob_arg)
                 else:
-                    result = await frame.evaluate(_BLOB_FETCH_JS, blob_arg)
+                    result = await frame.evaluate(_SAME_ORIGIN_FETCH_JS, blob_arg)
             except Exception:
                 retry_log(
                     "blob URL in-frame fetch raised; trying next frame if any",
@@ -751,6 +840,72 @@ class SkyvernFrame:
             "blob URL read could not retrieve bytes from any matching frame",
             workflow_run_id=workflow_run_id,
         )
+        return None
+
+    @staticmethod
+    async def read_http_url_bytes(
+        page: Page,
+        url: str,
+        workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    ) -> bytes | None:
+        """Fetch an http(s) URL's bytes via an in-page fetch() inside a same-origin frame.
+
+        Recovers a resource whose inline iframe render was refused by a frame-embedding policy
+        while its bytes stay retrievable same-origin (session cookies + connect-src apply to a
+        same-origin fetch). Returns None for non-http(s) URLs, when no same-origin frame exists,
+        or when every candidate frame's fetch fails.
+
+        ``timeout_ms`` is the per-fetch evaluate timeout (default matches SkyvernFrame.evaluate);
+        a caller with a larger whole-operation budget can widen it so a slow-but-alive server
+        isn't rejected by the generic action timeout.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+        frames = _frames_for_origin(page, f"{parsed.scheme}://{parsed.netloc}")
+        if not frames:
+            LOG.debug("same-origin URL read found no matching frame", workflow_run_id=workflow_run_id)
+            return None
+
+        # _SAME_ORIGIN_FETCH_JS is a plain fetch(); reused here for http(s) recovery.
+        fetch_arg = {"url": url, "maxSizeBytes": max_size_bytes}
+        main_frame = page.main_frame
+        for frame in frames:
+            # Route the main frame through the Page so SkyvernFrame.evaluate can attach any
+            # context-level main-world prefix; sub-frames evaluate in-frame (prefixes are
+            # page-scoped). SkyvernFrame.evaluate centralizes the main-world dispatch, timeout,
+            # and navigation-context recovery.
+            target: Page | Frame = page if frame is main_frame else frame
+            try:
+                result = await SkyvernFrame.evaluate(
+                    frame=target, expression=_SAME_ORIGIN_FETCH_JS, arg=fetch_arg, timeout_ms=timeout_ms
+                )
+            except Exception:
+                LOG.debug(
+                    "same-origin URL in-frame fetch raised; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(result, dict) and result.get("error") == "too_large":
+                LOG.warning(
+                    "same-origin URL exceeds max size; not reading",
+                    workflow_run_id=workflow_run_id,
+                    size=result.get("size"),
+                    max_size_bytes=max_size_bytes,
+                )
+                return None
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+            b64_payload = result.get("base64")
+            if not isinstance(b64_payload, str):
+                continue
+            try:
+                return base64.b64decode(b64_payload, validate=True)
+            except Exception:
+                continue
         return None
 
     # -- cursor overlay helpers ------------------------------------------------
@@ -937,7 +1092,9 @@ class SkyvernFrame:
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> dict:
         js_script = "async ([frame, element, interactable]) => await buildElementObject(frame, element, interactable)"
-        return await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
+        parsed = await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
+        pop_destination_facts([parsed])
+        return parsed
 
     async def get_element_scrollable(self, element: ElementHandle) -> bool:
         js_script = "(element) => isScrollable(element)"
@@ -1113,16 +1270,25 @@ class SkyvernFrame:
         frame_index: int,
         must_included_tags: list[str] | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
-    ) -> tuple[list[dict], list[dict]]:
+    ) -> tuple[list[dict], list[dict], dict[str, dict]]:
         must_included_tags = must_included_tags or []
         await self._set_enriched_element_tree_flag()
-        js_script = "async ([frame_name, frame_index, must_included_tags]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags)"
-        return await self.evaluate(
+        # Capture is flag-gated so a disabled-mode build does no destination-fact work on any page
+        # that has not interposed on the builder global; a page that has can still force the flag,
+        # and the per-build budget in domUtils is what bounds that. The strip below stays
+        # unconditional: it is protection against a hostile wrapper injecting the key, not capture
+        # cost.
+        capture_destination_facts = policy_observation_enabled()
+        js_script = "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)"
+        elements, element_tree = await self.evaluate(
             frame=self.frame,
             expression=js_script,
             timeout_ms=timeout_ms,
-            arg=[frame_name, frame_index, must_included_tags],
+            arg=[frame_name, frame_index, must_included_tags, capture_destination_facts],
         )
+        destinations = pop_destination_facts(elements)
+        destinations.update(pop_destination_facts(element_tree))
+        return elements, element_tree, destinations
 
     @traced(name="skyvern.browser.incremental_element_tree")
     async def get_incremental_element_tree(
@@ -1132,9 +1298,12 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
-        return await self.evaluate(
+        elements, element_tree = await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
+        pop_destination_facts(elements)
+        pop_destination_facts(element_tree)
+        return elements, element_tree
 
     @traced(name="skyvern.browser.element_tree_from_element")
     async def build_tree_from_element(
@@ -1146,9 +1315,12 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
         js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
-        return await self.evaluate(
+        elements, element_tree = await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
+        pop_destination_facts(elements)
+        pop_destination_facts(element_tree)
+        return elements, element_tree
 
     @traced(name="skyvern.browser.wait_for_animation")
     async def safe_wait_for_animation_end(
