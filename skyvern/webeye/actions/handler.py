@@ -176,7 +176,7 @@ from skyvern.webeye.utils.dom import (
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
-from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
+from skyvern.webeye.utils.page import SkyvernFrame, _all_page_frames, take_element_screenshot
 
 LOG = structlog.get_logger()
 
@@ -877,6 +877,140 @@ async def _finalize_download_artifacts(
         observed_file_paths=set(list_files_after),
     )
     return [os.path.basename(path) for path in paths], new_file_paths
+
+
+_INLINE_IFRAME_SRC_JS = "() => Array.from(document.querySelectorAll('iframe')).map((f) => f.src || '')"
+
+# Whole-operation cap for blocked-inline-PDF recovery (all candidate same-origin fetches share it,
+# so up to _collect's cap of candidates can't multiply the budget). A ~3 MB same-origin PDF fetches
+# in well under a second; 30s is generous headroom for a slow-but-alive server while a hung one can
+# no longer out-wait the download loop this recovery backstops.
+_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS = 30.0
+
+
+def _looks_like_pdf(data: bytes) -> bool:
+    # A real PDF starts with %PDF-, optionally after a single exact UTF-8 BOM. Match the whole
+    # 3-byte BOM sequence (not individual BOM bytes) and anchor at the start so HTML/JSON error
+    # pages that merely mention the marker further down are rejected.
+    header = data[3:] if data[:3] == b"\xef\xbb\xbf" else data
+    return header[:5] == b"%PDF-"
+
+
+async def _collect_inline_iframe_src_candidates(page: Page) -> list[str]:
+    """Every http(s) <iframe> src on the page, deduped, order-preserving.
+
+    Uncapped on purpose: this feeds the before/after action-window comparison, so an arbitrary cap
+    (e.g. the first N in DOM order) could drop a newly-appended target that sits past many pre-existing
+    ad/tracker iframes, silently no-opping recovery. Enumeration is cheap (one evaluate per frame);
+    the fetch work it gates is bounded by the whole-operation budget in handle_action instead.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+    main_frame = page.main_frame
+    for frame in _all_page_frames(page):
+        # Route the main frame through the Page so SkyvernFrame.evaluate can attach any
+        # context-level main-world prefix; child frames evaluate in-frame (prefixes are page-scoped).
+        target: Page | Frame = page if frame is main_frame else frame
+        try:
+            srcs = await SkyvernFrame.evaluate(frame=target, expression=_INLINE_IFRAME_SRC_JS)
+        except Exception:
+            continue
+        if not isinstance(srcs, list):
+            continue
+        for src in srcs:
+            if not isinstance(src, str) or not src.startswith(("http://", "https://")) or src in seen:
+                continue
+            seen.add(src)
+            candidates.append(src)
+    return candidates
+
+
+async def _recover_blocked_inline_pdf_download(
+    page: Page,
+    download_dir: Path,
+    workflow_run_id: str | None,
+    *,
+    iframe_srcs_before: list[str],
+) -> Path | None:
+    """Recover a PDF whose inline iframe render was refused by a browser frame-embedding policy.
+
+    A download-intent click can leave the statement in an <iframe> the browser refuses to display
+    (its bytes still download fine, they just can't be framed). To tie the recovery to *this* click
+    rather than any PDF on the page, only iframes that appeared in the action window are candidates:
+    an iframe whose src is absent from ``iframe_srcs_before`` (the pre-action snapshot, required) is
+    either newly attached or an existing iframe navigated to a new src. Pre-existing frames (adverts,
+    a reCAPTCHA anchor, a previously opened statement) are excluded because their src is already in
+    the baseline. Recovery only fires when exactly one candidate src is a PDF; zero or several
+    equally-plausible candidate srcs fail closed (return None) so we never save an unrelated file —
+    two distinct candidate URLs are ambiguous even when their bytes happen to match. The recovered
+    bytes are written to ``download_dir`` to rejoin the normal finalize / dedupe / filename / upload
+    lifecycle.
+    """
+    after = await _collect_inline_iframe_src_candidates(page)
+    if not after:
+        return None
+    baseline = set(iframe_srcs_before)
+    action_window_candidates = [src for src in after if src not in baseline]
+    if not action_window_candidates:
+        return None
+
+    pdf_candidate: tuple[str, bytes] | None = None
+    for src in action_window_candidates:
+        try:
+            data = await SkyvernFrame.read_http_url_bytes(
+                page,
+                src,
+                workflow_run_id=workflow_run_id,
+                max_size_bytes=MAX_FILE_SIZE_BYTES,
+                timeout_ms=_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS * 1000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.debug(
+                "Blocked-iframe recovery fetch raised; trying next candidate",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            continue
+        if not data or not _looks_like_pdf(data):
+            continue
+        if pdf_candidate is not None:
+            # A second distinct candidate src is a PDF: the action window is ambiguous, fail closed.
+            LOG.warning(
+                "Multiple inline PDF candidates appeared in the action window; not recovering any",
+                workflow_run_id=workflow_run_id,
+            )
+            return None
+        pdf_candidate = (src, data)
+
+    if pdf_candidate is None:
+        return None
+
+    src, data = pdf_candidate
+    base_name = normalize_download_filename(os.path.basename(urllib.parse.urlparse(src).path), "application/pdf")
+    if not base_name:
+        # A URL with no path basename (e.g. ".../?token=...") yields no name; the bytes are a
+        # confirmed PDF, so give the persisted file a .pdf extension instead of an extension-less one.
+        base_name = "statement.pdf"
+    target = _download_target_path(download_dir, base_name)
+    try:
+        download_dir.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    except OSError:
+        LOG.warning(
+            "Failed to persist recovered blocked-iframe PDF",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    LOG.info(
+        "Recovered a browser-blocked inline PDF via same-origin fetch",
+        workflow_run_id=workflow_run_id,
+        recovered_bytes=len(data),
+        download_target=str(target),
+    )
+    return target
 
 
 async def _cleanup_captured_download_popup(
@@ -2598,6 +2732,9 @@ class ActionHandler:
             num_downloaded_files_before=len(list_files_before),
             download_dir=download_dir,
         )
+        # Baseline of inline iframe srcs before the action, so a blocked-inline-PDF recovery can
+        # admit only frames that appeared in this action's window (see _recover_blocked_inline_pdf_download).
+        inline_iframe_srcs_before = await _collect_inline_iframe_src_candidates(page)
 
         staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
         xhr_capture = ScopedXhrDownloadCapture(
@@ -2884,6 +3021,32 @@ class ActionHandler:
                 if download_wait_matched_errors:
                     await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, 0)
                 elif await _drain_and_move_staged_xhr(xhr_fallback_moved_paths, _remaining_download_wait_seconds()):
+                    download_triggered = True
+
+            # A download-intent click can render the target PDF inline in a frame the browser refuses
+            # to display, so no download event ever fires. If the bytes are still same-origin
+            # retrievable, recover them and rejoin the normal finalize path. Skipped when the workflow
+            # matched a user-defined terminal error, so configured stop conditions stay authoritative.
+            if not download_triggered and not download_wait_matched_errors:
+                recovered_path = None
+                try:
+                    # One whole-operation budget over every candidate fetch: a hung same-origin
+                    # server must not out-wait the download loop this backstops. On timeout, fall
+                    # through to the normal download-not-triggered follow-up — never hang or hard-fail.
+                    async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                        recovered_path = await _recover_blocked_inline_pdf_download(
+                            page,
+                            download_dir,
+                            workflow_run_id=task.workflow_run_id,
+                            iframe_srcs_before=inline_iframe_srcs_before,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Blocked-inline PDF recovery exceeded its budget; treating as no recovery",
+                        workflow_run_id=task.workflow_run_id,
+                        recovery_budget_seconds=_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+                    )
+                if recovered_path is not None:
                     download_triggered = True
 
             if not download_triggered:
