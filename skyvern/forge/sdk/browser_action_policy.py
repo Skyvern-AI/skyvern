@@ -571,17 +571,18 @@ def hydrate_destination(
 ) -> ActionProjection:
     """Attach scrape-time destination facts for the action's element to its projection.
 
-    *** A MAIN-WORLD-SOURCED FACT NEVER ESTABLISHES COMPLETENESS. *** Completeness means the
-    destination is KNOWN, not that it is safe. A model-declared URL on the action itself (a PAGE
-    target) is the exact string the sink will use — genuinely known, and the origin check does the
-    safety work on it; that holds even for an attacker-influenced model URL under prompt
-    injection, because it is still exactly where the action goes. A page-supplied anchor or form
-    fact is NOT necessarily where the browser goes at all: the page can hide ``ping`` from a
-    patched main-world ``getAttribute`` or preventDefault and navigate programmatically. So facts
-    captured from page content (ANCHOR/FORM kinds — the kind IS the source taxonomy) may attach
-    as targets — they still DENY on a bad origin, still narrow, still feed sink evidence — but
-    the projection stays destination-INCOMPLETE, and no mutating element action reaches ALLOWED
-    until an enforcement sink (SKY-12881+) re-verifies the destination at execution time.
+    Facts sourced in the MAIN WORLD are tamperable: hostile page code can forge or suppress them,
+    so they can be false telemetry. They may DENY or NARROW a decision, but must never establish
+    ALLOWED, authorization, or completeness. Completeness means the destination is KNOWN, not that
+    it is safe. A model-declared URL on the action itself (a PAGE target) is the exact string the
+    sink will use — genuinely known, and the origin check does the safety work on it; that holds
+    even for an attacker-influenced model URL under prompt injection, because it is still exactly
+    where the action goes. A page-supplied anchor or form fact is NOT necessarily where the browser
+    goes at all: the page can hide ``ping`` from a patched main-world ``getAttribute`` or
+    preventDefault and navigate programmatically. Facts captured from page content (ANCHOR/FORM
+    kinds — the kind IS the source taxonomy) may attach as targets and feed sink evidence, but the
+    projection stays destination-INCOMPLETE, and no mutating element action reaches ALLOWED until
+    an enforcement sink (SKY-12881+) re-verifies the destination at execution time.
 
     Otherwise pure and fail-closed in every direction: a defective projection is returned
     untouched; an unobserved element or an opaque destination changes nothing; a claimed element
@@ -618,7 +619,11 @@ def with_resolved_target(projection: ActionProjection, target: ResolvedTarget | 
     ``complete=True`` here means "a record spoke for this index", not "this is where the browser
     will go". Benign today — SWITCH_TAB is ungated recovery and the next step re-scrapes — and
     covered by the sink-side re-verification obligation on SKY-12881+. Do not read a TAB target as
-    execution truth, and do not extend this helper to gated actions without closing that gap."""
+    execution truth, and do not extend this helper to gated actions without closing that gap.
+
+    Load-bearing enrichment invariant: the explicit ``complete=True`` keyword occurs only here, on
+    the tab-record path. ``hydrate_destination`` never passes ``complete``, so page facts
+    structurally cannot establish completeness; future edits must preserve that separation."""
     if projection.defects or projection.action_class is None:
         # Same guard as hydrate_destination: the field the lookup was keyed on came from a model
         # whose layout the core refused to trust, so no target may attach and nothing completes.

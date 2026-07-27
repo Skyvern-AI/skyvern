@@ -292,6 +292,7 @@ class TestScrapeAssemblyCarriesTheSidecar:
         assert all("destination" not in node for node in elements)
 
 
+@pytest.mark.skip(reason="SKY-12875 mitigation: buildDestinationFacts short-circuits; un-skip with PR #13991")
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 class TestDestinationFactsJs:
     def test_behavioral(self) -> None:

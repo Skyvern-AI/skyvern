@@ -1772,12 +1772,18 @@ function normalizeFormMethod(raw) {
 }
 
 // Destination facts for the browser action firewall (SKY-12875): where would interacting with
-// this element send data? The page controls every attribute read here, so the output is UNTRUSTED
-// PREFLIGHT INPUT — Python strips it out of the element dicts at the SkyvernFrame boundary and
-// the policy layer treats it as evidence, never authorization. Fail closed on anything malformed,
-// clobbered, or throwing: null means "no destination structure", url:null means "structure that
-// did not resolve"; both classify as INCOMPLETE downstream.
+// this element send data? They are captured in the MAIN WORLD and are TAMPERABLE: hostile page
+// code can forge or suppress them, so they can be FALSE TELEMETRY. They may DENY or NARROW a
+// decision, but must never establish ALLOWED or authorization. Python strips them from element
+// dicts at the SkyvernFrame boundary. Malformed, clobbered, or throwing input fails closed:
+// null means "no destination structure"; url:null means unresolved; both are INCOMPLETE.
 function buildDestinationFacts(element, tagNameLower) {
+  // Capture remains deliberately disabled for SKY-12875. Re-enable only after: (1) F3 bounds
+  // resolution/serialization work before allocation instead of truncating the post-resolution
+  // result (that truncation is the defect, not the fix); (2) the MAIN-WORLD tamperability and
+  // cannot-authorize telemetry note has landed; (3) the (beforeunload, dismiss) capability-table
+  // gap is closed; and (4) the F5 consequence is load-bearing in with_resolved_target's docstring.
+  return null;
   try {
     const doc = element.ownerDocument;
     // Length caps bound the RESOLVED value, not just the raw attribute: 4096 compact raw chars
