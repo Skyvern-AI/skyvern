@@ -19,7 +19,7 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
-from skyvern.exceptions import FailedToTakeScreenshot, SkyvernPageAnalysisTimeout
+from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+
+_SCREENSHOT_TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
 
 
 async def _safe_tab_title(page: Page) -> str:
@@ -162,6 +164,10 @@ async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None
         LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
 
 
+def _is_screenshot_target_closed(error: BaseException) -> bool:
+    return isinstance(error, PlaywrightError) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
+
+
 def _load_cursor_overlay_js() -> str:
     path = f"{SKYVERN_DIR}/webeye/scraper/cursorOverlay.js"
     with open(path, encoding="utf-8") as f:
@@ -220,7 +226,12 @@ async def _current_viewpoint_screenshot_helper(
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> bytes:
     if page.is_closed():
-        raise FailedToTakeScreenshot(error_message="Page is closed")
+        LOG.info(
+            "Skipping screenshot because target is closed",
+            full_page=full_page,
+            mode=mode.value if hasattr(mode, "value") else str(mode),
+        )
+        raise ScreenshotTargetClosed(error_message="Page is closed")
 
     # Capture page context for debugging screenshot issues
     url = page.url
@@ -262,6 +273,15 @@ async def _current_viewpoint_screenshot_helper(
         )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
     except Exception as e:
+        if _is_screenshot_target_closed(e):
+            LOG.info(
+                "Skipping screenshot because target closed during capture",
+                url=url,
+                viewport=viewport_info,
+                full_page=full_page,
+                mode=mode.value if hasattr(mode, "value") else str(mode),
+            )
+            raise ScreenshotTargetClosed(error_message=str(e)) from e
         LOG.error(
             "Screenshot failed",
             url=url,
