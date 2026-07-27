@@ -3769,6 +3769,39 @@ async def _is_commit_required_combobox(skyvern_element: SkyvernElement) -> bool:
     return _attr_indicates_aria_invalid(aria_invalid)
 
 
+async def _retarget_wrapper_for_input_text(
+    dom: DomUtil,
+    skyvern_element: SkyvernElement,
+    action: actions.InputTextAction,
+) -> SkyvernElement | None:
+    # Normalize a secure card-entry wrapper (<div>/<iframe>) to its single unambiguous nested <input>
+    # so the pipeline below (including wait_until_enabled) runs against the real field. include_disabled
+    # keeps a transiently-disabled unique input as the target -- the downstream enabled-wait then waits on
+    # it. Sibling/decoy inputs make the helper bail, so card data can never land in a CVV or decoy field.
+    child_id = skyvern_element.find_deepest_interactable_descendant_in_single_chain(include_disabled=True)
+    if not child_id:
+        return None
+    child_element = await dom.safe_get_skyvern_element_by_id(child_id)
+    if child_element is None:
+        return None
+    if await child_element.has_hidden_attr():
+        return None
+    # This path can carry card data; has_hidden_attr only reads attributes, so a candidate that went
+    # CSS-hidden (display:none/visibility:hidden) between scrape and action would slip through. Fail
+    # closed on rendered visibility before committing the retarget.
+    if not await child_element.is_visible():
+        return None
+    if not await child_element.supports_text_input():
+        return None
+    LOG.info(
+        "Re-targeting input_text from wrapper to nested interactable input",
+        parent_id=skyvern_element.get_id(),
+        child_id=child_id,
+    )
+    action.element_id = child_id
+    return child_element
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -3829,6 +3862,24 @@ async def handle_input_text_action(
 
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+
+    # Normalize a wrapper target -- a visible <div>/<iframe> whose real editable <input> is nested one
+    # frame deeper (e.g. cross-origin card-entry widgets) -- to that input so the pipeline below runs
+    # against the real field. Selectable targets are left for the select-option conversion below.
+    # Fail-closed: sibling/decoy descendants make the single-chain helper bail, so card data can never
+    # land in a CVV or anti-autofill decoy field.
+    can_input_text = await skyvern_element.supports_text_input()
+    # Cache the wrapper's dynamic hidden state read for the retarget gate; the reject block below reuses it
+    # (the target is unchanged when no retarget occurs) instead of a second dynamic get_attribute round-trip.
+    target_hidden: bool | None = None
+    if not can_input_text:
+        target_hidden = await skyvern_element.has_hidden_attr()
+        if not target_hidden and not await skyvern_element.get_selectable():
+            retargeted_element = await _retarget_wrapper_for_input_text(dom, skyvern_element, action)
+            if retargeted_element is not None:
+                skyvern_element = retargeted_element
+                can_input_text = True
+
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(
         skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
@@ -3897,8 +3948,9 @@ async def handle_input_text_action(
         skyvern_element=skyvern_element,
         step=step,
     )
-    if not await skyvern_element.supports_text_input():
-        if await skyvern_element.has_hidden_attr():
+    if not can_input_text:
+        target_is_hidden = target_hidden if target_hidden is not None else await skyvern_element.has_hidden_attr()
+        if target_is_hidden:
             return [ActionFailure(InputToInvisibleElement(skyvern_element.get_id()), stop_execution_on_failure=False)]
 
         is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
@@ -4338,7 +4390,14 @@ async def handle_input_text_action(
                 if secret_failure is not None:
                     return [secret_failure]
             else:
-                await skyvern_element.input_sequentially(text=text)
+                contenteditable = await skyvern_element.get_attr("contenteditable", mode="static")
+                if contenteditable is not None and str(contenteditable).lower() != "false":
+                    # A contenteditable rich-text editor that auto-linkifies URLs corrupts a value entered
+                    # across the input_sequentially fill(prefix)+type(tail) seam, so fill it in one event (SKY-13014).
+                    await skyvern_element.refresh_locator_if_stale()
+                    await skyvern_element.input_fill(text)
+                else:
+                    await skyvern_element.input_sequentially(text=text)
                 if log_tel_fallback_readback:
                     await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
@@ -4947,7 +5006,9 @@ async def handle_select_option_action(
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
         await skyvern_element.scroll_into_view()
 
-        await skyvern_element.click(page=page, dom=dom, timeout=timeout)
+        await skyvern_element.click(
+            page=page, dom=dom, timeout=timeout, engine_selection=resolve_engine_selection_for_task(task)
+        )
         # The click opens the widget: mark it open now (not only on the incremental path below) so the
         # finally cleanup dismisses it on every exit — including an emerging-path optional miss that
         # returns ActionAbort before reaching the incremental branch.
@@ -5879,6 +5940,10 @@ async def chain_click(
     Clicks on an element identified by the css and its parent if failed.
     :param css: css of the element to click
     """
+    # Pin the run's selected engine before the first dispatch so every
+    # post-dispatch classification below uses one stable authority — a later
+    # browser-state removal/replacement must not drift it.
+    engine_selection = resolve_engine_selection_for_task(task)
     # Tracks the return value so the finally block can inspect click success.
     action_results: list[ActionResult] = []
     try:
@@ -5897,7 +5962,7 @@ async def chain_click(
         return action_results
 
     except Exception as e:
-        if is_post_dispatch_click_timeout(e):
+        if is_post_dispatch_click_timeout(e, engine_selection):
             LOG.info(
                 "Chain click: physical click dispatched; navigation-wait timed out — skipping fallback",
                 action=action,
@@ -5921,6 +5986,14 @@ async def chain_click(
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
+                if is_post_dispatch_click_timeout(e, engine_selection):
+                    LOG.info(
+                        "Chain click: for-label fallback dispatched; navigation-wait timed out — skipping fallback",
+                        action=action,
+                        locator=locator,
+                    )
+                    action_results.append(ActionSuccess())
+                    return action_results
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for", msg=str(e))))
 
             try:
@@ -5939,6 +6012,14 @@ async def chain_click(
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
+                if is_post_dispatch_click_timeout(e, engine_selection):
+                    LOG.info(
+                        "Chain click: label-children fallback dispatched; navigation-wait timed out — skipping fallback",
+                        action=action,
+                        locator=locator,
+                    )
+                    action_results.append(ActionSuccess())
+                    return action_results
                 action_results.append(
                     ActionFailure(FailToClick(action.element_id, anchor="direct_children", msg=str(e)))
                 )
@@ -5957,6 +6038,14 @@ async def chain_click(
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
+                if is_post_dispatch_click_timeout(e, engine_selection):
+                    LOG.info(
+                        "Chain click: attr-id label fallback dispatched; navigation-wait timed out — skipping fallback",
+                        action=action,
+                        locator=locator,
+                    )
+                    action_results.append(ActionSuccess())
+                    return action_results
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
 
             try:
@@ -5974,6 +6063,14 @@ async def chain_click(
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
+                if is_post_dispatch_click_timeout(e, engine_selection):
+                    LOG.info(
+                        "Chain click: direct-parent label fallback dispatched; navigation-wait timed out — skipping fallback",
+                        action=action,
+                        locator=locator,
+                    )
+                    action_results.append(ActionSuccess())
+                    return action_results
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="direct_parent", msg=str(e))))
 
         if not await skyvern_element.is_visible():
@@ -6148,6 +6245,14 @@ async def chain_click(
                 action_results.append(ActionSuccess())
                 return action_results
         except Exception as e:
+            if is_post_dispatch_click_timeout(e, engine_selection):
+                LOG.info(
+                    "Chain click: blocking-element fallback dispatched; navigation-wait timed out — skipping fallback",
+                    action=action,
+                    locator=locator,
+                )
+                action_results.append(ActionSuccess())
+                return action_results
             action_results.append(ActionFailure(FailToClick(action.element_id, anchor="blocking_element", msg=str(e))))
 
         # Only attempt JS click when the caller provided an observer to verify
@@ -6572,7 +6677,7 @@ async def choose_auto_completion_dropdown(
             static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
         )
         await selected_element.scroll_into_view()
-        await selected_element.click(page=page)
+        await selected_element.click(page=page, engine_selection=resolve_engine_selection_for_task(task))
         clear_input = False
         return result
 
@@ -7857,7 +7962,7 @@ async def _select_deterministic_custom_option(
         click_attempted = True
         if on_click_attempted is not None:
             on_click_attempted()
-        await selected_element.click(page=page)
+        await selected_element.click(page=page, engine_selection=resolve_engine_selection_for_task(task))
         verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
             readback_scope_element=readback_scope_element,
@@ -7892,7 +7997,9 @@ async def _select_deterministic_custom_option(
     if anchor_is_combobox_input:
         # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
         # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
-        reset_verified = await _reset_custom_select_combobox_input(readback_scope_element, page)
+        reset_verified = await _reset_custom_select_combobox_input(
+            readback_scope_element, page, engine_selection=resolve_engine_selection_for_task(task)
+        )
         if reset_verified:
             LOG.info(
                 "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
@@ -7931,13 +8038,17 @@ async def _select_deterministic_custom_option(
     return _terminal_custom_select_failure(target_value=target_value, matched_label=matched_label)
 
 
-async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> bool:
+async def _reset_custom_select_combobox_input(
+    element: SkyvernElement | None,
+    page: Page,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
     if element is None:
         return False
     try:
         locator = element.get_locator()
         await locator.fill("")
-        await element.click(page=page)
+        await element.click(page=page, engine_selection=engine_selection)
         return await get_input_value(element.get_tag_name(), locator) == ""
     except Exception:
         LOG.info(
@@ -8179,7 +8290,7 @@ async def select_from_emerging_elements(
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
     await selected_element.scroll_into_view()
-    await selected_element.click(page=page)
+    await selected_element.click(page=page, engine_selection=resolve_engine_selection_for_task(task))
     return ActionSuccess()
 
 
@@ -8398,7 +8509,9 @@ async def select_from_dropdown(
             return single_select_result
 
         await selected_element.scroll_into_view()
-        await selected_element.click(page=page, timeout=timeout)
+        await selected_element.click(
+            page=page, timeout=timeout, engine_selection=resolve_engine_selection_for_task(task)
+        )
         single_select_result.action_result = ActionSuccess()
         return single_select_result
     except (MissingElement, MissingElementDict, MissingElementInCSSMap, MultipleElementsFound):
