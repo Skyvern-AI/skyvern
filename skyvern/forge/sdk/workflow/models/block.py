@@ -44,7 +44,7 @@ from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
@@ -458,6 +458,11 @@ class Block(BaseModel, abc.ABC):
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
 
+    # Set by record_output_parameter_value within a single execute_safe call; lets the
+    # failure handler tell a value recorded during THIS execution apart from a stale
+    # value left by a prior for-loop iteration.
+    _output_recorded_this_execution: bool = PrivateAttr(default=False)
+
     @property
     def override_llm_key(self) -> str | None:
         return self.override_llm_key_for_organization(None)
@@ -490,6 +495,7 @@ class Block(BaseModel, abc.ABC):
             parameter=self.output_parameter,
             value=value,
         )
+        self._output_recorded_this_execution = True
         await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
@@ -939,6 +945,24 @@ class Block(BaseModel, abc.ABC):
         """Return block-level error codes for unexpected failures. Override in subclasses."""
         return []
 
+    async def _invalidate_stale_output_on_failure(
+        self,
+        workflow_run_id: str,
+        current_index: int | None,
+        *,
+        include_missing_value_guard: bool,
+    ) -> None:
+        # On a failed execution, invalidate this block's output to None so a prior for-loop
+        # iteration's value can't leak into the failed iteration's downstream blocks; a value
+        # already recorded this execution is preserved and non-loop behavior is unchanged.
+        if self._output_recorded_this_execution:
+            return
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if current_index is not None or (
+            include_missing_value_guard and not workflow_run_context.has_value(self.output_parameter.key)
+        ):
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+
     @traced(name="skyvern.block.execute", role="wrapper")
     async def execute_safe(
         self,
@@ -954,6 +978,7 @@ class Block(BaseModel, abc.ABC):
         # have wildly different latency profiles. Set early so it's present even if
         # execute_safe raises before any child work.
         otel_trace.get_current_span().set_attribute("block_type", self.block_type.value)
+        self._output_recorded_this_execution = False
         workflow_run_block_id = None
         engine: RunEngine | None = None
         try:
@@ -1016,13 +1041,21 @@ class Block(BaseModel, abc.ABC):
                 block_label=self.label,
                 block_type=self.block_type,
             )
-            return await self.execute(
+            result = await self.execute(
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 **kwargs,
             )
+            # Blocks that report failure by returning an unsuccessful BlockResult never reach the
+            # except branch, and build_block_result does not touch WorkflowRunContext, so invalidate
+            # stale loop output here too.
+            if not result.success:
+                await self._invalidate_stale_output_on_failure(
+                    workflow_run_id, current_index, include_missing_value_guard=False
+                )
+            return result
         except Exception as e:
             LOG.exception(
                 "Block execution failed",
@@ -1030,10 +1063,9 @@ class Block(BaseModel, abc.ABC):
                 block_label=self.label,
                 block_type=self.block_type,
             )
-            # Record output parameter value if it hasn't been recorded yet
-            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-            if not workflow_run_context.has_value(self.output_parameter.key):
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
+            await self._invalidate_stale_output_on_failure(
+                workflow_run_id, current_index, include_missing_value_guard=True
+            )
 
             failure_reason = get_user_facing_exception_message(e)
 
