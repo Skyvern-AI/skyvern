@@ -3,7 +3,10 @@
 import pytest
 
 from skyvern.forge.sdk.artifact.manager import ArtifactBatchData, BulkArtifactCreationRequest
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.test_helpers import create_fake_for_ai_suggestion, create_fake_step
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.models import ArtifactModel
 
 
@@ -113,6 +116,91 @@ def test_bulk_artifact_creation_performance_benefit():
     # The reduction ratio
     reduction_ratio = individual_insert_count / bulk_insert_count
     assert reduction_ratio == num_artifacts
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_artifact_masks_workflow_and_runtime_secrets(monkeypatch):
+    class FakeWorkflowRunContext:
+        def mask_secrets_in_data(self, data: str, mask: str = "*****") -> str:
+            return data.replace("workflow-secret", mask)
+
+    class FakeWorkflowContextManager:
+        def get_workflow_run_context(self, workflow_run_id: str) -> FakeWorkflowRunContext:
+            assert workflow_run_id == "workflow-run-1"
+            return FakeWorkflowRunContext()
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.WORKFLOW_CONTEXT_MANAGER",
+        FakeWorkflowContextManager(),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE.build_ai_suggestion_uri",
+        lambda **kwargs: "s3://bucket/prompt",
+    )
+
+    context = skyvern_context.SkyvernContext(
+        workflow_run_id="workflow-run-1",
+        sensitive_values={"123456", "totp-secret"},
+    )
+
+    with skyvern_context.scoped(context):
+        request = await ArtifactManager().prepare_llm_artifact(
+            data=b"prompt has workflow-secret plus 123456 and totp-secret",
+            artifact_type=ArtifactType.LLM_PROMPT,
+            ai_suggestion=create_fake_for_ai_suggestion("suggestion-1"),
+        )
+
+    assert request is not None
+    prompt_artifact = request.artifacts[0]
+    assert prompt_artifact.artifact_model.artifact_type == ArtifactType.LLM_PROMPT
+    assert prompt_artifact.data == b"prompt has ***** plus ***** and *****"
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_artifact_redacts_prompt_when_secret_masking_fails(monkeypatch):
+    class BrokenWorkflowContextManager:
+        def get_workflow_run_context(self, workflow_run_id: str) -> None:
+            raise RuntimeError("masking unavailable")
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.WORKFLOW_CONTEXT_MANAGER",
+        BrokenWorkflowContextManager(),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE.build_ai_suggestion_uri",
+        lambda **kwargs: "s3://bucket/prompt",
+    )
+
+    context = skyvern_context.SkyvernContext(workflow_run_id="workflow-run-1")
+
+    with skyvern_context.scoped(context):
+        request = await ArtifactManager().prepare_llm_artifact(
+            data=b"prompt has raw-secret",
+            artifact_type=ArtifactType.LLM_PROMPT,
+            ai_suggestion=create_fake_for_ai_suggestion("suggestion-1"),
+        )
+
+    assert request is not None
+    assert request.artifacts[0].data == b"[LLM prompt artifact redacted: secret masking failed]"
+
+
+def test_add_to_step_archive_masks_bundled_llm_prompt_runtime_secrets(monkeypatch):
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE.build_step_uri",
+        lambda **kwargs: "s3://bucket/step-archive.zip",
+    )
+
+    manager = ArtifactManager()
+    context = skyvern_context.SkyvernContext(sensitive_values={"runtime-secret"})
+
+    with skyvern_context.scoped(context):
+        manager.accumulate_llm_call_to_archive(
+            step=create_fake_step("step-1"),
+            prompt=b"prompt has runtime-secret",
+        )
+
+    archive = manager._step_archives["step-1"]
+    assert archive.entries["llm_prompt_0.txt"] == b"prompt has *****"
 
 
 if __name__ == "__main__":
