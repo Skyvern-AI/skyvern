@@ -10,7 +10,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import urlsplit
 
@@ -95,16 +95,6 @@ class ProtectedReferenceKind(StrEnum):
     FILE = "file"
 
 
-class TargetKind(StrEnum):
-    """Where a destination fact came from: a DOM anchor, an effective form owner, an explicit page
-    URL on the action model, or an open tab selected by index."""
-
-    ANCHOR = "anchor"
-    FORM = "form"
-    PAGE = "page"
-    TAB = "tab"
-
-
 class PolicyOutcome(StrEnum):
     NOT_ENROLLED = "not_enrolled"
     ALLOWED = "allowed"
@@ -117,8 +107,6 @@ class PolicyReason(StrEnum):
     UNKNOWN_ACTION = "unknown_action"
     ACTION_MODEL_MISMATCH = "action_model_mismatch"
     UNRESOLVABLE_TARGET = "unresolvable_target"
-    INCOMPLETE_DESTINATION = "incomplete_destination"
-    ELEMENT_HASH_MISMATCH = "element_hash_mismatch"
     MISSING_PAGE_EVIDENCE = "missing_page_evidence"
     STALE_PAGE_EVIDENCE = "stale_page_evidence"
     MISSING_PROTECTED_REFERENCE = "missing_protected_reference"
@@ -143,8 +131,6 @@ REASON_PRECEDENCE: tuple[PolicyReason, ...] = (
     PolicyReason.UNKNOWN_ACTION,
     PolicyReason.ACTION_MODEL_MISMATCH,
     PolicyReason.UNRESOLVABLE_TARGET,
-    PolicyReason.INCOMPLETE_DESTINATION,
-    PolicyReason.ELEMENT_HASH_MISMATCH,
     PolicyReason.MISSING_PAGE_EVIDENCE,
     PolicyReason.STALE_PAGE_EVIDENCE,
     PolicyReason.MISSING_PROTECTED_REFERENCE,
@@ -266,49 +252,9 @@ class ProtectedReference:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedTarget:
-    """One typed destination an action would reach. ``url`` is a resolved absolute URL; whether its
-    origin is usable is the decision core's question, not this record's."""
-
-    kind: TargetKind
-    url: str
-    method: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ElementDestination:
-    """Scrape-time destination facts for one element: STALE, UNTRUSTED PREFLIGHT INPUT (SKY-12875).
-
-    Captured from the page's own DOM by the scraper, so a hostile page controls every field. The
-    decision core treats it as evidence about where an action would go — it can DENY on a bad
-    origin or fail an identity check, and it can never complete a target or satisfy the evidence,
-    verdict or authority gates. ``url=None`` means the element bears destination-carrying
-    structure that did not resolve; a missing record means it bears none. Both are INCOMPLETE,
-    never implicitly safe — and so is a fully resolved fact, because a page-supplied URL is not
-    necessarily where the browser goes.
-    """
-
-    kind: TargetKind
-    url: str | None
-    method: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ObservedElement:
-    """What the accepted observation recorded for one element id: its content hash and, when the
-    element bears any, its destination facts."""
-
-    element_hash: str
-    destination: ElementDestination | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class ActionTarget:
-    #: ``complete=False`` is the default for every mutating projection: an unhydrated mutating
-    #: action reads as unknown-destination, so forgetting to hydrate fails closed rather than open.
-    resolved: tuple[ResolvedTarget, ...] = ()
+    urls: tuple[str, ...] = ()
     resolvable: bool = True
-    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,35 +431,17 @@ def _required_references(action: Action, action_type: ActionType) -> frozenset[P
     return frozenset()
 
 
-def _page_target(url: str) -> tuple[ResolvedTarget, ...]:
-    return (ResolvedTarget(kind=TargetKind.PAGE, url=url),)
-
-
 def _target(action: Action, action_type: ActionType) -> ActionTarget:
     if _ACTION_CLASSES.get(action_type) is ActionClass.UNRESOLVABLE:
-        return ActionTarget(resolvable=False, complete=False)
+        return ActionTarget(resolvable=False)
     if isinstance(action, (GotoUrlAction, NewTabAction)):
-        return ActionTarget(resolved=_page_target(action.url))
-    if isinstance(action, DownloadFileAction):
-        if action.download_url:
-            return ActionTarget(resolved=_page_target(action.download_url))
-        # A byte-carrying download names no destination, and opaque is never implicitly safe.
-        # Confining where the bytes land remains the sink's job; classifying the unknown is ours.
-        return ActionTarget(complete=False)
-    if action_type is ActionType.GO_FORWARD:
-        # The history destination is unknowable before execution.
-        return ActionTarget(complete=False)
-    action_class = _ACTION_CLASSES.get(action_type)
-    if action_class is ActionClass.MUTATING:
-        # Every mutating action starts unknown-destination and an element-targeted one STAYS that
-        # way: scrape-time facts attach as deniable targets but never complete (see
-        # hydrate_destination), so completion waits on execution-time re-verification in the
-        # SKY-12881+ sinks. Element-less ones (KEYPRESS can submit a form, SOLVE_CAPTCHA and
-        # VERIFICATION_CODE type into unseen elements) never complete either.
-        resolved: tuple[ResolvedTarget, ...] = ()
-        if isinstance(action, (ClickAction, UploadFileAction)) and action.file_url:
-            resolved = _page_target(action.file_url)
-        return ActionTarget(resolved=resolved, complete=False)
+        return ActionTarget(urls=(action.url,))
+    if isinstance(action, DownloadFileAction) and action.download_url:
+        return ActionTarget(urls=(action.download_url,))
+    # A download carrying bytes rather than a URL has no destination to check here; confining where
+    # it lands is the sink's job, so an EGRESS action is not always target-checked.
+    if isinstance(action, (ClickAction, UploadFileAction)) and action.file_url:
+        return ActionTarget(urls=(action.file_url,))
     return ActionTarget()
 
 
@@ -529,7 +457,7 @@ def project_action(action: Action) -> ActionProjection:
         return ActionProjection(
             action_type=None,
             action_class=None,
-            target=ActionTarget(resolvable=False, complete=False),
+            target=ActionTarget(resolvable=False),
             defects=(PolicyReason.UNKNOWN_ACTION,),
         )
 
@@ -541,7 +469,7 @@ def project_action(action: Action) -> ActionProjection:
         return ActionProjection(
             action_type=action_type,
             action_class=None,
-            target=ActionTarget(resolvable=False, complete=False),
+            target=ActionTarget(resolvable=False),
             defects=(PolicyReason.UNKNOWN_ACTION,),
         )
 
@@ -551,7 +479,7 @@ def project_action(action: Action) -> ActionProjection:
         return ActionProjection(
             action_type=action_type,
             action_class=None,
-            target=ActionTarget(resolvable=False, complete=False),
+            target=ActionTarget(resolvable=False),
             defects=(PolicyReason.ACTION_MODEL_MISMATCH,),
         )
 
@@ -560,74 +488,6 @@ def project_action(action: Action) -> ActionProjection:
         action_class=action_class,
         target=_target(action, action_type),
         required_references=_required_references(action, action_type),
-    )
-
-
-def hydrate_destination(
-    projection: ActionProjection,
-    *,
-    claimed_element_hash: str | None,
-    observed: ObservedElement | None,
-) -> ActionProjection:
-    """Attach scrape-time destination facts for the action's element to its projection.
-
-    *** A MAIN-WORLD-SOURCED FACT NEVER ESTABLISHES COMPLETENESS. *** Completeness means the
-    destination is KNOWN, not that it is safe. A model-declared URL on the action itself (a PAGE
-    target) is the exact string the sink will use — genuinely known, and the origin check does the
-    safety work on it; that holds even for an attacker-influenced model URL under prompt
-    injection, because it is still exactly where the action goes. A page-supplied anchor or form
-    fact is NOT necessarily where the browser goes at all: the page can hide ``ping`` from a
-    patched main-world ``getAttribute`` or preventDefault and navigate programmatically. So facts
-    captured from page content (ANCHOR/FORM kinds — the kind IS the source taxonomy) may attach
-    as targets — they still DENY on a bad origin, still narrow, still feed sink evidence — but
-    the projection stays destination-INCOMPLETE, and no mutating element action reaches ALLOWED
-    until an enforcement sink (SKY-12881+) re-verifies the destination at execution time.
-
-    Otherwise pure and fail-closed in every direction: a defective projection is returned
-    untouched; an unobserved element or an opaque destination changes nothing; a claimed element
-    hash contradicting the observation adds ELEMENT_HASH_MISMATCH and discards the facts, because
-    they describe an element the action was not planned against.
-    """
-    if projection.defects or projection.action_class is None:
-        return projection
-    if observed is None:
-        return projection
-    if claimed_element_hash is not None and claimed_element_hash != observed.element_hash:
-        return replace(
-            projection,
-            target=replace(projection.target, resolved=(), complete=False),
-            defects=projection.defects + (PolicyReason.ELEMENT_HASH_MISMATCH,),
-        )
-    destination = observed.destination
-    if destination is None or destination.url is None:
-        return projection
-    resolved = projection.target.resolved + (
-        ResolvedTarget(kind=destination.kind, url=destination.url, method=destination.method),
-    )
-    return replace(projection, target=replace(projection.target, resolved=resolved))
-
-
-def with_resolved_target(projection: ActionProjection, target: ResolvedTarget | None) -> ActionProjection:
-    """The projection with one runtime-resolved target attached, or marked incomplete when the
-    caller could not resolve one. Used for tab selection, where the destination comes from the
-    recorded open-tabs list rather than from element facts.
-
-    KNOWN FALSE-COMPLETENESS (SKY-12875 F5), accepted rather than fixed: the tab record is a
-    PROMPT-TIME SNAPSHOT. A tab opened, closed or navigated between the prompt and execution can
-    leave the recorded URL naming something the live list no longer has at that index, so
-    ``complete=True`` here means "a record spoke for this index", not "this is where the browser
-    will go". Benign today — SWITCH_TAB is ungated recovery and the next step re-scrapes — and
-    covered by the sink-side re-verification obligation on SKY-12881+. Do not read a TAB target as
-    execution truth, and do not extend this helper to gated actions without closing that gap."""
-    if projection.defects or projection.action_class is None:
-        # Same guard as hydrate_destination: the field the lookup was keyed on came from a model
-        # whose layout the core refused to trust, so no target may attach and nothing completes.
-        return projection
-    if target is None:
-        return replace(projection, target=replace(projection.target, complete=False))
-    return replace(
-        projection,
-        target=replace(projection.target, resolved=projection.target.resolved + (target,), complete=True),
     )
 
 
@@ -694,10 +554,6 @@ def decide_browser_action(request: BrowserActionRequest) -> PolicyDecision:
         elif verdict is ObservationVerdict.UNKNOWN:
             reasons.add(PolicyReason.UNVERIFIED_OBSERVATION)
     if action_class not in _ORIGIN_UNGATED_CLASSES:
-        if not projection.target.complete:
-            # SKY-12875: a destination-opaque action is INCOMPLETE, never implicitly safe. Reported
-            # under every authority state — completeness is knowable regardless of authority.
-            reasons.add(PolicyReason.INCOMPLETE_DESTINATION)
         authority = request.authority
         authority_reason = _AUTHORITY_REASONS.get(authority.state)
         if authority.state is not AuthorityState.ESTABLISHED:
@@ -708,8 +564,8 @@ def decide_browser_action(request: BrowserActionRequest) -> PolicyDecision:
             reachable = policy.allowed_origins & authority.origins
             if page_origin is not None and page_origin not in reachable:
                 reasons.add(PolicyReason.PAGE_ORIGIN_NOT_AUTHORIZED)
-            for target in projection.target.resolved:
-                target_origin = canonicalize_origin(target.url)
+            for url in projection.target.urls:
+                target_origin = canonicalize_origin(url)
                 if target_origin is None:
                     reasons.add(PolicyReason.MISSING_TARGET_ORIGIN)
                 elif target_origin not in reachable:

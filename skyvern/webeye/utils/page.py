@@ -20,7 +20,6 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, SkyvernPageAnalysisTimeout
-from skyvern.forge.sdk.browser_action_preflight import policy_observation_enabled, record_observed_tabs
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
@@ -52,9 +51,6 @@ async def build_open_tabs_context(
     if working_page is None:
         return None
     pages = await browser_state.list_valid_pages()
-    # Recorded before the single-tab early return: a SWITCH_TAB judged against a stale record from
-    # an earlier multi-tab prompt is exactly the mismatch the record exists to surface.
-    record_observed_tabs([p.url for p in pages])
     if len(pages) <= 1:
         return None
     # Fetch titles concurrently so a few slow tabs don't add N×timeout latency to every iteration.
@@ -87,37 +83,9 @@ def _wrap_js_in_isolated_scope(script: str) -> str:
     # lexical binding with the same name. Scope the script in an IIFE and export via
     # property writes, which never collide; typeof guards drop names the column-0 regex
     # matched inside block comments.
-    # Export via defineProperty, never a bare assignment. A page that installs a setter on one of
-    # these globals BEFORE injection has `globalThis.x = x` hand it our genuine function
-    # synchronously, letting it serve a wrapper from a getter and drive our own builder with
-    # arguments we never passed (SKY-12875 M2: forcing destination capture on in disabled mode).
-    # defineProperty redefines the slot instead of invoking a setter.
     names = sorted(set(_JS_TOP_LEVEL_DECL_RE.findall(script)))
-    exporter = """
-const __skyvernExport = (name, value) => {
-  const existing = Object.getOwnPropertyDescriptor(globalThis, name);
-  if (existing && !existing.configurable) {
-    // A page's own top-level `var element = ...` makes a non-configurable WRITABLE data property,
-    // and several exported names are ordinary words — so this case is ordinary pages, not attack,
-    // and a plain write is correct there (a data property has no setter to invoke). A locked
-    // ACCESSOR is the interposition this export exists to refuse, and a locked read-only slot
-    // would silently leave the page's value in place; both fail loudly instead.
-    if (existing.get || existing.set || !existing.writable) {
-      throw new Error("skyvern: refusing to export over locked global " + name);
-    }
-    globalThis[name] = value;
-    return;
-  }
-  Object.defineProperty(globalThis, name, {
-    value,
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
-};
-"""
-    exports = "\n".join(f'if (typeof {name} !== "undefined") __skyvernExport("{name}", {name});' for name in names)
-    return f"(() => {{\n{script}\n{exporter}\n{exports}\n}})();"
+    exports = "\n".join(f'if (typeof {name} !== "undefined") globalThis.{name} = {name};' for name in names)
+    return f"(() => {{\n{script}\n{exports}\n}})();"
 
 
 def load_js_script() -> str:
@@ -550,54 +518,6 @@ def _all_page_frames(page: Page) -> list[Frame]:
     return frames
 
 
-def pop_destination_facts(nodes: object) -> dict[str, dict]:
-    """Strip SKY-12875 destination facts out of scraper payloads, in place, at the JS->Python
-    boundary. Every downstream consumer — element hashes and cached-action matching, persisted
-    skyvern_element_data (DB rows and the public SDK Action type), the element-tree artifact,
-    prompt building, incremental dropdown dedup — then sees dicts byte-identical to a build that
-    never captured facts.
-
-    Only a MAPPING-valued ``destination`` is ours. ``<div destination="shipping">`` is ordinary
-    markup on ordinary sites, and every attribute is collected verbatim into ``attributes``, so a
-    key-name-only match deleted page content — changing hashes, cached matching, prompts and
-    persisted rows on pages that have nothing to do with this feature, and in disabled mode it
-    also let the page seed the sidecar with an arbitrary id. DOM attribute values are always
-    strings, so the page cannot forge the mapping shape through that channel; our facts are always
-    mappings.
-
-    The walk is DEEP: every nested dict and list at any depth is visited, because a hostile
-    wrapper around the page-global builder can relocate a fact into a nested position (an
-    attribute value, a grandchild) where a children-only walk would miss it. A wrapper that
-    RENAMES the key is fabricating arbitrary payload content, which was possible before facts
-    existed and is out of this strip's scope. The strip itself stays unconditional in both policy
-    modes — it is protection against wrapper INJECTION, not capture cost — while capture is
-    flag-gated so disabled mode does no fact work. The sidecar is keyed by element id and is
-    consumed only by the observation epoch; the payload is page-controlled, so any shape is
-    tolerated and cycles (reconstructable via Playwright's ref protocol) terminate via the
-    seen-set instead of hanging the worker.
-    """
-    facts: dict[str, dict] = {}
-    stack = list(nodes) if isinstance(nodes, list) else []
-    seen: set[int] = set()
-    while stack:
-        node = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        if isinstance(node, list):
-            stack.extend(node)
-            continue
-        if not isinstance(node, dict):
-            continue
-        if isinstance(node.get("destination"), dict):
-            destination = node.pop("destination")
-            element_id = node.get("id")
-            if isinstance(element_id, str) and element_id:
-                facts[element_id] = destination
-        stack.extend(node.values())
-    return facts
-
-
 class SkyvernFrame:
     @staticmethod
     async def evaluate(
@@ -1017,9 +937,7 @@ class SkyvernFrame:
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> dict:
         js_script = "async ([frame, element, interactable]) => await buildElementObject(frame, element, interactable)"
-        parsed = await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
-        pop_destination_facts([parsed])
-        return parsed
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
 
     async def get_element_scrollable(self, element: ElementHandle) -> bool:
         js_script = "(element) => isScrollable(element)"
@@ -1195,25 +1113,16 @@ class SkyvernFrame:
         frame_index: int,
         must_included_tags: list[str] | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
-    ) -> tuple[list[dict], list[dict], dict[str, dict]]:
+    ) -> tuple[list[dict], list[dict]]:
         must_included_tags = must_included_tags or []
         await self._set_enriched_element_tree_flag()
-        # Capture is flag-gated so a disabled-mode build does no destination-fact work on any page
-        # that has not interposed on the builder global; a page that has can still force the flag,
-        # and the per-build budget in domUtils is what bounds that. The strip below stays
-        # unconditional: it is protection against a hostile wrapper injecting the key, not capture
-        # cost.
-        capture_destination_facts = policy_observation_enabled()
-        js_script = "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)"
-        elements, element_tree = await self.evaluate(
+        js_script = "async ([frame_name, frame_index, must_included_tags]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags)"
+        return await self.evaluate(
             frame=self.frame,
             expression=js_script,
             timeout_ms=timeout_ms,
-            arg=[frame_name, frame_index, must_included_tags, capture_destination_facts],
+            arg=[frame_name, frame_index, must_included_tags],
         )
-        destinations = pop_destination_facts(elements)
-        destinations.update(pop_destination_facts(element_tree))
-        return elements, element_tree, destinations
 
     @traced(name="skyvern.browser.incremental_element_tree")
     async def get_incremental_element_tree(
@@ -1223,12 +1132,9 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
-        elements, element_tree = await self.evaluate(
+        return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
-        pop_destination_facts(elements)
-        pop_destination_facts(element_tree)
-        return elements, element_tree
 
     @traced(name="skyvern.browser.element_tree_from_element")
     async def build_tree_from_element(
@@ -1240,12 +1146,9 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
         js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
-        elements, element_tree = await self.evaluate(
+        return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
-        pop_destination_facts(elements)
-        pop_destination_facts(element_tree)
-        return elements, element_tree
 
     @traced(name="skyvern.browser.wait_for_animation")
     async def safe_wait_for_animation_end(
