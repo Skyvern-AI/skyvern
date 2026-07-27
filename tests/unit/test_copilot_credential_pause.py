@@ -35,6 +35,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -1029,7 +1030,7 @@ def test_elapsed_run_seconds_subtracts_pause_time() -> None:
 
 @pytest.mark.asyncio
 async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: a slow pause would consume the (tiny) real timeout budget."""
+    """A pause longer than the work budget is excluded when the loop resumes."""
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.15)
 
     ctx = make_copilot_context()
@@ -1042,13 +1043,18 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
 
     cache = _FakeCache()
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.2)
 
-    async def _populate_after_first_poll() -> None:
-        await asyncio.sleep(0.25)
-        cache.store[credential_response_cache_key("org-1", "chat-1", "turn-credit")] = encode_credential_response(
-            "skip", None
-        )
+    monotonic_seconds = 100.0
+    fake_time = SimpleNamespace(monotonic=lambda: monotonic_seconds)
+    monkeypatch.setattr(enforcement_module, "time", fake_time)
+    monkeypatch.setattr(credential_pause_module, "time", fake_time)
+
+    async def _resolve_after_pause(*args: Any, **kwargs: Any) -> CredentialPauseResolution:
+        nonlocal monotonic_seconds
+        monotonic_seconds += 0.25
+        return CredentialPauseResolution(action="skip")
+
+    monkeypatch.setattr(credential_pause_module, "_wait_for_credential_response", _resolve_after_pause)
 
     stream = _make_stream()
     fake_result = _fake_result()
@@ -1066,20 +1072,17 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
 
     config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
 
-    populate_task = asyncio.ensure_future(_populate_after_first_poll())
-    try:
-        returned = await run_with_enforcement(
-            agent=MagicMock(),
-            initial_input="hello",
-            ctx=ctx,
-            stream=stream,
-            run_config=RunConfig(),
-            copilot_config=config,
-        )
-    finally:
-        await populate_task
+    returned = await run_with_enforcement(
+        agent=MagicMock(),
+        initial_input="hello",
+        ctx=ctx,
+        stream=stream,
+        run_config=RunConfig(),
+        copilot_config=config,
+    )
 
     assert returned is fake_result
+    assert ctx.copilot_credential_pause_seconds == 0.25
     assert len(calls) == 2, "pause time must be credited so the resumed iteration isn't timed out"
     assert ctx.copilot_total_timeout_exceeded is False
 
