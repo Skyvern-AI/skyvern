@@ -431,11 +431,11 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
 
 # FileReader keeps the payload binary-safe without arrayBuffer/Uint8Array
 # transcoding back across CDP.
-_BLOB_FETCH_JS = """
+_SAME_ORIGIN_FETCH_JS = """
 async (args) => {
     try {
-        const { blobUrl, maxSizeBytes } = args;
-        const response = await fetch(blobUrl);
+        const { url, maxSizeBytes } = args;
+        const response = await fetch(url);
         if (!response.ok) {
             return { ok: false, status: response.status };
         }
@@ -486,8 +486,8 @@ def _frame_origin(frame_url: str | None) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
-    """Return frames whose origin matches the blob's origin, main frame first."""
+def _frames_for_origin(page: Page, origin: str) -> list[Frame]:
+    """Return frames whose origin matches the given origin, main frame first."""
     seen: set[int] = set()
     matches: list[Frame] = []
     candidates: list[Frame] = [page.main_frame, *page.frames]
@@ -500,9 +500,14 @@ def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
             frame_url = frame.url
         except Exception:
             continue
-        if _frame_origin(frame_url) == blob_origin:
+        if _frame_origin(frame_url) == origin:
             matches.append(frame)
     return matches
+
+
+def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
+    """Return frames whose origin matches the blob's origin, main frame first."""
+    return _frames_for_origin(page, blob_origin)
 
 
 def _all_page_frames(page: Page) -> list[Frame]:
@@ -697,7 +702,7 @@ class SkyvernFrame:
             return None
 
         # blob.size is checked in-page against this before the payload is serialized.
-        blob_arg = {"blobUrl": blob_url, "maxSizeBytes": max_size_bytes}
+        blob_arg = {"url": blob_url, "maxSizeBytes": max_size_bytes}
         main_frame = page.main_frame
         for frame in frames:
             try:
@@ -705,9 +710,9 @@ class SkyvernFrame:
                 # context-level main-world prefix stays attached; sub-frames use
                 # frame.evaluate (main-world prefixes are page-scoped).
                 if frame is main_frame:
-                    result = await evaluate_in_main_world(page, _BLOB_FETCH_JS, blob_arg)
+                    result = await evaluate_in_main_world(page, _SAME_ORIGIN_FETCH_JS, blob_arg)
                 else:
-                    result = await frame.evaluate(_BLOB_FETCH_JS, blob_arg)
+                    result = await frame.evaluate(_SAME_ORIGIN_FETCH_JS, blob_arg)
             except Exception:
                 retry_log(
                     "blob URL in-frame fetch raised; trying next frame if any",
@@ -751,6 +756,72 @@ class SkyvernFrame:
             "blob URL read could not retrieve bytes from any matching frame",
             workflow_run_id=workflow_run_id,
         )
+        return None
+
+    @staticmethod
+    async def read_http_url_bytes(
+        page: Page,
+        url: str,
+        workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    ) -> bytes | None:
+        """Fetch an http(s) URL's bytes via an in-page fetch() inside a same-origin frame.
+
+        Recovers a resource whose inline iframe render was refused by a frame-embedding policy
+        while its bytes stay retrievable same-origin (session cookies + connect-src apply to a
+        same-origin fetch). Returns None for non-http(s) URLs, when no same-origin frame exists,
+        or when every candidate frame's fetch fails.
+
+        ``timeout_ms`` is the per-fetch evaluate timeout (default matches SkyvernFrame.evaluate);
+        a caller with a larger whole-operation budget can widen it so a slow-but-alive server
+        isn't rejected by the generic action timeout.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+        frames = _frames_for_origin(page, f"{parsed.scheme}://{parsed.netloc}")
+        if not frames:
+            LOG.debug("same-origin URL read found no matching frame", workflow_run_id=workflow_run_id)
+            return None
+
+        # _SAME_ORIGIN_FETCH_JS is a plain fetch(); reused here for http(s) recovery.
+        fetch_arg = {"url": url, "maxSizeBytes": max_size_bytes}
+        main_frame = page.main_frame
+        for frame in frames:
+            # Route the main frame through the Page so SkyvernFrame.evaluate can attach any
+            # context-level main-world prefix; sub-frames evaluate in-frame (prefixes are
+            # page-scoped). SkyvernFrame.evaluate centralizes the main-world dispatch, timeout,
+            # and navigation-context recovery.
+            target: Page | Frame = page if frame is main_frame else frame
+            try:
+                result = await SkyvernFrame.evaluate(
+                    frame=target, expression=_SAME_ORIGIN_FETCH_JS, arg=fetch_arg, timeout_ms=timeout_ms
+                )
+            except Exception:
+                LOG.debug(
+                    "same-origin URL in-frame fetch raised; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(result, dict) and result.get("error") == "too_large":
+                LOG.warning(
+                    "same-origin URL exceeds max size; not reading",
+                    workflow_run_id=workflow_run_id,
+                    size=result.get("size"),
+                    max_size_bytes=max_size_bytes,
+                )
+                return None
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+            b64_payload = result.get("base64")
+            if not isinstance(b64_payload, str):
+                continue
+            try:
+                return base64.b64decode(b64_payload, validate=True)
+            except Exception:
+                continue
         return None
 
     # -- cursor overlay helpers ------------------------------------------------
