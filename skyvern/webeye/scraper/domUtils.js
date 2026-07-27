@@ -1738,6 +1738,144 @@ function enrichValidationState(attrs, element, elementTagNameLower) {
   }
 }
 
+// Destination-fact capture state (SKY-12875): OFF by default, switched on per build by
+// buildTreeFromBody only when the browser action policy is observing. Incremental builds,
+// single-element parses and tree-from-element never enable it.
+var __captureDestinationFacts = false;
+var __destinationFactBudget = 0;
+
+// Serialized overhead of one attached fact ({"kind":...,"url":null,"method":"get"} plus its
+// element-id key). Charging only url.length let 15,000 url-less facts through for 615,000 bytes:
+// an opaque fact is cheap, not free, and the budget bounds the PAYLOAD, not one field of it.
+const DESTINATION_FACT_OVERHEAD = 56;
+
+// Charge one fact against the per-build budget, or return null to attach nothing. Exhaustion
+// zeroes the budget, which is what stops all further capture WORK in buildElementObject —
+// resolution runs before the per-URL cap, so bounding only the output leaves the cost unbounded.
+function chargeDestinationBudget(facts) {
+  if (!facts) return null;
+  const cost =
+    DESTINATION_FACT_OVERHEAD +
+    (typeof facts.url === "string" ? facts.url.length : 0);
+  if (__destinationFactBudget < cost) {
+    __destinationFactBudget = 0;
+    return null;
+  }
+  __destinationFactBudget -= cost;
+  return facts;
+}
+
+function normalizeFormMethod(raw) {
+  if (typeof raw !== "string") return "get";
+  const method = raw.toLowerCase();
+  return method === "post" || method === "dialog" ? method : "get";
+}
+
+// Destination facts for the browser action firewall (SKY-12875): where would interacting with
+// this element send data? The page controls every attribute read here, so the output is UNTRUSTED
+// PREFLIGHT INPUT — Python strips it out of the element dicts at the SkyvernFrame boundary and
+// the policy layer treats it as evidence, never authorization. Fail closed on anything malformed,
+// clobbered, or throwing: null means "no destination structure", url:null means "structure that
+// did not resolve"; both classify as INCOMPLETE downstream.
+function buildDestinationFacts(element, tagNameLower) {
+  // TEMPORARY production mitigation for the SKY-12875 amplification defect: a hostile page can
+  // expand a compact attribute into a much larger resolved URL, duplicated per element, and this
+  // capture runs unconditionally in every policy mode. Short-circuit before any URL resolution.
+  // Superseded by PR #13991, which re-enables capture with correct gating and budgeting.
+  return null;
+  try {
+    const doc = element.ownerDocument;
+    // Length caps bound the RESOLVED value, not just the raw attribute: 4096 compact raw chars
+    // resolve to ~9x that once percent-encoded, and the fact is duplicated into every owned
+    // control — an O(controls x resolved-length) amplification. Over-cap degrades to opaque.
+    const bounded = (value) =>
+      typeof value === "string" && value !== "" && value.length <= 4096
+        ? value
+        : null;
+    // The BASE is capped for cost, not just the result: resolving a short relative href against a
+    // page-controlled 1MB <base> builds a 1MB string per element before any cap can reject it.
+    const baseURI =
+      doc && typeof doc.baseURI === "string" ? bounded(doc.baseURI) : null;
+    const resolve = (raw) => {
+      if (bounded(raw) === null) return null;
+      try {
+        return bounded(
+          baseURI ? new URL(raw, baseURI).href : new URL(raw).href,
+        );
+      } catch (e) {
+        return null;
+      }
+    };
+    if (tagNameLower === "a" || tagNameLower === "area") {
+      const rawHref = element.getAttribute("href");
+      if (rawHref === null) return null;
+      if (element.getAttribute("ping")) {
+        // ping= sends POST beacons to further destinations on activation; one URL cannot
+        // represent where the click sends data, so the anchor is opaque, not partially safe.
+        return { kind: "anchor", url: null };
+      }
+      return { kind: "anchor", url: resolve(rawHref) };
+    }
+    // element.form is the EFFECTIVE owner per spec: a form= attribute override wins, an invalid
+    // form= id means no owner (not the ancestor), and a hidden ancestor form still owns.
+    const form = element.form;
+    if (!form || typeof form.getAttribute !== "function") {
+      // Covers no owner AND a clobbered form: HTMLFormElement's named getter is
+      // [LegacyOverrideBuiltIns], so <input name=getAttribute> shadows the method itself.
+      return null;
+    }
+    const controlType = (element.getAttribute("type") || "").toLowerCase();
+    if (controlType === "button" || controlType === "reset") {
+      // A non-submitting click control stages no data and never submits: its activation is
+      // arbitrary script, and an ancestor form must not lend it a known destination. The same
+      // control outside a form is opaque; inside one it must classify the same way.
+      return null;
+    }
+    const documentUrl = () =>
+      doc && typeof doc.URL === "string" ? bounded(doc.URL) : null;
+    // "Empty" means empty AFTER the URL parser's leading/trailing strip, which is the C0-control
+    // and space set — NOT String.trim(), which also eats U+00A0 and would over-strip. A
+    // whitespace-only action submits to the DOCUMENT URL; resolving it instead resolves against
+    // <base>, which real Chromium contradicted across origins.
+    const isBlankUrl = (value) =>
+      value.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "") === "";
+    const rawAction = form.getAttribute("action");
+    // Per spec a missing or empty action attribute submits to the document's own URL.
+    let url;
+    if (rawAction === null || isBlankUrl(rawAction)) {
+      url = documentUrl();
+    } else {
+      url = resolve(rawAction);
+    }
+    let method = normalizeFormMethod(form.getAttribute("method"));
+    // Enumerated-attribute normalization: an INVALID button type defaults to "submit" (only
+    // "button" and "reset" opt out, and both returned opaque above), while an invalid input type
+    // defaults to "text". Treating a garbage-typed button as non-submit would record the owner
+    // form's action while the browser submits to the button's hostile formaction — a fail-open.
+    const isSubmitter =
+      tagNameLower === "button" ||
+      (tagNameLower === "input" &&
+        (controlType === "submit" || controlType === "image"));
+    if (isSubmitter) {
+      // A PRESENT-but-blank override still overrides (F6/L1): Chromium submits formaction="" AND
+      // formaction="   " to the DOCUMENT URL and normalizes formmethod="" to GET. Treating blank
+      // as absent recorded the owner form's action+method while the browser went elsewhere — the
+      // invalid-button-type fail-open's sibling.
+      const formAction = element.getAttribute("formaction");
+      if (formAction !== null) {
+        url = isBlankUrl(formAction) ? documentUrl() : resolve(formAction);
+      }
+      const formMethod = element.getAttribute("formmethod");
+      if (formMethod !== null) {
+        method = normalizeFormMethod(formMethod);
+      }
+    }
+    return { kind: "form", url: url, method: method };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function buildElementObject(
   frame,
   element,
@@ -1905,6 +2043,20 @@ async function buildElementObject(
     elementObj.attributes["selected"] = selectedValue;
   }
 
+  // The budget is checked BEFORE building: buildDestinationFacts resolves URLs, and resolution
+  // is the expensive half. Exhaustion zeroes the budget, so every later element in this build
+  // skips the call entirely instead of resolving and then being discarded. Over budget the fact
+  // is DROPPED, not nulled — an element with no fact is INCOMPLETE downstream, so this fails
+  // closed rather than fails large.
+  if (__captureDestinationFacts && __destinationFactBudget > 0) {
+    const destinationFacts = chargeDestinationBudget(
+      buildDestinationFacts(element, elementTagNameLower),
+    );
+    if (destinationFacts) {
+      elementObj.destination = destinationFacts;
+    }
+  }
+
   return elementObj;
 }
 
@@ -1913,6 +2065,7 @@ async function buildTreeFromBody(
   frame = "main.frame",
   frame_index = undefined,
   must_included_tags = [],
+  captureDestinationFacts = false,
 ) {
   if (
     window.GlobalSkyvernFrameIndex === undefined &&
@@ -1920,17 +2073,29 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
-  const maxElementNumber = 15000;
-  const elementsAndResultArray = await buildElementTree(
-    document.documentElement,
-    frame,
-    false,
-    undefined,
-    maxElementNumber,
-    must_included_tags,
-  );
-  DomUtils.elementListCache = elementsAndResultArray[0];
-  return elementsAndResultArray;
+  // Destination-fact capture (SKY-12875) runs ONLY when the caller opts in: for a page that has
+  // not interposed on this global, a disabled-mode build does zero capture work — no attribute
+  // reads, no URL resolution, no fact allocation. A page CAN still reach this argument by
+  // redefining the global between injection and the call (the export itself is no longer
+  // hijackable via a setter), so the per-build budget is the load-bearing bound rather than the
+  // flag: it caps total serialized fact bytes AND stops resolution once exhausted.
+  __captureDestinationFacts = captureDestinationFacts === true;
+  __destinationFactBudget = 524288;
+  try {
+    const maxElementNumber = 15000;
+    const elementsAndResultArray = await buildElementTree(
+      document.documentElement,
+      frame,
+      false,
+      undefined,
+      maxElementNumber,
+      must_included_tags,
+    );
+    DomUtils.elementListCache = elementsAndResultArray[0];
+    return elementsAndResultArray;
+  } finally {
+    __captureDestinationFacts = false;
+  }
 }
 
 async function buildElementTree(
