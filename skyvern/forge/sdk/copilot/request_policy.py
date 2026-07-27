@@ -314,6 +314,7 @@ ExpectedOutputShape = Literal[
     "money_amount",
     "owner_label",
     "goal_judgment_boolean",
+    "value_present",
 ]
 RequestedOutputEvidenceSource = Literal[
     "runtime_output",
@@ -2035,12 +2036,31 @@ def _omitted_request_slot_criterion(
     )
 
 
+def _canonical_mint_path(path: str) -> str:
+    return path.strip().removeprefix("output.")
+
+
+def _minted_path_has_typed_child(path: str, sibling_output_paths: frozenset[str]) -> bool:
+    """True when another requested-output path is nested under ``path`` (``path.x`` or
+    ``path[].x``), i.e. ``path`` is a collection parent whose contract is carried by its
+    typed children -- so it should floor-rekey, not mint a loose value_present criterion.
+    Paths are compared canonically so a child written without the ``output.`` prefix still
+    suppresses the mint."""
+    parent = _canonical_mint_path(path)
+    return any(
+        (child := _canonical_mint_path(sibling)) != parent
+        and (child.startswith(f"{parent}.") or child.startswith(f"{parent}["))
+        for sibling in sibling_output_paths
+    )
+
+
 def _bind_criterion_to_request_slot(
     criterion: CompletionCriterion,
     *,
     slot: CanonicalRequestSlotV1,
     source_quote: str,
     allow_canonical_path_fallback: bool = True,
+    sibling_output_paths: frozenset[str] = frozenset(),
 ) -> CompletionCriterion:
     pinability = cast(Pinability, slot.pinability.value)
     lexical_interrogative_key = _interrogative_slot_classification_output_key(
@@ -2081,7 +2101,25 @@ def _bind_criterion_to_request_slot(
         and _has_boolean_output_signal(criterion)
     )
     degraded = degraded or malformed_shapeless_boolean or assertive_shapeless_boolean
-    rekeyed = degraded or pinability == "shapeless_valid"
+
+    minted_output_path = criterion.output_path or (
+        f"output.{criterion.classification_output_key}" if criterion.classification_output_key is not None else None
+    )
+    # A single named non-boolean run-plane value keeps its computed output_path with a
+    # presence-only shape so the grounding gate can check it, without claiming an exact value.
+    minted_requested_output = (
+        pinability == "shapeless_valid"
+        and slot.plane.value == "run"
+        and minted_output_path is not None
+        and not _minted_path_has_typed_child(minted_output_path, sibling_output_paths)
+        and not _has_boolean_output_signal(criterion)
+        and not neutral_boolean_candidate
+        and not malformed_shapeless_boolean
+        and not assertive_shapeless_boolean
+        and antecedent_family in {"unconditional", "blocker"}
+    )
+
+    rekeyed = degraded or (pinability == "shapeless_valid" and not minted_requested_output)
 
     expected_output_value = criterion.expected_output_value
     expected_output_shape = criterion.expected_output_shape
@@ -2103,6 +2141,8 @@ def _bind_criterion_to_request_slot(
         expected_output_shape = None
         expected_classification = None
         judgment_truth_condition = None
+    if minted_requested_output:
+        expected_output_shape = "value_present"
     if malformed_shapeless_boolean:
         requested_output_evidence_source = "runtime_output"
         classification_output_key = None
@@ -2119,6 +2159,11 @@ def _bind_criterion_to_request_slot(
         kind = "outcome"
         classification_output_key = None
     output_path = None if rekeyed else criterion.output_path
+    if minted_requested_output:
+        kind = "outcome"
+        classification_output_key = None
+        if output_path is None:
+            output_path = minted_output_path
     if neutral_boolean_key is not None:
         original_output_path = f"output.{neutral_boolean_key}"
     requested_output_floor_rekeyed = rekeyed and neutral_boolean_key is None and original_output_path is not None
@@ -2143,6 +2188,12 @@ def _bind_criterion_to_request_slot(
             original_output_path=original_output_path,
             requested_output_evidence_source=criterion.requested_output_evidence_source,
             outcome=(criterion.outcome or source_quote or "")[:80],
+        )
+    if minted_requested_output:
+        LOG.info(
+            "copilot_request_slot_criterion_minted_requested_output",
+            slot_id=slot.slot_id,
+            output_path=output_path,
         )
     return replace(
         criterion,
@@ -2184,7 +2235,9 @@ def _parse_fresh_request_slot_criteria(
         trusted_bindings_by_slot_id.setdefault(binding.slot_id, []).append(binding)
     bound_by_slot_id: dict[str, CompletionCriterion] = {}
     non_slot_criteria: list[CompletionCriterion] = []
-    for item, criterion in _parse_completion_criterion_entries(raw):
+    entries = list(_parse_completion_criterion_entries(raw))
+    sibling_output_paths = frozenset(criterion.output_path for _item, criterion in entries if criterion.output_path)
+    for item, criterion in entries:
         criterion_index = criterion_index_by_item_id[id(item)]
         anchor = _request_slot_anchor(item)
         slot = (
@@ -2225,6 +2278,7 @@ def _parse_fresh_request_slot_criteria(
             criterion,
             slot=slot,
             source_quote=anchor[1],
+            sibling_output_paths=sibling_output_paths,
         )
 
     for slot in request_slot_contract.slots:
@@ -2241,6 +2295,7 @@ def _parse_fresh_request_slot_criteria(
             slot=slot,
             source_quote=source_quote,
             allow_canonical_path_fallback=False,
+            sibling_output_paths=sibling_output_paths,
         )
     return ([bound_by_slot_id[slot.slot_id] for slot in request_slot_contract.slots] + non_slot_criteria)[
         :_MAX_COMPLETION_CRITERIA
@@ -2377,6 +2432,11 @@ def _parse_completion_criterion_entries(
             item.get("expected_output_value")
         )
         expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        if expected_output_shape == "value_present":
+            # value_present is minted by the policy only (see _bind_criterion_to_request_slot); a
+            # classifier-supplied one on a pinned slot would be credited by presence and bypass the
+            # exact-value bar. Drop it here so only the mint can set it.
+            expected_output_shape = None
         requested_output_evidence_source = _coerce_requested_output_evidence_source(
             item.get("requested_output_evidence_source")
         )
@@ -2954,6 +3014,9 @@ def _requested_output_mint_state(
 ) -> tuple[MintDisposition, MintDegrade | None]:
     if isinstance(expected_value, bool) or expected_shape == "goal_judgment_boolean" or judgment_condition is not None:
         return "pending", None
+    if expected_shape == "value_present":
+        # A minted single-value extraction is decidable by presence, not an undecidable judgment.
+        return "decidable", None
     if expected_shape == "status_label" or (expected_value is None and expected_shape is not None):
         return "degraded", "undecidable_judgment"
     return "decidable", None
