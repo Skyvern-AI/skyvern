@@ -160,16 +160,34 @@ async def _run_combobox_input(
     stop_flag: bool,
     is_search_bar: bool = False,
     is_location_input: bool = False,
+    is_date_related: bool = False,
     is_secret: bool = False,
+    prefilter_typeahead: bool = False,
+    prefilter_raises: bool = False,
+    first_block_incremental: list[dict] | None = None,
 ) -> tuple[list, MagicMock, MagicMock]:
     skyvern_el = make_input_element_mock(element_id="CBX", attrs=attrs)
+    if prefilter_raises:
+        # Simulate the prefilter typing a prefix then raising mid-dispatch (field left dirty). Raise only on
+        # the first call (the Block A prefilter); later calls succeed, so the rest of the flow runs normally.
+        _raised = {"done": False}
+
+        def _raise_first(*_args: object, **_kwargs: object) -> None:
+            if not _raised["done"]:
+                _raised["done"] = True
+                raise RuntimeError("partial prefilter dispatch then raise")
+
+        skyvern_el.input_sequentially = AsyncMock(side_effect=_raise_first)
     dom_instance = MagicMock()
     dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
 
     inc = MagicMock()
     inc.start_listen_dom_increment = AsyncMock()
     inc.stop_listen_dom_increment = AsyncMock()
-    if is_secret:
+    if first_block_incremental is not None:
+        # A typeahead that surfaces options in Block A itself (after the target is typed to filter).
+        inc.get_incremental_element_tree = AsyncMock(return_value=first_block_incremental)
+    elif is_secret:
         # Secret-valued params skip Block A's ArrowDown probe (its guard excludes secrets),
         # so Block B is the first and only incremental read.
         inc.get_incremental_element_tree = AsyncMock(return_value=options)
@@ -183,7 +201,12 @@ async def _run_combobox_input(
     scraped_page = MagicMock()
     scraped_page.id_to_element_dict = {"CBX": {"tagName": "input"}}
 
-    context = InputOrSelectContext(field="Title", is_search_bar=is_search_bar, is_location_input=is_location_input)
+    context = InputOrSelectContext(
+        field="Title",
+        is_search_bar=is_search_bar,
+        is_location_input=is_location_input,
+        is_date_related=is_date_related,
+    )
 
     select_result = MagicMock()
     select_result.action_result = ActionSuccess() if select_success else ActionFailure(Exception("not committed"))
@@ -192,6 +215,8 @@ async def _run_combobox_input(
     action_text = "{{secret_param}}" if is_secret else _TARGET
     action = InputTextAction(element_id="CBX", text=action_text, reasoning="type the job title")
     action.stop_batch_after_dropdown_select = stop_flag
+    # Admission is a Cloud Setup concern; the OSS handler consumes only this runtime flag.
+    action.prefilter_typeahead = prefilter_typeahead
 
     select_mock = AsyncMock(return_value=select_result)
 
@@ -319,4 +344,132 @@ async def test_secret_valued_action_does_not_trigger_select() -> None:
         is_secret=True,
     )
     select_mock.assert_not_awaited()
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+# --------------------------------------------------------------------------- #
+# handle_input_text_action — runtime prefilter_typeahead flag drives type-before-match
+#
+# Field admission (which sites/fields qualify) is a Cloud Setup concern and is not tested here. The OSS
+# handler consumes only the generic runtime-only InputTextAction.prefilter_typeahead flag, gated by the
+# existing safety checks (non-empty resolved text, not date-related, plus the enclosing
+# search/location/secret/TOTP/raw exclusions). No site/field strings appear in this OSS-synced file.
+# --------------------------------------------------------------------------- #
+def test_prefilter_typeahead_flag_excluded_from_serialization() -> None:
+    # Runtime-only: set per-step by Cloud Setup, never persisted/serialized.
+    action = InputTextAction(element_id="CBX", text=_TARGET)
+    action.prefilter_typeahead = True
+    assert "prefilter_typeahead" not in action.model_dump()
+    assert action.prefilter_typeahead is True
+
+
+_FLAG_TYPEAHEAD_ATTRS = {"role": None, "aria-autocomplete": None, "aria-invalid": "false"}
+
+
+@pytest.mark.asyncio
+async def test_prefilter_flag_types_target_to_filter_before_match() -> None:
+    """With prefilter_typeahead set (by Cloud Setup), Block A types the target to filter the listbox
+    before candidate matching, instead of opening it unfiltered with ArrowDown."""
+    results, el, select_mock = await _run_combobox_input(
+        attrs=_FLAG_TYPEAHEAD_ATTRS,
+        options=_listbox_with_option(_TARGET),
+        select_success=True,
+        stop_flag=False,
+        prefilter_typeahead=True,
+        first_block_incremental=_listbox_with_option(_TARGET),
+    )
+    # entered the target to filter the listbox ...
+    entered = [call.args[0] for call in el.input_sequentially.await_args_list if call.args]
+    assert _TARGET in entered
+    # ... and did NOT fall back to the unfiltered ArrowDown probe
+    assert "ArrowDown" not in _pressed_keys(el)
+    # the custom-select ran against the filtered listbox and committed the option
+    select_mock.assert_awaited_once()
+    assert select_mock.await_args.kwargs["target_value"] == _TARGET
+    assert select_mock.await_args.kwargs["entry_action_type"] == "input_text"
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_prefilter_flag_failure_clears_before_terminal_fill() -> None:
+    """When the flagged prefilter types the target but the block select does NOT commit, the terminal fill
+    must clear first so the typed-but-uncommitted value is not doubled (e.g. 'BackendBackend') on the
+    fall-through path."""
+    results, el, select_mock = await _run_combobox_input(
+        attrs=_FLAG_TYPEAHEAD_ATTRS,
+        options=_listbox_with_option(_TARGET),
+        select_success=False,
+        stop_flag=False,
+        prefilter_typeahead=True,
+        first_block_incremental=_listbox_with_option(_TARGET),
+    )
+    # prefilter entered the target (Block A) ...
+    entered = [call.args[0] for call in el.input_sequentially.await_args_list if call.args]
+    assert _TARGET in entered
+    # ... the select was attempted but did not commit ...
+    select_mock.assert_awaited()
+    # ... so the field is cleared again before the terminal fill (Block A clear + terminal clear).
+    assert el.input_clear.await_count >= 2
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_prefilter_partial_dispatch_failure_clears_before_terminal_fill() -> None:
+    """If the flagged prefilter's input_sequentially dispatches a prefix then raises (field left dirty)
+    with initially empty current_text, the terminal fill must still clear first — otherwise it appends the
+    full target to the dirty prefix. It falls back to ArrowDown and clears before the final fill."""
+    results, el, select_mock = await _run_combobox_input(
+        attrs=_FLAG_TYPEAHEAD_ATTRS,
+        options=_listbox_with_option(_TARGET),
+        select_success=False,
+        stop_flag=False,
+        prefilter_typeahead=True,
+        prefilter_raises=True,
+        first_block_incremental=_listbox_with_option(_TARGET),
+    )
+    # the prefilter was attempted (dispatched then raised) ...
+    assert el.input_sequentially.call_count >= 1
+    # ... so it fell back to the unfiltered ArrowDown probe ...
+    assert "ArrowDown" in _pressed_keys(el)
+    # ... and the terminal path cleared the dirty field before the final fill (Block A clear + terminal clear),
+    # even though current_text was empty and prefilter_typeahead was reset to False on the exception.
+    assert el.input_clear.await_count >= 2
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_flag_off_keeps_arrowdown_probe() -> None:
+    """Control: with the flag off the input must NOT be pre-filtered — it keeps the ArrowDown probe and
+    never types the target as a filter before the block select."""
+    results, el, select_mock = await _run_combobox_input(
+        attrs=_FLAG_TYPEAHEAD_ATTRS,
+        options=_listbox_with_option(_TARGET),
+        select_success=True,
+        stop_flag=False,
+        prefilter_typeahead=False,
+        first_block_incremental=_listbox_with_option(_TARGET),
+    )
+    assert "ArrowDown" in _pressed_keys(el)
+    entered = [call.args[0] for call in el.input_sequentially.await_args_list if call.args]
+    assert _TARGET not in entered
+    select_mock.assert_awaited_once()
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_date_related_overrides_flag_and_keeps_arrowdown() -> None:
+    """The is_date_related safety gate overrides the flag: even with prefilter_typeahead set, a date input
+    performs no prefilter and retains the ArrowDown path (date pickers must keep the existing flow)."""
+    results, el, select_mock = await _run_combobox_input(
+        attrs=_FLAG_TYPEAHEAD_ATTRS,
+        options=_listbox_with_option(_TARGET),
+        select_success=True,
+        stop_flag=False,
+        is_date_related=True,
+        prefilter_typeahead=True,
+        first_block_incremental=_listbox_with_option(_TARGET),
+    )
+    assert "ArrowDown" in _pressed_keys(el)
+    entered = [call.args[0] for call in el.input_sequentially.await_args_list if call.args]
+    assert _TARGET not in entered
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)

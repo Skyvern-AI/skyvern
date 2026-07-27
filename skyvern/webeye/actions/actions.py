@@ -304,6 +304,11 @@ class InputTextAction(WebAction):
     totp_identifier: str | None = None
     totp_url: str | None = None
 
+    # Runtime-only (never serialized): set per-step by a deployment's INPUT_TEXT Setup to opt this action
+    # into the generic type-to-filter path for a wrapper-marked typeahead combobox. See
+    # handle_input_text_action; admission policy lives in the deployment layer, not here.
+    prefilter_typeahead: bool = Field(default=False, exclude=True)
+
     def __repr__(self) -> str:
         payload = redact_input_text_payload_for_log(
             {
