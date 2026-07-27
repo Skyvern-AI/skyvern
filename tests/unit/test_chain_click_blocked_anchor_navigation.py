@@ -12,6 +12,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
 from skyvern.webeye.utils import dom as dom_module
@@ -536,6 +537,434 @@ class TestChainClickBlockedAnchorNavigation:
 def test_dom_module_exports_try_navigate_via_href() -> None:
     """Sanity check that the helper is a method on ``SkyvernElement``."""
     assert hasattr(dom_module.SkyvernElement, "try_navigate_via_href")
+
+
+class _SelectedEngineTimeout(Exception):
+    pass
+
+
+def _selected_engine() -> MagicMock:
+    selection = MagicMock()
+    selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, _SelectedEngineTimeout)
+    return selection
+
+
+class TestChainClickEngineAwarePostDispatch:
+    """``chain_click`` must classify a post-dispatch navigation-wait timeout
+    against the logical run's selected browser engine — resolved through
+    ``resolve_engine_selection_for_task`` — so an alternate engine's native
+    timeout short-circuits the fallback exactly like stock Playwright does."""
+
+    _NAV_MSG = (
+        "click: Timeout 10000ms exceeded.\nCall log:\n"
+        "  - performing click action\n  - click action done\n"
+        "  - waiting for scheduled navigations to finish\n"
+    )
+
+    @staticmethod
+    def _make_element() -> SkyvernElement:
+        elem = object.__new__(SkyvernElement)
+        elem._SkyvernElement__static_element = {"id": "AAA3", "tagName": "button"}  # type: ignore[attr-defined]
+        elem.get_tag_name = MagicMock(return_value="button")  # type: ignore[method-assign]
+        elem.get_id = MagicMock(return_value="AAA3")  # type: ignore[method-assign]
+        elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+        elem.locator = MagicMock()
+        elem.navigate_to_a_href = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        elem.find_blocking_element = AsyncMock(return_value=(None, False))  # type: ignore[method-assign]
+        elem.is_checkbox = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        elem.is_checked = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.coordinate_click = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.click_in_javascript = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        return elem
+
+    async def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        first_click_exc: Exception,
+        engine_selection: MagicMock | None,
+    ) -> tuple[list, SkyvernElement]:
+        from skyvern.webeye.actions import handler as handler_module
+        from skyvern.webeye.actions.actions import ClickAction
+
+        monkeypatch.setattr(
+            handler_module.EventStrategyFactory,
+            "click_element",
+            AsyncMock(side_effect=first_click_exc),
+        )
+        monkeypatch.setattr(handler_module.skyvern_context, "current", MagicMock(return_value=None))
+        monkeypatch.setattr(
+            handler_module,
+            "resolve_engine_selection_for_task",
+            MagicMock(return_value=engine_selection),
+        )
+
+        elem = self._make_element()
+        page = MagicMock()
+        page.url = "https://portal.example.com/dashboard"
+        page.on = MagicMock()
+        task = MagicMock()
+        task.organization_id = "org_test"
+        action = ClickAction(element_id="AAA3")
+
+        results = await handler_module.chain_click(
+            task=task,
+            scraped_page=MagicMock(),
+            page=page,
+            action=action,
+            skyvern_element=elem,
+        )
+        return results, elem
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_post_dispatch_timeout_short_circuits_as_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        results, elem = await self._run(
+            monkeypatch,
+            first_click_exc=_SelectedEngineTimeout(self._NAV_MSG),
+            engine_selection=_selected_engine(),
+        )
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.coordinate_click.assert_not_called()
+        elem.click_in_javascript.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_foreign_engine_timeout_is_not_classified_and_falls_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A stock Playwright timeout is foreign to the selected engine: it must
+        # not be treated as a completed side effect, so the coordinate fallback
+        # still runs.
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        _, elem = await self._run(
+            monkeypatch,
+            first_click_exc=PlaywrightTimeoutError(self._NAV_MSG),
+            engine_selection=_selected_engine(),
+        )
+
+        elem.coordinate_click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_none_engine_selection_matches_stock_playwright_short_circuit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        results, elem = await self._run(
+            monkeypatch,
+            first_click_exc=PlaywrightTimeoutError(self._NAV_MSG),
+            engine_selection=None,
+        )
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.coordinate_click.assert_not_called()
+
+
+_LADDER_NAV_MSG = (
+    "click: Timeout 10000ms exceeded.\nCall log:\n"
+    "  - performing click action\n  - click action done\n"
+    "  - waiting for scheduled navigations to finish\n"
+)
+
+
+def _bound_click_element(click_mock: AsyncMock) -> MagicMock:
+    """A ``SkyvernElement``-like bound element whose ``get_locator().click`` is
+    ``click_mock`` (used by the for-label / label-children fallbacks)."""
+    bound = MagicMock()
+    loc = MagicMock()
+    loc.click = click_mock
+    loc.dblclick = AsyncMock(return_value=None)
+    bound.get_locator = MagicMock(return_value=loc)
+    return bound
+
+
+def _bound_click_locator(click_mock: AsyncMock) -> MagicMock:
+    """A raw Locator whose ``click`` is ``click_mock`` (used by the
+    bound-label-by-attr-id / by-direct-parent fallbacks)."""
+    loc = MagicMock()
+    loc.click = click_mock
+    loc.dblclick = AsyncMock(return_value=None)
+    return loc
+
+
+def _blocking_click_element(click_mock: AsyncMock) -> MagicMock:
+    blocker = MagicMock()
+    loc = MagicMock()
+    loc.click = click_mock
+    blocker.get_locator = MagicMock(return_value=loc)
+    blocker.get_id = MagicMock(return_value="BLK")
+    blocker.is_parent_of = AsyncMock(return_value=True)
+    blocker.is_sibling_of = AsyncMock(return_value=False)
+    blocker.is_safe_for_checkbox_direct_click = AsyncMock(return_value=True)
+    return blocker
+
+
+def _make_ladder_element(*, tag: str = "button", **stubs: object) -> SkyvernElement:
+    elem = object.__new__(SkyvernElement)
+    elem._SkyvernElement__static_element = {"id": "AAA3", "tagName": tag}  # type: ignore[attr-defined]
+    elem.get_tag_name = MagicMock(return_value=tag)  # type: ignore[method-assign]
+    elem.get_id = MagicMock(return_value="AAA3")  # type: ignore[method-assign]
+    elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+    elem.locator = MagicMock()
+    elem.navigate_to_a_href = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.find_label_for = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.find_element_in_label_children = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    elem.find_blocking_element = AsyncMock(return_value=(None, False))  # type: ignore[method-assign]
+    elem.is_checkbox = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    elem.is_checked = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.coordinate_click = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.click_in_javascript = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    for name, value in stubs.items():
+        setattr(elem, name, value)
+    return elem
+
+
+async def _run_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+    elem: SkyvernElement,
+    engine_selection: MagicMock | None,
+) -> list:
+    from skyvern.webeye.actions import handler as handler_module
+    from skyvern.webeye.actions.actions import ClickAction
+
+    monkeypatch.setattr(
+        handler_module.EventStrategyFactory,
+        "click_element",
+        AsyncMock(side_effect=RuntimeError("primary click failed")),
+    )
+    monkeypatch.setattr(handler_module.skyvern_context, "current", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        handler_module,
+        "resolve_engine_selection_for_task",
+        MagicMock(return_value=engine_selection),
+    )
+
+    page = MagicMock()
+    page.url = "https://portal.example.com/dashboard"
+    page.on = MagicMock()
+    task = MagicMock()
+    task.organization_id = "org_test"
+    action = ClickAction(element_id="AAA3")
+
+    return await handler_module.chain_click(
+        task=task,
+        scraped_page=MagicMock(),
+        page=page,
+        action=action,
+        skyvern_element=elem,
+    )
+
+
+class TestChainClickFallbackPostDispatchGuard:
+    """Each side-effecting fallback locator click in ``chain_click`` can itself
+    dispatch then time out on the post-click navigation wait. When classified
+    against the run's selected engine (or stock Playwright for ``None``) that
+    means the side effect already fired, so the remaining ladder must not
+    re-click. A foreign-engine timeout stays a plain failure and the existing
+    ladder continues."""
+
+    # --- for-label fallback (label element -> find_label_for) ---------------
+
+    @pytest.mark.asyncio
+    async def test_for_label_selected_timeout_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        bound = _bound_click_element(AsyncMock(side_effect=_SelectedEngineTimeout(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="label", find_label_for=AsyncMock(return_value=bound))
+
+        results = await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.find_element_in_label_children.assert_not_awaited()  # type: ignore[attr-defined]
+        elem.coordinate_click.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_for_label_foreign_timeout_continues_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        bound = _bound_click_element(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="label", find_label_for=AsyncMock(return_value=bound))
+
+        await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        elem.find_element_in_label_children.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_for_label_none_engine_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        bound = _bound_click_element(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="label", find_label_for=AsyncMock(return_value=bound))
+
+        results = await _run_ladder(monkeypatch, elem, None)
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.find_element_in_label_children.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # --- label-children fallback (label element -> find_element_in_label_children)
+
+    @pytest.mark.asyncio
+    async def test_label_children_selected_timeout_skips_remaining_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        bound = _bound_click_element(AsyncMock(side_effect=_SelectedEngineTimeout(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="label", find_element_in_label_children=AsyncMock(return_value=bound))
+
+        results = await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.is_visible.assert_not_awaited()  # type: ignore[attr-defined]
+        elem.coordinate_click.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_label_children_foreign_timeout_continues_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        bound = _bound_click_element(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="label", find_element_in_label_children=AsyncMock(return_value=bound))
+
+        await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        elem.is_visible.assert_awaited()  # type: ignore[attr-defined]
+        elem.coordinate_click.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_label_children_none_engine_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        bound = _bound_click_element(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="label", find_element_in_label_children=AsyncMock(return_value=bound))
+
+        results = await _run_ladder(monkeypatch, elem, None)
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.is_visible.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # --- bound-label-by-attr-id fallback (non-label element) ----------------
+
+    @pytest.mark.asyncio
+    async def test_attr_id_selected_timeout_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        locator = _bound_click_locator(AsyncMock(side_effect=_SelectedEngineTimeout(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_bound_label_by_attr_id=AsyncMock(return_value=locator))
+
+        results = await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.find_bound_label_by_direct_parent.assert_not_awaited()  # type: ignore[attr-defined]
+        elem.coordinate_click.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_attr_id_foreign_timeout_continues_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        locator = _bound_click_locator(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_bound_label_by_attr_id=AsyncMock(return_value=locator))
+
+        await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        elem.find_bound_label_by_direct_parent.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_attr_id_none_engine_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        locator = _bound_click_locator(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_bound_label_by_attr_id=AsyncMock(return_value=locator))
+
+        results = await _run_ladder(monkeypatch, elem, None)
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.find_bound_label_by_direct_parent.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # --- bound-label-by-direct-parent fallback (non-label element) ----------
+
+    @pytest.mark.asyncio
+    async def test_direct_parent_selected_timeout_skips_remaining_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        locator = _bound_click_locator(AsyncMock(side_effect=_SelectedEngineTimeout(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_bound_label_by_direct_parent=AsyncMock(return_value=locator))
+
+        results = await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.is_visible.assert_not_awaited()  # type: ignore[attr-defined]
+        elem.coordinate_click.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_direct_parent_foreign_timeout_continues_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        locator = _bound_click_locator(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_bound_label_by_direct_parent=AsyncMock(return_value=locator))
+
+        await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        elem.is_visible.assert_awaited()  # type: ignore[attr-defined]
+        elem.coordinate_click.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_direct_parent_none_engine_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        locator = _bound_click_locator(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_bound_label_by_direct_parent=AsyncMock(return_value=locator))
+
+        results = await _run_ladder(monkeypatch, elem, None)
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.is_visible.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # --- blocking-element (parent/sibling) fallback -------------------------
+
+    @pytest.mark.asyncio
+    async def test_blocking_element_selected_timeout_skips_remaining_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker = _blocking_click_element(AsyncMock(side_effect=_SelectedEngineTimeout(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_blocking_element=AsyncMock(return_value=(blocker, True)))
+
+        results = await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.click_in_javascript.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_blocking_element_foreign_timeout_stays_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        blocker = _blocking_click_element(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_blocking_element=AsyncMock(return_value=(blocker, True)))
+
+        results = await _run_ladder(monkeypatch, elem, _selected_engine())
+
+        assert results and isinstance(results[-1], ActionFailure)
+        assert "blocking_element" in results[-1].exception_message
+
+    @pytest.mark.asyncio
+    async def test_blocking_element_none_engine_skips_remaining_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        blocker = _blocking_click_element(AsyncMock(side_effect=PlaywrightTimeoutError(_LADDER_NAV_MSG)))
+        elem = _make_ladder_element(tag="button", find_blocking_element=AsyncMock(return_value=(blocker, True)))
+
+        results = await _run_ladder(monkeypatch, elem, None)
+
+        assert results and isinstance(results[-1], ActionSuccess)
+        elem.click_in_javascript.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 class TestChainClickCheckboxCoordinateVerification:
