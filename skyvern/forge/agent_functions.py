@@ -54,6 +54,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
+from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -1827,13 +1828,17 @@ class AgentFunction:
         timeout_seconds: float = 30.0,
         organization_id: str | None = None,
         run_id: str | None = None,
+        resolved_ips: tuple[str, ...] | None = None,
     ) -> httpx.Response:
         """Deliver a webhook POST request to *url*.
 
         Returns the upstream ``httpx.Response``.  Cloud override routes NAT-org
         traffic through the egress proxy so it egresses from a static IP.
+
+        ``resolved_ips`` pins the connection to addresses the caller already validated,
+        closing the DNS-rebinding window between validation and connect.
         """
-        async with httpx.AsyncClient() as client:
+        async with pinned_ip_client(resolved_ips) as client:
             return await client.post(
                 url,
                 content=payload,
