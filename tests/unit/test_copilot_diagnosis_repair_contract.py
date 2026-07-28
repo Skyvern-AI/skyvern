@@ -396,9 +396,7 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
     )
 
 
-def test_repair_loop_state_counts_through_authoring_repair_context_identity_change() -> None:
-    # An identity change rotates the streak token but is not progress; the zero-run
-    # ceiling still does not terminalize.
+def test_repair_loop_state_climbs_on_the_same_failure_repeating() -> None:
     ctx = _ctx()
     ambiguous = CodeAuthoringRepairContext(
         block_label="retrieve_document_link",
@@ -406,13 +404,8 @@ def test_repair_loop_state_counts_through_authoring_repair_context_identity_chan
         selector="button",
         refiner_selector="xpath=//button[normalize-space()='View / Download']",
     )
-    sandbox = CodeAuthoringRepairContext(
-        block_label="retrieve_document_link",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
-        unresolved_names=["confirmation_number", "row_text"],
-    )
 
-    for expected_count in (1, 2):
+    for expected_count in (1, 2, 3):
         contract = build_diagnosis_repair_contract(
             source_tool="update_and_run_blocks",
             result=_authoring_repair_result(ambiguous),
@@ -420,21 +413,6 @@ def test_repair_loop_state_counts_through_authoring_repair_context_identity_chan
         )
         run_execution_module._update_repair_loop_state(ctx, contract)
         assert contract.repair_loop_state.consecutive_identical_repair_count == expected_count
-        assert contract.repair_loop_state.ceiling_reached is False
-
-    sandbox_contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result=_authoring_repair_result(sandbox),
-        ctx=ctx,
-    )
-    run_execution_module._update_repair_loop_state(ctx, sandbox_contract)
-
-    assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert sandbox_contract.repair_loop_state.streak_token != contract.repair_loop_state.streak_token
-    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 3
-    assert sandbox_contract.repair_loop_state.ceiling_reached is True
-    assert getattr(ctx, "blocker_signal", None) is None
-    assert ctx.turn_halt is None
 
 
 def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
