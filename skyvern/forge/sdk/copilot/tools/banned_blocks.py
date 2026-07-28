@@ -223,6 +223,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
+        "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
         "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
     ]
 

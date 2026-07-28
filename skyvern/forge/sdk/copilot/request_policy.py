@@ -4404,6 +4404,41 @@ def _credential_name_candidates(user_message: str) -> list[str]:
     return _exact_credential_name_candidates(user_message)
 
 
+_CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH = 4
+
+
+def _explicit_login_action_asserted(user_message: str) -> bool:
+    """Whether the message asks for a login in its own words, ignoring phrasings that refuse one.
+
+    Shares the negation rule with saved-name matching, so "do not log in with prod" authorizes neither.
+    """
+    text = _credential_authority_text(user_message or "")
+    return any(
+        not _credential_reference_is_negated(text, match.start()) for match in _EXPLICIT_LOGIN_ACTION_RE.finditer(text)
+    )
+
+
+def _saved_credential_names_mentioned(user_message: str, credentials: list[Credential]) -> list[str]:
+    """Saved names a message states outright, e.g. "use skyvern-datadog to login".
+
+    The saved names are known, so match on them rather than on the prose around them.
+    """
+    text = _credential_authority_text(user_message or "")
+    mentioned: list[str] = []
+    for credential in credentials:
+        name = (credential.name or "").strip()
+        if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+            continue
+        for match in re.finditer(rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])", text, re.IGNORECASE):
+            if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
+                text, match.start()
+            ):
+                continue
+            mentioned.append(name)
+            break
+    return _clean_list(mentioned)
+
+
 def _explicit_credential_ids(user_message: str) -> list[str]:
     text = _credential_authority_text(user_message or "")
     explicit: list[str] = []
@@ -4832,10 +4867,21 @@ async def _resolve_credentials(
             policy.allow_missing_credentials_in_draft = True
         return
 
+    # `login_intent` is a classifier-authored hint that misses on runs where the model does not set
+    # it, so a message asking for a login in its own words must still count. A classifier that failed
+    # outright is a different case: a degraded turn never enumerates the org's saved credentials.
+    login_phrase_asserted = _explicit_login_action_asserted(user_message)
+    may_scan_saved_names = policy.login_intent or (policy.classifier_status != "fallback" and login_phrase_asserted)
     name_candidates = _credential_name_candidates(user_message)
     credentials: list[Credential] | None = None
-    if name_candidates:
+    # Only a request that already asserts a login or credential intent may be matched against the
+    # org's saved names; without that gate an unrelated message would scan the credential list.
+    if not name_candidates and may_scan_saved_names:
         credentials = await _load_credentials(organization_id)
+        name_candidates = _saved_credential_names_mentioned(user_message, credentials)
+    if name_candidates:
+        if credentials is None:
+            credentials = await _load_credentials(organization_id)
         named_matches = _deduplicate_credentials(
             [credential for credential in credentials if credential.name in name_candidates]
         )
@@ -4895,7 +4941,7 @@ async def _resolve_credentials(
     # A passwordless turn must not reach the URL credential tiers below: a host match there
     # asks for a saved credential under a different reason, which is the same dead end.
     current_turn_login_authorized = (
-        policy.login_intent or bool(_EXPLICIT_LOGIN_ACTION_RE.search(user_message))
+        policy.login_intent or login_phrase_asserted
     ) and not _is_passwordless_email_signin(policy)
     url_candidates: list[str] = []
     allow_host_fallback = False

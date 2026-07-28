@@ -142,7 +142,11 @@ from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import poll_otp_value, resolve_otp_value
-from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import (
+    WEBHOOK_DELIVERY_MAX_ATTEMPTS,
+    deliver_webhook_with_retries,
+    describe_delivery_error,
+)
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
     PROMPT_HARD_CEILING_TOKENS,
@@ -4995,15 +4999,37 @@ class ForgeAgent:
                 headers=signed_data.headers,
             )
 
-            resp = await deliver_webhook_with_retries(
-                url=task.webhook_callback_url,
-                payload=signed_data.signed_payload,
-                headers=signed_data.headers,
-                timeout_seconds=30.0,
-                organization_id=task.organization_id,
-                run_id=task.task_id,
-                max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
-            )
+            try:
+                resp = await deliver_webhook_with_retries(
+                    url=task.webhook_callback_url,
+                    payload=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout_seconds=30.0,
+                    organization_id=task.organization_id,
+                    run_id=task.task_id,
+                    max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
+                )
+            except Exception as delivery_error:
+                LOG.warning(
+                    "Task webhook delivery failed after attempting delivery",
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    error=describe_delivery_error(delivery_error),
+                    exc_info=True,
+                )
+                try:
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=task.organization_id,
+                        webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to record task webhook delivery error",
+                        task_id=task.task_id,
+                        exc_info=True,
+                    )
+                raise
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
@@ -5194,17 +5220,23 @@ class ForgeAgent:
                         data=video_artifact.video_data,
                     )
                     continue
-                # No pre-registered artifact row: a recording attached at browser teardown
-                # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
-                # Upload by path so the bytes stream straight from disk to storage.
+                # A teardown-attached recording has no pre-registered artifact row.
+                # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
                 video_path = video_artifact.video_path
-                if not video_path or not os.path.exists(video_path):
+                if video_artifact.video_data:
+                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                    )
+                elif video_path and os.path.exists(video_path):
+                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                    )
+                else:
                     continue
-                video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    path=video_path,
-                )
 
             _ctx = skyvern_context.current()
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False

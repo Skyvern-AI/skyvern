@@ -110,7 +110,6 @@ class VerificationResult(StrictModel):
 class RepairLoopState(StrictModel):
     streak_token: str | None = None
     consecutive_identical_repair_count: int = 0
-    ceiling_reached: bool = False
 
 
 class DiagnosisRepairContract(StrictModel):
@@ -142,7 +141,6 @@ class DiagnosisRepairContract(StrictModel):
             "user_goal_satisfied": self.verification_result.user_goal_satisfied,
             "completion_contract_satisfied": self.verification_result.completion_contract_satisfied,
             "consecutive_identical_repair_count": self.repair_loop_state.consecutive_identical_repair_count,
-            "ceiling_reached": self.repair_loop_state.ceiling_reached,
             "streak_token": self.repair_loop_state.streak_token,
         }
 
