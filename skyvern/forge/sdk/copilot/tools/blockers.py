@@ -17,10 +17,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     loop_blocker_evidence_from_ctx,
     refresh_held_loop_blocker_evidence,
 )
-from skyvern.forge.sdk.copilot.build_test_outcome import (
-    maybe_satisfy_recorded_outcome_grounding_requirement,
-    recorded_outcome_grounding_requires_current_page,
-)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     artifact_challenge_flag_key,
     is_carrier_backed_category_entry,
@@ -33,7 +29,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
     synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
-    uncovered_output_reject_scout_steer_signal,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
@@ -45,9 +40,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOA
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    AuthorTimeGateAblationPayload,
     output_contract_ladder_unresolved,
-    record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -82,18 +75,6 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
     | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
 )
 _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
-_RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
-    {
-        "update_workflow",
-        "click",
-        "fill_credential_field",
-        "navigate_browser",
-        "press_key",
-        "scroll",
-        "select_option",
-        "type_text",
-    }
-)
 
 
 async def _safe_read_workflow_run(
@@ -1520,27 +1501,59 @@ def _challenge_gated_anti_bot_rerun_signal(
     )
 
 
+# The complete vocabulary the runtime/loop plane may refuse with. It exists for the same reason
+# AUTHOR_TIME_HARD_BLOCKS does: a check added here cannot wall a turn without appearing in this set.
+# A refusal keyed on what the submitted draft says is an author-time decision, not a runtime one.
+LOOP_PLANE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "loop_detected_credential_or_parameter_misconfig",
+        "loop_detected_repeated_failed_step",
+        "loop_detected_consecutive_same_tool",
+        "loop_detected_generic",
+        "loop_detected_no_forward_progress_interaction",
+        "loop_detected_discovery_exhausted_no_entry_url",
+        "code_authoring_guardrail_churn",
+        "credential_priority_authoring_churn",
+        "tool_error_active_run_terminal_evidence",
+        "tool_error_terminal_challenge_blocker",
+        "tool_error_synthesized_block_persistence_required",
+        "tool_error_challenge_gated_submit_disabled",
+        "tool_error_late_block_running",
+        "tool_error_non_retriable_nav",
+        "tool_error_pending_reconciliation_no_input",
+        "tool_error_pending_reconciliation_requires_input",
+        "tool_error_per_tool_budget_rerun",
+        "tool_error_post_budget_page_inspection_required",
+        "tool_error_post_budget_upstream_replay",
+        "tool_error_post_budget_challenge_result_evidence",
+        "tool_error_post_budget_challenge_blocker",
+        "tool_error_repeated_action_abort",
+        "runtime_self_heal_native_tool_blocked",
+    }
+)
+
+
+def _emit_loop_plane_refusal(ctx: AgentContext, signal: CopilotToolBlockerSignal) -> str:
+    reason = signal.internal_reason_code
+    if reason not in LOOP_PLANE_REFUSAL_REASON_CODES:
+        raise ValueError(
+            f"{reason!r} is not a declared loop-plane refusal. A check that refuses because of what "
+            "the submitted draft says is an author-time decision: mint an AuthorTimeBlock, or return a "
+            f"finding. Declared: {sorted(LOOP_PLANE_REFUSAL_REASON_CODES)}"
+        )
+    return _emit_tool_blocker_signal(ctx, signal)
+
+
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     refresh_held_loop_blocker_evidence(ctx)
     if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS:
         current_page_challenge_signal = _current_page_terminal_challenge_signal(ctx, arguments, tool_name)
         if current_page_challenge_signal is not None:
-            return _emit_tool_blocker_signal(ctx, current_page_challenge_signal)
-
-    uncovered_output_steer = uncovered_output_reject_scout_steer_signal(ctx, tool_name)
-    if uncovered_output_steer is not None:
-        return _emit_tool_blocker_signal(ctx, uncovered_output_steer)
+            return _emit_loop_plane_refusal(ctx, current_page_challenge_signal)
 
     persistence_signal = synthesized_block_persistence_signal(ctx, tool_name, arguments)
     if persistence_signal is not None:
-        grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
-        if grounding_signal is not None:
-            LOG.info(
-                "copilot recorded outcome grounding enforced over persistence force",
-                tool_name=tool_name,
-            )
-            return _emit_tool_blocker_signal(ctx, grounding_signal)
-        return _emit_tool_blocker_signal(ctx, persistence_signal)
+        return _emit_loop_plane_refusal(ctx, persistence_signal)
 
     # While a typed output-contract actuation ladder is still unresolved for the authoring tools, the
     # bounded ladder (not a generic loop backstop) owns the turn's outcome; the guards re-engage the moment
@@ -1548,15 +1561,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     output_contract_owns_turn = (
         tool_name in _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS and output_contract_ladder_unresolved(ctx)
     )
-    grounding_owns_mutation = (
-        tool_name in _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS
-        and recorded_outcome_grounding_requires_current_page(ctx)
-    )
 
-    if not output_contract_owns_turn and not grounding_owns_mutation:
+    if not output_contract_owns_turn:
         detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
         if detected is not None:
-            return _emit_tool_blocker_signal(
+            return _emit_loop_plane_refusal(
                 ctx,
                 _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
             )
@@ -1571,11 +1580,10 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         isinstance(tracker, list)
         and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
         and not output_contract_owns_turn
-        and not grounding_owns_mutation
     ):
         detected = detect_tool_loop(tracker, tool_name, arguments)
         if detected is not None:
-            return _emit_tool_blocker_signal(
+            return _emit_loop_plane_refusal(
                 ctx,
                 _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
             )
@@ -1583,7 +1591,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     if tool_name == "update_workflow" or tool_name in BLOCK_RUNNING_TOOLS:
         active_terminal_signal = _active_run_terminal_evidence_signal(ctx, tool_name)
         if active_terminal_signal is not None:
-            return _emit_tool_blocker_signal(ctx, active_terminal_signal)
+            return _emit_loop_plane_refusal(ctx, active_terminal_signal)
 
     # Hard-abort when the agent has re-fired the same action sequence against
     # the page N times without intervening success. This is the signal that
@@ -1603,38 +1611,38 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
         if isinstance(pending_run_id, str) and pending_run_id:
             if getattr(ctx, "pending_reconciliation_requires_user_input", False) is True:
-                return _emit_tool_blocker_signal(
+                return _emit_loop_plane_refusal(
                     ctx,
                     _pending_reconciliation_requires_input_signal(
                         pending_run_id=pending_run_id, blocked_tool=tool_name
                     ),
                 )
-            return _emit_tool_blocker_signal(
+            return _emit_loop_plane_refusal(
                 ctx,
                 _pending_reconciliation_no_input_signal(pending_run_id=pending_run_id, blocked_tool=tool_name),
             )
 
         inspection_signal = _post_budget_page_inspection_signal(ctx, tool_name)
         if inspection_signal is not None:
-            return _emit_tool_blocker_signal(ctx, inspection_signal)
+            return _emit_loop_plane_refusal(ctx, inspection_signal)
 
         # Terminal anti-bot evidence should produce the final user-facing reply
         # before the generic budget rerun path can ask for another attempt.
         post_budget_challenge_signal = _post_budget_terminal_challenge_signal(ctx, arguments, tool_name)
         if post_budget_challenge_signal is not None:
-            return _emit_tool_blocker_signal(ctx, post_budget_challenge_signal)
+            return _emit_loop_plane_refusal(ctx, post_budget_challenge_signal)
 
         budget_signal = _per_tool_budget_problem_rerun_signal(ctx, arguments, tool_name)
         if budget_signal is not None:
-            return _emit_tool_blocker_signal(ctx, budget_signal)
+            return _emit_loop_plane_refusal(ctx, budget_signal)
 
         upstream_replay_signal = _post_budget_upstream_replay_signal(ctx, arguments, tool_name)
         if upstream_replay_signal is not None:
-            return _emit_tool_blocker_signal(ctx, upstream_replay_signal)
+            return _emit_loop_plane_refusal(ctx, upstream_replay_signal)
 
         challenge_signal = _challenge_gated_anti_bot_rerun_signal(ctx, arguments, tool_name)
         if challenge_signal is not None:
-            return _emit_tool_blocker_signal(ctx, challenge_signal)
+            return _emit_loop_plane_refusal(ctx, challenge_signal)
 
         streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
         streak = streak_raw if isinstance(streak_raw, int) else 0
@@ -1650,7 +1658,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
             user_facing = (
                 "I tried the same actions a few times without making progress. The site looks blocked. I'll stop here."
             )
-            return _emit_tool_blocker_signal(
+            return _emit_loop_plane_refusal(
                 ctx,
                 CopilotToolBlockerSignal(
                     blocker_kind="tool_error",
@@ -1680,7 +1688,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 "explaining the failure and asking them to verify the URL."
             )
             user_facing = "The URL I tried isn't reachable. Tell me the correct address and I'll try again."
-            return _emit_tool_blocker_signal(
+            return _emit_loop_plane_refusal(
                 ctx,
                 CopilotToolBlockerSignal(
                     blocker_kind="tool_error",
@@ -1695,57 +1703,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
 
         late_signal = _late_block_running_call_signal(ctx, tool_name)
         if late_signal is not None:
-            return _emit_tool_blocker_signal(ctx, late_signal)
-    grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
-    if grounding_signal is not None:
-        return _emit_tool_blocker_signal(ctx, grounding_signal)
+            return _emit_loop_plane_refusal(ctx, late_signal)
     return None
 
 
 _build_loop_blocker_signal = build_loop_blocker_signal
-
-
-def _recorded_outcome_grounding_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    if tool_name not in _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS:
-        return None
-    if maybe_satisfy_recorded_outcome_grounding_requirement(ctx):
-        return None
-    if not recorded_outcome_grounding_requires_current_page(ctx):
-        return None
-    requirement = ctx.recorded_outcome_grounding_requirement
-    if requirement is None:
-        return None
-    payload: AuthorTimeGateAblationPayload = {
-        "phase": requirement.phase,
-        "outcome_reason_code": requirement.reason_code,
-        "workflow_run_id": requirement.workflow_run_id,
-        "block_labels": list(requirement.block_labels),
-        "required_tool": requirement.required_tool,
-        "required_target_url": requirement.required_target_url,
-    }
-    if record_author_time_gate_ablation_event(
-        ctx,
-        gate_id="recorded_outcome_grounding",
-        reason_code="recorded_outcome_grounding_required",
-        fingerprint=requirement.structural_key,
-        blocked_tool=tool_name,
-        payload=payload,
-    ):
-        return None
-    return CopilotToolBlockerSignal(
-        blocker_kind="missing_required_context",
-        agent_steering_text=(
-            "The repeated recorded build-test outcome is still ungrounded. Call "
-            'inspect_page_for_composition(target_url="current_page") and use that bounded page '
-            "evidence before the next workflow mutation or browser mutation."
-        ),
-        user_facing_reason="I need to inspect the current page before changing the workflow again.",
-        recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({"inspect_page_for_composition"}),
-        renders_final_reply=False,
-        internal_reason_code="recorded_outcome_grounding_required",
-        blocked_tool=tool_name,
-    )
 
 
 def _analyze_run_blocks(

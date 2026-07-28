@@ -1823,29 +1823,6 @@ def test_terminal_goal_record_self_asserted_boolean_without_identifier_remains_u
     )
 
 
-def test_submit_terminal_still_rejects_false_submit_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": _terminal_goal_payload(submitted=False)})
-
-    assert (
-        grade_terminal_goal_record_criteria(
-            [
-                _criterion(
-                    "c0",
-                    "a commercial water service request is submitted",
-                    kind="terminal_action",
-                    terminal_action_family="request",
-                )
-            ],
-            snapshot,
-        )
-        == []
-    )
-
-
 @pytest.mark.parametrize(
     "payload",
     [
@@ -11729,21 +11706,6 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
     assert no_handler_result.is_fully_satisfied() is False
 
 
-@pytest.mark.asyncio
-async def test_completion_verification_still_fails_closed_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    _patch_completion_handler(monkeypatch, None)
-
-    result = await _maybe_run_completion_verification(_run_ctx(), _clean_success_result(), time.monotonic())
-
-    assert result is not None
-    assert result.status == "unavailable"
-    assert result.is_fully_satisfied() is False
-
-
 def test_completion_contract_not_violated_unavailable_blocks_surfacing() -> None:
     ctx = SimpleNamespace(
         completion_verification_result=CompletionVerificationResult("unavailable"),
@@ -14093,8 +14055,8 @@ async def test_p7_run2_zero_signal_packet_replays_to_typed_abstention() -> None:
     persisted_criteria = criteria_from_json(criteria_to_json(criteria))
     assert persisted_criteria[-1].request_slot_id == contract.slots[-1].slot_id
     assert persisted_criteria[-1].antecedent_family == "blocker"
-    assert persisted_criteria[-1].requested_output_floor_rekeyed is True
-    assert persisted_criteria[-1].floor_rekeyed_from_path == fixture["criterion"]["output_path"]
+    assert persisted_criteria[-1].requested_output_floor_rekeyed is False
+    assert persisted_criteria[-1].output_path == fixture["criterion"]["output_path"]
     ctx = _run_ctx()
     _set_workflow_labels(ctx, fixture["registered_output_row"]["block_label"])
     ctx.request_policy = RequestPolicy(
@@ -14963,3 +14925,108 @@ def test_fallback_degraded_criterion_in_structural_unfired_set_still_vetoes() ->
     assert result.degraded_criterion_ids == [fallback.id]
     assert result.contingent_degraded_criterion_ids == []
     assert result.is_fully_satisfied() is False
+
+
+def test_value_present_requested_output_presence_is_credited() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("star_count")
+    criteria = [
+        _criterion(
+            "c_star_count",
+            "The run returns the number of stars.",
+            output_path="output.star_count",
+            expected_output_shape="value_present",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"star_count": 22600}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    # value_present is verified by delivery: a present value at the declared path is satisfaction.
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "requested_output_present"
+    assert verdicts[0].grounding_mode == "presence"
+    assert verdicts[0].self_emitted_judgment_not_independent is False
+
+
+def test_pinned_exact_value_contradiction_still_refused() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("star_count")
+    criteria = [
+        _criterion(
+            "c_star_count",
+            "The run returns 22600 stars.",
+            output_path="output.star_count",
+            expected_output_value="22600",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"star_count": "17"}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+
+
+def _graded_minted_star_count_verdict() -> CriterionVerdict:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("star_count")
+    criteria = [
+        _criterion(
+            "c_star_count",
+            "The run returns the number of stars.",
+            output_path="output.star_count",
+            expected_output_shape="value_present",
+        )
+    ]
+    return grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={"extract_profile": {"star_count": 22600}},
+            block_output_sources={"extract_profile": "runtime_output"},
+        ),
+    )[0]
+
+
+def test_minted_value_present_single_criterion_reaches_verified_success() -> None:
+    verdict = _graded_minted_star_count_verdict()
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_star_count"],
+        verdicts=[verdict],
+    )
+
+    assert verdict.state == "satisfied"
+    assert result.is_fully_satisfied() is True
+
+
+def test_minted_value_present_criterion_corroborated_reaches_verified_success() -> None:
+    verdict = _graded_minted_star_count_verdict()
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_reach", "c_star_count"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_reach",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref="observed_end_state_url",
+            ),
+            verdict,
+        ],
+    )
+
+    assert result.is_fully_satisfied() is True

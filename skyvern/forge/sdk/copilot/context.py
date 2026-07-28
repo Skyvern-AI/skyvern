@@ -146,7 +146,6 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentClassifierResult
@@ -811,7 +810,6 @@ class CopilotContext(AgentContext):
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
-    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.
@@ -903,7 +901,6 @@ class CopilotContext(AgentContext):
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
     repeated_failure_streak_count: int = 0
-    last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
     # Unlike the progress-gated repair ceiling, this climbs even when every
     # rejection is different; it resets only on an accepted persist.

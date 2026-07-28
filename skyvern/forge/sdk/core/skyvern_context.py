@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
 
     from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, RuntimeOriginAuthority
-    from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch
+    from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch, ObservedTabs
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
     # Deferred import: skyvern_context.py sits below the service layer and
@@ -260,6 +260,11 @@ class SkyvernContext:
     # Newest accepted scrape (SKY-12874). Advanced by the scrape itself; actions are stamped with
     # the epoch they were planned under so an observation cannot vouch for a plan built before it.
     browser_observation_epoch: ObservationEpoch | None = None
+
+    # The open-tab list exactly as the planner's prompt rendered it, bound to the epoch it was
+    # rendered under (SKY-12875). A SwitchTabAction's tab_index resolves against this record and
+    # nothing else; no record, or a record from another epoch, resolves nothing.
+    browser_observed_tabs: ObservedTabs | None = None
 
     def set_enrich_tree_mode(self, mode: Any) -> None:
         self.enrich_tree_mode = parse_enrich_tree_mode(mode)
