@@ -66,6 +66,7 @@ def _mock_context() -> AgentContext:
         "scouted_interactions": [],
         "scout_trajectory": [],
         "challenge_solve_attempts": {},
+        "never_captured_obligation": None,
         "last_evaluate_actionable_signature": None,
         "last_scout_observation_trajectory_index": None,
     }
