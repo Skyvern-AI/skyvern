@@ -17,15 +17,16 @@ from __future__ import annotations
 
 import asyncio
 import typing as t
-from datetime import datetime, timedelta
 
 import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.browser_session_timeouts import MAX_LIFETIME_SECONDS, session_is_active
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
@@ -62,10 +63,20 @@ async def verify_browser_session(
     timeout_minutes = browser_session.timeout_minutes
 
     if started_at and timeout_minutes:
-        current_time = datetime.utcnow()
-        times_out_at = started_at + timedelta(minutes=timeout_minutes)
+        current_time = naive_utc_now()
+        base_timeout_seconds = timeout_minutes * 60
+        last_activity_at = browser_session.last_activity_at
+        seconds_since_last_activity = (
+            (current_time - last_activity_at).total_seconds() if last_activity_at is not None else None
+        )
 
-        if current_time > times_out_at:
+        if not session_is_active(
+            seconds_since_start=(current_time - started_at).total_seconds(),
+            base_timeout_seconds=base_timeout_seconds,
+            seconds_since_last_activity=seconds_since_last_activity,
+            idle_timeout_seconds=base_timeout_seconds,
+            max_lifetime_seconds=MAX_LIFETIME_SECONDS,
+        ):
             LOG.info(
                 "Browser session invalid, as it has timed out, but is still in a non-final status. This is likely a bug!",
                 browser_session_id=browser_session_id,
@@ -73,7 +84,7 @@ async def verify_browser_session(
                 timeout_minutes=timeout_minutes,
                 started_at=started_at.isoformat(),
                 now=current_time.isoformat(),
-                times_out_at=times_out_at.isoformat(),
+                last_activity_at=last_activity_at.isoformat() if last_activity_at is not None else None,
             )
             return None
 
