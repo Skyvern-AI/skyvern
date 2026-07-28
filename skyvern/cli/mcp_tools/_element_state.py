@@ -11,7 +11,10 @@ DEFAULT_DIRECT_ACTION_TIMEOUT_MS = 5000
 DIRECT_ACTION_TIMEOUT_ENV = "SKYVERN_MCP_DIRECT_TIMEOUT_MS"
 MIN_ACTION_TIMEOUT_MS = 1000
 MAX_ACTION_TIMEOUT_MS = 60000
-ELEMENT_STATE_PROBE_TIMEOUT_MS = 1000
+# The probe reports why an action failed, and every timeout here degrades to the useless "unknown"
+# state. It only runs after an action already failed, so a wider budget costs nothing on the happy
+# path and buys an accurate reason on the path that needs one.
+ELEMENT_STATE_PROBE_TIMEOUT_MS = 3000
 
 ACTION_TIMEOUT_DESCRIPTION = (
     "Max time to wait for the element in ms. "
@@ -24,7 +27,9 @@ _STATE_ERRORS: dict[ElementState, tuple[str, str, str]] = {
     "not_found": (
         ErrorCode.SELECTOR_NOT_FOUND,
         "Selector did not match any element before the direct action timeout",
-        "Verify the selector matches an element on the page, or wait for the element to render before retrying.",
+        "The page may have re-rendered since it was inspected, which invalidates a selector captured "
+        "earlier. Inspect the page again and act on a freshly reported selector rather than retrying "
+        "this one.",
     ),
     "hidden": (
         ErrorCode.ACTION_FAILED,
@@ -44,7 +49,8 @@ _STATE_ERRORS: dict[ElementState, tuple[str, str, str]] = {
     "unknown": (
         ErrorCode.ACTION_FAILED,
         "Direct action failed before the element became actionable",
-        "Re-check the selector and page state, or use an intent-based action if the target is dynamic.",
+        "The element may not have settled, or the page may have re-rendered since it was inspected. "
+        "Inspect the page again and act on a freshly reported selector.",
     ),
 }
 
@@ -75,6 +81,21 @@ def is_pointer_interception_error(exc: Exception) -> bool:
     return "intercepts pointer events" in message or "intercepted by another element" in message
 
 
+async def _click_point_is_covered(locator: Any) -> bool:
+    """True when a different element sits at the target's click point, i.e. the click cannot land."""
+    try:
+        return bool(
+            await locator.evaluate(
+                "el => { const r = el.getBoundingClientRect();"
+                " if (!r.width || !r.height) return false;"
+                " const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);"
+                " return !!top && top !== el && !el.contains(top); }"
+            )
+        )
+    except Exception:
+        return False
+
+
 async def classify_element_state(page: Any, selector: str, *, pointer_intercepted: bool = False) -> ElementState:
     # Frame-aware actions resolve against SkyvernPage._locator_scope (working iframe if set);
     # the probe must query the same root or an iframe failure misclassifies as not_found.
@@ -92,6 +113,10 @@ async def classify_element_state(page: Any, selector: str, *, pointer_intercepte
         if not await first.is_enabled():
             return "disabled"
         if pointer_intercepted:
+            return "occluded"
+        # Playwright reports an occluded target as a plain action timeout, so the caller cannot
+        # flag interception. Ask the page what actually sits at the click point instead.
+        if await _click_point_is_covered(first):
             return "occluded"
         return "unknown"
 

@@ -1,6 +1,7 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
 import inspect
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +80,49 @@ async def test_otp_repository_can_include_unscoped_workflow_run_rows_in_sql():
     assert "totp_codes.workflow_run_id = :workflow_run_id_1" in sql
     assert "totp_codes.workflow_run_id IS NULL" in sql
     assert " OR " in sql
+
+
+@pytest.mark.asyncio
+async def test_otp_repository_stores_blank_run_scoping_ids_as_null():
+    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
+
+    class CapturingWriteSession:
+        added = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def add(self, obj):
+            self.added = obj
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            obj.totp_code_id = "otp_test"
+            obj.created_at = obj.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    session = CapturingWriteSession()
+    repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
+
+    await repo.create_otp_code(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        content="123456",
+        code="123456",
+        otp_type=OTPType.TOTP,
+        task_id="",
+        workflow_id="",
+        workflow_run_id="",
+    )
+
+    assert session.added.workflow_run_id is None
+    assert session.added.workflow_id is None
+    assert session.added.task_id is None
 
 
 def test_debug_repository_instantiation():

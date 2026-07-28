@@ -562,7 +562,7 @@ def test_phase_tool_error_returns_none_when_phase_attr_missing() -> None:
             BuildPhase.COMPOSING,
             "build_phase_discovery_disallowed_post_compose",
             "retry_with_different_tool",
-            frozenset({"update_workflow", "update_and_run_blocks"}),
+            frozenset({"update_workflow", "update_and_run_blocks", "edit_block"}),
         ),
         (
             "navigate_browser",

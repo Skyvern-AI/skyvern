@@ -1330,6 +1330,10 @@ async def test_do_select_option_recognizes_aria_custom_selects(
     page, control = make_select_like_page(target)
     dom_options = [{"selector": "#music", "role": "option", "name": "Music"}]
     monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    # do_select_option's deadline is real wall clock (started_at + timeout/1000), so a
+    # loaded runner can blow the 100ms budget before the option loop ticks. Freeze the
+    # clock: this asserts the success path, not the deadline.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
     control.evaluate.side_effect = [
         target,
         [{"selector": "#music", "label": "Music", "value": "music"}],

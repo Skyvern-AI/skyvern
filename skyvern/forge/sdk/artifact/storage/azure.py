@@ -23,9 +23,11 @@ from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
+    SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
 from skyvern.forge.sdk.models import Step
@@ -149,11 +151,17 @@ class AzureStorage(BaseStorage):
         return await self.async_client.download_file(artifact.uri)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        share_urls = await self.async_client.create_sas_urls([artifact.uri])
+        share_urls = await self.get_share_links([artifact])
         return share_urls[0] if share_urls else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return await self.async_client.create_sas_urls([artifact.uri for artifact in artifacts])
+        return await presign_with_sensitive_cap(
+            artifacts,
+            presign=self.async_client.create_sas_urls,
+            presign_sensitive=lambda uris: self.async_client.create_sas_urls(
+                uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
+            ),
+        )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         tier = await self._get_storage_tier_for_org(artifact.organization_id)
