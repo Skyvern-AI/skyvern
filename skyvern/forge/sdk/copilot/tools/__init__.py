@@ -11,11 +11,9 @@ from agents import function_tool
 from agents.run_context import RunContextWrapper
 
 from skyvern.forge import app as app
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_testing,
 )
-from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_grounding_requires_current_page
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -51,9 +49,6 @@ from ._shared import (
 )
 from ._shared import _composition_get_html as _composition_get_html
 from ._shared import _current_workflow_has_evidence_block as _current_workflow_has_evidence_block
-from ._shared import (
-    _emit_tool_blocker_signal,
-)
 from ._shared import _fallback_page_info as _fallback_page_info
 from ._shared import _is_meaningful_extracted_data as _is_meaningful_extracted_data
 from ._shared import _proxy_location_trace_value as _proxy_location_trace_value
@@ -62,11 +57,8 @@ from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragmen
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
-from .banned_blocks import _challenge_http_request_reject_message as _challenge_http_request_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
-from .banned_blocks import _detect_timing_only_challenge_wait_blocks as _detect_timing_only_challenge_wait_blocks
 from .banned_blocks import _record_banned_block_reject_span as _record_banned_block_reject_span
-from .banned_blocks import _timing_only_challenge_wait_reject_message as _timing_only_challenge_wait_reject_message
 from .blockers import REPEATED_ACTION_STREAK_ABORT_AT as REPEATED_ACTION_STREAK_ABORT_AT
 from .blockers import _active_block_run_budget_seconds as _active_block_run_budget_seconds
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
@@ -162,7 +154,6 @@ from .frontier import (
     _workflow_with_runtime_frontier_starter_url_seed as _workflow_with_runtime_frontier_starter_url_seed,
 )
 from .guardrails import (
-    _COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA,
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     _authority_tool_error,
 )
@@ -172,9 +163,6 @@ from .guardrails import (
     _request_policy_allows_update_and_skip_run,
 )
 from .guardrails import _turn_intent_tool_error as _turn_intent_tool_error
-from .guardrails import (
-    _update_and_run_blocks_composition_evidence_precheck,
-)
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
 from .mcp_hooks import _click_pre_hook as _click_pre_hook
@@ -250,19 +238,35 @@ from .workflow_update import _code_block_safety_errors as _code_block_safety_err
 from .workflow_update import (
     _impose_output_contract_envelope_after_steering as _impose_output_contract_envelope_after_steering,
 )
-from .workflow_update import _metadata_contract_run_preflight_reject as _metadata_contract_run_preflight_reject
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
-from .workflow_update import _run_dispatch_definition_reject as _run_dispatch_definition_reject
 from .workflow_update import _scaffold_metadata_contract_for_update as _scaffold_metadata_contract_for_update
 from .workflow_update import _update_workflow as _update_workflow
+from .workflow_update import carry_author_time_findings as carry_author_time_findings
 from .workflow_update import (
     consume_output_contract_advisory_grant_for_run_result as consume_output_contract_advisory_grant_for_run_result,
 )
-from .workflow_update import metadata_same_key_terminal_preflight as metadata_same_key_terminal_preflight
 
 LOG = structlog.get_logger()
+
+_CREDENTIAL_DEFERRED_DRAFT_MESSAGE = (
+    "I can save this as a draft without running it because the credentials aren't set up yet. "
+    "Add them in the Credentials UI and ask me to test the workflow."
+)
+
+
+def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
+    """Credential-deferred drafts persist without a run, so they carry the same skip markers and
+    set the same flag the combined tool's skip branch does — credential-pause routing reads it."""
+    copilot_ctx.last_run_skipped_unbound_credentials = True
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        result["data"] = data
+    data["skipped_run"] = True
+    data["skip_reason"] = "workflow_credential_inputs_unbound"
+    data["message"] = _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
 
 
 @function_tool(
@@ -297,6 +301,9 @@ async def update_workflow_tool(
     refs, observation refs, and terminal verifier expectations.
     """
     copilot_ctx = ctx.context
+    # Mirrors the combined tool: a stale True from an earlier call in the same turn would
+    # misreport this call's authoring error as a credential ask.
+    copilot_ctx.last_run_skipped_unbound_credentials = False
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
     arguments = {
@@ -308,52 +315,6 @@ async def update_workflow_tool(
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
     credential_deferred_draft = _request_policy_allows_credential_deferred_draft(copilot_ctx)
-    # A credential-deferred draft is redirected to update_and_run_blocks' skip-run
-    # save path, which saves the draft and skips the browser run with the required
-    # credential setup message.
-    if credential_deferred_draft:
-        agent_steering = (
-            "Use update_and_run_blocks for this credential-deferred draft. It will save the workflow draft "
-            "and skip the browser run with the required credential setup message."
-        )
-        user_facing = (
-            "I can save this as a draft without running it because the credentials aren't set up yet. "
-            "Add them in the Credentials UI and ask me to test the workflow."
-        )
-        signal = CopilotToolBlockerSignal(
-            blocker_kind="authority_denied",
-            agent_steering_text=agent_steering,
-            user_facing_reason=user_facing,
-            recovery_hint="retry_with_different_tool",
-            cleared_by_tools=frozenset({"update_and_run_blocks"}),
-            internal_reason_code="request_policy_credential_deferred_redirect",
-            blocked_tool="update_workflow",
-        )
-        payload = _emit_tool_blocker_signal(copilot_ctx, signal)
-        result = {"ok": False, "error": payload}
-        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
-        return json.dumps(result)
-
-    with copilot_span(
-        "composition_evidence_precheck",
-        data={**_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA, "tool_name": "update_workflow"},
-    ):
-        composition_evidence_error = _update_and_run_blocks_composition_evidence_precheck(
-            copilot_ctx,
-            workflow_yaml,
-            normalized_block_observation_refs,
-            block_observation_refs,
-        )
-    if composition_evidence_error:
-        result = {"ok": False, "error": composition_evidence_error}
-        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_workflow",
-            result=result,
-        )
-        sanitized = sanitize_tool_result_for_llm("update_workflow", result)
-        return json.dumps(sanitized)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
@@ -364,8 +325,11 @@ async def update_workflow_tool(
                 "raw_code_artifact_metadata": code_artifact_metadata,
             },
             copilot_ctx,
-            allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
+            allow_missing_credentials=credential_deferred_draft
+            or getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
         )
+        if credential_deferred_draft and result.get("ok"):
+            _mark_credential_deferred_draft(copilot_ctx, result)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
         if result.get("ok") is False:
@@ -458,21 +422,6 @@ async def run_blocks_tool(
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", loop_error)
-
-    definition_reject_result = _run_dispatch_definition_reject(copilot_ctx, copilot_ctx.workflow_yaml or "")
-    if definition_reject_result is not None:
-        record_tool_step_result_for_ctx(
-            copilot_ctx,
-            "run_blocks_and_collect_debug",
-            arguments,
-            definition_reject_result,
-        )
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="run_blocks_and_collect_debug",
-            result=definition_reject_result,
-        )
-        return json.dumps(definition_reject_result)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
@@ -669,68 +618,9 @@ async def update_and_run_blocks_tool(
         serialized_code_artifact_metadata = scaffolded_code_artifact_metadata
         arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
 
-    metadata_same_key_terminal = metadata_same_key_terminal_preflight(
-        copilot_ctx,
-        workflow_yaml,
-        serialized_code_artifact_metadata,
-    )
-    if metadata_same_key_terminal is not None:
-        record_tool_step_result_for_ctx(
-            copilot_ctx,
-            "update_and_run_blocks",
-            arguments,
-            metadata_same_key_terminal,
-        )
-        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", metadata_same_key_terminal)
-        return json.dumps(sanitized)
-
-    if recorded_outcome_grounding_requires_current_page(copilot_ctx):
-        loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
-        if loop_error:
-            return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
-
-    metadata_contract_preflight_reject = _metadata_contract_run_preflight_reject(
-        copilot_ctx,
-        workflow_yaml,
-        serialized_code_artifact_metadata,
-        parameters or {},
-    )
-    if metadata_contract_preflight_reject is not None:
-        record_tool_step_result_for_ctx(
-            copilot_ctx,
-            "update_and_run_blocks",
-            arguments,
-            metadata_contract_preflight_reject,
-        )
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=metadata_contract_preflight_reject,
-        )
-        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", metadata_contract_preflight_reject)
-        return json.dumps(sanitized)
-
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
-
-    with copilot_span("composition_evidence_precheck", data=_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA):
-        composition_evidence_error = _update_and_run_blocks_composition_evidence_precheck(
-            copilot_ctx,
-            workflow_yaml,
-            normalized_block_observation_refs,
-            block_observation_refs,
-        )
-    if composition_evidence_error:
-        result = {"ok": False, "error": composition_evidence_error}
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=result,
-        )
-        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", result)
-        return json.dumps(sanitized)
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
 
@@ -782,6 +672,7 @@ async def update_and_run_blocks_tool(
                 "skip_reason": "workflow_credential_inputs_unbound",
             },
         }
+        carry_author_time_findings(update_result, skip_result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, skip_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
@@ -794,29 +685,6 @@ async def update_and_run_blocks_tool(
             workflow_permanent_id=copilot_ctx.workflow_permanent_id,
         )
         return json.dumps(skip_result)
-
-    exact_candidate_preflight_reject = _metadata_contract_run_preflight_reject(
-        copilot_ctx,
-        copilot_ctx.workflow_yaml or workflow_yaml,
-        copilot_ctx.code_artifact_metadata,
-        parameters or {},
-        enforce_untagged_declared_inputs=True,
-    )
-    if exact_candidate_preflight_reject is not None:
-        record_tool_step_result_for_ctx(
-            copilot_ctx,
-            "update_and_run_blocks",
-            arguments,
-            exact_candidate_preflight_reject,
-        )
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=exact_candidate_preflight_reject,
-            workflow_updated=True,
-        )
-        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", exact_candidate_preflight_reject)
-        return json.dumps(sanitized)
 
     # Step 2: Compute frontier and run the blocks.
     new_definition = None
@@ -832,6 +700,7 @@ async def update_and_run_blocks_tool(
         data = result.get("data")
         if isinstance(data, dict):
             data["workflow_updated"] = True
+        carry_author_time_findings(update_result, result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
@@ -865,6 +734,7 @@ async def update_and_run_blocks_tool(
             run_result,
             completion_verification,
         )
+        carry_author_time_findings(update_result, tool_visible_result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, tool_visible_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
