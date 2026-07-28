@@ -1511,7 +1511,13 @@ async def _resolve_collapse_xp_assignment(
     return assignment
 
 
-async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -> _CollapseGateResult:
+async def _resolve_collapse_gate(
+    task: Task,
+    family_flag: str,
+    log_label: str,
+    *,
+    consult_assignment: bool = True,
+) -> _CollapseGateResult:
     organization_id = task.organization_id
     if not organization_id:
         return _CollapseGateResult(False, None, False)
@@ -1538,6 +1544,9 @@ async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -
         )
         if not family_enabled:
             return _CollapseGateResult(False, None, False)
+        if not consult_assignment:
+            # Family-only mode skips the umbrella (and its memo seed) so sibling families keep their control arms.
+            return _CollapseGateResult(family_enabled, None, False)
         # Cached-script runs skip only the umbrella randomization: they must always be
         # in-treatment when the family is on, while the family flag stays the kill switch.
         if script_mode_run:
@@ -1561,7 +1570,13 @@ async def _is_collapse_fanout_enabled(task: Task, family_flag: str, log_label: s
 
 
 async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
-    return await _is_collapse_fanout_enabled(task, COLLAPSE_SELECT_FANOUT_FLAG, "collapse-select-fanout")
+    gate = await _resolve_collapse_gate(
+        task,
+        COLLAPSE_SELECT_FANOUT_FLAG,
+        "collapse-select-fanout",
+        consult_assignment=False,
+    )
+    return gate.family_enabled
 
 
 async def _is_collapse_custom_select_fanout_enabled(task: Task) -> bool:

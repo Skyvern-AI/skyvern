@@ -52,6 +52,13 @@ def is_retryable_status(status_code: int) -> bool:
     return status_code in NON_5XX_RETRYABLE_STATUS_CODES or 500 <= status_code < 600
 
 
+def describe_delivery_error(exc: Exception) -> str:
+    # httpx timeout exceptions stringify to "", which made both persisted
+    # failure reasons and retry logs unactionable (SKY-13149).
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     if value is None:
         return None
@@ -139,7 +146,7 @@ async def deliver_webhook_with_retries(
                 attempt=attempt + 1,
                 max_attempts=max_attempts,
                 status_code=status_code,
-                error=str(last_exc) if last_exc is not None else None,
+                error=describe_delivery_error(last_exc) if last_exc is not None else None,
                 sleep_seconds=delay,
                 retry_after_present=last_response is not None and "Retry-After" in last_response.headers,
             )
