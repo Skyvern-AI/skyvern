@@ -9,6 +9,10 @@ You have access to the following task types to take actions:
   - When the goal is "Open up to 10 links from an ecomm search result page, and extract information like the price of each product.", loop task should be used to iterate through a list of links or URLs. In each iteration of the loop, the task will go to the linked page and trigger another planning session with the goal of extracting price information of the product
   - When the goal is "download 5 documents found on a page", loop task should be used to iterate through a list of document names. Each document will trigger another planning session to download the relative document
   - When the goal is "compare a field across 10 items", use ONE loop over the 10 items — do NOT plan 10 separate navigate+extract task pairs
+{% if compute_enabled|default(false) %}- compute: this task runs a small program over data that earlier extract/loop tasks have ALREADY captured into the task history, to produce a deliverable that requires deterministic calculation — ranking, totaling, averaging, counting, filtering, or selecting the minimum/maximum across the gathered records. Use compute when every piece of DATA the answer needs is already present in the task history's extracted_data and the only remaining work is to combine or calculate over it. Do NOT use extract for this — extract only re-scrapes the current page and cannot reliably rank, total, or pick across the task history; a compute task computes the exact answer from data you already have.
+  - When the goal is "find the cheapest plan" and the plan tiers have already been extracted, use compute to select the minimum by price from the extracted tiers
+  - When the goal is "rank the products by rating" or "total the prices of the rows you collected", and the underlying rows are already in the task history, use compute to produce the ranking or total
+{% endif %}
 
 **Loop preference:** Do NOT decompose repeated same-shape work into many sequential one-off navigate/extract tasks. Iterating N items as N separate planned tasks exhausts the planning-iteration and step budget and usually runs out before finishing; a single loop task does the same work in one planning step. Reach for a loop as soon as you can enumerate (or will discover on the page) a list of similar targets, even before you know the exact count.
 
@@ -48,6 +52,8 @@ CRITICAL - Do not declare success on a partially-complete multi-part goal:
 CRITICAL - The agent's own final answer is composed at completion, not by a task:
 - The final summary, comparison, recommendation, brief, or decision returned to the user is written automatically once you set user_goal_achieved to true. No task type authors it — extract only scrapes the current page and cannot synthesize across the task history.
 - Once the underlying DATA each required part needs has been captured by extract tasks, set user_goal_achieved to true. Do NOT plan extract or navigate tasks whose only purpose is to author the agent's own response — e.g. "summarize the findings", "combine the results into a recommendation", "present the comparison". That loops forever, because extract keeps returning page data instead of the synthesis, and it is the single most common way these runs exhaust their step budget.
+{% if compute_enabled|default(false) %}- Exception — deterministic calculation over gathered data is a compute task, not the auto-written summary: if the deliverable requires a precise computed result over data already in the task history (rank the items, total/average a column, count matches, filter, pick the min/max), plan ONE compute task to calculate it exactly before completing. The auto-written summary handles prose, but it should not be relied on to do arithmetic or ranking in its head. Still do NOT use extract for this, and do NOT plan a compute task merely to re-word a prose summary.
+{% endif %}
 - Exception — required on-page actions still count: entering content INTO a web page the goal asks you to fill (a form, document, or post), and completing terminal actions the goal requires (submit, confirm, place order, send), are real navigate tasks and must still be done. This carve-out is only about the agent's own returned answer — do NOT set user_goal_achieved to true while a required final action is still pending.
 
 CRITICAL - Honor explicit count, selection, and kept-open-tab constraints in the goal:
@@ -74,7 +80,7 @@ Reply in JSON format with the following keys:
   "should_terminate": bool, // True ONLY if the user goal is definitively IMPOSSIBLE to achieve. Must have explicit evidence from the page. See termination guidelines above. False if there's any chance the goal can still be achieved.
   "termination_reason": str, // If should_terminate is true, quote the EXACT error message or text from the page that proves impossibility. Be specific. Null if should_terminate is false.
   "plan": str, // The mini goal to achieve to move towards the user goal. DO NOT come up or hallucinate any data that's not provided in the user goal. Be accurate and precise. Return null if the user goal has been achieved or if should_terminate is true.
-  "task_type": str, // One of the available task types: navigate, extract, loop. Null if user_goal_achieved is true or should_terminate is true.
+  "task_type": str, // One of the available task types: navigate, extract, loop{% if compute_enabled|default(false) %}, compute{% endif %}. Null if user_goal_achieved is true or should_terminate is true.
   "loop_values": list[str], // a list of string values to iterate through for loop task. null if it's not a loop task
   "is_loop_value_link": bool, // true if the loop_values is a list of urls to go to before for each planning session inside the loop
 }

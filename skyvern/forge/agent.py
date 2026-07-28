@@ -5194,17 +5194,23 @@ class ForgeAgent:
                         data=video_artifact.video_data,
                     )
                     continue
-                # No pre-registered artifact row: a recording attached at browser teardown
-                # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
-                # Upload by path so the bytes stream straight from disk to storage.
+                # A teardown-attached recording has no pre-registered artifact row.
+                # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
                 video_path = video_artifact.video_path
-                if not video_path or not os.path.exists(video_path):
+                if video_artifact.video_data:
+                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                    )
+                elif video_path and os.path.exists(video_path):
+                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                    )
+                else:
                     continue
-                video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    path=video_path,
-                )
 
             _ctx = skyvern_context.current()
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
