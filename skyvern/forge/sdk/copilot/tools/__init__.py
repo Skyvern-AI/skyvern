@@ -528,6 +528,7 @@ async def update_and_run_blocks_tool(
     """Update the workflow YAML and immediately run the specified blocks in one step.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
+
     `block_labels` may be a tested frontier subset of the full workflow YAML;
     save the complete reusable workflow, then run only the next 1-2 unverified
     blocks when a long form/search/result chain can be verified incrementally.
