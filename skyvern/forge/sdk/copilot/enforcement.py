@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_authoring_repair_context,
-    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -97,7 +96,6 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
-    DiagnosisRepairContract,
     RepairLoopState,
     RepairNextAction,
 )
@@ -155,7 +153,6 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
-    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
@@ -413,39 +410,6 @@ def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
     contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
     state = getattr(contract, "repair_loop_state", None)
     return state if isinstance(state, RepairLoopState) else None
-
-
-def _needs_repair_ceiling_halt(ctx: Any) -> bool:
-    state = _repair_loop_state(ctx)
-    return state is not None and state.ceiling_reached is True and run_backed_repair_evidence_exists(ctx)
-
-
-def repair_ceiling_stop_signal(
-    ctx: Any,
-    contract: DiagnosisRepairContract | None,
-    config: CopilotConfig | None = None,
-) -> CopilotToolBlockerSignal:
-    state = contract.repair_loop_state if isinstance(contract, DiagnosisRepairContract) else None
-    count = state.consecutive_identical_repair_count if state is not None else 0
-    evidence = loop_blocker_evidence_from_ctx(ctx)
-    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
-        "repair_ceiling_reached", evidence, blocked_tool="update_and_run_blocks"
-    )
-    agent_steering = (
-        f"This repair has made no verified progress across {count} attempts; "
-        "stop retrying and report the recorded blocker from the preserved draft."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=evidence.has_draft,
-        renders_final_reply=True,
-        internal_reason_code="repair_ceiling_reached",
-        blocked_tool="update_and_run_blocks",
-    )
 
 
 def code_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
@@ -1660,19 +1624,6 @@ def _check_enforcement(
         raise CopilotGoalSatisfied()
     if built_unverified_repair_inert_context(ctx) or built_complete_without_evaluated_outcome(ctx):
         raise CopilotBuiltUnverified()
-
-    if _needs_repair_ceiling_halt(ctx):
-        contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-        state = _repair_loop_state(ctx)
-        # Backstop: detection-time latch normally raises this above; catches a run-backed increment that bypassed it.
-        signal = repair_ceiling_stop_signal(ctx, contract, config)
-        stash_blocker_signal(ctx, signal)
-        stash_repair_ceiling_turn_halt(
-            ctx,
-            signal,
-            consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
-        )
-        raise_if_turn_halt(ctx, verified=verified)
 
     # A pending credential pause pre-empts every hygiene nudge below, not just
     # the failed-test one: a credential-blocked update_and_run_blocks call

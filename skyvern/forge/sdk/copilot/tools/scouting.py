@@ -35,6 +35,9 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     validated_dynamic_row_period_matches,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    enclosing_form_submit_controls_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -81,6 +84,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     resolve_browser_state_for_context,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
 
 from ._shared import (
@@ -552,6 +556,63 @@ async def _capture_element_fingerprint(
     captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
     captured["probed"] = _FINGERPRINT_PROBED_ATTRS
     return captured
+
+
+async def _capture_post_interaction_screenshot(
+    ctx: AgentContext, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> None:
+    """Attach a look at the page after a state-changing action. Reading the DOM answers "what is
+    on the page" but not "did that work" -- a filled password reads as empty, and a dialog covering
+    the content reads as an ordinary node. Only the most recent screenshot is retained.
+    """
+    # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
+    if not getattr(ctx, "supports_vision", False):
+        return
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_screenshot", {}),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return
+    if isinstance(result, dict) and result.get("ok"):
+        enqueue_screenshot_from_result(ctx, result)
+
+
+async def _capture_enclosing_form_submits(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> list[dict[str, str]]:
+    """Submit controls of the form holding a just-filled field, so submitting what was filled is not
+    a guess among the page's other prominent buttons. Returns an empty list on failure."""
+    selector = _selector_text(selector)
+    if not selector:
+        return []
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return []
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": enclosing_form_submit_controls_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return []
+    if not isinstance(result, dict) or not result.get("ok"):
+        return []
+    controls = (result.get("data") or {}).get("result")
+    if not isinstance(controls, list):
+        return []
+    return [
+        {"label": str(entry.get("label") or "")[:80], "selector": str(entry.get("selector") or "")[:160]}
+        for entry in controls
+        if isinstance(entry, dict) and (entry.get("label") or entry.get("selector"))
+    ]
 
 
 def _capped_with_eviction_accounting(
