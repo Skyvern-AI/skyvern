@@ -75,7 +75,7 @@ def _config_with_preserved_api_key(config: CustomLLMConfig, existing_custom_llm:
     summary="List Custom LLMs",
     description="List the custom LLM configurations available to the current organization.",
     tags=["Custom LLMs"],
-    openapi_extra={"x-fern-sdk-method-name": "list_custom_llms"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_custom_llms"},
 )
 @base_router.get(
     "/custom-llms/",
@@ -111,7 +111,7 @@ async def list_custom_llms(
     summary="Create Custom LLM",
     description="Create a custom LLM configuration for the current organization.",
     tags=["Custom LLMs"],
-    openapi_extra={"x-fern-sdk-method-name": "create_custom_llm"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "create_custom_llm"},
 )
 @base_router.post(
     "/custom-llms/",
@@ -139,7 +139,7 @@ async def create_custom_llm(
     summary="Update Custom LLM",
     description="Update a custom LLM configuration for the current organization.",
     tags=["Custom LLMs"],
-    openapi_extra={"x-fern-sdk-method-name": "update_custom_llm"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_custom_llm"},
 )
 @base_router.put(
     "/custom-llms/{custom_llm_id}/",
@@ -175,7 +175,7 @@ async def update_custom_llm(
     summary="Delete Custom LLM",
     description="Delete a custom LLM configuration for the current organization.",
     tags=["Custom LLMs"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_custom_llm"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_custom_llm"},
 )
 @base_router.delete(
     "/custom-llms/{custom_llm_id}/",
