@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
     loop_blocker_evidence_from_ctx,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedOutcomeGroundingRequirement
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
@@ -183,6 +184,32 @@ def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
         "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
     )
     assert dict(ctx.blocker_signal.extra) == {}
+
+
+def test_unsatisfied_grounding_requirement_does_not_suppress_loop_guards() -> None:
+    requirement = RecordedOutcomeGroundingRequirement(
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        structural_key="key",
+        workflow_run_id="wr_1",
+        block_labels=["block_a"],
+    )
+
+    consecutive_ctx = _ctx(consecutive_tool_tracker=_streak("click"))
+    consecutive_ctx.recorded_outcome_grounding_requirement = requirement
+    consecutive_payload = _tool_loop_error(consecutive_ctx, "click", None)
+
+    assert consecutive_payload is not None
+    assert isinstance(consecutive_ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert consecutive_ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+
+    failed_step_ctx = _ctx(failed_tool_step_tracker={tool_step_identity("update_workflow", {}): 3})
+    failed_step_ctx.recorded_outcome_grounding_requirement = requirement
+    failed_step_payload = _tool_loop_error(failed_step_ctx, "update_workflow", {})
+
+    assert failed_step_payload is not None
+    assert isinstance(failed_step_ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert failed_step_ctx.blocker_signal.internal_reason_code == "loop_detected_repeated_failed_step"
 
 
 def test_consecutive_evaluate_loop_without_composition_steer_uses_generic_copy() -> None:

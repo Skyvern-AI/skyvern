@@ -5,6 +5,7 @@ URL at the point of use, so consumers never depend on the long-lived URLs
 embedded in earlier API responses.
 """
 
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS,
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -207,6 +209,57 @@ class TestMintedUrlAgainstContentEndpoint:
             spliced = signed_url.replace("/artifacts/a_1/", "/artifacts/a_other/")
             resp = client.get(spliced)
         assert resp.status_code == 403
+
+
+class TestSensitiveArtifactEmbeddedUrl:
+    """Screenshots/recordings embedded in API and webhook payloads (SKY-12527).
+
+    Those URLs are not minted on demand, so they carry the capped TTL rather
+    than the org's — and stop authorizing anything once it lapses.
+    """
+
+    def _embedded_url_and_client(self, artifact: Artifact) -> tuple[str, TestClient, "AsyncMock"]:
+        with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
+            patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
+            patch("skyvern.forge.sdk.artifact.manager.app") as manager_app,
+        ):
+            from skyvern.forge.sdk.artifact.manager import ArtifactManager
+
+            manager = ArtifactManager()
+            manager_app.DATABASE.organizations.get_organization = AsyncMock(return_value=_make_org())
+            url = asyncio.run(manager.get_share_link(artifact))
+        return url, _make_client(), AsyncMock(return_value=artifact)
+
+    def _fetch(self, artifact: Artifact, url: str, client: TestClient, age_seconds: int) -> "TestClient.Response":
+        real_time = time.time
+        with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
+            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            patch("skyvern.forge.sdk.artifact.signing.time.time", new=lambda: real_time() + age_seconds),
+        ):
+            app_module.DATABASE.artifacts.get_artifact_by_id_no_org = AsyncMock(return_value=artifact)
+            app_module.ARTIFACT_MANAGER.retrieve_artifact = AsyncMock(return_value=b"secret-pixels")
+            return client.get(url.replace("http://testserver", ""))
+
+    def test_embedded_screenshot_url_expires_within_the_sensitive_window(self) -> None:
+        artifact = _make_artifact()
+        url, client, _ = self._embedded_url_and_client(artifact)
+        expiry = int(parse_qs(urlparse(url).query)["expiry"][0])
+        assert expiry - int(time.time()) <= SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+
+        assert self._fetch(artifact, url, client, age_seconds=0).status_code == 200
+        replayed = self._fetch(artifact, url, client, age_seconds=SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS + 5)
+        assert replayed.status_code == 403
+
+    def test_expired_screenshot_url_is_not_revived_by_dropping_the_signature(self) -> None:
+        """Stripping sig/kid/expiry falls back to the org-auth path, which needs credentials."""
+        artifact = _make_artifact()
+        url, client, _ = self._embedded_url_and_client(artifact)
+        unsigned = url.replace("http://testserver", "").split("?")[0]
+        with patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON):
+            resp = client.get(unsigned)
+        assert resp.status_code in (401, 403)
 
 
 class TestKeyringUnsetFallback:

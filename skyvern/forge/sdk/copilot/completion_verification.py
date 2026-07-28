@@ -102,7 +102,9 @@ class CriterionVerdict:
     evidence_ref: str | None = None
     missing_evidence: str | None = None
     output_path: str | None = None
-    grounding_mode: Literal["exact_value", "shape", "missing", "terminal_record", "judgment_boolean"] | None = None
+    grounding_mode: (
+        Literal["exact_value", "shape", "missing", "terminal_record", "judgment_boolean", "presence"] | None
+    ) = None
     expected_output_shape: str | None = None
     has_exact_value: bool = False
     requested_output_evidence_source: str | None = None

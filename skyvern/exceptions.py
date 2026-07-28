@@ -632,6 +632,10 @@ class FailedToTakeScreenshot(SkyvernException):
         super().__init__(f"Failed to take screenshot. Error message: {error_message}")
 
 
+class ScreenshotTargetClosed(FailedToTakeScreenshot):
+    pass
+
+
 class EmptyScrapePage(SkyvernException):
     def __init__(self) -> None:
         super().__init__("Failed to scrape the page, returned an NONE result")
