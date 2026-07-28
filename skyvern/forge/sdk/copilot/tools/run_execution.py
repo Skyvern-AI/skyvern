@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -24,7 +23,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
-    MetadataRejectLadderState,
     RecordedBuildTestOutcome,
     RecordedOutcomeGroundingRequirement,
     arm_recorded_outcome_grounding_requirement,
@@ -35,7 +33,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
     registered_output_payload_binds_output_path,
-    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
@@ -76,7 +73,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    repair_ceiling_stop_signal,
     reset_no_progress_interaction_count,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -129,7 +125,6 @@ from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     stash_delivered_unverified_turn_halt,
-    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.typed_value_policy import should_reject_type_text_value
@@ -3439,24 +3434,6 @@ def _should_arm_recorded_outcome_grounding(copilot_ctx: Any) -> bool:
     return bool(latest.workflow_run_id or getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
 
 
-def _metadata_reject_ladder_defers_repair_ceiling(copilot_ctx: CopilotContext, *, count: int) -> bool:
-    state = getattr(copilot_ctx, "metadata_reject_ladder_state", None)
-    if not isinstance(state, MetadataRejectLadderState):
-        return False
-    latest = copilot_ctx.latest_recorded_build_test_outcome
-    if (
-        not isinstance(latest, RecordedBuildTestOutcome)
-        or latest.phase != "author_time_reject"
-        or latest.reason_code != "metadata_reject"
-        or latest.structural_key != state.structural_key
-    ):
-        return False
-    threshold = settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL
-    # Reserve the first ceiling crossing for same-key confirmation. Beyond it, only the active
-    # rung-2 metadata retry defers; an unrelated latest repair restores the generic fallback.
-    return count == threshold or state.streak_count >= 2
-
-
 def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRepairContract) -> None:
     """Count consecutive REPAIR verdicts that made no newly-verified forward progress.
 
@@ -3490,12 +3467,10 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
     signature = _repair_non_convergence_signature(copilot_ctx, contract)
     if signature is None or progressed:
         copilot_ctx.consecutive_non_converging_repair_count = 0
-        copilot_ctx.last_repair_non_convergence_signature = None
         clear_recorded_outcome_grounding_requirement(copilot_ctx)
         contract.repair_loop_state = RepairLoopState(
             streak_token=None,
             consecutive_identical_repair_count=0,
-            ceiling_reached=False,
         )
         return
     prior_count = copilot_ctx.consecutive_non_converging_repair_count
@@ -3511,32 +3486,12 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
         ):
             clear_recorded_outcome_grounding_requirement(copilot_ctx)
     copilot_ctx.consecutive_non_converging_repair_count = count
-    copilot_ctx.last_repair_non_convergence_signature = signature
-    repair_ceiling_reached = count >= settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL
-    if repair_ceiling_reached and _metadata_reject_ladder_defers_repair_ceiling(copilot_ctx, count=count):
-        state = copilot_ctx.metadata_reject_ladder_state
-        assert isinstance(state, MetadataRejectLadderState)
-        repair_ceiling_reached = False
-        LOG.info(
-            "copilot_metadata_reject_ladder_deferred_repair_ceiling",
-            structural_key=state.structural_key,
-            streak_count=state.streak_count,
-            repair_count=count,
-        )
     contract.repair_loop_state = RepairLoopState(
         streak_token=signature,
         consecutive_identical_repair_count=count,
-        ceiling_reached=repair_ceiling_reached,
     )
     if _should_arm_recorded_outcome_grounding(copilot_ctx):
         arm_recorded_outcome_grounding_requirement(copilot_ctx)
-    if contract.repair_loop_state.ceiling_reached and run_backed_repair_evidence_exists(copilot_ctx):
-        signal = repair_ceiling_stop_signal(copilot_ctx, contract)
-        contract.repair_decision = contract.repair_decision.model_copy(
-            update={"next_action": RepairNextAction.STOP, "target_blocks": []}
-        )
-        stash_blocker_signal(copilot_ctx, signal)
-        stash_repair_ceiling_turn_halt(copilot_ctx, signal, consecutive_identical_repair_count=count)
 
 
 def _record_diagnosis_repair_contract(

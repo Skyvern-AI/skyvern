@@ -1023,6 +1023,28 @@ class TestVerifyScoutTypeLanded:
         ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_an_auto_formatting_field_passes_despite_growing_past_the_typed_length(self) -> None:
+        """A phone/card/date input inserts its own separators, so the readback is longer than what
+        was typed with nothing having landed in the wrong field. Rejecting it fails every such form."""
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        ctx = self._ctx_with_value("(555) 123-4567")
+        result = await _verify_scout_type_landed(ctx, selector="#phone", typed_length=len("5551234567"))
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_a_value_appended_to_an_occupied_field_still_fails(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        ctx = self._ctx_with_value("alreadyherenewvalue")
+        result = await _verify_scout_type_landed(ctx, selector="#name", typed_length=len("newvalue"))
+
+        assert result is not None
+        assert result["ok"] is False
+        assert "already held a value" in result["error"]
+
+    @pytest.mark.asyncio
     async def test_zero_typed_length_skips_readback(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
 

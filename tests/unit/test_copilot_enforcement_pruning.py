@@ -2185,7 +2185,7 @@ class TestSynthesizedOfferPersistenceGate:
             cleared_by_tools=frozenset(),
             preserves_workflow_draft=True,
             renders_final_reply=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
 

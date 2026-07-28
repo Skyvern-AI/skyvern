@@ -71,3 +71,89 @@ def test_type_text_rejection_allows_benign_secret_word_search_phrases() -> None:
     assert should_reject_type_text_value(value="2fa setup", selector="#search", intent="search help") is False
     assert should_reject_type_text_value(value="password", selector="#search", intent="search catalog") is True
     assert should_reject_type_text_value(value="password manager", selector="input[type=password]", intent="") is True
+
+
+@pytest.mark.asyncio
+async def test_type_text_refuses_a_value_already_registered_as_a_credential() -> None:
+    """A real password need not look like one, and this one reached a plaintext username field.
+    The value is known to be secret because a credential fill registered it."""
+    ctx = SimpleNamespace(
+        organization_id="o",
+        browser_session_id=None,
+        pending_scout_source_url=None,
+        pending_scout_typed_value=None,
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        secret_scrub_values=["Tuesday Harbor 41"],
+    )
+
+    rejected = await _type_text_pre_hook({"selector": "#username", "text": "Tuesday Harbor 41"}, ctx)
+
+    assert rejected is not None
+    assert rejected["ok"] is False
+    assert "Tuesday Harbor 41" not in rejected["error"]
+    assert ctx.pending_scout_typed_value is None
+
+
+@pytest.mark.asyncio
+async def test_code_block_schema_carries_the_steps_already_demonstrated() -> None:
+    """The synthesizer that checks a draft against the demonstrated steps also answers what to
+    write, so the block is authored from the trajectory instead of corrected against it."""
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
+
+    ctx = SimpleNamespace(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        code_only_code_schema_seen=False,
+        reached_download_target=None,
+        scout_trajectory=[
+            {"tool_name": "click", "selector": 'button[aria-label="Log in"]', "source_url": "https://example.com/a"}
+        ],
+    )
+
+    result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+
+    demonstrated = result["data"]["demonstrated_steps"]
+    assert "aria-label=" in demonstrated and "Log in" in demonstrated
+    assert ".click()" in demonstrated
+
+
+@pytest.mark.asyncio
+async def test_demonstrated_steps_match_the_synthesis_the_draft_is_judged_against() -> None:
+    """The payload is only worth reading if it is the source the judge compares the draft to.
+    Synthesized with different arguments it is a laxer variant, and authoring from it reproduces
+    the correction round-trip this exists to remove."""
+    from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
+
+    trajectory = [
+        {"tool_name": "click", "selector": 'button[aria-label="Log in"]', "source_url": "https://example.com/a"},
+        {"tool_name": "click", "selector": "button", "source_url": "https://example.com/a"},
+        {"tool_name": "press_key", "key": "Enter", "source_url": "https://example.com/a"},
+    ]
+    ctx = SimpleNamespace(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        code_only_code_schema_seen=False,
+        reached_download_target=None,
+        scout_trajectory=list(trajectory),
+    )
+
+    result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+
+    judged = synthesize_code_block(list(trajectory), strict_selectors=True, reached_download_target=None)
+    assert judged is not None
+    assert result["data"]["demonstrated_steps"] == judged.code
+
+
+@pytest.mark.asyncio
+async def test_code_block_schema_omits_demonstrated_steps_before_anything_is_demonstrated() -> None:
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
+
+    ctx = SimpleNamespace(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        code_only_code_schema_seen=False,
+        reached_download_target=None,
+        scout_trajectory=[],
+    )
+
+    result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+
+    assert "demonstrated_steps" not in result["data"]
