@@ -196,6 +196,36 @@ def test_enforce_prompt_ceiling_tracked_noop_under_ceiling() -> None:
     assert post_kwargs["data_extraction_schema"] == {"type": "object"}
 
 
+def test_enforce_prompt_ceiling_tracked_error_log_reports_zero_drops_and_html_share(
+    small_prompt_ceiling: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.exceptions import SkyvernContextWindowExceededError
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils import prompt_engine
+
+    log = MagicMock()
+    monkeypatch.setattr(prompt_engine, "LOG", log)
+
+    # check-user-goal has no CEILING_FALLBACK_KEYS_BY_TEMPLATE entry, so no drop is attempted
+    with pytest.raises(SkyvernContextWindowExceededError):
+        prompt_engine.enforce_prompt_ceiling_tracked(
+            "lorem " * (small_prompt_ceiling + 100),
+            prompt_engine=engine_module,
+            template_name="check-user-goal",
+            kwargs={"action_history": "some history"},
+            elements="<a>link</a>",
+        )
+
+    message = log.error.call_args.args[0]
+    fields = log.error.call_args.kwargs
+    assert "after all fallback drops" not in message
+    assert fields["fallback_keys_configured"] == 0
+    assert fields["drops_applied"] == 0
+    assert fields["html_token_count"] > 0
+    assert 0 < fields["html_pct"] <= 1.0
+
+
 def test_load_prompt_with_elements_tracked_reports_dropped_keys(small_prompt_ceiling: int) -> None:
     from skyvern.forge.prompts import prompt_engine as engine_module
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements_tracked

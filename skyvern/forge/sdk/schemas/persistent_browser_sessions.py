@@ -77,6 +77,10 @@ class PersistentBrowserSession(BaseModel):
     # BrowserSessionResponse.from_browser_session is the allowlist that enforces the former.
     upstream_cdp_url: str | None = None
     browser_vendor: str | None = None
+    # The upstream provider's own id for this browser. Server-side only, under the same allowlist
+    # as the two fields above. It is the sole handle for terminating a session out of band, so the
+    # orphan reaper reads it off the row after the process that created the session is gone.
+    browser_id: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
     proxy_location: ProxyLocationInput = None
