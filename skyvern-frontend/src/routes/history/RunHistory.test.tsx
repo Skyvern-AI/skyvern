@@ -306,7 +306,11 @@ describe("RunHistory inputs during filtering", () => {
 
     const runRow = screen.getByText("wr_123").closest("tr");
     expect(runRow).not.toBeNull();
-    fireEvent.click(within(runRow as HTMLElement).getByRole("button"));
+    fireEvent.click(
+      within(runRow as HTMLElement).getByRole("button", {
+        name: "Show inputs",
+      }),
+    );
 
     expect(await screen.findByText("Run Inputs")).toBeTruthy();
     expect(screen.getByText("Paris")).toBeTruthy();
