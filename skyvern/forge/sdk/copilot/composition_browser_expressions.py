@@ -22,8 +22,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_SELECT_OPTIONS,
     _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
-    _MODAL_DISMISS_HINTS,
-    _MODAL_DISMISS_SYMBOLS,
     _MODAL_IDENTITY_PATTERNS,
     _MODAL_ROLE_VALUES,
     _RESULT_CONTAINER_HINTS,
@@ -172,6 +170,38 @@ def role_name_match_count_expression(role: str, name: str) -> str:
 def selector_match_count_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
+
+
+# Submit controls belonging to the form that contains a just-filled field. A login page often
+# offers a federated button that is larger and earlier in the DOM than the form's own submit, so
+# naming the filled form's submits keeps "how do I submit what I just filled" from being a guess.
+def enclosing_form_submit_controls_expression(css_selector: str) -> str:
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        "  try {"
+        f"    const el = document.querySelector({sel});"
+        "    const form = el && el.closest ? el.closest('form') : null;"
+        "    if (!form) return [];"
+        "    const uniq = (s) => { try { return s && document.querySelectorAll(s).length === 1; } catch (e) { return false; } };"
+        "    const esc = (v) => String(v).split('\\\\').join('\\\\\\\\').split('\"').join('\\\\\"');"
+        "    const out = [];"
+        "    for (const c of form.querySelectorAll('button, input[type=submit]')) {"
+        "      if (out.length >= 5) break;"
+        "      const aria = c.getAttribute('aria-label') || '';"
+        "      const label = (String(c.textContent || '').replace(/\\s+/g, ' ').trim()"
+        "        || aria || c.getAttribute('title') || c.getAttribute('value') || '').slice(0, 80);"
+        "      const tag = (c.tagName || '').toLowerCase();"
+        "      const id = c.getAttribute('id');"
+        "      let s = '';"
+        "      if (id && uniq('#' + id)) s = '#' + id;"
+        "      else if (aria && uniq(tag + '[aria-label=\"' + esc(aria) + '\"]')) s = tag + '[aria-label=\"' + esc(aria) + '\"]';"
+        "      out.push({ label: label, selector: s });"
+        "    }"
+        "    return out;"
+        "  } catch (e) { return []; }"
+        "})()"
+    )
 
 
 def scout_dynamic_row_evidence_expression(selector: str) -> str:
@@ -332,8 +362,6 @@ _STRUCTURED_CONST_HEADER = (
     f"const ANTI_BOT_PATTERNS={json.dumps(list(_ANTI_BOT_PATTERNS))};"
     f"const MODAL_IDENTITY_PATTERNS={json.dumps(sorted(_MODAL_IDENTITY_PATTERNS))};"
     f"const MODAL_ROLE_VALUES={json.dumps(sorted(_MODAL_ROLE_VALUES))};"
-    f"const MODAL_DISMISS_HINTS={json.dumps(sorted(_MODAL_DISMISS_HINTS))};"
-    f"const MODAL_DISMISS_SYMBOLS={json.dumps(sorted(_MODAL_DISMISS_SYMBOLS))};"
     f"const RESULT_CONTAINER_HINTS={json.dumps(sorted(_RESULT_CONTAINER_HINTS))};"
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
@@ -365,18 +393,79 @@ const classesFor = (el) => Array.from((el && el.classList) || []).map((c) => Str
 const cssAttr = (v) => String(v).split('\\').join('\\\\').split('"').join('\\"');
 const simpleIdent = (v) => { if (!v) return false; if (!/[A-Za-z_-]/.test(v[0])) return false; for (let i = 1; i < v.length; i++) { if (!/[A-Za-z0-9_-]/.test(v[i])) return false; } return true; };
 const classSelector = (classes) => { const parts = []; for (const c of classes.slice(0, 3)) { parts.push(simpleIdent(c) ? '.' + c : '[class~="' + cssAttr(c) + '"]'); } return parts.join(''); };
+const resolvesUniquely = (sel, el) => {
+  if (!sel) return false;
+  try { const m = document.querySelectorAll(sel); return m.length === 1 && m[0] === el; } catch (e) { return false; }
+};
+const structuralPath = (el) => {
+  const parts = [];
+  let node = el;
+  while (node && node.nodeType === 1 && parts.length < 8) {
+    const tag = (node.tagName || '').toLowerCase();
+    if (!tag || tag === 'html') break;
+    const parent = node.parentElement;
+    if (!parent) { parts.unshift(tag); break; }
+    let idx = 1;
+    for (let i = 0; i < parent.children.length; i++) {
+      const sib = parent.children[i];
+      if (sib === node) break;
+      if (sib.tagName === node.tagName) idx++;
+    }
+    parts.unshift(tag + ':nth-of-type(' + idx + ')');
+    const pid = attr(parent, 'id');
+    if (pid && simpleIdent(pid)) { parts.unshift('#' + pid); break; }
+    node = parent;
+  }
+  return parts.join(' > ');
+};
+// The selector is a contract: the model clicks it and authors it into generated blocks, so an
+// ambiguous or unresolvable guess costs a failed run rather than a retry. Every candidate is
+// verified to match this exact node and nothing else before it is handed out.
 const selectorFor = (el) => {
   const tag = (el.tagName || '*').toLowerCase();
-  const id = attr(el, 'id'); if (id) return '#' + id;
+  const candidates = [];
+  const id = attr(el, 'id');
+  if (id) candidates.push(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]');
   const name = attr(el, 'name'); const value = attr(el, 'value');
-  if (name && value) return tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]';
+  if (name && value) candidates.push(tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]');
   const classes = classesFor(el); const cs = classSelector(classes);
-  if (cs && value) return tag + cs + '[value="' + cssAttr(value) + '"]';
-  if (name) return tag + '[name="' + cssAttr(name) + '"]';
+  if (cs && value) candidates.push(tag + cs + '[value="' + cssAttr(value) + '"]');
+  if (name) candidates.push(tag + '[name="' + cssAttr(name) + '"]');
   const href = attr(el, 'href');
-  if (tag === 'a' && href) return 'a[href="' + cssAttr(href) + '"]';
-  if (cs) return tag + cs;
-  return tag;
+  if (tag === 'a' && href) candidates.push('a[href="' + cssAttr(href) + '"]');
+  if (cs) candidates.push(tag + cs);
+  const type = attr(el, 'type');
+  if (cs && type) candidates.push(tag + cs + '[type="' + cssAttr(type) + '"]');
+  for (let i = 0; i < candidates.length; i++) {
+    if (resolvesUniquely(candidates[i], el)) return candidates[i];
+  }
+  const path = structuralPath(el);
+  if (resolvesUniquely(path, el)) return path;
+  return candidates.length ? candidates[0] : tag;
+};
+// A submit control with no text still has an identity in title/aria-label/alt (an icon-only
+// "Sign in with Google" is the common shape). Reporting it as an empty string offers the model an
+// anonymous control alongside the named one it actually wants.
+const controlLabel = (el) => {
+  const own = nodeText(el) || attr(el, 'value');
+  if (own) return own;
+  const img = el.querySelector && el.querySelector('img[alt], [aria-label]');
+  return (
+    attr(el, 'aria-label') ||
+    attr(el, 'title') ||
+    (img ? attr(img, 'alt') || attr(img, 'aria-label') : '') ||
+    ''
+  );
+};
+// A filled value lives on the DOM property, not the attribute, and a password's value must never
+// be reported at all. Without a non-secret filled signal the page looks unfilled after a credential
+// fill, and the agent concludes the fill failed and hunts for another way to sign in.
+const isFilled = (el) => {
+  try {
+    return typeof el.value === 'string' && el.value.length > 0;
+  } catch (e) {
+    return false;
+  }
 };
 const FIELD_TAGS = new Set(['input', 'select', 'textarea', 'button']);
 const adjacentText = (field) => {
@@ -461,17 +550,12 @@ const modalDismissControls = (node) => {
     if (out.length >= MAX_MODAL_DISMISS_CONTROLS) break;
     const selector = selectorFor(c);
     if (seen.has(selector)) continue;
-    const text = nodeText(c) || attr(c, 'value');
-    const ariaLabel = attr(c, 'aria-label');
-    const title = attr(c, 'title');
-    const explicit = [text.trim().toLowerCase(), ariaLabel.trim().toLowerCase(), title.trim().toLowerCase()];
-    const identity = (text + ' ' + ariaLabel + ' ' + title + ' ' + modalIdentity(c)).toLowerCase();
-    const hasDataDismiss = c.hasAttribute && c.hasAttribute('data-dismiss');
-    const hasSymbol = MODAL_DISMISS_SYMBOLS.some((s) => explicit.includes(s));
-    const hasText = MODAL_DISMISS_HINTS.some((h) => identity.includes(h));
-    if (!(hasDataDismiss || hasSymbol || hasText)) continue;
+    // Every control the dialog offers is reported. A keyword list cannot name every way a dialog
+    // closes ("No, keep ...", an icon-only glyph), and filtering on one leaves the agent looking at
+    // a modal it has no way to clear.
+    const text = controlLabel(c);
     seen.add(selector);
-    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: ariaLabel, title: title, selector: selector, type: attr(c, 'type') });
+    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, type: attr(c, 'type') });
   }
   return out;
 };
@@ -492,11 +576,11 @@ for (const form of document.querySelectorAll('form')) {
       : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push({ text: nodeText(node) || attr(node, 'value'), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
+      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node) });
+    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node) });
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }

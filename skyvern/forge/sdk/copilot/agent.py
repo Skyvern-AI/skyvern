@@ -156,6 +156,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyVerdict,
     actuation_obligation_key,
     build_output_policy_diagnostics,
+    demote_author_time_steer_reasons,
     derive_output_kind,
     evaluate_actuation_obligation,
     evaluate_output_policy,
@@ -190,7 +191,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
     _browser_context_is_attachable,
-    cache_copilot_author_time_gate_log_only_ids,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import SECRET_KEYWORD_ASSIGNMENT_PATTERN
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
@@ -2318,7 +2318,7 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
     )
 
 
-_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED})
 _SCOUTED_SPINE_MISSING_STEPS_PREFIX = "This draft is still missing steps you demonstrated:"
 
 
@@ -3896,8 +3896,8 @@ def _inline_replace_workflow_credential_verdict(
     ctx: CopilotContext, action_data: dict[str, Any], resp_type: str, user_response: str
 ) -> tuple[str, OutputPolicyVerdict, OutputPolicyVerdict]:
     """Rebind scouted credential literals into ``action_data['workflow_yaml']`` and evaluate the inline
-    REPLACE_WORKFLOW output policy, recording churn when the hard-block verdict rejects. Returns the
-    effective YAML plus the raw and hard-block verdicts."""
+    REPLACE_WORKFLOW output policy, recording churn when the author-time verdict rejects. Returns the
+    effective YAML plus the raw and author-time verdicts."""
     workflow_yaml = action_data.get("workflow_yaml", "")
     inline_rebind = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
     if inline_rebind.changed:
@@ -3924,18 +3924,31 @@ def _inline_replace_workflow_credential_verdict(
         has_workflow_proposal=True,
         output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
     )
-    hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
-    if inline_rebind.residual_selectors and hard_block_verdict.allowed:
+    # This surface persists a draft, so it is graded like the update_workflow tool body rather than
+    # like a final reply: only what a later test-run cannot undo refuses here, and every other reason
+    # steers the next authoring attempt.
+    author_time_verdict = OutputPolicyVerdict(
+        allowed=raw_verdict.allowed,
+        output_kind=raw_verdict.output_kind,
+        reason_codes=list(raw_verdict.reason_codes),
+    )
+    steered_reasons = demote_author_time_steer_reasons(author_time_verdict)
+    if steered_reasons:
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW output policy reasons demoted to steering",
+            steered_reason_codes=[reason.value for reason in steered_reasons],
+        )
+    if inline_rebind.residual_selectors and author_time_verdict.allowed:
         # This path bypasses the update_workflow guardrail, and the output-policy scan does not catch a bare
         # `page.fill(sel, ...)`, so an inline secret the rebind could not neutralize would slip through here.
         LOG.info(
             "copilot inline REPLACE_WORKFLOW credential residual raw fill fail-closed",
             residual_raw_credential_fill_selectors=list(inline_rebind.residual_selectors),
         )
-        hard_block_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
-    if not hard_block_verdict.allowed:
-        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, hard_block_verdict)
-    return workflow_yaml, raw_verdict, hard_block_verdict
+        author_time_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
+    if not author_time_verdict.allowed:
+        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, author_time_verdict)
+    return workflow_yaml, raw_verdict, author_time_verdict
 
 
 async def _translate_to_agent_result(
@@ -4044,23 +4057,24 @@ async def _translate_to_agent_result(
             # The final-output policy pass still runs below; leave last_workflow
             # / last_workflow_yaml unchanged until this candidate survives the
             # inline checks.
+            from skyvern.forge.sdk.copilot.author_time_block import (
+                BANNED_BLOCKS_BLOCK_ID,
+                CODE_SAFETY_BLOCK_ID,
+                AuthorTimeBlock,
+            )
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
+                _code_block_safety_errors,
                 _detect_new_banned_blocks,
                 _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
                 _stale_block_metadata_message,
-                _timing_only_challenge_wait_reject_message,
                 composition_page_evidence_error,
                 workflow_target_url,
             )
             from skyvern.forge.sdk.copilot.tools.banned_blocks import _copilot_banned_block_types
+            from skyvern.forge.sdk.copilot.tools.workflow_update import _human_facing_code_safety_errors
 
-            wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
-            if wait_block_error:
-                user_response = _with_inline_reject_note(user_response, wait_block_error)
-                ctx.last_test_ok = None
-                workflow_yaml = ""
             banned_items = _detect_new_banned_blocks(
                 workflow_yaml,
                 ctx.last_workflow_yaml,
@@ -4068,23 +4082,43 @@ async def _translate_to_agent_result(
             )
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
-                user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items, ctx))
+                inline_banned_blocks_block = AuthorTimeBlock(
+                    block_id=BANNED_BLOCKS_BLOCK_ID,
+                    error=_banned_block_reject_message(banned_items, ctx),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_banned_blocks_block.error)
                 workflow_yaml = ""
+            # This surface persists a draft without the update_workflow tool, so it needs the same
+            # code-safety block: unsafe in-page code on a page holding a filled credential is the
+            # one thing a later test-run cannot undo. Constructed as an AuthorTimeBlock rather than
+            # discarded on a bare error string, so this refusal is bound by the same three-identity
+            # check as the tool seam and a new inline gate cannot join it silently.
+            inline_code_safety_errors = _human_facing_code_safety_errors(
+                _code_block_safety_errors(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
+            )
+            if inline_code_safety_errors:
+                inline_code_safety_block = AuthorTimeBlock(
+                    block_id=CODE_SAFETY_BLOCK_ID,
+                    error="\n".join(str(error) for error in inline_code_safety_errors),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_code_safety_block.error)
+                workflow_yaml = ""
+            # Stale metadata and missing page evidence are both authoring quality, not disclosure: a
+            # later test-run is what settles whether the draft works. They surface as a finding and
+            # clear the test credit, so the draft survives but cannot be reported as verified.
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
                 user_response = _with_inline_reject_note(user_response, _stale_block_metadata_message(stale_metadata))
                 ctx.last_test_ok = None
-                workflow_yaml = ""
             composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
             if composition_evidence_error:
                 LOG.info(
-                    "copilot inline composition page evidence rejected workflow",
+                    "copilot inline composition page evidence finding",
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     target_url=workflow_target_url(workflow_yaml),
                 )
                 user_response = _with_inline_reject_note(user_response, composition_evidence_error)
                 ctx.last_test_ok = None
-                workflow_yaml = ""
         if workflow_yaml:
             # Inline REPLACE_WORKFLOW bypasses the update_workflow tool, so apply the same default here.
             workflow_yaml = default_data_write_continue_on_failure(
@@ -5233,29 +5267,6 @@ def _reconcile_turn_end_ownership(
         return result
 
 
-async def _cache_copilot_author_time_gate_log_only_ids(ctx: CopilotContext) -> None:
-    try:
-        resolved_ids = await app.AGENT_FUNCTION.resolve_copilot_author_time_gate_log_only_ids(
-            turn_id=ctx.turn_id,
-            organization_id=ctx.organization_id,
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to resolve Copilot author-time gate log-only registry",
-            turn_id=ctx.turn_id,
-            organization_id=ctx.organization_id,
-            exc_info=True,
-        )
-        resolved_ids = frozenset()
-    cache_copilot_author_time_gate_log_only_ids(ctx, resolved_ids)
-    selected_gate_ids = sorted(ctx.author_time_gate_log_only_ids)
-    LOG.info(
-        "copilot_author_time_gate_log_only_registry_resolved",
-        selected_gate_ids=selected_gate_ids,
-        selected_gate_count=len(selected_gate_ids),
-    )
-
-
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -5473,7 +5484,6 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
-    await _cache_copilot_author_time_gate_log_only_ids(ctx)
     if ctx_sink is not None:
         ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(

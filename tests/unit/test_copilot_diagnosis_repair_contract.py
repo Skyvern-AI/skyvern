@@ -4,16 +4,13 @@ import hashlib
 import json
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
-    recorded_outcome_from_author_time_reject,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -399,9 +396,7 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
     )
 
 
-def test_repair_loop_state_counts_through_authoring_repair_context_identity_change() -> None:
-    # An identity change rotates the streak token but is not progress; the zero-run
-    # ceiling still does not terminalize.
+def test_repair_loop_state_climbs_on_the_same_failure_repeating() -> None:
     ctx = _ctx()
     ambiguous = CodeAuthoringRepairContext(
         block_label="retrieve_document_link",
@@ -409,13 +404,8 @@ def test_repair_loop_state_counts_through_authoring_repair_context_identity_chan
         selector="button",
         refiner_selector="xpath=//button[normalize-space()='View / Download']",
     )
-    sandbox = CodeAuthoringRepairContext(
-        block_label="retrieve_document_link",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
-        unresolved_names=["confirmation_number", "row_text"],
-    )
 
-    for expected_count in (1, 2):
+    for expected_count in (1, 2, 3):
         contract = build_diagnosis_repair_contract(
             source_tool="update_and_run_blocks",
             result=_authoring_repair_result(ambiguous),
@@ -423,38 +413,11 @@ def test_repair_loop_state_counts_through_authoring_repair_context_identity_chan
         )
         run_execution_module._update_repair_loop_state(ctx, contract)
         assert contract.repair_loop_state.consecutive_identical_repair_count == expected_count
-        assert contract.repair_loop_state.ceiling_reached is False
-
-    sandbox_contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result=_authoring_repair_result(sandbox),
-        ctx=ctx,
-    )
-    run_execution_module._update_repair_loop_state(ctx, sandbox_contract)
-
-    assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert sandbox_contract.repair_loop_state.streak_token != contract.repair_loop_state.streak_token
-    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 3
-    assert sandbox_contract.repair_loop_state.ceiling_reached is True
-    assert getattr(ctx, "blocker_signal", None) is None
-    assert ctx.turn_halt is None
 
 
 def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
     criterion = CompletionCriterion(id=output_path, outcome="the value is captured", output_path=output_path)
     return SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
-
-
-def _uncovered_output_author_reject(output_path: str) -> RecordedBuildTestOutcome:
-    return recorded_outcome_from_author_time_reject(
-        reason_code="metadata_reject",
-        block_labels=["extract_order"],
-        structural_payload={
-            "reason_code": "recorded_outcome_missing_output_coverage",
-            "missing_output_paths": [output_path],
-        },
-        missing_requested_output_facts=[{"output_path": output_path, "output_root": output_path.split(".", 1)[0]}],
-    )
 
 
 def _run_repair_loop_state(ctx: CopilotContext) -> RepairLoopState:
@@ -472,25 +435,6 @@ def _run_repair_loop_state(ctx: CopilotContext) -> RepairLoopState:
     return contract.repair_loop_state
 
 
-def test_uncovered_output_author_reject_reopens_once_then_counts_to_ceiling() -> None:
-    ctx = _ctx()
-    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
-    ctx.latest_recorded_build_test_outcome = _uncovered_output_author_reject("output.document_name")
-
-    first = _run_repair_loop_state(ctx)
-    assert first.consecutive_identical_repair_count == 0
-    assert first.ceiling_reached is False
-    assert ctx.synthesized_block_reopened_for_output_coverage is True
-    assert ctx.consecutive_non_converging_repair_count == 0
-
-    states = [_run_repair_loop_state(ctx) for _ in range(3)]
-    counts = [state.consecutive_identical_repair_count for state in states]
-    assert counts == [1, 2, 3]
-    assert counts[-1] == settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL
-    assert states[-1].ceiling_reached is True
-    assert ctx.blocker_signal is None
-
-
 def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
     ctx = _ctx()
     ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
@@ -504,26 +448,9 @@ def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
     )
     state = _run_repair_loop_state(ctx)
     assert state.consecutive_identical_repair_count == 1
-    assert ctx.synthesized_block_reopened_for_output_coverage is False
 
     repeat = _run_repair_loop_state(ctx)
     assert repeat.consecutive_identical_repair_count == 2
-    assert ctx.synthesized_block_reopened_for_output_coverage is False
-
-
-def test_uncovered_output_reopen_preserves_prior_streak_count() -> None:
-    ctx = _ctx()
-    assert _run_repair_loop_state(ctx).consecutive_identical_repair_count == 1
-    assert _run_repair_loop_state(ctx).consecutive_identical_repair_count == 2
-
-    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
-    ctx.latest_recorded_build_test_outcome = _uncovered_output_author_reject("output.document_name")
-    reopened = _run_repair_loop_state(ctx)
-
-    assert ctx.synthesized_block_reopened_for_output_coverage is True
-    assert reopened.consecutive_identical_repair_count == 2
-    assert reopened.ceiling_reached is False
-    assert ctx.consecutive_non_converging_repair_count == 2
 
 
 def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:
@@ -1147,34 +1074,6 @@ def test_runtime_authoring_repair_context_sanitizes_failure_and_page_summaries()
     assert "user:secret" not in dumped
     assert "password=hunter2" not in dumped
     assert repair_context.current_origin == "https://example.test"
-
-
-def test_schema_incompatibility_failure_type_stops_without_repair() -> None:
-    # SKY-11380: the typed schema-incompatibility reject must route to STOP, never repair,
-    # so the agent reports the mismatch instead of churning toward repair_ceiling_reached.
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": False,
-            "error": "STOP: the edited extraction_schema declares field(s) [shoebox] that map to no output.",
-            "data": {
-                "failure_type": "schema_incompatibility",
-                "workflow_updated": False,
-                "schema_incompatibility": {
-                    "block_label": "capture_row",
-                    "incompatible_paths": ["shoebox"],
-                    "known_output_paths": ["order_date", "order_total"],
-                },
-            },
-        },
-        ctx=_ctx(),
-        workflow_updated=False,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY
-    assert contract.repair_decision.next_action == RepairNextAction.STOP
-    assert contract.repair_decision.next_action != RepairNextAction.REPAIR
-    assert contract.repair_decision.target_blocks == []
 
 
 def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
@@ -2299,39 +2198,6 @@ def test_contract_trace_exposes_stable_root_cause_identity() -> None:
     assert {base.diagnosis_result.suspected_failure_type, renamed.diagnosis_result.suspected_failure_type} == {
         DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
     }
-
-
-@pytest.mark.asyncio
-async def test_update_workflow_failure_records_diagnosis_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.copilot import tools as tools_module
-
-    error = (
-        "Unable to impose synthesized code block: dropped scout interaction 0 from `click` (ambiguous_bare_selector)."
-    )
-    recorded: list[tuple[str, dict[str, object], str]] = []
-
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_request_policy_allows_credential_deferred_draft", lambda *args: False)
-    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-    monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_workflow", AsyncMock(return_value={"ok": False, "error": error}))
-
-    def fake_record_contract(ctx: CopilotContext, *, source_tool: str, result: dict[str, object]) -> None:
-        contract = build_diagnosis_repair_contract(source_tool=source_tool, result=result, ctx=ctx)
-        recorded.append((source_tool, result, contract.to_trace_data()["root_cause_error_class"]))
-
-    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", fake_record_contract)
-
-    result = await tools_module.update_workflow_tool.on_invoke_tool(
-        SimpleNamespace(context=_ctx(), tool_name="update_workflow"),
-        json.dumps({"workflow_yaml": "title: Test\nworkflow_definition:\n  parameters: []\n  blocks: []\n"}),
-    )
-
-    assert json.loads(result)["ok"] is False
-    assert recorded == [
-        ("update_workflow", {"ok": False, "error": error}, "code_block_synthesis_ambiguous_bare_selector")
-    ]
 
 
 def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() -> None:
