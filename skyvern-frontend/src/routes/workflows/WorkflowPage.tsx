@@ -98,7 +98,7 @@ import {
 } from "@/components/SelectionCheckbox";
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
-import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
+import { RunRowActions } from "@/routes/runs/RunRowActions";
 import { WorkflowReliabilityPanel } from "./workflowRun/WorkflowReliabilityPanel";
 import { RunOutcomeRiskMarker } from "./workflowRun/RunOutcomeRiskMarker";
 import { useRunsHealSummaryBatchQuery } from "./hooks/useRunsHealSummaryBatchQuery";
@@ -450,7 +450,7 @@ function WorkflowPage() {
                             workflowRun.workflow_run_id,
                           );
 
-                      const mainRow = (
+                      const mainRow = (kebab: React.ReactNode) => (
                         <TableRow
                           onClick={(event) => {
                             if (event.ctrlKey || event.metaKey) {
@@ -529,6 +529,11 @@ function WorkflowPage() {
                                     <Button
                                       size="icon"
                                       variant="ghost"
+                                      aria-label={
+                                        isExpanded
+                                          ? "Hide inputs"
+                                          : "Show inputs"
+                                      }
                                       onClick={(event) => {
                                         event.stopPropagation();
                                         toggleParametersExpanded(
@@ -549,6 +554,7 @@ function WorkflowPage() {
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
+                              {kebab}
                             </div>
                           </TableCell>
                         </TableRow>
@@ -556,24 +562,21 @@ function WorkflowPage() {
 
                       return (
                         <React.Fragment key={workflowRun.workflow_run_id}>
-                          {taggingEnabled ? (
-                            <RunRowContextMenu
-                              workflowRunId={workflowRun.workflow_run_id}
-                              runPath={runPath}
-                              currentTags={runTags ?? []}
-                              tagKeys={tagFilterKeys}
-                              labelSuggestions={runTagSuggestions?.labels ?? []}
-                              valueSuggestionsByKey={
-                                runTagSuggestions?.valuesByKey
-                              }
-                              selectedCount={selectedRuns.length}
-                              onNavigate={navigate}
-                            >
-                              {mainRow}
-                            </RunRowContextMenu>
-                          ) : (
-                            mainRow
-                          )}
+                          <RunRowActions
+                            runId={workflowRun.workflow_run_id}
+                            runPath={runPath}
+                            taggable={taggingEnabled}
+                            currentTags={runTags ?? []}
+                            tagKeys={tagFilterKeys}
+                            labelSuggestions={runTagSuggestions?.labels ?? []}
+                            valueSuggestionsByKey={
+                              runTagSuggestions?.valuesByKey
+                            }
+                            selectedCount={selectedRuns.length}
+                            onNavigate={navigate}
+                          >
+                            {mainRow}
+                          </RunRowActions>
                           {/* Expanded parameters section */}
                           {isExpanded && (
                             <TableRow
