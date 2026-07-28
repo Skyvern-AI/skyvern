@@ -122,7 +122,7 @@ _TRANSIENT_CLAIMANTS = frozenset(
     }
 )
 
-_SIGNALLESS_TERMINAL_TURN_HALT_KIND_VALUES = frozenset({"repair_ceiling_reached", "delivered_unverified"})
+_SIGNALLESS_TERMINAL_TURN_HALT_KIND_VALUES = frozenset({"delivered_unverified"})
 
 
 def claimant_outranks(candidate: TurnClaimant, incumbent: TurnClaimant) -> bool:
