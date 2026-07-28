@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.workflow.models.block import Block, TaskBlock
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 
@@ -65,7 +65,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -81,7 +81,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -97,7 +97,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -113,7 +113,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)

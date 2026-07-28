@@ -44,6 +44,7 @@ def _mock_input(attrs: dict[str, str | None]) -> MagicMock:
     el.input_sequentially = AsyncMock()
     el.input_clear = AsyncMock()
     el.input_fill = AsyncMock()
+    el.refresh_locator_if_stale = AsyncMock()
     el.press_key = AsyncMock()
     return el
 
@@ -295,8 +296,9 @@ async def test_single_character_secret_skips_readback() -> None:
 
 @pytest.mark.asyncio
 async def test_secret_in_non_input_element_skips_readback() -> None:
-    # A contenteditable/div is not a native input (its read-back is trimmed/normalized), so the read-back
-    # is skipped; it keeps the plain sequential fill and its pre-existing behavior.
+    # A non-native editable sink (a plain <div> with no contenteditable attribute) trims/normalizes its
+    # read-back, so the exact-value read-back is skipped. It is not an explicit contenteditable, so it keeps
+    # the per-key sequential fill; only an explicit contenteditable takes the atomic path.
     el = _mock_input({"type": None, "autocomplete": None, "name": "note"})
     el.get_tag_name.return_value = "div"
 
@@ -306,6 +308,45 @@ async def test_secret_in_non_input_element_skips_readback() -> None:
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     el.input_sequentially.assert_awaited_once_with(text="mysecretvalue")
+    el.input_fill.assert_not_awaited()
+    secret_readback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_contenteditable_url_uses_atomic_fill_not_sequential_seam() -> None:
+    # SKY-13014: a Quill-style rich-text editor carries contenteditable="true". Filling it with the
+    # input_sequentially fill(prefix)+type(tail) split lets a URL auto-linkifier wrap the prefix before the
+    # tail arrives, corrupting the link. An explicit contenteditable must fill atomically via input_fill and
+    # keep the stale-locator refresh locally (input_fill alone skips it); input_sequentially must not run.
+    el = _mock_input({"type": None, "autocomplete": None, "name": "key-take-aways", "contenteditable": "true"})
+    el.get_tag_name.return_value = "div"
+    url_value = "https://example.com/shared/call/CUPRZqEEAWnXLTaMSGhrnR5UW5RZVthv8b6MZTiDGtmY"
+
+    results, _, _, _, _, secret_readback = await _run_input_text(el, url_value, tag_name="div")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with(url_value)
+    el.refresh_locator_if_stale.assert_awaited_once()
+    el.input_sequentially.assert_not_awaited()
+    secret_readback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_contenteditable_custom_sink_url_keeps_sequential_fill() -> None:
+    # Scope regression (SKY-13014): the atomic path is reserved for an explicit contenteditable. A non-native
+    # custom sink that is editable but has no contenteditable attribute (here a role=textbox div) must keep
+    # the per-key sequential fill even for a URL value -- it must not be widened onto the atomic branch, and
+    # the contenteditable-only stale-locator refresh must not run for it.
+    el = _mock_input({"type": None, "autocomplete": None, "name": "widget", "role": "textbox"})
+    el.get_tag_name.return_value = "div"
+    url_value = "https://example.com/shared/call/CUPRZqEEAWnXLTaMSGhrnR5UW5RZVthv8b6MZTiDGtmY"
+
+    results, _, _, _, _, secret_readback = await _run_input_text(el, url_value, tag_name="div")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text=url_value)
+    el.input_fill.assert_not_awaited()
+    el.refresh_locator_if_stale.assert_not_awaited()
     secret_readback.assert_not_awaited()
 
 

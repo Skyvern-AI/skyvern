@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.sql.sqltypes import NullType
 
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -128,3 +129,64 @@ async def test_returns_none_without_calling_save_or_refresh_when_no_row_updated(
     mock_save.assert_not_awaited()
     session.refresh.assert_not_awaited()
     mock_convert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preexisting_timeout_finish_only_updates_unfinished_timeout() -> None:
+    mock_workflow_run = MagicMock()
+    mock_workflow_run.workflow_run_id = "wr_test"
+    repo, session = _make_repo_with_session(mock_workflow_run)
+
+    failure_category = [{"category": "TIMEOUT"}]
+    with (
+        patch(
+            "skyvern.forge.sdk.db.repositories.workflow_runs.save_workflow_run_logs",
+            new=AsyncMock(),
+        ),
+        patch(
+            "skyvern.forge.sdk.db.repositories.workflow_runs.convert_to_workflow_run",
+            return_value=MagicMock(),
+        ),
+    ):
+        await repo.finish_preexisting_timed_out_workflow_run(
+            workflow_run_id="wr_test",
+            failure_reason="workflow timed out",
+            failure_category=failure_category,
+        )
+
+    statement = session.execute.await_args.args[0]
+    statement_sql = str(statement)
+    compiled_statement = statement.compile()
+    statement_parameters = compiled_statement.params
+    assert WorkflowRunStatus.timed_out.value in statement_parameters.values()
+    assert "workflow_runs.finished_at IS NULL" in statement_sql
+    assert "coalesce(workflow_runs.failure_reason" in statement_sql
+    failure_category_binds = [bind for bind in compiled_statement.binds.values() if bind.value == failure_category]
+    assert failure_category_binds
+    assert all(not isinstance(bind.type, NullType) for bind in failure_category_binds)
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_can_guard_status_and_returns_only_updated_ids() -> None:
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = ["wr_running"]
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=execute_result)
+    session.commit = AsyncMock()
+    repo = WorkflowRunsRepository(session_factory=lambda: MockAsyncSessionCtx(session))
+
+    result = await repo.bulk_update_workflow_runs(
+        workflow_run_ids=["wr_running", "wr_completed"],
+        status=WorkflowRunStatus.timed_out,
+        only_if_status_in=[WorkflowRunStatus.running],
+    )
+
+    statement = session.execute.await_args.args[0]
+    statement_sql = str(statement)
+    statement_parameters = statement.compile().params
+    assert result == ["wr_running"]
+    assert "workflow_runs.status IN" in statement_sql
+    assert [WorkflowRunStatus.running.value] in statement_parameters.values()
+    assert statement_parameters["finished_at"] is None
+    assert statement_parameters["failure_reason"] is None
+    assert statement_parameters["failure_category"] is None
