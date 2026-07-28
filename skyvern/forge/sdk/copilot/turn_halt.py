@@ -9,15 +9,12 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
     DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES as GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
-    OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
     blocker_signal_is_genuinely_terminal,
     build_output_source_unobservable_blocker_signal,
@@ -32,7 +29,6 @@ from skyvern.forge.sdk.copilot.output_contracts import (
 )
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.runtime import output_contract_ladder_unresolved
-from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_REASON_CODE
 from skyvern.forge.sdk.copilot.turn_ownership import (
     TURN_HALT_RETIRED_LOG_EVENT,
     TurnClaimant,
@@ -60,11 +56,8 @@ class TurnHaltKind(StrEnum):
     ACTIVE_TERMINAL_CHALLENGE = "active_terminal_challenge"
     PROBABLE_SITE_BLOCK = "probable_site_block"
     REPAIR_CEILING_REACHED = "repair_ceiling_reached"
-    SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
     OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
     DELIVERED_UNVERIFIED = "delivered_unverified"
-    DEFINITION_CONTRACT_UNSATISFIED = "definition_contract_unsatisfied"
-    METADATA_REJECT_SAME_KEY = "metadata_reject_same_key"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -95,17 +88,13 @@ _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     }
 )
 _PROBABLE_SITE_BLOCK_REASON_CODES = frozenset({"probable_site_block_stop"})
-_SCHEMA_INCOMPATIBILITY_REASON_CODES = frozenset({SCHEMA_INCOMPATIBILITY_REASON_CODE})
 _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
-        OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
         ADVISORY_DISPATCH_STALLED_REASON_CODE,
     }
 )
-_DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES = frozenset({DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE})
-_METADATA_REJECT_SAME_KEY_REASON_CODES = frozenset({METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE})
 
 # Halts the agent did not choose: a verified outcome may suppress these.
 # ACTIVE_TERMINAL_CHALLENGE is voluntary and is deliberately excluded so a
@@ -115,19 +104,13 @@ _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
         TurnHaltKind.LOOP_DETECTED,
         TurnHaltKind.PROBABLE_SITE_BLOCK,
         TurnHaltKind.REPAIR_CEILING_REACHED,
-        TurnHaltKind.SCHEMA_INCOMPATIBILITY,
         TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE,
-        TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED,
-        TurnHaltKind.METADATA_REJECT_SAME_KEY,
     }
 )
 _INVOLUNTARY_BLOCKER_REASON_CODES = (
     _LOOP_TERMINAL_REASON_CODES
     | _PROBABLE_SITE_BLOCK_REASON_CODES
-    | _SCHEMA_INCOMPATIBILITY_REASON_CODES
     | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
-    | _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES
-    | _METADATA_REJECT_SAME_KEY_REASON_CODES
     | frozenset({REPAIR_CEILING_REASON_CODE})
 )
 _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
@@ -158,14 +141,8 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
     if reason in _PROBABLE_SITE_BLOCK_REASON_CODES:
         return TurnHaltKind.PROBABLE_SITE_BLOCK
-    if reason in _SCHEMA_INCOMPATIBILITY_REASON_CODES:
-        return TurnHaltKind.SCHEMA_INCOMPATIBILITY
     if reason in _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES:
         return TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
-    if reason in _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES:
-        return TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED
-    if reason in _METADATA_REJECT_SAME_KEY_REASON_CODES:
-        return TurnHaltKind.METADATA_REJECT_SAME_KEY
     return None
 
 
