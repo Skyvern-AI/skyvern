@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -39,7 +38,6 @@ RecoveryHint = Literal[
 ]
 
 LOG = structlog.get_logger()
-METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE = "metadata_reject_same_key_terminal"
 
 
 # Matched case-insensitively. Imperative variants are narrow ("do not run" etc.) so plain "do not worry" prose doesn't false-positive.
@@ -151,52 +149,6 @@ class CopilotToolBlockerSignal(BaseModel):
         return dict(value)
 
 
-def build_metadata_reject_same_key_terminal_signal(
-    *,
-    structural_key: str,
-    reject_family: Literal[
-        "missing_code_artifact_metadata",
-        "metadata_normalization",
-        "recorded_outcome_output_candidate",
-        "recorded_outcome_output_coverage",
-    ],
-    missing_fields_by_label: Mapping[str, list[str]],
-) -> CopilotToolBlockerSignal:
-    exact_fields = {label: list(fields) for label, fields in missing_fields_by_label.items()}
-    rendered_fields = json.dumps(exact_fields, sort_keys=True, separators=(",", ":"))
-    user_facing_reason = (
-        "I couldn't satisfy the code_artifact_metadata gate after repeated identical submissions. "
-        f"missing_fields_by_label={rendered_fields}. I've kept the draft so those exact fields can be added."
-    )
-    try:
-        assert_clean_user_facing_text(user_facing_reason, blocked_tool="update_and_run_blocks")
-    except ValueError:
-        user_facing_reason = (
-            "I couldn't satisfy the required output metadata after repeated identical submissions. "
-            "I've kept the draft so the missing fields can be added."
-        )
-    return CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text=(
-            "The same structural metadata rejection reached its terminal rung. Preserve the draft and report "
-            f"the code_artifact_metadata gate with missing_fields_by_label={rendered_fields}."
-        ),
-        user_facing_reason=user_facing_reason,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
-        blocked_tool="update_and_run_blocks",
-        extra={
-            "reject_family": reject_family,
-            "structural_key": structural_key,
-            "gate_id": "code_artifact_metadata",
-            "missing_fields_by_label": exact_fields,
-        },
-    )
-
-
 def build_output_source_unobservable_blocker_signal(
     *,
     reason_code: str,
@@ -215,33 +167,18 @@ def build_output_source_unobservable_blocker_signal(
             "visits, so there is nothing for the workflow to read them from. I've kept the draft; "
             "tell me where those values appear and I'll wire them up."
         )
-    elif reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE:
-        user_facing = (
-            "I rewrote this workflow several times to return the value(s) you asked for"
-            f"{f' ({path_text})' if path_text else ''}, but each version left those outputs "
-            "undeclared or unreturned, so the workflow can't reliably hand them back. I've kept "
-            "the draft; tell me where each of those values appears and I'll declare and return them."
-        )
     else:
         user_facing = (
             "I couldn't shape this workflow so it reliably returns the values you asked for"
             f"{f' ({path_text})' if path_text else ''}. I've kept the current draft; let me know "
             "where those values show up and I'll try a different structure."
         )
-    if reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE:
-        agent_steer = (
-            "STOP: the output contract kept failing its declaration/return coverage across repeated "
-            f"re-authored candidates for required path(s) [{path_text or '(unknown)'}]. This is not "
-            "repairable by re-authoring the same draft. Report the missing output declarations to the "
-            "user and ask where the values appear. The prior draft is preserved; do not rerun the blocks."
-        )
-    else:
-        agent_steer = (
-            "STOP: the requested output contract has no observable extraction source in the current "
-            f"trajectory for required path(s) [{path_text or '(unknown)'}]. This is not repairable by "
-            "re-authoring the same draft. Report the missing source to the user and ask where the "
-            "values appear. The prior draft is preserved; do not rerun the blocks."
-        )
+    agent_steer = (
+        "STOP: the requested output contract has no observable extraction source in the current "
+        f"trajectory for required path(s) [{path_text or '(unknown)'}]. This is not repairable by "
+        "re-authoring the same draft. Report the missing source to the user and ask where the "
+        "values appear. The prior draft is preserved; do not rerun the blocks."
+    )
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=agent_steer,
@@ -256,39 +193,6 @@ def build_output_source_unobservable_blocker_signal(
             "canonical_required_child_paths": paths,
             "block_label": block_label,
         },
-    )
-
-
-def build_definition_contract_unsatisfied_blocker_signal(
-    *, unresolved_parameter_keys: Iterable[str], grounding_unresolved: bool = False
-) -> CopilotToolBlockerSignal:
-    parameter_keys = sorted({str(key).strip() for key in unresolved_parameter_keys if str(key).strip()})
-    if parameter_keys:
-        key_text = ", ".join(f"`{key}`" for key in parameter_keys)
-        user_facing = (
-            f"I kept the workflow draft, but I could not safely connect the current page fields to these reusable "
-            f"inputs: {key_text}. No workflow run was started."
-            if grounding_unresolved
-            else f"I kept the workflow draft, but it cannot run because these reusable inputs are not used: "
-            f"{key_text}. Connect each input to the workflow before trying again."
-        )
-    else:
-        user_facing = (
-            "I kept the workflow draft, but it does not yet satisfy the required workflow definition. "
-            "Complete the missing definition requirements before trying again."
-        )
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "The exact candidate failed its definition contract before execution. Preserve the draft, stop this "
-            "turn, and explain the unresolved reusable inputs without dispatching the candidate."
-        ),
-        user_facing_reason=user_facing,
-        recovery_hint="report_blocker_to_user",
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
-        extra={"unresolved_parameter_keys": parameter_keys, "grounding_unresolved": grounding_unresolved},
     )
 
 
@@ -444,17 +348,12 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
-UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
-RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
-DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE = "definition_contract_unsatisfied"
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
-OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE = "output_contract_reject_budget_exhausted"
 DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE = "loop_detected_discovery_exhausted_no_entry_url"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
-        OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     }
 )
 
@@ -468,14 +367,10 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         "tool_error_post_budget_challenge_blocker",
         "tool_error_challenge_gated_submit_disabled",
         "probable_site_block_stop",
-        SCHEMA_INCOMPATIBILITY_REASON_CODE,
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
-        OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
         "advisory_dispatch_stalled",
-        DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
         "repair_ceiling_reached",
-        METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
         DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
@@ -504,18 +399,6 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code == "tool_error_post_budget_challenge_blocker"
         and existing.internal_reason_code in _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES
-    ):
-        return True
-    if (
-        incoming.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
-        and existing.blocker_kind == "tool_error"
-        and not existing.renders_final_reply
-    ):
-        return True
-    if (
-        existing.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
-        and not existing.renders_final_reply
-        and incoming.renders_final_reply
     ):
         return True
     if (

@@ -9,7 +9,7 @@ import keyword
 import re
 import textwrap
 import tokenize
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -25,6 +25,12 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
+from skyvern.forge.sdk.copilot.author_time_block import (
+    BANNED_BLOCKS_BLOCK_ID,
+    CODE_SAFETY_BLOCK_ID,
+    CREDENTIAL_SCOUT_BLOCK_ID,
+    AuthorTimeBlock,
+)
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingCandidate,
     AuthoringParameterBindingDirective,
@@ -44,39 +50,23 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
-    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
-    OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
-    blocker_signal_is_genuinely_terminal,
-    build_definition_contract_unsatisfied_blocker_signal,
-    build_metadata_reject_same_key_terminal_signal,
-    build_output_source_unobservable_blocker_signal,
     clear_terminal_evidence_on_workflow_edit,
-    stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
-    MetadataRejectFamily,
-    MetadataRejectLadderDecision,
-    MetadataRejectLadderInput,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
     RecordedOutcomeGroundingRequirement,
     _stable_hash,
-    adjudicate_metadata_reject_ladder,
-    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
-    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
-    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
-    CodeBlockRenderDiagnostic,
     author_time_code_block_diagnostics,
-    code_block_render_diagnostic,
     sandbox_unresolved_name_diagnostics,
     sandbox_unresolved_name_repair_diagnostic,
     strip_redundant_sandbox_imports,
@@ -100,7 +90,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _bare_drop_superseded_on_screen,
-    _bare_locator_call_selector,
     _credential_field_accesses,
     _get_by_role_expr_strict,
     _is_ignorable_entry_opener_drop,
@@ -109,11 +98,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _selector_refines,
     artifact_dependency_id,
     artifact_observation_ref_id,
-)
-from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    block_has_unguarded_credential_fill as _block_has_unguarded_credential_fill,
-)
-from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_input_templated_locator,
     build_same_month_file_match_locator,
     credential_scout_gap,
@@ -126,7 +110,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
-    normalized_scout_selector,
     obligation_finding_reason_code,
     obligation_finding_selector,
     produce_covered_static_return_envelope,
@@ -145,9 +128,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
-    composition_page_evidence_error,
     normalize_block_observation_refs,
-    workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import (
@@ -161,7 +142,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _record_code_authoring_guardrail_reject,
     _scouted_spine_open_obligation,
     arm_credential_scout_reopen,
-    code_authoring_churn_stop_would_claim,
     download_satisfied_requested_output_paths,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
@@ -174,7 +154,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
-from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_contracts import (
     OutputContractActuation,
     OutputContractActuationEvidence,
@@ -183,13 +162,13 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     classify_output_contract_bail_family,
     code_block_available_binding_keys_by_label,
     declared_string_workflow_parameter_keys,
-    declared_workflow_parameter_keys,
     resolve_output_contract_actuation,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
+    demote_author_time_steer_reasons,
     evaluate_output_policy,
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
@@ -211,45 +190,26 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import (
-    DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
-    METADATA_RUN_PREFLIGHT_REJECT_GATE_ID,
-    OUTPUT_CONTRACT_ACTUATION_GATE_ID,
-    RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
-    SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     AgentContext,
-    AuthorTimeGateAblationPayload,
-    CodeArtifactMetadataValue,
-    NeverCapturedObligation,
-    NeverCapturedReplayPayload,
-    RejectedCodeArtifactMetadataCapture,
     ScoutedInteraction,
-    copilot_author_time_gate_log_only_enabled,
-    record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
-    SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
+    SCHEMA_INCOMPATIBILITY_REASON_CODE,
     SchemaIncompatibility,
-    build_schema_incompatibility_blocker_signal,
     merge_schema_incompatibilities,
     render_schema_incompatibility_agent_steer,
+    render_schema_incompatibility_user_reason,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import (
-    stash_repair_ceiling_turn_halt,
-    stash_turn_halt_from_blocker_signal,
-)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
-    claim_and_stash_blocker_signal,
     claim_turn,
-    current_turn_owner,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     credential_param_ids,
-    credential_params,
     parse_workflow_yaml,
     workflow_blocks,
 )
@@ -270,12 +230,10 @@ from ._shared import (
 )
 from .banned_blocks import (
     _banned_block_reject_message,
-    _challenge_http_request_reject_message,
     _copilot_banned_block_types,
     _copilot_block_authoring_policy,
     _detect_new_banned_blocks,
     _record_banned_block_reject_span,
-    _timing_only_challenge_wait_reject_message,
 )
 from .blockers import _clear_resolved_per_tool_budget_problem_labels
 from .credentials import (
@@ -284,16 +242,12 @@ from .credentials import (
     _credential_reference_validation_error,
 )
 from .frontier import (
-    _detect_stale_block_metadata,
     _get_prior_workflow,
     _invalidate_verified_state_on_edit,
-    _stale_block_metadata_message,
     _workflow_requires_canonical_persist,
 )
 from .guardrails import (
     _authority_tool_error,
-    _download_binding_required_error,
-    _download_scout_required_error,
     _request_policy_allows_untested_code_block_draft,
 )
 
@@ -672,9 +626,9 @@ def _normalize_code_artifact_metadata_detailed(
         if schema_incompatibility is not None:
             schema_incompatibilities.append(schema_incompatibility)
             item_violations.append(render_schema_incompatibility_agent_steer(schema_incompatibility))
-        download_shape_error = _download_return_shape_error(label, dumped, block_code)
-        if download_shape_error is not None:
-            item_violations.append(download_shape_error)
+        descriptor_leak = _download_descriptor_leak_finding(label, block_code)
+        if descriptor_leak is not None:
+            item_violations.append(descriptor_leak)
         if item_violations:
             violations.extend(item_violations)
             offending_labels.append(label)
@@ -1000,59 +954,6 @@ def _default_missing_extraction_schema_provenance(raw_item: Any) -> Any:
     return item
 
 
-def _downgrade_stale_selected_metadata_item(item: dict[str, Any], selected_label: str) -> None:
-    if str(item.get("block_label") or "").strip() != selected_label:
-        return
-    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
-        for row in _artifact_mutable_rows(item.get(field_name)):
-            row.pop("goal_value_paths", None)
-            if field_name == "terminal_verifier_expectations":
-                row.pop("criteria_ids", None)
-                row.pop("claimed_outcome_ids", None)
-    criteria = _artifact_mutable_rows(item.get("completion_criteria"))
-    if not criteria:
-        item["completion_criteria"] = [
-            {
-                "id": f"criterion:{_artifact_label_fragment(selected_label)}_diagnostic",
-                "text": str(item.get("declared_goal") or selected_label).strip() or selected_label,
-                "level": "outcome",
-                "terminal": False,
-            }
-        ]
-        criteria = _artifact_mutable_rows(item.get("completion_criteria"))
-    for criterion in criteria:
-        criterion["level"] = "outcome"
-        criterion["terminal"] = False
-    criterion_ids = [str(criterion.get("id") or "").strip() for criterion in criteria]
-    criterion_ids = [criterion_id for criterion_id in criterion_ids if criterion_id]
-    for row in _artifact_mutable_rows(item.get("claimed_outcomes")):
-        row.pop("criteria_ids", None)
-        if criterion_ids:
-            row["covered_criteria"] = list(criterion_ids)
-    for row in _artifact_mutable_rows(item.get("terminal_verifier_expectations")):
-        if criterion_ids:
-            row["criteria_ids"] = list(criterion_ids)
-
-
-def _downgrade_stale_selected_goal_value_paths(raw_metadata: Any, selected_label: str) -> Any:
-    if raw_metadata in (None, [], {}) or not selected_label:
-        return raw_metadata
-    scrubbed = copy.deepcopy(raw_metadata)
-    if isinstance(scrubbed, list):
-        for item in scrubbed:
-            if isinstance(item, dict):
-                _downgrade_stale_selected_metadata_item(item, selected_label)
-    elif isinstance(scrubbed, dict):
-        if "block_label" in scrubbed:
-            _downgrade_stale_selected_metadata_item(scrubbed, selected_label)
-        else:
-            for block_label, value in scrubbed.items():
-                if block_label == selected_label and isinstance(value, dict):
-                    value.setdefault("block_label", selected_label)
-                    _downgrade_stale_selected_metadata_item(value, selected_label)
-    return scrubbed
-
-
 def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, Mapping[str, Any]]:
     if workflow_yaml is None:
         return {}
@@ -1114,42 +1015,6 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
             f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
         )
     return errors
-
-
-def _code_block_render_bound_names(workflow_yaml: str) -> set[str]:
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return set()
-    names = set(declared_workflow_parameter_keys(parsed))
-    workflow_definition = parsed.get("workflow_definition")
-    if isinstance(workflow_definition, dict):
-        for key in credential_params(workflow_definition.get("parameters")):
-            names.add(f"{key}_real_username")
-            names.add(f"{key}_real_password")
-    for block in workflow_blocks(parsed):
-        label = str(block.get("label") or "").strip()
-        if label:
-            names.add(label)
-            names.add(f"{label}_output")
-    return names
-
-
-def _code_block_render_reject(
-    workflow_yaml: str, prior_yaml: str | None
-) -> tuple[str, CodeBlockRenderDiagnostic] | None:
-    prior_blocks = _workflow_yaml_code_blocks_by_label(prior_yaml)
-    bound_names = _code_block_render_bound_names(workflow_yaml)
-    for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items():
-        code = str(block.get("code") or "")
-        if not code.strip():
-            continue
-        prior_block = prior_blocks.get(label)
-        if prior_block is not None and str(prior_block.get("code") or "") == code:
-            continue
-        diagnostic = code_block_render_diagnostic(code, bound_names)
-        if diagnostic is not None:
-            return label, diagnostic
-    return None
 
 
 def _human_facing_code_safety_errors(errors: list[str | CodeBlockSecurityError]) -> list[str | CodeBlockSecurityError]:
@@ -1443,152 +1308,6 @@ def _credential_scout_reopen_identity_digest(workflow_yaml: str) -> str:
     return f"{structural_identity}|{_stable_hash(binding)}"
 
 
-def _code_artifact_metadata_reject_payload(
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-    offending_labels: list[str],
-    violation_categories: list[str],
-    missing_labels: list[str] | None = None,
-) -> Mapping[str, object] | None:
-    labels = sorted(dict.fromkeys([*offending_labels, *(missing_labels or [])]))
-    if not labels:
-        labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-    payload = {
-        "reason_code": "metadata_reject",
-        "offending_labels": labels,
-        "required_fields": [
-            "declared_goal",
-            *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS,
-            "evidence_refs_or_observation_refs",
-        ],
-        "missing_fields_by_label": _metadata_missing_required_fields_by_label(
-            raw_metadata,
-            labels=labels,
-            missing_labels=missing_labels or [],
-        ),
-        "output_path_roots": _metadata_output_path_roots(raw_metadata),
-        "output_path_roots_by_label": _metadata_output_path_roots_by_label(raw_metadata),
-        "code_block_output_status": _metadata_reject_code_block_output_status(
-            workflow_yaml,
-            raw_metadata=raw_metadata,
-            labels=labels,
-        ),
-        "violation_categories": sorted(dict.fromkeys(violation_categories)),
-    }
-    return payload
-
-
-def _metadata_missing_required_fields_by_label(
-    raw_metadata: object,
-    *,
-    labels: list[str],
-    missing_labels: list[str],
-) -> dict[str, list[str]]:
-    items_by_label: dict[str, Mapping[str, Any]] = {}
-    for raw_item in _code_artifact_metadata_items(raw_metadata):
-        item = _raw_metadata_item_mapping(raw_item)
-        if item is None:
-            continue
-        label = str(item.get("block_label") or "").strip()
-        if label and label not in items_by_label:
-            items_by_label[label] = item
-
-    missing_label_set = set(missing_labels)
-    missing_by_label: dict[str, list[str]] = {}
-    for label in labels:
-        item = items_by_label.get(label)
-        if item is None or label in missing_label_set:
-            missing_by_label[label] = [
-                "declared_goal",
-                *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS,
-                "evidence_refs_or_observation_refs",
-            ]
-            continue
-        missing_fields: list[str] = []
-        if not str(item.get("declared_goal") or "").strip():
-            missing_fields.append("declared_goal")
-        for field_name in _CODE_ARTIFACT_REQUIRED_LIST_FIELDS:
-            value = item.get(field_name)
-            if not isinstance(value, list) or not value:
-                missing_fields.append(field_name)
-        if not item.get("evidence_refs") and not item.get("observation_refs"):
-            missing_fields.append("evidence_refs_or_observation_refs")
-        if missing_fields:
-            missing_by_label[label] = missing_fields
-    return missing_by_label
-
-
-def _metadata_output_path_roots(raw_metadata: object) -> list[str]:
-    roots: set[str] = set()
-    for label_roots in _metadata_output_path_roots_by_label(raw_metadata).values():
-        roots.update(label_roots)
-    return sorted(roots)
-
-
-def _metadata_output_paths(raw_metadata: object) -> set[str]:
-    paths: set[str] = set()
-    for raw_item in _code_artifact_metadata_items(raw_metadata):
-        item = _raw_metadata_item_mapping(raw_item)
-        if item is not None:
-            paths.update(_metadata_item_output_paths(item))
-    return paths
-
-
-def _metadata_extraction_schema_paths(raw_metadata: object) -> set[str]:
-    paths: set[str] = set()
-    for raw_item in _code_artifact_metadata_items(raw_metadata):
-        item = _raw_metadata_item_mapping(raw_item)
-        if item is not None:
-            paths.update(_metadata_item_extraction_schema_paths(item))
-    return paths
-
-
-def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list[str]]:
-    roots_by_label: dict[str, set[str]] = {}
-    for label, paths in _metadata_output_paths_by_label(raw_metadata).items():
-        roots = roots_by_label.setdefault(label, set())
-        for path in paths:
-            root = _top_level_path_segment(path)
-            if root:
-                roots.add(root)
-    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
-
-
-def _metadata_output_paths_by_label(raw_metadata: object) -> dict[str, list[str]]:
-    paths_by_label: dict[str, set[str]] = {}
-    unlabeled_index = 0
-    for raw_item in _code_artifact_metadata_items(raw_metadata):
-        item = _raw_metadata_item_mapping(raw_item)
-        if item is None:
-            continue
-        label = str(item.get("block_label") or "").strip()
-        if not label:
-            unlabeled_index += 1
-            label = f"<unlabeled:{unlabeled_index}>"
-        paths = paths_by_label.setdefault(label, set())
-        paths.update(_metadata_item_output_paths(item))
-    return {label: sorted(paths) for label, paths in sorted(paths_by_label.items()) if paths}
-
-
-def _metadata_item_output_path_roots(item: Mapping[str, Any]) -> set[str]:
-    roots: set[str] = set()
-    for path in _metadata_item_output_paths(item):
-        root = _top_level_path_segment(path)
-        if root:
-            roots.add(root)
-    return roots
-
-
-def _metadata_item_output_paths(item: Mapping[str, Any]) -> set[str]:
-    paths: set[str] = set()
-    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
-        for row in _artifact_rows(item.get(field_name)):
-            paths.update(_artifact_goal_value_paths(row.get("goal_value_paths")))
-    paths.update(_metadata_item_extraction_schema_paths(item))
-    return paths
-
-
 def _metadata_item_extraction_schema_paths(item: Mapping[str, Any]) -> set[str]:
     for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
         for row in _artifact_rows(item.get(field_name)):
@@ -1596,39 +1315,6 @@ def _metadata_item_extraction_schema_paths(item: Mapping[str, Any]) -> set[str]:
             if schema is not None:
                 return _schema_property_paths(schema)
     return set()
-
-
-def _metadata_reject_code_block_output_status(
-    workflow_yaml: str,
-    *,
-    raw_metadata: object,
-    labels: list[str],
-) -> dict[str, Mapping[str, object]]:
-    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
-    metadata_by_label: dict[str, Mapping[str, Any]] = {}
-    for raw_item in _code_artifact_metadata_items(raw_metadata):
-        item = _raw_metadata_item_mapping(raw_item)
-        if item is None:
-            continue
-        label = str(item.get("block_label") or "").strip()
-        if label and label not in metadata_by_label:
-            metadata_by_label[label] = item
-
-    status: dict[str, Mapping[str, object]] = {}
-    for label in labels:
-        block = code_blocks.get(label)
-        if block is None:
-            continue
-        block_code = str(block.get("code") or "")
-        metadata = metadata_by_label.get(label)
-        status[label] = {
-            "block_type": _enum_or_string_name(block.get("block_type")) or str(block.get("block_type") or ""),
-            "has_code": bool(block_code.strip()),
-            "declares_output_intent": _block_declares_output_intent(block),
-            "declares_output_roots": sorted(_metadata_item_output_path_roots(metadata)) if metadata else [],
-            "has_meaningful_output": _code_block_has_meaningful_output(block_code, metadata),
-        }
-    return status
 
 
 def _schema_property_roots(schema: Mapping[str, object]) -> set[str]:
@@ -1659,87 +1345,6 @@ def _schema_property_paths(schema: Mapping[str, object], *, prefix: str = "") ->
         array_prefix = f"{prefix}[]" if prefix else ""
         return _schema_property_paths(items, prefix=array_prefix)
     return set()
-
-
-def _metadata_violation_categories(violations: list[str]) -> list[str]:
-    categories: list[str] = []
-    for violation in violations:
-        if "requires non-empty" in violation:
-            categories.append("missing_required_list")
-        elif "requires a non-empty `declared_goal`" in violation:
-            categories.append("missing_declared_goal")
-        elif "requires `evidence_refs` or `observation_refs`" in violation:
-            categories.append("missing_artifact_refs")
-        elif "requires `source_tool`" in violation:
-            categories.append("missing_source_tool")
-        elif "goal_value_paths" in violation:
-            categories.append("invalid_goal_value_paths")
-        elif "extraction_schema" in violation:
-            categories.append("invalid_extraction_schema")
-        elif "return" in violation or "output" in violation:
-            categories.append("invalid_output_shape")
-        else:
-            categories.append("metadata_contract_violation")
-    return categories
-
-
-class _ConvergenceReject(NamedTuple):
-    authored_structure_signature: str
-    reason: Literal["identical_authored_structure", "frontier_unchanged"]
-    commit_early_terminal: bool
-
-
-def _recorded_outcome_convergence_reject(
-    ctx: AgentContext,
-    *,
-    workflow_yaml: str,
-    code_artifact_metadata: object,
-) -> _ConvergenceReject | None:
-    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
-    if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
-        return None
-    candidate_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
-    if candidate_signature is None:
-        return None
-    if candidate_signature == latest.authored_structure_signature:
-        return _ConvergenceReject(candidate_signature, "identical_authored_structure", False)
-    constraint = getattr(ctx, "recorded_outcome_binding_constraint", None)
-    if not isinstance(constraint, RecordedOutcomeBindingConstraint):
-        return None
-    # An author-time reject re-keys `latest` without an executed run, so keep the binding
-    # anchored to its run-outcome key across consecutive frontier-unchanged rejects until a
-    # real run legitimately re-keys it.
-    if latest.phase != "author_time_reject" and constraint.repeated_structural_key != latest.structural_key:
-        return None
-    candidate_block_signatures = authored_block_signatures_from_workflow(workflow_yaml, code_artifact_metadata)
-    if constraint.owning_block_frontier_moved(candidate_block_signatures):
-        return None
-    return _ConvergenceReject(candidate_signature, "frontier_unchanged", constraint.frontier_uncrossable)
-
-
-def _commit_recorded_outcome_early_terminal(ctx: AgentContext) -> None:
-    constraint = ctx.recorded_outcome_binding_constraint
-    diagnostic_reason = (
-        constraint.diagnostic_reason if isinstance(constraint, RecordedOutcomeBindingConstraint) else "none"
-    )
-    signal = CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text=(
-            f"The recorded build-test outcome names an uncrossable page frontier ({diagnostic_reason}) and the "
-            "frontier block is unchanged; stop retrying and report the recorded blocker from the preserved draft."
-        ),
-        user_facing_reason="I can't get past this page, so I'll stop here and report what I found.",
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code="repair_ceiling_reached",
-        blocked_tool="update_workflow",
-    )
-    stash_blocker_signal(ctx, signal)
-    stash_repair_ceiling_turn_halt(
-        ctx, signal, consecutive_identical_repair_count=ctx.consecutive_non_converging_repair_count
-    )
 
 
 def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
@@ -2243,65 +1848,6 @@ def _definition_plane_preflight_reject(
     )
 
 
-def _synthesized_business_input_floor_reject(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    imposition: _SynthesizedCodeImpositionResult,
-) -> _DefinitionPlaneReject | None:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if not (
-        imposition.substitutions is not None or ctx.synthesized_block_offered or ctx.spine_imposition_owned_attempt
-    ):
-        return None
-    criteria = _active_completion_criteria(ctx)
-    has_business_goal = any(
-        criterion.kind == "terminal_action"
-        or (
-            criterion.level == "run"
-            and criterion.requested_output_floor_rekeyed
-            and bool(criterion.floor_rekeyed_from_path)
-        )
-        for criterion in criteria
-    )
-    if not has_business_goal:
-        return None
-    rejection = _definition_plane_preflight_reject(
-        ctx,
-        workflow_yaml,
-        enforce_untagged_declared_inputs=True,
-    )
-    retained_required_keys = set(getattr(ctx, "synthesized_business_required_parameter_keys", set()))
-    if not retained_required_keys:
-        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
-    runtime_sources = _workflow_runtime_parameter_sources(parsed)
-    if runtime_sources is None:
-        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
-    missing_retained_keys = retained_required_keys - runtime_sources
-    if not missing_retained_keys:
-        return rejection if rejection is not None and rejection.unreferenced_parameter_keys else None
-    current_missing_keys = set(rejection.unreferenced_parameter_keys) if rejection is not None else set()
-    return _DefinitionPlaneReject(
-        criterion_ids=(
-            rejection.criterion_ids if rejection is not None else tuple(criterion.id for criterion in criteria)
-        ),
-        reason_codes=(
-            rejection.reason_codes if rejection is not None else ("synthesized_required_parameters_unreferenced",)
-        ),
-        unreferenced_parameter_keys=tuple(sorted(current_missing_keys | missing_retained_keys)),
-    )
-
-
-def _reopen_scout_after_synthesized_business_input_floor(ctx: AgentContext) -> None:
-    ctx.synthesized_block_offered = False
-    ctx.synthesized_block_offered_trajectory_len = 0
-    ctx.synthesized_block_offered_goal_complete = False
-    ctx.spine_imposition_owned_attempt = False
-
-
 def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
     if rejection.unreferenced_parameter_keys:
         keys = ", ".join(f"`{key}`" for key in rejection.unreferenced_parameter_keys)
@@ -2345,105 +1891,6 @@ def _definition_plane_structural_key(
         observed_evidence_summary=_definition_plane_reject_error(rejection),
     )
     return outcome.structural_key or authored_signature or ""
-
-
-def _record_definition_plane_reject(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    rejection: _DefinitionPlaneReject,
-    *,
-    code_artifact_metadata: object = None,
-) -> None:
-    structural_payload, authored_signature = _definition_plane_structural_payload(
-        workflow_yaml,
-        rejection,
-        code_artifact_metadata,
-    )
-    block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-    _record_author_time_reject_outcome(
-        ctx,
-        reason_code="definition_contract_unsatisfied",
-        summary=_definition_plane_reject_error(rejection),
-        structural_payload=structural_payload,
-        authored_structure_signature=authored_signature,
-        block_labels=block_labels,
-    )
-
-
-def _record_definition_plane_ablation_event(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    rejection: _DefinitionPlaneReject,
-    *,
-    code_artifact_metadata: object = None,
-) -> bool:
-    fingerprint = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
-    if fingerprint is None:
-        return False
-    payload: AuthorTimeGateAblationPayload = {
-        "criterion_ids": list(rejection.criterion_ids),
-        "definition_reason_codes": list(rejection.reason_codes),
-        "unreferenced_parameter_keys": list(rejection.unreferenced_parameter_keys),
-    }
-    return record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
-        reason_code="definition_contract_unsatisfied",
-        fingerprint=fingerprint,
-        blocked_tool="update_workflow",
-        payload=payload,
-    )
-
-
-def _stash_unresolved_recorded_outcome_grounding_halt(
-    ctx: AgentContext,
-    unresolved_parameter_keys: Iterable[str],
-) -> bool:
-    requirement = ctx.recorded_outcome_grounding_requirement
-    constraint = ctx.recorded_outcome_binding_constraint
-    latest = ctx.latest_recorded_build_test_outcome
-    if (
-        not isinstance(requirement, RecordedOutcomeGroundingRequirement)
-        or requirement.phase != "author_time_reject"
-        or not requirement.satisfied
-        or not isinstance(constraint, RecordedOutcomeBindingConstraint)
-        or constraint.repeated_structural_key != requirement.structural_key
-        or not isinstance(latest, RecordedBuildTestOutcome)
-        or latest.structural_key != requirement.structural_key
-        or latest_recorded_build_test_outcome_repeated(ctx) is not True
-    ):
-        return False
-    keys = sorted(set(unresolved_parameter_keys))
-    if not keys:
-        return False
-    payload: AuthorTimeGateAblationPayload = {
-        "phase": requirement.phase,
-        "outcome_reason_code": requirement.reason_code,
-        "workflow_run_id": requirement.workflow_run_id,
-        "block_labels": list(requirement.block_labels),
-        "unresolved_parameter_keys": keys,
-    }
-    if record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
-        reason_code="definition_contract_unsatisfied",
-        fingerprint=requirement.structural_key,
-        blocked_tool="update_workflow",
-        payload=payload,
-    ):
-        return False
-    signal = build_definition_contract_unsatisfied_blocker_signal(
-        unresolved_parameter_keys=keys,
-        grounding_unresolved=True,
-    )
-    claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, signal, force_stash=True)
-    stash_turn_halt_from_blocker_signal(ctx, signal, source="recorded_outcome_regrounding")
-    LOG.info(
-        "copilot recorded outcome regrounding halted before reauthor",
-        structural_key=requirement.structural_key,
-        unresolved_parameter_keys=keys,
-    )
-    return True
 
 
 def _scout_trajectory_index(interaction: Mapping[str, Any], position: int) -> int:
@@ -2856,30 +2303,6 @@ def _authoring_parameter_binding_resolution(
     return _AuthoringParameterBindingResolution(snapshot, directive)
 
 
-def _authoring_parameter_binding_resolution_for_definition(
-    ctx: AgentContext,
-    parsed: Mapping[str, Any],
-    runtime_parameters: Mapping[str, Any] | None,
-    code_artifact_metadata: object = None,
-) -> _AuthoringParameterBindingResolution | None:
-    workflow_yaml = yaml.safe_dump(dict(parsed), sort_keys=False)
-    rejection = _definition_plane_preflight_reject(ctx, workflow_yaml)
-    if rejection is None:
-        return None
-    return _authoring_parameter_binding_resolution(
-        ctx,
-        parsed,
-        runtime_parameters,
-        unreferenced_parameter_keys=rejection.unreferenced_parameter_keys,
-        carrier_code="",
-        diagnostic_structural_key=_definition_plane_structural_key(
-            workflow_yaml,
-            rejection,
-            code_artifact_metadata,
-        ),
-    )
-
-
 def _judgment_output_paths(ctx: AgentContext) -> set[str]:
     # Judgment-boolean paths are dropped from the producer's static-bind set, not moved to the
     # declaration lane; declaring one would fabricate a None where the run's own judgment belongs. The
@@ -3029,8 +2452,6 @@ _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE = "separated_browser_spine_pl
 _OUTPUT_CONTRACT_REJECT_REASON_CODE = "output_contract_required"
 _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE = "value_bearing_output_required"
 _OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH = "output"
-_OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE = OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
-_MAX_OUTPUT_CONTRACT_REJECTS = 4
 _MAX_OUTPUT_CONTRACT_DEFERRALS = 3
 _MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY = "missing_code_artifact_metadata"
 _METADATA_NORMALIZATION_REJECT_FAMILY = "metadata_normalization"
@@ -3045,8 +2466,6 @@ _METADATA_FAMILY_REJECT_FAMILIES = frozenset(
     }
 )
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
-_OUTPUT_CONTRACT_ABLATION_GATE_ID = OUTPUT_CONTRACT_ACTUATION_GATE_ID
-_METADATA_PREFLIGHT_ABLATION_GATE_ID = METADATA_RUN_PREFLIGHT_REJECT_GATE_ID
 _VALUE_BEARING_ROOT_GUIDANCE_PATH = "output"
 _VALUE_BEARING_PREARM_FINGERPRINT_PREFIX = "value-bearing:prearm:"
 _VALUE_BEARING_GUIDANCE_FINGERPRINT_PREFIX = "value-bearing:guidance:"
@@ -3078,63 +2497,6 @@ class _OutputContractEvaluation:
             or self.missing_return_paths
             or self.shape_violations
         )
-
-
-def _record_output_contract_ablation_event(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    gate_id: str,
-    blocked_tool: str,
-    fingerprint: str,
-) -> bool:
-    reason_code = str(
-        evaluation.payload.get("reason_code") or evaluation.reason_code or _OUTPUT_CONTRACT_REJECT_REASON_CODE
-    )
-    payload: AuthorTimeGateAblationPayload = {
-        "block_label": evaluation.block_label,
-        "canonical_output_contract_signature": evaluation.canonical_signature,
-        "canonical_required_child_paths": sorted(evaluation.required_paths),
-        "missing_metadata_paths": list(evaluation.missing_metadata_paths),
-        "missing_schema_paths": list(evaluation.missing_schema_paths),
-        "missing_return_paths": list(evaluation.missing_return_paths),
-        "shape_violations": list(evaluation.shape_violations),
-        "can_attempt_run": evaluation.can_attempt_run,
-    }
-    return record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=gate_id,
-        reason_code=reason_code,
-        fingerprint=fingerprint,
-        blocked_tool=blocked_tool,
-        payload=payload,
-    )
-
-
-def _record_output_contract_actuation_ablation_event(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    *,
-    reason_code: str,
-    signature: str,
-    block_labels: Sequence[str],
-    required_paths: Iterable[str],
-) -> bool:
-    if not copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
-        return False
-    payload: AuthorTimeGateAblationPayload = {
-        "block_labels": list(block_labels),
-        "canonical_output_contract_signature": signature,
-        "canonical_required_child_paths": sorted(required_paths),
-    }
-    return record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
-        reason_code=reason_code,
-        fingerprint=_output_contract_structural_fingerprint(workflow_yaml, signature),
-        blocked_tool="update_workflow",
-        payload=payload,
-    )
 
 
 @dataclass(frozen=True)
@@ -3500,27 +2862,6 @@ def _stable_output_contract_key(
     if request_slot_identity:
         payload["request_slot_identity"] = sorted(request_slot_identity)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def _output_contract_author_time_structural_payload(
-    ctx: AgentContext,
-    required_paths: set[str],
-    *,
-    block_label: str = "",
-    deficiency_family: str = "output_contract_unsatisfied",
-) -> Mapping[str, object] | None:
-    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
-    if not signature:
-        return None
-    payload: dict[str, object] = {
-        "version": "metadata_reject_output_contract:v1",
-        "canonical_output_contract_signature": signature,
-        "canonical_required_child_paths": sorted(required_paths),
-        "deficiency_family": deficiency_family,
-    }
-    if block_label.strip():
-        payload["block_label"] = block_label.strip()
-    return payload
 
 
 def _output_contract_signature(
@@ -4067,26 +3408,6 @@ def _statically_lacks_value_bearing_observation_paths(code: str, observation_pat
         return False
 
 
-def _statically_valueless_return_envelope(code: str) -> bool:
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-        return_nodes = [node for node in _iter_top_level_scope(tree.body) if isinstance(node, ast.Return)]
-        if not return_nodes:
-            return False
-        assignments, uncertain_names = _top_level_static_assignments(tree)
-        for node in return_nodes:
-            if node.value is None:
-                return False
-            resolved = _resolve_static_expression(node.value, assignments, uncertain_names)
-            if not isinstance(resolved, ast.Dict):
-                return False
-            if _static_leaf_value_state(resolved) != "empty":
-                return False
-        return True
-    except (RecursionError, SyntaxError, ValueError):
-        return False
-
-
 def _static_value_bearing_violations(code: str, observation_paths: set[str]) -> list[str]:
     if not _statically_lacks_value_bearing_observation_paths(code, observation_paths):
         return []
@@ -4349,782 +3670,7 @@ def _evaluate_output_contract_for_code_block(
     )
 
 
-def _adjudicate_output_contract_ladder_after_reject(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    workflow_yaml: str,
-    current_fingerprint: str,
-    steer_only: bool = False,
-    structure_directive_paths: set[str] | None = None,
-) -> OutputContractActuation | None:
-    """Run the actuation ladder at the shared deficiency seam so a signature whose formation
-    remains incomplete advances toward an advisory-consumed run or a typed terminal within the
-    existing caps, keeping the loop/churn defer bounded. A bail with no owner block is left to the
-    owner-directive path, not granted an inert run."""
-    if ctx.turn_halt is not None or ctx.output_contract_bail_actuated_this_call:
-        return None
-    # A statically valueless contract cannot be adjudicated by dispatching a run. The native
-    # reject seam may still ask the same ladder for steer-only structure guidance, but ordinary
-    # callers remain inert so they cannot mint an advisory grant that would yield the preflight.
-    if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations and not steer_only:
-        return None
-    signature = evaluation.canonical_signature
-    block_label = evaluation.block_label
-    if not signature or not block_label:
-        return None
-    if _output_contract_advisory_state(ctx, signature) in {
-        OutputContractAdvisoryState.GRANTED,
-        OutputContractAdvisoryState.CONSUMED,
-    }:
-        return None
-    block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(block_label)
-    target_code = str(block.get("code") or "") if block is not None else ""
-    blockers = list(evaluation.shape_violations) or [_OUTPUT_CONTRACT_REJECT_REASON_CODE]
-    actuation = _actuate_output_contract_bail(
-        ctx,
-        blockers=blockers,
-        target_code=target_code,
-        required_paths=(
-            structure_directive_paths
-            if steer_only and structure_directive_paths is not None
-            else evaluation.observation_paths
-        ),
-        signature=signature,
-        current_fingerprint=current_fingerprint,
-        advisory_run_grantable=blockers == [_OUTPUT_CONTRACT_REJECT_REASON_CODE],
-        declaration_paths=evaluation.declaration_paths,
-        steer_only=steer_only,
-    )
-    if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
-        _stash_output_source_unobservable_terminal(
-            ctx,
-            reason_code=actuation.reason_code,
-            required_paths=evaluation.required_paths,
-            block_label=block_label,
-            signature=signature,
-            blockers=blockers,
-        )
-    elif actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE:
-        _record_armed_directive_fingerprint(ctx, signature, current_fingerprint)
-    return actuation
-
-
 _METADATA_CONVERGENCE_DIRECTIVE_BLOCKER = "missing_code_artifact_metadata"
-
-
-def _metadata_reject_directive_payload(
-    *,
-    missing_fields_by_label: dict[str, list[str]],
-    required_paths: set[str],
-    escalate: bool,
-) -> dict[str, Any]:
-    directive: dict[str, Any] = {
-        "rung": 2 if escalate else 1,
-        "missing_fields_by_label": {label: list(fields) for label, fields in missing_fields_by_label.items()},
-    }
-    if escalate:
-        # "evidence_refs_or_observation_refs" is a messaging label for the either-one requirement;
-        # the skeleton must only offer real CodeArtifactMetadata fields the model can set.
-        directive["metadata_fill_in_skeleton"] = {
-            label: {
-                field: "" if field == "declared_goal" else []
-                for raw_field in fields
-                for field in (
-                    ("evidence_refs", "observation_refs")
-                    if raw_field == "evidence_refs_or_observation_refs"
-                    else (raw_field,)
-                )
-            }
-            for label, fields in missing_fields_by_label.items()
-        }
-    if required_paths:
-        directive["required_output_paths"] = sorted(required_paths)
-        directive["extraction_schema_template"] = _schema_template_for_required_paths(required_paths)
-    return directive
-
-
-def _emit_metadata_convergence_directive(
-    *,
-    signature: str,
-    block_label: str,
-    missing_fields_by_label: dict[str, list[str]],
-    required_paths: set[str],
-    escalate: bool,
-) -> dict[str, Any]:
-    LOG.info(
-        "copilot_output_contract_spine_structure_directive_emitted",
-        block_label=block_label,
-        canonical_output_contract_signature=signature,
-        spine_split_blockers=[_METADATA_CONVERGENCE_DIRECTIVE_BLOCKER],
-        spine_stage_count=None,
-        rung=2 if escalate else 1,
-    )
-    return _metadata_reject_directive_payload(
-        missing_fields_by_label=missing_fields_by_label,
-        required_paths=required_paths,
-        escalate=escalate,
-    )
-
-
-def _metadata_reject_seam_fingerprint(
-    workflow_yaml: str, signature: str, missing_fields_by_label: dict[str, list[str]]
-) -> str:
-    return hashlib.sha256(
-        (
-            _output_contract_structural_fingerprint(workflow_yaml, signature)
-            + json.dumps(missing_fields_by_label, sort_keys=True)
-        ).encode("utf-8")
-    ).hexdigest()
-
-
-@dataclass(frozen=True)
-class _ValueBearingEvaluationGuidance:
-    required_output_paths: tuple[str, ...]
-    shape_violations: tuple[str, ...]
-    satisfying_templates: dict[str, Any]
-
-    def fingerprint_payload(self) -> dict[str, Any]:
-        return {
-            "required_output_paths": list(self.required_output_paths),
-            "shape_violations": list(self.shape_violations),
-            "satisfying_templates": self.satisfying_templates,
-        }
-
-
-def _value_bearing_evaluation_guidance(
-    evaluation: _OutputContractEvaluation,
-) -> _ValueBearingEvaluationGuidance | None:
-    raw_paths = evaluation.payload.get("canonical_required_child_paths")
-    raw_shape_violations = evaluation.payload.get("shape_violations")
-    raw_satisfying_templates = evaluation.payload.get("satisfying_templates")
-    if (
-        not isinstance(raw_paths, list)
-        or not raw_paths
-        or any(not isinstance(path, str) or not path for path in raw_paths)
-        or not isinstance(raw_shape_violations, list)
-        or any(not isinstance(violation, str) or not violation for violation in raw_shape_violations)
-        or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in raw_shape_violations
-        or not isinstance(raw_satisfying_templates, dict)
-    ):
-        return None
-    paths = tuple(sorted(set(raw_paths)))
-    if any(
-        path != _canonical_requested_output_path(path) or _output_path_root(path) != _VALUE_BEARING_ROOT_GUIDANCE_PATH
-        for path in paths
-    ):
-        return None
-    return _ValueBearingEvaluationGuidance(
-        required_output_paths=paths,
-        shape_violations=tuple(raw_shape_violations),
-        satisfying_templates=dict(raw_satisfying_templates),
-    )
-
-
-def _value_bearing_reject_seam_fingerprint(
-    signature: str,
-    guidance: _ValueBearingEvaluationGuidance,
-) -> str:
-    digest = hashlib.sha256(
-        json.dumps(
-            {
-                "directive_family": _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
-                "canonical_output_contract_signature": signature,
-                "guidance": guidance.fingerprint_payload(),
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    return f"{_VALUE_BEARING_GUIDANCE_FINGERPRINT_PREFIX}{digest}"
-
-
-def _value_bearing_reject_directive_payload(
-    *,
-    guidance: _ValueBearingEvaluationGuidance,
-    escalate: bool,
-) -> dict[str, Any]:
-    return {
-        "rung": 2 if escalate else 1,
-        "required_output_paths": list(guidance.required_output_paths),
-        "shape_violations": list(guidance.shape_violations),
-        "satisfying_templates": guidance.satisfying_templates,
-    }
-
-
-def _emit_value_bearing_convergence_directive(
-    *,
-    signature: str,
-    block_label: str,
-    guidance: _ValueBearingEvaluationGuidance,
-    guidance_fingerprint: str,
-    candidate_fingerprint: str,
-    escalate: bool,
-) -> dict[str, Any]:
-    directive = _value_bearing_reject_directive_payload(
-        guidance=guidance,
-        escalate=escalate,
-    )
-    LOG.info(
-        "copilot_output_contract_spine_structure_directive_emitted",
-        directive_family=_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
-        block_label=block_label,
-        canonical_output_contract_signature=signature,
-        canonical_required_child_paths=list(guidance.required_output_paths),
-        guidance_fingerprint=guidance_fingerprint,
-        candidate_fingerprint=candidate_fingerprint,
-        spine_split_blockers=list(guidance.shape_violations),
-        spine_stage_count=None,
-        rung=directive["rung"],
-    )
-    return directive
-
-
-def _value_bearing_definition_reject_corrective(
-    ctx: AgentContext,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-) -> dict[str, Any] | None:
-    if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
-        return None
-    evaluation = _evaluate_output_contract_for_code_block(
-        ctx,
-        workflow_yaml,
-        raw_metadata,
-        allow_static_return_advisory=True,
-        enforce_value_bearing_liveness=True,
-    )
-    if evaluation is None or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in evaluation.shape_violations:
-        return None
-    guidance = _value_bearing_evaluation_guidance(evaluation)
-    if guidance is None or not evaluation.canonical_signature or not evaluation.block_label:
-        return None
-    guidance_fingerprint = _value_bearing_reject_seam_fingerprint(
-        evaluation.canonical_signature,
-        guidance,
-    )
-    escalate = _prior_output_contract_directive_unconsumed(
-        ctx,
-        evaluation.canonical_signature,
-        guidance_fingerprint,
-    )
-    actuation = _adjudicate_output_contract_ladder_after_reject(
-        ctx,
-        evaluation,
-        workflow_yaml=workflow_yaml,
-        current_fingerprint=guidance_fingerprint,
-        steer_only=True,
-        structure_directive_paths=set(guidance.required_output_paths),
-    )
-    if actuation is None or actuation.kind != OutputContractActuationKind.STRUCTURE_DIRECTIVE:
-        return None
-    candidate_fingerprint = _output_contract_structural_fingerprint(
-        workflow_yaml,
-        evaluation.canonical_signature,
-    )
-    directive = _emit_value_bearing_convergence_directive(
-        signature=evaluation.canonical_signature,
-        block_label=evaluation.block_label,
-        guidance=guidance,
-        guidance_fingerprint=guidance_fingerprint,
-        candidate_fingerprint=candidate_fingerprint,
-        escalate=escalate,
-    )
-    return {
-        "canonical_output_contract_signature": evaluation.canonical_signature,
-        "canonical_required_child_paths": list(guidance.required_output_paths),
-        "shape_violations": list(guidance.shape_violations),
-        "satisfying_templates": guidance.satisfying_templates,
-        "output_contract_actuation": actuation.kind.value,
-        "value_bearing_convergence_directive": directive,
-    }
-
-
-def _adjudicate_metadata_reject_ladder(
-    ctx: AgentContext,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-    missing_labels: list[str],
-    required_paths: set[str],
-) -> dict[str, Any] | None:
-    """Adjudicate an enforcing metadata reject without coupling it to unrelated outcome state."""
-    if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
-        return None
-    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
-    block_label = missing_labels[0] if len(missing_labels) == 1 else ""
-    if not signature or not block_label:
-        return None
-    missing_fields_by_label = _metadata_missing_required_fields_by_label(
-        raw_metadata, labels=missing_labels, missing_labels=missing_labels
-    )
-    reject_payload = _code_artifact_metadata_reject_payload(
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_metadata,
-        offending_labels=[],
-        missing_labels=missing_labels,
-        violation_categories=["missing_code_artifact_metadata"],
-    )
-    latest_outcome = ctx.latest_recorded_build_test_outcome
-    candidate_outcome = (
-        latest_outcome
-        if isinstance(latest_outcome, RecordedBuildTestOutcome)
-        and latest_outcome.phase == "author_time_reject"
-        and latest_outcome.reason_code == "metadata_reject"
-        else _build_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary="Submitted workflow is missing required code artifact metadata.",
-            structural_payload=reject_payload,
-            block_labels=missing_labels,
-            missing_requested_output_facts=_missing_requested_output_facts(
-                required_paths,
-                reason_code=_required_child_output_paths_for_authoring(ctx)[2],
-            ),
-        )
-    )
-    seam_fingerprint = _metadata_reject_seam_fingerprint(workflow_yaml, signature, missing_fields_by_label)
-    if ctx.metadata_reject_ladder_state is None and _prior_output_contract_directive_unconsumed(
-        ctx,
-        signature,
-        seam_fingerprint,
-    ):
-        structural_key = candidate_outcome.structural_key
-        if structural_key is not None:
-            ctx.metadata_reject_ladder_state = adjudicate_metadata_reject_ladder(
-                None,
-                MetadataRejectLadderInput(
-                    reject_family="missing_code_artifact_metadata",
-                    structural_key=structural_key,
-                    missing_fields_by_label=missing_fields_by_label,
-                ),
-            ).state
-    decision = _metadata_reject_ladder_decision(
-        ctx,
-        candidate_outcome=candidate_outcome,
-        reject_family="missing_code_artifact_metadata",
-        missing_fields_by_label=missing_fields_by_label,
-    )
-    if decision is None:
-        return None
-    if decision.action == "terminal":
-        return _metadata_reject_terminal_data(decision)
-    assert decision.rung is not None
-    _record_armed_directive_fingerprint(ctx, signature, seam_fingerprint)
-    return _emit_metadata_convergence_directive(
-        signature=signature,
-        block_label=block_label,
-        missing_fields_by_label=missing_fields_by_label,
-        required_paths=required_paths,
-        escalate=decision.rung == 2,
-    )
-
-
-def _metadata_reject_ladder_decision(
-    ctx: AgentContext,
-    *,
-    candidate_outcome: RecordedBuildTestOutcome,
-    reject_family: MetadataRejectFamily,
-    missing_fields_by_label: dict[str, list[str]],
-) -> MetadataRejectLadderDecision | None:
-    structural_key = candidate_outcome.structural_key
-    if structural_key is None or not missing_fields_by_label:
-        return None
-    prior_state = ctx.metadata_reject_ladder_state
-    latest_outcome = ctx.latest_recorded_build_test_outcome
-    if (
-        prior_state is not None
-        and isinstance(latest_outcome, RecordedBuildTestOutcome)
-        and latest_outcome.phase == "author_time_reject"
-        and (
-            latest_outcome.reason_code != "metadata_reject"
-            or latest_outcome.structural_key != prior_state.structural_key
-        )
-    ):
-        _reset_metadata_reject_ladder_state(
-            ctx,
-            superseding_reject_family=latest_outcome.reason_code,
-        )
-        prior_state = None
-    decision = adjudicate_metadata_reject_ladder(
-        prior_state,
-        MetadataRejectLadderInput(
-            reject_family=reject_family,
-            structural_key=structural_key,
-            missing_fields_by_label=missing_fields_by_label,
-        ),
-    )
-    ctx.metadata_reject_ladder_state = decision.state
-    if decision.state.streak_count >= 2:
-        LOG.info(
-            "copilot_metadata_reject_same_key_detected",
-            reject_family=reject_family,
-            structural_key=structural_key,
-            gate_id=decision.gate_id,
-            streak_count=decision.state.streak_count,
-            missing_fields_by_label=decision.missing_fields_by_label,
-        )
-    if decision.action == "terminal":
-        signal = build_metadata_reject_same_key_terminal_signal(
-            structural_key=structural_key,
-            reject_family=reject_family,
-            missing_fields_by_label=decision.missing_fields_by_label,
-        )
-        claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, signal)
-        stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
-        LOG.info(
-            "copilot_metadata_reject_same_key_terminal_selected",
-            reject_family=reject_family,
-            structural_key=structural_key,
-            gate_id=decision.gate_id,
-            streak_count=decision.state.streak_count,
-            missing_fields_by_label=decision.missing_fields_by_label,
-        )
-    return decision
-
-
-def _reset_metadata_reject_ladder_state(ctx: AgentContext, *, superseding_reject_family: str) -> None:
-    prior_state = ctx.metadata_reject_ladder_state
-    if prior_state is None:
-        return
-    ctx.metadata_reject_ladder_state = None
-    LOG.info(
-        "copilot_metadata_reject_streak_reset",
-        prior_reject_family=prior_state.reject_family,
-        prior_structural_key=prior_state.structural_key,
-        prior_streak_count=prior_state.streak_count,
-        superseding_reject_family=superseding_reject_family,
-    )
-
-
-def _metadata_reject_terminal_data(decision: MetadataRejectLadderDecision) -> dict[str, CodeArtifactMetadataValue]:
-    return cast(
-        dict[str, CodeArtifactMetadataValue],
-        {
-            "reason_code": METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
-            "reject_family": decision.state.reject_family,
-            "structural_key": decision.state.structural_key,
-            "gate_id": decision.gate_id,
-            "missing_fields_by_label": decision.missing_fields_by_label,
-            "preserves_workflow_draft": True,
-        },
-    )
-
-
-def _synthesized_metadata_reject_directive(
-    ctx: AgentContext,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-    label_candidates: list[str],
-    required_paths: set[str],
-) -> dict[str, Any] | None:
-    if len(label_candidates) != 1:
-        _reset_metadata_reject_ladder_state(
-            ctx,
-            superseding_reject_family="recorded_outcome_metadata_reject",
-        )
-        return None
-    label = label_candidates[0]
-    full_required_fields = {"declared_goal", *_CODE_ARTIFACT_REQUIRED_LIST_FIELDS, "evidence_refs_or_observation_refs"}
-    missing_fields_by_label = _metadata_missing_required_fields_by_label(
-        raw_metadata, labels=[label], missing_labels=[]
-    )
-    if set(missing_fields_by_label.get(label) or []) != full_required_fields:
-        _reset_metadata_reject_ladder_state(
-            ctx,
-            superseding_reject_family="recorded_outcome_metadata_reject",
-        )
-        return None
-    return _adjudicate_metadata_reject_ladder(
-        ctx,
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_metadata,
-        missing_labels=[label],
-        required_paths=required_paths,
-    )
-
-
-def _record_output_contract_reject(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    summary: str,
-    authored_structural_fingerprint: str = "",
-    workflow_yaml: str = "",
-    raw_metadata: object = None,
-) -> dict[str, Any]:
-    # A candidate so incomplete that no required child paths are derivable must still consume the
-    # reject budget: an empty set would silently skip counting and degrade the turn to the generic
-    # churn stop (loop_detected) instead of this ladder's typed terminal.
-    value_bearing_reject = _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations
-    value_bearing_guidance = _value_bearing_evaluation_guidance(evaluation) if value_bearing_reject else None
-    value_bearing_directive_paths = (
-        set(value_bearing_guidance.required_output_paths) if value_bearing_guidance is not None else set()
-    )
-    counted_paths = (
-        value_bearing_directive_paths or evaluation.required_paths or {_OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH}
-    )
-    count = _record_output_contract_family_reject(
-        ctx,
-        counted_paths,
-        reject_family=str(evaluation.payload.get("reason_code") or _OUTPUT_CONTRACT_REJECT_REASON_CODE),
-        authored_structural_fingerprint=authored_structural_fingerprint,
-    )
-    _capture_rejected_code_artifact_metadata(ctx)
-    payload = dict(evaluation.payload)
-    payload["output_contract_reject_count"] = count
-    payload["output_contract_reject_budget"] = _MAX_OUTPUT_CONTRACT_REJECTS
-    value_bearing_directive_eligible = bool(
-        value_bearing_reject
-        and evaluation.canonical_signature
-        and evaluation.block_label
-        and value_bearing_guidance is not None
-    )
-    missing_fields_by_label = (
-        _metadata_missing_required_fields_by_label(raw_metadata, labels=[evaluation.block_label], missing_labels=[])
-        if evaluation.block_label
-        else {}
-    )
-    if value_bearing_directive_eligible:
-        assert value_bearing_guidance is not None
-        directive_fingerprint = _value_bearing_reject_seam_fingerprint(
-            evaluation.canonical_signature,
-            value_bearing_guidance,
-        )
-    else:
-        directive_fingerprint = (
-            _metadata_reject_seam_fingerprint(workflow_yaml, evaluation.canonical_signature, missing_fields_by_label)
-            if missing_fields_by_label
-            else authored_structural_fingerprint
-        )
-    directive_escalate = _prior_output_contract_directive_unconsumed(
-        ctx, evaluation.canonical_signature, directive_fingerprint
-    )
-    budget_terminal = value_bearing_directive_eligible and _adjudicate_output_contract_budget(
-        ctx,
-        counted_paths,
-        count=count,
-        block_label=evaluation.block_label,
-    )
-    actuation = (
-        None
-        if budget_terminal
-        else _adjudicate_output_contract_ladder_after_reject(
-            ctx,
-            evaluation,
-            workflow_yaml=workflow_yaml,
-            current_fingerprint=directive_fingerprint,
-            steer_only=value_bearing_directive_eligible,
-            structure_directive_paths=value_bearing_directive_paths if value_bearing_directive_eligible else None,
-        )
-    )
-    value_bearing_directive_emitted = False
-    if actuation is not None:
-        payload["output_contract_actuation"] = actuation.kind.value
-        if actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE and value_bearing_directive_eligible:
-            assert value_bearing_guidance is not None
-            candidate_fingerprint = _output_contract_structural_fingerprint(
-                workflow_yaml, evaluation.canonical_signature
-            )
-            value_bearing_directive = _emit_value_bearing_convergence_directive(
-                signature=evaluation.canonical_signature,
-                block_label=evaluation.block_label,
-                guidance=value_bearing_guidance,
-                guidance_fingerprint=directive_fingerprint,
-                candidate_fingerprint=candidate_fingerprint,
-                escalate=directive_escalate,
-            )
-            payload["value_bearing_convergence_directive"] = value_bearing_directive
-            value_bearing_directive_emitted = True
-            latest_outcome = ctx.latest_recorded_build_test_outcome
-            if isinstance(latest_outcome, RecordedBuildTestOutcome) and latest_outcome.phase == "author_time_reject":
-                record_build_test_outcome(ctx, None)
-        if (
-            actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
-            and not value_bearing_directive_eligible
-            and evaluation.block_label
-            and missing_fields_by_label
-        ):
-            payload["metadata_convergence_directive"] = _emit_metadata_convergence_directive(
-                signature=evaluation.canonical_signature,
-                block_label=evaluation.block_label,
-                missing_fields_by_label=missing_fields_by_label,
-                required_paths=evaluation.required_paths,
-                escalate=directive_escalate,
-            )
-        if actuation.kind != OutputContractActuationKind.STRUCTURE_DIRECTIVE:
-            latest_outcome = ctx.latest_recorded_build_test_outcome
-            if (
-                isinstance(latest_outcome, RecordedBuildTestOutcome)
-                and latest_outcome.phase == "author_time_reject"
-                and latest_outcome.reason_code == "metadata_reject"
-            ):
-                # The typed adjudication now owns this same deficiency. Keep the historical reject for
-                # ceiling/liveness evidence, but do not render it again as a fresh rejection next turn.
-                record_build_test_outcome(ctx, None)
-    if not value_bearing_directive_eligible:
-        budget_terminal = _adjudicate_output_contract_budget(
-            ctx,
-            counted_paths,
-            count=count,
-            block_label=evaluation.block_label,
-        )
-    if budget_terminal:
-        payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-        payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-    if (
-        actuation is None or actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
-    ) and not value_bearing_directive_emitted:
-        structural_payload = _output_contract_author_time_structural_payload(
-            ctx,
-            evaluation.required_paths,
-            block_label=evaluation.block_label,
-        )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary=summary,
-            structural_payload=structural_payload or payload,
-            block_labels=[evaluation.block_label] if evaluation.block_label else [],
-            missing_requested_output_facts=payload.get("missing_requested_output_facts")
-            if isinstance(payload.get("missing_requested_output_facts"), list)
-            else None,
-        )
-        if count < 1:
-            _record_code_authoring_guardrail_reject(ctx)
-    return payload
-
-
-def _record_output_contract_family_reject(
-    ctx: AgentContext,
-    required_paths: set[str],
-    *,
-    reject_family: str,
-    authored_structural_fingerprint: str = "",
-) -> int:
-    if not required_paths:
-        return 0
-    scope_key = _output_contract_scope_key(ctx)
-    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
-    if not signature:
-        LOG.info(
-            "copilot_output_contract_reject_count_unscoped",
-            reject_family=reject_family,
-            canonical_required_child_paths=sorted(required_paths),
-        )
-        return 0
-    count_by_signature = getattr(ctx, "output_contract_reject_count_by_signature", None)
-    if not isinstance(count_by_signature, dict):
-        count_by_signature = {}
-    if authored_structural_fingerprint:
-        prior_fingerprint = ctx.output_contract_last_reject_fingerprint_by_signature.get(signature)
-        imposed_since = ctx.output_contract_imposed_since_last_reject_by_signature.get(signature, False)
-        fingerprint_rotated = prior_fingerprint is not None and prior_fingerprint != authored_structural_fingerprint
-        rotation_resets = fingerprint_rotated and reject_family not in _METADATA_FAMILY_REJECT_FAMILIES
-        if imposed_since or rotation_resets:
-            count_by_signature[signature] = 0
-            ctx.output_contract_imposed_since_last_reject_by_signature[signature] = False
-            LOG.info(
-                "copilot_output_contract_reject_streak_reset",
-                canonical_output_contract_signature=signature,
-                imposed_since_last_reject=imposed_since,
-                reject_family=reject_family,
-            )
-        ctx.output_contract_last_reject_fingerprint_by_signature[signature] = authored_structural_fingerprint
-    count = int(count_by_signature.get(signature, 0) or 0) + 1
-    count_by_signature[signature] = count
-    ctx.output_contract_reject_count_by_signature = count_by_signature
-    LOG.info(
-        "copilot_output_contract_reject_counted",
-        output_contract_scope_key=scope_key,
-        canonical_output_contract_signature=signature,
-        output_contract_reject_count=count,
-        output_contract_reject_budget=_MAX_OUTPUT_CONTRACT_REJECTS,
-        reject_family=reject_family,
-        canonical_required_child_paths=sorted(required_paths),
-    )
-    return count
-
-
-def _record_output_contract_deferral(ctx: AgentContext, required_paths: set[str]) -> int:
-    if not required_paths:
-        return 0
-    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
-    if not signature:
-        return 0
-    count = int(ctx.output_contract_deferral_count_by_signature.get(signature, 0) or 0) + 1
-    ctx.output_contract_deferral_count_by_signature[signature] = count
-    return count
-
-
-def _adjudicate_output_contract_budget(
-    ctx: AgentContext,
-    required_paths: set[str],
-    *,
-    count: int,
-    block_label: str,
-) -> bool:
-    if count < _MAX_OUTPUT_CONTRACT_REJECTS:
-        return False
-    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
-    if not run_backed_repair_evidence_exists(ctx):
-        deferral_count = _record_output_contract_deferral(ctx, required_paths)
-        if deferral_count < _MAX_OUTPUT_CONTRACT_DEFERRALS:
-            LOG.info(
-                "copilot_output_contract_budget_rewrite_deferred_no_run",
-                block_label=block_label,
-                canonical_output_contract_signature=signature,
-                output_contract_reject_count=count,
-                output_contract_deferral_count=deferral_count,
-            )
-            return False
-        LOG.info(
-            "copilot_output_contract_budget_deferral_cap_reached",
-            block_label=block_label,
-            canonical_output_contract_signature=signature,
-            output_contract_reject_count=count,
-            output_contract_deferral_count=deferral_count,
-        )
-    _stash_output_contract_reject_budget_terminal(
-        ctx, required_paths=required_paths, block_label=block_label, signature=signature
-    )
-    return True
-
-
-def _stash_output_contract_reject_budget_terminal(
-    ctx: AgentContext,
-    *,
-    required_paths: set[str],
-    block_label: str,
-    signature: str,
-) -> None:
-    if ctx.turn_halt is not None or blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
-        return
-    signal = build_output_source_unobservable_blocker_signal(
-        reason_code=_OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE,
-        required_paths=required_paths,
-        block_label=block_label,
-    )
-    stash_blocker_signal(ctx, signal)
-    stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
-    LOG.info(
-        "copilot_output_contract_reject_budget_terminal",
-        block_label=block_label,
-        canonical_output_contract_signature=signature,
-        canonical_required_child_paths=sorted(required_paths),
-    )
-
-
-@dataclass(frozen=True)
-class _OutputContractCeilingResolution:
-    """Outcome of the impose-or-credit move at the convergence ceiling: the draft (possibly
-    rewritten server-side) plus the crediting re-evaluation that admits it."""
-
-    workflow_yaml: str
-    code_artifact_metadata: object
-    evaluation: _OutputContractEvaluation
-    mode: Literal["credited", "imposed"]
 
 
 def _loaded_result_source_producible_for_signature(
@@ -5143,360 +3689,6 @@ def _loaded_result_source_producible_for_signature(
         return False
     ctx.latest_evaluate_result_composition_signature = signature
     return True
-
-
-def _every_required_output_value_observed(ctx: AgentContext, required_paths: set[str]) -> bool:
-    """Imposition writes a binding for every required path, so authorization needs observation
-    coverage for every one of them — a single overlapping path would otherwise license composing
-    the rest as constants the recording never saw."""
-    if not required_paths:
-        return False
-    return all(_observed_required_output_values(ctx, {path}) for path in required_paths)
-
-
-def _output_contract_binding_source_on_record(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    workflow_yaml: str,
-) -> bool:
-    """Whether the recorded exploration already pins where the requested value lives: either the
-    scout observed every required path, or a producible loaded-result composition anchors the
-    target block's selectors. Imposition is only justified when this is on record."""
-    binding_paths = evaluation.observation_paths or evaluation.required_paths
-    if _every_required_output_value_observed(ctx, binding_paths):
-        return True
-    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(evaluation.block_label)
-    if target_block is None:
-        return False
-    return _loaded_result_source_producible_for_signature(
-        ctx,
-        target_code=str(target_block.get("code") or ""),
-        signature=evaluation.canonical_signature,
-    )
-
-
-def _impose_output_contract_binding_at_ceiling(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    raw_code_artifact_metadata: object,
-    evaluation: _OutputContractEvaluation,
-) -> tuple[str, object] | None:
-    """Compose the required output binding onto the submitted draft using the same static-return
-    and metadata-scaffold composers the steer directives describe to the model. Abstains (returns
-    None) when no value-bearing envelope can be composed, leaving the reject path byte-identical."""
-    label = evaluation.block_label
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return None
-    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(label)
-    if target_block is None:
-        return None
-    target_code = str(target_block.get("code") or "")
-    contract = _output_contract_required_paths_source(ctx)
-    binding_paths = set(contract.union) or _value_bearing_directive_paths(contract)
-    if not binding_paths:
-        return None
-    keyed_code, violations = _extraction_code_with_value_bearing_static_return(
-        target_code,
-        required_paths=binding_paths,
-        declaration_paths=contract.declaration_paths,
-    )
-    if violations:
-        return None
-    imposed_yaml = workflow_yaml
-    if keyed_code != textwrap.dedent(target_code).strip():
-        applied = False
-        for block in _workflow_code_blocks(parsed):
-            if str(block.get("label") or "").strip() == label:
-                block["code"] = keyed_code.rstrip() + "\n"
-                applied = True
-                break
-        if not applied:
-            return None
-        imposed_yaml = yaml.safe_dump(parsed, sort_keys=False)
-    scaffolded_metadata = _apply_metadata_contract_scaffold(
-        ctx,
-        imposed_yaml,
-        raw_code_artifact_metadata,
-        required_paths=contract.observation_paths or (binding_paths - contract.declaration_paths),
-        source=contract.source or evaluation.source,
-        reason_code=contract.reason_code or evaluation.reason_code,
-        declaration_paths=contract.declaration_paths,
-        allow_missing_static_return=True,
-    )
-    return imposed_yaml, scaffolded_metadata
-
-
-def _output_contract_steering_exhausted(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    workflow_yaml: str,
-) -> bool:
-    """Steering has stopped moving the draft: this submission came back with the same canonical
-    structural fingerprint the last reject already steered on, so re-emitting the directive cannot
-    converge. Keyed on that fingerprint rather than reject counts, which inflate, and unreachable
-    on a first submission because no prior reject fingerprint exists yet."""
-    signature = evaluation.canonical_signature
-    if not signature or not evaluation.block_label:
-        return False
-    if not _prior_output_contract_actuation(ctx, signature):
-        return False
-    steered_fingerprint = ctx.output_contract_last_reject_fingerprint_by_signature.get(signature)
-    if not steered_fingerprint:
-        return False
-    return steered_fingerprint == _output_contract_structural_fingerprint(workflow_yaml, signature)
-
-
-def _credit_output_contract_submission(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-) -> _OutputContractEvaluation | None:
-    """Re-adjudicate the submission with static uncertainty credited, so a draft that binds the
-    required paths but that the liveness prover can only call "unknown" ships instead of looping.
-    Returns None when the deficiency is genuine."""
-    credited = _evaluate_output_contract_for_code_block(
-        ctx,
-        workflow_yaml,
-        raw_metadata,
-        enforce_value_bearing_liveness=True,
-        credit_convergence_ceiling=True,
-    )
-    if credited is None or credited.has_deficiencies:
-        return None
-    return credited
-
-
-def _credit_output_contract_submission_at_ceiling(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-) -> _OutputContractEvaluation | None:
-    resolution = _credit_or_impose_output_contract(
-        ctx,
-        evaluation,
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_metadata,
-        credit_only=True,
-    )
-    return resolution.evaluation if resolution is not None else None
-
-
-def _resolve_output_contract_pass_path(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-    credit_only: bool,
-    steering_exhausted: bool = False,
-) -> OutputContractActuation:
-    """Convert the pass-path preconditions to typed evidence and let the single resolver decide.
-    Crediting and composing are probed here because the resolver is pure; probing mutates nothing
-    and abstains exactly where the strict path already rejects.
-
-    ``steering_exhausted`` lets a caller contribute its own lane's exhaustion evidence — the
-    code-authoring churn ceiling is the same fact reached by a different lane."""
-    credited = _credit_output_contract_submission(
-        ctx, evaluation, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata
-    )
-    impose_available = (
-        not credit_only
-        and credited is None
-        and _output_contract_binding_source_on_record(ctx, evaluation, workflow_yaml)
-        and _impose_output_contract_binding_at_ceiling(ctx, workflow_yaml, raw_metadata, evaluation) is not None
-    )
-    evidence = OutputContractActuationEvidence(
-        imposed_available=False,
-        click_only_spine=False,
-        observed_required_values=bool(evaluation.observation_paths)
-        and _observed_required_output_values(ctx, evaluation.observation_paths),
-        prior_actuation=_prior_output_contract_actuation(ctx, evaluation.canonical_signature),
-        prior_directive_unconsumed=False,
-        steering_exhausted=steering_exhausted or _output_contract_steering_exhausted(ctx, evaluation, workflow_yaml),
-        credit_available=credited is not None,
-        scouted_binding_impose_available=impose_available,
-    )
-    return resolve_output_contract_actuation(
-        family=classify_output_contract_bail_family(evaluation.shape_violations), evidence=evidence
-    )
-
-
-def _credit_or_impose_output_contract(
-    ctx: AgentContext,
-    evaluation: _OutputContractEvaluation,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-    credit_only: bool = False,
-    steering_exhausted: bool = False,
-) -> _OutputContractCeilingResolution | None:
-    """Resolve a submission the steer loop can no longer move: credit it when the strict prover
-    was merely uncertain, else impose the binding the recording pins. Returns None when the
-    resolver picks neither, leaving the caller's reject/ablation path untouched."""
-    actuation = _resolve_output_contract_pass_path(
-        ctx,
-        evaluation,
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_metadata,
-        credit_only=credit_only,
-        steering_exhausted=steering_exhausted,
-    )
-    if actuation.kind not in {
-        OutputContractActuationKind.CREDIT,
-        OutputContractActuationKind.IMPOSE_SCOUTED_BINDING,
-    }:
-        return None
-    if actuation.kind == OutputContractActuationKind.CREDIT:
-        credited = _credit_output_contract_submission(
-            ctx, evaluation, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata
-        )
-        if credited is None:
-            return None
-        LOG.info(
-            "copilot_output_contract_submission_credited_at_ceiling",
-            block_label=evaluation.block_label,
-            canonical_output_contract_signature=evaluation.canonical_signature,
-            credited_shape_violations=list(evaluation.shape_violations),
-            credited_missing_code_return_paths=list(evaluation.missing_return_paths),
-        )
-        return _OutputContractCeilingResolution(
-            workflow_yaml=workflow_yaml,
-            code_artifact_metadata=raw_metadata,
-            evaluation=credited,
-            mode="credited",
-        )
-    imposed = _impose_output_contract_binding_at_ceiling(ctx, workflow_yaml, raw_metadata, evaluation)
-    if imposed is None:
-        return None
-    imposed_yaml, imposed_metadata = imposed
-    reevaluated = _evaluate_output_contract_for_code_block(
-        ctx,
-        imposed_yaml,
-        imposed_metadata,
-        enforce_value_bearing_liveness=True,
-        credit_convergence_ceiling=True,
-    )
-    if reevaluated is None or reevaluated.has_deficiencies:
-        return None
-    LOG.info(
-        "copilot_output_contract_binding_imposed_at_ceiling",
-        block_label=evaluation.block_label,
-        canonical_output_contract_signature=evaluation.canonical_signature,
-    )
-    return _OutputContractCeilingResolution(
-        workflow_yaml=imposed_yaml,
-        code_artifact_metadata=imposed_metadata,
-        evaluation=reevaluated,
-        mode="imposed",
-    )
-
-
-def _consult_guardrail_ceiling_actuation(
-    ctx: AgentContext,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-) -> _OutputContractCeilingResolution | None:
-    """At the code-authoring guardrail give-up, re-evaluate the live local draft and, when the
-    requested output's binding is already on record, consult the existing ceiling actuation (credit
-    or impose) before any stopped envelope. Side-effect-free until the actuation itself resolves."""
-    evaluation = _evaluate_output_contract_for_code_block(
-        ctx,
-        workflow_yaml,
-        raw_metadata,
-        enforce_value_bearing_liveness=True,
-    )
-    if evaluation is None or not evaluation.canonical_signature or not evaluation.block_label:
-        return None
-    if not _output_contract_binding_source_on_record(ctx, evaluation, workflow_yaml):
-        return None
-    LOG.info(
-        "copilot_guardrail_ceiling_actuation_consulted",
-        reject_count=ctx.code_authoring_guardrail_reject_count,
-        block_label=evaluation.block_label,
-        canonical_output_contract_signature=evaluation.canonical_signature,
-        binding_source_on_record=True,
-    )
-    return _credit_or_impose_output_contract(
-        ctx,
-        evaluation,
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_metadata,
-        steering_exhausted=True,
-    )
-
-
-def _guardrail_ceiling_actuation_resolution(
-    ctx: AgentContext,
-    *,
-    workflow_yaml: str,
-    raw_metadata: object,
-    frontier_unchanged: bool = False,
-) -> _OutputContractCeilingResolution | None:
-    if not code_authoring_churn_stop_would_claim(ctx, frontier_unchanged=frontier_unchanged):
-        return None
-    return _consult_guardrail_ceiling_actuation(ctx, workflow_yaml=workflow_yaml, raw_metadata=raw_metadata)
-
-
-def _capture_rejected_code_artifact_metadata(ctx: AgentContext) -> None:
-    snapshot = ctx.submitted_code_artifact_metadata_snapshot
-    if snapshot is None:
-        return
-    captures = ctx.rejected_code_artifact_metadata_captures
-    captures.append(RejectedCodeArtifactMetadataCapture(payload=snapshot))
-    del captures[:-5]
-    LOG.info(
-        "copilot_rejected_code_artifact_metadata_captured",
-        capture_count=len(captures),
-        submitted_metadata_labels=sorted(snapshot) if isinstance(snapshot, dict) else None,
-        submitted_metadata_type=type(snapshot).__name__,
-        rejected_code_artifact_metadata_payload=snapshot,
-    )
-
-
-def _output_contract_reject_result(
-    evaluation: _OutputContractEvaluation,
-    *,
-    payload: dict[str, Any] | None = None,
-    tool_name: str = "update_workflow",
-) -> dict[str, Any]:
-    data = payload or evaluation.payload
-    observation_paths = {str(path) for path in data.get("canonical_required_child_paths", []) or []} - {
-        str(path) for path in data.get("declaration_only_child_paths", []) or []
-    }
-    if data.get("reason_code") == _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE:
-        error = (
-            "The workflow output contract repair budget is exhausted for this canonical requested-output contract. "
-            "Return with the typed output-contract payload instead of trying another variant."
-        )
-    elif data.get("reason_code") == _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE and not observation_paths:
-        error = (
-            f"{tool_name} cannot proceed: every requested value-bearing output has degraded out of the "
-            "completion criteria, so no code revision can satisfy the contract. Re-establish at least one "
-            "requested value-bearing output before authoring again."
-        )
-    else:
-        path_text = ", ".join(str(path) for path in data.get("canonical_required_child_paths", []) or [])
-        path_suffix = f" Required requested output paths: {path_text}." if path_text else ""
-        declaration_suffix = _declaration_repair_sentence(
-            str(path) for path in data.get("declaration_only_child_paths", []) or []
-        )
-        error = (
-            f"{tool_name} cannot proceed until the submitted workflow satisfies the requested output contract. "
-            "Use the returned code_artifact_metadata, extraction_schema, and return skeleton templates exactly for "
-            "the canonical required child paths." + path_suffix + declaration_suffix
-        )
-    return {
-        "ok": False,
-        "error": error,
-        "user_facing_summary": _compiled_authoring_user_summary(),
-        "data": data,
-    }
 
 
 def _ensure_metadata_contract_rows(
@@ -5774,16 +3966,6 @@ def _workflow_needs_contract_readback_persist(
     return True
 
 
-def _output_contract_reject_count(ctx: AgentContext, signature: str) -> int:
-    count_by_signature = getattr(ctx, "output_contract_reject_count_by_signature", None)
-    if not isinstance(count_by_signature, Mapping):
-        return 0
-    try:
-        return int(count_by_signature.get(signature, 0) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _runtime_output_repair_attempt_key(ctx: AgentContext, required_paths: set[str]) -> str:
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
@@ -5796,13 +3978,6 @@ def _runtime_output_repair_attempt_key(ctx: AgentContext, required_paths: set[st
         "authored_structure_signature": outcome.authored_structure_signature,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
-
-def _runtime_output_repair_attempt_recorded(ctx: AgentContext, attempt_key: str) -> bool:
-    if not attempt_key:
-        return True
-    attempts = getattr(ctx, "runtime_output_repair_attempt_by_signature", None)
-    return isinstance(attempts, Mapping) and bool(attempts.get(attempt_key))
 
 
 def _record_runtime_output_repair_attempt(ctx: AgentContext, attempt_key: str) -> None:
@@ -6177,16 +4352,6 @@ def _output_contract_advisory_granted(ctx: AgentContext, signature: str) -> bool
     return _output_contract_advisory_state(ctx, signature) == OutputContractAdvisoryState.GRANTED
 
 
-def _revoke_output_contract_advisory_run(ctx: AgentContext, signature: str) -> None:
-    if _output_contract_advisory_granted(ctx, signature):
-        ctx.output_contract_actuation_by_signature.pop(signature, None)
-        LOG.info(
-            "copilot_output_contract_advisory_run_revoked",
-            canonical_output_contract_signature=signature,
-            reason_code=_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
-        )
-
-
 def _grant_output_contract_advisory_run(ctx: AgentContext, signature: str) -> None:
     if not signature:
         return
@@ -6254,61 +4419,6 @@ def _workflow_run_id_from_run_result(run_result: Mapping[str, object]) -> str | 
     return None
 
 
-def _stash_output_source_unobservable_terminal(
-    ctx: AgentContext,
-    *,
-    reason_code: str,
-    required_paths: set[str],
-    block_label: str,
-    signature: str,
-    blockers: list[str],
-) -> None:
-    if ctx.turn_halt is not None:
-        return
-    payload: AuthorTimeGateAblationPayload = {
-        "block_label": block_label,
-        "canonical_output_contract_signature": signature,
-        "canonical_required_child_paths": sorted(required_paths),
-        "spine_split_blockers": list(blockers),
-    }
-    if (
-        copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID)
-        and ctx.output_contract_bail_actuated_this_call
-    ):
-        return
-    if record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
-        reason_code=reason_code,
-        fingerprint=signature,
-        blocked_tool="update_workflow",
-        payload=payload,
-    ):
-        return
-    signal = build_output_source_unobservable_blocker_signal(
-        reason_code=reason_code,
-        required_paths=required_paths,
-        block_label=block_label,
-    )
-    _record_author_time_reject_outcome(
-        ctx,
-        reason_code=cast(BuildTestOutcomeReasonCode, reason_code),
-        summary=signal.user_facing_reason,
-        structural_payload=_output_contract_author_time_structural_payload(ctx, required_paths, block_label=block_label)
-        or {},
-        block_labels=[block_label] if block_label else [],
-    )
-    stash_blocker_signal(ctx, signal)
-    stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
-    LOG.info(
-        "copilot_output_contract_blocked_terminal",
-        reason=reason_code,
-        block_label=block_label,
-        canonical_output_contract_signature=signature,
-        spine_split_blockers=list(blockers),
-    )
-
-
 def _run_authority_permits_dispatch(ctx: AgentContext) -> bool:
     turn_intent = getattr(ctx, "turn_intent", None)
     authority = getattr(turn_intent, "authority", None)
@@ -6329,21 +4439,6 @@ def _arm_pending_run_evidence(ctx: AgentContext, signature: str, required_paths:
     ctx.output_contract_pending_run_evidence[signature] = sorted(required_paths)
     ctx.output_contract_run_output_observed_by_signature.pop(signature, None)
     ctx.output_contract_run_bound_required_path_by_signature.pop(signature, None)
-
-
-def _apply_output_contract_ceiling_bookkeeping(ctx: AgentContext, resolution: _OutputContractCeilingResolution) -> str:
-    """Arm pending-run evidence for a credited/imposed ceiling draft so a run that binds nothing
-    reopens the ladder, and for an imposed draft mark the imposition so a later reject in the same
-    call refunds the streak. Returns the imposed signature (empty when credited)."""
-    _arm_pending_run_evidence(
-        ctx,
-        resolution.evaluation.canonical_signature,
-        set(resolution.evaluation.observation_paths),
-    )
-    if resolution.mode == "imposed":
-        _mark_output_contract_imposed(ctx, resolution.evaluation.canonical_signature)
-        return resolution.evaluation.canonical_signature
-    return ""
 
 
 def _registered_output_paths(result: object) -> set[str]:
@@ -6440,7 +4535,6 @@ def _actuate_output_contract_bail(
 ) -> OutputContractActuation:
     click_only_spine = _output_contract_click_only_spine(target_code, declaration_paths)
     observed_required_values = _observed_required_output_values(ctx, required_paths)
-    loaded_result_evidence = ctx.latest_evaluate_result_composition_steer
     result_source_producible = _loaded_result_source_producible_for_signature(
         ctx, target_code=target_code, signature=signature
     )
@@ -6472,34 +4566,7 @@ def _actuate_output_contract_bail(
         OutputContractActuationKind.BLOCKED_TERMINAL,
     }:
         actuation = OutputContractActuation(OutputContractActuationKind.STRUCTURE_DIRECTIVE, actuation.family)
-    payload: AuthorTimeGateAblationPayload = {
-        "actuation_kind": actuation.kind.value,
-        "family": actuation.family.value,
-        "blockers": list(blockers),
-        "canonical_required_child_paths": sorted(required_paths),
-        "advisory_state": evidence.advisory_state.value,
-        "advisory_run_grantable": evidence.advisory_run_grantable,
-        "loaded_result_source_producible": evidence.loaded_result_source_producible,
-        "loaded_result_structure_signature": loaded_result_evidence.structure_signature
-        if result_source_producible and loaded_result_evidence is not None
-        else "",
-        "loaded_result_source_tool": loaded_result_evidence.source_tool
-        if result_source_producible and loaded_result_evidence is not None
-        else "",
-        "loaded_result_source_url": loaded_result_evidence.source_url
-        if result_source_producible and loaded_result_evidence is not None
-        else "",
-    }
     ctx.output_contract_bail_actuated_this_call = True
-    if record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
-        reason_code=actuation.reason_code or actuation.kind.value,
-        fingerprint=current_fingerprint,
-        blocked_tool="update_workflow",
-        payload=payload,
-    ):
-        return actuation
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
         _grant_output_contract_advisory_run(ctx, signature)
         _arm_pending_run_evidence(ctx, signature, required_paths)
@@ -6674,12 +4741,9 @@ def _impose_covered_static_return_envelope(
     download_paths = observation_paths & download_registered
     download = ctx.reached_download_target
     expects_download = download is not None and bool(download.selector) and _code_uses_expect_download(target_code)
-    block_metadata = _metadata_item_for_block_label(raw_code_artifact_metadata, label) or {}
 
     if not scalar_paths:
         if not (download_paths and expects_download):
-            return None
-        if _download_return_shape_error(label, block_metadata, target_code) is not None:
             return None
         scaffolded_metadata = _apply_metadata_contract_scaffold(
             ctx,
@@ -6716,8 +4780,6 @@ def _impose_covered_static_return_envelope(
     )
     if revalidation:
         return None
-    if download_paths and _download_return_shape_error(label, block_metadata, envelope.code) is not None:
-        return None
 
     for block in _workflow_code_blocks(parsed):
         if str(block.get("label") or "").strip() == label:
@@ -6747,7 +4809,6 @@ def _impose_covered_static_return_envelope(
         "copilot_output_contract_envelope_imposed_after_steering",
         block_label=label,
         canonical_output_contract_signature=signature,
-        steering_reject_count=_output_contract_reject_count(ctx, signature),
         return_envelope_applied=True,
         metadata_scaffold_applied=scaffolded_metadata is not raw_code_artifact_metadata,
     )
@@ -6856,19 +4917,10 @@ def _impose_output_contract_envelope_after_steering(
                 advisory_run_grantable=True,
                 declaration_paths=declaration_paths,
             )
-            if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
-                _stash_output_source_unobservable_terminal(
-                    ctx,
-                    reason_code=actuation.reason_code,
-                    required_paths=required_paths,
-                    block_label=label,
-                    signature=signature,
-                    blockers=split.blockers,
-                )
-                return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
-            if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
-                return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
-            if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
+            if actuation.kind in {
+                OutputContractActuationKind.BLOCKED_TERMINAL,
+                OutputContractActuationKind.ADVISORY_RUN,
+            }:
                 return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
             attempt_key = _output_contract_spine_directive_attempt_key(
                 signature=signature, block_label=label, workflow_yaml=workflow_yaml
@@ -6942,15 +4994,6 @@ def _impose_output_contract_envelope_after_steering(
             current_fingerprint=current_fingerprint,
             declaration_paths=declaration_paths,
         )
-        if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
-            _stash_output_source_unobservable_terminal(
-                ctx,
-                reason_code=actuation.reason_code,
-                required_paths=required_paths,
-                block_label=label,
-                signature=signature,
-                blockers=["static_return_envelope_unavailable"],
-            )
         return workflow_yaml, scaffolded_metadata, scaffolded or declaration_stamped
     changed_code = keyed_code != textwrap.dedent(target_code).strip()
     if changed_code:
@@ -6977,428 +5020,10 @@ def _impose_output_contract_envelope_after_steering(
             "copilot_output_contract_envelope_imposed_after_steering",
             block_label=label,
             canonical_output_contract_signature=signature,
-            steering_reject_count=_output_contract_reject_count(ctx, signature),
             return_envelope_applied=changed_code,
             metadata_scaffold_applied=scaffolded,
         )
     return workflow_yaml, scaffolded_metadata, applied or declaration_stamped
-
-
-def _has_granted_output_contract_advisory_run(ctx: AgentContext) -> bool:
-    return any(
-        state == OutputContractAdvisoryState.GRANTED for state in ctx.output_contract_actuation_by_signature.values()
-    )
-
-
-def _metadata_preflight_reject_yields_to_ladder(ctx: AgentContext) -> bool:
-    """Register the preflight reject's claim and report whether it must yield to a live GRANTED advisory run.
-
-    The reject always registers its (transient) claim. It yields only when a GRANTED advisory — the ladder's
-    decision to dispatch despite deficiencies — owns the turn: yielding lets the forced dispatch consume the grant
-    instead of re-blocking it. An ordinary reject cycle (a landed actuation without a grant) is the ladder's own
-    mechanism, not a contradiction, so the reject still fires; and it does not yield to a genuinely-terminal owner
-    (e.g. a just-committed early terminal), which legitimately ends the turn rather than dispatching a run behind it.
-    """
-    owner = current_turn_owner(ctx)
-    claim_turn(ctx, TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT)
-    return (
-        _has_granted_output_contract_advisory_run(ctx)
-        and owner is not None
-        and owner.claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
-    )
-
-
-def _run_dispatch_definition_reject(ctx: AgentContext, workflow_yaml: str) -> dict[str, Any] | None:
-    # A keyless draft may persist (draft-first authoring), but a run must never dispatch
-    # while declared string keys are unreferenced — mirrors the update_and_run gate.
-    if not workflow_yaml:
-        return None
-    definition_reject = _definition_plane_preflight_reject(
-        ctx,
-        workflow_yaml,
-        enforce_untagged_declared_inputs=True,
-    )
-    if definition_reject is None:
-        return None
-    halted = _stash_unresolved_recorded_outcome_grounding_halt(
-        ctx,
-        definition_reject.unreferenced_parameter_keys,
-    )
-    if not halted:
-        if _record_definition_plane_ablation_event(
-            ctx,
-            workflow_yaml,
-            definition_reject,
-            code_artifact_metadata=ctx.code_artifact_metadata,
-        ):
-            return None
-        _record_definition_plane_reject(
-            ctx,
-            workflow_yaml,
-            definition_reject,
-            code_artifact_metadata=ctx.code_artifact_metadata,
-        )
-    return {
-        "ok": False,
-        "error": _definition_plane_reject_error(definition_reject),
-        "user_facing_summary": _compiled_authoring_user_summary(),
-        "data": {
-            "reason_code": "definition_contract_unsatisfied",
-            "definition_criterion_ids": list(definition_reject.criterion_ids),
-            "definition_reason_codes": list(definition_reject.reason_codes),
-            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-        },
-    }
-
-
-def _metadata_contract_run_preflight_reject(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    raw_code_artifact_metadata: object,
-    runtime_parameters: Mapping[str, Any] | None = None,
-    *,
-    enforce_untagged_declared_inputs: bool = False,
-) -> dict[str, Any] | None:
-    if isinstance(ctx, AgentContext):
-        ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(raw_code_artifact_metadata)
-    definition_reject = (
-        _definition_plane_preflight_reject(
-            ctx,
-            workflow_yaml,
-            enforce_untagged_declared_inputs=enforce_untagged_declared_inputs,
-        )
-        if isinstance(ctx, AgentContext)
-        else None
-    )
-    parsed = parse_workflow_yaml(workflow_yaml)
-    binding_resolution = (
-        _authoring_parameter_binding_resolution_for_definition(
-            ctx,
-            parsed,
-            runtime_parameters,
-            raw_code_artifact_metadata,
-        )
-        if isinstance(ctx, AgentContext) and isinstance(parsed, Mapping)
-        else None
-    )
-    binding_path_available = binding_resolution is not None and (
-        binding_resolution.snapshot is not None or binding_resolution.directive is not None
-    )
-    if definition_reject is not None and (enforce_untagged_declared_inputs or not binding_path_available):
-        definition_corrective = (
-            None
-            if copilot_author_time_gate_log_only_enabled(ctx, DEFINITION_CONTRACT_UNSATISFIED_GATE_ID)
-            else _value_bearing_definition_reject_corrective(
-                ctx,
-                workflow_yaml=workflow_yaml,
-                raw_metadata=raw_code_artifact_metadata,
-            )
-        )
-        definition_data = {
-            "reason_code": "definition_contract_unsatisfied",
-            "definition_criterion_ids": list(definition_reject.criterion_ids),
-            "definition_reason_codes": list(definition_reject.reason_codes),
-            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-            **(definition_corrective or {}),
-        }
-        halted = _stash_unresolved_recorded_outcome_grounding_halt(
-            ctx,
-            definition_reject.unreferenced_parameter_keys,
-        )
-        if halted:
-            return {
-                "ok": False,
-                "error": _definition_plane_reject_error(definition_reject),
-                "user_facing_summary": _compiled_authoring_user_summary(),
-                "data": definition_data,
-            }
-        if not _record_definition_plane_ablation_event(
-            ctx,
-            workflow_yaml,
-            definition_reject,
-            code_artifact_metadata=raw_code_artifact_metadata,
-        ):
-            _record_definition_plane_reject(
-                ctx,
-                workflow_yaml,
-                definition_reject,
-                code_artifact_metadata=raw_code_artifact_metadata,
-            )
-            return {
-                "ok": False,
-                "error": _definition_plane_reject_error(definition_reject),
-                "user_facing_summary": _compiled_authoring_user_summary(),
-                "data": definition_data,
-            }
-    convergence_reject = _recorded_outcome_convergence_reject(
-        ctx,
-        workflow_yaml=workflow_yaml,
-        code_artifact_metadata=raw_code_artifact_metadata,
-    )
-    if convergence_reject is not None and not binding_path_available:
-        block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="unchanged_after_recorded_outcome",
-            summary="The authored code and output structure are unchanged after the last recorded test outcome.",
-            structural_payload={
-                "reason_code": "unchanged_after_recorded_outcome",
-                "authored_structure_signature": convergence_reject.authored_structure_signature,
-                "block_labels": block_labels,
-            },
-            authored_structure_signature=convergence_reject.authored_structure_signature,
-            block_labels=block_labels,
-        )
-        _record_code_authoring_guardrail_reject(
-            ctx, frontier_unchanged=convergence_reject.reason == "frontier_unchanged"
-        )
-        LOG.info(
-            "copilot recorded outcome convergence behavior",
-            convergence_reason=convergence_reject.reason,
-            commit_early_terminal=convergence_reject.commit_early_terminal,
-            block_labels=block_labels,
-        )
-        if convergence_reject.commit_early_terminal:
-            _commit_recorded_outcome_early_terminal(ctx)
-        if _metadata_preflight_reject_yields_to_ladder(ctx):
-            return None
-        return {
-            "ok": False,
-            "error": (
-                "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
-                "Revise the code block or output metadata that owns that frontier before testing again."
-            ),
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(),
-        }
-    evaluation = _evaluate_output_contract_for_code_block(
-        ctx,
-        workflow_yaml,
-        raw_code_artifact_metadata,
-        allow_static_return_advisory=True,
-        enforce_value_bearing_liveness=True,
-    )
-    if evaluation is None or not evaluation.has_deficiencies:
-        return None
-    if (
-        _credit_output_contract_submission_at_ceiling(
-            ctx,
-            evaluation,
-            workflow_yaml=workflow_yaml,
-            raw_metadata=raw_code_artifact_metadata,
-        )
-        is not None
-    ):
-        # The steer loop consumed its budget on this contract and the submission satisfies it
-        # under ceiling crediting: let the run proceed instead of re-emitting the directive.
-        return None
-    if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations:
-        _revoke_output_contract_advisory_run(ctx, evaluation.canonical_signature)
-    authored_fingerprint = _output_contract_structural_fingerprint(workflow_yaml, evaluation.canonical_signature)
-    advisory_granted = _output_contract_advisory_granted(ctx, evaluation.canonical_signature)
-    # A granted advisory must arm run-output evidence before the grant is consumed, even when the
-    # workflow is otherwise run-attemptable — otherwise the dispatched run records no evidence.
-    if evaluation.can_attempt_run and not advisory_granted:
-        return None
-    if _record_output_contract_ablation_event(
-        ctx,
-        evaluation,
-        gate_id=_METADATA_PREFLIGHT_ABLATION_GATE_ID,
-        blocked_tool="update_and_run_blocks",
-        fingerprint=authored_fingerprint,
-    ):
-        return None
-    payload = _record_output_contract_reject(
-        ctx,
-        evaluation,
-        summary="Submitted workflow does not satisfy the requested output contract before run.",
-        authored_structural_fingerprint=authored_fingerprint,
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_code_artifact_metadata,
-    )
-    if (
-        evaluation.can_attempt_run or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in evaluation.shape_violations
-    ) and (advisory_granted or _output_contract_advisory_granted(ctx, evaluation.canonical_signature)):
-        _arm_pending_run_evidence(ctx, evaluation.canonical_signature, set(evaluation.observation_paths))
-        return None
-    if evaluation.repair_context is not None:
-        ctx.last_code_authoring_repair_context = evaluation.repair_context
-    if _metadata_preflight_reject_yields_to_ladder(ctx):
-        return None
-    if payload.get("reason_code") == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE:
-        assert ctx.blocker_signal is not None
-        return {
-            "ok": False,
-            "error": ctx.blocker_signal.user_facing_reason,
-            "user_facing_summary": ctx.blocker_signal.user_facing_reason,
-            "data": payload,
-        }
-    if "value_bearing_convergence_directive" in payload:
-        return _output_contract_reject_result(
-            evaluation,
-            payload=payload,
-            tool_name="update_and_run_blocks",
-        )
-    payload = dict(payload)
-    payload["output_contract_reason_code"] = payload.get("reason_code")
-    payload["reason_code"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
-    payload["reject_reason"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
-    block_label = evaluation.block_label or "the target output block"
-    return {
-        "ok": False,
-        "error": (
-            "update_and_run_blocks cannot attempt a run until structurally complete "
-            f"`code_artifact_metadata` is submitted for `{block_label}`."
-        ),
-        "user_facing_summary": _compiled_authoring_user_summary(),
-        "data": payload,
-    }
-
-
-def metadata_same_key_terminal_preflight(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    raw_code_artifact_metadata: object,
-) -> dict[str, CodeArtifactMetadataValue] | None:
-    prior_state = ctx.metadata_reject_ladder_state
-    if (
-        prior_state is None
-        or prior_state.streak_count < 2
-        or copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID)
-    ):
-        return None
-    missing_error = _missing_code_artifact_metadata_error(workflow_yaml, ctx, raw_code_artifact_metadata)
-    if missing_error is None:
-        return None
-    missing_labels = _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_code_artifact_metadata)
-    if len(missing_labels) != 1:
-        return None
-    required_paths, _, coverage_reason_code = _required_child_output_paths_for_authoring(ctx)
-    reject_payload = _code_artifact_metadata_reject_payload(
-        workflow_yaml=workflow_yaml,
-        raw_metadata=raw_code_artifact_metadata,
-        offending_labels=[],
-        missing_labels=missing_labels,
-        violation_categories=["missing_code_artifact_metadata"],
-    )
-    candidate_outcome = _build_author_time_reject_outcome(
-        ctx,
-        reason_code="metadata_reject",
-        summary=missing_error,
-        structural_payload=reject_payload,
-        block_labels=missing_labels,
-        missing_requested_output_facts=_missing_requested_output_facts(
-            required_paths,
-            reason_code=coverage_reason_code,
-        ),
-    )
-    structural_key = candidate_outcome.structural_key
-    missing_fields_by_label = _metadata_missing_required_fields_by_label(
-        raw_code_artifact_metadata,
-        labels=missing_labels,
-        missing_labels=missing_labels,
-    )
-    if (
-        structural_key is None
-        or prior_state.reject_family != "missing_code_artifact_metadata"
-        or prior_state.structural_key != structural_key
-        or prior_state.gate_id != "code_artifact_metadata"
-        or prior_state.missing_fields_by_label != missing_fields_by_label
-    ):
-        return None
-    decision = _metadata_reject_ladder_decision(
-        ctx,
-        candidate_outcome=candidate_outcome,
-        reject_family="missing_code_artifact_metadata",
-        missing_fields_by_label=missing_fields_by_label,
-    )
-    if decision is None or decision.action != "terminal":
-        return None
-    assert ctx.blocker_signal is not None
-    return {
-        "ok": False,
-        "error": ctx.blocker_signal.user_facing_reason,
-        "user_facing_summary": ctx.blocker_signal.user_facing_reason,
-        "data": _metadata_reject_terminal_data(decision),
-    }
-
-
-def output_contract_value_bearing_run_reject(
-    ctx: AgentContext,
-    code_by_label: Mapping[str, str],
-) -> dict[str, Any] | None:
-    """Refuses dispatch of a saved workflow whose author contract is statically provably
-    valueless. Observation paths stay fail-open when unknown; a root-only repair must prove its envelope."""
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    contract = _output_contract_required_paths_source(ctx)
-    declaration_only_contract = bool(contract.declaration_paths) and not contract.observation_paths
-    root_only_liveness_contract = (
-        contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract
-    )
-    if root_only_liveness_contract:
-        statically_valueless = not code_by_label or all(
-            _root_output_envelope_state(code) != "proven"
-            or _statically_lacks_value_bearing_observation_paths(code, {_VALUE_BEARING_ROOT_GUIDANCE_PATH})
-            for code in code_by_label.values()
-        )
-    else:
-        statically_valueless = False
-    if contract.liveness is _OutputContractLiveness.VALUE_REQUIRED and code_by_label:
-        statically_valueless = all(
-            _statically_lacks_value_bearing_observation_paths(code, contract.observation_paths)
-            for code in code_by_label.values()
-        )
-    # The code lane is criteria-independent so the invariant survives drift in the persisted
-    # criteria source (an unparseable row must not readmit a statically hollow envelope).
-    statically_empty_return_envelope = False
-    if not statically_valueless and code_by_label:
-        statically_empty_return_envelope = all(
-            _statically_valueless_return_envelope(code) for code in code_by_label.values()
-        )
-        statically_valueless = statically_empty_return_envelope
-    if not statically_valueless:
-        return None
-    LOG.info(
-        "copilot_value_bearing_dispatch_preflight_reject",
-        contract_liveness=contract.liveness.value,
-        canonical_required_child_paths=sorted(contract.union),
-        declaration_only_child_paths=sorted(contract.declaration_paths),
-        statically_empty_return_envelope=statically_empty_return_envelope,
-        block_labels=sorted(code_by_label),
-    )
-    if statically_empty_return_envelope and not contract.union:
-        error = (
-            "Cannot run the saved workflow: its code statically returns no values (every return "
-            "envelope is empty or null-only). Revise the code to return at least one real value "
-            "before running."
-        )
-    elif contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
-        error = (
-            "Cannot run the saved workflow: its code does not prove a non-empty top-level `output` "
-            "value. Revise the owning code block to return a real value under `output` before running."
-        )
-    else:
-        error = (
-            "Cannot run the saved workflow: its output contract carries no value-bearing output "
-            "(only a blocker declaration or statically empty values). Revise the owning code block "
-            "to produce at least one requested value-bearing output before running."
-        )
-    return {
-        "ok": False,
-        "error": error,
-        "user_facing_summary": _compiled_authoring_user_summary(),
-        "data": {
-            "reason_code": _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
-            "reject_reason": _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
-            "contract_liveness": contract.liveness.value,
-            "canonical_required_child_paths": sorted(contract.union),
-            "declaration_only_child_paths": sorted(contract.declaration_paths),
-            "statically_empty_return_envelope": statically_empty_return_envelope,
-            "degraded_request_slots": [slot.to_payload() for slot in contract.degraded_request_slots],
-            "can_attempt_run": False,
-        },
-    }
 
 
 def _output_path_root(path: str) -> str:
@@ -7407,49 +5032,6 @@ def _output_path_root(path: str) -> str:
 
 def _output_path_has_child(path: str) -> bool:
     return "." in path or "[" in path
-
-
-def _candidate_missing_required_output_paths(
-    workflow_yaml: str,
-    code_artifact_metadata: object,
-    *,
-    required_paths: set[str],
-) -> list[str]:
-    if not required_paths:
-        return []
-    required_paths = {path for path in (str(item).strip() for item in required_paths) if path}
-    declared_paths_by_label = {
-        label: set(paths) for label, paths in _metadata_output_paths_by_label(code_artifact_metadata).items()
-    }
-    produced_by_label = _workflow_yaml_produced_output_roots_by_label(workflow_yaml)
-    covered_paths: set[str] = set()
-    abstained_declared_paths: set[str] = set()
-    for label, declared_paths in declared_paths_by_label.items():
-        produced = produced_by_label.get(label)
-        if produced is None:
-            continue
-        for required_path in required_paths & declared_paths:
-            if _top_level_path_segment(required_path) in produced.roots:
-                covered_paths.add(required_path)
-        if produced.abstained:
-            abstained_declared_paths.update(required_paths & declared_paths)
-    missing_paths = required_paths - covered_paths
-    if missing_paths:
-        missing_paths -= abstained_declared_paths
-    return sorted(missing_paths)
-
-
-def _recorded_runtime_produced_output_roots(ctx: AgentContext, workflow_yaml: str) -> set[str]:
-    verified_outputs = getattr(ctx, "verified_block_outputs", None)
-    if not isinstance(verified_outputs, Mapping):
-        return set()
-    code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-    roots: set[str] = set()
-    for label, output in verified_outputs.items():
-        if not isinstance(label, str) or label not in code_block_labels:
-            continue
-        roots.update(_meaningful_runtime_output_roots(output))
-    return roots
 
 
 def _meaningful_runtime_output_roots(value: object, *, prefix: str = "") -> set[str]:
@@ -7487,73 +5069,6 @@ def _runtime_output_value_is_meaningful(value: object) -> bool:
 class _ProducedOutputRoots(NamedTuple):
     roots: set[str]
     abstained: bool = False
-
-
-def _workflow_yaml_produced_output_roots_by_label(workflow_yaml: str) -> dict[str, _ProducedOutputRoots]:
-    return {
-        label: _code_block_produced_output_roots(str(block.get("code") or ""))
-        for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items()
-    }
-
-
-def _workflow_yaml_produced_output_roots(workflow_yaml: str) -> set[str]:
-    roots: set[str] = set()
-    for produced in _workflow_yaml_produced_output_roots_by_label(workflow_yaml).values():
-        roots.update(produced.roots)
-    return roots
-
-
-def _workflow_yaml_produced_output_paths(workflow_yaml: str) -> set[str]:
-    paths: set[str] = set()
-    for block in _workflow_yaml_code_blocks_by_label(workflow_yaml).values():
-        paths.update(_code_block_produced_output_paths(str(block.get("code") or "")))
-    return paths
-
-
-def _code_block_produced_output_roots(code: str) -> _ProducedOutputRoots:
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-    except SyntaxError:
-        return _ProducedOutputRoots(set(), True)
-    scope_statements = list(_iter_top_level_scope(tree.body))
-    assigned_roots = _assigned_top_level_names(tree.body)
-    dict_assignments: dict[str, set[str]] = {}
-    dynamic_dict_assignment_names: set[str] = set()
-    helper_return_roots = _helper_function_literal_return_roots(tree.body)
-    returned_roots: set[str] = set()
-    abstained = False
-    saw_return = False
-    for node in scope_statements:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            if isinstance(node.value, ast.Dict):
-                produced = _dict_literal_output_roots(node.value)
-                dict_assignments[node.targets[0].id] = produced.roots
-                if produced.abstained:
-                    dynamic_dict_assignment_names.add(node.targets[0].id)
-        elif isinstance(node, ast.Assign):
-            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and isinstance(node.value, ast.Dict):
-                produced = _dict_literal_output_roots(node.value)
-                dict_assignments[node.target.id] = produced.roots
-                if produced.abstained:
-                    dynamic_dict_assignment_names.add(node.target.id)
-            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
-        elif isinstance(node, ast.AugAssign):
-            _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, node)
-        elif isinstance(node, ast.Return):
-            saw_return = True
-            if node.value is not None:
-                returned = _return_output_roots(
-                    node.value,
-                    dict_assignments,
-                    dynamic_dict_assignment_names,
-                    helper_return_roots,
-                )
-                returned_roots.update(returned.roots)
-                abstained = abstained or returned.abstained
-    roots = returned_roots if saw_return else assigned_roots
-    return _ProducedOutputRoots(roots, abstained)
 
 
 def _code_block_produced_output_paths(code: str) -> set[str]:
@@ -7883,54 +5398,6 @@ def _list_literal_output_roots(node: ast.List) -> _ProducedOutputRoots:
     return _ProducedOutputRoots(set(), True)
 
 
-def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[str, _ProducedOutputRoots]:
-    helpers: dict[str, _ProducedOutputRoots] = {}
-    for statement in statements:
-        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        dict_assignments: dict[str, set[str]] = {}
-        dynamic_dict_assignment_names: set[str] = set()
-        roots: set[str] = set()
-        abstained = False
-        saw_return = False
-        for helper_statement in _iter_top_level_scope(statement.body):
-            if (
-                isinstance(helper_statement, ast.Assign)
-                and len(helper_statement.targets) == 1
-                and isinstance(helper_statement.targets[0], ast.Name)
-            ):
-                if isinstance(helper_statement.value, ast.Dict):
-                    produced = _dict_literal_output_roots(helper_statement.value)
-                    dict_assignments[helper_statement.targets[0].id] = produced.roots
-                    if produced.abstained:
-                        dynamic_dict_assignment_names.add(helper_statement.targets[0].id)
-            elif isinstance(helper_statement, ast.Assign):
-                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
-            elif isinstance(helper_statement, ast.AnnAssign):
-                if isinstance(helper_statement.target, ast.Name) and isinstance(helper_statement.value, ast.Dict):
-                    produced = _dict_literal_output_roots(helper_statement.value)
-                    dict_assignments[helper_statement.target.id] = produced.roots
-                    if produced.abstained:
-                        dynamic_dict_assignment_names.add(helper_statement.target.id)
-                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
-            elif isinstance(helper_statement, ast.AugAssign):
-                _apply_literal_dict_key_assignment(dict_assignments, dynamic_dict_assignment_names, helper_statement)
-            elif isinstance(helper_statement, ast.Return):
-                saw_return = True
-                if helper_statement.value is not None:
-                    returned = _return_output_roots(
-                        helper_statement.value,
-                        dict_assignments,
-                        dynamic_dict_assignment_names,
-                        {},
-                    )
-                    roots.update(returned.roots)
-                    abstained = abstained or returned.abstained
-        if roots or abstained or saw_return:
-            helpers[statement.name] = _ProducedOutputRoots(roots, abstained)
-    return helpers
-
-
 def _helper_function_literal_return_paths(statements: list[ast.stmt]) -> dict[str, set[str]]:
     helpers: dict[str, set[str]] = {}
     for statement in statements:
@@ -7975,16 +5442,6 @@ def _dict_literal_output_roots(node: ast.Dict) -> _ProducedOutputRoots:
     return _ProducedOutputRoots(roots, abstained)
 
 
-def _dict_literal_string_key_roots(node: ast.expr) -> set[str]:
-    if not isinstance(node, ast.Dict):
-        return set()
-    roots: set[str] = set()
-    for key in node.keys:
-        if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
-            roots.add(key.value.strip())
-    return roots
-
-
 def _dict_literal_string_key_paths(
     node: ast.expr,
     dict_assignments: Mapping[str, set[str]],
@@ -8015,181 +5472,6 @@ def _dict_literal_string_key_paths(
             for child_path in dict_assignments.get(value_node.id, set()):
                 paths.add(f"{path}{child_path}" if child_path.startswith("[]") else f"{path}.{child_path}")
     return paths
-
-
-def _output_empty_code_block_labels(workflow_yaml: str, code_artifact_metadata: object) -> list[str]:
-    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
-    if not code_blocks:
-        return []
-    metadata_by_label = code_artifact_metadata if isinstance(code_artifact_metadata, Mapping) else {}
-    labels_without_output = [
-        label
-        for label, block in code_blocks.items()
-        if not _code_block_has_meaningful_output(
-            str(block.get("code") or ""),
-            metadata_by_label.get(label),
-        )
-    ]
-    return sorted(labels_without_output) if len(labels_without_output) == len(code_blocks) else []
-
-
-def _code_block_has_meaningful_output(code: str, artifact: object) -> bool:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return False
-    helper_return_roots = _helper_function_literal_return_roots(tree.body)
-
-    class ReturnVisitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self.has_meaningful_return = False
-
-        def visit_Return(self, node: ast.Return) -> None:
-            if _return_value_is_meaningful(node.value, helper_return_roots):
-                self.has_meaningful_return = True
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            return
-
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            return
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            return
-
-    visitor = ReturnVisitor()
-    visitor.visit(tree)
-    if visitor.has_meaningful_return:
-        return True
-    if _code_block_has_top_level_return(tree):
-        return False
-    if isinstance(artifact, Mapping):
-        goal_roots = _artifact_goal_value_roots(artifact)
-        if goal_roots and _missing_declared_output_roots(code, goal_roots) is None:
-            return True
-    return False
-
-
-@dataclass(frozen=True)
-class _ScoutedSelectOptionInteraction:
-    selector: str
-    source_origin: str
-    value_present: bool
-    label_present: bool
-
-
-def _scouted_select_option_interactions(ctx: AgentContext) -> list[_ScoutedSelectOptionInteraction]:
-    trajectory = getattr(ctx, "scout_trajectory", None)
-    if not isinstance(trajectory, list):
-        return []
-    interactions: list[_ScoutedSelectOptionInteraction] = []
-    seen: set[tuple[str, str, bool, bool]] = set()
-    for interaction in trajectory:
-        if not isinstance(interaction, Mapping):
-            continue
-        if str(interaction.get("tool_name") or "").strip() != "select_option":
-            continue
-        selector = _safe_selector_repair_atom(interaction.get("selector"))
-        if not selector:
-            continue
-        raw_source_url = str(interaction.get("source_url") or "").strip()
-        source_origin = (url_origin(raw_source_url) or "") if raw_source_url else ""
-        entry = _ScoutedSelectOptionInteraction(
-            selector=selector,
-            source_origin=source_origin,
-            value_present=bool(str(interaction.get("value") or "").strip()),
-            label_present=bool(str(interaction.get("label") or interaction.get("option_label") or "").strip()),
-        )
-        key = (entry.selector, entry.source_origin, entry.value_present, entry.label_present)
-        if key in seen:
-            continue
-        seen.add(key)
-        interactions.append(entry)
-    return interactions
-
-
-def _select_option_text_click_repair_context(
-    workflow_yaml: str, ctx: AgentContext
-) -> CodeAuthoringRepairContext | None:
-    expected_interactions = _scouted_select_option_interactions(ctx)
-    if not expected_interactions:
-        return None
-    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
-    candidate_selectors = _workflow_select_option_call_selectors(code_blocks.values())
-    if None in candidate_selectors:
-        return None
-    missing_interactions = [
-        interaction for interaction in expected_interactions if interaction.selector not in candidate_selectors
-    ]
-    if not missing_interactions:
-        return None
-    for label, block in code_blocks.items():
-        tree = _parsed_code_tree(str(block.get("code") or ""))
-        if tree is None or not _code_contains_get_by_text_click(tree):
-            continue
-        missing_interaction = missing_interactions[0]
-        return CodeAuthoringRepairContext(
-            block_label=label,
-            reason_code="select_option_interaction_mismatch",
-            selector=missing_interaction.selector,
-            source_url=missing_interaction.source_origin or None,
-            current_origin=missing_interaction.source_origin or None,
-            binding_candidates=[
-                "expected_tool:select_option",
-                "authored_tool:get_by_text_click",
-                f"value_present:{missing_interaction.value_present}",
-                f"label_present:{missing_interaction.label_present}",
-            ],
-            repair_instruction=(
-                "Use the captured select element API for this interaction, for example "
-                "page.locator(selector).select_option(...), instead of clicking option text."
-            ),
-        )
-    return None
-
-
-def _workflow_select_option_call_selectors(code_blocks: Iterable[Mapping[str, Any]]) -> set[str | None]:
-    selectors: set[str | None] = set()
-    for block in code_blocks:
-        tree = _parsed_code_tree(str(block.get("code") or ""))
-        if tree is not None:
-            selectors.update(_select_option_call_selectors(tree))
-    return selectors
-
-
-def _parsed_code_tree(code: str) -> ast.AST | None:
-    try:
-        return ast.parse(code)
-    except SyntaxError:
-        return None
-
-
-def _code_contains_get_by_text_click(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "click"
-            and _call_chain_contains_method(node.func.value, "get_by_text")
-        ):
-            return True
-    return False
-
-
-def _select_option_call_selectors(tree: ast.AST) -> set[str | None]:
-    locator_aliases = _locator_alias_selectors(tree)
-    selectors: set[str | None] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr != "select_option":
-            continue
-        resolved = _locator_receiver_selectors(node.func.value, locator_aliases)
-        if resolved:
-            selectors.update(resolved)
-        else:
-            selectors.add(None)
-    return selectors
 
 
 def _locator_alias_selectors(tree: ast.AST) -> dict[str, set[str]]:
@@ -8241,11 +5523,6 @@ def _call_chain_contains_method(node: ast.AST, method_name: str) -> bool:
     if isinstance(node, ast.Attribute):
         return _call_chain_contains_method(node.value, method_name)
     return False
-
-
-def _code_block_has_top_level_return(tree: ast.AST) -> bool:
-    body = tree.body if isinstance(tree, ast.Module) else []
-    return any(isinstance(statement, ast.Return) for statement in _iter_top_level_scope(body))
 
 
 def _return_value_is_meaningful(
@@ -8324,122 +5601,8 @@ def _raw_workflow_yaml_conflict_marker_error(workflow_yaml: str) -> str | None:
     return None
 
 
-def _declared_workflow_parameter_keys(parsed: dict[str, Any]) -> set[str] | None:
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return set()
-    parameters = workflow_definition.get("parameters")
-    if parameters is None:
-        return set()
-    if not isinstance(parameters, list):
-        return None
-    return {
-        str(parameter.get("key") or "").strip()
-        for parameter in parameters
-        if isinstance(parameter, Mapping) and str(parameter.get("key") or "").strip()
-    }
-
-
 _ORDERED_CHILD_BLOCK_LIST_KEYS = ("loop_blocks", "blocks")
 _ORDERED_BRANCH_LIST_KEYS = ("branch_conditions", "branches", "ordered_branches")
-
-
-def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return None
-    declared_parameter_keys = _declared_workflow_parameter_keys(parsed)
-    if declared_parameter_keys is None:
-        return "Unable to validate code-block parameter keys: workflow_definition.parameters must be a list."
-    registered_download_keys = set(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
-
-    errors: list[str] = []
-
-    def block_output_key(block: Mapping[str, Any]) -> str | None:
-        label = str(block.get("label") or "").strip()
-        return f"{label}_output" if label else None
-
-    def check_code_block(block: Mapping[str, Any], available_parameter_keys: set[str]) -> None:
-        label = str(block.get("label") or "").strip() or "unlabeled code block"
-        code = str(block.get("code") or "")
-        for line_number, line in enumerate(code.splitlines(), start=1):
-            marker = _conflict_marker_for_line(line)
-            if marker is not None:
-                errors.append(
-                    f"Code block `{label}` contains unresolved conflict marker `{marker}` on code line "
-                    f"{line_number}. Remove every git conflict marker line before retrying."
-                )
-                break
-        parameter_keys = _code_block_parameter_keys(block)
-        registered_keys = sorted(parameter_keys & registered_download_keys)
-        if registered_keys:
-            joined = ", ".join(f"`{key}`" for key in registered_keys)
-            errors.append(
-                f"Code block `{label}` lists registered download output key(s) {joined} in `parameter_keys`, "
-                "but the execution layer injects registered download output keys only after a browser download "
-                "fires. Remove them from `parameter_keys` and return a small descriptor instead."
-            )
-        undeclared_keys = sorted(parameter_keys - available_parameter_keys - registered_download_keys)
-        if undeclared_keys:
-            joined = ", ".join(f"`{key}`" for key in undeclared_keys)
-            errors.append(
-                f"Code block `{label}` lists undeclared `parameter_keys`: {joined}. Declare each workflow input "
-                "under `workflow_definition.parameters`, use a prior block output key such as "
-                "`<block_label>_output`, or remove stale `parameter_keys` entries before retrying."
-            )
-
-    def visit_branch(branch: Mapping[str, Any], available_parameter_keys: set[str]) -> None:
-        for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-            # Child scopes inherit known keys without leaking their outputs back into sibling branches.
-            visit_blocks(branch.get(key), set(available_parameter_keys))
-        for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-            branches = branch.get(branch_key)
-            if not isinstance(branches, list):
-                continue
-            for nested_branch in branches:
-                if isinstance(nested_branch, Mapping):
-                    # Branch scopes intentionally isolate output keys from their parent branch.
-                    visit_branch(nested_branch, set(available_parameter_keys))
-
-    def visit_blocks(blocks: Any, available_parameter_keys: set[str]) -> set[str]:
-        if not isinstance(blocks, list):
-            return available_parameter_keys
-        for block in blocks:
-            if not isinstance(block, Mapping):
-                continue
-            if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
-                check_code_block(block, available_parameter_keys)
-            for key in _ORDERED_CHILD_BLOCK_LIST_KEYS:
-                visit_blocks(block.get(key), set(available_parameter_keys))
-            for branch_key in _ORDERED_BRANCH_LIST_KEYS:
-                branches = block.get(branch_key)
-                if not isinstance(branches, list):
-                    continue
-                for branch in branches:
-                    if isinstance(branch, Mapping):
-                        visit_branch(branch, set(available_parameter_keys))
-            output_key = block_output_key(block)
-            if output_key:
-                available_parameter_keys.add(output_key)
-        return available_parameter_keys
-
-    workflow_definition = parsed.get("workflow_definition")
-    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
-    try:
-        visit_blocks(blocks, set(declared_parameter_keys))
-    except RecursionError:
-        return "Workflow YAML nesting is too deep to validate."
-    return "\n".join(errors) if errors else None
-
-
-class _NeverCapturedObligationCandidate(NamedTuple):
-    block_label: str
-    site: str
-    method: str
-    receiver: str
-    call_shape: str
-    expected_tool_name: str
-    expected_argument_literal: str | None
 
 
 def _code_repair_progress_data(
@@ -8480,8 +5643,6 @@ class _SynthesizedCodeImpositionResult:
     selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
     minted_parameter_keys: list[str] = dataclass_field(default_factory=list)
     metadata_repair_contract: dict[str, object] | None = None
-    ablation_gate_id: str | None = None
-    never_captured_candidate: _NeverCapturedObligationCandidate | None = None
     omission_digest: str | None = None
 
 
@@ -8673,19 +5834,6 @@ def _missing_code_artifact_metadata_labels(workflow_yaml: str, ctx: AgentContext
     ]
 
 
-def _missing_code_artifact_metadata_error(workflow_yaml: str, ctx: AgentContext, raw_metadata: Any) -> str | None:
-    missing = _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_metadata)
-    if not missing:
-        return None
-    joined = ", ".join(f"`{label}`" for label in missing)
-    return (
-        f"Code-only browser workflow output block(s) {joined} must pass `code_artifact_metadata` with concrete "
-        "`goal_value_paths` before saving or testing. Include an `extraction_schema` when the user requested "
-        "structured fields, and make the code return a keyed dict/list or expose top-level locals matching those "
-        "goal path roots."
-    )
-
-
 def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | None) -> bool:
     label = str(block.get("label") or "").strip()
     if not label or not prior_yaml:
@@ -8706,7 +5854,6 @@ def _should_impose_after_update_attempt(ctx: AgentContext, *, repeated_identical
         (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
         or synthesized_persistence_reopened_after_failed_run(ctx)
         or ctx.synthesized_block_reopened_for_credential_scout
-        or ctx.synthesized_block_reopened_for_capture_obligation
         or repeated_identical_omission
         or _author_time_reject_reopens_synthesized_imposition(ctx)
     )
@@ -9302,90 +6449,6 @@ _NEVER_CAPTURED_SCOUT_TOOL_BY_METHOD = {
     "press": "press_key",
     "select_option": "select_option",
 }
-
-
-def _never_captured_obligation_candidate(
-    provenance: Iterable[_BrowserSurfaceRejectionProvenance],
-) -> _NeverCapturedObligationCandidate | None:
-    for record in provenance:
-        mutation = record.mutation
-        if record.kind != "never_captured" or mutation is None:
-            continue
-        expected_tool_name = _NEVER_CAPTURED_SCOUT_TOOL_BY_METHOD.get(mutation.method)
-        if expected_tool_name is None or not mutation.generator_compatible:
-            continue
-        if mutation.method == "press" and mutation.argument_literal is None:
-            continue
-        return _NeverCapturedObligationCandidate(
-            block_label=record.block_label,
-            site=record.site,
-            method=mutation.method,
-            receiver=normalized_locator_expr(mutation.receiver),
-            call_shape=mutation.call_shape,
-            expected_tool_name=expected_tool_name,
-            expected_argument_literal=mutation.argument_literal,
-        )
-    return None
-
-
-def _arm_never_captured_obligation(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    candidate: _NeverCapturedObligationCandidate | None,
-    replay_payload: NeverCapturedReplayPayload,
-) -> None:
-    if candidate is None:
-        return
-    turn_id = str(getattr(ctx, "turn_id", ""))
-    draft_fingerprint = hashlib.sha256(workflow_yaml.encode()).hexdigest()
-    call_shape_digest = hashlib.sha256(candidate.call_shape.encode()).hexdigest()
-    identity_payload = "\0".join(
-        (
-            turn_id,
-            draft_fingerprint,
-            candidate.block_label,
-            candidate.site,
-            candidate.method,
-            candidate.receiver,
-            call_shape_digest,
-        )
-    )
-    identity_digest = hashlib.sha256(identity_payload.encode()).hexdigest()
-    if identity_digest in ctx.never_captured_obligation_identity_history:
-        return
-    armed_after_trajectory_index = max(
-        (index for item in ctx.scout_trajectory if isinstance((index := item.get("trajectory_index")), int)),
-        default=-1,
-    )
-    ctx.never_captured_obligation = NeverCapturedObligation(
-        identity_digest=identity_digest,
-        turn_id=turn_id,
-        draft_fingerprint=draft_fingerprint,
-        block_label=candidate.block_label,
-        site=candidate.site,
-        method=candidate.method,
-        normalized_receiver=candidate.receiver,
-        call_shape_digest=call_shape_digest,
-        expected_tool_name=candidate.expected_tool_name,
-        armed_after_trajectory_index=armed_after_trajectory_index,
-        expected_argument_literal=candidate.expected_argument_literal,
-        replay_payload=replay_payload,
-    )
-    ctx.never_captured_obligation_identity_history.add(identity_digest)
-    LOG.info(
-        "copilot_never_captured_obligation_armed",
-        identity_digest=identity_digest,
-        turn_id=turn_id,
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        draft_fingerprint=draft_fingerprint,
-        block_label=candidate.block_label,
-        site=candidate.site,
-        method=candidate.method,
-        receiver=candidate.receiver,
-        call_shape_digest=call_shape_digest,
-        expected_tool_name=candidate.expected_tool_name,
-        armed_after_trajectory_index=armed_after_trajectory_index,
-    )
 
 
 class _BrowserBindings(NamedTuple):
@@ -10099,15 +7162,6 @@ def _synthesized_resubmission_credential_scout_requirements(
     return _credentialed_code_block_scout_gate_errors(probe_yaml, ctx)
 
 
-def _record_scouted_spine_omission_reject(ctx: AgentContext, digest: str | None) -> None:
-    if digest is not None and digest == ctx.scouted_spine_previous_omission_digest:
-        ctx.scouted_spine_repeated_identical_missing_steps = True
-        LOG.info("copilot_scouted_spine_repeated_identical_omission", omission_digest=digest)
-    else:
-        ctx.scouted_spine_repeated_identical_missing_steps = False
-    ctx.scouted_spine_previous_omission_digest = digest
-
-
 def _scouted_spine_omission_digest(records: Sequence[Mapping[str, Any]]) -> str:
     items = sorted(
         (
@@ -10220,11 +7274,7 @@ def _scouted_spine_partition_under_build_result(
         finding_count=len(findings),
         finding_summary=summary,
     )
-    violation = (
-        f"Unable to impose synthesized code block: `{block_label}` under-builds the scouted spine "
-        f"({reason_code}): {summary}. Resubmit the code block reusing the synthesized rung source verbatim so "
-        "every captured interaction is replayed or carries a forgiven-drop reason."
-    )
+    violation = f"`{block_label}` does not replay every scouted interaction ({reason_code}): {summary}."
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=workflow_yaml,
         violations=[violation],
@@ -10277,247 +7327,6 @@ def _pre_persist_scouted_spine_result(workflow_yaml: str, ctx: AgentContext) -> 
 
 
 _FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE = "freehand_unresolvable_selector"
-_FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE = "freehand_unguarded_credential_fill"
-
-
-def _scouted_selector_forms(scout_trajectory: list[ScoutedInteraction]) -> set[str]:
-    return {
-        normalized_scout_selector(selector)
-        for interaction in scout_trajectory
-        if (selector := str(interaction.get("selector") or "").strip())
-    }
-
-
-def _receiver_is_self_validating_get_by_role(receiver: str) -> bool:
-    try:
-        node = ast.parse(receiver, mode="eval").body
-    except SyntaxError:
-        return False
-    if not (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "get_by_role"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "page"
-    ):
-        return False
-    if len(node.args) != 1:
-        return False
-    role = node.args[0]
-    if not (isinstance(role, ast.Constant) and isinstance(role.value, str) and role.value):
-        return False
-    if any(keyword.arg is None or not isinstance(keyword.value, ast.Constant) for keyword in node.keywords):
-        return False
-    return any(
-        keyword.arg == "name"
-        and isinstance(keyword.value, ast.Constant)
-        and isinstance(keyword.value.value, str)
-        and keyword.value.value
-        for keyword in node.keywords
-    )
-
-
-def _fragment_scout_freehand_validation(
-    *,
-    code_blocks: list[dict[str, Any]],
-    exempt_block: dict[str, Any] | None,
-    prior_yaml: str | None,
-    scout_trajectory: list[ScoutedInteraction],
-    synthesized_code: str,
-    synthesized_diagnostics: SynthesisDiagnostics | None,
-) -> _BrowserSurfaceValidation:
-    """A fragment scout is no authoritative full-spine reference, but every durable mutation must still
-    resolve to a scout-captured form (captured selector or synthesized receiver) or be rejected; only
-    selectorless page navigation and self-validating literal role+name receivers are admitted unscouted."""
-    scouted_forms = _scouted_selector_forms(scout_trajectory)
-    scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
-    admitted_receivers = {
-        (mutation.method, normalized_locator_expr(mutation.receiver)) for mutation in scouted_mutations
-    }
-    violations: list[str] = []
-    provenance: list[_BrowserSurfaceRejectionProvenance] = []
-    for block in code_blocks:
-        if block is exempt_block:
-            continue
-        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
-            continue
-        label = _code_block_label(block)
-        block_mutations, _, block_ambiguous = _browser_surface_for_code(str(block.get("code") or ""))
-        freehand_mutations: list[_BrowserMutationSignature] = []
-        for mutation in block_mutations:
-            if mutation.receiver == "page":
-                continue
-            if (mutation.method, normalized_locator_expr(mutation.receiver)) in admitted_receivers:
-                continue
-            if _receiver_is_self_validating_get_by_role(mutation.receiver):
-                continue
-            selector = _bare_locator_call_selector(mutation.receiver)
-            if selector is not None and normalized_scout_selector(selector) in scouted_forms:
-                continue
-            freehand_mutations.append(mutation)
-        if freehand_mutations:
-            action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(freehand_mutations))
-            block_provenance = [
-                _classify_unscouted_mutation(
-                    mutation,
-                    scouted_mutations=scouted_mutations,
-                    diagnostics=synthesized_diagnostics,
-                    site="fragment_scout",
-                    block_label=label,
-                )
-                for mutation in sorted(freehand_mutations)
-            ]
-            provenance.extend(block_provenance)
-            violations.append(
-                f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): "
-                f"{action_text}.{_provenance_suffix_text(block_provenance)}"
-            )
-        if block_ambiguous:
-            ambiguous_provenance = [
-                _ambiguous_browser_action_provenance(action, site="fragment_scout", block_label=label)
-                for action in block_ambiguous
-            ]
-            provenance.extend(ambiguous_provenance)
-            violations.append(
-                f"Unable to impose synthesized code block: `{label}` contains ambiguous browser action(s): "
-                + ", ".join(block_ambiguous)
-                + "."
-                + _provenance_suffix_text(ambiguous_provenance)
-            )
-    _log_browser_surface_rejection_provenance(provenance)
-    return _BrowserSurfaceValidation(violations, provenance)
-
-
-def _workflow_credential_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
-    workflow_definition = parsed.get("workflow_definition")
-    parameters = workflow_definition.get("parameters") if isinstance(workflow_definition, dict) else None
-    if not isinstance(parameters, list):
-        return set()
-    keys: set[str] = set()
-    for parameter in parameters:
-        if not isinstance(parameter, Mapping) or not _is_credential_parameter(parameter):
-            continue
-        key = str(parameter.get("key") or "").strip()
-        if key:
-            keys.add(key)
-    return keys
-
-
-def _freehand_surface_reject(
-    workflow_yaml: str, code_blocks: list[dict[str, Any]], validation: _BrowserSurfaceValidation
-) -> _SynthesizedCodeImpositionResult:
-    first = validation.provenance[0] if validation.provenance else None
-    repair_context = CodeAuthoringRepairContext(
-        block_label=first.block_label if first is not None else _code_block_label(code_blocks[0]),
-        reason_code=_FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE,
-        selector=first.nearest_selector if first is not None else None,
-    )
-    return _SynthesizedCodeImpositionResult(
-        workflow_yaml=workflow_yaml,
-        violations=validation.violations,
-        repair_context=repair_context,
-        never_captured_candidate=_never_captured_obligation_candidate(validation.provenance),
-    )
-
-
-def _persist_seam_freehand_surface_result(
-    workflow_yaml: str, ctx: AgentContext
-) -> _SynthesizedCodeImpositionResult | None:
-    # Imposition validates only the spine it rewrites; this leg closes the persist lanes where a changed
-    # freehand browser block never reached that surface gate, applying the same admissibility to siblings.
-    if not ctx.impose_synthesized_code_block:
-        return None
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    scout_trajectory = ctx.scout_trajectory
-    if not scout_trajectory:
-        return None
-    if not str(scout_trajectory[0].get("source_url") or "").strip():
-        return None
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return None
-    code_blocks = _workflow_code_blocks(parsed)
-    if not code_blocks:
-        return None
-    _, prior_yaml = _prior_yaml_source(ctx)
-    carrier_label = ctx.spine_imposition_carrier_label
-    exempt_block = (
-        next((block for block in code_blocks if _code_block_label(block) == carrier_label), None)
-        if carrier_label
-        else None
-    )
-    credential_parameter_keys = _workflow_credential_parameter_keys(parsed)
-    for block in code_blocks:
-        if block is exempt_block:
-            continue
-        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
-            continue
-        if not _block_has_unguarded_credential_fill(str(block.get("code") or ""), credential_parameter_keys):
-            continue
-        label = _code_block_label(block)
-        LOG.info("copilot_freehand_unguarded_credential_fill", block_label=label)
-        violation = (
-            f"Unable to persist code block: `{label}` fills a credential field without a presence guard, so it "
-            "re-fills and times out when the workflow replays on an already-authenticated page. Reuse the "
-            "synthesized entry rung, which fills only when the login form is still present."
-        )
-        return _SynthesizedCodeImpositionResult(
-            workflow_yaml=workflow_yaml,
-            violations=[violation],
-            repair_context=CodeAuthoringRepairContext(
-                block_label=label, reason_code=_FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE
-            ),
-        )
-    synthesized = synthesize_code_block(
-        scout_trajectory, strict_selectors=True, reached_download_target=ctx.reached_download_target
-    )
-    synthesized_code = "" if synthesized is None else (synthesized.interaction_code or synthesized.code)
-    synthesized_diagnostics = None if synthesized is None else synthesized.diagnostics
-    sentinel_selected: dict[str, Any] = {}
-    selected_code_block = exempt_block if exempt_block is not None else sentinel_selected
-    # get_by_label is never a synthesized selector, so an unresolvable one is rejected regardless of whether
-    # the scout reached its goal; a fragment scout still fails this class closed to the scout-the-step route.
-    factory_validation = _whole_trajectory_browser_surface_violations(
-        code_blocks=code_blocks,
-        selected_code_block=selected_code_block,
-        submitted_selected_code="",
-        synthesized_code=synthesized_code,
-        prior_yaml=prior_yaml,
-        synthesized_diagnostics=synthesized_diagnostics,
-        admit_on_receiver=True,
-        restrict_to_durable_factory=True,
-    )
-    if factory_validation.violations:
-        return _freehand_surface_reject(workflow_yaml, code_blocks, factory_validation)
-    # The full synthesized spine is an authoritative admissibility reference only when the scout captured a
-    # durable entry through a commit; a fragment scout would false-reject legitimate multi-block authoring.
-    if synthesized is None or not synthesized_trajectory_reaches_goal(ctx):
-        # scouted_interactions joins the admitted set because the trajectory is cap-evicted; both
-        # collections carry only scout-captured selectors.
-        fragment_validation = _fragment_scout_freehand_validation(
-            code_blocks=code_blocks,
-            exempt_block=exempt_block,
-            prior_yaml=prior_yaml,
-            scout_trajectory=[*scout_trajectory, *ctx.scouted_interactions],
-            synthesized_code=synthesized_code,
-            synthesized_diagnostics=synthesized_diagnostics,
-        )
-        if fragment_validation.violations:
-            return _freehand_surface_reject(workflow_yaml, code_blocks, fragment_validation)
-        return None
-    validation = _whole_trajectory_browser_surface_violations(
-        code_blocks=code_blocks,
-        selected_code_block=selected_code_block,
-        submitted_selected_code="",
-        synthesized_code=synthesized_code,
-        prior_yaml=prior_yaml,
-        synthesized_diagnostics=synthesized_diagnostics,
-        admit_on_receiver=True,
-    )
-    if not validation.violations:
-        return None
-    return _freehand_surface_reject(workflow_yaml, code_blocks, validation)
 
 
 def _workflow_yaml_browser_call_pairs(workflow_yaml: str) -> list[tuple[str, str]]:
@@ -10757,11 +7566,6 @@ def _submitted_direct_fill_type_usage(code: str, parameter_key: str) -> _DirectF
     return _DirectFillTypeUsage(matched, mismatched)
 
 
-def _submitted_uses_parameter_in_direct_fill_type(code: str, parameter_key: str) -> bool:
-    usage = _submitted_direct_fill_type_usage(code, parameter_key)
-    return usage.matched and not usage.mismatched
-
-
 def _safe_singleton_literal_for_parameter(
     code: str, parameter_key: str, typed_length: int | None
 ) -> tuple[str | None, str | None]:
@@ -10960,11 +7764,6 @@ def _strip_redundant_sandbox_imports_in_yaml(workflow_yaml: str) -> tuple[str, l
     return yaml.safe_dump(parsed, sort_keys=False), stripped_modules
 
 
-def _code_block_has_load_bearing_mutation(code: str) -> bool:
-    mutations, _reads, _ambiguous = _browser_surface_for_code(code)
-    return any(mutation.method in _LOCATOR_MUTATION_METHODS for mutation in mutations)
-
-
 def _iter_workflow_blocks(blocks: object) -> Iterator[dict[str, Any]]:
     if not isinstance(blocks, list):
         return
@@ -11009,102 +7808,6 @@ def _dangling_next_block_label_violation(parsed: Mapping[str, Any]) -> str | Non
         + ", ".join(f"`{label}`" for label in dangling)
         + "."
     )
-
-
-def _scaffolding_only_body_violation(ctx: AgentContext, parsed: Mapping[str, Any]) -> str | None:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    scout_trajectory = ctx.scout_trajectory
-    if not isinstance(scout_trajectory, list) or not scout_trajectory:
-        return None
-    synthesized = synthesize_code_block(
-        scout_trajectory, reached_download_target=getattr(ctx, "reached_download_target", None)
-    )
-    if synthesized is None:
-        return None
-    required = [record for record in synthesized.diagnostics.emitted_interactions if not str(record.get("lane") or "")]
-    if not required:
-        return None
-    code_blocks = _workflow_code_blocks(parsed) if isinstance(parsed, dict) else []
-    if not code_blocks:
-        return None
-    if any(_code_block_has_load_bearing_mutation(str(block.get("code") or "")) for block in code_blocks):
-        return None
-    return (
-        "Unable to persist workflow: the persisted code block(s) commit no load-bearing browser interaction "
-        f"({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}), though the scout demonstrated {len(required)} rung(s). "
-        "Reuse the synthesized code block verbatim so the captured interactions are replayed."
-    )
-
-
-def _normalize_prompt_text(text: str) -> str:
-    return " ".join(text.split()).casefold()
-
-
-def _stub_with_raw_prompt_violation(ctx: AgentContext, parsed: Mapping[str, Any]) -> str | None:
-    packet = getattr(ctx, "turn_context_packet", None)
-    if packet is None:
-        return None
-    anchor = _normalize_prompt_text(str(packet.transcript_context.earliest_user_turn or ""))
-    if not anchor:
-        return None
-    if _scaffolding_only_body_violation(ctx, parsed) is None:
-        return None
-    for block in _iter_workflow_blocks(parsed.get("workflow_definition", {}).get("blocks")):
-        for field_name in ("prompt", "description", "title"):
-            if _normalize_prompt_text(str(block.get(field_name) or "")) == anchor:
-                return (
-                    "Unable to persist workflow: a block reproduces the raw user request as its "
-                    f"{field_name} while committing no load-bearing browser interaction "
-                    f"({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE})."
-                )
-    return None
-
-
-def _code_references_parameter(code: str, key: str) -> bool:
-    sources = _code_runtime_parameter_sources(code, {key})
-    return sources is not None and key in sources
-
-
-def _orphan_minted_parameter_violation(parsed: Mapping[str, Any], minted_keys: list[str]) -> str | None:
-    if not minted_keys or not isinstance(parsed, dict):
-        return None
-    codes = [str(block.get("code") or "") for block in _workflow_code_blocks(parsed)]
-    orphans = sorted(
-        {key for key in minted_keys if key and not any(_code_references_parameter(code, key) for code in codes)}
-    )
-    if not orphans:
-        return None
-    return (
-        "Unable to persist workflow: minted workflow parameter(s) are not referenced by any generated code: "
-        + ", ".join(f"`{key}`" for key in orphans)
-        + "."
-    )
-
-
-def _final_yaml_structural_violations(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    *,
-    minted_parameter_keys: list[str],
-    promoted_parameter_keys: list[str],
-    carried_by_imposition: bool,
-) -> list[str]:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return []
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return []
-    candidates: list[str | None] = [
-        _dangling_next_block_label_violation(parsed),
-        _orphan_minted_parameter_violation(parsed, [*minted_parameter_keys, *promoted_parameter_keys]),
-    ]
-    # The spine-coverage seam runs only when imposition made no substitution; a successful imposition
-    # skips it, so the body-shape predicates re-validate exactly that bypassed window.
-    if carried_by_imposition:
-        candidates.insert(0, _scaffolding_only_body_violation(ctx, parsed))
-        candidates.insert(1, _stub_with_raw_prompt_violation(ctx, parsed))
-    return [violation for violation in candidates if violation is not None]
 
 
 def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContext) -> tuple[str, list[str], list[str]]:
@@ -11357,31 +8060,6 @@ def _apply_parameter_reconciliation_to_code(code: str, reconciliation: _Synthesi
 
 
 _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE = "synthesized_parameter_binding_ambiguous"
-
-
-def _record_synthesized_parameter_binding_ablation_event(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    repair_context: CodeAuthoringRepairContext,
-) -> bool:
-    fingerprint = authored_structure_signature_from_workflow(workflow_yaml, ctx.raw_code_artifact_metadata)
-    if fingerprint is None:
-        return False
-    payload: AuthorTimeGateAblationPayload = {
-        "block_label": repair_context.block_label,
-        "unresolved_names": list(repair_context.unresolved_names),
-        "parameter_keys": list(repair_context.parameter_keys),
-        "available_parameter_keys": list(repair_context.available_parameter_keys),
-        "binding_candidates": list(repair_context.binding_candidates),
-    }
-    return record_author_time_gate_ablation_event(
-        ctx,
-        gate_id=SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
-        reason_code=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
-        fingerprint=fingerprint,
-        blocked_tool="update_workflow",
-        payload=payload,
-    )
 
 
 def _synthesized_parameter_binding_repair_context(
@@ -11844,7 +8522,6 @@ def _maybe_impose_synthesized_code_block(
     if not isinstance(parsed, dict):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     requirement = ctx.recorded_outcome_grounding_requirement
-    constraint = ctx.recorded_outcome_binding_constraint
     code_blocks = _workflow_code_blocks(parsed)
     prior_source, prior_yaml = _prior_yaml_source(ctx)
     code_block = _select_synthesized_imposition_code_block(
@@ -11938,20 +8615,6 @@ def _maybe_impose_synthesized_code_block(
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: current-page parameter binding is ambiguous."],
             repair_context=binding_repair_context,
-        )
-    grounding_repair_active = (
-        binding_snapshot is None
-        and file_match_transform is None
-        and bool(declared_keys)
-        and isinstance(requirement, RecordedOutcomeGroundingRequirement)
-        and requirement.satisfied
-        and isinstance(constraint, RecordedOutcomeBindingConstraint)
-        and constraint.repeated_structural_key == requirement.structural_key
-    )
-    if grounding_repair_active and _stash_unresolved_recorded_outcome_grounding_halt(ctx, declared_keys):
-        return _SynthesizedCodeImpositionResult(
-            workflow_yaml=workflow_yaml,
-            violations=["Unable to impose synthesized code block: current-page parameter binding is unresolved."],
         )
     synthesis_values = _runtime_declared_string_parameter_values(parsed, runtime_parameters)
     synthesis_trajectory: list[Mapping[str, Any]] = []
@@ -12186,7 +8849,6 @@ def _maybe_impose_synthesized_code_block(
         scout_trajectory=scout_trajectory,
         parameter_binding_snapshot=binding_snapshot,
     )
-    parameter_binding_is_only_violation = not violations and bool(parameter_reconciliation.violations)
     violations.extend(parameter_reconciliation.violations)
     if repair_context is None:
         repair_context = parameter_reconciliation.repair_context
@@ -12203,14 +8865,6 @@ def _maybe_impose_synthesized_code_block(
             violations=violations,
             repair_context=repair_context,
             metadata_repair_contract=_co_computed_metadata_repair_contract(ctx, workflow_yaml, raw_metadata),
-            never_captured_candidate=_never_captured_obligation_candidate(rejection_provenance),
-            ablation_gate_id=(
-                SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID
-                if parameter_binding_is_only_violation
-                and repair_context is not None
-                and repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
-                else None
-            ),
         )
 
     metadata_declares_goal_values = bool(raw_metadata) and _raw_metadata_declares_goal_values_for_block(
@@ -13021,6 +9675,38 @@ def _code_uses_expect_download(code: str) -> bool:
     return False
 
 
+_DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET = frozenset({"downloaded_file_path", "download_url"})
+
+
+def _download_descriptor_leak_finding(label: str, code: str) -> str | None:
+    """A run cannot reveal this: it succeeds, and a local filesystem path or raw download URL
+    lands in workflow output. The execution layer owns those keys."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return None
+    leak_key_locals: set[str] = set()
+    leaked = False
+    for node in _iter_top_level_scope(tree.body):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if _dict_keys(node.value) & _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET or (
+                isinstance(node.value, ast.Name) and node.value.id in leak_key_locals
+            ):
+                leaked = True
+                break
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if _dict_keys(node.value) & _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET:
+                leak_key_locals.add(node.targets[0].id)
+    if not leaked:
+        return None
+    return (
+        f"Code block `{label}` returns the raw descriptor keys "
+        f"({', '.join(sorted(_DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET))}), which put a local filesystem path or download "
+        "URL into workflow output. The execution layer owns those; return a small descriptor such as "
+        '`{"saved_as": dl_info.value.suggested_filename}` instead.'
+    )
+
+
 def _dict_keys(node: ast.expr) -> set[str]:
     if isinstance(node, ast.Await):
         return _dict_keys(node.value)
@@ -13032,7 +9718,6 @@ def _dict_keys(node: ast.expr) -> set[str]:
 
 
 _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
-_DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET = frozenset({"downloaded_file_path", "download_url"})
 
 
 def _code_returns_registration_keys(code: str) -> bool:
@@ -13050,26 +9735,6 @@ def _code_returns_registration_keys(code: str) -> bool:
         if isinstance(node, ast.Assign):
             if _dict_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
                 return True
-    return False
-
-
-def _code_returns_download_descriptor_leak_keys(code: str) -> bool:
-    """Detect simple top-level descriptor returns; execution-registered artifacts remain
-    the authoritative download proof."""
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-    except SyntaxError:
-        return False
-    leak_key_locals: set[str] = set()
-    for node in _iter_top_level_scope(tree.body):
-        if isinstance(node, ast.Return) and node.value is not None:
-            if _dict_keys(node.value) & _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET:
-                return True
-            if isinstance(node.value, ast.Name) and node.value.id in leak_key_locals:
-                return True
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            if _dict_keys(node.value) & _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET:
-                leak_key_locals.add(node.targets[0].id)
     return False
 
 
@@ -13094,36 +9759,6 @@ def _is_download_intent(artifact: Mapping[str, Any], code: str) -> bool:
         or _code_returns_registration_keys(code)
         or _artifact_declares_registration_keys(artifact)
     )
-
-
-def _download_return_shape_error(label: str, artifact: Mapping[str, Any], code: str) -> str | None:
-    """Fail closed on a download-intent code block that cannot register a real download:
-    one lacking the `page.expect_download` idiom (no browser download ever fires), or one
-    whose return writes the execution-layer-owned registration keys (self-certification)."""
-    if not _is_download_intent(artifact, code):
-        return None
-    if not _code_uses_expect_download(code):
-        return (
-            f"Code block `{label}` is a download block but does not fire the browser download with the "
-            "`page.expect_download` idiom (async with page.expect_download() as dl_info: await "
-            "page.click(<unique selector>)). A static fetch or a plain click registers no file. Author the "
-            "expect_download idiom against a unique target so the runtime registers the file into the workflow "
-            "output (downloaded_files); never place file bytes or URLs in the chat reply."
-        )
-    if _code_returns_registration_keys(code):
-        return (
-            f"Code block `{label}` `return`s the download registration keys "
-            f"({', '.join(REGISTERED_DOWNLOAD_OUTPUT_KEYS)}) itself. The execution layer injects those keys when a "
-            "browser download fires; writing them self-certifies a download that may never have happened. Return a "
-            'small keyed descriptor instead (for example `return {"saved_as": dl_info.value.suggested_filename}`) and '
-            "let the expect_download idiom register the file."
-        )
-    if _code_returns_download_descriptor_leak_keys(code):
-        return (
-            f"Code block `{label}` returns raw download path/URL descriptor keys. Return only non-sensitive summary "
-            "fields such as the suggested filename; the execution layer injects artifact URLs and IDs."
-        )
-    return None
 
 
 def _code_artifact_metadata_shape_errors(
@@ -13424,34 +10059,59 @@ def _credential_scout_reject_error_text(ctx: AgentContext, credential_scout_erro
     return error_text
 
 
-def _reject_schema_incompatibility(
-    ctx: AgentContext,
-    incompatibility: SchemaIncompatibility,
-    reject: Callable[..., dict[str, Any]],
-) -> dict[str, Any]:
-    """Emit the typed, non-repairable schema-incompatibility outcome: stash the terminal
-    blocker + turn halt so enforcement renders a product-language reply (instead of
-    falling through to repair churn), record it on the context, and reject without
-    persisting the incompatible draft."""
-    signal = build_schema_incompatibility_blocker_signal(incompatibility)
-    _record_author_time_reject_outcome(
-        ctx,
-        reason_code="schema_incompatibility",
-        summary=signal.user_facing_reason,
-        structural_payload=incompatibility.to_summary_dict(),
-        block_labels=[incompatibility.block_label],
-    )
-    stash_blocker_signal(ctx, signal)
-    stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
-    ctx.latest_schema_incompatibility = incompatibility
-    return reject(
-        error=render_schema_incompatibility_agent_steer(incompatibility),
-        user_facing_summary=signal.user_facing_reason,
-        data={
-            "failure_type": SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
-            "schema_incompatibility": incompatibility.to_summary_dict(),
-        },
-    )
+def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """The combined update-and-run tool returns the run's result, not the update's, so findings
+    labelled on the persisted draft reach the model only if they are carried across."""
+    update_data = update_result.get("data")
+    findings = update_data.get("findings") if isinstance(update_data, dict) else None
+    if not findings:
+        return result
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        result["data"] = data
+    data.setdefault("findings", findings)
+    return result
+
+
+def _author_time_findings(
+    *,
+    schema_incompatibility: SchemaIncompatibility | None,
+    metadata_violations: Sequence[str],
+    imposition_violations: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
+    test-run would not surface it; anything a run reveals belongs in the run, not here."""
+    findings: list[dict[str, Any]] = []
+    # An edited schema field that binds to nothing does not fail the run: the run succeeds and
+    # silently omits the field, so only the known output contract can say it can never bind.
+    if schema_incompatibility is not None:
+        findings.append(
+            {
+                "reason_code": SCHEMA_INCOMPATIBILITY_REASON_CODE,
+                "summary": render_schema_incompatibility_user_reason(schema_incompatibility),
+                "schema_incompatibility": schema_incompatibility.to_summary_dict(),
+            }
+        )
+    # The normalizer rewrites what it can; the residue names metadata the authored artifact
+    # never declared, which a run cannot report because it never had the field to produce.
+    if metadata_violations:
+        findings.append(
+            {
+                "reason_code": "code_artifact_metadata_incomplete",
+                "summary": "\n".join(str(violation) for violation in metadata_violations),
+            }
+        )
+    # An imposition that could not apply leaves the model's own YAML persisted; naming why
+    # is not observable from the run, which only ever sees the un-imposed draft.
+    if imposition_violations:
+        findings.append(
+            {
+                "reason_code": "synthesized_code_block_not_imposed",
+                "summary": "\n".join(str(violation) for violation in imposition_violations),
+            }
+        )
+    return findings
 
 
 def _declared_string_parameter_values(workflow_yaml: str) -> dict[str, str]:
@@ -13509,11 +10169,9 @@ async def _update_workflow(
 
     output_contract_imposed_signature = ""
 
-    def reject(
+    def _blocked(
+        block: AuthorTimeBlock,
         *,
-        error: str,
-        user_facing_summary: str | None = None,
-        data: dict[str, Any] | None = None,
         repair_context: CodeAuthoringRepairContext | None = None,
         record_repair_context_outcome: bool = True,
     ) -> dict[str, Any]:
@@ -13526,291 +10184,56 @@ async def _update_workflow(
             _set_code_authoring_repair_context(ctx, repair_context)
         else:
             ctx.last_code_authoring_repair_context = repair_context
+        _record_code_authoring_guardrail_reject(
+            ctx,
+            defer_churn_stop=block.block_id == CREDENTIAL_SCOUT_BLOCK_ID,
+        )
+        result: dict[str, Any] = {"ok": False, "error": block.error, "block_id": block.block_id}
+        if block.user_facing_summary is not None:
+            result["user_facing_summary"] = block.user_facing_summary
+        if block.data:
+            result["data"] = block.data
+        return result
+
+    def _tool_error(error: str, *, user_facing_summary: str | None = None) -> dict[str, Any]:
+        # The submission cannot become a Workflow, so there is no authored artifact to refuse:
+        # report it honestly without a block identity, a turn halt, or a churn increment.
         result: dict[str, Any] = {"ok": False, "error": error}
         if user_facing_summary is not None:
             result["user_facing_summary"] = user_facing_summary
-        if data is not None:
-            result["data"] = data
         return result
 
     authority_error = _authority_tool_error(ctx, "update_workflow")
     if authority_error is not None:
-        return reject(error=authority_error)
+        return _tool_error(authority_error)
 
     workflow_yaml = params["workflow_yaml"]
-    never_captured_replay_payload = NeverCapturedReplayPayload(
-        params=copy.deepcopy(params),
-        allow_missing_credentials=allow_missing_credentials,
-        allow_static_output_uncertainty=allow_static_output_uncertainty,
-        formation_prepared=formation_prepared,
-    )
     raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
     if raw_conflict_marker_error is not None:
-        return reject(
-            error=raw_conflict_marker_error,
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
-        )
-    # Tool wrappers run authority/loop guards before calling here. The composition
-    # gate below consumes these refs, so they must be visible before validation.
+        return _tool_error(raw_conflict_marker_error, user_facing_summary=_compiled_authoring_user_summary())
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(params.get("code_artifact_metadata"))
-    # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     _enrich_scout_trajectory_input_correspondences(workflow_yaml, ctx)
     runtime_parameters = params.get("parameters")
-    capture_obligation = ctx.never_captured_obligation
-    if (
-        capture_obligation is not None
-        and capture_obligation.state == "captured"
-        and capture_obligation.draft_fingerprint != hashlib.sha256(workflow_yaml.encode()).hexdigest()
-    ):
-        ctx.never_captured_obligation = replace(capture_obligation, state="consumed")
-        ctx.synthesized_block_reopened_for_capture_obligation = False
-        LOG.info(
-            "copilot_never_captured_obligation_expired_for_different_draft",
-            identity_digest=capture_obligation.identity_digest,
-        )
     imposition = _maybe_impose_synthesized_code_block(
         workflow_yaml,
         ctx,
         runtime_parameters if isinstance(runtime_parameters, Mapping) else None,
     )
-    capture_obligation = ctx.never_captured_obligation
-    if capture_obligation is not None and capture_obligation.state == "captured":
-        ctx.never_captured_obligation = replace(capture_obligation, state="consumed")
-    ctx.synthesized_block_reopened_for_capture_obligation = False
-    # Consume the one-shot credential-scout reopen before the gate below so a fresh reject can re-arm it.
     ctx.synthesized_block_reopened_for_credential_scout = False
-    if imposition.violations:
-        if (
-            imposition.ablation_gate_id == SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID
-            and imposition.repair_context is not None
-            and _record_synthesized_parameter_binding_ablation_event(
-                ctx,
-                workflow_yaml,
-                imposition.repair_context,
-            )
-        ):
-            imposition = _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
-        else:
-            _arm_never_captured_obligation(
-                ctx,
-                workflow_yaml,
-                imposition.never_captured_candidate,
-                never_captured_replay_payload,
-            )
-            if (
-                imposition.repair_context is not None
-                and imposition.repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
-            ):
-                required_paths = _output_contract_required_paths_source(ctx).union
-                _record_output_contract_family_reject(
-                    ctx,
-                    required_paths,
-                    reject_family=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
-                )
-            if (
-                imposition.repair_context is not None
-                and imposition.repair_context.reason_code in _SCOUTED_SPINE_REASON_CODES
-            ):
-                _set_code_authoring_repair_context(ctx, imposition.repair_context)
-                _record_code_authoring_guardrail_reject(ctx)
-                return reject(
-                    error="\n".join(imposition.violations),
-                    user_facing_summary=_compiled_authoring_user_summary(),
-                    data=_code_repair_progress_data(imposition.repair_context),
-                    repair_context=imposition.repair_context,
-                    record_repair_context_outcome=False,
-                )
-            return reject(
-                error="\n".join(imposition.violations),
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data=_code_repair_progress_data(
-                    imposition.repair_context,
-                    metadata_repair_contract=imposition.metadata_repair_contract,
-                ),
-                repair_context=imposition.repair_context,
-            )
-    workflow_yaml = imposition.workflow_yaml
-    if imposition.substitutions is None:
-        freehand_surface = _persist_seam_freehand_surface_result(workflow_yaml, ctx)
-        if freehand_surface is not None:
-            _arm_never_captured_obligation(
-                ctx,
-                workflow_yaml,
-                freehand_surface.never_captured_candidate,
-                never_captured_replay_payload,
-            )
-            _set_code_authoring_repair_context(ctx, freehand_surface.repair_context)
-            _record_code_authoring_guardrail_reject(ctx)
-            return reject(
-                error="\n".join(freehand_surface.violations),
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data=_code_repair_progress_data(freehand_surface.repair_context),
-                repair_context=freehand_surface.repair_context,
-                record_repair_context_outcome=False,
-            )
+    if not imposition.violations:
+        workflow_yaml = imposition.workflow_yaml
     stripped_sandbox_imports: list[str] = []
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml, stripped_sandbox_imports = _strip_redundant_sandbox_imports_in_yaml(workflow_yaml)
-    workflow_yaml, typed_default_violations, promoted_parameter_keys = _apply_scouted_typed_default_promotions(
+    workflow_yaml, _typed_default_violations, _promoted_parameter_keys = _apply_scouted_typed_default_promotions(
         workflow_yaml, ctx
     )
-    if typed_default_violations:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(
-            error="\n".join(typed_default_violations),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
-        )
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml = _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml)
-    final_structural_violations = _final_yaml_structural_violations(
-        ctx,
-        workflow_yaml,
-        minted_parameter_keys=imposition.minted_parameter_keys,
-        promoted_parameter_keys=promoted_parameter_keys,
-        carried_by_imposition=imposition.substitutions is not None,
-    )
-    if final_structural_violations:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(
-            error="\n".join(final_structural_violations),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
-        )
-    business_input_floor_reject = _synthesized_business_input_floor_reject(ctx, workflow_yaml, imposition)
-    if business_input_floor_reject is not None:
-        unreferenced_keys = list(business_input_floor_reject.unreferenced_parameter_keys)
-        ctx.synthesized_business_required_parameter_keys.update(unreferenced_keys)
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="required_input_unbound",
-            summary=_definition_plane_reject_error(business_input_floor_reject),
-            structural_payload={
-                "reason_code": SYNTHESIZED_BUSINESS_INPUT_FLOOR_REASON_CODE,
-                "unreferenced_parameter_keys": unreferenced_keys,
-            },
-            block_labels=[
-                _code_block_label(block) for block in _workflow_code_blocks(parse_workflow_yaml(workflow_yaml) or {})
-            ],
-        )
-        _record_code_authoring_guardrail_reject(ctx)
-        _reopen_scout_after_synthesized_business_input_floor(ctx)
-        return reject(
-            error=(
-                _definition_plane_reject_error(business_input_floor_reject)
-                + " Continue scouting the business-value fields before saving or running this synthesized block."
-            ),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data={
-                "reason_code": SYNTHESIZED_BUSINESS_INPUT_FLOOR_REASON_CODE,
-                "unreferenced_parameter_keys": unreferenced_keys,
-            },
-        )
-    definition_reject = _definition_plane_preflight_reject(ctx, workflow_yaml)
-    if definition_reject is not None:
-        definition_corrective = (
-            None
-            if copilot_author_time_gate_log_only_enabled(ctx, DEFINITION_CONTRACT_UNSATISFIED_GATE_ID)
-            else _value_bearing_definition_reject_corrective(
-                ctx,
-                workflow_yaml=workflow_yaml,
-                raw_metadata=ctx.raw_code_artifact_metadata,
-            )
-        )
-        definition_data = {
-            "reason_code": "definition_contract_unsatisfied",
-            "definition_criterion_ids": list(definition_reject.criterion_ids),
-            "definition_reason_codes": list(definition_reject.reason_codes),
-            "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-            **(definition_corrective or {}),
-        }
-        halted = _stash_unresolved_recorded_outcome_grounding_halt(
-            ctx,
-            definition_reject.unreferenced_parameter_keys,
-        )
-        if halted:
-            return reject(
-                error=_definition_plane_reject_error(definition_reject),
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data=definition_data,
-            )
-        if not _record_definition_plane_ablation_event(
-            ctx,
-            workflow_yaml,
-            definition_reject,
-            code_artifact_metadata=ctx.raw_code_artifact_metadata,
-        ):
-            _record_definition_plane_reject(
-                ctx,
-                workflow_yaml,
-                definition_reject,
-                code_artifact_metadata=ctx.raw_code_artifact_metadata,
-            )
-            return reject(
-                error=_definition_plane_reject_error(definition_reject),
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data=definition_data,
-            )
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        unrenderable = _code_block_render_reject(workflow_yaml, getattr(ctx, "workflow_yaml", None))
-        if unrenderable is not None:
-            unrenderable_label, render_diagnostic = unrenderable
-            render_error = (
-                f"Code block `{unrenderable_label}` contains a Jinja expression the workflow runtime "
-                f"cannot render. {render_diagnostic.message}"
-            )
-            LOG.info(
-                "copilot code block render preflight reject",
-                reason_code="code_block_unrenderable",
-                block_label=unrenderable_label,
-                failing_expression=render_diagnostic.failing_expression,
-            )
-            _record_author_time_reject_outcome(
-                ctx,
-                reason_code="code_block_unrenderable",
-                summary=render_error,
-                structural_payload={
-                    "reason_code": "code_block_unrenderable",
-                    "block_label": unrenderable_label,
-                    "failing_expression": render_diagnostic.failing_expression,
-                },
-                block_labels=[unrenderable_label],
-            )
-            _record_code_authoring_guardrail_reject(ctx)
-            return reject(
-                error=render_error,
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data={
-                    "reason_code": "code_block_unrenderable",
-                    "block_label": unrenderable_label,
-                    "failing_expression": render_diagnostic.failing_expression,
-                },
-            )
     params["workflow_yaml"] = workflow_yaml
-    metadata_scrubbed_by_imposition = False
-    if (
-        imposition.selected_extraction_metadata_disposition == "browser_spine_replaced_metadata_stale"
-        and imposition.scrubbed_selected_metadata_label
-    ):
-        scrubbed_metadata = _downgrade_stale_selected_goal_value_paths(
-            params.get("code_artifact_metadata"),
-            imposition.scrubbed_selected_metadata_label,
-        )
-        params["code_artifact_metadata"] = scrubbed_metadata
-        ctx.raw_code_artifact_metadata = scrubbed_metadata
-        metadata_scrubbed_by_imposition = True
-    parameter_contract_error = _code_block_parameter_contract_error(workflow_yaml)
-    if parameter_contract_error is not None:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(
-            error=parameter_contract_error,
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
-        )
     workflow_yaml, imposed_metadata, envelope_imposed = (
         (workflow_yaml, params.get("code_artifact_metadata"), False)
         if formation_prepared and imposition.substitutions is None
@@ -13827,7 +10250,7 @@ async def _update_workflow(
         ctx.raw_code_artifact_metadata = imposed_metadata
     scaffolded_metadata, scaffold_applied = (
         (params.get("code_artifact_metadata"), False)
-        if formation_prepared and not metadata_scrubbed_by_imposition
+        if formation_prepared
         else _scaffold_metadata_contract_for_update(
             ctx,
             workflow_yaml,
@@ -13838,11 +10261,6 @@ async def _update_workflow(
         params["code_artifact_metadata"] = scaffolded_metadata
         params["raw_code_artifact_metadata"] = scaffolded_metadata
         ctx.raw_code_artifact_metadata = scaffolded_metadata
-    (
-        required_child_output_paths,
-        output_path_coverage_source,
-        output_path_coverage_reason_code,
-    ) = _required_child_output_paths_for_authoring(ctx)
     output_contract_evaluation = _evaluate_output_contract_for_code_block(
         ctx,
         workflow_yaml,
@@ -13850,265 +10268,10 @@ async def _update_workflow(
         allow_static_return_advisory=allow_static_output_uncertainty,
         enforce_value_bearing_liveness=True,
     )
-    if (
-        output_contract_evaluation is not None
-        and _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in output_contract_evaluation.shape_violations
-    ):
-        _revoke_output_contract_advisory_run(ctx, output_contract_evaluation.canonical_signature)
     output_contract_static_advisory_allowed = (
         output_contract_evaluation is not None and output_contract_evaluation.can_attempt_run
     )
-    output_contract_deficient = (
-        output_contract_evaluation is not None
-        and output_contract_evaluation.has_deficiencies
-        and not output_contract_static_advisory_allowed
-    )
-    output_contract_ceiling_resolution: _OutputContractCeilingResolution | None = None
-    if output_contract_deficient:
-        assert output_contract_evaluation is not None
-        authored_fingerprint = _output_contract_structural_fingerprint(
-            workflow_yaml, output_contract_evaluation.canonical_signature
-        )
-        # Recorded before the pass path resolves so the gate's would-block population still
-        # counts the submissions credit-or-impose goes on to handle.
-        output_contract_ablated = _record_output_contract_ablation_event(
-            ctx,
-            output_contract_evaluation,
-            gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
-            blocked_tool="update_workflow",
-            fingerprint=authored_fingerprint,
-        )
-        output_contract_ceiling_resolution = _credit_or_impose_output_contract(
-            ctx,
-            output_contract_evaluation,
-            workflow_yaml=workflow_yaml,
-            raw_metadata=params.get("code_artifact_metadata"),
-        )
-        if output_contract_ceiling_resolution is None:
-            output_contract_ceiling_resolution = _guardrail_ceiling_actuation_resolution(
-                ctx,
-                workflow_yaml=workflow_yaml,
-                raw_metadata=params.get("code_artifact_metadata"),
-            )
-    if output_contract_ceiling_resolution is not None:
-        assert output_contract_evaluation is not None
-        workflow_yaml = output_contract_ceiling_resolution.workflow_yaml
-        params["workflow_yaml"] = workflow_yaml
-        params["code_artifact_metadata"] = output_contract_ceiling_resolution.code_artifact_metadata
-        params["raw_code_artifact_metadata"] = output_contract_ceiling_resolution.code_artifact_metadata
-        ctx.raw_code_artifact_metadata = output_contract_ceiling_resolution.code_artifact_metadata
-        # The pass path inherits the advisory lane's adjudication: the draft persists now, and a
-        # run that binds nothing reopens the ladder instead of shipping an unverified workflow.
-        _arm_pending_run_evidence(
-            ctx,
-            output_contract_evaluation.canonical_signature,
-            set(output_contract_evaluation.observation_paths),
-        )
-        if output_contract_ceiling_resolution.mode == "imposed":
-            _mark_output_contract_imposed(ctx, output_contract_evaluation.canonical_signature)
-            output_contract_imposed_signature = output_contract_evaluation.canonical_signature
-        output_contract_evaluation = output_contract_ceiling_resolution.evaluation
-    elif output_contract_deficient:
-        assert output_contract_evaluation is not None
-        if not output_contract_ablated:
-            payload = _record_output_contract_reject(
-                ctx,
-                output_contract_evaluation,
-                summary="Submitted workflow does not satisfy the requested output contract.",
-                authored_structural_fingerprint=authored_fingerprint,
-                workflow_yaml=workflow_yaml,
-                raw_metadata=params.get("code_artifact_metadata"),
-            )
-            if allow_static_output_uncertainty and _output_contract_advisory_granted(
-                ctx, output_contract_evaluation.canonical_signature
-            ):
-                _arm_pending_run_evidence(
-                    ctx,
-                    output_contract_evaluation.canonical_signature,
-                    set(output_contract_evaluation.observation_paths),
-                )
-            else:
-                reject_result = _output_contract_reject_result(
-                    output_contract_evaluation,
-                    payload=payload,
-                    tool_name="update_workflow",
-                )
-                _record_code_authoring_guardrail_reject(ctx)
-                return reject(
-                    error=str(reject_result["error"]),
-                    user_facing_summary=str(
-                        reject_result.get("user_facing_summary") or _compiled_authoring_user_summary()
-                    ),
-                    data=reject_result.get("data") if isinstance(reject_result.get("data"), dict) else None,
-                    repair_context=output_contract_evaluation.repair_context,
-                    record_repair_context_outcome=False,
-                )
-    typed_output_owner_contract_complete = (
-        formation_prepared
-        and output_contract_evaluation is not None
-        and not output_contract_evaluation.has_deficiencies
-    )
-    # update_and_run_blocks already resolved the exact output owner and validated its typed
-    # contract. Do not let the legacy output-intent scan reclassify a non-owner browser block
-    # as another output owner. Save-only update_workflow retains the conservative label gate.
-    missing_metadata_error = (
-        None
-        if typed_output_owner_contract_complete
-        else _missing_code_artifact_metadata_error(
-            workflow_yaml,
-            ctx,
-            params.get("code_artifact_metadata"),
-        )
-    )
-    missing_labels = (
-        []
-        if missing_metadata_error is None
-        else _missing_code_artifact_metadata_labels(workflow_yaml, ctx, params.get("code_artifact_metadata"))
-    )
-    metadata_reject_ablated = False
-    if missing_metadata_error is not None and _record_output_contract_actuation_ablation_event(
-        ctx,
-        workflow_yaml,
-        reason_code=_MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY,
-        signature=(output_contract_evaluation.canonical_signature if output_contract_evaluation is not None else ""),
-        block_labels=missing_labels,
-        required_paths=required_child_output_paths,
-    ):
-        missing_metadata_error = None
-        metadata_reject_ablated = True
-    if missing_metadata_error is not None:
-        missing_metadata_output_facts = _missing_requested_output_facts(
-            required_child_output_paths,
-            reason_code=output_path_coverage_reason_code,
-        )
-        if required_child_output_paths:
-            missing_metadata_error = (
-                f"{missing_metadata_error}\nRequired requested output paths: "
-                f"{', '.join(sorted(required_child_output_paths))}"
-            )
-        metadata_repair_context = _metadata_output_repair_context(
-            block_labels=missing_labels,
-            required_paths=required_child_output_paths,
-            coverage_reason_code=output_path_coverage_reason_code,
-            source=output_path_coverage_source,
-            summary=missing_metadata_error,
-        )
-        metadata_repair_contract = _metadata_repair_contract(
-            block_labels=missing_labels,
-            required_paths=required_child_output_paths,
-            source=output_path_coverage_source,
-            reason_code=output_path_coverage_reason_code,
-        )
-        metadata_reject_payload = _code_artifact_metadata_reject_payload(
-            workflow_yaml=workflow_yaml,
-            raw_metadata=params.get("code_artifact_metadata"),
-            offending_labels=[],
-            missing_labels=missing_labels,
-            violation_categories=["missing_code_artifact_metadata"],
-        )
-        candidate_outcome = _build_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary=missing_metadata_error,
-            structural_payload=metadata_reject_payload,
-            block_labels=missing_labels,
-            missing_requested_output_facts=missing_metadata_output_facts,
-        )
-        missing_fields_by_label = _metadata_missing_required_fields_by_label(
-            params.get("code_artifact_metadata"),
-            labels=missing_labels,
-            missing_labels=missing_labels,
-        )
-        if len(missing_labels) != 1:
-            _reset_metadata_reject_ladder_state(
-                ctx,
-                superseding_reject_family="multi_label_missing_code_artifact_metadata",
-            )
-        metadata_ladder_decision = (
-            None
-            if len(missing_labels) != 1
-            or copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID)
-            else _metadata_reject_ladder_decision(
-                ctx,
-                candidate_outcome=candidate_outcome,
-                reject_family="missing_code_artifact_metadata",
-                missing_fields_by_label=missing_fields_by_label,
-            )
-        )
-        if metadata_ladder_decision is not None and metadata_ladder_decision.action == "terminal":
-            assert ctx.blocker_signal is not None
-            return reject(
-                error=ctx.blocker_signal.user_facing_reason,
-                user_facing_summary=ctx.blocker_signal.user_facing_reason,
-                data=_metadata_reject_terminal_data(metadata_ladder_decision),
-                repair_context=metadata_repair_context,
-                record_repair_context_outcome=False,
-            )
-        missing_metadata_reject_count = _record_output_contract_family_reject(
-            ctx,
-            required_child_output_paths,
-            reject_family=_MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY,
-        )
-        record_build_test_outcome(ctx, candidate_outcome)
-        _capture_rejected_code_artifact_metadata(ctx)
-        credential_scout_errors = (
-            []
-            if _request_policy_allows_untested_code_block_draft(ctx)
-            else _credentialed_code_block_scout_gate_errors(
-                workflow_yaml,
-                ctx,
-                block_labels=params.get("block_labels"),
-            )
-        )
-        budget_terminal = _adjudicate_output_contract_budget(
-            ctx,
-            required_child_output_paths,
-            count=missing_metadata_reject_count,
-            block_label=missing_labels[0] if len(missing_labels) == 1 else "",
-        )
-        if credential_scout_errors:
-            _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
-        elif missing_metadata_reject_count < 1 and not budget_terminal:
-            _record_code_authoring_guardrail_reject(ctx)
-        metadata_signature = _output_contract_signature(ctx=ctx, required_paths=required_child_output_paths)
-        if metadata_ladder_decision is not None and metadata_ladder_decision.rung is not None:
-            _record_armed_directive_fingerprint(
-                ctx,
-                metadata_signature,
-                _metadata_reject_seam_fingerprint(
-                    workflow_yaml,
-                    metadata_signature,
-                    missing_fields_by_label,
-                ),
-            )
-        metadata_convergence_directive = (
-            _emit_metadata_convergence_directive(
-                signature=metadata_signature,
-                block_label=missing_labels[0],
-                missing_fields_by_label=missing_fields_by_label,
-                required_paths=required_child_output_paths,
-                escalate=metadata_ladder_decision.rung == 2,
-            )
-            if metadata_ladder_decision is not None
-            and metadata_ladder_decision.rung is not None
-            and len(missing_labels) == 1
-            else None
-        )
-        metadata_reject_data = _code_repair_progress_data(
-            metadata_repair_context,
-            missing_requested_output_facts=missing_metadata_output_facts,
-            metadata_repair_contract=metadata_repair_contract,
-        )
-        if metadata_convergence_directive is not None:
-            metadata_reject_data["metadata_convergence_directive"] = metadata_convergence_directive
-        return reject(
-            error=missing_metadata_error,
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=metadata_reject_data,
-            repair_context=metadata_repair_context,
-            record_repair_context_outcome=False,
-        )
-    scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    scout_trajectory = ctx.scout_trajectory
     normalization = _normalize_code_artifact_metadata_detailed(
         params.get("code_artifact_metadata"),
         workflow_yaml,
@@ -14117,73 +10280,14 @@ async def _update_workflow(
         verified_runtime_output_paths_by_label=_verified_runtime_output_contract_paths_by_label(ctx, workflow_yaml),
         advisory_declared_output_return_shape_labels=(
             {output_contract_evaluation.block_label}
-            if output_contract_evaluation is not None
-            and (output_contract_static_advisory_allowed or output_contract_ceiling_resolution is not None)
+            if output_contract_evaluation is not None and output_contract_static_advisory_allowed
             else None
         ),
     )
     code_artifact_metadata = normalization.normalized
-    code_artifact_metadata_error = normalization.error
-    # A schema incompatibility rejects below regardless, so suppressing here would emit an
-    # ablation event for a save that never lands and overstate what the flag let through.
-    if (
-        code_artifact_metadata_error is not None
-        and not normalization.schema_incompatibilities
-        and (
-            metadata_reject_ablated
-            or _record_output_contract_actuation_ablation_event(
-                ctx,
-                workflow_yaml,
-                reason_code=_METADATA_NORMALIZATION_REJECT_FAMILY,
-                signature=(
-                    output_contract_evaluation.canonical_signature if output_contract_evaluation is not None else ""
-                ),
-                block_labels=normalization.offending_labels,
-                required_paths=required_child_output_paths,
-            )
-        )
-    ):
-        code_artifact_metadata_error = None
-    if code_artifact_metadata_error is not None:
-        _reset_metadata_reject_ladder_state(
-            ctx,
-            superseding_reject_family=_METADATA_NORMALIZATION_REJECT_FAMILY,
-        )
-        record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
-        normalization_reject_count = _record_output_contract_family_reject(
-            ctx,
-            required_child_output_paths,
-            reject_family=_METADATA_NORMALIZATION_REJECT_FAMILY,
-        )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary=code_artifact_metadata_error,
-            structural_payload=_output_contract_author_time_structural_payload(
-                ctx,
-                required_child_output_paths,
-                block_label=normalization.offending_labels[0] if len(normalization.offending_labels) == 1 else "",
-            )
-            or _code_artifact_metadata_reject_payload(
-                workflow_yaml=workflow_yaml,
-                raw_metadata=params.get("code_artifact_metadata"),
-                offending_labels=normalization.offending_labels,
-                violation_categories=_metadata_violation_categories(normalization.violations),
-            ),
-            block_labels=normalization.offending_labels,
-        )
-        _capture_rejected_code_artifact_metadata(ctx)
-        _adjudicate_output_contract_budget(
-            ctx,
-            required_child_output_paths,
-            count=normalization_reject_count,
-            block_label=normalization.offending_labels[0] if len(normalization.offending_labels) == 1 else "",
-        )
-    if normalization.schema_incompatibilities:
-        incompatibility = merge_schema_incompatibilities(normalization.schema_incompatibilities)
-        if incompatibility is not None:
-            return _reject_schema_incompatibility(ctx, incompatibility, reject)
-    prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
+    schema_incompatibility_finding = merge_schema_incompatibilities(normalization.schema_incompatibilities)
+
+    prior_workflow_yaml = ctx.workflow_yaml
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
     code_authoring_repair_context = (
         _code_block_authoring_repair_context(workflow_yaml, prior_workflow_yaml)
@@ -14195,10 +10299,6 @@ async def _update_workflow(
         if _request_policy_allows_untested_code_block_draft(ctx)
         else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx, block_labels=params.get("block_labels"))
     )
-    unresolved_symbol_priority_reject = _is_unresolved_symbol_repair_context(code_authoring_repair_context)
-    credential_priority_reject = (
-        bool(credential_scout_errors) and code_artifact_metadata_error is None and not unresolved_symbol_priority_reject
-    )
     if code_safety_errors:
         _set_code_authoring_repair_context(ctx, code_authoring_repair_context)
         if code_authoring_repair_context is None:
@@ -14208,13 +10308,12 @@ async def _update_workflow(
                 summary="Code authoring guardrail rejected the submitted code block.",
                 structural_payload=_code_safety_reject_payload(code_safety_errors),
             )
-        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=credential_priority_reject)
     # Per-label salvage keeps conforming metadata across a rejection; a
     # rejected code block keeps nothing, since its yaml never becomes the
     # draft. Prior-draft labels survive every rejection gate below — the
     # accept path prunes to the submitted blocks once the draft switches.
     if code_artifact_metadata and not code_safety_errors:
-        existing_metadata = getattr(ctx, "code_artifact_metadata", None)
+        existing_metadata = ctx.code_artifact_metadata
         merged_metadata = {
             **(existing_metadata if isinstance(existing_metadata, dict) else {}),
             **code_artifact_metadata,
@@ -14229,53 +10328,50 @@ async def _update_workflow(
         params["code_artifact_metadata"] = merged_metadata
         workflow_yaml = _apply_metadata_contract_schema_to_workflow_yaml(ctx, workflow_yaml, merged_metadata)
         params["workflow_yaml"] = workflow_yaml
-    if (
-        credential_scout_errors
-        and code_safety_errors
-        and code_artifact_metadata_error is None
-        and unresolved_symbol_priority_reject
-    ):
-        return reject(
-            error="\n".join(str(error) for error in code_safety_errors if error),
-            user_facing_summary=_code_seam_rejection_user_summary(
-                metadata_rejected=False,
-                code_rejected=True,
-            ),
-            data=_code_repair_progress_data(code_authoring_repair_context),
-            repair_context=code_authoring_repair_context,
-        )
-    if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
-        arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
-        return reject(
-            error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
-            user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
-            data={
-                "failure_type": "missing_credential_or_init",
-                "diagnostic_code_safety_errors": code_safety_errors,
-                **(
-                    {"authoring_repair_context": code_authoring_repair_context.model_dump(mode="json")}
-                    if code_authoring_repair_context is not None
-                    else {}
+    if credential_scout_errors and code_safety_errors:
+        if _is_unresolved_symbol_repair_context(code_authoring_repair_context):
+            return _blocked(
+                AuthorTimeBlock(
+                    block_id=CODE_SAFETY_BLOCK_ID,
+                    error="\n".join(str(error) for error in code_safety_errors if error),
+                    user_facing_summary=_code_seam_rejection_user_summary(
+                        metadata_rejected=False,
+                        code_rejected=True,
+                    ),
+                    data=_code_repair_progress_data(code_authoring_repair_context),
                 ),
-            },
+                repair_context=code_authoring_repair_context,
+            )
+        arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
+        return _blocked(
+            AuthorTimeBlock(
+                block_id=CREDENTIAL_SCOUT_BLOCK_ID,
+                error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
+                user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
+                data={
+                    "failure_type": "missing_credential_or_init",
+                    "diagnostic_code_safety_errors": code_safety_errors,
+                    **(
+                        {"authoring_repair_context": code_authoring_repair_context.model_dump(mode="json")}
+                        if code_authoring_repair_context is not None
+                        else {}
+                    ),
+                },
+            ),
             repair_context=code_authoring_repair_context,
         )
-    seam_errors = [
-        error
-        for error in (
-            code_artifact_metadata_error,
-            *_human_facing_code_safety_errors(code_safety_errors),
-        )
-        if error
-    ]
-    if seam_errors:
-        return reject(
-            error="\n".join(seam_errors),
-            user_facing_summary=_code_seam_rejection_user_summary(
-                metadata_rejected=code_artifact_metadata_error is not None,
-                code_rejected=bool(code_safety_errors),
+    human_facing_code_safety_errors = _human_facing_code_safety_errors(code_safety_errors)
+    if human_facing_code_safety_errors:
+        return _blocked(
+            AuthorTimeBlock(
+                block_id=CODE_SAFETY_BLOCK_ID,
+                error="\n".join(human_facing_code_safety_errors),
+                user_facing_summary=_code_seam_rejection_user_summary(
+                    metadata_rejected=False,
+                    code_rejected=True,
+                ),
+                data=_code_repair_progress_data(code_authoring_repair_context),
             ),
-            data=_code_repair_progress_data(code_authoring_repair_context),
             repair_context=code_authoring_repair_context,
         )
     if credential_scout_errors:
@@ -14285,19 +10381,21 @@ async def _update_workflow(
             summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
             structural_payload=_credential_scout_reject_payload(workflow_yaml),
         )
-        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
         arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
-        return reject(
-            error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
-            user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
-            data={"failure_type": "missing_credential_or_init"},
+        return _blocked(
+            AuthorTimeBlock(
+                block_id=CREDENTIAL_SCOUT_BLOCK_ID,
+                error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
+                user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
+                data={"failure_type": "missing_credential_or_init"},
+            )
         )
     if allow_missing_credentials is None:
-        allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
+        allow_missing_credentials = ctx.allow_untested_workflow_draft is True
     if not allow_missing_credentials:
         credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
         if credential_error is not None:
-            return reject(error=credential_error)
+            return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=credential_error))
 
     misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
     if misbinding_findings:
@@ -14307,19 +10405,30 @@ async def _update_workflow(
             workflow_id=ctx.workflow_id,
             findings=misbinding_findings,
         )
-        return reject(error=_credential_id_misbinding_error_message(misbinding_findings))
+        return _blocked(
+            AuthorTimeBlock(
+                block_id=CREDENTIAL_SCOUT_BLOCK_ID,
+                error=_credential_id_misbinding_error_message(misbinding_findings),
+            )
+        )
 
     output_policy_verdict = evaluate_output_policy(
-        request_policy=getattr(ctx, "request_policy", None),
+        request_policy=ctx.request_policy,
         workflow_yaml=workflow_yaml,
         tool_arguments=params,
     )
+    output_policy_steered_reasons = demote_author_time_steer_reasons(output_policy_verdict)
     if not output_policy_verdict.allowed:
         output_policy_trace_data = output_policy_verdict_to_trace_data(
             output_policy_verdict,
             surface="tool_body",
             tool_name="update_workflow",
         )
+        if output_policy_steered_reasons:
+            output_policy_trace_data = {
+                **output_policy_trace_data,
+                "steered_reason_codes": [reason.value for reason in output_policy_steered_reasons],
+            }
         output_policy_error = format_output_policy_tool_error(output_policy_verdict)
         _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
@@ -14332,28 +10441,13 @@ async def _update_workflow(
             summary=output_policy_error,
             structural_payload=output_policy_trace_data,
         )
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=output_policy_error)
+        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=output_policy_error))
 
     # Prefer the most-recent in-turn emission so cross-path flows (inline
     # REPLACE_WORKFLOW followed by update_workflow) compare against what the
     # LLM actually saw, not the turn-start persisted state.
-    last_yaml = getattr(ctx, "last_workflow_yaml", None)
+    last_yaml = ctx.last_workflow_yaml
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
-    stale_metadata = _detect_stale_block_metadata(workflow_yaml, prior_yaml)
-    if stale_metadata:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=_stale_block_metadata_message(stale_metadata))
-
-    wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
-    if wait_block_error:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=wait_block_error)
-
-    challenge_http_error = _challenge_http_request_reject_message(ctx, workflow_yaml, ctx.workflow_yaml)
-    if challenge_http_error:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=challenge_http_error)
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -14366,260 +10460,21 @@ async def _update_workflow(
     )
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=_banned_block_reject_message(banned_items, ctx))
-
-    download_scout_error = _download_scout_required_error(ctx, workflow_yaml)
-    if download_scout_error:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=download_scout_error)
-
-    download_binding_error = _download_binding_required_error(ctx, workflow_yaml)
-    if download_binding_error:
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=download_binding_error)
-
-    composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
-    if composition_evidence_error:
-        LOG.info(
-            "copilot composition page evidence rejected workflow",
-            workflow_permanent_id=ctx.workflow_permanent_id,
-            target_url=workflow_target_url(workflow_yaml),
+        return _blocked(
+            AuthorTimeBlock(
+                block_id=BANNED_BLOCKS_BLOCK_ID,
+                error=_banned_block_reject_message(banned_items, ctx),
+            )
         )
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(error=composition_evidence_error)
 
     # New data-write blocks default to surfacing failures rather than swallowing them.
     workflow_yaml = default_data_write_continue_on_failure(workflow_yaml, ctx.workflow_yaml)
-
-    convergence_reject = _recorded_outcome_convergence_reject(
-        ctx,
-        workflow_yaml=workflow_yaml,
-        code_artifact_metadata=getattr(ctx, "code_artifact_metadata", None),
-    )
-    if convergence_reject is not None:
-        frontier_unchanged = convergence_reject.reason == "frontier_unchanged"
-        convergence_ceiling_resolution = _guardrail_ceiling_actuation_resolution(
-            ctx,
-            workflow_yaml=workflow_yaml,
-            raw_metadata=params.get("code_artifact_metadata"),
-            frontier_unchanged=frontier_unchanged,
-        )
-        if convergence_ceiling_resolution is not None:
-            imposed_code_artifact_metadata = convergence_ceiling_resolution.code_artifact_metadata
-            workflow_yaml = convergence_ceiling_resolution.workflow_yaml
-            params["workflow_yaml"] = workflow_yaml
-            params["code_artifact_metadata"] = imposed_code_artifact_metadata
-            params["raw_code_artifact_metadata"] = imposed_code_artifact_metadata
-            ctx.raw_code_artifact_metadata = imposed_code_artifact_metadata
-            if isinstance(imposed_code_artifact_metadata, dict):
-                ctx.code_artifact_metadata = imposed_code_artifact_metadata
-            output_contract_imposed_signature = (
-                _apply_output_contract_ceiling_bookkeeping(ctx, convergence_ceiling_resolution)
-                or output_contract_imposed_signature
-            )
-        else:
-            block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-            _record_author_time_reject_outcome(
-                ctx,
-                reason_code="unchanged_after_recorded_outcome",
-                summary="The authored code and output structure are unchanged after the last recorded test outcome.",
-                structural_payload={
-                    "reason_code": "unchanged_after_recorded_outcome",
-                    "authored_structure_signature": convergence_reject.authored_structure_signature,
-                    "block_labels": block_labels,
-                },
-                authored_structure_signature=convergence_reject.authored_structure_signature,
-                block_labels=block_labels,
-            )
-            _record_code_authoring_guardrail_reject(ctx, frontier_unchanged=frontier_unchanged)
-            LOG.info(
-                "copilot recorded outcome convergence behavior",
-                convergence_reason=convergence_reject.reason,
-                commit_early_terminal=convergence_reject.commit_early_terminal,
-                block_labels=block_labels,
-            )
-            if convergence_reject.commit_early_terminal:
-                _commit_recorded_outcome_early_terminal(ctx)
-            return reject(
-                error=(
-                    "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
-                    "Revise the code block or output metadata that owns that frontier before testing again."
-                ),
-                user_facing_summary=_compiled_authoring_user_summary(),
-                data=_code_repair_progress_data(),
-            )
-
-    recorded_output_paths_required = output_path_coverage_source == "recorded_outcome"
-    recorded_missing_output_paths = (
-        _recorded_outcome_missing_output_paths(ctx) if recorded_output_paths_required else set()
-    )
-    unresolved_recorded_output_paths = recorded_missing_output_paths
-
-    output_empty_labels = (
-        _output_empty_code_block_labels(workflow_yaml, getattr(ctx, "code_artifact_metadata", None))
-        if recorded_output_paths_required and (not recorded_missing_output_paths or unresolved_recorded_output_paths)
-        else []
-    )
-    if output_empty_labels:
-        authored_structure_signature = authored_structure_signature_from_workflow(
-            workflow_yaml,
-            getattr(ctx, "code_artifact_metadata", None),
-        )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary="Submitted workflow does not return any keyed output after the last recorded test outcome.",
-            structural_payload={
-                "reason_code": "recorded_outcome_requires_output_candidate",
-                "authored_structure_signature": authored_structure_signature,
-                "empty_output_block_labels": output_empty_labels,
-                "recorded_reason_code": "outcome_not_demonstrated",
-            },
-            authored_structure_signature=authored_structure_signature,
-            block_labels=output_empty_labels,
-        )
-        _record_code_authoring_guardrail_reject(ctx)
-        reject_data = _code_repair_progress_data()
-        metadata_convergence_directive = _synthesized_metadata_reject_directive(
-            ctx,
-            workflow_yaml=workflow_yaml,
-            raw_metadata=ctx.code_artifact_metadata,
-            label_candidates=output_empty_labels,
-            required_paths=unresolved_recorded_output_paths,
-        )
-        if (
-            metadata_convergence_directive is not None
-            and metadata_convergence_directive.get("reason_code") == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
-        ):
-            assert ctx.blocker_signal is not None
-            return reject(
-                error=ctx.blocker_signal.user_facing_reason,
-                user_facing_summary=ctx.blocker_signal.user_facing_reason,
-                data=metadata_convergence_directive,
-                record_repair_context_outcome=False,
-            )
-        if metadata_convergence_directive is not None:
-            reject_data["metadata_convergence_directive"] = metadata_convergence_directive
-        return reject(
-            error=(
-                "Submitted workflow does not return any keyed output after the last recorded test outcome. "
-                "Add structured output for the unsatisfied completion criteria before testing again."
-            ),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=reject_data,
-        )
-
-    missing_output_paths = (
-        _candidate_missing_required_output_paths(
-            workflow_yaml,
-            getattr(ctx, "code_artifact_metadata", None),
-            required_paths=unresolved_recorded_output_paths,
-        )
-        if recorded_output_paths_required
-        else []
-    )
-    if missing_output_paths:
-        authored_structure_signature = authored_structure_signature_from_workflow(
-            workflow_yaml,
-            getattr(ctx, "code_artifact_metadata", None),
-        )
-        block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
-        missing_output_roots = sorted(
-            {root for path in missing_output_paths if (root := _top_level_path_segment(path))}
-        )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="metadata_reject",
-            summary=(
-                "Submitted workflow does not cover the missing requested output paths "
-                "from the last recorded test outcome."
-            ),
-            structural_payload={
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "authored_structure_signature": authored_structure_signature,
-                "missing_output_paths": missing_output_paths,
-                "missing_output_roots": missing_output_roots,
-                "block_labels": block_labels,
-                "recorded_reason_code": "outcome_not_demonstrated",
-            },
-            authored_structure_signature=authored_structure_signature,
-            block_labels=block_labels,
-            missing_requested_output_facts=[
-                {
-                    "output_path": path,
-                    "output_root": _top_level_path_segment(path),
-                    "reason_code": "recorded_outcome_missing_output_coverage",
-                    "value_status": "no_typed_value",
-                }
-                for path in missing_output_paths
-            ],
-        )
-        _record_code_authoring_guardrail_reject(ctx)
-        missing_path_text = ", ".join(missing_output_paths[:8])
-        reject_data = _code_repair_progress_data()
-        metadata_convergence_directive = _synthesized_metadata_reject_directive(
-            ctx,
-            workflow_yaml=workflow_yaml,
-            raw_metadata=ctx.code_artifact_metadata,
-            label_candidates=block_labels,
-            required_paths=set(missing_output_paths),
-        )
-        if (
-            metadata_convergence_directive is not None
-            and metadata_convergence_directive.get("reason_code") == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
-        ):
-            assert ctx.blocker_signal is not None
-            return reject(
-                error=ctx.blocker_signal.user_facing_reason,
-                user_facing_summary=ctx.blocker_signal.user_facing_reason,
-                data=metadata_convergence_directive,
-                record_repair_context_outcome=False,
-            )
-        if metadata_convergence_directive is not None:
-            reject_data["metadata_convergence_directive"] = metadata_convergence_directive
-        return reject(
-            error=(
-                "Submitted workflow does not cover the missing requested output paths from the last recorded test "
-                f"outcome: {missing_path_text}. Declare those exact output_path values in goal_value_paths and "
-                "produce matching structured output before testing again; output_root is diagnostic only."
-            ),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=reject_data,
-        )
-
-    select_option_mismatch_context = _select_option_text_click_repair_context(workflow_yaml, ctx)
-    if select_option_mismatch_context is not None:
-        _set_code_authoring_repair_context(ctx, select_option_mismatch_context)
-        _record_code_authoring_guardrail_reject(ctx)
-        return {
-            "ok": False,
-            "error": (
-                "Submitted workflow replaces a captured select-option interaction with a text click. "
-                "Use the select element API for the captured selector before testing again."
-            ),
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": _code_repair_progress_data(select_option_mismatch_context),
-        }
-
-    pre_persist_spine = _pre_persist_scouted_spine_result(workflow_yaml, ctx)
-    if pre_persist_spine is not None:
-        _record_scouted_spine_omission_reject(ctx, pre_persist_spine.omission_digest)
-        _set_code_authoring_repair_context(ctx, pre_persist_spine.repair_context)
-        _record_code_authoring_guardrail_reject(ctx)
-        return reject(
-            error="\n".join(pre_persist_spine.violations),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(pre_persist_spine.repair_context),
-            repair_context=pre_persist_spine.repair_context,
-            record_repair_context_outcome=False,
-        )
 
     try:
         # A code block renders code-first (goal + plain step timeline) only when it
         # carries a `prompt`; the model authors the goal as artifact `declared_goal`
         # and code regeneration drops it, so carry the goal onto the block here.
-        artifact_metadata = getattr(ctx, "code_artifact_metadata", None)
+        artifact_metadata = ctx.code_artifact_metadata
         fallback_goals = {
             label: str(meta["declared_goal"]).strip()
             for label, meta in (artifact_metadata or {}).items()
@@ -14691,14 +10546,11 @@ async def _update_workflow(
         ctx.workflow_yaml = workflow_yaml
         ctx.persisted_draft_browser_calls = _workflow_yaml_browser_call_pairs(workflow_yaml)
         ctx.code_authoring_guardrail_reject_count = 0
-        ctx.scouted_spine_previous_omission_digest = None
-        ctx.scouted_spine_repeated_identical_missing_steps = False
         ctx.last_code_authoring_reject_was_credential_priority = False
         ctx.last_output_policy_reject_reason_codes = None
-        ctx.metadata_reject_ladder_state = None
         _clear_code_authoring_repair_context(ctx)
         _clear_held_churn_signals(ctx)
-        accepted_metadata = getattr(ctx, "code_artifact_metadata", None)
+        accepted_metadata = ctx.code_artifact_metadata
         if isinstance(accepted_metadata, dict) and accepted_metadata:
             accepted_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
             pruned_metadata = {block: row for block, row in accepted_metadata.items() if block in accepted_labels}
@@ -14723,96 +10575,27 @@ async def _update_workflow(
             data["imposed_substitutions"] = imposition.substitutions
         if stripped_sandbox_imports:
             data["stripped_redundant_imports"] = stripped_sandbox_imports
+        findings = _author_time_findings(
+            schema_incompatibility=schema_incompatibility_finding,
+            metadata_violations=normalization.violations,
+            imposition_violations=imposition.violations,
+        )
+        if findings:
+            data["findings"] = findings
         return {
             "ok": True,
             "data": data,
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
-        repair_data = None
-        user_facing_summary = None
-        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-            repair_data = _code_repair_progress_data()
-            user_facing_summary = _code_seam_rejection_user_summary(
-                metadata_rejected=False,
-                code_rejected=True,
-            )
-        return reject(
-            error=f"{INTERNAL_VALIDATION_FAILURE_PREFIX}{e}",
-            user_facing_summary=user_facing_summary,
-            data=repair_data,
+        return _tool_error(
+            f"{INTERNAL_VALIDATION_FAILURE_PREFIX}{e}",
+            user_facing_summary=(
+                _code_seam_rejection_user_summary(metadata_rejected=False, code_rejected=True)
+                if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+                else None
+            ),
         )
-
-
-async def _replay_captured_never_captured_obligation(ctx: AgentContext) -> dict[str, Any] | None:
-    """Retry the exact rejected authoring call after its canonical browser action is captured."""
-    obligation = getattr(ctx, "never_captured_obligation", None)
-    if (
-        obligation is None
-        or obligation.state != "captured"
-        or obligation.turn_id != str(getattr(ctx, "turn_id", ""))
-        or obligation.replay_payload is None
-    ):
-        return None
-    payload = obligation.replay_payload
-    workflow_yaml = payload.params.get("workflow_yaml")
-    if (
-        not isinstance(workflow_yaml, str)
-        or hashlib.sha256(workflow_yaml.encode()).hexdigest() != obligation.draft_fingerprint
-    ):
-        ctx.never_captured_obligation = replace(obligation, state="consumed")
-        ctx.synthesized_block_reopened_for_capture_obligation = False
-        LOG.warning(
-            "copilot_never_captured_obligation_replay_payload_invalid",
-            identity_digest=obligation.identity_digest,
-            turn_id=obligation.turn_id,
-            workflow_permanent_id=ctx.workflow_permanent_id,
-            draft_fingerprint=obligation.draft_fingerprint,
-            block_label=obligation.block_label,
-            site=obligation.site,
-        )
-        return None
-    prior_definition = getattr(getattr(ctx, "last_workflow", None), "workflow_definition", None)
-    try:
-        result = await _update_workflow(
-            copy.deepcopy(payload.params),
-            ctx,
-            allow_missing_credentials=payload.allow_missing_credentials,
-            allow_static_output_uncertainty=payload.allow_static_output_uncertainty,
-            formation_prepared=payload.formation_prepared,
-        )
-    except Exception:
-        current_obligation = getattr(ctx, "never_captured_obligation", None)
-        if current_obligation is not None and current_obligation.identity_digest == obligation.identity_digest:
-            ctx.never_captured_obligation = obligation
-            ctx.synthesized_block_reopened_for_capture_obligation = True
-        raise
-    current_obligation = ctx.never_captured_obligation
-    if current_obligation is not None and current_obligation.state == "captured":
-        ctx.never_captured_obligation = replace(current_obligation, state="consumed")
-        ctx.synthesized_block_reopened_for_capture_obligation = False
-    _record_workflow_update_result(ctx, result, prior_definition)
-    data = result.get("data")
-    post_replay_obligation = ctx.never_captured_obligation
-    obligation_state = (
-        post_replay_obligation.state
-        if post_replay_obligation is not None and post_replay_obligation.identity_digest == obligation.identity_digest
-        else "superseded"
-    )
-    LOG.info(
-        "copilot_never_captured_obligation_replayed",
-        identity_digest=obligation.identity_digest,
-        turn_id=obligation.turn_id,
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        draft_fingerprint=obligation.draft_fingerprint,
-        block_label=obligation.block_label,
-        site=obligation.site,
-        captured_trajectory_index=obligation.captured_trajectory_index,
-        obligation_state=obligation_state,
-        ok=result.get("ok") is True,
-        reason_code=data.get("reason_code") if isinstance(data, dict) else None,
-    )
-    return result
 
 
 def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:
@@ -14878,8 +10661,6 @@ def _record_workflow_update_result(
             copilot_ctx.synthesized_goal_complete_landed = True
         copilot_ctx.pending_goal_complete_landing = False
     copilot_ctx.synthesized_block_reopened_after_failed_run = False
-    copilot_ctx.synthesized_block_reopened_for_output_coverage = False
-    copilot_ctx.uncovered_output_rescout_steer_key = None
     copilot_ctx.test_after_update_done = False
     copilot_ctx.post_update_nudge_count = 0
     copilot_ctx.last_test_ok = None

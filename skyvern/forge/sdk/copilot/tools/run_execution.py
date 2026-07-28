@@ -76,7 +76,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    consume_uncovered_output_reopen_event,
     repair_ceiling_stop_signal,
     reset_no_progress_interaction_count,
 )
@@ -207,7 +206,7 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_page_inspected, _mark_post_run_page_observed
-from .workflow_update import output_contract_value_bearing_run_reject, record_output_contract_run_output_evidence
+from .workflow_update import record_output_contract_run_output_evidence
 
 LOG = structlog.get_logger()
 
@@ -1547,23 +1546,6 @@ async def _run_blocks_and_collect_debug(
     if runtime_security_failure is not None:
         ctx.last_executed_block_labels = []
         return runtime_security_failure
-
-    # The lane asserts a saved-workflow property, so its evidence set is every saved code
-    # block, never just the selected subset (security lanes above stay selection-scoped).
-    value_bearing_reject = output_contract_value_bearing_run_reject(
-        ctx,
-        {
-            code_input.label: code_input.code
-            for code_input in _selected_code_security_inputs(
-                _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
-                selected_labels=set(),
-                include_descendants=True,
-            )
-        },
-    )
-    if value_bearing_reject is not None:
-        ctx.last_executed_block_labels = []
-        return value_bearing_reject
 
     credential_ids = list(
         dict.fromkeys(
@@ -3504,14 +3486,6 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
     copilot_ctx.verified_full_pass_consumed = full_pass
     if progressed:
         reset_no_progress_interaction_count(copilot_ctx)
-
-    if not progressed and consume_uncovered_output_reopen_event(copilot_ctx):
-        contract.repair_loop_state = RepairLoopState(
-            streak_token=copilot_ctx.last_repair_non_convergence_signature,
-            consecutive_identical_repair_count=copilot_ctx.consecutive_non_converging_repair_count,
-            ceiling_reached=False,
-        )
-        return
 
     signature = _repair_non_convergence_signature(copilot_ctx, contract)
     if signature is None or progressed:
