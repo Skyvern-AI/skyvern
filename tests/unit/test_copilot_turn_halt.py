@@ -28,7 +28,6 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     TurnHaltKind,
     expire_output_contract_ladder_at_turn_end,
     raise_if_turn_halt,
-    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
     turn_halt_from_blocker_signal,
 )
@@ -339,16 +338,16 @@ def test_current_page_challenge_signal_from_current_page_evidence(
         assert signal is None
 
 
-def _involuntary_repair_ceiling_signal() -> CopilotToolBlockerSignal:
+def _involuntary_loop_signal() -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="repair ceiling",
-        user_facing_reason="I could not get the run to pass after several repair attempts.",
+        blocker_kind="loop_detected",
+        agent_steering_text="loop detected",
+        user_facing_reason="I couldn't keep going on this turn.",
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=True,
         renders_final_reply=True,
-        internal_reason_code="repair_ceiling_reached",
+        internal_reason_code="loop_detected_generic",
         blocked_tool="update_and_run_blocks",
         extra={},
     )
@@ -370,8 +369,8 @@ def _consume_ctx(
 
 
 def test_verified_outcome_suppresses_and_consumes_involuntary_halt() -> None:
-    signal = _involuntary_repair_ceiling_signal()
-    halt = stash_repair_ceiling_turn_halt(_halt_ctx(), signal, consecutive_identical_repair_count=3)
+    signal = _involuntary_loop_signal()
+    halt = stash_turn_halt_from_blocker_signal(_halt_ctx(), signal, source="enforcement")
     ctx = _consume_ctx(
         turn_halt=halt,
         blocker_signal=signal,
@@ -447,9 +446,9 @@ def test_verified_outcome_consumes_involuntary_tool_blocker_history() -> None:
 
 
 def test_involuntary_suppression_lets_later_voluntary_challenge_raise() -> None:
-    signal = _involuntary_repair_ceiling_signal()
+    signal = _involuntary_loop_signal()
     ctx = _consume_ctx(blocker_signal=signal)
-    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
     raise_if_turn_halt(ctx, verified=True)
     assert ctx.turn_halt is None
@@ -465,9 +464,9 @@ def test_involuntary_suppression_lets_later_voluntary_challenge_raise() -> None:
 
 
 def test_unverified_involuntary_halt_still_raises() -> None:
-    signal = _involuntary_repair_ceiling_signal()
+    signal = _involuntary_loop_signal()
     ctx = _consume_ctx(blocker_signal=signal)
-    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
     with pytest.raises(CopilotTurnHalt):
         raise_if_turn_halt(ctx, verified=False)
@@ -477,9 +476,9 @@ def test_unverified_involuntary_halt_still_raises() -> None:
 
 
 def test_default_verified_argument_is_fail_safe_and_raises() -> None:
-    signal = _involuntary_repair_ceiling_signal()
+    signal = _involuntary_loop_signal()
     ctx = _consume_ctx(blocker_signal=signal)
-    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
     with pytest.raises(CopilotTurnHalt):
         raise_if_turn_halt(ctx)
@@ -647,16 +646,6 @@ def test_terminal_stash_choke_point_claims_genuinely_terminal() -> None:
     signal = _signal(internal_reason_code="probable_site_block_stop")
 
     stash_turn_halt_from_blocker_signal(ctx, signal, source="test")
-
-    assert ctx.turn_ownership is not None
-    assert TurnClaimant.GENUINELY_TERMINAL in ctx.turn_ownership.claims
-
-
-def test_repair_ceiling_stash_choke_point_claims_genuinely_terminal() -> None:
-    ctx = make_copilot_context()
-    signal = _involuntary_repair_ceiling_signal()
-
-    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
 
     assert ctx.turn_ownership is not None
     assert TurnClaimant.GENUINELY_TERMINAL in ctx.turn_ownership.claims
