@@ -257,19 +257,32 @@ def test_with_copilot_code_mode_metadata_preserves_turn_outcome_fields() -> None
 
 
 def test_derive_copilot_code_mode_diagnostics_uses_context_state() -> None:
-    ctx = type("Ctx", (), {})()
-    ctx.last_test_ok = False
-    ctx.last_failed_workflow_yaml = None
-    ctx.code_native_pending_capability = "credential-typed code synthesis"
-    ctx.turn_halt = type("Halt", (), {"kind": type("Kind", (), {"value": "repair_ceiling_reached"})()})()
+    ctx = SimpleNamespace(
+        last_test_ok=False,
+        last_failed_workflow_yaml=None,
+        code_native_pending_capability="credential-typed code synthesis",
+        turn_halt=SimpleNamespace(kind=SimpleNamespace(value="repair_ceiling_reached")),
+    )
 
-    diagnostics = derive_copilot_code_mode_diagnostics(ctx)
-
-    assert diagnostics == {
+    assert derive_copilot_code_mode_diagnostics(ctx) == {
         "copilot_last_code_build_failed": True,
         "copilot_repair_ceiling_hit": True,
         "copilot_pending_capability": "credential-typed code synthesis",
-        "copilot_schema_incompatibility": None,
+    }
+
+
+def test_derive_copilot_code_mode_diagnostics_on_a_clean_turn() -> None:
+    ctx = SimpleNamespace(
+        last_test_ok=True,
+        last_failed_workflow_yaml=None,
+        code_native_pending_capability=None,
+        turn_halt=None,
+    )
+
+    assert derive_copilot_code_mode_diagnostics(ctx) == {
+        "copilot_last_code_build_failed": False,
+        "copilot_repair_ceiling_hit": False,
+        "copilot_pending_capability": None,
     }
 
 
