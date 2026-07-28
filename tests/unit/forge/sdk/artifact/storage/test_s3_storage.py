@@ -19,6 +19,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
@@ -1262,3 +1263,60 @@ async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
     storage.async_client.delete_file = AsyncMock()
     await storage.delete_browser_profile("o", "bp", hard_delete=False)
     assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is False
+
+
+def _share_artifact(artifact_type: ArtifactType, uri: str) -> Artifact:
+    return Artifact(
+        artifact_id=generate_artifact_id(),
+        artifact_type=artifact_type,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        created_at=datetime.utcnow(),
+        modified_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+class TestS3ShareLinkSensitiveCap:
+    """Sensitive artifact types get capped presigned-URL TTLs (SKY-12527)."""
+
+    async def test_screenshot_share_link_uses_capped_expiry(self, s3_storage: S3Storage) -> None:
+        s3_storage.async_client.create_presigned_urls = AsyncMock(return_value=["https://s3/shot"])
+        artifact = _share_artifact(ArtifactType.SCREENSHOT_ACTION, f"s3://{TEST_BUCKET}/shot.png")
+        assert await s3_storage.get_share_link(artifact) == "https://s3/shot"
+        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with(
+            [artifact.uri], expires_in=SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+        )
+
+    async def test_download_share_link_keeps_default_expiry(self, s3_storage: S3Storage) -> None:
+        s3_storage.async_client.create_presigned_urls = AsyncMock(return_value=["https://s3/file"])
+        artifact = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
+        assert await s3_storage.get_share_link(artifact) == "https://s3/file"
+        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with([artifact.uri])
+
+    async def test_mixed_batch_preserves_order_and_routes_by_type(self, s3_storage: S3Storage) -> None:
+        download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
+        screenshot = _share_artifact(ArtifactType.SCREENSHOT_FINAL, f"s3://{TEST_BUCKET}/shot.png")
+        recording = _share_artifact(ArtifactType.RECORDING, f"s3://{TEST_BUCKET}/rec.webm")
+
+        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str]:
+            suffix = "capped" if expires_in is not None else "default"
+            return [f"{uri}?{suffix}" for uri in uris]
+
+        s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)
+        urls = await s3_storage.get_share_links([download, screenshot, recording])
+        assert urls == [
+            f"{download.uri}?default",
+            f"{screenshot.uri}?capped",
+            f"{recording.uri}?capped",
+        ]
+
+    async def test_failed_sensitive_presign_fails_the_batch(self, s3_storage: S3Storage) -> None:
+        screenshot = _share_artifact(ArtifactType.SCREENSHOT_LLM, f"s3://{TEST_BUCKET}/shot.png")
+        download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
+
+        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str] | None:
+            return None if expires_in is not None else [f"{uri}?ok" for uri in uris]
+
+        s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)
+        assert await s3_storage.get_share_links([screenshot, download]) is None

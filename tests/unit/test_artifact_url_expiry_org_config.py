@@ -18,6 +18,7 @@ from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS,
 )
 from skyvern.forge.sdk.routes.agent_protocol import _artifact_content_response_headers
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -391,9 +392,23 @@ class TestGetShareLinksWithBundleSupportAlwaysUsesSignedContentUrl:
     async def test_per_org_expiry_propagates_to_non_bundled(self) -> None:
         """The per-org TTL override must reach non-bundled artifacts too — they
         used to bypass the resolver entirely on the presigned-URL path."""
-        manager = ArtifactManager()
-        artifacts = [_make_artifact("a_1")]
+        from skyvern.forge.sdk.artifact.models import ArtifactType
 
+        assert await self._minted_expiry(_make_artifact("a_1", artifact_type=ArtifactType.DOWNLOAD)) == 3 * 3600
+
+    @pytest.mark.asyncio
+    async def test_sensitive_artifacts_are_capped_below_the_per_org_expiry(self) -> None:
+        """Screenshots and recordings ignore a longer org TTL (SKY-12527)."""
+        from skyvern.forge.sdk.artifact.models import ArtifactType
+
+        for artifact_type in (ArtifactType.SCREENSHOT_FINAL, ArtifactType.RECORDING):
+            minted = await self._minted_expiry(_make_artifact("a_1", artifact_type=artifact_type))
+            assert minted == SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS, artifact_type
+
+    @staticmethod
+    async def _minted_expiry(artifact: "Artifact") -> int | None:  # type: ignore[name-defined]  # noqa: F821
+        """TTL handed to the URL signer for ``artifact``, with a 3-hour org override."""
+        manager = ArtifactManager()
         resolve = AsyncMock(return_value=3 * 3600)
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON),
@@ -402,9 +417,9 @@ class TestGetShareLinksWithBundleSupportAlwaysUsesSignedContentUrl:
             patch("skyvern.forge.sdk.artifact.manager.app") as app,
         ):
             app.STORAGE.get_share_links = AsyncMock()
-            await manager.get_share_links_with_bundle_support(artifacts)
+            await manager.get_share_links_with_bundle_support([artifact])
 
-        assert bundle.call_args.kwargs["expiry_seconds"] == 3 * 3600
+        return bundle.call_args.kwargs["expiry_seconds"]
 
 
 __all__ = [
