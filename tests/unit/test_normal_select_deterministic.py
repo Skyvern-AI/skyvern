@@ -99,6 +99,8 @@ async def _run_normal_select(
     selected_index: int | None = None,
     llm_response: dict | None = None,
     evaluate_side_effect: BaseException | None = None,
+    collapse_gate: AsyncMock | None = None,
+    agent_function: object | None = None,
 ) -> tuple[list, MagicMock, AsyncMock]:
     provider = SimpleNamespace(
         is_feature_enabled_cached=AsyncMock(return_value=feature_enabled),
@@ -106,8 +108,11 @@ async def _run_normal_select(
     )
     normal_select_llm = AsyncMock(return_value=llm_response or {"value": "fallback", "index": None})
 
-    monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
-    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+    if collapse_gate is None:
+        monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
+    else:
+        monkeypatch.setattr(handler, "_is_collapse_select_fanout_enabled", collapse_gate)
+    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", agent_function or AgentFunction())
     monkeypatch.setattr(handler.app, "NORMAL_SELECT_AGENT_LLM_API_HANDLER", normal_select_llm)
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", MagicMock(return_value="prompt"))
     monkeypatch.setattr(handler.skyvern_context, "ensure_context", MagicMock(return_value=SimpleNamespace(tz_info=UTC)))
@@ -157,15 +162,20 @@ async def test_normal_select_exact_or_stem_match_skips_llm(
     options: list[dict],
     selected_value: str,
 ) -> None:
+    gate = AsyncMock(return_value=True)
+    action = _select_action(target)
     result, locator, normal_select_llm = await _run_normal_select(
         monkeypatch,
         feature_enabled=True,
-        action=_select_action(target),
+        action=action,
         options=options,
         selected_value=selected_value,
+        collapse_gate=gate,
     )
 
     assert handler._normal_select_successful(result)
+    assert not action.has_mini_agent
+    gate.assert_awaited_once()
     locator.select_option.assert_awaited_once_with(
         value=selected_value,
         timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -255,6 +265,7 @@ async def test_normal_select_unsafe_match_falls_back_to_llm(
     options: list[dict],
     llm_value: str,
 ) -> None:
+    gate = AsyncMock(return_value=True)
     action = _select_action(target)
     result, locator, normal_select_llm = await _run_normal_select(
         monkeypatch,
@@ -263,10 +274,12 @@ async def test_normal_select_unsafe_match_falls_back_to_llm(
         options=options,
         selected_value=llm_value,
         llm_response={"value": llm_value, "index": None},
+        collapse_gate=gate,
     )
 
     assert handler._normal_select_successful(result)
     assert action.has_mini_agent is True
+    gate.assert_awaited_once()
     locator.select_option.assert_awaited_once_with(value=llm_value, timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS)
     normal_select_llm.assert_awaited_once()
 
@@ -409,6 +422,8 @@ async def test_normal_select_readback_index_mismatch_falls_back_to_llm(monkeypat
 
 @pytest.mark.asyncio
 async def test_normal_select_flag_off_uses_llm_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = AsyncMock(return_value=False)
+    resolver = AsyncMock()
     action = _select_action("United States")
     result, locator, normal_select_llm = await _run_normal_select(
         monkeypatch,
@@ -417,10 +432,14 @@ async def test_normal_select_flag_off_uses_llm_path(monkeypatch: pytest.MonkeyPa
         options=[{"optionIndex": 0, "text": "United States", "value": "US"}],
         selected_value="US",
         llm_response={"value": "US", "index": None},
+        collapse_gate=gate,
+        agent_function=SimpleNamespace(resolve_field_option=resolver),
     )
 
     assert handler._normal_select_successful(result)
     assert action.has_mini_agent is True
+    gate.assert_awaited_once()
+    resolver.assert_not_awaited()
     locator.select_option.assert_awaited_once_with(value="US", timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS)
     normal_select_llm.assert_awaited_once()
 

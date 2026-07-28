@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
@@ -113,6 +117,44 @@ class FakePage:
 
     async def scroll(self, **kwargs):  # noqa: ANN003, ANN201
         return None
+
+
+@asynccontextmanager
+async def _recorded_action_db() -> AsyncIterator[AgentDB]:
+    db = AgentDB("sqlite+aiosqlite:///:memory:")
+    async with db.engine.begin() as connection:
+        await connection.run_sync(ActionModel.__table__.create)
+    try:
+        yield db
+    finally:
+        await db.engine.dispose()
+
+
+async def _record_timed_action() -> Action:
+    recorder = _Recorder()
+
+    async def delayed_call() -> None:
+        await asyncio.sleep(0.01)
+
+    await recorder.record(ActionType.CLICK, "locator.click", "#go", delayed_call, (), {})
+    action = recorder.actions[0]
+    action.task_id = "tsk_timing"
+    action.step_id = "stp_timing"
+    action.step_order = 0
+    return action
+
+
+@pytest.mark.asyncio
+async def test_recorded_action_has_wall_clock_timestamps_and_duration() -> None:
+    action = await _record_timed_action()
+
+    assert action.created_at is not None
+    assert action.modified_at is not None
+    assert action.created_at < action.modified_at
+    assert action.created_at.tzinfo is None
+    assert action.modified_at.tzinfo is None
+    assert isinstance(action.output, dict)
+    assert "duration_ms" in action.output
 
 
 @pytest.mark.asyncio
@@ -892,6 +934,72 @@ async def test_streamed_write_precedes_screenshot_backfilled_by_batch(monkeypatc
     assert writes[0].screenshot_artifact_id is None  # streamed: upload still deferred
     assert writes[-1].screenshot_artifact_id == "artifact_1"  # batch: screenshot backfilled
     assert writes[0].action_id == writes[-1].action_id
+
+
+@pytest.mark.asyncio
+async def test_reupsert_preserves_action_end_timestamp_and_backfills_screenshot() -> None:
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        stamped_end = action.modified_at
+        await db.workflow_params.upsert_recorded_action(action)
+
+        await asyncio.sleep(0.01)
+        action.screenshot_artifact_id = "artifact_timing"
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.modified_at == stamped_end
+    assert row.screenshot_artifact_id == "artifact_timing"
+
+
+@pytest.mark.asyncio
+async def test_recorded_action_timestamps_round_trip_through_hydration() -> None:
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+            hydrated = hydrate_action(row)
+
+    assert row.created_at == action.created_at
+    assert row.modified_at == action.modified_at
+    assert hydrated.created_at == action.created_at
+    assert hydrated.modified_at == action.modified_at
+
+
+@pytest.mark.asyncio
+async def test_unstamped_action_reupsert_keeps_bump_behavior() -> None:
+    async with _recorded_action_db() as db:
+        action = Action(
+            action_id="act_unstamped",
+            action_type=ActionType.CLICK,
+            status=ActionStatus.completed,
+            task_id="tsk_unstamped",
+            step_id="stp_unstamped",
+            step_order=0,
+            action_order=0,
+        )
+        assert action.created_at is None
+        assert action.modified_at is None
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            first = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+            first_modified = first.modified_at
+
+        await asyncio.sleep(0.01)
+        action.screenshot_artifact_id = "artifact_unstamped"
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.screenshot_artifact_id == "artifact_unstamped"
+    assert row.modified_at > first_modified
+    assert row.modified_at.tzinfo is None
 
 
 @pytest.mark.asyncio
