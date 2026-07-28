@@ -1,7 +1,12 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
+import ast
 import asyncio
+import base64
+import contextlib
 import gc
+import inspect
+import textwrap
 import threading
 import weakref
 from pathlib import Path
@@ -937,6 +942,37 @@ class TestBlobDownloadCapture:
             await interceptor._handle_browser_download({"url": url, "suggestedFilename": "x.pdf"})
 
         read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_empty_blob_does_not_clobber_captured_artifact(self, tmp_path: Path) -> None:
+        # A large-response empty-body fulfill can make page JS re-emit a 0-byte blob with the same
+        # suggestedFilename as a just-captured real download. Since _resolve_save_path overwrites on
+        # collision, an empty blob must never be persisted — else it truncates the real artifact.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        real_bytes = b"%PDF-1.4 real captured document bytes"
+        (tmp_path / "report.pdf").write_bytes(real_bytes)
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=b"")):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/empty", "suggestedFilename": "report.pdf"}
+            )
+
+        assert (tmp_path / "report.pdf").read_bytes() == real_bytes
+        assert [p.name for p in tmp_path.iterdir()] == ["report.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_empty_blob_writes_no_artifact(self, tmp_path: Path) -> None:
+        # A genuinely empty blob is not a useful download and is skipped (no 0-byte file created).
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=b"")):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/empty2", "suggestedFilename": "x.pdf"}
+            )
+
         assert list(tmp_path.iterdir()) == []
 
 
@@ -2192,3 +2228,540 @@ class TestDownloadDirRebindDedup:
         await interceptor._handle_browser_download(event)
         assert (target / "note.txt").read_bytes() == b"hello"
         assert len(interceptor._downloaded_urls) == 1
+
+
+class _StreamCDP:
+    """Fake CDP session that dispatches Fetch/IO calls by method, for _handle_download streaming tests.
+
+    IO.read emits the configured `chunks` one per call (last one carries eof), so a chunk and eof can
+    arrive in the same message — mirroring real Chromium behavior.
+    """
+
+    def __init__(
+        self,
+        *,
+        chunks: list[bytes] | None = None,
+        take_error: BaseException | None = None,
+        stream_missing: bool = False,
+        read_error: BaseException | None = None,
+        read_error_after: int = 0,
+        getbody: bytes | None = None,
+        getbody_error: BaseException | None = None,
+        fulfill_error: BaseException | None = None,
+        read_hang: bool = False,
+        close_hang: bool = False,
+        take_hang: bool = False,
+        fulfill_hang: bool = False,
+    ) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._chunks = list(chunks or [])
+        self._take_error = take_error
+        self._stream_missing = stream_missing
+        self._read_error = read_error
+        self._read_error_after = read_error_after
+        self._getbody = getbody
+        self._getbody_error = getbody_error
+        self._fulfill_error = fulfill_error
+        self._read_hang = read_hang
+        self._close_hang = close_hang
+        self._take_hang = take_hang
+        self._fulfill_hang = fulfill_hang
+        self._read_idx = 0
+
+    async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        params = params or {}
+        self.calls.append((method, params))
+        if method == "Fetch.takeResponseBodyAsStream":
+            if self._take_hang:
+                await asyncio.Event().wait()  # never returns — simulates a stalled stream-start
+            if self._take_error is not None:
+                raise self._take_error
+            return {} if self._stream_missing else {"stream": "handle-1"}
+        if method == "IO.read":
+            if self._read_hang:
+                await asyncio.Event().wait()  # never returns — simulates a stalled CDP read
+            if self._read_error is not None and self._read_idx >= self._read_error_after:
+                raise self._read_error
+            if self._read_idx < len(self._chunks):
+                chunk = self._chunks[self._read_idx]
+                self._read_idx += 1
+                eof = self._read_idx >= len(self._chunks)
+                return {"data": base64.b64encode(chunk).decode(), "base64Encoded": True, "eof": eof}
+            return {"data": "", "base64Encoded": False, "eof": True}
+        if method == "IO.close":
+            if self._close_hang:
+                await asyncio.Event().wait()  # never returns — simulates a stalled close on a dead session
+            return {}
+        if method == "Fetch.getResponseBody":
+            if self._getbody_error is not None:
+                raise self._getbody_error
+            if self._getbody is None:
+                raise RuntimeError("getResponseBody not configured")
+            return {"body": base64.b64encode(self._getbody).decode(), "base64Encoded": True}
+        if method == "Fetch.fulfillRequest":
+            if self._fulfill_hang:
+                await asyncio.Event().wait()  # never returns — simulates a stalled fulfill on a dead session
+            if self._fulfill_error is not None:
+                raise self._fulfill_error
+            return {}
+        return {}
+
+    def count(self, method: str) -> int:
+        return sum(1 for m, _ in self.calls if m == method)
+
+    def last(self, method: str) -> dict[str, Any] | None:
+        for m, p in reversed(self.calls):
+            if m == method:
+                return p
+        return None
+
+
+def _raw_headers(
+    *,
+    content_length: int | None = None,
+    content_type: str = "application/pdf",
+    content_disposition: str | None = 'attachment; filename="doc.pdf"',
+    content_encoding: str | None = None,
+    transfer_encoding: str | None = None,
+    content_range: str | None = None,
+) -> list[dict[str, str]]:
+    raw: list[dict[str, str]] = []
+    if content_type:
+        raw.append({"name": "Content-Type", "value": content_type})
+    if content_disposition:
+        raw.append({"name": "Content-Disposition", "value": content_disposition})
+    if content_length is not None:
+        raw.append({"name": "Content-Length", "value": str(content_length)})
+    if content_encoding:
+        raw.append({"name": "Content-Encoding", "value": content_encoding})
+    if transfer_encoding:
+        raw.append({"name": "Transfer-Encoding", "value": transfer_encoding})
+    if content_range:
+        raw.append({"name": "Content-Range", "value": content_range})
+    return raw
+
+
+@contextlib.contextmanager
+def _stream_limits(threshold: int = 1024, cap: int = 4096) -> Any:
+    """Shrink the stream threshold/cap so state-machine transitions can be tested on tiny payloads."""
+    with (
+        patch.object(mod, "STREAM_TO_DISK_THRESHOLD_BYTES", threshold),
+        patch.object(mod, "MAX_STREAMED_FILE_SIZE_BYTES", cap),
+    ):
+        yield
+
+
+async def _drive_download(
+    interceptor: CDPDownloadInterceptor,
+    cdp: _StreamCDP,
+    raw: list[dict[str, str]],
+    *,
+    url: str = "https://example.com/doc.pdf",
+    status: int = 200,
+) -> None:
+    await interceptor._handle_download(cdp, "req-1", url, mod._parse_headers(raw), status, raw)  # type: ignore[arg-type]
+
+
+def _fulfill_body(cdp: _StreamCDP) -> str | None:
+    p = cdp.last("Fetch.fulfillRequest")
+    return None if p is None else p.get("body", "")
+
+
+def _fulfill_headers(cdp: _StreamCDP) -> dict[str, str]:
+    p = cdp.last("Fetch.fulfillRequest")
+    if p is None:
+        return {}
+    return {h["name"].lower(): h["value"] for h in p.get("responseHeaders", [])}
+
+
+def _only_file(tmp_path: Path) -> Path:
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1, f"expected exactly one file, found {[f.name for f in files]}"
+    return files[0]
+
+
+async def _settle(interceptor: CDPDownloadInterceptor) -> None:
+    async with interceptor.settle_browser_downloads():
+        pass
+
+
+def test_finalize_download_has_no_dead_buffered_threshold_or_fallback_branch() -> None:
+    """A buffered outcome reaching _finalize_download is always below STREAM_TO_DISK_THRESHOLD_BYTES: the
+    stream loop spills to disk (→ "streamed") the instant total bytes cross the threshold, so the buffered
+    branch can never carry a body at/over the threshold or the removed getResponseBody-fallback cap. Guard
+    against reintroducing a dead re-check of either size constant or a reference to the removed fallback."""
+    source = inspect.getsource(CDPDownloadInterceptor._finalize_download)
+    referenced_names = {node.id for node in ast.walk(ast.parse(textwrap.dedent(source))) if isinstance(node, ast.Name)}
+    assert "MAX_STREAMED_FILE_SIZE_BYTES" not in referenced_names
+    assert "STREAM_TO_DISK_THRESHOLD_BYTES" not in referenced_names
+    assert "getResponseBody" not in source
+
+
+class TestTwoPathDownloadStreaming:
+    """SKY-12642: large captured downloads stream to a temp file and fulfill the browser with an empty
+    body; small ones keep the legacy buffer + full replay. Threshold/cap patched tiny per test."""
+
+    @pytest.mark.asyncio
+    async def test_small_body_buffered_full_replay(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        payload = b"A" * 500
+        cdp = _StreamCDP(chunks=[payload])
+        with _stream_limits():
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=500))
+
+        assert _only_file(tmp_path).read_bytes() == payload
+        assert _fulfill_body(cdp) == base64.b64encode(payload).decode()  # full-body replay preserved
+        assert cdp.count("Fetch.getResponseBody") == 0
+        assert cdp.count("Fetch.failRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_streams_to_disk_empty_fulfill(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        payload = b"B" * 1024  # exactly the threshold → large path
+        cdp = _StreamCDP(chunks=[payload])
+        with _stream_limits(threshold=1024):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=1024))
+
+        assert _only_file(tmp_path).read_bytes() == payload
+        assert _fulfill_body(cdp) == ""  # empty body, no base64 replay
+        assert _fulfill_headers(cdp).get("content-length") == "0"
+        assert cdp.count("Fetch.failRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_above_threshold_known_large_streams(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        payload = b"C" * 2000
+        cdp = _StreamCDP(chunks=[b"C" * 800, b"C" * 800, b"C" * 400])
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=2000))
+
+        assert _only_file(tmp_path).read_bytes() == payload
+        assert _fulfill_body(cdp) == ""
+
+    @pytest.mark.asyncio
+    async def test_unknown_content_length_spills_to_disk(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        # No Content-Length: must not assume small. Buffers, then spills once bytes cross the threshold.
+        chunks = [b"D" * 400, b"D" * 400, b"D" * 400, b"D" * 400, b"D" * 400]  # 2000 total
+        cdp = _StreamCDP(chunks=list(chunks))
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=None))
+
+        assert _only_file(tmp_path).read_bytes() == b"D" * 2000  # early buffered bytes preserved on spill
+        assert _fulfill_body(cdp) == ""
+
+    @pytest.mark.asyncio
+    async def test_lying_small_content_length_spills(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        # Header claims 100 bytes but the body is 2000 → must spill to the large path, not trust the header.
+        cdp = _StreamCDP(chunks=[b"E" * 700, b"E" * 700, b"E" * 600])
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=100))
+
+        assert _only_file(tmp_path).read_bytes() == b"E" * 2000
+        assert _fulfill_body(cdp) == ""
+
+    @pytest.mark.asyncio
+    async def test_lying_large_content_length_tiny_body_finalizes(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        # Header claims large (>= threshold) → disk path from chunk 1, but the actual body is tiny.
+        cdp = _StreamCDP(chunks=[b"F" * 300])
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=2000))
+
+        assert _only_file(tmp_path).read_bytes() == b"F" * 300
+        assert _fulfill_body(cdp) == ""
+        assert cdp.count("Fetch.failRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_cap_breach_unknown_cl_aborts_no_artifact(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"G" * 1500, b"G" * 1500, b"G" * 1500, b"G" * 1500])  # 6000 > cap 4096
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=None))
+
+        assert list(tmp_path.iterdir()) == []  # no artifact, no leftover .crdownload temp
+        assert cdp.count("Fetch.failRequest") == 1
+        assert cdp.count("Fetch.fulfillRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_header_content_length_over_cap_fast_fails(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"H" * 10])
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=5000))  # > cap
+
+        assert list(tmp_path.iterdir()) == []
+        assert cdp.count("Fetch.takeResponseBodyAsStream") == 0  # fast-fail without streaming
+        assert cdp.count("Fetch.failRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_header_content_length_over_cap_marks_url_handled(self, tmp_path: Path) -> None:
+        # The oversized-by-header fast-fail must still mark the URL handled, or a queued
+        # Browser.downloadWillBegin lets _handle_browser_download re-fetch it via _download_url_directly
+        # (which reads the whole body before its 100 MiB check) and materializes the very payload the cap
+        # exists to block (SKY-12642).
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"H" * 10])
+        url = "https://example.com/huge.pdf"
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=5000), url=url)  # > cap
+
+        assert cdp.count("Fetch.failRequest") == 1
+        assert interceptor._downloaded_urls == {url}
+
+    @pytest.mark.asyncio
+    async def test_midstream_read_error_cleans_temp_and_fails(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        # Known-large → disk path; the second IO.read raises after one chunk is on disk.
+        cdp = _StreamCDP(
+            chunks=[b"I" * 800, b"I" * 800, b"I" * 800],
+            read_error=RuntimeError("CDP IO.read boom"),
+            read_error_after=1,
+        )
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=2400))
+
+        assert list(tmp_path.iterdir()) == []  # partial temp cleaned up
+        assert cdp.count("Fetch.fulfillRequest") == 0
+        assert cdp.count("Fetch.failRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_cleans_temp_and_propagates(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(
+            chunks=[b"J" * 800, b"J" * 800, b"J" * 800],
+            read_error=asyncio.CancelledError(),
+            read_error_after=1,
+        )
+        with _stream_limits(threshold=1024, cap=4096):
+            with pytest.raises(asyncio.CancelledError):
+                await _drive_download(interceptor, cdp, _raw_headers(content_length=2400))
+
+        assert list(tmp_path.iterdir()) == []  # no partial artifact
+        assert cdp.count("Fetch.failRequest") == 0  # never do I/O during cancellation
+
+    @pytest.mark.asyncio
+    async def test_streamed_empty_fulfill_normalizes_headers(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"K" * 2000])
+        raw = _raw_headers(
+            content_length=2000,
+            content_type="application/pdf",
+            content_disposition='attachment; filename="report.pdf"',
+            content_encoding="gzip",
+            transfer_encoding="chunked",
+            content_range="bytes 0-1999/2000",
+        )
+        with _stream_limits(threshold=1024, cap=8192):
+            await _drive_download(interceptor, cdp, raw)
+
+        h = _fulfill_headers(cdp)
+        assert h.get("content-length") == "0"
+        assert "content-encoding" not in h  # empty body must not be content-decoded
+        assert "transfer-encoding" not in h
+        assert "content-range" not in h
+        assert h.get("content-disposition") == 'attachment; filename="report.pdf"'  # MUST survive
+        assert h.get("content-type") == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_stream_start_fail_fails_request_never_falls_back_to_whole_body(self, tmp_path: Path) -> None:
+        # takeResponseBodyAsStream failing must fail the request — we never fall back to getResponseBody,
+        # whose whole-body materialization could OOM on a lying/understated Content-Length (SKY-12642).
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(take_error=RuntimeError("takeResponseBodyAsStream unavailable"), getbody=b"L" * 300)
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=300))
+
+        assert list(tmp_path.iterdir()) == []  # nothing materialized or persisted
+        assert cdp.count("Fetch.getResponseBody") == 0  # whole-body fallback removed
+        assert cdp.count("Fetch.failRequest") == 1
+        assert cdp.count("Fetch.fulfillRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_start_fail_with_content_encoding_no_direct_fallback(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        # Encoded small CL can decode to an unbounded body → getResponseBody would materialize it. Refuse.
+        cdp = _StreamCDP(take_error=RuntimeError("take failed"), getbody=b"L" * 300)
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=300, content_encoding="gzip"))
+
+        assert list(tmp_path.iterdir()) == []
+        assert cdp.count("Fetch.getResponseBody") == 0
+        assert cdp.count("Fetch.failRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_extraction_serialized_second_download_waits_for_lock(self, tmp_path: Path) -> None:
+        # Single-active guard: while one extraction holds the lock, a second _handle_download must block
+        # (not stream concurrently), so N parallel downloads cannot each write up to the cap to disk.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"A" * 200])
+        await interceptor._download_extraction_lock.acquire()
+        task = asyncio.create_task(_drive_download(interceptor, cdp, _raw_headers(content_length=200)))
+        await asyncio.sleep(0.05)
+        # Blocked on the lock: no extraction started, nothing written to disk.
+        assert not task.done()
+        assert cdp.count("Fetch.takeResponseBodyAsStream") == 0
+        assert list(tmp_path.iterdir()) == []
+        interceptor._download_extraction_lock.release()
+        await asyncio.wait_for(task, timeout=2)
+        assert _only_file(tmp_path).read_bytes() == b"A" * 200  # proceeds once serialized
+        assert not interceptor._download_extraction_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_extraction_lock_released_on_success_error_and_start_failure(self, tmp_path: Path) -> None:
+        # The single-active lock must be released on every exit path, or one failed download deadlocks all
+        # later downloads on this interceptor.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        await _drive_download(interceptor, _StreamCDP(chunks=[b"S" * 100]), _raw_headers(content_length=100))
+        assert not interceptor._download_extraction_lock.locked()  # success
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, _StreamCDP(chunks=[b"B" * 5000]), _raw_headers(content_length=None))
+        assert not interceptor._download_extraction_lock.locked()  # cap abort
+        await _drive_download(interceptor, _StreamCDP(stream_missing=True), _raw_headers(content_length=100))
+        assert not interceptor._download_extraction_lock.locked()  # stream-start failure
+
+    @pytest.mark.asyncio
+    async def test_settle_drains_scheduled_cdp_handler(self, tmp_path: Path) -> None:
+        # A capture runs inside a _cdp_handler_task (and a second Fetch.requestPaused may be scheduled but
+        # not yet classified as a download). settle drains those to quiescence, so a capture queued behind
+        # the lock — which owns no .crdownload yet — is still waited on before artifact collection instead
+        # of being silently omitted.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"Q" * 150])
+        await interceptor._download_extraction_lock.acquire()  # hold the lock so the capture queues
+        interceptor._schedule_cdp_handler(_drive_download(interceptor, cdp, _raw_headers(content_length=150)))
+        await asyncio.sleep(0.05)
+        assert len(interceptor._cdp_handler_tasks) == 1  # scheduled + queued on the lock, no .crdownload yet
+        settling = asyncio.create_task(_settle(interceptor))
+        await asyncio.sleep(0.05)
+        assert not settling.done()  # settle blocks while the scheduled handler is in flight
+        interceptor._download_extraction_lock.release()
+        await asyncio.wait_for(settling, timeout=2)  # unblocks once the handler finishes
+        assert _only_file(tmp_path).read_bytes() == b"Q" * 150
+        assert not interceptor._cdp_handler_tasks  # drained to quiescence
+
+    @pytest.mark.asyncio
+    async def test_stalled_close_times_out_and_releases_lock(self, tmp_path: Path) -> None:
+        # The IO.close cleanup is bounded too: a hung close on a dead session must not hold the extraction
+        # lock or hang teardown. The streamed file is already published, so the download still finalizes.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"C" * 2000], close_hang=True)  # IO.close never returns
+        with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
+            await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=2000)), timeout=5)
+        assert _only_file(tmp_path).read_bytes() == b"C" * 2000  # saved despite the hung close
+        assert not interceptor._download_extraction_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_settle_cancellation_does_not_cancel_capture(self, tmp_path: Path) -> None:
+        # A settle-timeout cancellation must NOT cancel the in-flight/queued capture handlers (gather would,
+        # destroying the temp mid-stream); the capture keeps running and its artifact still lands.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"K" * 150])
+        await interceptor._download_extraction_lock.acquire()  # hold the lock so the capture queues
+        interceptor._schedule_cdp_handler(_drive_download(interceptor, cdp, _raw_headers(content_length=150)))
+        await asyncio.sleep(0.05)
+        handler_task = next(iter(interceptor._cdp_handler_tasks))
+        settling = asyncio.create_task(_settle(interceptor))
+        await asyncio.sleep(0.05)
+        settling.cancel()  # the outer download-timeout cancels settle
+        with pytest.raises(asyncio.CancelledError):
+            await settling
+        assert not handler_task.cancelled()  # the capture survives the settle cancellation
+        interceptor._download_extraction_lock.release()
+        await asyncio.wait_for(handler_task, timeout=2)
+        assert _only_file(tmp_path).read_bytes() == b"K" * 150  # artifact lands, not destroyed
+
+    @pytest.mark.asyncio
+    async def test_stalled_take_stream_times_out_and_releases_lock(self, tmp_path: Path) -> None:
+        # takeResponseBodyAsStream on a dead session is bounded too: on timeout it becomes _StreamStartError
+        # → failRequest, so it can't hold the lock or hang settle's drain.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(take_hang=True)  # takeResponseBodyAsStream never returns
+        with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
+            await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=300)), timeout=5)
+        assert cdp.count("Fetch.failRequest") == 1
+        assert list(tmp_path.iterdir()) == []
+        assert not interceptor._download_extraction_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_stalled_fulfill_times_out_and_releases_lock(self, tmp_path: Path) -> None:
+        # A hung fulfillRequest (after the streamed file is already published) is bounded: the artifact is
+        # saved, the download still finalizes, and the lock is released.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"F" * 2000], fulfill_hang=True)  # fulfillRequest never returns
+        with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
+            await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=2000)), timeout=5)
+        assert _only_file(tmp_path).read_bytes() == b"F" * 2000  # streamed artifact saved despite hung fulfill
+        assert not interceptor._download_extraction_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_stalled_read_times_out_and_releases_lock(self, tmp_path: Path) -> None:
+        # A stalled IO.read must not hold the extraction lock forever (which would deadlock later captures
+        # and hang teardown's drain). The per-read timeout aborts it, cleans the temp, and releases the lock.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(read_hang=True)  # IO.read never returns
+        with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
+            # Outer bound so a regression (no per-read timeout) fails fast instead of hanging the suite.
+            await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=2000)), timeout=5)
+        assert cdp.count("Fetch.failRequest") == 1
+        assert list(tmp_path.iterdir()) == []  # temp cleaned up, no artifact
+        assert not interceptor._download_extraction_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_stream_start_fail_unknown_cl_no_direct_fallback(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(take_error=RuntimeError("take failed"), getbody=b"M" * 300)
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=None))
+
+        assert list(tmp_path.iterdir()) == []
+        assert cdp.count("Fetch.getResponseBody") == 0  # unbounded getResponseBody not safe on unknown size
+        assert cdp.count("Fetch.continueResponse") == 0  # never let the browser materialize a large body
+        assert cdp.count("Fetch.failRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_os_replace_failure_cleans_temp_and_fails(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[b"N" * 2000])
+        with _stream_limits(threshold=1024, cap=4096):
+            with patch.object(mod.os, "replace", side_effect=OSError("rename failed")):
+                await _drive_download(interceptor, cdp, _raw_headers(content_length=2000))
+
+        assert list(tmp_path.iterdir()) == []  # temp cleaned even when finalize fails
+        assert cdp.count("Fetch.fulfillRequest") == 0
+        assert cdp.count("Fetch.failRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_read_data_and_eof_in_same_message_not_dropped(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        # Single IO.read returns the whole body AND eof in one message; the last chunk must not be lost.
+        cdp = _StreamCDP(chunks=[b"O" * 900])
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=900))
+
+        assert _only_file(tmp_path).read_bytes() == b"O" * 900
+        assert cdp.count("IO.read") == 1
+
+    @pytest.mark.asyncio
+    async def test_zero_byte_download_saved_and_replayed(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(chunks=[])  # immediate eof, no data
+        with _stream_limits(threshold=1024, cap=4096):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=0))
+
+        assert _only_file(tmp_path).read_bytes() == b""
+        assert cdp.count("Fetch.fulfillRequest") == 1
+        assert cdp.count("Fetch.failRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_interception_on_fulfill_is_benign_after_save(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        stale = Exception("Protocol error (Fetch.fulfillRequest): Invalid InterceptionId")
+        cdp = _StreamCDP(chunks=[b"P" * 2000], fulfill_error=stale)
+        with _stream_limits(threshold=1024, cap=4096):
+            with capture_logs() as logs:
+                await _drive_download(interceptor, cdp, _raw_headers(content_length=2000))
+
+        assert _only_file(tmp_path).read_bytes() == b"P" * 2000  # file saved despite the benign fulfill race
+        assert not [log for log in logs if log.get("log_level") == "error"]

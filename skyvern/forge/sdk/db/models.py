@@ -1331,6 +1331,9 @@ class PersistentBrowserSessionModel(Base):
     compute_cost = Column(Numeric, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    # Last client CDP command seen by the proxy; drives activity-based lease renewal so an
+    # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT).
+    last_activity_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

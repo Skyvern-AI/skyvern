@@ -65,6 +65,22 @@ def is_element_detached_error(exc: BaseException) -> bool:
     return "not attached to the dom" in message or "frame was detached" in message
 
 
+def is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
+    """Whether ``exc`` is a driver-family error from THIS run's engine. Routes through the per-run
+    selection when one is pinned so a non-Playwright engine's natives are recognised; falls back to the
+    stock Playwright identity when no engine is pinned (callers built outside the per-run engine seam),
+    preserving exact stock behavior. A foreign engine's native error is rejected either way."""
+    return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
+
+
+def is_engine_timeout_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
+    """Whether ``exc`` is THIS run's engine timeout. Same selection-vs-stock routing as
+    ``is_engine_error``; the stock fallback keeps the historical ``TimeoutError`` identity."""
+    return (
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+    )
+
+
 def is_post_dispatch_click_timeout(
     exc: BaseException,
     engine_selection: BrowserEngineSelection | None = None,
@@ -76,15 +92,18 @@ def is_post_dispatch_click_timeout(
     trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
     chain would duplicate the already-applied side effect.
     """
-    is_timeout = (
-        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
-    )
-    if not is_timeout:
+    if not is_engine_timeout_error(exc, engine_selection):
         return False
     return "scheduled navigation" in str(exc).lower()
 
 
-async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> tuple[Locator, Page | Frame]:
+async def resolve_locator(
+    scrape_page: ScrapedPage,
+    page: Page,
+    frame: str,
+    css: str,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
     while frame != "main.frame":
@@ -112,8 +131,8 @@ async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css:
 
         try:
             content_frame = await frame_handler.content_frame()
-        except PlaywrightError as exc:
-            if not is_element_detached_error(exc):
+        except Exception as exc:
+            if not is_engine_error(exc, engine_selection) or not is_element_detached_error(exc):
                 raise
             # The iframe node detached between query_selector and content_frame (page
             # mutation). Re-query once for a fresh handle; if it is gone or detaches
@@ -123,8 +142,8 @@ async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css:
                 raise MissingElement(element_id=child_frame) from exc
             try:
                 content_frame = await frame_handler.content_frame()
-            except PlaywrightError as retry_exc:
-                if not is_element_detached_error(retry_exc):
+            except Exception as retry_exc:
+                if not is_engine_error(retry_exc, engine_selection) or not is_element_detached_error(retry_exc):
                     raise
                 raise MissingElement(element_id=child_frame) from retry_exc
         if content_frame is None:
@@ -188,13 +207,23 @@ class SkyvernElement:
             )
             raise MultipleElementsFound(num=num_elements, selector=css_selector, element_id=element_id)
 
-        return cls(locator, frame, element_dict)
+        return cls(locator, frame, element_dict, engine_selection=incre_page.engine_selection)
 
-    def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict, hash_value: str = "") -> None:
+    def __init__(
+        self,
+        locator: Locator,
+        frame: Page | Frame,
+        static_element: dict,
+        hash_value: str = "",
+        engine_selection: BrowserEngineSelection | None = None,
+    ) -> None:
         self.__static_element = static_element
         self.__frame = frame
         self.locator = locator
         self.hash_value = hash_value
+        # THIS run's pinned engine, so the element's error catches classify driver-native errors against
+        # the selected engine; None (default) preserves the stock Playwright identity.
+        self._engine_selection = engine_selection
         self._id_cache = static_element.get("id", "")
         self._tag_name = static_element.get("tagName", "")
         self._selectable = static_element.get("isSelectable", False)
@@ -1041,12 +1070,12 @@ class SkyvernElement:
         # here, not a new error to surface.
         try:
             return await locator.count()
-        except PlaywrightError as exc:
-            if is_element_detached_error(exc):
+        except Exception as exc:
+            if is_engine_error(exc, self._engine_selection) and is_element_detached_error(exc):
                 return 0
             raise
 
-    async def _classify_typing_timeout(self, exc: TimeoutError) -> None:
+    async def _classify_typing_timeout(self, exc: BaseException) -> None:
         """Raise MissingElement when the typing target vanished mid-action; otherwise
         return so the caller re-raises the original timeout (a readiness problem)."""
         if await self._safe_match_count(self.get_locator()) == 0:
@@ -1056,7 +1085,9 @@ class SkyvernElement:
         await self.refresh_locator_if_stale()
         try:
             await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
-        except TimeoutError as exc:
+        except Exception as exc:
+            if not is_engine_timeout_error(exc, self._engine_selection):
+                raise
             await self._classify_typing_timeout(exc)
             raise
 
@@ -1068,7 +1099,9 @@ class SkyvernElement:
         locator = self.get_locator()
         try:
             await EventStrategyFactory.type_text(locator.page, locator, text)
-        except TimeoutError as exc:
+        except Exception as exc:
+            if not is_engine_timeout_error(exc, self._engine_selection):
+                raise
             await self._classify_typing_timeout(exc)
             raise
 
@@ -1081,7 +1114,9 @@ class SkyvernElement:
     async def input_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         try:
             await self.get_locator().fill(text, timeout=timeout)
-        except PlaywrightError as exc:
+        except Exception as exc:
+            if not is_engine_error(exc, self._engine_selection):
+                raise
             if is_incompatible_text_input_error(exc):
                 raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
             raise
@@ -1090,7 +1125,9 @@ class SkyvernElement:
         locator = self.get_locator()
         try:
             await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
-        except PlaywrightError as exc:
+        except Exception as exc:
+            if not is_engine_error(exc, self._engine_selection):
+                raise
             if is_incompatible_text_input_error(exc):
                 raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
             raise
@@ -1332,7 +1369,9 @@ class SkyvernElement:
         try:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
-        except TimeoutError:
+        except Exception as exc:
+            if not is_engine_timeout_error(exc, self._engine_selection):
+                raise
             LOG.warning(
                 "Scroll into view timed out",
                 element_id=self.get_id(),
@@ -1452,9 +1491,20 @@ class DomUtil:
     Some functions like wait_for_xxx should be supposed to define here.
     """
 
-    def __init__(self, scraped_page: ScrapedPage, page: Page) -> None:
+    def __init__(
+        self,
+        scraped_page: ScrapedPage,
+        page: Page,
+        engine_selection: BrowserEngineSelection | None = None,
+    ) -> None:
         self.scraped_page = scraped_page
         self.page = page
+        # Inherit the run's pinned engine from the scraped page's browser state when a caller does not
+        # pass one explicitly, so element error catches classify against THIS run's engine without every
+        # construction site threading it. A non-ScrapedPage (e.g. a test double) leaves it None → stock.
+        if engine_selection is None and isinstance(scraped_page, ScrapedPage):
+            engine_selection = scraped_page._browser_state.engine_selection
+        self.engine_selection = engine_selection
 
     async def check_id_in_dom(self, element_id: str) -> bool:
         css_selector = self.scraped_page.id_to_css_dict.get(element_id, "")
@@ -1475,7 +1525,9 @@ class DomUtil:
         if not css:
             raise MissingElementInCSSMap(element_id)
 
-        locator, frame_content = await resolve_locator(self.scraped_page, self.page, frame, css)
+        locator, frame_content = await resolve_locator(
+            self.scraped_page, self.page, frame, css, engine_selection=self.engine_selection
+        )
 
         num_elements = await locator.count()
         if num_elements < 1:
@@ -1516,7 +1568,7 @@ class DomUtil:
 
         hash_value = self.scraped_page.id_to_element_hash.get(element_id, "")
 
-        return SkyvernElement(locator, frame_content, element, hash_value)
+        return SkyvernElement(locator, frame_content, element, hash_value, engine_selection=self.engine_selection)
 
     async def safe_get_skyvern_element_by_id(self, element_id: str) -> SkyvernElement | None:
         try:

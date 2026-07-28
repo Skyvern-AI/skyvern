@@ -901,7 +901,6 @@ class CopilotContext(AgentContext):
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
     repeated_failure_streak_count: int = 0
-    last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
     # Unlike the progress-gated repair ceiling, this climbs even when every
     # rejection is different; it resets only on an accepted persist.
