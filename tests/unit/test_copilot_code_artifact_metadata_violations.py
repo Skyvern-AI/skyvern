@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _code_block_returns_flat_string,
     _code_block_returns_uninvoked_structured_function,
+    _download_descriptor_leak_finding,
     _normalize_code_artifact_metadata_detailed,
 )
 
@@ -981,7 +982,27 @@ def _download_intent_metadata(label: str) -> dict:
     return metadata
 
 
-class TestDownloadReturnShape:
+class TestDownloadDescriptorLeak:
+    """A run cannot reveal this arm: the run succeeds and the path lands in workflow output.
+    The registration-detection arms were deleted precisely because a run does reveal those."""
+
+    def test_returned_path_or_url_is_flagged(self) -> None:
+        for code in (
+            'return {"downloaded_file_path": p}',
+            'return {"download_url": u}',
+            'out = {"download_url": u}\nreturn out',
+        ):
+            assert _download_descriptor_leak_finding("b", code) is not None
+
+    def test_clean_descriptor_and_registration_keys_are_not_flagged(self) -> None:
+        assert _download_descriptor_leak_finding("b", 'return {"saved_as": n}') is None
+        assert _download_descriptor_leak_finding("b", 'return {"downloaded_files": [f]}') is None
+
+
+class TestDownloadShapesThatMustNotBeFlagged:
+    """Negative space for the surviving descriptor-leak arm: a clean descriptor, an extraction
+    block, and a non-download block must all normalize without a violation."""
+
     def test_expect_download_idiom_with_descriptor_passes(self) -> None:
         code = """
         async with page.expect_download() as dl_info:
@@ -995,93 +1016,6 @@ class TestDownloadReturnShape:
         assert error is None
         assert list(normalized.keys()) == ["dl_block"]
 
-    def test_self_asserted_keys_without_idiom_is_rejected(self) -> None:
-        code = """
-        await page.click("a#statement-pdf")
-        return {"downloaded_files": ["/tmp/statement.pdf"]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
-    def test_plain_click_fabricated_dict_is_rejected(self) -> None:
-        code = """
-        await page.click("a#statement-pdf")
-        return {"downloaded_file_name": "statement.pdf", "evidence": "ok"}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
-    def test_static_fetch_body_is_rejected(self) -> None:
-        code = """
-        import requests
-        body = requests.get("https://example.com/statement.pdf").content
-        return {"downloaded_files": [body]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
-    def test_idiom_but_returns_registration_keys_is_rejected(self) -> None:
-        code = """
-        async with page.expect_download() as dl_info:
-            await page.click("a#statement-pdf")
-        return {"downloaded_files": [await dl_info.value.path()]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "downloaded_files" in error
-        assert "self-certifies" in error
-
-    def test_idiom_but_returns_raw_path_or_url_descriptor_keys_is_rejected(self) -> None:
-        code = """
-        async with page.expect_download() as dl_info:
-            await page.click("a#statement-pdf")
-        payload = dict(
-            download_url="https://example.com/statement.pdf",
-            downloaded_file_path=await dl_info.value.path(),
-            downloaded_file_name="statement.pdf",
-        )
-        return payload
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "raw download path/URL descriptor keys" in error
-
-    def test_self_asserted_keys_detected_without_goal_path_declaration(self) -> None:
-        code = """
-        await page.click("a#statement-pdf")
-        return {"downloaded_files": ["/tmp/statement.pdf"]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_non_extraction_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
     def test_extraction_block_is_not_treated_as_download_intent(self) -> None:
         code = """
         await page.goto("https://example.com/")
@@ -1093,20 +1027,6 @@ class TestDownloadReturnShape:
         )
         assert error is None
         assert list(normalized.keys()) == ["ex_block"]
-
-    def test_bare_expect_download_attribute_does_not_satisfy_the_idiom(self) -> None:
-        code = """
-        _ = page.expect_download
-        await page.click("a#statement-pdf")
-        return {"downloaded_files": ["/tmp/statement.pdf"]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
 
     def test_non_download_non_extraction_block_passes(self) -> None:
         code = """

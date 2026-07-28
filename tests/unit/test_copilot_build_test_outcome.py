@@ -8,9 +8,12 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedOutcomeBindingConstraint,
     _binding_frontier_facet,
     adjudicate_metadata_reject_ladder,
+    arm_recorded_outcome_grounding_requirement,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
+    clear_recorded_outcome_grounding_requirement,
     latest_recorded_build_test_outcome_repeated,
+    maybe_satisfy_recorded_outcome_grounding_requirement,
     observed_value_extraction_scaffold_lines,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
@@ -1399,3 +1402,113 @@ def test_persisted_run_prose_only_failure_is_not_authoritative() -> None:
     assert outcome is None or outcome.is_authoritative is False
     assert outcome is None or outcome.structural_key is None
     (adjudicate_metadata_reject_ladder,)
+
+
+def _grounding_outcome(*, workflow_run_id: str | None = "wr_grounded") -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+        workflow_run_id=workflow_run_id,
+        block_labels=["search_records"],
+        structural_failure_identity="runtime:timeout_waiting_for_selector:failed",
+        page_evidence_refs=["origin_present"],
+    )
+
+
+def _grounding_ctx(outcome: RecordedBuildTestOutcome | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_grounding_requirement=None,
+        recorded_outcome_binding_constraint=None,
+        composition_page_evidence=None,
+        scout_observation_contract=None,
+        last_run_blocks_workflow_run_id=None,
+        observed_browser_urls=[],
+    )
+
+
+def test_grounding_arms_on_an_authoritative_non_progress_outcome() -> None:
+    outcome = _grounding_outcome()
+    ctx = _grounding_ctx(outcome)
+
+    requirement = arm_recorded_outcome_grounding_requirement(ctx)
+
+    assert requirement is not None
+    assert requirement.structural_key == outcome.structural_key
+    assert requirement.workflow_run_id == "wr_grounded"
+    assert requirement.satisfied is False
+    assert ctx.recorded_outcome_grounding_requirement is requirement
+
+
+def test_grounding_does_not_arm_on_progress_or_without_an_authoritative_outcome() -> None:
+    progressed = _grounding_outcome().model_copy(update={"verdict": "progress_observed"})
+    assert arm_recorded_outcome_grounding_requirement(_grounding_ctx(progressed)) is None
+
+    assert arm_recorded_outcome_grounding_requirement(_grounding_ctx(None)) is None
+
+    unauthoritative = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+    )
+    assert unauthoritative.is_authoritative is False
+    assert arm_recorded_outcome_grounding_requirement(_grounding_ctx(unauthoritative)) is None
+
+
+def test_grounding_arm_is_idempotent_for_the_same_outcome_and_run() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+
+    first = arm_recorded_outcome_grounding_requirement(ctx)
+    second = arm_recorded_outcome_grounding_requirement(ctx)
+
+    assert first is not None
+    assert second is first
+
+
+def test_grounding_is_satisfied_only_by_inspected_evidence_from_the_same_run() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    ctx.composition_page_evidence = {
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.com/results",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_other",
+    }
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+    assert ctx.recorded_outcome_grounding_requirement.satisfied is False
+
+    ctx.composition_page_evidence = {**ctx.composition_page_evidence, "workflow_run_id": "wr_grounded"}
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+
+    satisfied = ctx.recorded_outcome_grounding_requirement
+    assert satisfied.satisfied is True
+    assert satisfied.payload is not None
+    assert satisfied.payload.source_url == "https://example.com/results"
+    assert satisfied.payload.repeated_structural_key == satisfied.structural_key
+
+
+def test_grounding_is_not_satisfied_by_evidence_from_another_tool() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = {
+        "source_tool": "evaluate",
+        "current_url": "https://example.com/results",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_grounded",
+    }
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+
+def test_clearing_the_grounding_requirement_also_drops_the_binding_constraint() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.recorded_outcome_binding_constraint = object()
+
+    clear_recorded_outcome_grounding_requirement(ctx)
+
+    assert ctx.recorded_outcome_grounding_requirement is None
+    assert ctx.recorded_outcome_binding_constraint is None
