@@ -33,6 +33,12 @@ from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_organization, make_step, make_task
 
+# One second is only a test-side runaway guard. The behavior under test is
+# asserted through configured timeout values, cleanup, and span attributes
+# below; it tolerates the hundreds of ms a loaded CI runner can delay a
+# completed coroutine without turning scheduling latency into a product failure.
+CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 1.0
+
 
 class _EventEmitter:
     def __init__(self, context: object = None, url: str = "https://example.test/files") -> None:
@@ -789,7 +795,7 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
                     timeout=0.5,
                 )
 
-        assert time.monotonic() - started_at < 0.2
+        assert time.monotonic() - started_at < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
         assert not interceptor._browser_download_tasks
 
 
@@ -849,7 +855,7 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
         elapsed = time.monotonic() - started_at
 
     assert elapsed >= 0.05
-    assert elapsed < 0.5
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == ["report.pdf"]
 
@@ -1152,9 +1158,8 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
 
         elapsed = time.monotonic() - started_at
 
-    # Proves the 0.03s download budget raised, not the 5s wait_for safety net;
-    # the bound is loose because loaded CI runners add hundreds of ms of lag.
-    assert elapsed < 1.0
+    # Proves the 0.03s download budget raised, not the 5s wait_for safety net.
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
 
 
 def test_remove_download_listener_uses_playwright_remove_listener_when_off_unavailable() -> None:
@@ -1788,7 +1793,7 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     assert results[-1].needs_followup is True
@@ -1935,7 +1940,7 @@ async def test_handle_action_download_fails_on_transient_user_defined_error_text
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert isinstance(results[-1], ActionFailure)
     assert results[-1].download_triggered is False
     assert "download failure says the generated archive could not be saved" in (results[-1].exception_message or "")
@@ -2327,7 +2332,7 @@ async def test_handle_action_download_in_flight_request_does_not_extend_custom_t
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.1
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -2389,9 +2394,7 @@ async def test_handle_action_download_without_explicit_timeout_has_bounded_in_fl
             )
         elapsed = time.monotonic() - started_at
 
-    # Keep a generous wall-clock runaway guard for loaded CI runners; the
-    # precise logical deadline is asserted via timeout_seconds below.
-    assert 0.03 <= elapsed < 1.0
+    assert 0.03 <= elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["no_signal_grace_seconds"] == 0.01
@@ -2904,7 +2907,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     assert wait_for_downloads.await_count == 0

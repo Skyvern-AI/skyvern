@@ -112,7 +112,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     TurnHaltKind,
     TurnHaltVerdict,
     _kind_for_blocker_signal,
-    stash_repair_ceiling_turn_halt,
+    stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
@@ -8155,13 +8155,6 @@ def _metadata_less_two_block_yaml() -> str:
     )
 
 
-class TestMetadataLessRejectArming:
-    def test_metadata_ladder_does_not_defer_ceiling_for_legacy_context(self) -> None:
-        legacy_ctx: Any = SimpleNamespace()
-
-        assert run_execution_module._metadata_reject_ladder_defers_repair_ceiling(legacy_ctx, count=8) is False
-
-
 class TestWholeTrajectoryImposition:
     def test_imposes_over_unscouted_browser_fill_in_selected_block(self) -> None:
         ctx = _quote_ctx()
@@ -10988,13 +10981,13 @@ def _full_coverage_calls() -> list[tuple[str, str]]:
 
 
 class TestScoutedSpineTurnHaltExit:
-    def test_repair_ceiling_halt_with_open_obligation_emits_unresolved_and_reframes_reply(self) -> None:
+    def test_terminal_halt_with_open_obligation_emits_unresolved_and_reframes_reply(self) -> None:
         ctx = _checkpoint_eligible_ctx()
         ctx.last_test_anti_bot = "challenge_detected"
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
         assert "verification challenge" in signal.user_facing_reason
         ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED, blocker_signal=signal)
+        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
 
         with capture_logs() as logs:
             result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
@@ -11036,9 +11029,9 @@ class TestScoutedSpineTurnHaltExit:
     def test_halt_without_open_obligation_emits_nothing_and_keeps_reply(self) -> None:
         ctx = _checkpoint_eligible_ctx()
         ctx.persisted_draft_browser_calls = _full_coverage_calls()
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
         ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED, blocker_signal=signal)
+        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
 
         with capture_logs() as logs:
             result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
@@ -11047,10 +11040,10 @@ class TestScoutedSpineTurnHaltExit:
         assert result.user_response == signal.user_facing_reason
 
     @pytest.mark.asyncio
-    async def test_wrapped_exception_exit_with_stashed_repair_ceiling_halt_emits_unresolved(self) -> None:
+    async def test_wrapped_exception_exit_with_stashed_terminal_halt_emits_unresolved(self) -> None:
         ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
         ctx.blocker_signal = signal
 
         with capture_logs() as logs:
@@ -11069,9 +11062,9 @@ class TestScoutedSpineTurnHaltExit:
 
     def test_obligation_check_failure_never_blocks_the_halt_reply(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
         ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED, blocker_signal=signal)
+        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
 
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("synthesis unavailable")
