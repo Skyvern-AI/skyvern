@@ -26,6 +26,7 @@ Those three are where the SKY-9163 correctness properties live:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -272,6 +273,36 @@ async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reco
         session_id="pbs_copilot",
         organization_id="o_test",
     )
+
+
+@pytest.mark.asyncio
+async def test_fallback_page_info_bounds_a_title_that_never_resolves_and_keeps_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged renderer hangs `title()` rather than raising it. The bound has to return, and it
+    has to keep the url — `page.url` is synchronous, so it is already in hand when the title
+    stalls, and most callers of this helper want only the url."""
+    from skyvern.forge import app as forge_app
+    from skyvern.forge.sdk.copilot.tools import _shared
+
+    async def _never_resolves() -> str:
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    page = SimpleNamespace(url="https://example.test/wedged", title=_never_resolves)
+    browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
+    session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
+    monkeypatch.setattr(_shared, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
+
+    ctx = SimpleNamespace(
+        organization_id="o_test", browser_session_id="pbs_copilot", turn_origin=TurnOrigin.interactive
+    )
+
+    current_url, page_title = await asyncio.wait_for(_fallback_page_info(ctx), timeout=5)
+
+    assert current_url == "https://example.test/wedged"
+    assert page_title == ""
 
 
 @pytest.mark.asyncio
