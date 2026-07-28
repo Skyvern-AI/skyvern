@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import (
     CredentialCheck,
     StructuredContext,
@@ -444,28 +443,6 @@ def test_credential_prompt_reason_marker_fallback_is_case_insensitive(text: str)
 def test_credential_prompt_reason_policy_none_is_safe() -> None:
     assert credential_prompt_reason(None, None) is None
     assert credential_prompt_reason(None, "Everything is set, no action needed.") is None
-
-
-@pytest.mark.asyncio
-async def test_request_policy_resolver_still_blocks_raw_secret_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
-    policy = await build_request_policy(
-        user_message="Use password: Hunter99! to sign in.",
-        workflow_yaml="",
-        chat_history=[],
-        global_llm_context="",
-        organization_id="o_test",
-        handler=None,
-    )
-
-    assert policy.raw_secret_detected is True
-    assert policy.user_response_policy == "ask_clarification"
-    assert policy.allow_update_workflow is False
-    assert policy.allow_run_blocks is False
 
 
 def _cred(

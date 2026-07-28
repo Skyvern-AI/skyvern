@@ -291,6 +291,29 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
 )
 
 
+# The authoring seam refuses only what the ``credential_scout`` hard block covers, because a raw or
+# broadened credential in a persisted draft is an irreversible disclosure; everything else steers.
+# Each member's surface and the reason it cannot be dropped are in
+# cloud_docs/workflow-copilot/architecture/output-policy-disposition.md.
+_AUTHOR_TIME_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
+    {
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
+        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+    }
+)
+
+
+def demote_author_time_steer_reasons(verdict: OutputPolicyVerdict) -> list[OutputPolicyReason]:
+    """Drop the reasons that only steer the next authoring attempt, flipping ``allowed``
+    back to True when nothing that outlives the turn remains. Returns the demoted reasons
+    so the caller can trace them."""
+    steered = [reason for reason in verdict.reason_codes if reason not in _AUTHOR_TIME_HARD_BLOCK_REASONS]
+    for reason in steered:
+        verdict.remove(reason)
+    return steered
+
+
 def coerce_cannot_act_reason(value: str | None) -> CannotActReason | None:
     if value is None:
         return None
