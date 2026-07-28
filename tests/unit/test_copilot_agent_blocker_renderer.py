@@ -954,7 +954,7 @@ def test_delivered_unverified_halt_without_workflow_renders_observed_output() ->
     assert observed_outputs["result"] == ctx.delivered_unverified_observed_outputs["result"]
 
 
-def test_repair_ceiling_give_up_halt_names_demonstrated_missing_steps() -> None:
+def test_give_up_halt_names_demonstrated_missing_steps() -> None:
     ctx = _ctx()
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
     ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
@@ -974,7 +974,7 @@ def test_repair_ceiling_give_up_halt_names_demonstrated_missing_steps() -> None:
     result = _build_turn_halt_exit_result(
         ctx,
         global_llm_context=None,
-        halt=TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED),
+        halt=TurnHalt(kind=TurnHaltKind.LOOP_DETECTED),
     )
 
     assert "#search-submit" in result.user_response
