@@ -168,14 +168,11 @@ def _string_or_none(value: object) -> str | None:
 
 
 def derive_copilot_code_mode_diagnostics(ctx: Any) -> dict[str, Any]:
-    turn_halt_kind = getattr(getattr(ctx, "turn_halt", None), "kind", None)
-    turn_halt_kind_value = getattr(turn_halt_kind, "value", turn_halt_kind)
     pending_capability = _string_or_none(getattr(ctx, "code_native_pending_capability", None))
     return {
         "copilot_last_code_build_failed": bool(
             getattr(ctx, "last_test_ok", None) is False or getattr(ctx, "last_failed_workflow_yaml", None)
         ),
-        "copilot_repair_ceiling_hit": turn_halt_kind_value == "repair_ceiling_reached",
         "copilot_pending_capability": pending_capability,
     }
 

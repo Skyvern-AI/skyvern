@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,7 +8,28 @@ from playwright._impl._errors import Error as PWError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
 
 from skyvern.config import settings
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.cdp_retry import _resolve_retry_budget, connect_over_cdp_with_retry
+
+
+class _FakeEngineError(Exception):
+    pass
+
+
+class _FakeEngineRetryable(_FakeEngineError):
+    pass
+
+
+def _fake_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name="fake",
+        start_driver=cast(Any, lambda: None),
+        error_type=_FakeEngineError,
+        timeout_error_type=_FakeEngineError,
+        metadata=BrowserEngineMetadata(name="fake"),
+        selection_reason="test-fake",
+        retryable_error_types=(_FakeEngineRetryable,),
+    )
 
 
 def _make_playwright(side_effect):
@@ -199,6 +221,28 @@ class TestRetryBudget:
         monkeypatch.setattr(settings, "CDP_CONNECT_RETRY_BACKOFF_SECONDS", [])
         _, backoff = _resolve_retry_budget()
         assert backoff == (1, 2, 3, 4, 5)
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_retryable_error_is_retried(self, monkeypatch):
+        """A selected engine's own retryable-CDP class (foreign to Playwright) is recognized via the
+        selection and retried, then recovered — proving the retry loop forwards ``selection`` to the
+        classifier instead of relying on Playwright's hardcoded identities."""
+        _set_budget(monkeypatch, attempts=3, backoff=[1, 2])
+        pw = _make_playwright([_FakeEngineRetryable("transient CDP disconnect"), "browser"])
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", selection=_fake_selection())
+        assert result == "browser"
+        assert pw.chromium.connect_over_cdp.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_foreign_error_is_not_retried(self):
+        """Under a non-stock selection a foreign Playwright error is not a recognized connection
+        error, so it is raised immediately (never swallowed by a blind retry)."""
+        pw = _make_playwright([PWTimeoutError("Timeout 30000ms exceeded.")])
+        with pytest.raises(PWTimeoutError):
+            await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", selection=_fake_selection())
+        assert pw.chromium.connect_over_cdp.call_count == 1
 
     @pytest.mark.asyncio
     async def test_slow_to_bind_local_port_reconnects_on_a_later_attempt(self, monkeypatch):

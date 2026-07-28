@@ -381,7 +381,9 @@ def test_composition_parse_html_ignores_empty_modal_root_as_bounded_schema() -> 
     assert has_bounded_page_schema(parsed) is False
 
 
-def test_composition_parse_html_does_not_treat_next_as_modal_dismiss_control() -> None:
+def test_composition_parse_html_reports_every_control_a_modal_offers() -> None:
+    """A dialog closes through controls no keyword list can enumerate ("No, keep ...", an icon-only
+    glyph), so the schema reports all of them by label and the agent picks."""
     parsed = parse_composition_html(
         """
         <html><body>
@@ -395,8 +397,10 @@ def test_composition_parse_html_does_not_treat_next_as_modal_dismiss_control() -
         current_url="https://example.com/results",
     )
 
-    assert parsed["modal_overlays"] == []
-    assert has_bounded_page_schema(parsed) is False
+    overlays = parsed["modal_overlays"]
+    assert len(overlays) == 1
+    labels = [control.get("text") for control in overlays[0]["dismiss_controls"]]
+    assert labels == ["Next", "Export"]
 
 
 def test_composition_parse_html_preserves_stable_control_selectors_and_values() -> None:
