@@ -340,7 +340,7 @@ def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any
         return True
     if data.get("skip_reason") == "workflow_credential_inputs_unbound":
         return True
-    if data.get("failure_type") in {"schema_incompatibility", "missing_credential_or_init"}:
+    if data.get("failure_type") == "missing_credential_or_init":
         return True
     categories = data.get("failure_categories")
     if not isinstance(categories, list):

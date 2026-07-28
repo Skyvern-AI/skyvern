@@ -452,16 +452,33 @@ async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None
     session_id = session_id_override or ctx.browser_session_id
     if not session_id:
         return "", ""
-    try:
+
+    # page.url is a synchronous property, so it is already in hand when the title stalls, and most
+    # callers here destructure the title away and want only the url.
+    url = ""
+
+    async def _read() -> str:
+        nonlocal url
         browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
-            return "", ""
+            return ""
         page = await browser_state.get_or_create_page()
-        if page:
-            return page.url, await page.title()
+        if not page:
+            return ""
+        url = page.url
+        return await page.title()
+
+    # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
+    # raising — and every caller reaches this path, since a tool result's browser_context carries
+    # no url. Without the bound, one unreachable page deadlocks the whole turn.
+    try:
+        title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
+        return url, ""
     except Exception:
-        pass
-    return "", ""
+        return url, ""
+    return url, title
 
 
 def _composition_evidence_page_url(evidence: dict[str, Any] | None) -> str | None:

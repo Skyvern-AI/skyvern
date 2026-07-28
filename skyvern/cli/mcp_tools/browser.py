@@ -265,6 +265,22 @@ def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
     return bool(url and is_localhost_url(url) and getattr(ctx, "can_access_localhost", None) is False)
 
 
+def _log_direct_failure_diagnostics(action: str, page: Any, selector: str, exc: Exception, error: dict) -> None:
+    """Record why a direct action failed, pairing the classified element state with the page it was
+    attempted on. Adds no protocol round-trips: the state comes from the error the caller just
+    built, and page.url is a cached property that survives a page whose protocol calls time out.
+    """
+    target = page.page if hasattr(page, "page") else page
+    LOG.info(
+        "direct_action_failure_diagnostics",
+        action=action,
+        selector=selector[:160],
+        page_url=str(getattr(target, "url", None))[:200],
+        element_state=(error.get("details") or {}).get("element_state"),
+        playwright_error=str(exc)[:300],
+    )
+
+
 async def _direct_failure_result(
     action: str,
     ctx: Any,
@@ -278,6 +294,8 @@ async def _direct_failure_result(
     value: str | None = None,
     key: str | None = None,
 ) -> dict[str, Any]:
+    error = await make_direct_action_error(page, selector, exc, timeout_ms=timeout_ms)
+    _log_direct_failure_diagnostics(action, page, selector, exc, error)
     return _action_result_factory(
         ctx=ctx,
         page=page,
@@ -290,7 +308,7 @@ async def _direct_failure_result(
         ok=False,
         browser_context=ctx,
         timing_ms=timer.timing_ms,
-        error=await make_direct_action_error(page, selector, exc, timeout_ms=timeout_ms),
+        error=error,
     )
 
 

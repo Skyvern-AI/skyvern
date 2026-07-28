@@ -12,9 +12,7 @@ import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
-    RECORDED_OUTCOME_GROUNDING_REASON_CODE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-    UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
     CopilotToolBlockerSignal,
     blocker_signal_is_genuinely_terminal,
     build_llm_tool_error_payload,
@@ -38,14 +36,10 @@ class TurnClaimant(StrEnum):
     GENUINELY_TERMINAL = "genuinely_terminal"
     OUTPUT_CONTRACT_ACTUATION = "output_contract_actuation"
     CREDENTIAL_PRIORITY_CHURN = "credential_priority_authoring_churn"
-    METADATA_RUN_PREFLIGHT_REJECT = "metadata_run_preflight_reject"
     ACTUATION_OBLIGATION_FILL = "actuation_obligation_fill"
     ACTUATION_OBLIGATION_LOGIN_COMPLETION = "actuation_obligation_login_completion"
     POST_RUN_PAGE_PATH_INTERACTION = "post_run_page_path_interaction"
-    CAPTURE_OBLIGATION_REOPEN = "capture_obligation_reopen"
     CREDENTIAL_SCOUT_REOPEN = "credential_scout_reopen"
-    UNCOVERED_OUTPUT_RESCOUT_STEER = "uncovered_output_rescout_steer"
-    RECORDED_OUTCOME_GROUNDING = "recorded_outcome_grounding"
     SYNTHESIZED_BLOCK_PERSISTENCE_FORCE = "synthesized_block_persistence_force"
     CODE_AUTHORING_CHURN = "code_authoring_guardrail_churn"
     LOOP_DETECTED = "loop_detected"
@@ -68,8 +62,6 @@ _PRECEDENCE_ORDER: tuple[TurnClaimant, ...] = (
     # Bound-8 credential-priority churn defers only to terminal evidence and the actuation ladder,
     # preserving the credential-scout reply.
     TurnClaimant.CREDENTIAL_PRIORITY_CHURN,
-    # Author-time preflight reject steers before any churn or loop floor accumulates.
-    TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT,
     # Actuation-obligation fill carve-out admits the required fill tool through the persistence
     # gate; predicate-gated at its call site, never an unconditional rank flip.
     TurnClaimant.ACTUATION_OBLIGATION_FILL,
@@ -78,22 +70,12 @@ _PRECEDENCE_ORDER: tuple[TurnClaimant, ...] = (
     TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
     # Post-run page-path repair admits only its outcome-bound click/Enter window.
     TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION,
-    # A never-captured obligation admits only the exact canonical interaction that can satisfy it.
-    TurnClaimant.CAPTURE_OBLIGATION_REOPEN,
     # One-shot credential-scout reopen admits evaluate through the persistence gate;
     # predicate-gated at its call site.
     TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
-    # First-match cascade order: the uncovered-output rescout steer is evaluated before the
-    # persistence force and the grounding gate.
-    TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER,
-    # Grounding-over-persistence nested exception: a live grounding requirement is emitted instead
-    # of the persistence force when both hold.
-    TurnClaimant.RECORDED_OUTCOME_GROUNDING,
     # A budget-exhausted churn halt is the loop exit and outranks the persistence force, whose
     # accepted-save channel has already failed by then; the pair only co-occurs on synthesized turns.
     TurnClaimant.CODE_AUTHORING_CHURN,
-    # Cascade position after the rescout steer and below the grounding exception; defers to the
-    # exhausted churn halt above.
     TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
     # Loop detectors defer to every steering gate above them.
     TurnClaimant.LOOP_DETECTED,
@@ -106,14 +88,10 @@ CLAIMANT_REASON_CODE_FAMILIES: dict[TurnClaimant, frozenset[str]] = {
     TurnClaimant.GENUINELY_TERMINAL: GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
     TurnClaimant.OUTPUT_CONTRACT_ACTUATION: frozenset(),
     TurnClaimant.CREDENTIAL_PRIORITY_CHURN: frozenset({"credential_priority_authoring_churn"}),
-    TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT: frozenset(),
     TurnClaimant.ACTUATION_OBLIGATION_FILL: frozenset(),
     TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION: frozenset(),
     TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION: frozenset(),
-    TurnClaimant.CAPTURE_OBLIGATION_REOPEN: frozenset(),
     TurnClaimant.CREDENTIAL_SCOUT_REOPEN: frozenset(),
-    TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER: frozenset({UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE}),
-    TurnClaimant.RECORDED_OUTCOME_GROUNDING: frozenset({RECORDED_OUTCOME_GROUNDING_REASON_CODE}),
     TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE: frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE}),
     TurnClaimant.CODE_AUTHORING_CHURN: frozenset({"code_authoring_guardrail_churn"}),
     TurnClaimant.LOOP_DETECTED: frozenset(
@@ -137,16 +115,14 @@ _CLAIMANT_BY_REASON_CODE: dict[str, TurnClaimant] = {
 # reachability and conflicts, but never suppresses a later gate or render on the same turn.
 _TRANSIENT_CLAIMANTS = frozenset(
     {
-        TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT,
         TurnClaimant.ACTUATION_OBLIGATION_FILL,
         TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
         TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION,
-        TurnClaimant.CAPTURE_OBLIGATION_REOPEN,
         TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
     }
 )
 
-_SIGNALLESS_TERMINAL_TURN_HALT_KIND_VALUES = frozenset({"repair_ceiling_reached", "delivered_unverified"})
+_SIGNALLESS_TERMINAL_TURN_HALT_KIND_VALUES = frozenset({"delivered_unverified"})
 
 
 def claimant_outranks(candidate: TurnClaimant, incumbent: TurnClaimant) -> bool:

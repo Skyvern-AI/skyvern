@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Literal, NotRequired, TypeAlias, TypedDict, cast
@@ -63,7 +62,6 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
     from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
@@ -78,42 +76,10 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
-DEFINITION_CONTRACT_UNSATISFIED_GATE_ID = "definition_contract_unsatisfied"
-RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID = "recorded_outcome_grounding_binder_ceiling"
-SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID = "synthesized_parameter_binding_ambiguous"
-OUTPUT_CONTRACT_ACTUATION_GATE_ID = "output_contract_actuation"
-METADATA_RUN_PREFLIGHT_REJECT_GATE_ID = "metadata_run_preflight_reject"
-UNCOVERED_OUTPUT_RESCOUT_STEER_GATE_ID = "uncovered_output_rescout_steer"
-RECORDED_OUTCOME_GROUNDING_GATE_ID = "recorded_outcome_grounding"
-# Every author-time gate that has a suppression seam, and therefore everything the flag
-# payload and the local blanket can disable. Security lanes are absent by construction, not
-# by omission: they never call record_author_time_gate_ablation_event, so no payload reaches
-# them. A gate that gains a seam belongs here, or the flag cannot address it.
-AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
-    {
-        DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
-        RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
-        SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
-        OUTPUT_CONTRACT_ACTUATION_GATE_ID,
-        METADATA_RUN_PREFLIGHT_REJECT_GATE_ID,
-        UNCOVERED_OUTPUT_RESCOUT_STEER_GATE_ID,
-        RECORDED_OUTCOME_GROUNDING_GATE_ID,
-    }
-)
 CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
-AuthorTimeGateAblationPayloadValue: TypeAlias = (
-    str
-    | int
-    | float
-    | bool
-    | None
-    | Sequence["AuthorTimeGateAblationPayloadValue"]
-    | dict[str, "AuthorTimeGateAblationPayloadValue"]
-)
-AuthorTimeGateAblationPayload: TypeAlias = dict[str, AuthorTimeGateAblationPayloadValue]
 SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
@@ -181,11 +147,6 @@ class PreRunPageReference:
 
 
 @dataclass(frozen=True)
-class RejectedCodeArtifactMetadataCapture:
-    payload: Any
-
-
-@dataclass(frozen=True)
 class RegisteredArtifactEntry:
     artifact_id: str
     file_name: str
@@ -196,16 +157,6 @@ class RegisteredArtifactEntry:
 class RegisteredArtifactEvidence:
     entries: tuple[RegisteredArtifactEntry, ...]
     workflow_run_id: str
-
-
-@dataclass(frozen=True)
-class AuthorTimeGateAblationEvent:
-    gate_id: str
-    reason_code: str
-    fingerprint: str
-    log_only: bool
-    blocked_tool: str | None = None
-    payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
 
 
 class ScoutedEquivalentInput(TypedDict):
@@ -479,7 +430,6 @@ class AgentContext:
     code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
     raw_code_artifact_metadata: object | None = None
     submitted_code_artifact_metadata_snapshot: Any = None
-    rejected_code_artifact_metadata_captures: list[RejectedCodeArtifactMetadataCapture] = field(default_factory=list)
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
@@ -528,13 +478,8 @@ class AgentContext:
     scouted_spine_repeated_identical_missing_steps: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
-    output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
-    output_contract_deferral_count_by_signature: dict[str, int] = field(default_factory=dict)
     runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Progress-gated reset ledger: the last rejected draft's structural fingerprint and
-    # whether an imposition landed since, so a genuinely-changed re-attempt resets the
-    # steering-reject streak instead of counting cosmetic churn toward the cap.
-    output_contract_last_reject_fingerprint_by_signature: dict[str, str] = field(default_factory=dict)
+    # Whether an imposition landed for this contract since the last attempt.
     output_contract_imposed_since_last_reject_by_signature: dict[str, bool] = field(default_factory=dict)
     # Structural fingerprint captured when a structure directive was armed; a re-entry whose
     # fingerprint still matches means the directive went unconsumed (cosmetic churn), which
@@ -595,9 +540,7 @@ class AgentContext:
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None
     synthesized_block_reopened_after_failed_run: bool = False
-    synthesized_block_reopened_for_output_coverage: bool = False
     synthesized_block_reopened_for_credential_scout: bool = False
-    synthesized_block_reopened_for_capture_obligation: bool = False
     # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
     # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
     synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
@@ -606,8 +549,6 @@ class AgentContext:
     # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.
     scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
     scout_observation_contract: ScoutObservationContract | None = None
-    uncovered_output_rescout_context_key: str | None = None
-    uncovered_output_rescout_steer_key: str | None = None
     credential_scout_rescout_context_key: str | None = None
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
@@ -616,9 +557,6 @@ class AgentContext:
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None
     last_scout_observation_has_password_control: bool = False
-    # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
-    # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
-    download_scout_required_rejections: int = 0
     # Required parameter keys the build-test resolution seam could not bind from a user param,
     # a non-empty default, or a scout value. Reset per run; read when composing the run outcome.
     unbound_required_parameter_keys: list[str] = field(default_factory=list)
@@ -660,12 +598,6 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
-    # Latest edited-schema-incompatibility terminal outcome, set when an edited
-    # extraction_schema declares fields that map to no output the block produces.
-    # Surfaced into the persisted TurnOutcome so a later turn can report it.
-    latest_schema_incompatibility: SchemaIncompatibility | None = None
-    author_time_gate_log_only_ids: frozenset[str] = frozenset()
-    author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
     # Single-owner turn-precedence contract. One mechanism owns a turn's steering
     # at a time; a contradicting weaker claim is recorded here and yields.
     turn_ownership: TurnOwnership | None = None
@@ -673,54 +605,6 @@ class AgentContext:
     # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
     # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
     blocker_signal_claimant: TurnClaimant | None = None
-
-
-def cache_copilot_author_time_gate_log_only_ids(ctx: AgentContext, resolved_ids: frozenset[str]) -> None:
-    ineligible_ids = resolved_ids - AUTHOR_TIME_GATE_LOG_ONLY_IDS
-    for gate_id in sorted(ineligible_ids):
-        LOG.info("copilot_gate_log_only_ineligible", gate_id=gate_id)
-    ctx.author_time_gate_log_only_ids = resolved_ids & AUTHOR_TIME_GATE_LOG_ONLY_IDS
-
-
-def copilot_author_time_gate_log_only_enabled(ctx: AgentContext, gate_id: str) -> bool:
-    local_blanket_enabled = (
-        not settings.is_cloud_environment()
-        and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
-        and gate_id in AUTHOR_TIME_GATE_LOG_ONLY_IDS
-    )
-    return local_blanket_enabled or gate_id in ctx.author_time_gate_log_only_ids
-
-
-def record_author_time_gate_ablation_event(
-    ctx: AgentContext,
-    *,
-    gate_id: str,
-    reason_code: str,
-    fingerprint: str,
-    blocked_tool: str | None = None,
-    payload: AuthorTimeGateAblationPayload | None = None,
-) -> bool:
-    if not copilot_author_time_gate_log_only_enabled(ctx, gate_id):
-        return False
-    event = AuthorTimeGateAblationEvent(
-        gate_id=gate_id,
-        reason_code=reason_code,
-        fingerprint=fingerprint,
-        blocked_tool=blocked_tool,
-        payload=dict(payload or {}),
-        log_only=True,
-    )
-    ctx.author_time_gate_ablation_events.append(event)
-    LOG.info(
-        "copilot_author_time_gate_ablation_event",
-        gate_id=event.gate_id,
-        reason_code=event.reason_code,
-        fingerprint=event.fingerprint,
-        blocked_tool=event.blocked_tool,
-        log_only=event.log_only,
-        payload=event.payload,
-    )
-    return True
 
 
 def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:
