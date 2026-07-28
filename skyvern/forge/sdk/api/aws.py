@@ -400,8 +400,10 @@ class AsyncAWSClient:
                 LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
-    async def create_presigned_urls(self, uris: list[str]) -> list[str] | None:
+    async def create_presigned_urls(self, uris: list[str], expires_in: int | None = None) -> list[str] | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
+        expiration = settings.PRESIGNED_URL_EXPIRATION if expires_in is None else expires_in
+
         async def _op() -> list[str]:
             presigned_urls = []
             async with self._s3_client() as client:
@@ -410,7 +412,7 @@ class AsyncAWSClient:
                     url = await client.generate_presigned_url(
                         "get_object",
                         Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
-                        ExpiresIn=settings.PRESIGNED_URL_EXPIRATION,
+                        ExpiresIn=expiration,
                     )
                     presigned_urls.append(url)
                 return presigned_urls
