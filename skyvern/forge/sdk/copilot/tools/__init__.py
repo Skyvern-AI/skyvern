@@ -36,7 +36,10 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.workflow_yaml import BlockEditError
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import apply_block_edit, delete_block_from_workflow
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
@@ -88,8 +91,6 @@ from .completion import _outcome_unverified_reason as _outcome_unverified_reason
 from .completion import (
     _tool_visible_result_after_completion_verification,
 )
-from .composition_capture import _COMPOSITION_INSPECTION_PER_CHAT_BUDGET as _COMPOSITION_INSPECTION_PER_CHAT_BUDGET
-from .composition_capture import _COMPOSITION_INSPECTION_PER_TURN_BUDGET as _COMPOSITION_INSPECTION_PER_TURN_BUDGET
 from .composition_capture import (
     _active_run_terminal_evidence_needs_visual_fallback as _active_run_terminal_evidence_needs_visual_fallback,
 )
@@ -168,6 +169,7 @@ from .mcp_hooks import _click_post_hook as _click_post_hook
 from .mcp_hooks import _click_pre_hook as _click_pre_hook
 from .mcp_hooks import (
     _code_only_pre_run_results_error,
+    _demonstrated_step_sources,
 )
 from .mcp_hooks import _evaluate_post_hook as _evaluate_post_hook
 from .mcp_hooks import _get_block_schema_post_hook as _get_block_schema_post_hook
@@ -340,6 +342,157 @@ async def update_workflow_tool(
             )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
+
+
+async def _persist_block_scoped_edit(copilot_ctx: Any, tool_name: str, workflow_yaml: str, arguments: dict) -> str:
+    """Send a server-composed workflow through the normal persistence path.
+
+    The model never sends the whole workflow, but the saved result still goes through every
+    author-time check, so a block edit cannot slip past what a full submission must satisfy.
+    """
+    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
+        result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        _record_workflow_update_result(copilot_ctx, result, prior_definition)
+        record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
+        if result.get("ok") is False:
+            _record_diagnosis_repair_contract(copilot_ctx, source_tool=tool_name, result=result)
+    return json.dumps(sanitize_tool_result_for_llm(tool_name, result))
+
+
+def _stored_workflow_yaml(copilot_ctx: Any) -> str:
+    latest = getattr(copilot_ctx, "last_workflow_yaml", None)
+    if isinstance(latest, str) and latest.strip():
+        return latest
+    stored = getattr(copilot_ctx, "workflow_yaml", None)
+    return stored if isinstance(stored, str) else ""
+
+
+def _submission_only_changes_existing_blocks(copilot_ctx: Any, workflow_yaml: str) -> bool:
+    """Whether a whole-workflow submission changes nothing structural.
+
+    Same labels in, same labels out means the model is editing block contents through a tool that
+    re-sends every block. Adding or removing a block is structural and still needs the whole
+    workflow, since edit_block only reaches blocks that already exist.
+    """
+    stored = _stored_workflow_yaml(copilot_ctx)
+    if not stored.strip() or not workflow_yaml.strip():
+        return False
+    try:
+        before = safe_load_no_dates(stored)
+        after = safe_load_no_dates(workflow_yaml)
+    except Exception:
+        return False
+
+    def labels(parsed: Any) -> set[str] | None:
+        if not isinstance(parsed, dict):
+            return None
+        definition = parsed.get("workflow_definition")
+        if not isinstance(definition, dict):
+            return None
+        blocks = definition.get("blocks")
+        if not isinstance(blocks, list):
+            return None
+        return {str(b.get("label") or "") for b in blocks if isinstance(b, dict)}
+
+    before_labels, after_labels = labels(before), labels(after)
+    if before_labels is None or after_labels is None or not after_labels:
+        return False
+    return before_labels == after_labels
+
+
+@function_tool(name_override="edit_block", strict_mode=False)
+async def edit_block_tool(
+    ctx: RunContextWrapper,
+    label: str,
+    expected_code: str | None = None,
+    replacement_code: str | None = None,
+    fields: dict[str, Any] | None = None,
+) -> str:
+    """Change one block, leaving every other block exactly as it is.
+
+    Prefer this over update_and_run_blocks whenever you are changing an existing block: you send only
+    the change, so a block that already works cannot be disturbed and the workflow is not retyped.
+
+    For a `code` block, pass `expected_code` (a snippet of its current code, unique within that block)
+    and `replacement_code`. The edit is rejected if the snippet is missing or appears more than once,
+    which is how an edit written against a stale copy of the block fails instead of overwriting newer
+    code. Read the block first if you are unsure what it currently contains.
+
+    For other settings, pass `fields` with just the keys to change (e.g. a navigation goal or url).
+
+    To remove a block use delete_block. Omitting a block here never deletes it.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"label": label, "fields": fields, "has_code_edit": expected_code is not None}
+    loop_error = _tool_loop_error(copilot_ctx, "edit_block", arguments)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+    authority_error = _authority_tool_error(copilot_ctx, "edit_block")
+    if authority_error:
+        return json.dumps({"ok": False, "error": authority_error})
+    try:
+        workflow_yaml = apply_block_edit(
+            _stored_workflow_yaml(copilot_ctx),
+            label,
+            expected_code=expected_code,
+            replacement_code=replacement_code,
+            fields=fields,
+        )
+    except BlockEditError as exc:
+        result = {"ok": False, "error": str(exc)}
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block", arguments, result)
+        return json.dumps(result)
+    return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
+
+
+@function_tool(name_override="delete_block")
+async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
+    """Remove one block from the workflow by label.
+
+    Deleting is an explicit action: leaving a block out of a workflow you send elsewhere does not
+    remove it. Any block that pointed at this one as its next step is unlinked.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"label": label}
+    loop_error = _tool_loop_error(copilot_ctx, "delete_block", arguments)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+    authority_error = _authority_tool_error(copilot_ctx, "delete_block")
+    if authority_error:
+        return json.dumps({"ok": False, "error": authority_error})
+    try:
+        workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
+    except BlockEditError as exc:
+        result = {"ok": False, "error": str(exc)}
+        record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
+        return json.dumps(result)
+    return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
+
+
+@function_tool(name_override="synthesize_demonstrated_block")
+async def synthesize_demonstrated_block_tool(ctx: RunContextWrapper) -> str:
+    """Return code-block source built from the steps you already performed in the browser.
+
+    This is compiled from your recorded interactions, so it reflects what actually happened rather
+    than what you remember doing. Use it as the body of a code block instead of writing the steps
+    again from memory, and edit it if the block needs to do more.
+    """
+    copilot_ctx = ctx.context
+    arguments: dict[str, Any] = {}
+    loop_error = _tool_loop_error(copilot_ctx, "synthesize_demonstrated_block", arguments)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+    source = _demonstrated_step_sources(copilot_ctx)
+    if not source:
+        result = {
+            "ok": False,
+            "error": "Nothing has been demonstrated in the browser yet, so there are no steps to compile.",
+        }
+    else:
+        result = {"ok": True, "data": {"code": source}}
+    record_tool_step_result_for_ctx(copilot_ctx, "synthesize_demonstrated_block", arguments, result)
+    return json.dumps(result)
 
 
 @function_tool(name_override="list_credentials")
@@ -528,6 +681,7 @@ async def update_and_run_blocks_tool(
     """Update the workflow YAML and immediately run the specified blocks in one step.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
+
     `block_labels` may be a tested frontier subset of the full workflow YAML;
     save the complete reusable workflow, then run only the next 1-2 unverified
     blocks when a long form/search/result chain can be verified incrementally.
@@ -573,6 +727,20 @@ async def update_and_run_blocks_tool(
     do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
+    if _submission_only_changes_existing_blocks(copilot_ctx, workflow_yaml):
+        # Re-sending every block to change some of them is what disturbs a block that already works
+        # and grows the turn with each repair. Structural changes still come through here.
+        return json.dumps(
+            {
+                "ok": False,
+                "error": (
+                    "This submission changes existing blocks without adding or removing any, so send just "
+                    "the change: call edit_block once per block you are actually changing (or delete_block "
+                    "to remove one), then run the affected blocks with run_blocks_and_collect_debug. Send a "
+                    "whole workflow here only when the set of blocks itself changes."
+                ),
+            }
+        )
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
@@ -854,6 +1022,9 @@ async def fill_credential_field_tool(
 
 NATIVE_TOOLS = [
     update_workflow_tool,
+    edit_block_tool,
+    delete_block_tool,
+    synthesize_demonstrated_block_tool,
     list_credentials_tool,
     run_blocks_tool,
     get_run_results_tool,
