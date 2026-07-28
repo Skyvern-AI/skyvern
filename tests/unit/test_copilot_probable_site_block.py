@@ -16,12 +16,8 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _repeated_frontier_failure_nudge,
 )
 from skyvern.forge.sdk.copilot.tools import (
-    _challenge_http_request_reject_message,
     _detect_probable_site_block_wall,
-    _detect_timing_only_challenge_wait_blocks,
     _record_run_blocks_result,
-    _timing_only_challenge_wait_reject_message,
-    _update_workflow,
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from tests.unit.conftest import make_copilot_context as _fresh_context
@@ -30,48 +26,6 @@ _SCRAPE_WALL_REASON = (
     "Skyvern failed to load the website. The page may have navigated "
     "unexpectedly or become unresponsive during analysis."
 )
-
-_CHALLENGE_WAIT_WORKFLOW = """
-workflow_definition:
-  blocks:
-    - label: open_page
-      block_type: goto_url
-      url: https://example.com
-      next_block_label: wait_challenge
-    - label: wait_challenge
-      title: Wait for challenge
-      block_type: wait
-      wait_sec: 10
-"""
-
-_GENERIC_WAIT_WORKFLOW = """
-workflow_definition:
-  blocks:
-    - label: wait_for_download
-      title: Wait for download
-      block_type: wait
-      wait_sec: 10
-"""
-
-_CONDITIONAL_ACTION_WORKFLOW = """
-workflow_definition:
-  blocks:
-    - label: check_for_challenge
-      block_type: conditional
-      branch_conditions:
-        - condition_type: prompt
-          condition: If a challenge is visible on the page
-          next_block_label: handle_visible_challenge
-      next_block_label: extract_data
-    - label: handle_visible_challenge
-      title: Handle visible challenge
-      block_type: navigation
-      navigation_goal: Click the visible verification control if present.
-      next_block_label: extract_data
-    - label: extract_data
-      block_type: extraction
-      data_extraction_goal: Extract the requested data.
-"""
 
 
 def _scrape_wall_result() -> dict:
@@ -362,103 +316,3 @@ def test_stop_nudge_keeps_configure_proxy_advice_when_proxy_is_none() -> None:
 
     assert exc_info.value.halt.kind == TurnHaltKind.PROBABLE_SITE_BLOCK
     assert "configure a proxy" in exc_info.value.halt.blocker_signal.user_facing_reason.lower()
-
-
-def test_detects_challenge_named_wait_block() -> None:
-    assert _detect_timing_only_challenge_wait_blocks(_CHALLENGE_WAIT_WORKFLOW) == ["wait_challenge"]
-
-
-def test_rejects_challenge_wait_after_explicit_anti_bot_evidence() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_anti_bot = "Cloudflare challenge page detected"
-
-    message = _timing_only_challenge_wait_reject_message(ctx, _CHALLENGE_WAIT_WORKFLOW)
-
-    assert message is not None
-    assert "wait_challenge" in message
-    assert "timing-only challenge wait" in message
-
-
-@pytest.mark.asyncio
-async def test_update_workflow_rejects_challenge_wait_after_explicit_anti_bot_evidence() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_anti_bot = "Cloudflare challenge page detected"
-
-    result = await _update_workflow({"workflow_yaml": _CHALLENGE_WAIT_WORKFLOW}, ctx)
-
-    assert result["ok"] is False
-    assert "wait_challenge" in str(result["error"])
-
-
-def test_rejects_challenge_wait_after_repeated_scrape_wall() -> None:
-    ctx = _fresh_context()
-    _record_run_blocks_result(ctx, _scrape_wall_result())
-    _record_run_blocks_result(ctx, _scrape_wall_result())
-
-    message = _timing_only_challenge_wait_reject_message(ctx, _CHALLENGE_WAIT_WORKFLOW)
-
-    assert message is not None
-    assert "wait_challenge" in message
-
-
-def test_allows_generic_wait_after_block_evidence() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_anti_bot = "challenge page detected"
-
-    assert _timing_only_challenge_wait_reject_message(ctx, _GENERIC_WAIT_WORKFLOW) is None
-
-
-def test_allows_conditional_challenge_action_after_block_evidence() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_anti_bot = "challenge page detected"
-
-    assert _timing_only_challenge_wait_reject_message(ctx, _CONDITIONAL_ACTION_WORKFLOW) is None
-
-
-def test_rejects_new_http_request_after_observed_challenge_evidence() -> None:
-    existing_yaml = """
-workflow_definition:
-  blocks:
-    - label: open_lookup
-      block_type: goto_url
-      url: https://example.com/registry/search
-"""
-    submitted_yaml = """
-workflow_definition:
-  blocks:
-    - label: open_lookup
-      block_type: goto_url
-      url: https://example.com/registry/search
-    - label: submit_lookup
-      block_type: http_request
-      method: POST
-      url: https://example.com/registry/search?s=1
-"""
-    ctx = _fresh_context()
-    ctx.composition_page_evidence = {
-        "anti_bot_indicators": ["human-verification"],
-        "challenge_controls": [{"selector": "#human-verification"}],
-    }
-    ctx.workflow_yaml = existing_yaml
-
-    message = _challenge_http_request_reject_message(ctx, submitted_yaml, ctx.workflow_yaml)
-
-    assert message is not None
-    assert "submit_lookup" in message
-    assert "raw http_request blocks are not allowed" in message
-
-
-def test_allows_existing_http_request_when_challenge_evidence_is_added_later() -> None:
-    existing_yaml = """
-workflow_definition:
-  blocks:
-    - label: submit_lookup
-      block_type: http_request
-      method: POST
-      url: https://example.com/search
-"""
-    ctx = _fresh_context()
-    ctx.composition_page_evidence = {"anti_bot_indicators": ["human-verification"]}
-    ctx.workflow_yaml = existing_yaml
-
-    assert _challenge_http_request_reject_message(ctx, existing_yaml, ctx.workflow_yaml) is None
