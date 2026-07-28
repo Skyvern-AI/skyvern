@@ -495,8 +495,6 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_bail_actuated_this_call=False,
         submitted_code_artifact_metadata_snapshot=None,
         rejected_code_artifact_metadata_captures=[],
-        author_time_gate_log_only_ids=frozenset(),
-        author_time_gate_ablation_events=[],
         latest_recorded_build_test_outcome=None,
         recorded_build_test_outcome_history=[],
         scouted_output_covered_paths=set(),

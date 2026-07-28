@@ -110,7 +110,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     TurnHalt,
     TurnHaltKind,
     raise_if_turn_halt,
-    stash_repair_ceiling_turn_halt,
+    stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_intent import (
     RequiredContextKey,
@@ -1374,16 +1374,16 @@ class TestVerifiedGoalSatisfiedStop:
             verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
         )
         signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="repair ceiling",
-            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            blocker_kind="loop_detected",
+            agent_steering_text="loop detected",
+            user_facing_reason="I couldn't keep going on this turn.",
             recovery_hint="report_blocker_to_user",
             preserves_workflow_draft=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
         raise_if_turn_halt(ctx, verified=True)
 
@@ -1453,16 +1453,16 @@ class TestVerifiedGoalSatisfiedStop:
             verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
         )
         signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="repair ceiling",
-            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            blocker_kind="loop_detected",
+            agent_steering_text="loop detected",
+            user_facing_reason="I couldn't keep going on this turn.",
             recovery_hint="report_blocker_to_user",
             preserves_workflow_draft=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
         result = await _resolve_wrapped_exception_exit_result(
             ctx,
@@ -1531,16 +1531,16 @@ class TestVerifiedGoalSatisfiedStop:
         # outcome_fully_verified is False and the involuntary halt must not be suppressed.
         ctx.completion_verification_result = None
         signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="repair ceiling",
-            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            blocker_kind="loop_detected",
+            agent_steering_text="loop detected",
+            user_facing_reason="I couldn't keep going on this turn.",
             recovery_hint="report_blocker_to_user",
             preserves_workflow_draft=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
         result = await _resolve_wrapped_exception_exit_result(
             ctx,
@@ -2734,10 +2734,10 @@ class TestTranslateToAgentResultGating:
         assert agent_result.updated_workflow is None
         assert "runtime self-heal" in agent_result.user_response.lower()
 
-    def test_inline_replace_workflow_rejects_stale_block_metadata(self, monkeypatch) -> None:
-        # Inline REPLACE_WORKFLOW bypasses _update_workflow, so it must also
-        # reject a corrected workflow whose labels/titles still describe the
-        # prior subject.
+    def test_inline_replace_workflow_steers_on_stale_block_metadata(self, monkeypatch) -> None:
+        # A label still describing the prior subject is authoring quality, not disclosure, so the
+        # draft is kept and reported on rather than thrown away. The test credit is cleared, so the
+        # kept draft still cannot be surfaced as a verified proposal.
         process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
@@ -2777,9 +2777,9 @@ workflow_definition:
             )
         )
 
-        process_mock.assert_not_called()
+        process_mock.assert_called_once()
         assert "corrected block metadata still appears stale" in agent_result.user_response
-        assert agent_result.updated_workflow is None
+        assert ctx.last_test_ok is None
         assert agent_result.workflow_yaml is None
 
     def test_inline_replace_workflow_rejects_unsafe_code_block(self, monkeypatch) -> None:
@@ -2813,7 +2813,9 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
-    def test_inline_replace_workflow_rejects_page_dependent_blocks_without_inspection(self, monkeypatch) -> None:
+    def test_inline_replace_workflow_steers_on_page_dependent_blocks_without_inspection(self, monkeypatch) -> None:
+        # Missing page evidence is what the test-run settles, so the draft is kept and reported on.
+        # The turn needs update authority or the inline REPLACE is downgraded before this gate runs.
         process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
@@ -2832,7 +2834,10 @@ workflow_definition:
         ctx = _ctx(
             workflow_yaml="",
             build_phase=BuildPhase.COMPOSING,
-            turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.BUILD,
+                authority=TurnIntentAuthority(may_update_workflow=True),
+            ),
             composition_page_evidence=None,
         )
         result = _fake_run_result(
@@ -2845,13 +2850,11 @@ workflow_definition:
             )
         )
 
-        process_mock.assert_not_called()
-        # The reject note must be product language, never the gate's
-        # agent-directed tool instruction.
+        process_mock.assert_called_once()
+        # The note must be product language, never the gate's agent-directed tool instruction.
         assert "(Note:" in agent_result.user_response
         assert "inspect_page_for_composition" not in agent_result.user_response
-        assert agent_result.updated_workflow is None
-        assert agent_result.workflow_yaml is None
+        assert ctx.last_test_ok is None
 
     def test_code_only_inline_replace_workflow_rejects_native_browser_block(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.output_policy import OutputPolicyVerdict
@@ -2884,6 +2887,50 @@ workflow_definition:
         assert "focused `code` blocks" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
+
+    def test_inline_replace_verdict_steers_a_reason_the_tool_seam_demotes(self, monkeypatch) -> None:
+        # This seam persists a draft, so it is graded like the update_workflow tool body. Grading it
+        # like a final reply walled drafts on reasons the tool seam only steers on, which is how the
+        # test-run signal was lost on this path.
+        from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
+
+        monkeypatch.setattr(
+            agent_module,
+            "evaluate_output_policy",
+            lambda **kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS]),
+        )
+
+        _, raw_verdict, author_time_verdict = agent_module._inline_replace_workflow_credential_verdict(
+            _ctx(), {"workflow_yaml": "title: Example\n"}, "REPLACE_WORKFLOW", "Here you go."
+        )
+
+        assert author_time_verdict.allowed is True
+        assert list(author_time_verdict.reason_codes) == []
+        # The raw verdict is what diagnostics report, so demotion must not consume it.
+        assert list(raw_verdict.reason_codes) == [OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS]
+
+    def test_inline_replace_verdict_still_blocks_a_credential_reason_co_firing_with_a_demoted_one(
+        self, monkeypatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
+
+        monkeypatch.setattr(
+            agent_module,
+            "evaluate_output_policy",
+            lambda **kwargs: OutputPolicyVerdict(
+                reason_codes=[
+                    OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+                    OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS,
+                ]
+            ),
+        )
+
+        _, _, author_time_verdict = agent_module._inline_replace_workflow_credential_verdict(
+            _ctx(), {"workflow_yaml": "title: Example\n"}, "REPLACE_WORKFLOW", "Here you go."
+        )
+
+        assert author_time_verdict.allowed is False
+        assert list(author_time_verdict.reason_codes) == [OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
 
     def test_inline_replace_with_invalid_yaml_keeps_prior_pass(self, monkeypatch) -> None:
         tested_wf = SimpleNamespace(name="tested")
