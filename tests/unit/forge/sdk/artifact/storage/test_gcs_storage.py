@@ -10,6 +10,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.api.gcp import STORAGE_CLASS_STANDARD
 from skyvern.forge.sdk.api.real_gcp import RealAsyncGcsStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import SENSITIVE_SHARE_URL_EXPIRY_HOURS
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 
 TEST_BUCKET = "test-gcs-bucket"
@@ -17,10 +18,12 @@ TEST_ORGANIZATION_ID = "test-org-123"
 TEST_BROWSER_SESSION_ID = "bs_test_123"
 
 
-def make_artifact(uri: str, artifact_id: str = "a_1") -> Artifact:
+def make_artifact(
+    uri: str, artifact_id: str = "a_1", artifact_type: ArtifactType = ArtifactType.SCREENSHOT
+) -> Artifact:
     return Artifact(
         artifact_id=artifact_id,
-        artifact_type=ArtifactType.SCREENSHOT,
+        artifact_type=artifact_type,
         uri=uri,
         organization_id=TEST_ORGANIZATION_ID,
         created_at=datetime.utcnow(),
@@ -358,3 +361,24 @@ class TestGcsStorageClientSigning:
             assert urls is not None and len(urls) == 3
             fake_creds.refresh.assert_called_once()
             assert mock_blob.generate_signed_url.call_count == 3
+
+
+@pytest.mark.asyncio
+class TestGcsShareLinkSensitiveCap:
+    """Sensitive artifact types get hour-capped signed URLs (SKY-12527)."""
+
+    async def test_share_links_route_sensitive_types_to_capped_expiry(self, gcs_storage: GcsStorageForTests) -> None:
+        screenshot = make_artifact(f"gs://{TEST_BUCKET}/shot.png", artifact_id="a_shot")
+        download = make_artifact(
+            f"gs://{TEST_BUCKET}/file.pdf", artifact_id="a_file", artifact_type=ArtifactType.DOWNLOAD
+        )
+
+        async def fake_sign(uris: list[str], expiry_hours: int = 24) -> list[str]:
+            return [f"{uri}?h={expiry_hours}" for uri in uris]
+
+        gcs_storage.async_client.create_signed_urls = AsyncMock(side_effect=fake_sign)
+        urls = await gcs_storage.get_share_links([screenshot, download])
+        assert urls == [
+            f"{screenshot.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
+            f"{download.uri}?h=24",
+        ]
