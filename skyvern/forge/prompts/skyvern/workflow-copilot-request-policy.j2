@@ -21,7 +21,7 @@ PRIMARY COMPLETION CRITERIA:
 ```{{ reconciliation_criteria }}```
 {% else %}
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; login_intent; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; login_intent; email_signin_intent; signin_email_candidates; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
 
 terminal_action priority:
 - Separate authentication from the requested end state before writing completion_criteria. Authentication is a prefix
@@ -57,6 +57,18 @@ login_intent:
 - false for an ordinary task with no authentication step, for a message that is essentially just a URL or a URL paired only with task language such as "scrape", "extract", "fill the form", "navigate to", or "go to", and for session-reuse phrasing such as "I'm already signed in" or "use my current browser session".
 - false on a passive first-touch read that merely implies an eventual login without explicitly asking to sign in or authenticate, for example "check my account balance" or "download my invoices". Let task or URL clarification happen first.
 - Independent of credential_input_kind: decide it from whether authentication is required, not from whether the user supplied credential material. It is true for an explicit login request that names a saved credential and true for one that names none.
+
+email_signin_intent:
+- true ONLY when the request describes authentication that has no password step at all — the site sends a one-time code or a sign-in link to an inbox, or the user says the account has no password.
+- An email address alone is NOT enough. Most ordinary logins use an email address as the username, so "log in as someone@example.com" is a password login and this stays false unless the request also describes a password-free sign-in.
+- false when the request supplies or refers to a password, a saved password credential, or a username-and-password pair, including a saved credential named by ID or exact name.
+- false when login_intent is false.
+- false when you are unsure whether the site has a password. Guessing true removes the credential step from a login that needs one.
+- Decide it from the authentication shape the user describes, not from whether the words "passwordless", "magic link", or "one-time code" appear.
+
+signin_email_candidates:
+- Every email address the latest request gives as the identity to sign in with, in the order they appear. Empty when the request names none.
+- Do not include an address the user gives for some other purpose, such as a recipient to send results to or an address to type into a form field that is not the sign-in identity.
 
 requires_user_clarification:
 - true only when the user refers to credentials but does not provide enough information to identify a saved credential or login page.

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.config import DEFAULT_MAX_TURNS
 from skyvern.forge.sdk.copilot.tools import (
-    _COMPOSITION_INSPECTION_PER_CHAT_BUDGET,
-    _COMPOSITION_INSPECTION_PER_TURN_BUDGET,
     BlockObservationRef,
     run_blocks_tool,
     update_and_run_blocks_tool,
@@ -57,7 +57,7 @@ def test_agent_prompt_accounts_for_observed_challenges_without_blind_waits() -> 
     rendered = _render_agent_prompt()
 
     assert "anti-bot or challenge controls" in rendered
-    assert "Use `get_browser_screenshot` when DOM evidence identifies a challenge" in rendered
+    assert "Use `get_browser_screenshot` whenever seeing the rendered page answers the question" in rendered
     assert "Prefer explicit challenge handling available to Skyvern over blind waits" in rendered
     assert "report the observed blocker instead of retrying the same flow" in rendered
     assert "challenge_state.gates_submit_controls=true" in rendered
@@ -103,10 +103,15 @@ def test_tool_descriptions_ground_composition_without_prescribing_extra_workflow
         assert "verify every requested constraint" not in desc
 
 
-def test_inspection_budget_allows_multi_page_authoring_evidence_but_remains_bounded() -> None:
-    assert _COMPOSITION_INSPECTION_PER_TURN_BUDGET >= 3
-    assert _COMPOSITION_INSPECTION_PER_CHAT_BUDGET >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
-    assert _COMPOSITION_INSPECTION_PER_CHAT_BUDGET <= 6
+def test_structured_page_inspection_is_not_rationed() -> None:
+    """Capping structured inspection sent the agent to hand-rolled `evaluate` probes once it ran
+    out, so understanding a page got harder the more the page needed understanding."""
+    from skyvern.forge.sdk.copilot.tools import composition_capture
+
+    source = Path(composition_capture.__file__).read_text()
+
+    assert "_COMPOSITION_INSPECTION_PER_TURN_BUDGET" not in source
+    assert "_COMPOSITION_INSPECTION_PER_CHAT_BUDGET" not in source
 
 
 def test_default_loop_budget_allows_inspect_build_run_answer_trajectory() -> None:
