@@ -717,6 +717,12 @@ export type EvalApiResponse = Array<
   EvalWorkflow | EvalTask | EvalBrowserSession
 >;
 
+export interface EvalModelTierStat {
+  total: number;
+  perfect_count: number;
+  pass_rate: number | null;
+}
+
 export interface EvalModelSummary {
   model: string | null;
   total: number;
@@ -726,6 +732,7 @@ export interface EvalModelSummary {
   rubric_avg: number | null;
   duration_avg_s: number | null;
   last_started_at: string | null;
+  tiers?: Partial<Record<"easy" | "medium" | "hard", EvalModelTierStat>>;
 }
 
 export interface EvalSummaryResponse {
