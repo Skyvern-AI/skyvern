@@ -26,7 +26,9 @@ def _patch_resolve(monkeypatch: pytest.MonkeyPatch, *, css_count: int, xpath_cou
     frame_content = MagicMock()
     frame_content.locator.return_value = xpath_locator
 
-    async def _resolve(scrape_page: object, page: object, frame: str, css: str) -> tuple[MagicMock, MagicMock]:
+    async def _resolve(
+        scrape_page: object, page: object, frame: str, css: str, engine_selection: object = None
+    ) -> tuple[MagicMock, MagicMock]:
         return css_locator, frame_content
 
     monkeypatch.setattr("skyvern.webeye.utils.dom.resolve_locator", _resolve)
