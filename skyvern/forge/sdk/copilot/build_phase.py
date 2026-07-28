@@ -287,6 +287,29 @@ def advance_to_testing(ctx: CopilotContext) -> None:
     _log_transition(ctx, prev=prev, new=ctx.build_phase, reason="update_workflow_succeeded")
 
 
+# The complete vocabulary the build-phase plane may refuse with. It exists for the same reason
+# AUTHOR_TIME_HARD_BLOCKS and LOOP_PLANE_REFUSAL_REASON_CODES do: a phase gate added here cannot
+# wall a turn without appearing in this set.
+BUILD_PHASE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "build_phase_discovery_disallowed_post_compose",
+        "build_phase_composition_inspection_blocked_pre_compose",
+        "build_phase_browser_blocked_pre_compose",
+        "build_phase_mutation_blocked_pre_compose",
+    }
+)
+
+
+def _declared_phase_refusal(signal: CopilotToolBlockerSignal) -> CopilotToolBlockerSignal:
+    reason = signal.internal_reason_code
+    if reason not in BUILD_PHASE_REFUSAL_REASON_CODES:
+        raise ValueError(
+            f"{reason!r} is not a declared build-phase refusal. A phase gate that ends a turn must be "
+            f"declared; anything else steers. Declared: {sorted(BUILD_PHASE_REFUSAL_REASON_CODES)}"
+        )
+    return signal
+
+
 def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
     """Phase-aware authority blocker, parallel to `_turn_intent_tool_error` / `_request_policy_tool_error`."""
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
@@ -299,63 +322,79 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
     in_mutation = phase in MUTATION_PERMITTED_PHASES
 
     if tool_name in _DISCOVERY_TOOLS and in_mutation:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "discover_workflow_entrypoint is only available before the entrypoint is resolved. "
-                "The workflow already has a target URL — scout it with the browser tools and author with update_workflow. "
-                "safe_reason_code=build_phase_discovery_disallowed_post_compose."
-            ),
-            user_facing_reason="I kept the existing target for this workflow instead of starting over.",
-            recovery_hint="retry_with_different_tool",
-            cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
-            internal_reason_code="build_phase_discovery_disallowed_post_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "discover_workflow_entrypoint is only available before the entrypoint is resolved. "
+                    "The workflow already has a target URL — scout it with the browser tools and author with update_workflow. "
+                    "safe_reason_code=build_phase_discovery_disallowed_post_compose."
+                ),
+                user_facing_reason="I kept the existing target for this workflow instead of starting over.",
+                recovery_hint="retry_with_different_tool",
+                cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_discovery_disallowed_post_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     if tool_name in _COMPOSITION_CONTEXT_TOOLS and in_discovery:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "Page inspection for composition is only available after an entrypoint URL is known. "
-                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
-                "safe_reason_code=build_phase_composition_inspection_blocked_pre_compose."
-            ),
-            user_facing_reason="I need to know what page to inspect before I can read its form controls.",
-            recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
-            internal_reason_code="build_phase_composition_inspection_blocked_pre_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "Page inspection for composition is only available after an entrypoint URL is known. "
+                    "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
+                    "safe_reason_code=build_phase_composition_inspection_blocked_pre_compose."
+                ),
+                user_facing_reason="I need to know what page to inspect before I can read its form controls.",
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_composition_inspection_blocked_pre_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     if tool_name in _BROWSER_PRIMITIVE_TOOLS and in_discovery:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "Direct browser tools are not callable before composition. "
-                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL. "
-                "safe_reason_code=build_phase_browser_blocked_pre_compose."
-            ),
-            user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
-            recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
-            internal_reason_code="build_phase_browser_blocked_pre_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "Direct browser tools are not callable before composition. "
+                    "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL. "
+                    "safe_reason_code=build_phase_browser_blocked_pre_compose."
+                ),
+                user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset(
+                    {"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}
+                ),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_browser_blocked_pre_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     if tool_name in _MUTATION_TOOLS and in_discovery:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "Workflow mutation is gated to composition. "
-                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
-                "safe_reason_code=build_phase_mutation_blocked_pre_compose."
-            ),
-            user_facing_reason="I need to know what site to work on before I can build a workflow. What URL should I use?",
-            recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
-            internal_reason_code="build_phase_mutation_blocked_pre_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "Workflow mutation is gated to composition. "
+                    "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
+                    "safe_reason_code=build_phase_mutation_blocked_pre_compose."
+                ),
+                user_facing_reason="I need to know what site to work on before I can build a workflow. What URL should I use?",
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset(
+                    {"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}
+                ),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_mutation_blocked_pre_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     return None

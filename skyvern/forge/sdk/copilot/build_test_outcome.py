@@ -596,24 +596,6 @@ def clear_recorded_outcome_grounding_requirement(ctx: object) -> None:
     ctx.recorded_outcome_binding_constraint = None  # type: ignore[attr-defined]
 
 
-def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
-    requirement = getattr(ctx, "recorded_outcome_grounding_requirement", None)
-    if not isinstance(requirement, RecordedOutcomeGroundingRequirement) or requirement.satisfied:
-        return False
-    if requirement.phase == "author_time_reject":
-        return True
-    if isinstance(requirement.workflow_run_id, str) and requirement.workflow_run_id:
-        return True
-    evidence = getattr(ctx, "composition_page_evidence", None)
-    if isinstance(evidence, dict) and _evidence_current_url(evidence):
-        return True
-    contract = getattr(ctx, "scout_observation_contract", None)
-    if scout_observation_contract_valid(contract):
-        return True
-    observed_urls = getattr(ctx, "observed_browser_urls", None)
-    return isinstance(observed_urls, list) and any(isinstance(url, str) and url.strip() for url in observed_urls)
-
-
 def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     requirement = getattr(ctx, "recorded_outcome_grounding_requirement", None)
     if not isinstance(requirement, RecordedOutcomeGroundingRequirement):
@@ -924,19 +906,6 @@ def recorded_outcome_from_author_time_reject(
             "page_evidence_refs": "author-time validator structural refs",
         },
     )
-
-
-def author_time_reject_missing_output_paths(latest: RecordedBuildTestOutcome | None) -> set[str]:
-    if latest is None or latest.phase != "author_time_reject":
-        return set()
-    paths: set[str] = set()
-    for fact in latest.missing_requested_output_facts:
-        if not isinstance(fact, Mapping):
-            continue
-        output_path = fact.get("output_path")
-        if isinstance(output_path, str) and output_path:
-            paths.add(output_path)
-    return paths
 
 
 def recorded_outcome_from_loaded_result_evidence(
