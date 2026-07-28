@@ -13,14 +13,19 @@ import time
 
 import pytest
 
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    SENSITIVE_ARTIFACT_TYPES,
+    SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS,
     ArtifactHmacKeyring,
     HmacKeyEntry,
     _canonical_string,
     _hmac_b64,
+    artifact_url_expiry_seconds_for_type,
     effective_artifact_url_expiry_seconds,
     parse_keyring,
     sign_artifact_url,
@@ -263,6 +268,56 @@ class TestEffectiveArtifactUrlExpirySeconds:
 
     def test_exactly_max_passes(self) -> None:
         assert effective_artifact_url_expiry_seconds(ARTIFACT_URL_EXPIRY_SECONDS_MAX) == ARTIFACT_URL_EXPIRY_SECONDS_MAX
+
+
+# ---------------------------------------------------------------------------
+# artifact_url_expiry_seconds_for_type
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactUrlExpirySecondsForType:
+    def test_sensitive_ttl_is_substantially_shorter_than_default(self) -> None:
+        assert SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS <= ARTIFACT_URL_EXPIRY_SECONDS / 4
+
+    def test_sensitive_ttl_is_not_below_the_per_org_floor(self) -> None:
+        """Webhook consumers cannot re-mint, so the cap must not dip under the sanctioned floor."""
+        assert SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS >= ARTIFACT_URL_EXPIRY_SECONDS_MIN
+
+    def test_screenshots_and_recordings_are_sensitive(self) -> None:
+        assert ArtifactType.RECORDING in SENSITIVE_ARTIFACT_TYPES
+        assert ArtifactType.SCREENSHOT_FINAL in SENSITIVE_ARTIFACT_TYPES
+        assert ArtifactType.SESSION_REPLAY in SENSITIVE_ARTIFACT_TYPES
+
+    @pytest.mark.parametrize("artifact_type", sorted(SENSITIVE_ARTIFACT_TYPES))
+    def test_sensitive_type_is_capped(self, artifact_type: ArtifactType) -> None:
+        assert (
+            artifact_url_expiry_seconds_for_type(artifact_type, ARTIFACT_URL_EXPIRY_SECONDS)
+            == SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+        )
+
+    def test_sensitive_type_with_no_expiry_gets_the_cap(self) -> None:
+        assert (
+            artifact_url_expiry_seconds_for_type(ArtifactType.RECORDING, None) == SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+        )
+
+    def test_never_lengthens_an_already_shorter_ttl(self) -> None:
+        """The on-demand mint endpoint's 5-minute window must survive the cap."""
+        assert (
+            artifact_url_expiry_seconds_for_type(ArtifactType.RECORDING, ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS)
+            == ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS
+        )
+
+    def test_download_keeps_the_callers_ttl(self) -> None:
+        assert (
+            artifact_url_expiry_seconds_for_type(ArtifactType.DOWNLOAD, ARTIFACT_URL_EXPIRY_SECONDS)
+            == ARTIFACT_URL_EXPIRY_SECONDS
+        )
+
+    def test_non_sensitive_type_with_no_expiry_stays_none(self) -> None:
+        assert artifact_url_expiry_seconds_for_type(ArtifactType.DOWNLOAD, None) is None
+
+    def test_none_type_passes_through(self) -> None:
+        assert artifact_url_expiry_seconds_for_type(None, ARTIFACT_URL_EXPIRY_SECONDS) == ARTIFACT_URL_EXPIRY_SECONDS
 
 
 # ---------------------------------------------------------------------------

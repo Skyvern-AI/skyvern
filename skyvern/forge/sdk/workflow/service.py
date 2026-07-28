@@ -2840,7 +2840,7 @@ class WorkflowService:
         pre_finally_failure_reason: str | None,
         timeout_failure_reason: str,
     ) -> tuple[WorkflowRun, WorkflowRunStatus | None, str | None]:
-        if pre_finally_status is None:
+        if pre_finally_status is None or not pre_finally_status.is_final():
             if refreshed_workflow_run := await app.DATABASE.workflow_runs.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -2849,7 +2849,7 @@ class WorkflowService:
                 if workflow_run.status.is_final():
                     pre_finally_status = workflow_run.status
                     pre_finally_failure_reason = workflow_run.failure_reason
-        if pre_finally_status and pre_finally_status.is_final():
+        if pre_finally_status is not None and pre_finally_status.is_final():
             LOG.info(
                 "Preserving terminal workflow run status after post-run elapsed timeout",
                 workflow_run_id=workflow_run_id,
@@ -2859,6 +2859,7 @@ class WorkflowService:
             workflow_run = await self.mark_workflow_run_as_timed_out(
                 workflow_run_id=workflow_run_id,
                 failure_reason=timeout_failure_reason,
+                fallback_workflow_run=workflow_run,
             )
             pre_finally_status = WorkflowRunStatus.timed_out
             pre_finally_failure_reason = timeout_failure_reason
@@ -2903,6 +2904,7 @@ class WorkflowService:
                     self.mark_workflow_run_as_timed_out(
                         workflow_run_id=workflow_run_id,
                         failure_reason=timeout_failure_reason,
+                        fallback_workflow_run=workflow_run,
                     )
                 )
                 return fallback_workflow_run, WorkflowRunStatus.timed_out, timeout_failure_reason
@@ -3192,6 +3194,13 @@ class WorkflowService:
         # in that case there's no terminal-state intent to restore.
         pre_finally_status: WorkflowRunStatus | None = None
         pre_finally_failure_reason: str | None = None
+        pre_finally_failure_category: list[dict] | None = None
+        # Freeze the body outcome used by browser write-back; a later finally-block
+        # failure must not discard valid session state produced by a successful body.
+        pre_finally_browser_persistence_status: WorkflowRunStatus | None = None
+        # A finally-only failure is a cleanup outcome, not evidence that replaying the
+        # workflow with another credential can help.
+        finally_block_set_terminal_outcome = False
 
         try:
             effective_max_elapsed_minutes = get_effective_workflow_run_max_elapsed_time_minutes(
@@ -3240,8 +3249,10 @@ class WorkflowService:
                 workflow_run = await self.mark_workflow_run_as_timed_out(
                     workflow_run_id=workflow_run_id,
                     failure_reason=pre_finally_failure_reason,
+                    fallback_workflow_run=workflow_run,
                 )
                 pre_finally_status = WorkflowRunStatus.timed_out
+                pre_finally_browser_persistence_status = pre_finally_status
                 return workflow_run
             else:
                 timeout_context = asyncio.timeout(max_elapsed_timeout_seconds)
@@ -3255,8 +3266,10 @@ class WorkflowService:
                     workflow_run = await self.mark_workflow_run_as_timed_out(
                         workflow_run_id=workflow_run_id,
                         failure_reason=pre_finally_failure_reason,
+                        fallback_workflow_run=workflow_run,
                     )
                     pre_finally_status = WorkflowRunStatus.timed_out
+                    pre_finally_browser_persistence_status = pre_finally_status
                     return workflow_run
 
             post_run_timeout_seconds = _get_workflow_run_max_elapsed_timeout_seconds(workflow_run)
@@ -3273,6 +3286,7 @@ class WorkflowService:
                     pre_finally_failure_reason=pre_finally_failure_reason,
                     timeout_failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                 )
+                pre_finally_browser_persistence_status = pre_finally_status
                 return workflow_run
 
             post_run_timeout_context = asyncio.timeout(post_run_timeout_seconds)
@@ -3291,6 +3305,7 @@ class WorkflowService:
 
                     pre_finally_status = workflow_run.status
                     pre_finally_failure_reason = workflow_run.failure_reason
+                    pre_finally_browser_persistence_status = pre_finally_status
 
                     # Statuses that always skip script generation
                     skip_statuses = {WorkflowRunStatus.canceled, WorkflowRunStatus.failed, WorkflowRunStatus.timed_out}
@@ -3380,12 +3395,52 @@ class WorkflowService:
                                 status=WorkflowRunStatus.running,
                                 failure_reason=None,
                             )
-                        await self._execute_finally_block_if_configured(
+                        finally_block_execution = await self._execute_finally_block_if_configured(
                             workflow=workflow,
                             workflow_run=workflow_run,
                             organization=organization,
                             browser_session_id=browser_session_id,
                         )
+                        if finally_block_execution is not None:
+                            finally_block, finally_block_result = finally_block_execution
+                            assert pre_finally_status is not None
+                            status_before_finally_result = pre_finally_status
+                            failure_reason_before_finally_result = pre_finally_failure_reason
+                            (
+                                finally_target_status,
+                                finally_failure_reason,
+                                finally_failure_category,
+                            ) = self._resolve_block_terminal_outcome(
+                                block=finally_block,
+                                block_result=finally_block_result,
+                            )
+                            if not status_before_finally_result.is_final() and finally_target_status is not None:
+                                # Keep the terminal outcome as intent until browser
+                                # cleanup/write-back has landed. Sequential dependents
+                                # remain blocked while this row is still running.
+                                pre_finally_status = finally_target_status
+                                pre_finally_failure_reason = finally_failure_reason
+                                pre_finally_failure_category = (
+                                    finally_failure_category
+                                    if finally_failure_category is not None
+                                    else self._classify_workflow_terminal_failure(
+                                        finally_target_status,
+                                        finally_failure_reason,
+                                    )
+                                )
+                                finally_block_set_terminal_outcome = True
+                            (
+                                workflow_run,
+                                pre_finally_status,
+                                pre_finally_failure_reason,
+                            ) = await self._apply_finally_block_result(
+                                block=finally_block,
+                                block_result=finally_block_result,
+                                workflow_run=workflow_run,
+                                pre_finally_status=status_before_finally_result,
+                                pre_finally_failure_reason=failure_reason_before_finally_result,
+                                defer_status_write=True,
+                            )
             except TimeoutError:
                 if not post_run_timeout_context.expired():
                     raise
@@ -3401,6 +3456,10 @@ class WorkflowService:
                     pre_finally_failure_reason=pre_finally_failure_reason,
                     timeout_failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                 )
+                if pre_finally_browser_persistence_status is None:
+                    # A timeout before the body outcome was captured must retain
+                    # the terminal guard instead of treating ``None`` as success.
+                    pre_finally_browser_persistence_status = pre_finally_status
         finally:
             # Shielded finalize runs even when the try body was cancelled
             # mid-flight (e.g. the copilot tool's orphan-task cancel path, or
@@ -3411,45 +3470,84 @@ class WorkflowService:
             # still ``None`` (cancellation landed before block execution
             # completed), there's no captured intent to restore and we skip.
             browser_cleanup_result: WorkflowBrowserCleanupResult | None = None
+            browser_persistence_status: WorkflowRunStatus | None = None
+            browser_write_back_exhausted = False
             if pre_finally_status is not None:
-                if workflow.persist_browser_session and pre_finally_status not in (
-                    WorkflowRunStatus.canceled,
-                    WorkflowRunStatus.failed,
-                    WorkflowRunStatus.terminated,
-                    WorkflowRunStatus.timed_out,
-                ):
+                browser_persistence_status = pre_finally_browser_persistence_status
+                if browser_persistence_status is not None and not browser_persistence_status.is_final():
+                    browser_persistence_status = WorkflowRunStatus.completed
+                if browser_persistence_status == WorkflowRunStatus.completed:
                     try:
-                        # Sequential dependency gates clear on terminal status, so persisted profile state must land first.
-                        browser_cleanup_result = await self._clean_up_workflow_browser(
-                            workflow_run=workflow_run,
-                            close_browser_on_completion=close_browser_on_completion,
-                            browser_session_id=browser_session_id,
-                        )
+                        current_workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
                     except BaseException:
+                        # Healthy-only persistence (including credential banking)
+                        # must never trust a stale nonterminal snapshot.
                         LOG.warning(
-                            "Pre-finalization browser cleanup failed during execute_workflow cleanup",
+                            "Failed to refresh workflow run before healthy browser write-back",
                             workflow_run_id=workflow_run_id,
                             exc_info=True,
                         )
-                    if browser_cleanup_result is not None:
+                        browser_persistence_status = None
+                        browser_write_back_exhausted = True
+                    else:
+                        workflow_run = current_workflow_run
+                        if current_workflow_run.status.is_final():
+                            # An out-of-band timeout/cancellation won before
+                            # cleanup. Preserve its status and do not bank state
+                            # as if this were a healthy completion.
+                            browser_persistence_status = current_workflow_run.status
+
+                if browser_persistence_status == WorkflowRunStatus.completed:
+                    # Sequential dependency gates clear on terminal status, so every
+                    # browser write-back attempt (including the retry) must finish first.
+                    for write_back_attempt in range(2):
+                        if browser_cleanup_result is None:
+                            try:
+                                browser_cleanup_result = await self._clean_up_workflow_browser(
+                                    workflow_run=workflow_run,
+                                    close_browser_on_completion=close_browser_on_completion,
+                                    browser_session_id=browser_session_id,
+                                )
+                            except BaseException:
+                                LOG.warning(
+                                    "Pre-finalization browser cleanup failed during execute_workflow cleanup",
+                                    workflow_run_id=workflow_run_id,
+                                    write_back_attempt=write_back_attempt + 1,
+                                    exc_info=True,
+                                )
+                                if write_back_attempt == 1:
+                                    browser_write_back_exhausted = True
+                                continue
                         try:
+                            current_workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+                            workflow_run = current_workflow_run
+                            if current_workflow_run.status.is_final():
+                                browser_persistence_status = current_workflow_run.status
+                                break
                             async with asyncio.timeout(BROWSER_SESSION_WRITE_BACK_TIMEOUT):
                                 await self._persist_workflow_browser_session_if_needed(
                                     workflow=workflow,
                                     workflow_run=workflow_run,
                                     browser_state=browser_cleanup_result.browser_state,
                                     close_browser_on_completion=browser_cleanup_result.close_browser_on_completion,
-                                    workflow_run_status=WorkflowRunStatus.completed,
+                                    workflow_run_status=browser_persistence_status,
                                 )
                             # Only suppress clean_up_workflow's write-back once this one has
-                            # actually persisted; a failed/timed-out attempt must still be retried.
+                            # actually persisted.
                             browser_cleanup_result.browser_session_write_back_attempted = True
+                            break
                         except BaseException:
                             LOG.warning(
                                 "Pre-finalization browser session write-back failed during execute_workflow cleanup",
                                 workflow_run_id=workflow_run_id,
+                                write_back_attempt=write_back_attempt + 1,
                                 exc_info=True,
                             )
+                            if write_back_attempt == 1:
+                                # Do not start another write-back after terminalizing the
+                                # run; a sequential dependent could otherwise read while
+                                # this predecessor is still updating its profile.
+                                browser_write_back_exhausted = True
                 try:
                     workflow_run = await asyncio.shield(
                         self._finalize_workflow_run_status(
@@ -3457,6 +3555,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             pre_finally_status=pre_finally_status,
                             pre_finally_failure_reason=pre_finally_failure_reason,
+                            pre_finally_failure_category=pre_finally_failure_category,
                         )
                     )
                 except BaseException:
@@ -3521,6 +3620,9 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
                 need_call_webhook=need_call_webhook,
                 browser_cleanup_result=browser_cleanup_result,
+                browser_persistence_status=browser_persistence_status,
+                skip_browser_session_write_back=browser_write_back_exhausted,
+                schedule_credential_fallback_retry=not finally_block_set_terminal_outcome,
             )
 
         return workflow_run
@@ -5561,6 +5663,13 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         workflow_run_id: str,
     ) -> tuple[WorkflowRun, bool]:
+        if block_result.status not in (
+            BlockStatus.canceled,
+            BlockStatus.failed,
+            BlockStatus.terminated,
+            BlockStatus.timed_out,
+        ):
+            return workflow_run, False
         if block_result.status == BlockStatus.canceled:
             LOG.info(
                 f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
@@ -5573,6 +5682,12 @@ class WorkflowService:
             )
             workflow_run = await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run_id)
             return workflow_run, True
+        target_status, failure_reason, task_failure_category = self._resolve_block_terminal_outcome(
+            block=block,
+            block_result=block_result,
+        )
+        # The resolver returns no target for ``continue_on_failure``. Keep the
+        # status-specific early returns below so each case retains its useful log.
         if block_result.status == BlockStatus.failed:
             # Run-level outcome, recorded as the run's failure_reason below; not a platform fault.
             LOG.warning(
@@ -5584,31 +5699,18 @@ class WorkflowService:
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
-            if not block.continue_on_failure:
-                failure_reason = f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
-                task_failure_category = (
-                    block_result.output_parameter_value.get("failure_category")
-                    if isinstance(block_result.output_parameter_value, dict)
-                    else None
-                )
-                workflow_run = await self.mark_workflow_run_as_failed(
+            if block.continue_on_failure:
+                LOG.warning(
+                    f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
+                    block_type=block.block_type,
                     workflow_run_id=workflow_run_id,
-                    failure_reason=failure_reason,
-                    failure_category=task_failure_category,
+                    block_idx=block_idx,
+                    block_result=block_result,
+                    continue_on_failure=block.continue_on_failure,
+                    block_type_var=block.block_type,
+                    block_label=block.label,
                 )
-                return workflow_run, True
-
-            LOG.warning(
-                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
-                block_type=block.block_type,
-                workflow_run_id=workflow_run_id,
-                block_idx=block_idx,
-                block_result=block_result,
-                continue_on_failure=block.continue_on_failure,
-                block_type_var=block.block_type,
-                block_label=block.label,
-            )
-            return workflow_run, False
+                return workflow_run, False
 
         if block_result.status == BlockStatus.terminated:
             LOG.info(
@@ -5621,31 +5723,18 @@ class WorkflowService:
                 block_label=block.label,
             )
 
-            if not block.continue_on_failure:
-                failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
-                task_failure_category = (
-                    block_result.output_parameter_value.get("failure_category")
-                    if isinstance(block_result.output_parameter_value, dict)
-                    else None
-                )
-                workflow_run = await self.mark_workflow_run_as_terminated(
+            if block.continue_on_failure:
+                LOG.warning(
+                    f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                    block_type=block.block_type,
                     workflow_run_id=workflow_run_id,
-                    failure_reason=failure_reason,
-                    failure_category=task_failure_category,
+                    block_idx=block_idx,
+                    block_result=block_result,
+                    continue_on_failure=block.continue_on_failure,
+                    block_type_var=block.block_type,
+                    block_label=block.label,
                 )
-                return workflow_run, True
-
-            LOG.warning(
-                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
-                block_type=block.block_type,
-                workflow_run_id=workflow_run_id,
-                block_idx=block_idx,
-                block_result=block_result,
-                continue_on_failure=block.continue_on_failure,
-                block_type_var=block.block_type,
-                block_label=block.label,
-            )
-            return workflow_run, False
+                return workflow_run, False
 
         if block_result.status == BlockStatus.timed_out:
             LOG.info(
@@ -5658,33 +5747,132 @@ class WorkflowService:
                 block_label=block.label,
             )
 
-            if not block.continue_on_failure:
-                failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
-                task_failure_category = (
-                    block_result.output_parameter_value.get("failure_category")
-                    if isinstance(block_result.output_parameter_value, dict)
-                    else None
-                )
-                workflow_run = await self.mark_workflow_run_as_failed(
+            if block.continue_on_failure:
+                LOG.warning(
+                    f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                    block_type=block.block_type,
                     workflow_run_id=workflow_run_id,
-                    failure_reason=failure_reason,
-                    failure_category=task_failure_category,
+                    block_idx=block_idx,
+                    block_result=block_result,
+                    continue_on_failure=block.continue_on_failure,
+                    block_type_var=block.block_type,
+                    block_label=block.label,
                 )
-                return workflow_run, True
+                return workflow_run, False
 
-            LOG.warning(
-                f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
-                block_type=block.block_type,
+        if target_status == WorkflowRunStatus.failed:
+            workflow_run = await self.mark_workflow_run_as_failed(
                 workflow_run_id=workflow_run_id,
-                block_idx=block_idx,
-                block_result=block_result,
-                continue_on_failure=block.continue_on_failure,
-                block_type_var=block.block_type,
-                block_label=block.label,
+                failure_reason=failure_reason,
+                failure_category=task_failure_category,
+            )
+        elif target_status == WorkflowRunStatus.terminated:
+            workflow_run = await self.mark_workflow_run_as_terminated(
+                workflow_run_id=workflow_run_id,
+                failure_reason=failure_reason,
+                failure_category=task_failure_category,
+            )
+        else:
+            LOG.warning(
+                "Block terminal outcome did not map to a workflow terminal status",
+                workflow_run_id=workflow_run_id,
+                block_status=block_result.status,
+                target_status=target_status,
             )
             return workflow_run, False
+        return workflow_run, True
 
-        return workflow_run, False
+    @staticmethod
+    def _resolve_block_terminal_outcome(
+        *,
+        block: BlockTypeVar,
+        block_result: BlockResult,
+    ) -> tuple[WorkflowRunStatus | None, str | None, list[dict] | None]:
+        failure_category = (
+            block_result.output_parameter_value.get("failure_category")
+            if isinstance(block_result.output_parameter_value, dict)
+            else None
+        )
+
+        if block_result.status == BlockStatus.canceled:
+            # Cancellation is never recoverable via continue_on_failure, matching normal block execution.
+            return WorkflowRunStatus.canceled, None, failure_category
+        if block.continue_on_failure:
+            return None, None, None
+        if block_result.status == BlockStatus.failed:
+            failure_reason = f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
+            return WorkflowRunStatus.failed, failure_reason, failure_category
+        if block_result.status == BlockStatus.terminated:
+            failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
+            return WorkflowRunStatus.terminated, failure_reason, failure_category
+        if block_result.status == BlockStatus.timed_out:
+            # A block timeout is a block failure; timed_out is reserved for the workflow's elapsed-time limit.
+            failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
+            return WorkflowRunStatus.failed, failure_reason, failure_category
+        return None, None, None
+
+    @staticmethod
+    def _classify_workflow_terminal_failure(
+        status: WorkflowRunStatus,
+        failure_reason: str | None,
+    ) -> list[dict] | None:
+        if status in (WorkflowRunStatus.failed, WorkflowRunStatus.timed_out):
+            return classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        if status == WorkflowRunStatus.terminated:
+            # Termination may be user-guided, so an unknown category is optional.
+            return classify_from_failure_reason(failure_reason)
+        return None
+
+    async def _apply_finally_block_result(
+        self,
+        *,
+        block: BlockTypeVar,
+        block_result: BlockResult,
+        workflow_run: WorkflowRun,
+        pre_finally_status: WorkflowRunStatus,
+        pre_finally_failure_reason: str | None,
+        defer_status_write: bool = False,
+    ) -> tuple[WorkflowRun, WorkflowRunStatus, str | None]:
+        if pre_finally_status.is_final():
+            return workflow_run, pre_finally_status, pre_finally_failure_reason
+
+        target_status, failure_reason, failure_category = self._resolve_block_terminal_outcome(
+            block=block,
+            block_result=block_result,
+        )
+        if target_status is None:
+            return workflow_run, pre_finally_status, pre_finally_failure_reason
+
+        if failure_category is None:
+            failure_category = self._classify_workflow_terminal_failure(target_status, failure_reason)
+
+        LOG.info(
+            "Resolved finally block terminal outcome",
+            workflow_run_id=workflow_run.workflow_run_id,
+            block_type=block.block_type,
+            block_label=block.label,
+            block_status=block_result.status,
+            workflow_status=target_status,
+            deferred=defer_status_write,
+        )
+        if defer_status_write:
+            return workflow_run, target_status, failure_reason
+
+        updated_workflow_run = await self._update_workflow_run_status_if_not_final(
+            workflow_run_id=workflow_run.workflow_run_id,
+            status=target_status,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+        )
+        if updated_workflow_run is not None:
+            otel_trace.get_current_span().set_attribute("task.completion_status", target_status)
+            return updated_workflow_run, target_status, updated_workflow_run.failure_reason
+
+        current_workflow_run = await self._current_row_after_lost_finalize(
+            workflow_run.workflow_run_id,
+            workflow_run,
+        )
+        return current_workflow_run, current_workflow_run.status, current_workflow_run.failure_reason
 
     async def _execute_finally_block_if_configured(
         self,
@@ -5692,10 +5880,10 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         organization: Organization,
         browser_session_id: str | None,
-    ) -> None:
+    ) -> tuple[BlockTypeVar, BlockResult] | None:
         finally_block_label = workflow.workflow_definition.finally_block_label
         if not finally_block_label:
-            return
+            return None
 
         label_to_block: dict[str, BlockTypeVar] = {block.label: block for block in workflow.workflow_definition.blocks}
 
@@ -5706,24 +5894,31 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 finally_block_label=finally_block_label,
             )
-            return
+            return None
 
         try:
             parameters = block.get_all_parameters(workflow_run.workflow_run_id)
             await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                 workflow_run.workflow_run_id, parameters, organization
             )
-            await block.execute_safe(
+            block_result = await block.execute_safe(
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=organization.organization_id,
                 browser_session_id=browser_session_id,
             )
+            return block, block_result
         except Exception as e:
             LOG.warning(
                 "Finally block execution failed",
                 workflow_run_id=workflow_run.workflow_run_id,
                 block_label=block.label,
                 error=str(e),
+            )
+            return block, BlockResult(
+                success=False,
+                output_parameter=block.output_parameter,
+                status=BlockStatus.failed,
+                failure_reason=get_user_facing_exception_message(e),
             )
 
     @staticmethod
@@ -6992,6 +7187,7 @@ class WorkflowService:
         workflow_run_id: str,
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
+        run_with: str | None = None,
         failure_category: list[dict] | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
@@ -7000,11 +7196,32 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             status=status,
             failure_reason=failure_reason,
+            run_with=run_with,
             failure_category=failure_category,
         )
         if workflow_run is None:
             return None
         await self._after_workflow_run_status_write(workflow_run, status)
+        return workflow_run
+
+    async def _finish_preexisting_timed_out_workflow_run(
+        self,
+        workflow_run_id: str,
+        failure_reason: str | None = None,
+        run_with: str | None = None,
+        failure_category: list[dict] | None = None,
+    ) -> WorkflowRun | None:
+        workflow_run = await app.DATABASE.workflow_runs.finish_preexisting_timed_out_workflow_run(
+            workflow_run_id=workflow_run_id,
+            failure_reason=failure_reason,
+            run_with=run_with,
+            failure_category=failure_category,
+        )
+        if workflow_run is None:
+            return None
+        # Bulk stuck-run cleanup writes only the status. Complete that deferred
+        # terminal transition exactly once, when ``finished_at`` is still null.
+        await self._after_workflow_run_status_write(workflow_run, WorkflowRunStatus.timed_out)
         return workflow_run
 
     async def _after_workflow_run_status_write(self, workflow_run: WorkflowRun, status: WorkflowRunStatus) -> None:
@@ -7107,6 +7324,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         pre_finally_status: WorkflowRunStatus,
         pre_finally_failure_reason: str | None,
+        pre_finally_failure_category: list[dict] | None = None,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -7132,11 +7350,12 @@ class WorkflowService:
                 return updated
             return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
 
-        if workflow_run.status == WorkflowRunStatus.running:
+        if not workflow_run.status.is_final():
             updated = await self._update_workflow_run_status_if_not_final(
                 workflow_run_id=workflow_run_id,
                 status=pre_finally_status,
                 failure_reason=pre_finally_failure_reason,
+                failure_category=pre_finally_failure_category,
             )
             if updated is None:
                 return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
@@ -7183,7 +7402,10 @@ class WorkflowService:
         # Auto-classify if no explicit category provided
         failure_category_source = "inherited_from_task" if failure_category is not None else "code_level"
         if failure_category is None:
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            failure_category = self._classify_workflow_terminal_failure(
+                WorkflowRunStatus.failed,
+                failure_reason,
+            )
 
         LOG.info(
             "Workflow run failure classified",
@@ -7224,7 +7446,10 @@ class WorkflowService:
         Children cascade only on the transition this call actually won.
         """
         if failure_category is None:
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            failure_category = self._classify_workflow_terminal_failure(
+                WorkflowRunStatus.failed,
+                failure_reason,
+            )
 
         workflow_run = await self._update_workflow_run_status_if_not_final(
             workflow_run_id=workflow_run_id,
@@ -7316,7 +7541,10 @@ class WorkflowService:
         # may be user-guided (e.g. terminate_criterion matched), so None is acceptable.
         failure_category_source = "inherited_from_task" if failure_category is not None else "code_level"
         if failure_category is None:
-            failure_category = classify_from_failure_reason(failure_reason)
+            failure_category = self._classify_workflow_terminal_failure(
+                WorkflowRunStatus.terminated,
+                failure_reason,
+            )
 
         LOG.info(
             "Workflow run failure classified",
@@ -7430,6 +7658,7 @@ class WorkflowService:
         workflow_run_id: str,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        fallback_workflow_run: WorkflowRun | None = None,
     ) -> WorkflowRun:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as timed out",
@@ -7437,10 +7666,10 @@ class WorkflowService:
             workflow_status="timed_out",
         )
 
-        # Add workflow timed out tag to trace
-        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.timed_out)
-
-        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        failure_category = self._classify_workflow_terminal_failure(
+            WorkflowRunStatus.timed_out,
+            failure_reason,
+        )
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
@@ -7450,15 +7679,41 @@ class WorkflowService:
             failure_category_source="code_level",
         )
 
-        workflow_run = await self._update_workflow_run_status(
+        updated_workflow_run = await self._update_workflow_run_status_if_not_final(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.timed_out,
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
         )
+        if updated_workflow_run is None:
+            # The CAS lost to a terminal writer, so only a fresh row can identify
+            # the winner. A supplied fallback is necessarily stale here; if the
+            # refresh fails, propagate so the timeout activity retries the repair
+            # and child cascade instead of accepting a nonterminal fallback.
+            current_workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+            if current_workflow_run.status != WorkflowRunStatus.timed_out:
+                return current_workflow_run
+
+            enriched_workflow_run = await self._finish_preexisting_timed_out_workflow_run(
+                workflow_run_id=workflow_run_id,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                failure_category=failure_category,
+            )
+            if enriched_workflow_run is not None:
+                updated_workflow_run = enriched_workflow_run
+            else:
+                updated_workflow_run = await self._current_row_after_lost_finalize(
+                    workflow_run_id,
+                    current_workflow_run,
+                )
+                if updated_workflow_run.status != WorkflowRunStatus.timed_out:
+                    return updated_workflow_run
+
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.timed_out)
         await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
-        return workflow_run
+        return updated_workflow_run
 
     async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
@@ -8454,6 +8709,9 @@ class WorkflowService:
         need_call_webhook: bool = True,
         browser_session_id: str | None = None,
         browser_cleanup_result: WorkflowBrowserCleanupResult | None = None,
+        browser_persistence_status: WorkflowRunStatus | None = None,
+        skip_browser_session_write_back: bool = False,
+        schedule_credential_fallback_retry: bool = True,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         if browser_cleanup_result is None:
@@ -8475,12 +8733,16 @@ class WorkflowService:
                 )
                 if tasks:
                     await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
-                if not browser_cleanup_result.browser_session_write_back_attempted:
+                if (
+                    not browser_cleanup_result.browser_session_write_back_attempted
+                    and not skip_browser_session_write_back
+                ):
                     await self._persist_workflow_browser_session_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
                         browser_state=browser_state,
                         close_browser_on_completion=close_browser_on_completion,
+                        workflow_run_status=browser_persistence_status,
                     )
 
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
@@ -8540,13 +8802,15 @@ class WorkflowService:
             for child_workflow_run_id in child_workflow_run_ids:
                 app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
 
-            # Schedule the credential fallback retry only after this run's cleanup (artifact/video
+            # When eligible, schedule the credential fallback retry only after this run's cleanup (artifact/video
             # persistence, browser/session write-back, webhook) has run, so the replacement run
             # cannot overlap it and race browser-profile/session writes. In the finally wrapping the
             # whole cleanup sequence — not after it — so an exception in any cleanup step can't skip
             # it; scheduling was removed from the status markers, which fired before cleanup and for
-            # cascade/reaper failures that never reach cleanup. A no-op for non-eligible runs.
-            self._schedule_credential_fallback_retry(workflow_run)
+            # cascade/reaper failures that never reach cleanup. Finally-only failures explicitly
+            # suppress it because replaying the workflow cannot repair post-run cleanup.
+            if schedule_credential_fallback_retry:
+                self._schedule_credential_fallback_retry(workflow_run)
 
     async def prepare_workflow_webhook(
         self,

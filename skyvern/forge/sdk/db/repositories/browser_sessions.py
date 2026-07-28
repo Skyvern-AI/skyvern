@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import and_, case, desc, func, or_, select
+from sqlalchemy import and_, case, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
@@ -711,6 +711,30 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
+
+    @db_operation("touch_last_activity")
+    async def touch_last_activity(self, session_id: str, last_activity_at: datetime | None = None) -> None:
+        """Record that a session was actively driven, for activity-based lease renewal.
+
+        Unscoped by organization on purpose: the CDP proxy calls this and learns the owning
+        org from the row, never from client input. A single UPDATE with no read-back — a
+        best-effort, no-op when the row is gone — so it stays cheap on the relay hot path.
+        """
+        ts = to_naive_utc(last_activity_at) if last_activity_at is not None else naive_utc_now()
+        async with self.Session() as session:
+            await session.execute(
+                update(PersistentBrowserSessionModel)
+                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+                .where(PersistentBrowserSessionModel.deleted_at.is_(None))
+                # Monotonic write: touches are fire-and-forget from the proxy, so an out-of-order
+                # commit must never move last_activity_at backward and shorten a live lease.
+                .values(
+                    last_activity_at=func.greatest(
+                        func.coalesce(PersistentBrowserSessionModel.last_activity_at, ts), ts
+                    )
+                )
+            )
+            await session.commit()
 
     @db_operation("create_persistent_browser_session")
     async def create_persistent_browser_session(

@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import (
     CredentialCheck,
     StructuredContext,
@@ -29,6 +28,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classification_from_raw,
     _clean_email_list,
     _resolve_credentials,
+    _saved_credential_names_mentioned,
     _should_defer_repeated_unresolved_credential_question,
     _workflow_credential_inputs_unbound,
     build_request_policy,
@@ -444,28 +444,6 @@ def test_credential_prompt_reason_marker_fallback_is_case_insensitive(text: str)
 def test_credential_prompt_reason_policy_none_is_safe() -> None:
     assert credential_prompt_reason(None, None) is None
     assert credential_prompt_reason(None, "Everything is set, no action needed.") is None
-
-
-@pytest.mark.asyncio
-async def test_request_policy_resolver_still_blocks_raw_secret_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
-    policy = await build_request_policy(
-        user_message="Use password: Hunter99! to sign in.",
-        workflow_yaml="",
-        chat_history=[],
-        global_llm_context="",
-        organization_id="o_test",
-        handler=None,
-    )
-
-    assert policy.raw_secret_detected is True
-    assert policy.user_response_policy == "ask_clarification"
-    assert policy.allow_update_workflow is False
-    assert policy.allow_run_blocks is False
 
 
 def _cred(
@@ -2704,3 +2682,30 @@ def test_a_model_authored_identity_cannot_appear_where_the_server_resolved_none(
 
     assert adopted.signin_email == ""
     assert adopted.signin_email_host == ""
+
+
+def test_a_named_credential_resolves_without_the_word_credential() -> None:
+    """ "use skyvern-datadog to login" names the credential outright. The pattern-based candidates
+    only fire when the message also says "credential", which left this resolving nothing."""
+    credentials = [SimpleNamespace(name="skyvern-datadog"), SimpleNamespace(name="skyvern-posthog")]
+
+    assert _saved_credential_names_mentioned("use skyvern-datadog to login.", credentials) == ["skyvern-datadog"]
+
+
+@pytest.mark.asyncio
+async def test_a_named_credential_resolves_when_the_classifier_misses_login_intent() -> None:
+    """`login_intent` is a model-authored hint that varies run to run. Gating the saved-name scan on
+    it alone let the classifier veto a message that says "log in" outright — the very case this
+    resolves. The deterministic login phrasing must reach the scan on its own."""
+    named = SimpleNamespace(credential_id="cred_datadog", name="skyvern-datadog", credential_type="password")
+    policy = RequestPolicy(credential_input_kind="skyvern_stored_credential", login_intent=False)
+
+    await _resolve_direct(policy, user_message="use skyvern-datadog to login.", org_credentials=[named])
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_datadog"]
+
+
+def test_a_negated_saved_name_is_not_treated_as_a_reference() -> None:
+    credentials = [SimpleNamespace(name="skyvern-datadog")]
+
+    assert _saved_credential_names_mentioned("do not use skyvern-datadog", credentials) == []

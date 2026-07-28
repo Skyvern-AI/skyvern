@@ -25,11 +25,13 @@ from skyvern.forge.sdk.api.files import (
     wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
@@ -224,11 +226,17 @@ class S3Storage(BaseStorage):
         return dict(pairs)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        share_urls = await self.async_client.create_presigned_urls([artifact.uri])
+        share_urls = await self.get_share_links([artifact])
         return share_urls[0] if share_urls else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return await self.async_client.create_presigned_urls([artifact.uri for artifact in artifacts])
+        return await presign_with_sensitive_cap(
+            artifacts,
+            presign=self.async_client.create_presigned_urls,
+            presign_sensitive=lambda uris: self.async_client.create_presigned_urls(
+                uris, expires_in=min(settings.PRESIGNED_URL_EXPIRATION, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS)
+            ),
+        )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, os.path.getsize(path))
