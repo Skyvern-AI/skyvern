@@ -130,6 +130,7 @@ def _mock_span_segment_element() -> MagicMock:
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=False)
     el.supports_text_input = AsyncMock(return_value=False)
+    el.find_deepest_interactable_descendant_in_single_chain = MagicMock(return_value=None)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
     el.is_auto_completion_input = AsyncMock(return_value=False)
@@ -227,6 +228,7 @@ def _mock_iframe_element(*, hidden: bool = False) -> MagicMock:
     el.get_locator.return_value = locator
     el.is_disabled = AsyncMock(return_value=False)
     el.supports_text_input = AsyncMock(return_value=False)
+    el.find_deepest_interactable_descendant_in_single_chain = MagicMock(return_value=None)
     el.get_selectable = AsyncMock(return_value=False)
     el.has_hidden_attr = AsyncMock(return_value=hidden)
     el.is_readonly = AsyncMock(return_value=False)

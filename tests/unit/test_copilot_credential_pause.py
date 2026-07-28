@@ -1488,34 +1488,40 @@ async def test_missing_credential_run_failure_pauses_the_loop(monkeypatch: pytes
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: the flag stays True after the second, successful call."""
+def _skip_flag_workflow_yaml() -> str:
+    return "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: step_one\n"
+
+
+def _skip_flag_ctx() -> CopilotContext:
     ctx = make_copilot_context()
     ctx.turn_intent = TurnIntent(
         mode=TurnIntentMode.BUILD,
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx.request_policy = RequestPolicy()
+    return ctx
 
-    workflow_yaml = "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: step_one\n"
 
-    async def fake_prior_definition(update_ctx: Any) -> object:
-        return None
+async def _no_prior_definition(update_ctx: CopilotContext) -> object:
+    return None
 
-    async def fake_update_workflow(payload: dict, update_ctx: Any, **kwargs: object) -> dict:
+
+@pytest.mark.asyncio
+async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _skip_flag_ctx()
+
+    async def fake_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
         workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "step_one"}]})
         update_ctx.last_workflow = workflow
         update_ctx.last_update_block_count = 1
         return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
 
-    async def fake_run_blocks(params: dict, run_ctx: Any, **kwargs: object) -> dict:
+    async def fake_run_blocks(params: dict, run_ctx: CopilotContext, **kwargs: object) -> dict:
         return {"ok": True, "data": {"workflow_run_id": "wr-1", "overall_status": "completed", "blocks": []}}
 
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *a, **k: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
     monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
     monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["step_one"], {}, "step_one"))
     monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
@@ -1523,9 +1529,10 @@ async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypat
     monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
 
-    call_args = json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["step_one"], "parameters": {}})
+    call_args = json.dumps(
+        {"workflow_yaml": _skip_flag_workflow_yaml(), "block_labels": ["step_one"], "parameters": {}}
+    )
 
-    # Call 1: policy forces a skip (unbound credential).
     monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: True)
     result_1 = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"), call_args
@@ -1533,7 +1540,6 @@ async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypat
     assert json.loads(result_1)["data"]["skip_reason"] == "workflow_credential_inputs_unbound"
     assert ctx.last_run_skipped_unbound_credentials is True
 
-    # Call 2: credential now bound, policy allows the real run.
     monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
     result_2 = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"), call_args
@@ -1547,36 +1553,23 @@ async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypat
 async def test_last_run_skipped_flag_stays_false_when_update_workflow_fails_before_skip_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fails on old code: the flag was set True from the policy check alone,
-    before _update_workflow ever ran, so an unrelated authoring failure got
-    misreported as a credential ask.
-    """
-    ctx = make_copilot_context()
-    ctx.turn_intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
-    ctx.request_policy = RequestPolicy()
-    workflow_yaml = "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: step_one\n"
+    """The policy would allow a skip, but the authoring failure lands first — reporting it as a
+    credential ask would misattribute an unrelated error."""
+    ctx = _skip_flag_ctx()
 
-    async def fake_prior_definition(update_ctx: Any) -> object:
-        return None
-
-    async def failing_update_workflow(payload: dict, update_ctx: Any, **kwargs: object) -> dict:
+    async def failing_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
         return {"ok": False, "error": "workflow_yaml is not valid: bad block reference"}
 
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *a, **k: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
     monkeypatch.setattr(tools_module, "_update_workflow", failing_update_workflow)
     monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-    # The policy would allow a skip if we got that far — but we never do.
     monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: True)
 
     result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["step_one"], "parameters": {}}),
+        json.dumps({"workflow_yaml": _skip_flag_workflow_yaml(), "block_labels": ["step_one"], "parameters": {}}),
     )
 
     assert json.loads(result)["ok"] is False
