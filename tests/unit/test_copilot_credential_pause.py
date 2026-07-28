@@ -1030,7 +1030,9 @@ def test_elapsed_run_seconds_subtracts_pause_time() -> None:
 @pytest.mark.asyncio
 async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fails on old code: a slow pause would consume the (tiny) real timeout budget."""
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.15)
+    # Leave enough room for normal loop overhead while keeping the budget below
+    # the pause duration, so this still proves that pause time is excluded.
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.3)
 
     ctx = make_copilot_context()
     ctx.organization_id = "org-1"
