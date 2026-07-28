@@ -400,6 +400,12 @@ def _ctx() -> MagicMock:
     ctx.organization_id = "o_test"
     ctx.allow_untested_workflow_draft = False
     ctx.request_policy = None
+    ctx.code_artifact_metadata = {}
+    ctx.code_authoring_guardrail_reject_count = 0
+    ctx.blocker_signal = None
+    ctx.turn_halt = None
+    ctx.build_test_outcomes = []
+    ctx.latest_recorded_build_test_outcome = None
     return ctx
 
 

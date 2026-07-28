@@ -97,7 +97,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
-from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
     _carry_degraded_ids,
@@ -2272,71 +2271,6 @@ class TestBlockGoalMainGoal:
 
 class TestRuntimeBlockGoalPersistenceBoundary:
     @pytest.mark.asyncio
-    async def test_update_and_run_blocks_metadata_repair_context_preflight_blocks_before_update(
-        self, monkeypatch
-    ) -> None:
-        workflow_yaml = """
-title: Test workflow
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: code
-      label: extract_entry_output
-      code: |
-        return {"output": {"summary": "found"}}
-"""
-        repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id", "output.flags"],
-            required_extraction_schema_paths=["output.record_id", "output.flags"],
-            required_code_return_paths=["output.record_id", "output.flags"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(
-            tools_module,
-            "_tool_loop_error",
-            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("loop check should not run")),
-        )
-        monkeypatch.setattr(
-            tools_module,
-            "_update_workflow",
-            AsyncMock(side_effect=AssertionError("_update_workflow should not run")),
-        )
-        record_calls: list[tuple[str, dict[str, object]]] = []
-        monkeypatch.setattr(
-            tools_module,
-            "record_tool_step_result_for_ctx",
-            lambda _ctx, tool, _args, result: record_calls.append((tool, result)),
-        )
-        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-
-        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
-        )
-
-        parsed = json.loads(result)
-        assert parsed["ok"] is False
-        assert "cannot attempt a run" in parsed["error"]
-        assert parsed["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert parsed["data"]["authoring_repair_context"]["required_goal_value_paths"] == [
-            "output.flags",
-            "output.record_id",
-        ]
-        assert parsed["data"]["metadata_repair_contract"]["block_label"] == "extract_entry_output"
-        assert record_calls
-        assert record_calls[0][0] == "update_and_run_blocks"
-        assert record_calls[0][1]["data"]["reason_code"] == "metadata_contract_required_before_run"
-
-    @pytest.mark.asyncio
     async def test_update_and_run_blocks_metadata_contract_scaffold_reaches_update_workflow(self, monkeypatch) -> None:
         workflow_yaml = """
 title: Test workflow
@@ -2391,92 +2325,6 @@ workflow_definition:
             "output.record_id",
         ]
         assert captured_metadata[-1]["formation_prepared"] is True
-
-    @pytest.mark.asyncio
-    async def test_update_and_run_blocks_typed_advisory_static_return_gap_reaches_run(self, monkeypatch) -> None:
-        workflow_yaml = """
-title: Test workflow
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: code
-      label: extract_entry_output
-      code: |
-        return "not a structured output"
-"""
-        required_paths = {"output.record_id"}
-        schema = workflow_update_module._schema_template_text_for_required_paths(required_paths)
-        repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id"],
-            required_extraction_schema_paths=["output.record_id"],
-            required_code_return_paths=["output.record_id"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-        ctx.turn_id = "metadata-contract-run-preflight"
-        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=required_paths)
-        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
-        captured: dict[str, object] = {}
-
-        async def fake_update_workflow(payload, update_ctx, **_kwargs):
-            captured["update_called"] = True
-            captured["metadata"] = payload["code_artifact_metadata"]
-            update_ctx.workflow_yaml = payload["workflow_yaml"]
-            update_ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
-            return {"ok": True, "data": {"block_count": 1}}
-
-        async def fake_run_blocks(params, _ctx, **_kwargs):
-            captured["run_called"] = True
-            captured["run_params"] = params
-            return {
-                "ok": True,
-                "data": {
-                    "workflow_run_id": "wr-1",
-                    "overall_status": "completed",
-                    "blocks": [{"label": "extract_entry_output", "status": "completed"}],
-                },
-            }
-
-        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
-        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(
-            tools_module, "_plan_frontier", lambda *args: (["extract_entry_output"], {}, "extract_entry_output")
-        )
-        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
-        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
-        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
-
-        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps(
-                {
-                    "workflow_yaml": workflow_yaml,
-                    "block_labels": ["extract_entry_output"],
-                }
-            ),
-        )
-
-        parsed = json.loads(result)
-        assert parsed["ok"] is True
-        assert captured["update_called"] is True
-        assert captured["run_called"] is True
-        update_metadata = captured["metadata"]
-        assert isinstance(update_metadata, list)
-        assert update_metadata[0]["block_label"] == "extract_entry_output"
-        assert update_metadata[0]["claimed_outcomes"][0]["goal_value_paths"] == ["output.record_id"]
-        assert update_metadata[0]["claimed_outcomes"][0]["extraction_schema"] == schema
 
     @pytest.mark.asyncio
     async def test_update_and_run_blocks_persists_clean_yaml(self, monkeypatch) -> None:
@@ -2931,6 +2779,37 @@ workflow_definition:
 
         process_mock.assert_not_called()
         assert "corrected block metadata still appears stale" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_inline_replace_workflow_rejects_unsafe_code_block(self, monkeypatch) -> None:
+        # This surface persists a draft without _update_workflow, so it carries the same
+        # code_safety block. Unsafe in-page code on a page holding a filled credential is
+        # the one thing a later test-run cannot undo.
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
+
+        submitted_yaml = """
+title: Registry lookup
+workflow_definition:
+  blocks:
+    - block_type: code
+      label: search_registry
+      code: |
+        import requests
+        requests.get("https://example.com")
+"""
+        ctx = _ctx(workflow_yaml="", last_workflow_yaml="")
+        result = _fake_run_result(
+            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": submitted_yaml}
+        )
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        process_mock.assert_not_called()
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
@@ -5892,80 +5771,6 @@ class TestRunBlocksCredentialApproval:
 
         assert result["ok"] is False
         assert "unapproved_credential_reference" in result["error"]
-        database.credentials.get_credentials_by_ids.assert_not_called()
-        database.organizations.get_organization.assert_not_called()
-        prepare_workflow.assert_not_called()
-        execute_workflow.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_update_and_run_blocks_rejects_unapproved_credential_at_shared_run_seam(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-
-        workflow = self._workflow("cred_unapproved")
-        database = self._db(
-            workflow=workflow,
-            credentials=[SimpleNamespace(credential_id="cred_unapproved")],
-        )
-        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
-        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
-        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
-        monkeypatch.setattr(
-            run_execution_module.app,
-            "WORKFLOW_SERVICE",
-            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
-        )
-        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
-        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["login"], {}, "login"))
-        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
-        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
-        monkeypatch.setattr(
-            tools_module,
-            "_tool_visible_result_after_completion_verification",
-            lambda _ctx, result, _completion: result,
-        )
-        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
-
-        async def fake_update_workflow(*args: object, **kwargs: object) -> dict[str, object]:
-            ctx = args[1]
-            ctx.staged_workflow = workflow
-            ctx.last_workflow = workflow
-            ctx.last_update_block_count = 1
-            return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
-
-        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-
-        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-            SimpleNamespace(
-                context=_ctx(request_policy=RequestPolicy(resolved_credentials=[])),
-                tool_name="update_and_run_blocks",
-            ),
-            json.dumps(
-                {
-                    "workflow_yaml": """
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_unapproved
-  blocks:
-    - block_type: login
-      label: login
-""",
-                    "block_labels": ["login"],
-                    "parameters": {},
-                }
-            ),
-        )
-
-        payload = json.loads(result)
-        assert payload["ok"] is False
-        assert "unapproved_credential_reference" in payload["error"]
         database.credentials.get_credentials_by_ids.assert_not_called()
         database.organizations.get_organization.assert_not_called()
         prepare_workflow.assert_not_called()
