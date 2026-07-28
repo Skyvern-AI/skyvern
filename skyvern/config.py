@@ -193,7 +193,6 @@ class Settings(BaseSettings):
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     # Consecutive repair runs that make no newly-verified forward progress before the
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.

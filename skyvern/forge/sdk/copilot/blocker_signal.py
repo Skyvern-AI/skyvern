@@ -370,7 +370,6 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
         "advisory_dispatch_stalled",
-        "repair_ceiling_reached",
         DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
@@ -506,10 +505,6 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     "loop_detected_generic": (
         "I couldn't keep going on this turn.",
         "Tell me what to change and I'll try again.",
-    ),
-    "repair_ceiling_reached": (
-        "I couldn't get past the same problem after several attempts.",
-        "Tell me what to change and I'll try a different approach.",
     ),
     "code_authoring_guardrail_churn": (
         "I kept rewriting the generated code, but the safety checks rejected each version.",

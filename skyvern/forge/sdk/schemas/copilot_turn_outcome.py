@@ -37,6 +37,5 @@ class TurnOutcome(BaseModel):
     copilot_effective_mode: Literal["ask", "build", "code"] | None = None
     copilot_code_available: bool = False
     copilot_last_code_build_failed: bool = False
-    copilot_repair_ceiling_hit: bool = False
     copilot_pending_capability: str | None = None
     copilot_turn_id: str | None = None

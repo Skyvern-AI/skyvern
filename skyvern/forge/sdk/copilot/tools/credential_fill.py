@@ -25,6 +25,8 @@ from .guardrails import _authority_tool_error
 from .mcp_hooks import _verify_scout_type_landed
 from .scouting import (
     _capture_element_fingerprint,
+    _capture_enclosing_form_submits,
+    _capture_post_interaction_screenshot,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
@@ -292,6 +294,10 @@ async def _fill_credential_field_impl(
         "typed_length": len(value),
         "url": url,
     }
+    form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
+    if form_submits:
+        data["form_submit_controls"] = form_submits
+    await _capture_post_interaction_screenshot(copilot_ctx)
     result: dict[str, Any] = {"ok": True, "data": data}
     if observation_step is not None:
         result["observation_step"] = observation_step
