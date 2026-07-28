@@ -444,7 +444,6 @@ class TestMCPFailedStepLoopDetection:
             pending_scout_source_url="https://source",
             pending_scout_typed_value="typed",
             completion_criteria_turn_state=None,
-            synthesized_block_reopened_for_output_coverage=False,
             last_code_authoring_repair_context=None,
             scouted_output_covered_paths=set(),
             reached_download_target=None,
@@ -829,14 +828,19 @@ class TestMCPToolOverlayCompleteness:
         for name in browser_tools:
             assert overlays[name].requires_browser, f"{name} should have requires_browser=True"
 
-    def test_intent_not_hidden_on_browser_tools(self) -> None:
+    def test_intent_hidden_on_element_action_tools(self) -> None:
+        """An `intent` runs a second LLM agent to pick the element, duplicating reasoning the
+        copilot loop already did. The element-action tools take a selector only."""
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlays = _build_skyvern_mcp_overlays()
-        tools_with_intent = {"click", "type_text", "scroll", "select_option", "press_key"}
-        for name in tools_with_intent:
+        for name in {"click", "type_text", "select_option", "press_key"}:
             hidden = overlays[name].hide_params or frozenset()
-            assert "intent" not in hidden, f"{name} should NOT hide intent"
+            assert "intent" in hidden, f"{name} should hide intent"
+
+        # `scroll` deliberately keeps it: scrolling a named element into view is not the
+        # element-picking this removes, and the agent prompt still offers it.
+        assert "intent" not in (overlays["scroll"].hide_params or frozenset())
 
 
 class TestNewToolOverlayConfigs:
@@ -862,7 +866,7 @@ class TestNewToolOverlayConfigs:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlay = _build_skyvern_mcp_overlays()["select_option"]
-        assert overlay.hide_params == frozenset({"session_id", "cdp_url", "timeout"})
+        assert overlay.hide_params == frozenset({"session_id", "cdp_url", "timeout", "intent"})
         assert overlay.required_overrides == ["value"]
         assert overlay.requires_browser is True
         assert overlay.timeout == 15
@@ -872,25 +876,24 @@ class TestNewToolOverlayConfigs:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlay = _build_skyvern_mcp_overlays()["press_key"]
-        assert overlay.hide_params == frozenset({"session_id", "cdp_url"})
+        assert overlay.hide_params == frozenset({"session_id", "cdp_url", "intent"})
         assert overlay.required_overrides == ["key"]
         assert overlay.requires_browser is True
         assert overlay.post_hook is not None
 
-    def test_click_and_type_overlays_steer_selector_first(self) -> None:
-        # The tool contract must steer toward selector-only (deterministic) acting;
-        # an `intent` routes the action through a slow full-page AI scan, so the
-        # description must not invite "both" as the default (regression guard).
+    def test_click_and_type_overlays_are_selector_only(self) -> None:
+        # Acting by selector is deterministic; an `intent` would spawn a second LLM agent to
+        # choose the element. The parameter is off the schema, so the description must not
+        # reference it and must point at re-observing when a selector fails (regression guard).
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlays = _build_skyvern_mcp_overlays()
         for name in ("click", "type_text"):
             desc = overlays[name].description or ""
-            assert "selector ALONE" in desc, f"{name} should steer toward selector-only"
-            assert "slower full-page AI scan" in desc, f"{name} should name the intent cost"
-            assert "or both for resilient targeting" not in desc, f"{name} must not invite both by default"
-            # intent must remain available for the genuine no-selector case
-            assert "intent" not in overlays[name].hide_params
+            assert "CSS selector" in desc, f"{name} should name the selector contract"
+            assert "intent" not in desc, f"{name} description must not reference intent"
+            assert "inspect the page again" in desc, f"{name} should steer to re-observation on failure"
+            assert "intent" in overlays[name].hide_params
 
     def test_browser_action_overlays_force_direct_selector_mode(self) -> None:
         # The copilot keeps deterministic selector actions by binding selector_mode="direct"

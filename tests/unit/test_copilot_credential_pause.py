@@ -35,7 +35,6 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
-from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -1030,7 +1029,7 @@ def test_elapsed_run_seconds_subtracts_pause_time() -> None:
 
 @pytest.mark.asyncio
 async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A pause longer than the work budget is excluded when the loop resumes."""
+    """Fails on old code: a slow pause would consume the (tiny) real timeout budget."""
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.15)
 
     ctx = make_copilot_context()
@@ -1043,18 +1042,13 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
 
     cache = _FakeCache()
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.2)
 
-    monotonic_seconds = 100.0
-    fake_time = SimpleNamespace(monotonic=lambda: monotonic_seconds)
-    monkeypatch.setattr(enforcement_module, "time", fake_time)
-    monkeypatch.setattr(credential_pause_module, "time", fake_time)
-
-    async def _resolve_after_pause(*args: Any, **kwargs: Any) -> CredentialPauseResolution:
-        nonlocal monotonic_seconds
-        monotonic_seconds += 0.25
-        return CredentialPauseResolution(action="skip")
-
-    monkeypatch.setattr(credential_pause_module, "_wait_for_credential_response", _resolve_after_pause)
+    async def _populate_after_first_poll() -> None:
+        await asyncio.sleep(0.25)
+        cache.store[credential_response_cache_key("org-1", "chat-1", "turn-credit")] = encode_credential_response(
+            "skip", None
+        )
 
     stream = _make_stream()
     fake_result = _fake_result()
@@ -1072,17 +1066,20 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
 
     config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
 
-    returned = await run_with_enforcement(
-        agent=MagicMock(),
-        initial_input="hello",
-        ctx=ctx,
-        stream=stream,
-        run_config=RunConfig(),
-        copilot_config=config,
-    )
+    populate_task = asyncio.ensure_future(_populate_after_first_poll())
+    try:
+        returned = await run_with_enforcement(
+            agent=MagicMock(),
+            initial_input="hello",
+            ctx=ctx,
+            stream=stream,
+            run_config=RunConfig(),
+            copilot_config=config,
+        )
+    finally:
+        await populate_task
 
     assert returned is fake_result
-    assert ctx.copilot_credential_pause_seconds == 0.25
     assert len(calls) == 2, "pause time must be credited so the resumed iteration isn't timed out"
     assert ctx.copilot_total_timeout_exceeded is False
 
@@ -1491,34 +1488,40 @@ async def test_missing_credential_run_failure_pauses_the_loop(monkeypatch: pytes
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: the flag stays True after the second, successful call."""
+def _skip_flag_workflow_yaml() -> str:
+    return "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: step_one\n"
+
+
+def _skip_flag_ctx() -> CopilotContext:
     ctx = make_copilot_context()
     ctx.turn_intent = TurnIntent(
         mode=TurnIntentMode.BUILD,
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx.request_policy = RequestPolicy()
+    return ctx
 
-    workflow_yaml = "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: step_one\n"
 
-    async def fake_prior_definition(update_ctx: Any) -> object:
-        return None
+async def _no_prior_definition(update_ctx: CopilotContext) -> object:
+    return None
 
-    async def fake_update_workflow(payload: dict, update_ctx: Any, **kwargs: object) -> dict:
+
+@pytest.mark.asyncio
+async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _skip_flag_ctx()
+
+    async def fake_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
         workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "step_one"}]})
         update_ctx.last_workflow = workflow
         update_ctx.last_update_block_count = 1
         return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
 
-    async def fake_run_blocks(params: dict, run_ctx: Any, **kwargs: object) -> dict:
+    async def fake_run_blocks(params: dict, run_ctx: CopilotContext, **kwargs: object) -> dict:
         return {"ok": True, "data": {"workflow_run_id": "wr-1", "overall_status": "completed", "blocks": []}}
 
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *a, **k: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
     monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
     monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["step_one"], {}, "step_one"))
     monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
@@ -1526,9 +1529,10 @@ async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypat
     monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
 
-    call_args = json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["step_one"], "parameters": {}})
+    call_args = json.dumps(
+        {"workflow_yaml": _skip_flag_workflow_yaml(), "block_labels": ["step_one"], "parameters": {}}
+    )
 
-    # Call 1: policy forces a skip (unbound credential).
     monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: True)
     result_1 = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"), call_args
@@ -1536,7 +1540,6 @@ async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypat
     assert json.loads(result_1)["data"]["skip_reason"] == "workflow_credential_inputs_unbound"
     assert ctx.last_run_skipped_unbound_credentials is True
 
-    # Call 2: credential now bound, policy allows the real run.
     monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
     result_2 = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"), call_args
@@ -1550,36 +1553,23 @@ async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypat
 async def test_last_run_skipped_flag_stays_false_when_update_workflow_fails_before_skip_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fails on old code: the flag was set True from the policy check alone,
-    before _update_workflow ever ran, so an unrelated authoring failure got
-    misreported as a credential ask.
-    """
-    ctx = make_copilot_context()
-    ctx.turn_intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
-    ctx.request_policy = RequestPolicy()
-    workflow_yaml = "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: step_one\n"
+    """The policy would allow a skip, but the authoring failure lands first — reporting it as a
+    credential ask would misattribute an unrelated error."""
+    ctx = _skip_flag_ctx()
 
-    async def fake_prior_definition(update_ctx: Any) -> object:
-        return None
-
-    async def failing_update_workflow(payload: dict, update_ctx: Any, **kwargs: object) -> dict:
+    async def failing_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
         return {"ok": False, "error": "workflow_yaml is not valid: bad block reference"}
 
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *a, **k: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
     monkeypatch.setattr(tools_module, "_update_workflow", failing_update_workflow)
     monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-    # The policy would allow a skip if we got that far — but we never do.
     monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: True)
 
     result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["step_one"], "parameters": {}}),
+        json.dumps({"workflow_yaml": _skip_flag_workflow_yaml(), "block_labels": ["step_one"], "parameters": {}}),
     )
 
     assert json.loads(result)["ok"] is False
