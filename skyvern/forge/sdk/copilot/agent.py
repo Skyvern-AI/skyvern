@@ -190,7 +190,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
     _browser_context_is_attachable,
-    cache_copilot_author_time_gate_log_only_ids,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import SECRET_KEYWORD_ASSIGNMENT_PATTERN
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
@@ -4044,23 +4043,20 @@ async def _translate_to_agent_result(
             # The final-output policy pass still runs below; leave last_workflow
             # / last_workflow_yaml unchanged until this candidate survives the
             # inline checks.
+            from skyvern.forge.sdk.copilot.author_time_block import CODE_SAFETY_BLOCK_ID, AuthorTimeBlock
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
+                _code_block_safety_errors,
                 _detect_new_banned_blocks,
                 _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
                 _stale_block_metadata_message,
-                _timing_only_challenge_wait_reject_message,
                 composition_page_evidence_error,
                 workflow_target_url,
             )
             from skyvern.forge.sdk.copilot.tools.banned_blocks import _copilot_banned_block_types
+            from skyvern.forge.sdk.copilot.tools.workflow_update import _human_facing_code_safety_errors
 
-            wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
-            if wait_block_error:
-                user_response = _with_inline_reject_note(user_response, wait_block_error)
-                ctx.last_test_ok = None
-                workflow_yaml = ""
             banned_items = _detect_new_banned_blocks(
                 workflow_yaml,
                 ctx.last_workflow_yaml,
@@ -4069,6 +4065,21 @@ async def _translate_to_agent_result(
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
                 user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items, ctx))
+                workflow_yaml = ""
+            # This surface persists a draft without the update_workflow tool, so it needs the same
+            # code-safety block: unsafe in-page code on a page holding a filled credential is the
+            # one thing a later test-run cannot undo. Constructed as an AuthorTimeBlock rather than
+            # discarded on a bare error string, so this refusal is bound by the same three-identity
+            # check as the tool seam and a new inline gate cannot join it silently.
+            inline_code_safety_errors = _human_facing_code_safety_errors(
+                _code_block_safety_errors(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
+            )
+            if inline_code_safety_errors:
+                inline_code_safety_block = AuthorTimeBlock(
+                    block_id=CODE_SAFETY_BLOCK_ID,
+                    error="\n".join(str(error) for error in inline_code_safety_errors),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_code_safety_block.error)
                 workflow_yaml = ""
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
@@ -5233,29 +5244,6 @@ def _reconcile_turn_end_ownership(
         return result
 
 
-async def _cache_copilot_author_time_gate_log_only_ids(ctx: CopilotContext) -> None:
-    try:
-        resolved_ids = await app.AGENT_FUNCTION.resolve_copilot_author_time_gate_log_only_ids(
-            turn_id=ctx.turn_id,
-            organization_id=ctx.organization_id,
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to resolve Copilot author-time gate log-only registry",
-            turn_id=ctx.turn_id,
-            organization_id=ctx.organization_id,
-            exc_info=True,
-        )
-        resolved_ids = frozenset()
-    cache_copilot_author_time_gate_log_only_ids(ctx, resolved_ids)
-    selected_gate_ids = sorted(ctx.author_time_gate_log_only_ids)
-    LOG.info(
-        "copilot_author_time_gate_log_only_registry_resolved",
-        selected_gate_ids=selected_gate_ids,
-        selected_gate_count=len(selected_gate_ids),
-    )
-
-
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -5473,7 +5461,6 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
-    await _cache_copilot_author_time_gate_log_only_ids(ctx)
     if ctx_sink is not None:
         ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(
