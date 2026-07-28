@@ -18,6 +18,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import DummyLogger, FakeLLMResponse
@@ -94,6 +95,93 @@ async def test_custom_openrouter_client_is_scoped_to_request(
 
     assert openai_client.call_args.kwargs["http_client"].follow_redirects is False
     client.close.assert_awaited_once()
+
+
+def test_openai_prompt_cache_key_is_stable_within_workflow() -> None:
+    context = SkyvernContext(workflow_run_id="workflow-run-123")
+
+    first = api_handler_factory._openai_prompt_cache_key("gpt-5.5", "extract-actions", context)
+    second = api_handler_factory._openai_prompt_cache_key("gpt-5.5", "extract-actions", context)
+
+    assert first == second
+    assert first is not None
+    assert first.startswith("skyvern:v1:")
+    assert "extract-actions" in first
+
+
+def test_openai_prompt_cache_key_partitions_prompt_families() -> None:
+    context = SkyvernContext(workflow_run_id="workflow-run-123")
+
+    planner_key = api_handler_factory._openai_prompt_cache_key("gpt-5.5", "task_v2", context)
+    completion_key = api_handler_factory._openai_prompt_cache_key("gpt-5.5", "task_v2_check_completion", context)
+
+    assert planner_key != completion_key
+
+
+def test_openai_prompt_cache_key_distributes_workflows_across_bounded_shards() -> None:
+    keys = {
+        api_handler_factory._openai_prompt_cache_key(
+            "gpt-5.5", "extract-actions", SkyvernContext(workflow_run_id=f"workflow-run-{index}")
+        )
+        for index in range(100)
+    }
+
+    assert 1 < len(keys) <= api_handler_factory._OPENAI_PROMPT_CACHE_KEY_SHARDS
+
+
+@pytest.mark.parametrize("model_name", ["gemini-3.5-flash", "anthropic/claude-sonnet-4"])
+def test_openai_prompt_cache_key_ignores_non_openai_models(model_name: str) -> None:
+    context = SkyvernContext(workflow_run_id="workflow-run-123")
+
+    assert api_handler_factory._openai_prompt_cache_key(model_name, "extract-actions", context) is None
+
+
+def test_openai_prompt_cache_key_requires_run_scope() -> None:
+    assert api_handler_factory._openai_prompt_cache_key("gpt-5.5", "extract-actions", SkyvernContext()) is None
+
+
+@pytest.mark.asyncio
+async def test_openai_prompt_cache_key_is_forwarded_and_caller_override_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = SkyvernContext(workflow_run_id="workflow-run-123")
+    llm_config = LLMConfig(
+        model_name="gpt-5.5",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.get_config", lambda _: llm_config
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.is_router_config", lambda _: False
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.skyvern_context.current", lambda: context)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+
+    completion_calls: list[dict[str, Any]] = []
+
+    async def mock_acompletion(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+        completion_calls.append(kwargs)
+        return FakeLLMResponse("gpt-5.5")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", AsyncMock(side_effect=mock_acompletion))
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("OPENAI_GPT5_5")
+    await handler(prompt="test prompt", prompt_name="task_v2")
+    await handler(
+        prompt="test prompt",
+        prompt_name="task_v2",
+        parameters={"prompt_cache_key": "caller-supplied-key"},
+    )
+
+    expected_key = api_handler_factory._openai_prompt_cache_key("gpt-5.5", "task_v2", context)
+    assert completion_calls[0]["prompt_cache_key"] == expected_key
+    assert completion_calls[1]["prompt_cache_key"] == "caller-supplied-key"
 
 
 @pytest.mark.asyncio
