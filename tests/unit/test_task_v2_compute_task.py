@@ -281,10 +281,9 @@ class TestComputeCodeSafety:
         task_v2_service._assert_compute_code_safe(code)  # does not raise
 
     def test_format_map_dunder_escape_rejected(self) -> None:
-        # "{x.__class__}".format_map(...) reaches dunders via a string literal is_safe_code can't see.
+        # "{x.__class__}".format_map(...) reaches dunders via a string literal the AST can't see.
         snippet = "leak = '{x.__class__}'.format_map({'x': 1})\nreturn {'output': leak}\n"
         code = task_v2_service._build_compute_code(GATHERED, snippet)
-        CodeBlock.is_safe_code(code)  # is_safe_code does NOT catch the format-string escape
         with pytest.raises(InsecureCodeDetected):
             task_v2_service._assert_compute_code_safe(code)
 

@@ -88,6 +88,7 @@ class PersistentBrowserSession(BaseModel):
     compute_cost: Decimal | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    last_activity_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
