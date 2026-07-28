@@ -15,7 +15,16 @@ vi.mock("@/components/ui/dropdown-menu", () => {
   return {
     DropdownMenu: Pass,
     DropdownMenuContent: Pass,
+    DropdownMenuItem: ({
+      children,
+      onSelect,
+    }: {
+      children: ReactNode;
+      onSelect?: () => void;
+    }) => <button onClick={onSelect}>{children}</button>,
+    DropdownMenuLabel: Pass,
     DropdownMenuPortal: Pass,
+    DropdownMenuSeparator: () => null,
     DropdownMenuSub: Pass,
     DropdownMenuSubContent: Pass,
     DropdownMenuSubTrigger: Pass,
@@ -63,7 +72,7 @@ vi.mock("@/routes/tasks/hooks/useRunTagMutations", () => ({
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 import { RunBulkActionBar } from "./RunBulkActionBar";
-import { RunRowContextMenu } from "./RunRowContextMenu";
+import { RunRowActions } from "./RunRowActions";
 
 class MockResizeObserver {
   observe() {}
@@ -148,21 +157,22 @@ describe("RunBulkActionBar", () => {
   });
 });
 
-describe("RunRowContextMenu", () => {
+describe("RunRowActions", () => {
   it("manages the clicked run and warns when a bulk selection is active", () => {
     const onNavigate = vi.fn();
     render(
-      <RunRowContextMenu
-        workflowRunId="wr_1"
+      <RunRowActions
+        runId="wr_1"
         runPath="/runs/wr_1"
+        taggable
         currentTags={runTagsMap.wr_1}
         tagKeys={[]}
         labelSuggestions={[]}
         selectedCount={2}
         onNavigate={onNavigate}
       >
-        <div>Run row</div>
-      </RunRowContextMenu>,
+        {() => <div>Run row</div>}
+      </RunRowActions>,
     );
 
     expect(screen.getByText(/Acts on this run only/)).toBeTruthy();
