@@ -110,7 +110,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     TurnHalt,
     TurnHaltKind,
     raise_if_turn_halt,
-    stash_repair_ceiling_turn_halt,
+    stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_intent import (
     RequiredContextKey,
@@ -1374,16 +1374,16 @@ class TestVerifiedGoalSatisfiedStop:
             verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
         )
         signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="repair ceiling",
-            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            blocker_kind="loop_detected",
+            agent_steering_text="loop detected",
+            user_facing_reason="I couldn't keep going on this turn.",
             recovery_hint="report_blocker_to_user",
             preserves_workflow_draft=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
         raise_if_turn_halt(ctx, verified=True)
 
@@ -1453,16 +1453,16 @@ class TestVerifiedGoalSatisfiedStop:
             verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
         )
         signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="repair ceiling",
-            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            blocker_kind="loop_detected",
+            agent_steering_text="loop detected",
+            user_facing_reason="I couldn't keep going on this turn.",
             recovery_hint="report_blocker_to_user",
             preserves_workflow_draft=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
         result = await _resolve_wrapped_exception_exit_result(
             ctx,
@@ -1531,16 +1531,16 @@ class TestVerifiedGoalSatisfiedStop:
         # outcome_fully_verified is False and the involuntary halt must not be suppressed.
         ctx.completion_verification_result = None
         signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="repair ceiling",
-            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            blocker_kind="loop_detected",
+            agent_steering_text="loop detected",
+            user_facing_reason="I couldn't keep going on this turn.",
             recovery_hint="report_blocker_to_user",
             preserves_workflow_draft=True,
-            internal_reason_code="repair_ceiling_reached",
+            internal_reason_code="loop_detected_generic",
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
 
         result = await _resolve_wrapped_exception_exit_result(
             ctx,

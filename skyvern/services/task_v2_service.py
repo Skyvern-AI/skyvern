@@ -2169,6 +2169,7 @@ async def mark_task_v2_as_timed_out(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     failure_reason: str | None = None,
+    fallback_workflow_run: WorkflowRun | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
@@ -2176,7 +2177,19 @@ async def mark_task_v2_as_timed_out(
         status=TaskV2Status.timed_out,
     )
     if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+        if fallback_workflow_run is None:
+            # Current callers with a linked run already supply this row. Keep
+            # the lookup for future direct callers so a failed status CAS still
+            # has a safe fallback if the follow-up refresh also fails.
+            fallback_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id,
+                organization_id=organization_id,
+            )
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(
+            workflow_run_id,
+            failure_reason,
+            fallback_workflow_run=fallback_workflow_run,
+        )
 
     # Add task timed out tag to trace
     otel_trace.get_current_span().set_attribute("task.completion_status", "timed_out")
