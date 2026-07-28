@@ -598,20 +598,23 @@ async def test_current_page_inspection_after_browser_action_is_click_reached_onc
     assert ctx.pending_browser_interaction_observation is None
 
 
+class _EmptyPageServer:
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"html": "<html><body></body></html>"}}
+        return {"ok": True, "data": {"result": None}}
+
+
 @pytest.mark.asyncio
-async def test_inspection_budget_steers_progress_check_instead_of_authoring() -> None:
-    ctx = _Ctx(server=object())
+async def test_repeated_structured_inspection_is_not_rationed() -> None:
+    """Understanding a page should not get harder the more inspection it needs; a prior per-turn
+    cap rejected further structured looks and steered the agent onto hand-rolled probes."""
+    ctx = _Ctx(server=_EmptyPageServer())
     ctx.page_inspection_calls_this_turn = 999
 
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
-    assert result["ok"] is False
-    assert "not evidence that scouting is complete" in result["error"]
-    assert "evaluate" in result["error"]
-    assert "get_browser_screenshot" in result["error"]
-    assert "browser action on the current page" in result["error"]
-    assert "Do not author downstream result" in result["error"]
-    assert "Compose from existing evidence" not in result["error"]
+    assert "budget" not in str(result.get("error") or "")
 
 
 @pytest.mark.asyncio

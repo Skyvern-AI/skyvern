@@ -913,6 +913,48 @@ async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clean_up_workflow_preserves_body_success_without_retrying_finally_failure() -> None:
+    service = WorkflowService()
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
+    workflow = _workflow([])
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
+    service.persist_video_data = AsyncMock()  # type: ignore[method-assign]
+    persist_browser_session = AsyncMock()
+    service._persist_workflow_browser_session_if_needed = persist_browser_session  # type: ignore[method-assign]
+    browser_cleanup_result = SimpleNamespace(
+        browser_state=object(),
+        tasks=[],
+        all_workflow_task_ids=[],
+        child_workflow_run_ids=[],
+        close_browser_on_completion=True,
+        browser_session_write_back_attempted=False,
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.analytics") as mock_analytics,
+    ):
+        mock_analytics.capture = MagicMock()
+        mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+
+        await service.clean_up_workflow(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            need_call_webhook=False,
+            browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
+            browser_persistence_status=WorkflowRunStatus.completed,
+            schedule_credential_fallback_retry=False,
+        )
+
+    persist_browser_session.assert_awaited_once()
+    assert persist_browser_session.await_args is not None
+    assert persist_browser_session.await_args.kwargs["workflow_run_status"] == WorkflowRunStatus.completed
+    service._schedule_credential_fallback_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> None:
     # The schedule lives in the finally block: a webhook-preparation failure must not swallow the
     # fallback retry (scheduling was removed from the status markers).
