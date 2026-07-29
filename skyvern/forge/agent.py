@@ -6541,6 +6541,7 @@ class ForgeAgent:
             workflow_run_id=task.workflow_run_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
+            expected_otp_type=OTPType.MAGIC_LINK,
         )
         if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
             return []
@@ -6579,7 +6580,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = await resolve_otp_value(task)
+        otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response
