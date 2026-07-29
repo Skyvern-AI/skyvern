@@ -143,7 +143,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
@@ -829,7 +829,7 @@ async def _persist_captured_download(
                 return _CapturedDownloadPersistence(None, "download_failed")
             if target is None:
                 try:
-                    local_path_value = await download.path()
+                    local_path_value = await resolve_artifact_path(download, timeout)
                     if local_path_value and (local_path := Path(local_path_value)).is_file():
                         if local_path.stat().st_size:
                             return _CapturedDownloadPersistence(local_path, "local_path")
@@ -4946,8 +4946,9 @@ async def handle_download_file_action(
         # Priority 2: If download_url is provided, download from URL
         if action.download_url is not None:
             # the URL is usally requiring login credentials/cookides, so we should use browser navigation to access the URL instead of downloading the file directly
+            validated_url = await asyncio.to_thread(validate_fetch_url, action.download_url)
             try:
-                await page.goto(action.download_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
             except Exception as e:
                 error = str(e)
                 # some cases use this method to download a file. but it will be redirected away soon
