@@ -5,11 +5,12 @@ Two independent guards:
 * ``detect_tool_loop`` fires on strictly consecutive same-identity streaks
   (A-A-A over one tool_step_identity). Resets the moment the identity
   changes, so oscillating and argument-distinct patterns bypass it by design.
-* ``detect_failed_tool_step_loop`` fires on N repeated failures of the
-  same (tool, args) pair, even when other tools dispatch in between.
-  Block-running credential/config failures are keyed by failure category
-  instead, because draft arguments can change while the init failure does not.
-  A successful invocation of the same step resets its counter.
+* ``detect_failed_tool_step_loop`` fires on N block-running credential/config
+  failures, keyed by failure category because draft arguments can change while
+  the init failure does not. It deliberately does not count same-(tool, args)
+  retries: an identical retry means the model learned nothing from the error,
+  which is the error message's problem, not grounds to end the turn.
+  A successful invocation of the same tool resets its counters.
 """
 
 from __future__ import annotations
@@ -216,28 +217,15 @@ def detect_failed_tool_step_loop(
         return None
 
     category_failure = _detect_argument_insensitive_failed_tool_loop(tracker, tool_name, threshold)
-    if category_failure is not None:
-        category, failure_count = category_failure
-        next_attempt = failure_count + 1
-        return (
-            f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
-            f"{failure_count} times with {category}; blocking attempt #{next_attempt}. "
-            "This failure is not tied to the draft arguments. Fix the credential/configuration, "
-            "ask the user, or produce your final JSON response."
-        )
-
-    identity = tool_step_identity(tool_name, arguments)
-    failure_count = tracker.get(identity, 0)
-    next_attempt = failure_count + 1
-    if next_attempt < threshold:
+    if category_failure is None:
         return None
-
+    category, failure_count = category_failure
+    next_attempt = failure_count + 1
     return (
         f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
-        f"{failure_count} consecutive times with these arguments; "
-        f"blocking attempt #{next_attempt}. "
-        "Use different arguments, a DIFFERENT tool, ask the user, "
-        "or produce your final JSON response."
+        f"{failure_count} times with {category}; blocking attempt #{next_attempt}. "
+        "This failure is not tied to the draft arguments. Fix the credential/configuration, "
+        "ask the user, or produce your final JSON response."
     )
 
 
@@ -248,14 +236,14 @@ def record_tool_step_result(
     result: Mapping[str, Any],
     threshold: int = MAX_REPEATED_FAILED_STEP,
 ) -> None:
-    identity = tool_step_identity(tool_name, arguments)
     if result.get("ok", True):
-        tracker.pop(identity, None)
+        tracker.pop(tool_step_identity(tool_name, arguments), None)
         _clear_argument_insensitive_failure_identities(tracker, tool_name)
         return
 
-    identity = _argument_insensitive_failure_identity(tool_name, result) or identity
-    tracker[identity] = min(tracker.get(identity, 0) + 1, threshold)
+    identity = _argument_insensitive_failure_identity(tool_name, result)
+    if identity is not None:
+        tracker[identity] = min(tracker.get(identity, 0) + 1, threshold)
 
 
 def clear_failed_step_tracker_for_tools(

@@ -12,7 +12,6 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
@@ -336,8 +335,6 @@ def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any
         return True
     if _error_text_requires_ask(data, result):
         return True
-    if data.get("active_run_terminal_evidence_detected") is True:
-        return True
     if data.get("skip_reason") == "workflow_credential_inputs_unbound":
         return True
     if data.get("failure_type") == "missing_credential_or_init":
@@ -351,7 +348,6 @@ def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any
         category = entry.get("category")
         if category in {
             "UNRECOVERABLE_TOOL_ERROR",
-            ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
             "ANTI_BOT_DETECTION",
         } and is_carrier_backed_category_entry(entry):
             return True

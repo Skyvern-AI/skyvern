@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -240,7 +241,6 @@ class OutputPolicyReason(StrEnum):
     UNAPPROVED_CREDENTIAL_REFERENCE = "unapproved_credential_reference"
     CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
     UNBACKED_WORKFLOW_DELIVERY_CLAIM = "unbacked_workflow_delivery_claim"
-    MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE = "missing_unvalidated_proposal_affordance"
     MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
     INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
@@ -291,13 +291,12 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
 )
 
 
-# The authoring seam refuses only what the ``credential_scout`` hard block covers, because a raw or
-# broadened credential in a persisted draft is an irreversible disclosure; everything else steers.
-# Each member's surface and the reason it cannot be dropped are in
+# The authoring seam refuses only a credential reference the org has not approved or that reaches
+# wider than the request, because either is an irreversible disclosure once persisted; everything
+# else steers. Each member's surface and the reason it cannot be dropped are in
 # cloud_docs/workflow-copilot/architecture/output-policy-disposition.md.
 _AUTHOR_TIME_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
-        OutputPolicyReason.RAW_SECRET_LEAK,
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
     }
@@ -563,11 +562,10 @@ def evaluate_output_policy(
             unvalidated=unvalidated,
         )
     verdict = OutputPolicyVerdict(output_kind=output_kind)
-    # Scan only proposed output/tool surfaces for hard leaks. The rolling
-    # global context can include prior turn state, so re-scanning it here can
-    # repeatedly block otherwise safe follow-up responses.
     values = [user_response, workflow_yaml, tool_arguments]
-    if any(_contains_raw_secret(value) for value in values):
+    # Only the reply is scanned for a raw secret: rebinding and persistence scrubbing own what
+    # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
+    if _contains_raw_secret(user_response):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
     if _contains_internal_tool_instruction(user_response):
         verdict.add(OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
@@ -579,13 +577,6 @@ def evaluate_output_policy(
     ):
         verdict.add(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
         verdict.add(OutputPolicyReason.MISSING_PROPOSAL_STATE)
-    if (
-        response_type == "REPLY"
-        and has_workflow_proposal
-        and unvalidated
-        and not _has_unvalidated_affordance(user_response)
-    ):
-        verdict.add(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
     if _contains_internal_block_taxonomy_leak(user_response, output_kind, response_type):
         verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_classifier_vocab_leak(user_response):
@@ -626,12 +617,6 @@ def _asks_to_confirm_output_fields(user_response: str | None) -> bool:
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
     message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
-    if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
-        message += (
-            " For saved credentials, bind a credential_id workflow parameter and reference fields as "
-            "`<key>.username`, `<key>.password`, or `await <key>.otp()` for one-time codes; do not split, "
-            "concatenate, or obfuscate literal secrets in workflow code or YAML."
-        )
     return message
 
 
@@ -644,21 +629,20 @@ def _contains_raw_secret(value: Any) -> bool:
                 matched = match.group(0)
                 if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
                     continue
-                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and (
-                    _is_sanctioned_secret_reference(matched)
-                    or _is_sanctioned_secret_reference(_line_containing_match(text, match))
-                ):
+                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and _keyword_assignment_is_exempt(text, match):
                     continue
                 return True
     return False
 
 
+def _line_end_after_match(text: str, match: re.Match[str]) -> int:
+    line_end = text.find("\n", match.end())
+    return len(text) if line_end == -1 else line_end
+
+
 def _line_containing_match(text: str, match: re.Match[str]) -> str:
     line_start = text.rfind("\n", 0, match.start()) + 1
-    line_end = text.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(text)
-    return text[line_start:line_end]
+    return text[line_start : _line_end_after_match(text, match)]
 
 
 def _is_sanctioned_secret_reference(matched: str) -> bool:
@@ -666,6 +650,91 @@ def _is_sanctioned_secret_reference(matched: str) -> bool:
     if rhs_match is None:
         return False
     return bool(_SANCTIONED_SECRET_REFERENCE_RE.match(rhs_match.group(1)))
+
+
+# `token` is the one secret keyword with an unrelated English sense — a lexical token parsed out of
+# page text. The other keywords (password, passcode, secret, api key, bearer, authorization) carry no
+# such second meaning and keep the strict sanctioned-source rule.
+_LEXICAL_TOKEN_LHS_RE = re.compile(r"^[A-Za-z0-9_]*token(?=\s*[:=])", re.I)
+_UNAMBIGUOUS_SECRET_KEYWORD_RE = re.compile(r"password|passcode|api[_ -]?key|secret|bearer|authorization", re.I)
+
+
+def _parse_chain_receiver(node: ast.expr) -> ast.expr | None:
+    """The variable a read/index/method chain is rooted in, or None for anything else — `identity(...)`
+    roots in a free function and `("ghp_...", parts)[0]` in a literal container, so neither counts."""
+    while True:
+        if isinstance(node, (ast.Subscript, ast.Attribute, ast.Await)):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Attribute):
+                return None
+            node = node.func.value
+        else:
+            return node
+
+
+def _parses_a_value_out_of_something(rhs: str) -> bool:
+    """Whether the assigned value is read out of a variable rather than written down: a credential
+    reaches code as a literal, a lexical token is parsed off something in scope (`m.group(1)`).
+    Anything that does not parse as one expression gets no verdict and keeps the keyword match."""
+    candidate = rhs.strip()
+    # On the last line of embedded code the scalar's own closing delimiter rides along.
+    for text in (candidate, candidate.rstrip("\"'")):
+        try:
+            body = ast.parse(text, mode="eval").body
+        except (SyntaxError, ValueError):
+            continue
+        # A bare dotted chain is how a JWT looks, so extraction has to involve an actual call or index.
+        if not any(isinstance(node, (ast.Call, ast.Subscript)) for node in ast.walk(body)):
+            return False
+        if any(_reads_as_a_written_down_secret(node) for node in ast.walk(body)):
+            return False
+        return isinstance(_parse_chain_receiver(body), ast.Name)
+    return False
+
+
+# A delimiter or key a parse chain consumes is short, or carries whitespace or punctuation
+# (`" logs found"`, `"access_token"`). A credential written into the chain is neither.
+_SECRET_SHAPED_LITERAL_LENGTH = 16
+
+
+def _reads_as_a_written_down_secret(node: ast.AST) -> bool:
+    """Whether a literal inside an extraction chain carries a value in rather than naming a
+    delimiter or key — `cache.get("ghp_...")` roots in a variable exactly as a real read does."""
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        return False
+    return len(node.value) >= _SECRET_SHAPED_LITERAL_LENGTH and all(
+        char.isalnum() or char in "-_" for char in node.value
+    )
+
+
+def _keyword_assignment_is_exempt(text: str, match: re.Match[str]) -> bool:
+    matched = match.group(0)
+    line = _line_containing_match(text, match)
+    if _is_sanctioned_secret_reference(matched) or _is_sanctioned_secret_reference(line):
+        return True
+    return any(_is_lexical_token_assignment(matched, reading) for reading in _assignment_readings(text, match))
+
+
+def _assignment_readings(text: str, match: re.Match[str]) -> list[str]:
+    """The assignment as the whole line, as the text from the keyword on, and — when the code is
+    embedded in a quoted YAML scalar — as the single escaped segment carrying it.
+
+    Only the YAML decoder knows whether an embedded ``\\n`` ends a line or is code data, so both
+    readings are offered and either one showing an extraction exempts the match. Reading from the
+    keyword matters because a YAML key's own colon precedes the code on a scalar's opening line.
+    """
+    from_keyword = text[match.start() : _line_end_after_match(text, match)]
+    escaped_segment = from_keyword.split("\\n")[0].replace('\\"', '"').replace("\\'", "'")
+    return [_line_containing_match(text, match), from_keyword, escaped_segment]
+
+
+def _is_lexical_token_assignment(matched: str, assignment: str) -> bool:
+    if not _LEXICAL_TOKEN_LHS_RE.match(matched) or _UNAMBIGUOUS_SECRET_KEYWORD_RE.search(assignment):
+        return False
+    # The keyword pattern ends at the first whitespace, so the rest of the line carries the expression.
+    rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(assignment)
+    return rhs_match is not None and _parses_a_value_out_of_something(rhs_match.group(1))
 
 
 def _contains_internal_tool_instruction(user_response: str | None) -> bool:

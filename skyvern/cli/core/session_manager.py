@@ -75,6 +75,7 @@ class SessionState:
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
 _global_session: SessionState | None = None
 _stateless_http_mode = False
+_stdio_local_file_access_enabled = False
 
 # Process-wide registry for copilot browser sessions. Keyed by browser_session_id.
 # This bypasses ContextVar propagation issues when FastMCP runs tool handlers
@@ -305,6 +306,15 @@ def set_stateless_http_mode(enabled: bool) -> None:
 
 def is_stateless_http_mode() -> bool:
     return _stateless_http_mode
+
+
+def set_stdio_local_file_access_enabled(enabled: bool) -> None:
+    global _stdio_local_file_access_enabled
+    _stdio_local_file_access_enabled = enabled
+
+
+def is_stdio_local_file_access_enabled() -> bool:
+    return _stdio_local_file_access_enabled
 
 
 def _api_key_hash(api_key: str | None) -> str | None:
