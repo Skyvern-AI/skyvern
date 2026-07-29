@@ -6,7 +6,7 @@ import asyncio
 import json
 import typing as t
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -229,6 +229,35 @@ class TestExecutionChannelHelpers:
         with pytest.raises(ValueError):
             ExecutionChannel._normalize_url("file:///etc/passwd")
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        ["http://127.0.0.1:8000/", "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/admin"],
+    )
+    async def test_navigate_refuses_internal_destination(self, url: str) -> None:
+        """The live-session navigate control renders the response, so an internal host must fail closed."""
+        channel = ExecutionChannel(vnc_channel=MagicMock(identity={"client_id": "abc"}))
+        channel.page = MagicMock()
+        channel.page.goto = AsyncMock()
+
+        with pytest.raises(Exception):
+            await channel.navigate(url)
+
+        channel.page.goto.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_navigate_uses_the_validated_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        validate = MagicMock(return_value="https://example.test/validated")
+        monkeypatch.setattr("skyvern.forge.sdk.routes.streaming.channels.execution.validate_fetch_url", validate)
+        channel = ExecutionChannel(vnc_channel=MagicMock(identity={"client_id": "abc"}))
+        channel.page = MagicMock()
+        channel.page.goto = AsyncMock()
+
+        await channel.navigate("example.test")
+
+        validate.assert_called_once_with("https://example.test")
+        assert channel.page.goto.call_args[0][0] == "https://example.test/validated"
+
     @pytest.mark.parametrize("url", ["", "   "])
     def test_normalize_url_rejects_empty_url(self, url: str) -> None:
         with pytest.raises(ValueError, match="URL must not be empty"):
@@ -267,7 +296,11 @@ class TestExecutionChannelHelpers:
         channel = ExecutionChannel(vnc_channel=vnc_channel)
         channel.page = page
 
-        await channel.navigate("example.com")
+        with patch(
+            "skyvern.forge.sdk.routes.streaming.channels.execution.validate_fetch_url",
+            side_effect=lambda url: url,
+        ):
+            await channel.navigate("example.com")
         await channel.reload()
         await channel.go_back()
         await channel.go_forward()
