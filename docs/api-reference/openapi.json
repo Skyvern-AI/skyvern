@@ -1440,6 +1440,7 @@
             "description": "Invalid tag key or value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "apply_run_tags"
       },
       "get": {
@@ -1508,6 +1509,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tags"
       }
     },
@@ -1592,6 +1594,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_run_tag"
       }
     },
@@ -1713,6 +1716,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tag_history"
       }
     },
@@ -1770,6 +1774,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_tag_keys"
       }
     },
@@ -1840,6 +1845,7 @@
             "description": "Description too long"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_tag_key"
       },
       "delete": {
@@ -1908,6 +1914,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
@@ -1983,6 +1990,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_tag_values"
       },
       "post": {
@@ -2040,6 +2048,7 @@
             "description": "Invalid key, value, or color"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_tag_value"
       }
     },
@@ -2113,6 +2122,7 @@
             "description": "Invalid palette color"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_tag_value"
       },
       "delete": {
@@ -2191,6 +2201,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_tag_value"
       }
     },
@@ -2267,6 +2278,7 @@
             "description": "Invalid value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "rename_tag_value"
       }
     },
@@ -2606,6 +2618,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tag_suggestions"
       }
     },
@@ -4843,6 +4856,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_custom_llms"
       },
       "post": {
@@ -4904,6 +4918,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_custom_llm"
       }
     },
@@ -4978,6 +4993,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_custom_llm"
       },
       "delete": {
@@ -5040,6 +5056,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_custom_llm"
       }
     },
@@ -5309,6 +5326,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_script"
       },
       "get": {
@@ -5396,6 +5414,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_scripts"
       }
     },
@@ -5463,6 +5482,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_script"
       }
     },
@@ -5540,6 +5560,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "deploy_script"
       }
     },
@@ -5604,7 +5625,8 @@
               }
             }
           }
-        }
+        },
+        "x-hidden": true
       }
     },
     "/v1/sdk/run_action": {
@@ -5938,6 +5960,7 @@
             "description": "Invalid tag key or value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "apply_workflow_tags"
       },
       "get": {
@@ -6006,6 +6029,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_workflow_tags"
       }
     },
@@ -6090,6 +6114,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_workflow_tag"
       }
     },
@@ -6211,6 +6236,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_workflow_tag_history"
       }
     },

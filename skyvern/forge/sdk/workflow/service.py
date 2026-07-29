@@ -18,6 +18,7 @@ from hashlib import sha256
 from typing import Any, Literal, cast
 
 import structlog
+from jinja2 import meta as jinja2_meta
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 # Import LockError for specific exception handling; fallback for OSS without redis
@@ -45,6 +46,7 @@ from skyvern.exceptions import (
     BrowserSessionNotRenewable,
     DisabledBlockExecutionError,
     InvalidCredentialId,
+    InvalidWorkflowParameter,
     MissingValueForParameter,
     ScriptTerminationException,
     SkyvernException,
@@ -90,6 +92,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
+from skyvern.forge.sdk.workflow.context_manager import jinja_sandbox_env
 from skyvern.forge.sdk.workflow.credential_fallback import (
     VALID_FALLBACK_TRIGGERS,
     maybe_start_credential_fallback_retry,
@@ -196,9 +199,14 @@ from skyvern.services.script_review_cap import (
 )
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
-from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import (
+    PreparedWorkflowWebhook,
+    deliver_webhook_with_retries,
+    describe_delivery_error,
+)
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
+from skyvern.utils.strings import is_uuid
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_state import BrowserState
@@ -1794,6 +1802,7 @@ class WorkflowService:
                 )
 
                 parameter_values = {param.key: value for param, value in workflow_parameter_values}
+                await self._validate_bitwarden_item_ids(workflow=workflow, parameter_values=parameter_values)
                 run_credential_parameter_overrides = await self._apply_run_credential_parameter_overrides(
                     workflow=workflow,
                     workflow_run=workflow_run,
@@ -1887,6 +1896,53 @@ class WorkflowService:
         if isinstance(error, IntegrityError):
             return "value cannot be null"
         return "database error while saving parameter value"
+
+    async def _validate_bitwarden_item_ids(self, workflow: Workflow, parameter_values: dict[str, Any]) -> None:
+        # BitwardenService rejects non-UUID item IDs, so a value already known at run creation and
+        # not a UUID can only produce a run that fails at context init — reject it here instead,
+        # mirroring WorkflowRunContext._resolve_parameter_value (which needs a worker-side context).
+        # Values only resolvable at run time (outputs, context values) are skipped.
+        defined_keys = {parameter.key for parameter in workflow.workflow_definition.parameters}
+        output_keys: set[str] | None = None
+        for parameter in workflow.workflow_definition.parameters:
+            if not isinstance(parameter, (BitwardenLoginCredentialParameter, BitwardenCreditCardDataParameter)):
+                continue
+            source = parameter.bitwarden_item_id
+            if not source:
+                continue
+            if source in parameter_values:
+                candidate = parameter_values[source]
+            elif source in defined_keys:
+                continue
+            else:
+                if source.endswith("_output"):
+                    if output_keys is None:
+                        output_keys = {
+                            output_parameter.key
+                            for output_parameter in await self.get_workflow_output_parameters(
+                                workflow_id=workflow.workflow_id
+                            )
+                        }
+                    if source in output_keys:
+                        continue
+                try:
+                    referenced_keys = jinja2_meta.find_undeclared_variables(jinja_sandbox_env.parse(source))
+                    if not referenced_keys <= parameter_values.keys():
+                        continue
+                    candidate = jinja_sandbox_env.from_string(source).render(parameter_values)
+                except Exception:
+                    continue
+            if not candidate:
+                # A falsy login item ID means "no item filter" at secret-fetch time, but the
+                # credit-card path requires an item ID and fails context init on a falsy value.
+                if isinstance(parameter, BitwardenLoginCredentialParameter):
+                    continue
+            if not isinstance(candidate, str) or not is_uuid(candidate):
+                raise InvalidWorkflowParameter(
+                    expected_parameter_type="Bitwarden item ID (UUID)",
+                    value=str(candidate),
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                )
 
     async def _resolve_and_stamp_run_seed(
         self,
@@ -8950,13 +9006,14 @@ class WorkflowService:
                 "Workflow webhook delivery failed after attempting delivery",
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
-                error=str(e),
+                organization_id=webhook.organization_id,
+                error=describe_delivery_error(e),
                 exc_info=True,
             )
             try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
                     workflow_run_id=webhook.workflow_run_id,
-                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {e}",
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(e)}",
                 )
             except Exception:
                 LOG.warning(
@@ -9053,11 +9110,10 @@ class WorkflowService:
                     upload_keys.add(upload_key)
                 continue
 
-            # No pre-registered artifact row: a recording attached at browser teardown
-            # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
-            # Upload by path so the bytes stream straight from disk to storage.
+            # A teardown-attached recording has no pre-registered artifact row.
+            # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
             video_path = video_artifact.video_path
-            if not video_path or not os.path.exists(video_path):
+            if not video_artifact.video_data and (not video_path or not os.path.exists(video_path)):
                 continue
             if not last_step_resolved:
                 last_step_resolved = True
@@ -9068,16 +9124,23 @@ class WorkflowService:
                     )
             if last_step is None:
                 LOG.warning(
-                    "Cannot persist path-based recording: no latest step for workflow run",
+                    "Cannot persist recording: no latest step for workflow run",
                     workflow_run_id=workflow_run.workflow_run_id,
                     video_path=video_path,
                 )
                 continue
-            artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                step=last_step,
-                artifact_type=ArtifactType.RECORDING,
-                path=video_path,
-            )
+            if video_artifact.video_data:
+                artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                    step=last_step,
+                    artifact_type=ArtifactType.RECORDING,
+                    data=video_artifact.video_data,
+                )
+            else:
+                artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                    step=last_step,
+                    artifact_type=ArtifactType.RECORDING,
+                    path=video_path,
+                )
             video_artifact.video_artifact_id = artifact_id
             upload_keys.add(last_step.task_id)
         if upload_keys:

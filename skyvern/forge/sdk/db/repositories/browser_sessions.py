@@ -53,6 +53,11 @@ _VISIBLE_TO_CUSTOMER = or_(
     PersistentBrowserSessionModel.browser_address.isnot(None),
 )
 
+_VENDOR_HELD = and_(
+    PersistentBrowserSessionModel.upstream_cdp_url.isnot(None),
+    PersistentBrowserSessionModel.browser_address.is_(None),
+)
+
 
 class BrowserSessionsRepository(BaseRepository):
     """Database operations for browser profiles and persistent browser sessions."""
@@ -696,6 +701,38 @@ class BrowserSessionsRepository(BaseRepository):
             await session.commit()
             await session.refresh(browser_session)
             return PersistentBrowserSession.model_validate(browser_session)
+
+    @db_operation("get_stale_vendor_held_browser_sessions")
+    async def get_stale_vendor_held_browser_sessions(
+        self,
+        *,
+        stale_before: datetime,
+        limit: int,
+    ) -> list[PersistentBrowserSession]:
+        """Vendor-held rows whose proxy lease has aged past ``stale_before``, oldest first.
+
+        The lease is ``last_activity_at`` — the proxy restamps it while it relays client commands,
+        so it ages by itself the moment the owning process stops, whether that was graceful or a
+        SIGKILL. ``started_at`` covers a session that died before its first relayed command. When
+        both are NULL the COALESCE comparison is NULL and the row is excluded: a row that cannot be
+        dated is never reaped.
+        """
+        async with self.Session() as session:
+            lease_at = func.coalesce(
+                PersistentBrowserSessionModel.last_activity_at,
+                PersistentBrowserSessionModel.started_at,
+            )
+            query = (
+                select(PersistentBrowserSessionModel)
+                .filter(_VENDOR_HELD)
+                .filter_by(deleted_at=None, completed_at=None)
+                .filter(PersistentBrowserSessionModel.status.not_in(FINAL_STATUSES))
+                .filter(lease_at < stale_before)
+                .order_by(lease_at)
+                .limit(limit)
+            )
+            rows = (await session.scalars(query)).all()
+            return [PersistentBrowserSession.model_validate(row) for row in rows]
 
     @db_operation("get_persistent_browser_session_unscoped")
     async def get_persistent_browser_session_unscoped(self, session_id: str) -> PersistentBrowserSession | None:
