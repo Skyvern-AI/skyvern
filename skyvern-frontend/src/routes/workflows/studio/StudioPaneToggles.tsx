@@ -1,11 +1,19 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
+import { CheckIcon, CopyIcon } from "@radix-ui/react-icons";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { Status } from "@/api/types";
+import { copyText } from "@/util/copyText";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
@@ -65,9 +73,10 @@ function useLabelsCollapsed(): boolean {
 /**
  * The studio's pane toggles, top-center in the top bar. Copilot, Editor and
  * Browser are peer TOGGLES (multi-active — each opens or closes its pane). The
- * run pane's tab is different: it's the "Past Runs" selector — clicking always
- * opens a run-history popover (it never toggles the pane), and picking a run
- * opens/retargets the run pane. Labels collapse to icons below xl so the
+ * run pane's tab is different: it's the run selector — labeled with the
+ * inspected run ("View Run: wr_…", falling back to "Past Runs"), clicking
+ * always opens a run-history popover (it never toggles the pane), and picking
+ * a run opens/retargets the run pane. Labels collapse to icons below xl so the
  * cluster never crowds the title or the run actions.
  */
 export function StudioPaneToggles() {
@@ -78,9 +87,24 @@ export function StudioPaneToggles() {
   );
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
 
-  const { runStatus } = useStudioRunSignals();
+  const { runId, runStatus } = useStudioRunSignals();
+  const workflowPermanentId = useWorkflowPermanentId();
   const labelsCollapsed = useLabelsCollapsed();
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
+  const [runLinkCopied, setRunLinkCopied] = useState(false);
+
+  // Copies the run's shareable deep link (?wr= names the run) — the thing
+  // people actually paste around — not just the raw id.
+  const copyRunLink = async () => {
+    if (!runId || runLinkCopied) {
+      return;
+    }
+    await copyText(
+      `${window.location.origin}/agents/${workflowPermanentId}/studio?wr=${runId}`,
+    );
+    setRunLinkCopied(true);
+    setTimeout(() => setRunLinkCopied(false), 1500);
+  };
 
   // Picking a run in the selector opens/retargets the run pane. The row's own
   // handler pushes ?wr= first; openPane then merges against the live URL, so
@@ -136,9 +160,9 @@ export function StudioPaneToggles() {
     >
       {STUDIO_PANE_IDS.map((id) => {
         const { icon: Icon } = STUDIO_PANE_META[id];
-        // The run pane's tab reads the static "Past Runs" (railLabel); the
-        // dynamic "Run: wr_…" label lives in the pane header, not the rail.
-        const label = railLabel(id);
+        // The run pane's tab names the inspected run ("View Run: wr_…") so the
+        // run id reads from the top bar; railLabel falls back to "Past Runs".
+        const label = railLabel(id, runId);
         const open = panes.includes(id);
         const blockedByDeletion = paneBlockedByDeletion(id);
         const isRunSelector = id === "overview";
@@ -197,14 +221,55 @@ export function StudioPaneToggles() {
                 aria-label={ariaLabel}
                 tabIndex={id === tabStopId ? 0 : -1}
                 onFocus={() => setFocusedId(id)}
-                className={buttonClassName}
+                className={cn(buttonClassName, "group")}
               >
                 {iconAndDot}
+                {runId ? (
+                  // Hover affordance beside the (fully visible) run id: copy
+                  // the run's URL without opening the selector popover. A span
+                  // because buttons can't nest; stopPropagation keeps the
+                  // popover closed.
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    aria-label="Copy run link"
+                    title="Copy run link"
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      event.preventDefault();
+                      void copyRunLink();
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.stopPropagation();
+                        event.preventDefault();
+                        void copyRunLink();
+                      }
+                    }}
+                    className={cn(
+                      "hidden rounded p-0.5 opacity-0 transition-opacity xl:inline-flex",
+                      "text-muted-foreground hover:text-foreground",
+                      "group-focus-within:opacity-100 group-hover:opacity-100",
+                      "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                      runLinkCopied && "text-foreground opacity-100",
+                    )}
+                  >
+                    {runLinkCopied ? (
+                      <CheckIcon className="size-3" aria-hidden />
+                    ) : (
+                      <CopyIcon className="size-3" aria-hidden />
+                    )}
+                  </span>
+                ) : null}
               </button>
             </PopoverTrigger>
           );
-          const tip =
-            runStatus && !showActivityDot
+          const tip = runId
+            ? `View Run: ${runId}${
+                runStatus ? ` · ${runStatusLabel(runStatus)}` : ""
+              }`
+            : runStatus
               ? `${label} · ${runStatusLabel(runStatus)}`
               : label;
           return (
@@ -213,8 +278,14 @@ export function StudioPaneToggles() {
               open={runsSelectorOpen}
               onOpenChange={setRunsSelectorOpen}
             >
+              {/* Icon-collapsed keeps a label tooltip, composed straight onto
+                  the (never-disabled) button so aria-describedby reaches it;
+                  with labels visible the full id is already in the tab. */}
               {labelsCollapsed ? (
-                <ControlTooltip content={tip}>{trigger}</ControlTooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+                  <TooltipContent side="bottom">{tip}</TooltipContent>
+                </Tooltip>
               ) : (
                 trigger
               )}
