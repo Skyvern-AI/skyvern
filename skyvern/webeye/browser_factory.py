@@ -76,6 +76,17 @@ class ParsedBrowserHeaders:
     enable_download: bool  # Whether download interception is enabled
 
 
+# Boolean header flags arrive as strings; accept the common truthy spellings
+# (trimmed and case-insensitive) so " true ", "1", and "yes" all enable a flag
+# while "false", "0", or any other value leaves it off.
+_TRUTHY_HEADER_VALUES = frozenset({"true", "1", "yes", "y", "on"})
+
+
+def _header_flag_is_truthy(value: str) -> bool:
+    """Interpret a header string as a boolean flag, tolerant of whitespace and case."""
+    return value.strip().lower() in _TRUTHY_HEADER_VALUES
+
+
 def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrowserHeaders:
     """Parse extra HTTP headers and extract internal Skyvern headers.
 
@@ -96,9 +107,9 @@ def parse_extra_headers(extra_http_headers: dict[str, str] | None) -> ParsedBrow
         for key, value in extra_http_headers.items():
             key_lower = key.lower()
             if key_lower == FRESH_CONTEXT_HEADER.lower():
-                use_fresh_context = value.lower() == "true"
+                use_fresh_context = _header_flag_is_truthy(value)
             elif key_lower == "enable_download":
-                enable_download = bool(value)
+                enable_download = _header_flag_is_truthy(value)
             else:
                 headers[key] = value
 

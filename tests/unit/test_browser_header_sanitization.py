@@ -6,7 +6,7 @@ context creation outright (SKY-8929). sanitize_browser_headers drops the bad nam
 launch survives with the valid headers intact.
 """
 
-from skyvern.webeye.browser_factory import sanitize_browser_headers
+from skyvern.webeye.browser_factory import FRESH_CONTEXT_HEADER, parse_extra_headers, sanitize_browser_headers
 
 
 class TestSanitizeBrowserHeaders:
@@ -51,3 +51,42 @@ class TestSanitizeBrowserHeaders:
     def test_drops_value_with_newline_or_null(self) -> None:
         result = sanitize_browser_headers({"X-NL": "a\nb", "X-Null": "a\x00b", "X-Ok": "keep"})
         assert result == {"X-Ok": "keep"}
+
+
+class TestParseExtraHeaders:
+    def test_enable_download_truthy_values(self) -> None:
+        # "1" was the shape of the original hack (bool("1") is True) and must keep working,
+        # alongside the other common truthy spellings.
+        for truthy in ("true", "TRUE", "True", "1", "yes", "y", "on", "ON"):
+            assert parse_extra_headers({"enable_download": truthy}).enable_download is True, truthy
+
+    def test_enable_download_trims_surrounding_whitespace(self) -> None:
+        # Regression: " true " was truthy under the old bool(str) hack; a bare
+        # value.lower() == "true" comparison would wrongly read it as False.
+        for truthy in (" true ", "\ttrue\n", " 1 ", " YES "):
+            assert parse_extra_headers({"enable_download": truthy}).enable_download is True, repr(truthy)
+
+    def test_enable_download_false_values_are_not_truthy(self) -> None:
+        # Regression: the value was passed through bool(str), so any non-empty
+        # string (including "false"/"0"/"no"/"disabled") enabled downloads.
+        for falsy in ("false", "FALSE", "0", "no", "n", "off", "disabled", "", "   "):
+            result = parse_extra_headers({"enable_download": falsy})
+            assert result.enable_download is False, repr(falsy)
+
+    def test_enable_download_defaults_false_when_absent(self) -> None:
+        assert parse_extra_headers({"X-Other": "v"}).enable_download is False
+        assert parse_extra_headers(None).enable_download is False
+
+    def test_internal_headers_are_stripped_from_output(self) -> None:
+        result = parse_extra_headers({"enable_download": "true", FRESH_CONTEXT_HEADER: "true", "X-Keep": "v"})
+        assert result.headers == {"X-Keep": "v"}
+        assert result.enable_download is True
+        assert result.use_fresh_context is True
+
+    def test_fresh_context_header_parses_boolean_text(self) -> None:
+        assert parse_extra_headers({FRESH_CONTEXT_HEADER: "true"}).use_fresh_context is True
+        assert parse_extra_headers({FRESH_CONTEXT_HEADER: "false"}).use_fresh_context is False
+
+    def test_fresh_context_header_trims_surrounding_whitespace(self) -> None:
+        # The same trimming applies to the fresh-context flag so " true " is honored.
+        assert parse_extra_headers({FRESH_CONTEXT_HEADER: " true "}).use_fresh_context is True
