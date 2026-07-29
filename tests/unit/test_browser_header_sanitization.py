@@ -54,16 +54,24 @@ class TestSanitizeBrowserHeaders:
 
 
 class TestParseExtraHeaders:
-    def test_enable_download_true(self) -> None:
-        assert parse_extra_headers({"enable_download": "true"}).enable_download is True
-        assert parse_extra_headers({"enable_download": "TRUE"}).enable_download is True
+    def test_enable_download_truthy_values(self) -> None:
+        # "1" was the shape of the original hack (bool("1") is True) and must keep working,
+        # alongside the other common truthy spellings.
+        for truthy in ("true", "TRUE", "True", "1", "yes", "y", "on", "ON"):
+            assert parse_extra_headers({"enable_download": truthy}).enable_download is True, truthy
+
+    def test_enable_download_trims_surrounding_whitespace(self) -> None:
+        # Regression: " true " was truthy under the old bool(str) hack; a bare
+        # value.lower() == "true" comparison would wrongly read it as False.
+        for truthy in (" true ", "\ttrue\n", " 1 ", " YES "):
+            assert parse_extra_headers({"enable_download": truthy}).enable_download is True, repr(truthy)
 
     def test_enable_download_false_values_are_not_truthy(self) -> None:
         # Regression: the value was passed through bool(str), so any non-empty
-        # string (including "false"/"0"/"no") enabled downloads.
-        for falsy in ("false", "FALSE", "0", "no", ""):
+        # string (including "false"/"0"/"no"/"disabled") enabled downloads.
+        for falsy in ("false", "FALSE", "0", "no", "n", "off", "disabled", "", "   "):
             result = parse_extra_headers({"enable_download": falsy})
-            assert result.enable_download is False, falsy
+            assert result.enable_download is False, repr(falsy)
 
     def test_enable_download_defaults_false_when_absent(self) -> None:
         assert parse_extra_headers({"X-Other": "v"}).enable_download is False
@@ -78,3 +86,7 @@ class TestParseExtraHeaders:
     def test_fresh_context_header_parses_boolean_text(self) -> None:
         assert parse_extra_headers({FRESH_CONTEXT_HEADER: "true"}).use_fresh_context is True
         assert parse_extra_headers({FRESH_CONTEXT_HEADER: "false"}).use_fresh_context is False
+
+    def test_fresh_context_header_trims_surrounding_whitespace(self) -> None:
+        # The same trimming applies to the fresh-context flag so " true " is honored.
+        assert parse_extra_headers({FRESH_CONTEXT_HEADER: " true "}).use_fresh_context is True
