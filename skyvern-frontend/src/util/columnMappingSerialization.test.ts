@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatDestinationLabel,
   parseColumnMapping,
   serializeColumnMapping,
   resolveDestination,
@@ -88,6 +89,22 @@ describe("resolveDestination", () => {
     expect(resolveDestination("email", headers)).toBe("B");
   });
 
+  it("resolves a combined destination label (case-insensitive) to its letter", () => {
+    expect(resolveDestination("A - Name", headers)).toBe("A");
+    expect(resolveDestination("a - name", headers)).toBe("A");
+  });
+
+  it("resolves a combined label whose header name contains a separator", () => {
+    const headersWithSeparator = [{ letter: "D", name: "Score - Notes" }];
+    expect(resolveDestination("D - Score - Notes", headersWithSeparator)).toBe(
+      "D",
+    );
+  });
+
+  it("preserves an unmatched combined-looking string", () => {
+    expect(resolveDestination("ZZ - Unknown", headers)).toBe("ZZ - Unknown");
+  });
+
   it("preserves user casing when no header matches and not a pure column letter", () => {
     expect(resolveDestination("  Phone Number  ", [])).toBe("Phone Number");
   });
@@ -100,5 +117,17 @@ describe("resolveDestination", () => {
   it("returns empty string for empty input", () => {
     expect(resolveDestination("", headers)).toBe("");
     expect(resolveDestination("   ", headers)).toBe("");
+  });
+});
+
+describe("formatDestinationLabel", () => {
+  it("formats named and unnamed headers", () => {
+    expect(formatDestinationLabel({ letter: "A", name: "Name" })).toBe(
+      "A - Name",
+    );
+    expect(formatDestinationLabel({ letter: "A", name: "  " })).toBe("A");
+    expect(formatDestinationLabel({ letter: "A", name: " Padded " })).toBe(
+      "A - Padded",
+    );
   });
 });
