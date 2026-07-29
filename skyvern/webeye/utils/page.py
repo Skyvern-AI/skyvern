@@ -23,7 +23,7 @@ from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, S
 from skyvern.forge.sdk.browser_action_preflight import policy_observation_enabled, record_observed_tabs
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
@@ -1448,7 +1448,7 @@ class SkyvernFrame:
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
         loading_indicator_result = "success"
-        with _tracer.start_as_current_span("skyvern.browser.page_ready.loading_indicators") as _li_span:
+        with traced_span(_tracer, "skyvern.browser.page_ready.loading_indicators") as _li_span:
             apply_context_attrs(_li_span)
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
@@ -1464,7 +1464,7 @@ class SkyvernFrame:
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
         network_idle_result = "success"
-        with _tracer.start_as_current_span("skyvern.browser.page_ready.network_idle") as _ni_span:
+        with traced_span(_tracer, "skyvern.browser.page_ready.network_idle") as _ni_span:
             apply_context_attrs(_ni_span)
             _ni_span.set_attribute("timeout_ms", network_idle_timeout_ms)
             try:
@@ -1480,7 +1480,7 @@ class SkyvernFrame:
 
         # 3. Wait for DOM to stabilize
         dom_stability_result = "success"
-        with _tracer.start_as_current_span("skyvern.browser.page_ready.dom_stability") as _ds_span:
+        with traced_span(_tracer, "skyvern.browser.page_ready.dom_stability") as _ds_span:
             apply_context_attrs(_ds_span)
             _ds_span.set_attribute("timeout_ms", dom_stability_timeout_ms)
             _ds_span.set_attribute("stable_ms", dom_stable_ms)
