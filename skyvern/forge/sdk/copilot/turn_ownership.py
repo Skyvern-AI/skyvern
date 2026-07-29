@@ -38,7 +38,6 @@ class TurnClaimant(StrEnum):
     CREDENTIAL_PRIORITY_CHURN = "credential_priority_authoring_churn"
     ACTUATION_OBLIGATION_FILL = "actuation_obligation_fill"
     ACTUATION_OBLIGATION_LOGIN_COMPLETION = "actuation_obligation_login_completion"
-    POST_RUN_PAGE_PATH_INTERACTION = "post_run_page_path_interaction"
     CREDENTIAL_SCOUT_REOPEN = "credential_scout_reopen"
     SYNTHESIZED_BLOCK_PERSISTENCE_FORCE = "synthesized_block_persistence_force"
     CODE_AUTHORING_CHURN = "code_authoring_guardrail_churn"
@@ -69,7 +68,6 @@ _PRECEDENCE_ORDER: tuple[TurnClaimant, ...] = (
     # began; predicate-gated at its call site and bounded by the post-credential commit.
     TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
     # Post-run page-path repair admits only its outcome-bound click/Enter window.
-    TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION,
     # One-shot credential-scout reopen admits evaluate through the persistence gate;
     # predicate-gated at its call site.
     TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
@@ -90,14 +88,12 @@ CLAIMANT_REASON_CODE_FAMILIES: dict[TurnClaimant, frozenset[str]] = {
     TurnClaimant.CREDENTIAL_PRIORITY_CHURN: frozenset({"credential_priority_authoring_churn"}),
     TurnClaimant.ACTUATION_OBLIGATION_FILL: frozenset(),
     TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION: frozenset(),
-    TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION: frozenset(),
     TurnClaimant.CREDENTIAL_SCOUT_REOPEN: frozenset(),
     TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE: frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE}),
     TurnClaimant.CODE_AUTHORING_CHURN: frozenset({"code_authoring_guardrail_churn"}),
     TurnClaimant.LOOP_DETECTED: frozenset(
         {
             "loop_detected_credential_or_parameter_misconfig",
-            "loop_detected_repeated_failed_step",
             "loop_detected_consecutive_same_tool",
             "loop_detected_generic",
             "loop_detected_no_forward_progress_interaction",
@@ -117,12 +113,9 @@ _TRANSIENT_CLAIMANTS = frozenset(
     {
         TurnClaimant.ACTUATION_OBLIGATION_FILL,
         TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
-        TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION,
         TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
     }
 )
-
-_SIGNALLESS_TERMINAL_TURN_HALT_KIND_VALUES = frozenset({"delivered_unverified"})
 
 
 def claimant_outranks(candidate: TurnClaimant, incumbent: TurnClaimant) -> bool:
@@ -203,9 +196,9 @@ def record_gate_precedence_conflict(
 def turn_halt_is_genuinely_terminal(halt: TurnHalt | None) -> bool:
     if halt is None:
         return False
-    if halt.blocker_signal is not None:
-        return blocker_signal_is_genuinely_terminal(halt.blocker_signal)
-    return halt.kind.value in _SIGNALLESS_TERMINAL_TURN_HALT_KIND_VALUES
+    if halt.blocker_signal is None:
+        return False
+    return blocker_signal_is_genuinely_terminal(halt.blocker_signal)
 
 
 def _held_signal_claimant(ctx: AgentContext) -> TurnClaimant | None:

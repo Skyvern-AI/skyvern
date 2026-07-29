@@ -16,8 +16,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     RepairRootCauseIdentity,
     compute_repair_root_cause_signature,
 )
@@ -53,9 +51,7 @@ class DiagnosisFailureType(StrEnum):
     TERMINAL_CHALLENGE_BLOCKER = "terminal_challenge_blocker"
     MISSING_CREDENTIAL_OR_INIT = "missing_credential_or_init"
     REPAIRABLE_BLOCK_FAILURE = "repairable_block_failure"
-    ACTIVE_RUN_TERMINAL_EVIDENCE = "active_run_terminal_evidence"
     UNRECOVERABLE_TOOL_ERROR = "unrecoverable_tool_error"
-    DELIVERED_UNVERIFIED = "delivered_unverified"
     UNKNOWN = "unknown"
 
 
@@ -176,18 +172,11 @@ def build_diagnosis_repair_contract(
     outcome_verified = outcome_fully_verified(ctx)
     completion_verification = getattr(ctx, "completion_verification_result", None)
     completion_verification_failed = _completion_verification_failed(completion_verification)
-    delivered_unverified = bool(
-        run_ok
-        and getattr(ctx, "delivered_unverified_terminal", False) is True
-        and workflow_run_id
-        and workflow_run_id == getattr(ctx, "delivered_unverified_workflow_run_id", None)
-    )
     failure_type = _failure_type(
         run_ok,
         suspicious,
         outcome_verified,
         completion_verification_failed,
-        delivered_unverified,
         failed_blocks,
         categories,
         terminal_challenge_categories,
@@ -243,13 +232,6 @@ def build_diagnosis_repair_contract(
         decision_summary = (
             "Stop retrying because structured evidence shows the workflow path is blocked by a site challenge."
         )
-    elif failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
-        decision_summary = (
-            "Stop the current retry loop: the active run reached the requested browser state, "
-            "but the reusable workflow is not verified end-to-end."
-        )
-    elif failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED:
-        decision_summary = "No repair selected; the latest run returned requested output but it was not verified."
     if (
         next_action == RepairNextAction.NO_CHANGE
         and user_goal_satisfied is True
@@ -258,9 +240,7 @@ def build_diagnosis_repair_contract(
         completion_check = "Current run already satisfies the goal."
     else:
         completion_check = {
-            RepairNextAction.NO_CHANGE: "No repair selected; completion is delivered but not independently verified."
-            if failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED
-            else "No repair selected; completion remains unverified.",
+            RepairNextAction.NO_CHANGE: "No repair selected; completion remains unverified.",
             RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
             RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
         }.get(
@@ -479,7 +459,6 @@ def _failure_type(
     suspicious: bool,
     outcome_verified: bool,
     completion_verification_failed: bool,
-    delivered_unverified: bool,
     failed_blocks: list[str],
     categories: list[str],
     terminal_challenge_categories: list[str],
@@ -509,13 +488,6 @@ def _failure_type(
     ):
         return DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
     if (
-        ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY in categories
-        or data.get("active_run_terminal_evidence_detected") is True
-    ):
-        if outcome_verified and _active_run_terminal_evidence_reason_code(data):
-            return DiagnosisFailureType.NO_FAILURE
-        return DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
-    if (
         category_set & _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES
         or "organization not found" in error_text
         or "workflow not found" in error_text
@@ -530,8 +502,6 @@ def _failure_type(
         return DiagnosisFailureType.NO_FAILURE
     if failed_blocks:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
-    if delivered_unverified:
-        return DiagnosisFailureType.DELIVERED_UNVERIFIED
     if category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if completion_verification_failed:
@@ -543,21 +513,15 @@ def _failure_type(
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
 
 
-def _active_run_terminal_evidence_reason_code(data: dict[str, Any]) -> bool:
-    return _safe_str(data.get("active_run_terminal_evidence_reason_code")) == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
-
-
 def _next_action(
     failure_type: DiagnosisFailureType,
     ctx: CopilotContext,
     data: dict[str, Any],
     repair_context: CodeAuthoringRepairContext | None,
 ) -> RepairNextAction:
-    if failure_type in {DiagnosisFailureType.NO_FAILURE, DiagnosisFailureType.DELIVERED_UNVERIFIED}:
+    if failure_type == DiagnosisFailureType.NO_FAILURE:
         return RepairNextAction.NO_CHANGE
     if failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR:
-        return RepairNextAction.STOP
-    if failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
         return RepairNextAction.STOP
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
         return RepairNextAction.STOP
@@ -645,12 +609,6 @@ def _verification_satisfaction(
 ) -> tuple[bool | None, bool | None]:
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
         return False, False
-    if failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED:
-        return True, False
-    if isinstance(data, dict) and data.get("active_run_terminal_evidence_detected") is True:
-        trace = data.get("active_run_terminal_completion_verification")
-        fully_satisfied = isinstance(trace, dict) and trace.get("fully_satisfied") is True
-        return fully_satisfied, fully_satisfied
     if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
         return False, False
     if outcome_fully_verified(ctx):
@@ -709,7 +667,6 @@ def _prior_repair_attempts(ctx: Any) -> dict[str, int]:
     keys = (
         "repeated_failure_streak_count",
         "failed_test_nudge_count",
-        "probable_site_block_streak_count",
         "per_tool_budget_nudge_count",
         "repeated_action_fingerprint_streak_count",
     )

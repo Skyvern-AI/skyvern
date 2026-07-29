@@ -38,7 +38,7 @@ from typing import Annotated, Any, NoReturn
 
 import pyotp
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response, status
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 from sqlalchemy.exc import IntegrityError
@@ -145,7 +145,12 @@ from skyvern.schemas.workflows import (
     WorkflowParameterYAML,
     WorkflowStatus,
 )
-from skyvern.services.otp_service import OTPValue, parse_otp_login, redact_otp_identifier_for_log
+from skyvern.services.otp_service import (
+    InsufficientCreditsForOTPParse,
+    OTPValue,
+    parse_otp_login,
+    redact_otp_identifier_for_log,
+)
 from skyvern.services.run_service import cancel_workflow_run
 from skyvern.utils.url_validators import validate_url
 
@@ -407,13 +412,19 @@ async def fetch_credential_item_background(item_id: str) -> None:
 
 @legacy_base_router.post(
     "/totp",
-    responses={202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"}},
+    responses={
+        202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"},
+        402: {"description": "Insufficient credits to parse OTP content"},
+    },
 )
 @legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
-    responses={202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"}},
+    responses={
+        202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"},
+        402: {"description": "Insufficient credits to parse OTP content"},
+    },
     summary="Send TOTP code",
     description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
@@ -432,7 +443,10 @@ async def fetch_credential_item_background(item_id: str) -> None:
 @base_router.post(
     "/credentials/totp/",
     response_model=TOTPCode,
-    responses={202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"}},
+    responses={
+        202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"},
+        402: {"description": "Insufficient credits to parse OTP content"},
+    },
     include_in_schema=False,
 )
 async def send_totp_code(
@@ -463,14 +477,26 @@ async def send_totp_code(
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content, type=data.type or OTPType.TOTP)
+    otp_parse_skipped_for_insufficient_credits = False
     parse_exception_type_name: str | None = None
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
         try:
             otp_value = await parse_otp_login(content, curr_org.organization_id, enforced_otp_type=data.type)
+        except InsufficientCreditsForOTPParse:
+            otp_value = None
+            otp_parse_skipped_for_insufficient_credits = True
         except Exception as e:
             otp_value = None
             parse_exception_type_name = type(e).__name__
+
+    if otp_parse_skipped_for_insufficient_credits and (
+        not settings.TOTP_RAW_FALLBACK_ENABLED or len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Insufficient credits to parse OTP content",
+        )
 
     if parse_exception_type_name:
         # parse_otp_login raised, meaning the OTP-extraction dependency (LLM backend)

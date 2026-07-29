@@ -23,9 +23,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY as ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-)
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
@@ -42,7 +39,6 @@ from skyvern.forge.sdk.copilot.workflow_yaml import apply_block_edit, delete_blo
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
-from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import COPILOT_FINAL_REPLY_RESERVE_SECONDS as COPILOT_FINAL_REPLY_RESERVE_SECONDS
@@ -62,7 +58,6 @@ from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
 from .banned_blocks import _record_banned_block_reject_span as _record_banned_block_reject_span
-from .blockers import REPEATED_ACTION_STREAK_ABORT_AT as REPEATED_ACTION_STREAK_ABORT_AT
 from .blockers import _active_block_run_budget_seconds as _active_block_run_budget_seconds
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
 from .blockers import _build_loop_blocker_signal as _build_loop_blocker_signal
@@ -91,11 +86,6 @@ from .completion import _outcome_unverified_reason as _outcome_unverified_reason
 from .completion import (
     _tool_visible_result_after_completion_verification,
 )
-from .composition_capture import (
-    _active_run_terminal_evidence_needs_visual_fallback as _active_run_terminal_evidence_needs_visual_fallback,
-)
-from .composition_capture import _active_run_terminal_evidence_result as _active_run_terminal_evidence_result
-from .composition_capture import _active_run_terminal_evidence_sample as _active_run_terminal_evidence_sample
 from .composition_capture import _capture_composition_evidence as _capture_composition_evidence
 from .composition_capture import (
     _composition_evidence_after_navigation_failure as _composition_evidence_after_navigation_failure,
@@ -190,7 +180,6 @@ from .run_execution import _attach_action_traces as _attach_action_traces
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
-from .run_execution import _detect_probable_site_block_wall as _detect_probable_site_block_wall
 from .run_execution import (
     _diagnosis_repair_tool_error,
     _frontier_run_size_result,
@@ -212,7 +201,6 @@ from .run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from .run_execution import _watchdog_error_message as _watchdog_error_message
-from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog_exit_allows_terminal_promotion
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name

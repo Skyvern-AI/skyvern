@@ -47,15 +47,6 @@ def parsed_ask_refs(value: object) -> list[str]:
     return [ref for ref in value if isinstance(ref, str) and ref]
 
 
-class DeliveredUnverifiedPublicOutputs(dict[str, Any]):
-    """Run-output values explicitly selected for terminal presentation.
-
-    The values remain dynamically shaped JSON until the presentation sanitizer
-    validates them.  The concrete marker prevents arbitrary result-factory
-    callers from minting the public structured-output surface.
-    """
-
-
 class NarrativeDraft(TypedDict):
     blockCount: int
     blockLabels: list[str]
@@ -112,8 +103,6 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
-    # Sanitized JSON boundary for reviewing outputs that were delivered but not independently verified.
-    deliveredUnverifiedObservedOutputs: NotRequired[dict[str, Any]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
@@ -857,17 +846,9 @@ class CopilotContext(AgentContext):
     # per-run pointer resets (``last_run_outcome = None``); cleared only by the
     # workflow-edit evidence reset, which invalidates pre-edit run evidence.
     terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
-    delivered_unverified_terminal: bool = False
-    delivered_unverified_workflow_run_id: str | None = None
-    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=DeliveredUnverifiedPublicOutputs)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
-    # changes deliberately — the frontier fingerprint resets each time the
-    # copilot rewrites the workflow, but the underlying site-block pattern is
-    # shape-independent.
-    probable_site_block_streak_count: int = 0
-    probable_site_block_stop_nudge_count: int = 0
     per_tool_budget_nudge_count: int = 0
     effective_workflow_proxy_location: Any | None = None
     # Labels of navigation blocks that were canceled/failed inside a
