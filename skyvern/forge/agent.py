@@ -58,6 +58,7 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
+    ScreenshotTargetClosed,
     SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
@@ -1401,6 +1402,25 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return step, detailed_output, None
+        except ScreenshotTargetClosed as e:
+            LOG.warning("Browser target closed mid-run, marking the task as failed")
+            await self.fail_task(
+                task,
+                step,
+                "The browser page closed while Skyvern was working on it. This can happen when the site, the browser, or the run itself closes the page mid-run.",
+                browser_state,
+                exception=e,
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
+            )
+            return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
@@ -1724,6 +1744,7 @@ class ForgeAgent:
             FailedToParseActionInstruction,
             ScrapingFailed,
             MissingBrowserStatePage,
+            ScreenshotTargetClosed,
         ):
             raise
 
@@ -3475,6 +3496,11 @@ class ForgeAgent:
                                 if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
                                     screenshot_artifact_id = artifact_data.artifact_model.artifact_id
                                     break
+        except ScreenshotTargetClosed:
+            # Teardown, browser death, or the site closing the tab. HTML capture below reads the same
+            # dead target, so returning here avoids trading this for an ERROR from get_content().
+            LOG.info("Skipping post-action artifacts because the browser target closed")
+            return
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -3758,6 +3784,15 @@ class ForgeAgent:
                             url=task.url,
                         )
                         continue
+                    if isinstance(e, ScreenshotTargetClosed):
+                        LOG.warning(
+                            "All scrape attempts failed because the browser target closed",
+                            total_attempts=len(SCRAPE_TYPE_ORDER),
+                            url=task.url,
+                            step_order=step.order,
+                            step_retry=step.retry_index,
+                        )
+                        raise e
                     LOG.error(
                         "All scrape attempts failed",
                         total_attempts=len(SCRAPE_TYPE_ORDER),
