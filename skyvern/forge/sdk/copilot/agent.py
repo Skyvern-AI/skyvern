@@ -239,7 +239,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
-from skyvern.forge.sdk.trace import apply_context_attrs
+from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -305,7 +305,7 @@ def _copilot_turn_span(
     turn_id: str | None = None,
 ) -> Iterator[Any]:
     tracer = otel_trace.get_tracer("skyvern")
-    with tracer.start_as_current_span(_COPILOT_TURN_SPAN_NAME) as span:
+    with traced_span(tracer, _COPILOT_TURN_SPAN_NAME) as span:
         span.set_attribute("skyvern.span.role", "wrapper")
         span.set_attribute("copilot.turn_index", _derive_turn_index(chat_history, turn_index))
         if turn_id is not None:
@@ -2318,7 +2318,7 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
     )
 
 
-_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED})
 _SCOUTED_SPINE_MISSING_STEPS_PREFIX = "This draft is still missing steps you demonstrated:"
 
 
@@ -5332,7 +5332,7 @@ async def run_copilot_agent(
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     exc_info=True,
                 )
-                turn_span.record_exception(exc)
+                record_span_exception(turn_span, exc, set_error_status=False)
                 ctx = CopilotContext(
                     organization_id=organization_id,
                     workflow_id=chat_request.workflow_id,

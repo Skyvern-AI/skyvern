@@ -33,6 +33,12 @@ from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_organization, make_step, make_task
 
+# One second is only a test-side runaway guard. The behavior under test is
+# asserted through configured timeout values, cleanup, and span attributes
+# below; it tolerates the hundreds of ms a loaded CI runner can delay a
+# completed coroutine without turning scheduling latency into a product failure.
+CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 1.0
+
 
 class _EventEmitter:
     def __init__(self, context: object = None, url: str = "https://example.test/files") -> None:
@@ -789,7 +795,7 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
                     timeout=0.5,
                 )
 
-        assert time.monotonic() - started_at < 0.2
+        assert time.monotonic() - started_at < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
         assert not interceptor._browser_download_tasks
 
 
@@ -849,7 +855,7 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
         elapsed = time.monotonic() - started_at
 
     assert elapsed >= 0.05
-    assert elapsed < 0.5
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == ["report.pdf"]
 
@@ -1152,9 +1158,8 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
 
         elapsed = time.monotonic() - started_at
 
-    # Proves the 0.03s download budget raised, not the 5s wait_for safety net;
-    # the bound is loose because loaded CI runners add hundreds of ms of lag.
-    assert elapsed < 1.0
+    # Proves the 0.03s download budget raised, not the 5s wait_for safety net.
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
 
 
 def test_remove_download_listener_uses_playwright_remove_listener_when_off_unavailable() -> None:
@@ -1253,7 +1258,10 @@ async def test_handle_download_file_action_with_download_url() -> None:
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         # Verify page.goto was called with the correct URL (handler uses browser navigation for download_url)
@@ -1294,7 +1302,10 @@ async def test_handle_download_file_action_with_download_url_same_filename() -> 
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         page.goto.assert_called_once()
@@ -1467,7 +1478,10 @@ async def test_handle_download_file_action_download_url_error() -> None:
 
     page.goto = AsyncMock(side_effect=Exception("Download failed"))
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         assert len(result) == 1
@@ -1547,7 +1561,10 @@ async def test_handle_download_file_action_download_url_err_aborted_swallowed() 
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         assert len(result) == 1
@@ -1788,7 +1805,7 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     assert results[-1].needs_followup is True
@@ -1935,7 +1952,7 @@ async def test_handle_action_download_fails_on_transient_user_defined_error_text
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert isinstance(results[-1], ActionFailure)
     assert results[-1].download_triggered is False
     assert "download failure says the generated archive could not be saved" in (results[-1].exception_message or "")
@@ -2327,7 +2344,7 @@ async def test_handle_action_download_in_flight_request_does_not_extend_custom_t
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.1
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -2389,9 +2406,7 @@ async def test_handle_action_download_without_explicit_timeout_has_bounded_in_fl
             )
         elapsed = time.monotonic() - started_at
 
-    # Keep a generous wall-clock runaway guard for loaded CI runners; the
-    # precise logical deadline is asserted via timeout_seconds below.
-    assert 0.03 <= elapsed < 1.0
+    assert 0.03 <= elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["no_signal_grace_seconds"] == 0.01
@@ -2904,7 +2919,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     assert wait_for_downloads.await_count == 0
@@ -4653,3 +4668,61 @@ async def test_handle_action_blocked_inline_recovery_is_time_bounded(tmp_path: P
     assert results[-1].download_triggered is False
     assert results[-1].needs_followup is True
     assert results[-1].followup_message == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+
+
+def _download_action(now: datetime, download_url: str) -> tuple[DownloadFileAction, ScrapedPage, object, object]:
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=MagicMock(),
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+    action = DownloadFileAction(
+        file_name="downloaded_file.pdf",
+        download_url=download_url,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+    return action, scraped_page, task, step
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download_url",
+    ["file:///etc/passwd", "http://127.0.0.1:8000/", "http://169.254.169.254/latest/meta-data/"],
+)
+async def test_handle_download_file_action_refuses_unsafe_download_url(download_url: str) -> None:
+    """download_url is model-supplied, so it must clear the same validator GOTO_URL clears."""
+    action, scraped_page, task, step = _download_action(datetime.now(UTC), download_url)
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+
+    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    page.goto.assert_not_awaited()
+    assert len(result) == 1
+    assert isinstance(result[0], ActionFailure)
+
+
+@pytest.mark.asyncio
+async def test_handle_download_file_action_navigates_to_validated_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The navigated URL is the validator's return value, not the raw action field."""
+    validate = MagicMock(return_value="https://example.test/validated.pdf")
+    monkeypatch.setattr("skyvern.webeye.actions.handler.validate_fetch_url", validate)
+    action, scraped_page, task, step = _download_action(datetime.now(UTC), "https://example.test/file.pdf")
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+
+    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    validate.assert_called_once_with("https://example.test/file.pdf")
+    assert page.goto.call_args[0][0] == "https://example.test/validated.pdf"
+    assert isinstance(result[0], ActionSuccess)

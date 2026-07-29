@@ -23,7 +23,7 @@ from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, S
 from skyvern.forge.sdk.browser_action_preflight import policy_observation_enabled, record_observed_tabs
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
@@ -88,37 +88,9 @@ def _wrap_js_in_isolated_scope(script: str) -> str:
     # lexical binding with the same name. Scope the script in an IIFE and export via
     # property writes, which never collide; typeof guards drop names the column-0 regex
     # matched inside block comments.
-    # Export via defineProperty, never a bare assignment. A page that installs a setter on one of
-    # these globals BEFORE injection has `globalThis.x = x` hand it our genuine function
-    # synchronously, letting it serve a wrapper from a getter and drive our own builder with
-    # arguments we never passed (SKY-12875 M2: forcing destination capture on in disabled mode).
-    # defineProperty redefines the slot instead of invoking a setter.
     names = sorted(set(_JS_TOP_LEVEL_DECL_RE.findall(script)))
-    exporter = """
-const __skyvernExport = (name, value) => {
-  const existing = Object.getOwnPropertyDescriptor(globalThis, name);
-  if (existing && !existing.configurable) {
-    // A page's own top-level `var element = ...` makes a non-configurable WRITABLE data property,
-    // and several exported names are ordinary words — so this case is ordinary pages, not attack,
-    // and a plain write is correct there (a data property has no setter to invoke). A locked
-    // ACCESSOR is the interposition this export exists to refuse, and a locked read-only slot
-    // would silently leave the page's value in place; both fail loudly instead.
-    if (existing.get || existing.set || !existing.writable) {
-      throw new Error("skyvern: refusing to export over locked global " + name);
-    }
-    globalThis[name] = value;
-    return;
-  }
-  Object.defineProperty(globalThis, name, {
-    value,
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
-};
-"""
-    exports = "\n".join(f'if (typeof {name} !== "undefined") __skyvernExport("{name}", {name});' for name in names)
-    return f"(() => {{\n{script}\n{exporter}\n{exports}\n}})();"
+    exports = "\n".join(f'if (typeof {name} !== "undefined") globalThis.{name} = {name};' for name in names)
+    return f"(() => {{\n{script}\n{exports}\n}})();"
 
 
 def load_js_script() -> str:
@@ -1104,6 +1076,23 @@ class SkyvernFrame:
         js_script = "() => getScrollXY()"
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
+    async def get_open_aria_popup_trigger(self) -> dict | None:
+        """Return structural details of an open ARIA popup trigger on this frame, or None.
+
+        Fails open (returns None) on any evaluation error so screenshot-scroll policy keeps the
+        current scrolling behavior rather than breaking the scrape/action loop. Detection
+        semantics live in getOpenAriaPopupTrigger in domUtils.js.
+        """
+        try:
+            result = await self.evaluate(frame=self.frame, expression="() => getOpenAriaPopupTrigger()")
+        except Exception:
+            LOG.warning(
+                "Failed to detect open ARIA popup trigger; using default scrolling behavior",
+                exc_info=True,
+            )
+            return None
+        return result if isinstance(result, dict) else None
+
     async def get_scroll_width_and_height(self) -> tuple[int, int]:
         js_script = "() => getScrollWidthAndHeight()"
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
@@ -1476,7 +1465,7 @@ class SkyvernFrame:
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
         loading_indicator_result = "success"
-        with _tracer.start_as_current_span("skyvern.browser.page_ready.loading_indicators") as _li_span:
+        with traced_span(_tracer, "skyvern.browser.page_ready.loading_indicators") as _li_span:
             apply_context_attrs(_li_span)
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
@@ -1492,7 +1481,7 @@ class SkyvernFrame:
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
         network_idle_result = "success"
-        with _tracer.start_as_current_span("skyvern.browser.page_ready.network_idle") as _ni_span:
+        with traced_span(_tracer, "skyvern.browser.page_ready.network_idle") as _ni_span:
             apply_context_attrs(_ni_span)
             _ni_span.set_attribute("timeout_ms", network_idle_timeout_ms)
             try:
@@ -1508,7 +1497,7 @@ class SkyvernFrame:
 
         # 3. Wait for DOM to stabilize
         dom_stability_result = "success"
-        with _tracer.start_as_current_span("skyvern.browser.page_ready.dom_stability") as _ds_span:
+        with traced_span(_tracer, "skyvern.browser.page_ready.dom_stability") as _ds_span:
             apply_context_attrs(_ds_span)
             _ds_span.set_attribute("timeout_ms", dom_stability_timeout_ms)
             _ds_span.set_attribute("stable_ms", dom_stable_ms)

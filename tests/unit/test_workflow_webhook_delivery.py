@@ -172,3 +172,18 @@ async def test_execute_workflow_webhook_propagates_pre_delivery_infra_failure(
 
     deliver.assert_not_awaited()
     update_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_webhook_records_exception_type_for_empty_message(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    deliver = AsyncMock(side_effect=httpx.ReadTimeout(""))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    await svc.execute_workflow_webhook(_workflow_run())
+
+    update_run.assert_awaited_once()
+    assert "ReadTimeout" in update_run.await_args.kwargs["webhook_failure_reason"]

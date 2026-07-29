@@ -1763,7 +1763,7 @@ async def require_workflow_tagging(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "apply_workflow_tags"},
     description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
     summary="Apply agent tags",
@@ -1819,7 +1819,7 @@ async def apply_workflow_tags(
     "/workflows/{workflow_permanent_id}/tags/{key}",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_workflow_tag"},
     description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
     summary="Delete agent tag",
     responses={
@@ -1865,7 +1865,7 @@ async def delete_workflow_tag(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_workflow_tags"},
     description="Get the current tag state for a workflow.",
     summary="Get agent tags",
     responses={
@@ -1912,7 +1912,7 @@ async def _build_tags_response(workflow_permanent_id: str, organization_id: str)
     "/workflows/{workflow_permanent_id}/tags/history",
     response_model=TagHistoryResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_workflow_tag_history"},
     description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
     summary="Get agent tag history",
     responses={
@@ -1959,7 +1959,7 @@ async def get_workflow_tag_history(
     "/runs/{workflow_run_id}/tags",
     response_model=RunTagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "apply_run_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "apply_run_tags"},
     description="Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
     summary="Apply run tags",
@@ -2011,7 +2011,7 @@ async def apply_run_tags(
     "/runs/{workflow_run_id}/tags/{key}",
     response_model=RunTagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_run_tag"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_run_tag"},
     description="Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.",
     summary="Delete run tag",
     responses={
@@ -2052,7 +2052,7 @@ async def delete_run_tag(
     "/runs/{workflow_run_id}/tags",
     response_model=RunTagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_run_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tags"},
     description="Get the current tag state for a workflow run.",
     summary="Get run tags",
     responses={
@@ -2096,7 +2096,7 @@ async def _build_run_tags_response(workflow_run_id: str, organization_id: str) -
     "/runs/{workflow_run_id}/tags/history",
     response_model=RunTagHistoryResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_run_tag_history"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tag_history"},
     description="Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.",
     summary="Get run tag history",
     responses={
@@ -2138,7 +2138,7 @@ async def get_run_tag_history(
     "/tag-keys",
     response_model=list[TagKey],
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_tag_keys"},
     description="List all tag keys registered for the organization with their descriptions.",
     summary="List tag keys",
     responses={200: {"description": "Successfully retrieved tag keys"}},
@@ -2160,7 +2160,7 @@ async def list_tag_keys(
     "/tag-keys/{key}",
     response_model=TagKey,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_tag_key"},
     description="Update the description for a tag key.",
     summary="Update tag key",
     responses={
@@ -2197,7 +2197,7 @@ async def update_tag_key(
     "/tag-keys/{key}",
     response_model=TagKeyDeleteResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_tag_key"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_tag_key"},
     description="Delete a tag key from the organization registry and remove that tag from every workflow that "
     "currently has it (cascade). Returns how many workflows the tag was removed from.",
     summary="Delete tag key",
@@ -2237,7 +2237,7 @@ async def delete_tag_key(
     "/tag-values",
     response_model=list[TagValue],
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "list_tag_values"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_tag_values"},
     description="List the palette color and current workflow usage count for each grouped tag (key, value) "
     "for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number "
     "of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
@@ -2270,7 +2270,7 @@ async def list_tag_values(
     "/tag-values",
     response_model=TagValue,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "create_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "create_tag_value"},
     description="Register a grouped tag (key, value) with a palette color before any workflow uses it. "
     "The label shows a zero workflow count until applied to a workflow.",
     summary="Create tag value",
@@ -2305,7 +2305,7 @@ async def create_tag_value(
     "/tag-values/{key}",
     response_model=TagValue,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "update_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_tag_value"},
     description="Recolor a grouped tag (key, value). The value is supplied in the body so values "
     "containing '/' stay addressable. The new color must be a palette name.",
     summary="Update tag value color",
@@ -2347,7 +2347,7 @@ async def update_tag_value(
     "/tag-values/{key}/rename",
     response_model=TagValueRenameResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "rename_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "rename_tag_value"},
     description="Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow "
     "carrying the old label; the new label inherits the old color. Both values ride in the body so values "
     "containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
@@ -2398,7 +2398,7 @@ async def rename_tag_value(
     "/tag-values/{key}",
     response_model=TagValueDeleteResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_tag_value"},
     description="Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it "
     "(cascade). The value rides in the body so values containing '/' stay addressable. Returns how many "
     "workflows the label was removed from.",
@@ -2686,7 +2686,7 @@ async def batch_get_run_tags_post(
     "/run-tag-suggestions",
     response_model=RunTagSuggestionsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_run_tag_suggestions"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tag_suggestions"},
     description="List distinct (key, value) pairs ever set on a run for the organization, sourced from the "
     "run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys "
     "(which are never registered) so pickers can offer them alongside user-defined tags.",

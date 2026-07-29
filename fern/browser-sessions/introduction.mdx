@@ -19,10 +19,12 @@ from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 browser_session = await skyvern.create_browser_session(
+	url="https://example.com",
 	timeout=60,
 )
 ```
 
+- The `url` parameter opens the browser session to that page when the session starts. Omit it to start from a blank page.
 - The `timeout` parameter (`>=5, <=10080`) is the max time in minutes that the browser session can run. By default, the timeout is 60 minutes.
 - The `browser_session_id` the session ID you should note.
 

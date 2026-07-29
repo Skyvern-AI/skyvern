@@ -372,6 +372,49 @@ class TestPersistenceSeam:
 
         assert set(all_registered_secret_values()) == {_FAKE_PASSWORD, _FAKE_OTP}
 
+    def test_importing_this_module_stays_cheap(self) -> None:
+        """This module sits on the logging and span-exception paths.
+
+        `output_utils` costs seconds to import. While it was a module-level import here, the first
+        exception to reach `record_span_exception` in a process paid it inline -- enough to blow
+        wall-clock budgets in whichever request happened to raise first. Keep it lazy.
+        """
+        import ast
+        from pathlib import Path
+
+        source = Path(secret_scrub.__file__).read_text(encoding="utf-8")
+        module_level = {
+            node.module
+            for node in ast.parse(source).body
+            if isinstance(node, ast.ImportFrom) and node.module and node.col_offset == 0
+        }
+
+        assert "skyvern.forge.sdk.copilot.output_utils" not in module_level
+
+    def test_a_dropped_session_does_not_serve_its_values_to_the_next_one(self) -> None:
+        """The cache key must track WHICH session holds values, not just how many there are.
+
+        Aggregate counts collide: one session holding one value looks identical to a different
+        session holding one value, so the dropped session's list was served as live and the new
+        session's credential went unscrubbed.
+        """
+        register_secret_scrub_value(_agent_ctx("pbs_a"), _FAKE_PASSWORD)
+        assert all_registered_secret_values() == [_FAKE_PASSWORD]
+
+        clear_session_scrub_values("pbs_a")
+        register_secret_scrub_value(_agent_ctx("pbs_b"), _FAKE_OTP)
+
+        assert all_registered_secret_values() == [_FAKE_OTP]
+
+    def test_appending_to_a_session_invalidates_the_cache(self) -> None:
+        ctx = _agent_ctx("pbs_a")
+        register_secret_scrub_value(ctx, _FAKE_PASSWORD)
+        assert all_registered_secret_values() == [_FAKE_PASSWORD]
+
+        register_secret_scrub_value(ctx, _FAKE_OTP)
+
+        assert set(all_registered_secret_values()) == {_FAKE_PASSWORD, _FAKE_OTP}
+
     def test_no_registered_values_leaves_the_workflow_alone(self) -> None:
         workflow_yaml = f'code: await page.fill("#password", "{_FAKE_PASSWORD}")\n'
 

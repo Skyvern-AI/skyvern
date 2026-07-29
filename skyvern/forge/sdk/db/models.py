@@ -1085,12 +1085,13 @@ class TOTPCodeModel(Base):
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
     content = Column(String, nullable=False)
-    code = Column(String, nullable=False)
+    code = Column(String)
     source = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
     otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
+    parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
 
 
 class ActionModel(Base):
@@ -1299,6 +1300,22 @@ class PersistentBrowserSessionModel(Base):
             "status",
             desc("created_at"),
         ),
+        # The orphan sweep (SKY-13158) is deliberately cross-organization, so it matches neither
+        # index above. The partial predicate is what does the work: it restricts the index to live
+        # vendor-held rows, a small subset, which is why plain column keys are enough even though
+        # the sweep orders by COALESCE(last_activity_at, started_at).
+        # Do NOT "fix" the keys to that COALESCE expression: alembic cannot reliably compare
+        # expression-based indexes, so an expression key here reads as drift and fails `alembic
+        # check`. Its postgresql_where is never compared, so the partial predicate is safe.
+        Index(
+            "idx_pbs_vendor_held_lease",
+            "last_activity_at",
+            "started_at",
+            postgresql_where=text(
+                "upstream_cdp_url IS NOT NULL AND browser_address IS NULL "
+                "AND completed_at IS NULL AND deleted_at IS NULL"
+            ),
+        ),
     )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
@@ -1331,6 +1348,9 @@ class PersistentBrowserSessionModel(Base):
     compute_cost = Column(Numeric, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    # Last client CDP command seen by the proxy; drives activity-based lease renewal so an
+    # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT).
+    last_activity_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

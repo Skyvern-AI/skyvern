@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
     advance_to_composing,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.copilot.config import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, _composition_get_structured_evidence
@@ -46,6 +48,7 @@ from .scouting import (
     _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
     _actionable_targets_for_result,
     _attach_scout_page_summary,
+    _capture_post_interaction_screenshot,
     _capture_scout_ambiguity,
     _capture_scout_dynamic_row,
     _capture_scout_role_name,
@@ -205,7 +208,36 @@ async def _get_block_schema_post_hook(
             ctx.code_only_code_schema_seen = True
             data["code_only_note"] = _code_only_browser_unavailable_summary()
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
+            demonstrated = _demonstrated_step_sources(ctx)
+            if demonstrated:
+                data["demonstrated_steps"] = demonstrated
     return result
+
+
+def _demonstrated_step_sources(ctx: AgentContext) -> str:
+    """The steps already performed on the page, synthesized into source to build from.
+
+    Invoked exactly as the post-authoring judge invokes it, so the agent reads the source its draft
+    will be compared against rather than a laxer variant of it.
+    """
+    if not ctx.scout_trajectory:
+        return ""
+    try:
+        synthesized = synthesize_code_block(
+            list(ctx.scout_trajectory),
+            strict_selectors=True,
+            reached_download_target=ctx.reached_download_target,
+        )
+    except Exception:
+        LOG.warning("copilot_demonstrated_steps_synthesis_failed", exc_info=True)
+        return ""
+    if synthesized is None:
+        return ""
+    if synthesized.diagnostics.truncated:
+        # Presenting a capped spine as the whole demonstration is how a step goes missing and comes
+        # back as a correction, which is the round-trip this exists to remove.
+        return f"{synthesized.code}\n# NOTE: trajectory truncated — later demonstrated steps are not shown above.\n"
+    return synthesized.code
 
 
 def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | None:
@@ -345,12 +377,17 @@ async def _type_text_pre_hook(
     text = params.get("text")
     selector = str(params.get("selector") or "")
     intent = str(params.get("intent") or "")
-    if should_reject_type_text_value(value=text, selector=selector, intent=intent):
+    # A value already registered as a credential is known to be secret, so it is rejected on that
+    # fact rather than on whether it looks secret — a real password need not, and this one reached a
+    # plaintext username field because it did not.
+    typed_is_registered_secret = isinstance(text, str) and bool(text) and text in set(registered_scrub_values(ctx))
+    if typed_is_registered_secret or should_reject_type_text_value(value=text, selector=selector, intent=intent):
         return {
             "ok": False,
             "error": (
                 "type_text cannot type raw credentials, secrets, OTP/TOTP codes, API keys, tokens, or "
-                "password-like values. Use the saved credential flow instead of inline secret text."
+                "password-like values. Use fill_credential_field with the saved credential and the "
+                "field it belongs in, rather than typing the value into a field yourself."
             ),
         }
     if isinstance(text, str) and text:
@@ -395,10 +432,11 @@ async def _navigate_post_hook(
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
         result["next_step"] = (
-            "Page loaded. You MUST now use evaluate, "
-            "get_browser_screenshot, or click to inspect page content "
+            "Page loaded, and a screenshot of it is attached. Use evaluate or "
+            "inspect_page_for_composition when you need the page's structure or selectors "
             "before responding."
         )
+        await _capture_post_interaction_screenshot(ctx)
         if (
             _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
             and isinstance(ctx, CopilotContext)
@@ -491,6 +529,7 @@ async def _click_post_hook(
         await _attach_reperception_targets_on_non_advancing_click(result, raw, ctx, attempted_selector)
     except Exception:
         LOG.warning("copilot_click_reperception_attach_failed", exc_info=True)
+    await _capture_post_interaction_screenshot(ctx)
     return result
 
 
@@ -682,6 +721,10 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
     return bool(state.get("readonly")), bool(state.get("disabled"))
 
 
+def _significant_character_count(value: str) -> int:
+    return sum(1 for character in value if character.isalnum())
+
+
 async def _verify_scout_type_landed(
     ctx: AgentContext,
     *,
@@ -720,6 +763,22 @@ async def _verify_scout_type_landed(
                 "(cookie/marketing popup) likely consumed the keystrokes or focus. "
                 "Re-inspect the current page and retry typing into the target field; "
                 "the overlay is usually dismissed by that first interaction."
+            ),
+        }
+    # A field holding more than was typed means the text joined a value already there — a re-render
+    # can move a selector onto a neighbouring input, so a second fill appends to the wrong field and
+    # leaves the intended one empty. Count only alphanumerics: a phone/card/date input that inserts
+    # its own separators grows past the typed length without anything having landed in the wrong
+    # field, and rejecting those would fail every auto-formatting form.
+    if isinstance(value, str) and _significant_character_count(value) > typed_length:
+        return {
+            "ok": False,
+            "error": (
+                f"type_text landed in a field that already held a value: {selector!r} now holds "
+                f"{_significant_character_count(value)} characters after typing {typed_length}. The selector "
+                "likely resolved to a different input than intended, leaving the target field empty. "
+                "Re-inspect the current page, confirm which input each value belongs in, clear the field, "
+                "and retry."
             ),
         }
     return None
@@ -854,7 +913,29 @@ async def _evaluate_post_hook(
         observed_data=data,
     )
     await _steer_evaluate_result(ctx, result, url=url)
+    await _widen_thin_evaluate_result(ctx, result, url=url)
     return result
+
+
+_THIN_EVALUATE_RESULT_CHARS = 400
+
+
+async def _widen_thin_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+    """Carry the page's visible text back when a read returned almost nothing.
+
+    A narrow read that lands on the wrong one of several similarly named elements comes back short
+    and plausible, and the next guess is narrow again. A page's whole visible text is usually the
+    size of a few such reads, so answering the thin one with it ends the guessing.
+    """
+    data = result.get("data")
+    if not isinstance(data, dict) or "page_visible_text" in data:
+        return
+    if len(json.dumps(data, default=str)) > _THIN_EVALUATE_RESULT_CHARS:
+        return
+    evidence = await _safe_composition_evidence(ctx, url, timeout_seconds=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
+    excerpt = (evidence or {}).get("visible_text_excerpt")
+    if isinstance(excerpt, str) and excerpt.strip():
+        data["page_visible_text"] = excerpt
 
 
 async def _scroll_post_hook(
