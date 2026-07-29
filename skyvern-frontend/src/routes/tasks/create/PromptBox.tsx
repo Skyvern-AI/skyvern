@@ -26,7 +26,7 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AxiosError } from "axios";
+import { AxiosError, type AxiosResponse } from "axios";
 import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -140,6 +140,35 @@ function buildBlankWorkflowRequest(
   };
 }
 
+function hasWorkflowShape(data: unknown): data is WorkflowApiResponse {
+  if (typeof data !== "object" || data === null) {
+    return false;
+  }
+  const candidate = data as Partial<WorkflowApiResponse>;
+  const definition = candidate.workflow_definition;
+  return (
+    typeof candidate.workflow_permanent_id === "string" &&
+    typeof definition === "object" &&
+    definition !== null &&
+    Array.isArray(definition.blocks)
+  );
+}
+
+// Axios yields a raw string for any 2xx whose body fails JSON.parse, and
+// `"".workflow_definition` is undefined — so an empty body or an edge/auth
+// interstitial reaches onSuccess looking like a workflow. Describe the
+// envelope only; the body may be an interstitial or carry customer data.
+function describeResponseEnvelope(response: AxiosResponse<unknown>): string {
+  const body: unknown = response.data;
+  const parsedAsJson = typeof body === "object" && body !== null;
+  const bodyLength =
+    typeof body === "string"
+      ? body.length
+      : JSON.stringify(body ?? null).length;
+  const contentType = String(response.headers?.["content-type"] ?? "unknown");
+  return `status=${response.status} content_type=${contentType} body_length=${bodyLength} parsed_as_json=${parsedAsJson}`;
+}
+
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
@@ -208,7 +237,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
       const trimmedMaxStepsOverride = maxStepsOverride?.trim();
       const result = await client.post<
         Createv2TaskRequest,
-        { data: WorkflowApiResponse }
+        AxiosResponse<unknown>
       >(
         "/workflows/create-from-prompt",
         {
@@ -220,9 +249,15 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
           : undefined,
       );
 
-      return result;
+      if (!hasWorkflowShape(result.data)) {
+        throw new Error(
+          `create-from-prompt returned an unexpected response shape (${describeResponseEnvelope(result)})`,
+        );
+      }
+
+      return result.data;
     },
-    onSuccess: ({ data: workflow }) => {
+    onSuccess: (workflow) => {
       toast({
         variant: "success",
         title: "Agent Created",
@@ -233,6 +268,8 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         queryKey: ["workflows"],
       });
 
+      // The agent already exists server-side, so nothing between here and
+      // navigate() may strand the user on /discover.
       const firstBlock = workflow.workflow_definition.blocks[0];
 
       if (firstBlock) {
@@ -243,7 +280,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
       );
     },
-    onError: (error: AxiosError) => {
+    onError: (error: Error) => {
       toast({
         variant: "destructive",
         title: "Error creating agent from prompt",
