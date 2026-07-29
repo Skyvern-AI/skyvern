@@ -352,3 +352,24 @@ async def test_fill_secret_logs_carry_no_secret_material() -> None:
     assert str(len(SECRET)) not in logged
     assert result.exception_type == "SecretInputMismatch"
     assert SECRET not in (result.exception_message or "")
+
+
+@pytest.mark.asyncio
+async def test_fill_secret_threads_engine_selection_to_both_readbacks() -> None:
+    selection = object()
+    element = _make_secret_element([])
+    with patch(
+        "skyvern.webeye.actions.handler.get_input_value",
+        new=AsyncMock(side_effect=[ROTATED, SECRET]),
+    ) as get_input_value:
+        result = await _fill_secret_with_readback(
+            skyvern_element=element,
+            tag_name="input",
+            text=SECRET,
+            input_type="password",
+            maxlength=None,
+            engine_selection=selection,
+        )
+
+    assert result is None
+    assert [call.kwargs["engine_selection"] for call in get_input_value.await_args_list] == [selection, selection]

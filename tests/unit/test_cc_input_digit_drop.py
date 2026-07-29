@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -174,6 +174,26 @@ async def test_fill_card_number_fails_when_retry_readback_masked() -> None:
     assert isinstance(result, ActionFailure)
     assert result.exception_type == "CardNumberInputMismatch"
     element.input_fill.assert_awaited_once_with(text=VISA_16)
+
+
+@pytest.mark.asyncio
+async def test_fill_card_number_threads_engine_selection_to_both_readbacks() -> None:
+    selection = object()
+    element = _make_card_element([])
+    with patch(
+        "skyvern.webeye.actions.handler.get_input_value",
+        new=AsyncMock(side_effect=["4539 5876 6214 6837", VISA_16]),
+    ) as get_input_value:
+        result = await _fill_card_number_with_readback(
+            skyvern_element=element,
+            tag_name="input",
+            text=VISA_16,
+            expected_digits=VISA_16,
+            engine_selection=selection,
+        )
+
+    assert result is None
+    assert [call.kwargs["engine_selection"] for call in get_input_value.await_args_list] == [selection, selection]
 
 
 @pytest.mark.asyncio
