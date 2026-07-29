@@ -224,6 +224,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
+        "Deciding which of two page states you are in costs no wait: wait once on `a.or_(b).first`, then branch with `is_visible()` or `count()`. A `wait_for` on a branch that may legitimately be absent spends its whole timeout proving the absence, and every repair attempt pays it again.",
         "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
     ]
 
@@ -257,10 +258,13 @@ Runtime facts:
 - A `credential_id` workflow parameter resolves to a credential object with
   `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
   `fill_credential_field`, never embed literal secrets.
-- Credentialed login code must be idempotent. After `goto`, wait for either the
-  login form or an already-authenticated page anchor; only fill username/password
-  when the login fields are visible, and after submit wait for a logged-in page
-  anchor instead of relying only on `networkidle`.
+- Credentialed login code must be idempotent. After `goto`, wait once on the two
+  states together, then branch without waiting again:
+  `await login_form.or_(authenticated_anchor).first.wait_for(state="visible")`,
+  then `if await login_form.is_visible():` to fill username/password. Waiting on the
+  login form by itself spends the entire timeout proving it is absent whenever the
+  session is already authenticated. After submit, wait for a logged-in page anchor
+  instead of relying only on `networkidle`.
 - After a credentialed login submit or navigation commit, call
   `await solve_captcha(page)` before waiting for post-login anchors. This helper
   owns any platform-managed verification challenge; do not locate or interact
