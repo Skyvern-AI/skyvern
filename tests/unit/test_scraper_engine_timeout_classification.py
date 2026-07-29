@@ -166,24 +166,31 @@ async def test_incremental_tree_propagates_non_timeout_without_retry() -> None:
 
 
 def test_resolve_engine_selection_for_task_reads_live_browser_state() -> None:
-    from skyvern.forge import app
-    from skyvern.webeye.actions.handler import resolve_engine_selection_for_task
+    from skyvern.webeye.browser_engine import resolve_engine_selection_for_task
 
     selection = _selection("engine-a", _EngineAError, _EngineATimeout)
     task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
     get_for_task = MagicMock(return_value=SimpleNamespace(engine_selection=selection))
-    with patch.object(app.BROWSER_MANAGER, "get_for_task", get_for_task):
-        assert resolve_engine_selection_for_task(task) is selection  # type: ignore[arg-type]
+    browser_manager = SimpleNamespace(get_for_task=get_for_task)
+    assert resolve_engine_selection_for_task(task, browser_manager) is selection  # type: ignore[arg-type]
     get_for_task.assert_called_once_with("tsk_1", workflow_run_id="wr_1")
 
 
 def test_resolve_engine_selection_for_task_returns_none_when_no_browser_state() -> None:
-    from skyvern.forge import app
-    from skyvern.webeye.actions.handler import resolve_engine_selection_for_task
+    from skyvern.webeye.browser_engine import resolve_engine_selection_for_task
 
     task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
-    with patch.object(app.BROWSER_MANAGER, "get_for_task", MagicMock(return_value=None)):
-        assert resolve_engine_selection_for_task(task) is None  # type: ignore[arg-type]
+    browser_manager = SimpleNamespace(get_for_task=MagicMock(return_value=None))
+    assert resolve_engine_selection_for_task(task, browser_manager) is None  # type: ignore[arg-type]
+
+
+def test_resolve_engine_selection_for_task_returns_none_without_task() -> None:
+    from skyvern.webeye.browser_engine import resolve_engine_selection_for_task
+
+    get_for_task = MagicMock()
+    browser_manager = SimpleNamespace(get_for_task=get_for_task)
+    assert resolve_engine_selection_for_task(None, browser_manager) is None  # type: ignore[arg-type]
+    get_for_task.assert_not_called()
 
 
 @pytest.mark.asyncio
