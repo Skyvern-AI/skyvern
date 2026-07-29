@@ -24,6 +24,11 @@ from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.experimentation.transient_ui_capture import (
+    decide_transient_ui_suppression,
+    emit_transient_ui_popup_telemetry,
+    transient_ui_capture_arm,
+)
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
@@ -229,6 +234,7 @@ async def scrape_website(
     support_empty_page: bool = False,
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
+    allow_transient_ui_suppression: bool = False,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -265,6 +271,7 @@ async def scrape_website(
             support_empty_page=support_empty_page,
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
+            allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
     except ScrapingFailedBlankPage:
         raise
@@ -306,6 +313,7 @@ async def scrape_website(
             max_screenshot_number=max_screenshot_number,
             scroll=scroll,
             must_included_tags=must_included_tags,
+            allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
 
 
@@ -433,6 +441,7 @@ async def scrape_web_unsafe(
     support_empty_page: bool = False,
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
+    allow_transient_ui_suppression: bool = False,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -496,6 +505,23 @@ async def scrape_web_unsafe(
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
 
+        # Shadow-detect an open transient popup only on the agent-step scrape (opt-in via
+        # allow_transient_ui_suppression); goal-verification / extraction / error-detection scrapes
+        # keep legacy scrolling. Only the treatment arm suppresses the scroll so the popup survives
+        # into the just-built tree's next action, and only up to a bounded number of consecutive
+        # captures so a stale expanded trigger cannot pin the run at one viewport.
+        popup_trigger: dict | None = None
+        transient_ui_ctx = skyvern_context.current()
+        arm = transient_ui_capture_arm(transient_ui_ctx)
+        suppress_scroll = False
+        suppression_capped = False
+        if allow_transient_ui_suppression and scroll and arm != "off":
+            popup_trigger = await skyvern_frame.get_open_aria_popup_trigger()
+            decision = decide_transient_ui_suppression(transient_ui_ctx, arm, detected=popup_trigger is not None)
+            suppress_scroll = decision.suppress
+            suppression_capped = decision.capped
+        effective_scroll = scroll and not suppress_scroll
+
         # get current x, y position of the page
         x: int | None = None
         y: int | None = None
@@ -515,6 +541,16 @@ async def scrape_web_unsafe(
             _ss_span.set_attribute("max_screenshot_number", max_screenshot_number)
             _ss_span.set_attribute("draw_boxes", draw_boxes)
             _ss_span.set_attribute("scroll", scroll)
+            _ss_span.set_attribute("effective_scroll", effective_scroll)
+            if arm != "off":
+                _ss_span.set_attribute("transient_ui_arm", arm)
+            if popup_trigger is not None:
+                _ss_span.set_attribute("transient_ui_detected", True)
+                emit_transient_ui_popup_telemetry(_ss_span, popup_trigger)
+                if suppress_scroll:
+                    _ss_span.set_attribute("transient_ui_scroll_suppressed", True)
+                if suppression_capped:
+                    _ss_span.set_attribute("transient_ui_suppression_capped", True)
             _scrape_ctx = skyvern_context.current()
             if _scrape_ctx:
                 if _scrape_ctx.scrape_trigger:
@@ -526,7 +562,7 @@ async def scrape_web_unsafe(
                 url=url,
                 draw_boxes=draw_boxes,
                 max_number=max_screenshot_number,
-                scroll=scroll,
+                scroll=effective_scroll,
             )
             _ss_span.set_attribute("screenshot_count", len(screenshots))
             _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))

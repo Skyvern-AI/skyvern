@@ -131,6 +131,25 @@ class SkyvernContext:
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
+    # PRESERVE_TRANSIENT_UI_CAPTURE experiment arm, resolved per run. Tri-state: True=treatment
+    # (suppress a scroll that would dismiss an open transient popup), False=control (shadow-detect
+    # only), None=off (undefined/no-provider/error -> current scrolling behavior).
+    preserve_transient_ui_capture: bool | None = None
+    # Pinned once resolve_transient_ui_capture_arm resolves the arm (including off/None), so a TTL
+    # expiry or mid-run flag ramp cannot flip the arm later in the same run.
+    preserve_transient_ui_capture_resolved: bool = False
+    # Single-flight the first-use provider resolution when parallel blocks/branches share one
+    # context, so it is queried at most once per run (mirrors slim_output_variant_lock).
+    preserve_transient_ui_capture_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Count of CONSECUTIVE agent-step captures the treatment arm has suppressed scrolling on. Co-owned
+    # by the two agent-step capture sites — the agent-step scrape (scrape_web_unsafe with
+    # allow_transient_ui_suppression=True) and the post-action screenshot
+    # (record_artifacts_after_action) — via decide_transient_ui_suppression: incremented when a
+    # capture suppresses, reset to 0 when a qualifying popup is not detected, and frozen at the cap
+    # while a stale expanded trigger keeps matching so later captures fall back to legacy scrolling.
+    # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
+    # extraction / error-detection scrapes never touch it.
+    transient_ui_consecutive_suppressions: int = 0
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
