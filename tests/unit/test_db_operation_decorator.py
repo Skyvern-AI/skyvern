@@ -1,9 +1,9 @@
 """Tests for the @db_operation decorator."""
 
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -172,6 +172,77 @@ async def test_db_operation_log_errors_false_suppresses_logging() -> None:
         mock_log.warning.assert_not_called()
         mock_log.error.assert_not_called()
         mock_log.exception.assert_not_called()
+
+
+class _ExpectedErrorDB:
+    """Declares one condition its callers handle themselves; everything else stays loud."""
+
+    @db_operation("declared_op", expected_errors=(ProgrammingError,))
+    async def raise_declared(self) -> None:
+        raise ProgrammingError("SELECT 1", {}, Exception("relation does not exist"))
+
+    @db_operation("declared_op", expected_errors=(ProgrammingError,))
+    async def raise_undeclared(self) -> None:
+        raise OperationalError("SELECT 1", {}, Exception("connection does not exist"))
+
+
+@pytest.mark.asyncio
+async def test_db_operation_declared_expected_error_logs_debug_not_error() -> None:
+    db = _ExpectedErrorDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(ProgrammingError):
+            await db.raise_declared()
+        mock_log.debug.assert_called_once_with(
+            "ExpectedError",
+            operation="declared_op",
+            error=ANY,
+            error_type="ProgrammingError",
+        )
+        mock_log.exception.assert_not_called()
+        mock_log.error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_undeclared_error_still_logs_exception() -> None:
+    """Declaring one expected condition must not quiet the rest of the operation's failures."""
+    db = _ExpectedErrorDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_undeclared()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="declared_op")
+        mock_log.debug.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_declares_nothing_expected_by_default() -> None:
+    """Operations that don't opt in keep logging every failure at error level."""
+
+    class DefaultDB:
+        @db_operation("default_op")
+        async def raise_programming(self) -> None:
+            raise ProgrammingError("SELECT 1", {}, Exception("relation does not exist"))
+
+    db = DefaultDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(ProgrammingError):
+            await db.raise_programming()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="default_op")
+        mock_log.debug.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_expected_error_still_reraises_unchanged() -> None:
+    """Callers degrade by catching the exception, so the instance must arrive untouched."""
+    raised = ProgrammingError("SELECT 1", {}, Exception("relation does not exist"))
+
+    class ReraiseDB:
+        @db_operation("reraise_op", expected_errors=(ProgrammingError,))
+        async def raise_declared(self) -> None:
+            raise raised
+
+    with pytest.raises(ProgrammingError) as caught:
+        await ReraiseDB().raise_declared()
+    assert caught.value is raised
 
 
 @pytest.mark.asyncio
