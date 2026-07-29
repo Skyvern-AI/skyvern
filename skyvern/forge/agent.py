@@ -122,7 +122,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.submission import shadow as submission_shadow
-from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
+from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -3471,7 +3471,7 @@ class ForgeAgent:
                 # step=None and speculative steps force the non-bundled path.
                 _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.agent.artifact.screenshot_action") as _ss_art_span:
+                with traced_span(_tracer, "skyvern.agent.artifact.screenshot_action") as _ss_art_span:
                     apply_context_attrs(_ss_art_span)
                     _ss_art_span.set_attribute("screenshot_bytes", len(screenshot))
                     _ss_art_span.set_attribute("bundled", _bundled)
@@ -3517,7 +3517,7 @@ class ForgeAgent:
             html_bytes = html.encode("utf-8")
             _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.agent.artifact.html_action") as _html_art_span:
+            with traced_span(_tracer, "skyvern.agent.artifact.html_action") as _html_art_span:
                 apply_context_attrs(_html_art_span)
                 _html_art_span.set_attribute("html_bytes", len(html_bytes))
                 _html_art_span.set_attribute("bundled", _bundled)
@@ -3536,7 +3536,7 @@ class ForgeAgent:
 
         if artifacts:
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.agent.artifact.bulk_create") as _bulk_span:
+            with traced_span(_tracer, "skyvern.agent.artifact.bulk_create") as _bulk_span:
                 apply_context_attrs(_bulk_span)
                 # Count underlying artifacts (main + screenshots per request), not request wrappers.
                 _bulk_span.set_attribute("artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None))
@@ -3559,7 +3559,7 @@ class ForgeAgent:
                 )
             else:
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.agent.artifact.update_action_screenshot_fk") as _fk_span:
+                with traced_span(_tracer, "skyvern.agent.artifact.update_action_screenshot_fk") as _fk_span:
                     apply_context_attrs(_fk_span)
                     try:
                         await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
@@ -4883,7 +4883,7 @@ class ForgeAgent:
 
         if task.organization_id:
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
+            with traced_span(_tracer, "skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
                 apply_context_attrs(_cl_save_span)
                 try:
                     # Keep both finalize and save inside a single timeout budget so a hung
@@ -4966,19 +4966,19 @@ class ForgeAgent:
         await self.async_operation_pool.remove_task(task.task_id)
 
         _tracer = otel_trace.get_tracer("skyvern")
-        with _tracer.start_as_current_span("skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
+        with traced_span(_tracer, "skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
             apply_context_attrs(_cl_br_span)
             await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
             )
 
         # Wait for all tasks to complete before generating the links for the artifacts
-        with _tracer.start_as_current_span("skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
+        with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            with _tracer.start_as_current_span("skyvern.agent.cleanup.webhook") as _cl_wh_span:
+            with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:
                 apply_context_attrs(_cl_wh_span)
                 await self.execute_task_webhook(task=task, api_key=api_key)
 

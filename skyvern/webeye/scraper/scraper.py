@@ -25,7 +25,7 @@ from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
@@ -506,7 +506,7 @@ async def scrape_web_unsafe(
             LOG.warning("Failed to get current x, y position of the page", exc_info=True)
 
         _tracer = otel_trace.get_tracer("skyvern")
-        with _tracer.start_as_current_span("skyvern.browser.scrape_screenshot") as _ss_span:
+        with traced_span(_tracer, "skyvern.browser.scrape_screenshot") as _ss_span:
             apply_context_attrs(_ss_span)
             # Hardcoded since this is an inline span, not a @traced method.
             # Update if scrape_web_unsafe is renamed.
@@ -521,20 +521,15 @@ async def scrape_web_unsafe(
                     _ss_span.set_attribute("scrape_trigger", _scrape_ctx.scrape_trigger)
                 if _scrape_ctx.scrape_screenshots_consumed is not None:
                     _ss_span.set_attribute("screenshots_consumed", _scrape_ctx.scrape_screenshots_consumed)
-            try:
-                screenshots = await SkyvernFrame.take_split_screenshots(
-                    page=page,
-                    url=url,
-                    draw_boxes=draw_boxes,
-                    max_number=max_screenshot_number,
-                    scroll=scroll,
-                )
-                _ss_span.set_attribute("screenshot_count", len(screenshots))
-                _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
-            except Exception as e:
-                _ss_span.record_exception(e)
-                _ss_span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
-                raise
+            screenshots = await SkyvernFrame.take_split_screenshots(
+                page=page,
+                url=url,
+                draw_boxes=draw_boxes,
+                max_number=max_screenshot_number,
+                scroll=scroll,
+            )
+            _ss_span.set_attribute("screenshot_count", len(screenshots))
+            _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
 
         # scroll back to the original x, y position of the page
         if x is not None and y is not None:

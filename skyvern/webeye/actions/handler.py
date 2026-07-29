@@ -112,7 +112,7 @@ from skyvern.forge.sdk.services.credentials import (
     parse_totp_config,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.utils.lean_html import apply_lean_to_tree
@@ -143,7 +143,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
@@ -829,7 +829,7 @@ async def _persist_captured_download(
                 return _CapturedDownloadPersistence(None, "download_failed")
             if target is None:
                 try:
-                    local_path_value = await download.path()
+                    local_path_value = await resolve_artifact_path(download, timeout)
                     if local_path_value and (local_path := Path(local_path_value)).is_file():
                         if local_path.stat().st_size:
                             return _CapturedDownloadPersistence(local_path, "local_path")
@@ -2523,7 +2523,7 @@ class ActionHandler:
                 and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0
             )
             if not observe_false_click:
-                with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                     apply_context_attrs(_hi_span)
                     results = await ActionHandler._handle_action(
                         scraped_page=scraped_page,
@@ -2535,7 +2535,7 @@ class ActionHandler:
             else:
                 assert browser_state is not None
                 page_url_before_download = page.url
-                with _tracer.start_as_current_span("skyvern.agent.action.false_click_download"):
+                with traced_span(_tracer, "skyvern.agent.action.false_click_download"):
                     false_click_download_event: asyncio.Future[tuple[Download, Page]] = (
                         asyncio.get_running_loop().create_future()
                     )
@@ -2627,7 +2627,7 @@ class ActionHandler:
                             )
 
                     try:
-                        with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                        with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                             apply_context_attrs(_hi_span)
                             try:
                                 results = await ActionHandler._handle_action(
@@ -2771,7 +2771,7 @@ class ActionHandler:
         try:
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
-            with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+            with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
                 results = await ActionHandler._handle_action(
                     scraped_page=scraped_page,
@@ -2803,7 +2803,7 @@ class ActionHandler:
             _download_event_grace_seconds = min(
                 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, download_wait_hard_timeout_seconds
             )
-            with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
+            with traced_span(_tracer, "skyvern.agent.action.download_wait") as _dl_wait_span:
                 apply_context_attrs(_dl_wait_span)
                 _dl_wait_span.set_attribute("timeout_seconds", download_wait_hard_timeout_seconds)
                 _dl_wait_span.set_attribute("download_event_grace_seconds", _download_event_grace_seconds)

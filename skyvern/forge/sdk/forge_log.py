@@ -549,6 +549,14 @@ def setup_logger() -> None:
                 structlog.stdlib.add_logger_name,
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
+                # Every record on this handler — native structlog AND foreign stdlib (temporal,
+                # asyncio, sqlalchemy, uvicorn) — is serialized here, so this is the one seam that
+                # covers both. `format_exc_info` in `foreign_pre_chain` has already rendered
+                # exc_info to a string by now, so a secret in the exception text is reachable.
+                # These stay duplicated in the structlog chain above on purpose: that pass also
+                # guards `context.log`, which is persisted to the per-run S3 log artifact.
+                redact_bearer_tokens,
+                redact_registered_secrets,
                 renderer,
             ],
         )
