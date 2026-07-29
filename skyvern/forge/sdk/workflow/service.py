@@ -74,6 +74,7 @@ from skyvern.forge.sdk.db.enums import BrowserSeedSource, OrganizationAuthTokenT
 from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_parameter_id
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
+from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -3286,6 +3287,16 @@ class WorkflowService:
                         current_context.generate_script = False
                     if workflow_run.code_gen:
                         current_context.generate_script = True
+                    # Assign the transient-UI capture arm at execution start — before any block
+                    # capture, and for cached/code runs that never reach agent_step — using the run
+                    # being executed, so an inline child workflow whose scoped context lacks full
+                    # identity is attributed to its own run rather than the parent's.
+                    await resolve_transient_ui_capture_arm(
+                        current_context,
+                        distinct_id=workflow_run.workflow_run_id,
+                        organization_id=organization.organization_id,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    )
                 workflow_run, blocks_to_update = await self._execute_workflow_blocks(
                     workflow=workflow,
                     workflow_run=workflow_run,

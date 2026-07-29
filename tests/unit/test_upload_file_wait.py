@@ -15,6 +15,39 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.actions import handler as handler_module
 from skyvern.webeye.actions.handler import _wait_for_upload_processing
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+
+
+class _EngineError(Exception):
+    pass
+
+
+class _EngineTimeout(_EngineError):
+    pass
+
+
+async def _never_start():  # pragma: no cover - never awaited
+    raise AssertionError("start_driver must not be called")
+
+
+def _engine_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name="engine-a",
+        start_driver=_never_start,
+        error_type=_EngineError,
+        timeout_error_type=_EngineTimeout,
+        metadata=BrowserEngineMetadata(name="engine-a", version="0.0.0"),
+        selection_reason="test",
+    )
+
+
+async def _run_with_page_ready_error(error: BaseException, engine_selection: BrowserEngineSelection | None) -> None:
+    mock_frame = AsyncMock()
+    mock_frame.wait_for_page_ready.side_effect = error
+    with patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new_callable=AsyncMock) as mock_create:
+        mock_create.return_value = mock_frame
+        await _wait_for_upload_processing(AsyncMock(), engine_selection=engine_selection)
+
 
 # ---------------------------------------------------------------------------
 # Helper behaviour tests
@@ -86,6 +119,31 @@ async def test_propagates_non_playwright_error() -> None:
         mock_create.return_value = mock_frame
         with pytest.raises(RuntimeError, match="unexpected bug"):
             await _wait_for_upload_processing(AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_swallows_selected_engine_timeout() -> None:
+    # A non-stock engine's native timeout must be tolerated like the stock Playwright timeout.
+    await _run_with_page_ready_error(_EngineTimeout("deadline exceeded"), _engine_selection())
+
+
+@pytest.mark.asyncio
+async def test_swallows_selected_engine_error() -> None:
+    await _run_with_page_ready_error(_EngineError("target closed"), _engine_selection())
+
+
+@pytest.mark.asyncio
+async def test_propagates_foreign_playwright_error_under_selected_engine() -> None:
+    # Under a pinned non-stock engine, a stock Playwright error is foreign and must propagate,
+    # not be swallowed as an upload-processing tolerance.
+    with pytest.raises(PlaywrightError):
+        await _run_with_page_ready_error(PlaywrightError("navigated away"), _engine_selection())
+
+
+@pytest.mark.asyncio
+async def test_propagates_foreign_playwright_timeout_under_selected_engine() -> None:
+    with pytest.raises(PlaywrightTimeoutError):
+        await _run_with_page_ready_error(PlaywrightTimeoutError("pw timeout"), _engine_selection())
 
 
 # ---------------------------------------------------------------------------

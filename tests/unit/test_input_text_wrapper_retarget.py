@@ -92,7 +92,7 @@ async def _run(action: InputTextAction, wrapper: MagicMock, child: MagicMock | N
     # successful retarget short-circuits to success, proving the child drove the pipeline.
     read_tags: list[str] = []
 
-    async def _get_input_value(tag_name: str, locator: object) -> str:
+    async def _get_input_value(tag_name: str, locator: object, engine_selection: object = None) -> str:
         read_tags.append(tag_name)
         return _CARD if tag_name == "input" else ""
 
