@@ -9,6 +9,7 @@ Cleanup is best-effort: a cleanup/release failure must never replace the script'
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,7 +17,8 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.services.script_service import run_script
+from skyvern.schemas.workflows import BlockType
+from skyvern.services.script_service import _create_workflow_block_run_and_task, run_script
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 
 SUCCESS_SCRIPT = "async def run_workflow(parameters=None):\n    return None\n"
@@ -44,6 +46,35 @@ def _write_script(tmp_path: Path, body: str) -> str:
     path = tmp_path / "user_script.py"
     path.write_text(body)
     return str(path)
+
+
+@pytest.mark.asyncio
+async def test_cached_script_container_task_stamps_started_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_run_block = MagicMock(workflow_run_block_id="wrb_1")
+    created_task = MagicMock(task_id="task_1", started_at=datetime(2026, 1, 1), workflow_run_id="wr_1")
+    step = MagicMock(step_id="step_1")
+    database = MagicMock()
+    database.observer.create_workflow_run_block = AsyncMock(return_value=workflow_run_block)
+    database.observer.update_workflow_run_block = AsyncMock()
+    database.tasks.create_task = AsyncMock(return_value=created_task)
+    database.tasks.update_task = AsyncMock(return_value=created_task)
+    database.tasks.create_step = AsyncMock(return_value=step)
+    monkeypatch.setattr(app, "DATABASE", database)
+    create_video_artifact = AsyncMock()
+    take_screenshot = AsyncMock()
+    monkeypatch.setattr("skyvern.services.script_service._create_video_artifact", create_video_artifact)
+    monkeypatch.setattr("skyvern.services.script_service._take_workflow_run_block_screenshot", take_screenshot)
+    skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", workflow_run_id="wr_1"))
+
+    result = await _create_workflow_block_run_and_task(BlockType.NAVIGATION)
+
+    assert result == ("wrb_1", "task_1", "step_1")
+    database.tasks.create_task.assert_awaited_once()
+    assert database.tasks.create_task.await_args.kwargs["status"] == "running"
+    database.tasks.update_task.assert_not_awaited()
+    setup_task = create_video_artifact.await_args.kwargs["task"]
+    assert setup_task.started_at is not None
+    assert setup_task is created_task
 
 
 @pytest.mark.asyncio

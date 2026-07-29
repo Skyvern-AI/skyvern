@@ -82,7 +82,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
@@ -2169,6 +2169,7 @@ async def mark_task_v2_as_timed_out(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     failure_reason: str | None = None,
+    fallback_workflow_run: WorkflowRun | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
@@ -2176,7 +2177,19 @@ async def mark_task_v2_as_timed_out(
         status=TaskV2Status.timed_out,
     )
     if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+        if fallback_workflow_run is None:
+            # Current callers with a linked run already supply this row. Keep
+            # the lookup for future direct callers so a failed status CAS still
+            # has a safe fallback if the follow-up refresh also fails.
+            fallback_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id,
+                organization_id=organization_id,
+            )
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(
+            workflow_run_id,
+            failure_reason,
+            fallback_workflow_run=fallback_workflow_run,
+        )
 
     # Add task timed out tag to trace
     otel_trace.get_current_span().set_attribute("task.completion_status", "timed_out")
@@ -2574,14 +2587,36 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        resp = await deliver_webhook_with_retries(
-            url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
-            timeout_seconds=30.0,
-            organization_id=task_v2.organization_id,
-            run_id=task_v2.observer_cruise_id,
-        )
+        try:
+            resp = await deliver_webhook_with_retries(
+                url=task_v2.webhook_callback_url,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=30.0,
+                organization_id=task_v2.organization_id,
+                run_id=task_v2.observer_cruise_id,
+            )
+        except Exception as delivery_error:
+            LOG.warning(
+                "Task v2 webhook delivery failed after attempting delivery",
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                error=describe_delivery_error(delivery_error),
+                exc_info=True,
+            )
+            try:
+                await app.DATABASE.observer.update_task_v2(
+                    task_v2_id=task_v2.observer_cruise_id,
+                    organization_id=task_v2.organization_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record task v2 webhook delivery error",
+                    task_v2_id=task_v2.observer_cruise_id,
+                    exc_info=True,
+                )
+            raise
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",

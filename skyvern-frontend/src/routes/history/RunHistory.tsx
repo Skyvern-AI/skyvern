@@ -94,7 +94,7 @@ import {
 } from "@/components/SelectionCheckbox";
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
-import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
+import { RunRowActions } from "@/routes/runs/RunRowActions";
 
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
@@ -184,6 +184,19 @@ function getRunNavigationPath(run: TaskRunListItem): string {
       return `/tasks/${run.run_id}/actions`;
     default:
       return `/runs/${run.run_id}`;
+  }
+}
+
+// Rerun exists only for the task family served by /tasks/create/retry.
+function getRerunPath(run: TaskRunListItem): string | null {
+  switch (run.task_run_type) {
+    case TaskRunType.TaskV1:
+    case TaskRunType.OpenaiCua:
+    case TaskRunType.AnthropicCua:
+    case TaskRunType.UiTars:
+      return `/tasks/create/retry/${run.run_id}`;
+    default:
+      return null;
   }
 }
 
@@ -445,7 +458,7 @@ function RunHistory() {
           (run.title ?? "")
         );
 
-      const mainRow = (
+      const mainRow = (kebab: React.ReactNode) => (
         <TableRow
           className="group/row cursor-pointer select-none"
           data-state={isRowSelected ? "selected" : undefined}
@@ -514,14 +527,19 @@ function RunHistory() {
             {executionTime ?? "-"}
           </TableCell>
           <TableCell>
-            {isWorkflowRun ? (
-              <div className="flex justify-end">
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
+            <div className="flex justify-end gap-0.5">
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span
+                      className="inline-flex"
+                      onClick={(event) => event.stopPropagation()}
+                    >
                       <Button
                         size="icon"
                         variant="ghost"
+                        disabled={!isWorkflowRun}
+                        aria-label={isExpanded ? "Hide inputs" : "Show inputs"}
                         onClick={(event) => {
                           event.stopPropagation();
                           toggleParametersExpanded(run.run_id);
@@ -533,36 +551,39 @@ function RunHistory() {
                       >
                         <MixerHorizontalIcon className="h-4 w-4" />
                       </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      {isExpanded ? "Hide Inputs" : "Show Inputs"}
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              </div>
-            ) : null}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {!isWorkflowRun
+                      ? "Inputs preview is only available for agent runs"
+                      : isExpanded
+                        ? "Hide Inputs"
+                        : "Show Inputs"}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              {kebab}
+            </div>
           </TableCell>
         </TableRow>
       );
 
       return (
         <React.Fragment key={run.task_run_id}>
-          {taggable ? (
-            <RunRowContextMenu
-              workflowRunId={run.run_id}
-              runPath={navPath}
-              currentTags={runTags ?? []}
-              tagKeys={tagFilterKeys}
-              labelSuggestions={runTagSuggestions?.labels ?? []}
-              valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
-              selectedCount={selectedRuns.length}
-              onNavigate={navigate}
-            >
-              {mainRow}
-            </RunRowContextMenu>
-          ) : (
-            mainRow
-          )}
+          <RunRowActions
+            runId={run.run_id}
+            runPath={navPath}
+            rerunPath={getRerunPath(run)}
+            taggable={taggable}
+            currentTags={runTags ?? []}
+            tagKeys={tagFilterKeys}
+            labelSuggestions={runTagSuggestions?.labels ?? []}
+            valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+            selectedCount={selectedRuns.length}
+            onNavigate={navigate}
+          >
+            {mainRow}
+          </RunRowActions>
           {isExpanded && run.workflow_permanent_id && (
             <TableRow key={`${run.run_id}-params`}>
               <TableCell
