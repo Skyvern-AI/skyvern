@@ -3123,19 +3123,6 @@ def _validation_classification_output_path(output_path: str | None) -> bool:
     )
 
 
-def completion_criterion_requires_active_run_terminal_monitor(criterion: CompletionCriterion) -> bool:
-    if criterion.requested_output_corroborator:
-        return False
-    if (
-        criterion.output_path
-        and criterion.level != "definition"
-        and not criterion.method_mandated
-        and criterion.kind != "validation_classification"
-    ):
-        return False
-    return True
-
-
 def _source_requested_output_corroborator(
     criteria: list[CompletionCriterion],
     requested_fields: list[str],

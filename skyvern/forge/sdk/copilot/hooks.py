@@ -13,7 +13,6 @@ from agents.run_context import RunContextWrapper
 from agents.tool import Tool
 
 from skyvern.forge.sdk.copilot.enforcement import (
-    CopilotGoalSatisfied,
     gate_decision_trace_fields,
     outcome_fully_verified,
 )
@@ -146,8 +145,10 @@ class CopilotRunHooks(RunHooksBase):
         raise_if_turn_halt(self._ctx, verified=outcome_fully_verified(self._ctx))
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
+            # The run record satisfying the ask is the model's cue to wrap up, not the
+            # harness's cue to end the loop and speak for it.
             LOG.info(
-                "copilot tool satisfied goal; stopping agent loop",
+                "copilot tool satisfied goal; model composes the reply",
                 tool_name=tool_name,
                 workflow_run_id=(parsed.get("data") or {}).get("workflow_run_id")
                 if isinstance(parsed.get("data"), dict)
@@ -156,4 +157,3 @@ class CopilotRunHooks(RunHooksBase):
             )
             self._ctx.goal_satisfied_tool_name = tool_name
             self._ctx.goal_satisfied_tool_output = dict(parsed)
-            raise CopilotGoalSatisfied()

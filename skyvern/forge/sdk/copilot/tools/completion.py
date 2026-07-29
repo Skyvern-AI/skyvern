@@ -90,7 +90,6 @@ from ._shared import (
     _workflow_output_parameter_payloads,
 )
 from .blockers import (
-    _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
     _artifact_challenge_flag_from_result,
     _run_blocks_structured_blocker_message,
@@ -847,7 +846,6 @@ def _completion_evidence_payload(output: Any) -> Any:
 
 _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
     {
-        "ACTIVE_RUN_TERMINAL_EVIDENCE",
         "ANTI_BOT_DETECTION",
         "AUTH_FAILURE",
         "BROWSER_ERROR",
@@ -900,8 +898,6 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
     even though the run did not finish cleanly — recognition must not key on run status.
     """
     if bool(result.get("ok", False)):
-        return False
-    if _active_run_terminal_evidence_detected(result):
         return False
     if _run_blocks_structured_blocker_message(result, copilot_ctx):
         return False
@@ -1914,13 +1910,6 @@ def _tool_visible_result_after_completion_verification(
     if outcome_unverified_reason is None:
         return result
     data = result.get("data")
-    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
-    if (
-        copilot_ctx.delivered_unverified_terminal
-        and isinstance(run_id, str)
-        and run_id == copilot_ctx.delivered_unverified_workflow_run_id
-    ):
-        return result
     if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
         return result
 
