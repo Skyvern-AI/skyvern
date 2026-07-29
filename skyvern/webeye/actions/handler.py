@@ -4946,8 +4946,9 @@ async def handle_download_file_action(
         # Priority 2: If download_url is provided, download from URL
         if action.download_url is not None:
             # the URL is usally requiring login credentials/cookides, so we should use browser navigation to access the URL instead of downloading the file directly
+            validated_url = await asyncio.to_thread(validate_fetch_url, action.download_url)
             try:
-                await page.goto(action.download_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
             except Exception as e:
                 error = str(e)
                 # some cases use this method to download a file. but it will be redirected away soon

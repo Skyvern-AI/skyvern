@@ -1258,7 +1258,10 @@ async def test_handle_download_file_action_with_download_url() -> None:
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         # Verify page.goto was called with the correct URL (handler uses browser navigation for download_url)
@@ -1299,7 +1302,10 @@ async def test_handle_download_file_action_with_download_url_same_filename() -> 
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         page.goto.assert_called_once()
@@ -1472,7 +1478,10 @@ async def test_handle_download_file_action_download_url_error() -> None:
 
     page.goto = AsyncMock(side_effect=Exception("Download failed"))
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         assert len(result) == 1
@@ -1552,7 +1561,10 @@ async def test_handle_download_file_action_download_url_err_aborted_swallowed() 
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         assert len(result) == 1
@@ -4656,3 +4668,61 @@ async def test_handle_action_blocked_inline_recovery_is_time_bounded(tmp_path: P
     assert results[-1].download_triggered is False
     assert results[-1].needs_followup is True
     assert results[-1].followup_message == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+
+
+def _download_action(now: datetime, download_url: str) -> tuple[DownloadFileAction, ScrapedPage, object, object]:
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=MagicMock(),
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+    action = DownloadFileAction(
+        file_name="downloaded_file.pdf",
+        download_url=download_url,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+    return action, scraped_page, task, step
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download_url",
+    ["file:///etc/passwd", "http://127.0.0.1:8000/", "http://169.254.169.254/latest/meta-data/"],
+)
+async def test_handle_download_file_action_refuses_unsafe_download_url(download_url: str) -> None:
+    """download_url is model-supplied, so it must clear the same validator GOTO_URL clears."""
+    action, scraped_page, task, step = _download_action(datetime.now(UTC), download_url)
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+
+    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    page.goto.assert_not_awaited()
+    assert len(result) == 1
+    assert isinstance(result[0], ActionFailure)
+
+
+@pytest.mark.asyncio
+async def test_handle_download_file_action_navigates_to_validated_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The navigated URL is the validator's return value, not the raw action field."""
+    validate = MagicMock(return_value="https://example.test/validated.pdf")
+    monkeypatch.setattr("skyvern.webeye.actions.handler.validate_fetch_url", validate)
+    action, scraped_page, task, step = _download_action(datetime.now(UTC), "https://example.test/file.pdf")
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+
+    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    validate.assert_called_once_with("https://example.test/file.pdf")
+    assert page.goto.call_args[0][0] == "https://example.test/validated.pdf"
+    assert isinstance(result[0], ActionSuccess)
