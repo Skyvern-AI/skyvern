@@ -208,6 +208,22 @@ def resolve_engine_selection_for_task(task: Task) -> BrowserEngineSelection | No
     return browser_state.engine_selection if browser_state is not None else None
 
 
+def _is_selected_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+    """A driver-native timeout under THIS run's selected engine; the stock Playwright ``TimeoutError``
+    identity when no engine is pinned (unchanged default)."""
+    if engine_selection is not None:
+        return engine_selection.is_engine_timeout_error(exc)
+    return isinstance(exc, TimeoutError)
+
+
+def _is_selected_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+    """A driver-native error under THIS run's selected engine; the stock Playwright ``Error`` identity
+    when no engine is pinned (unchanged default)."""
+    if engine_selection is not None:
+        return engine_selection.is_engine_error(exc)
+    return isinstance(exc, PlaywrightError)
+
+
 class _CollapseGateResult(NamedTuple):
     family_enabled: bool
     assigned: bool | None
@@ -4058,13 +4074,14 @@ async def handle_input_text_action(
                 skyvern_element = retargeted_element
                 can_input_text = True
 
+    engine_selection = resolve_engine_selection_for_task(task)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
-    )
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
-    current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
+    current_text = await get_input_value(
+        skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
+    )
     if not is_totp_value and current_text == current_text_target:
         return [ActionSuccess()]
 
@@ -4196,7 +4213,9 @@ async def handle_input_text_action(
         if not prefilter_typeahead:
             try:
                 await skyvern_element.press_key("ArrowDown")
-            except TimeoutError:
+            except Exception as exc:
+                if not _is_selected_engine_timeout(exc, engine_selection):
+                    raise
                 # sometimes we notice `press_key()` raise a timeout but actually the dropdown is opened.
                 LOG.info(
                     "Timeout to press ArrowDown to open dropdown, ignore the timeout and continue to execute the action",
@@ -4389,17 +4408,11 @@ async def handle_input_text_action(
         is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
         try:
             await skyvern_element.input_clear()
-        except TimeoutError:
-            LOG.info("None input tag clear timeout", action=action)
-            return [
-                ActionFailure(
-                    InvalidElementForTextInput(
-                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
-                    )
-                )
-            ]
-        except Exception:
-            LOG.warning("Failed to clear the input field", action=action, exc_info=True)
+        except Exception as exc:
+            if _is_selected_engine_timeout(exc, engine_selection):
+                LOG.info("None input tag clear timeout", action=action)
+            else:
+                LOG.warning("Failed to clear the input field", action=action, exc_info=True)
             return [
                 ActionFailure(
                     InvalidElementForTextInput(
@@ -4700,35 +4713,50 @@ async def handle_input_text_action(
                 error_message=str(inc_error),
             )
             raise inc_error
-        except PlaywrightError as inc_error:
-            # Handle Playwright-specific errors during incremental element processing
-            # (e.g., TOTP form auto-submit, or search-dropdown selection triggering navigation)
-            error_message = str(inc_error).lower()
-            if (
-                "execution context was destroyed" in error_message
-                or "navigation" in error_message
-                or "target closed" in error_message
-            ):
-                # These are expected during page navigation/auto-submit, silently continue
-                LOG.debug(
-                    "Playwright error during incremental element processing (likely page navigation)",
-                    error_type=type(inc_error).__name__,
-                    error_message=error_message,
-                )
-            else:
+        except Exception as inc_error:
+            # Driver-native errors during incremental processing (e.g. TOTP form auto-submit, or a
+            # search-dropdown selection triggering navigation) are classified against THIS run's
+            # selected engine, so a non-stock driver's navigation errors are tolerated identically;
+            # missing selection keeps the stock Playwright identity. Non-engine errors stay swallowed.
+            if _is_selected_engine_error(inc_error, engine_selection):
+                error_message = str(inc_error).lower()
+                if (
+                    "execution context was destroyed" in error_message
+                    or "navigation" in error_message
+                    or "target closed" in error_message
+                ):
+                    # These are expected during page navigation/auto-submit, silently continue
+                    LOG.debug(
+                        "Engine error during incremental element processing (likely page navigation)",
+                        error_type=type(inc_error).__name__,
+                        error_message=error_message,
+                    )
+                else:
+                    LOG.warning(
+                        "Unexpected engine error during incremental element processing",
+                        error_type=type(inc_error).__name__,
+                        error_message=str(inc_error),
+                    )
+                    raise inc_error
+            elif isinstance(inc_error, PlaywrightError):
+                # A foreign stock-Playwright driver error under a pinned non-stock engine. Under the
+                # stock default this arm is unreachable (a PlaywrightError satisfies the engine
+                # predicate above), so this is a no-op there. It is not one of the selected engine's
+                # tolerances, so propagate it exactly as the pre-PR ``except PlaywrightError`` did
+                # instead of falling through to a false ActionSuccess.
                 LOG.warning(
-                    "Unexpected Playwright error during incremental element processing",
+                    "Foreign driver error during incremental element processing under a pinned engine",
                     error_type=type(inc_error).__name__,
                     error_message=str(inc_error),
                 )
                 raise inc_error
-        except Exception as inc_error:
-            # Handle any other unexpected errors during incremental element processing
-            LOG.warning(
-                "Unexpected error during incremental element processing",
-                error_type=type(inc_error).__name__,
-                error_message=str(inc_error),
-            )
+            else:
+                # Handle any other unexpected errors during incremental element processing
+                LOG.warning(
+                    "Unexpected error during incremental element processing",
+                    error_type=type(inc_error).__name__,
+                    error_message=str(inc_error),
+                )
         finally:
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
@@ -4794,7 +4822,7 @@ def _find_similar_url_in_text(candidate_url: str, text: str) -> str | None:
     return matched
 
 
-async def _wait_for_upload_processing(page: Page) -> None:
+async def _wait_for_upload_processing(page: Page, engine_selection: BrowserEngineSelection | None = None) -> None:
     """Wait for page readiness signals after a file upload.
 
     Covers upload-processing UI (spinners, progress bars, DOM updates) beyond
@@ -4812,10 +4840,20 @@ async def _wait_for_upload_processing(page: Page) -> None:
             dom_stable_ms=300,
             dom_stability_timeout_ms=2000,
         )
-    except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
+    except (asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
         LOG.info("Upload processing page-ready wait timed out, continuing")
-    except PlaywrightError:
-        LOG.warning("Upload processing page-ready wait interrupted by Playwright error, continuing", exc_info=True)
+    except Exception as exc:
+        # Classify against THIS run's selected engine so a non-stock driver's timeout/error is
+        # tolerated identically; missing selection keeps the stock Playwright identity. Anything
+        # that is not an engine error propagates, as before.
+        if _is_selected_engine_timeout(exc, engine_selection):
+            LOG.info("Upload processing page-ready wait timed out, continuing")
+        elif _is_selected_engine_error(exc, engine_selection):
+            LOG.warning(
+                "Upload processing page-ready wait interrupted by browser engine error, continuing", exc_info=True
+            )
+        else:
+            raise
 
 
 @traced(name="skyvern.agent.action.upload_file")
@@ -4893,7 +4931,7 @@ async def handle_upload_file_action(
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            await _wait_for_upload_processing(page)
+            await _wait_for_upload_processing(page, engine_selection=resolve_engine_selection_for_task(task))
 
             return [ActionSuccess()]
         else:
@@ -6498,7 +6536,7 @@ async def chain_click(
             # File chooser opened during this click — upload completed normally
             LOG.info("File chooser triggered during this click", action=action)
             if file:
-                await _wait_for_upload_processing(page)
+                await _wait_for_upload_processing(page, engine_selection=engine_selection)
             if not has_pending:
                 page.remove_listener("filechooser", fc_func)
             if context is not None and context.pending_file_chooser is not None:
@@ -6534,7 +6572,7 @@ async def chain_click(
         ):
             # A previous UPLOAD_FILE's deferred listener was consumed by this click
             LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
-            await _wait_for_upload_processing(page)
+            await _wait_for_upload_processing(page, engine_selection=engine_selection)
             context.cleanup_pending_file_chooser()
 
         else:
@@ -7155,7 +7193,9 @@ async def discover_and_select_from_full_dropdown(
             )
             try:
                 await skyvern_element.press_key("ArrowDown")
-            except TimeoutError:
+            except Exception as exc:
+                if not _is_selected_engine_timeout(exc, resolve_engine_selection_for_task(task)):
+                    raise
                 LOG.info(
                     "Timeout pressing ArrowDown in discover fallback, continuing",
                     element_id=skyvern_element.get_id(),
@@ -8254,7 +8294,7 @@ async def _reset_custom_select_combobox_input(
         locator = element.get_locator()
         await locator.fill("")
         await element.click(page=page, engine_selection=engine_selection)
-        return await get_input_value(element.get_tag_name(), locator) == ""
+        return await get_input_value(element.get_tag_name(), locator, engine_selection=engine_selection) == ""
     except Exception:
         LOG.info(
             "Failed to reset custom-select combobox input before LLM fallback",
@@ -8474,7 +8514,11 @@ async def select_from_emerging_elements(
         )
         input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
         await input_element.scroll_into_view()
-        current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
+        current_text = await get_input_value(
+            input_element.get_tag_name(),
+            input_element.get_locator(),
+            engine_selection=resolve_engine_selection_for_task(task),
+        )
         if current_text == actual_value:
             return ActionSuccess()
 
@@ -8666,7 +8710,11 @@ async def select_from_dropdown(
             actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
-            current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
+            current_text = await get_input_value(
+                input_element.get_tag_name(),
+                input_element.get_locator(),
+                engine_selection=resolve_engine_selection_for_task(task),
+            )
             if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
                 return single_select_result
@@ -9776,18 +9824,24 @@ async def click_listbox_option(
     return False
 
 
-async def get_input_value(tag_name: str, locator: Locator) -> str | None:
+async def get_input_value(
+    tag_name: str, locator: Locator, engine_selection: BrowserEngineSelection | None = None
+) -> str | None:
     # input_value() rejects non-<input>/<textarea>/<select> nodes and inner_text() rejects
     # non-HTMLElement nodes; the live node can disagree with the scraped tag_name after a
     # re-render. Treat an incompatible read as "value unknown" so the caller's own
-    # element-type classification runs instead of a raw Playwright exception escaping here.
+    # element-type classification runs instead of a raw driver exception escaping here. The
+    # incompatible-node identity is matched against THIS run's selected engine; missing selection
+    # keeps the stock Playwright identity (unchanged default).
     try:
         if tag_name in COMMON_INPUT_TAGS:
             return await locator.input_value()
         # for span, div, p or other tags:
         # we need to trim the unicode space for these tags
         return (await locator.inner_text()).replace("\xa0", " ").strip()
-    except PlaywrightError as exc:
+    except Exception as exc:
+        if not _is_selected_engine_error(exc, engine_selection):
+            raise
         if is_incompatible_text_input_error(exc):
             LOG.info("Skipping value read on an incompatible element", tag_name=tag_name, error=str(exc))
             return None

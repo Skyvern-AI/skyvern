@@ -368,6 +368,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         workflow_run_id=workflow_run_id,
                         totp_identifier=totp_identifier,
                         totp_verification_url=totp_url,
+                        expected_otp_type=OTPType.TOTP,
                     )
                 if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
                     verification_code = otp_value.value

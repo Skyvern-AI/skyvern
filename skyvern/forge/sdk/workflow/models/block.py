@@ -3848,6 +3848,7 @@ async def _poll_code_block_otp(
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 totp_identifier=totp_identifier,
                 created_after=workflow_run.started_at,
+                expected_otp_type=OTPType.TOTP,
             ),
             timeout=budget_seconds,
         )
