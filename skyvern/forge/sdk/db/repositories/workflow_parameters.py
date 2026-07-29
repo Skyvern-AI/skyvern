@@ -906,6 +906,7 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("get_task_generation_by_prompt_hash")
     async def get_task_generation_by_prompt_hash(
         self,
+        organization_id: str,
         user_prompt_hash: str,
         query_window_hours: int = settings.PROMPT_CACHE_WINDOW_HOURS,
     ) -> TaskGeneration | None:
@@ -913,9 +914,11 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             query = (
                 select(TaskGenerationModel)
-                .filter_by(user_prompt_hash=user_prompt_hash)
+                .filter_by(organization_id=organization_id, user_prompt_hash=user_prompt_hash)
                 .filter(TaskGenerationModel.llm.is_not(None))
                 .filter(TaskGenerationModel.created_at > before_time)
+                .order_by(TaskGenerationModel.created_at.desc())
+                .limit(1)
             )
             task_generation = (await session.scalars(query)).first()
             if not task_generation:
