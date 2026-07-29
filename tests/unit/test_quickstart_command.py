@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -44,6 +45,9 @@ subprocess.Popen(
 )
 time.sleep(60)
 """
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _set_home(monkeypatch, home: Path) -> None:
@@ -754,12 +758,15 @@ def test_quickstart_interactive_choice_reprompts_invalid_alias(monkeypatch) -> N
     monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: True)
 
     result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="wat\nserver\nn\n")
+    # Rich colourises this prompt when it believes it is on a terminal, which splices escape codes
+    # through the phrase and breaks a raw substring match.
+    output = _ANSI_ESCAPE_RE.sub("", result.output)
 
     assert result.exit_code == 1
-    assert "Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3." in result.output
-    assert "Please select a valid option:" not in result.output
-    assert "Install the missing server dependencies now?" in result.output
-    assert 'Install: pip install "skyvern[server]"' in result.output
+    assert "Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3." in output
+    assert "Please select a valid option:" not in output
+    assert "Install the missing server dependencies now?" in output
+    assert 'Install: pip install "skyvern[server]"' in output
 
 
 def test_quickstart_interactive_eof_falls_back_to_default(monkeypatch) -> None:

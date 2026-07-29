@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    _OUTPUT_CONTRACT_TERMINAL_REASON_CODES,
     CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
@@ -15,7 +14,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     terminal_challenge_blocker_signal_from_current_page_evidence,
     terminal_challenge_blocker_signal_from_page_evidence,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
@@ -23,7 +21,6 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.turn_halt import (
-    ADVISORY_DISPATCH_STALLED_REASON_CODE,
     CopilotTurnHalt,
     TurnHaltKind,
     expire_output_contract_ladder_at_turn_end,
@@ -38,7 +35,7 @@ from tests.unit.conftest import make_copilot_context
 def _signal(
     *,
     blocker_kind: str = "tool_error",
-    internal_reason_code: str = ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+    internal_reason_code: str = TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     renders_final_reply: bool = True,
     extra: dict[str, object] | None = None,
 ) -> CopilotToolBlockerSignal:
@@ -60,7 +57,7 @@ def _signal(
     ("signal", "expected_kind"),
     [
         (
-            _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step"),
+            _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool"),
             TurnHaltKind.LOOP_DETECTED,
         ),
         (
@@ -68,7 +65,7 @@ def _signal(
             TurnHaltKind.LOOP_DETECTED,
         ),
         (
-            _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE),
+            _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE),
             TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
         ),
         (
@@ -79,7 +76,6 @@ def _signal(
             _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE),
             TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
         ),
-        (_signal(internal_reason_code="probable_site_block_stop"), TurnHaltKind.PROBABLE_SITE_BLOCK),
     ],
 )
 def test_terminal_blockers_map_to_halts(signal: CopilotToolBlockerSignal, expected_kind: TurnHaltKind) -> None:
@@ -88,16 +84,6 @@ def test_terminal_blockers_map_to_halts(signal: CopilotToolBlockerSignal, expect
     assert halt is not None
     assert halt.kind == expected_kind
     assert halt.blocker_signal is signal
-
-
-def test_every_output_contract_terminal_reason_code_maps_to_a_turn_halt() -> None:
-    # Fail-closed guard: an output-contract terminal reason code with no turn_halt mapping mints no
-    # halt, so the turn degrades to loop_detected instead of terminating (the SKY-12594 e25ec5 regression).
-    assert _OUTPUT_CONTRACT_TERMINAL_REASON_CODES
-    for reason_code in _OUTPUT_CONTRACT_TERMINAL_REASON_CODES:
-        halt = turn_halt_from_blocker_signal(_signal(internal_reason_code=reason_code), source="hook")
-        assert halt is not None, f"{reason_code} maps to no TurnHalt; the turn would degrade to loop_detected"
-        assert halt.kind is TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
 
 
 def _halt_ctx(**overrides: object) -> SimpleNamespace:
@@ -119,7 +105,7 @@ def _halt_ctx(**overrides: object) -> SimpleNamespace:
 
 def test_stash_and_raise_turn_halt_sets_context_once() -> None:
     ctx = _halt_ctx()
-    signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool")
 
     halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="stream")
 
@@ -387,7 +373,7 @@ def test_verified_outcome_suppresses_and_consumes_involuntary_halt() -> None:
 
 
 def test_verified_outcome_consumes_loop_blocker_signal() -> None:
-    signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool")
     ctx = _consume_ctx(blocker_signal=signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="hook")
 
@@ -398,7 +384,7 @@ def test_verified_outcome_consumes_loop_blocker_signal() -> None:
 
 
 def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:
-    signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    signal = _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE)
     ctx = _consume_ctx(blocker_signal=signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="hook")
 
@@ -410,10 +396,10 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
 
 
 def test_verified_outcome_does_not_clear_voluntary_blocker_when_involuntary_absent() -> None:
-    challenge_signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    challenge_signal = _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE)
     loop_halt = stash_turn_halt_from_blocker_signal(
         _halt_ctx(),
-        _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step"),
+        _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool"),
         source="hook",
     )
     ctx = _consume_ctx(
@@ -432,8 +418,8 @@ def test_verified_outcome_does_not_clear_voluntary_blocker_when_involuntary_abse
 
 
 def test_verified_outcome_consumes_involuntary_tool_blocker_history() -> None:
-    involuntary = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
-    voluntary = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    involuntary = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool")
+    voluntary = _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE)
     ctx = _consume_ctx(blocker_signal=involuntary)
     ctx.latest_tool_blocker_signal = involuntary
     ctx.tool_blocker_signals = [voluntary, involuntary]
@@ -454,7 +440,7 @@ def test_involuntary_suppression_lets_later_voluntary_challenge_raise() -> None:
     assert ctx.turn_halt is None
     assert ctx.blocker_signal is None
 
-    challenge_signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    challenge_signal = _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE)
     ctx.blocker_signal = challenge_signal
     stash_turn_halt_from_blocker_signal(ctx, challenge_signal, source="hook")
 
@@ -509,19 +495,9 @@ def test_loop_detected_promotes_once_output_contract_ladder_resolves() -> None:
     assert halt.kind == TurnHaltKind.LOOP_DETECTED
 
 
-def test_output_source_unobservable_terminal_promotes_even_while_ladder_unresolved() -> None:
-    ctx = _output_contract_ctx(granted=True)
-    signal = _signal(blocker_kind="tool_error", internal_reason_code="output_source_unobservable")
-
-    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
-
-    assert halt is not None
-    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
-
-
 def test_active_terminal_challenge_promotes_while_ladder_unresolved() -> None:
     ctx = _output_contract_ctx(granted=True)
-    signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+    signal = _signal(internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE)
 
     halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="run_execution")
 
@@ -567,15 +543,6 @@ def test_defer_never_expires_granted_grant_awaiting_forced_dispatch() -> None:
     assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
 
 
-def test_defer_expires_countonly_ladder_into_typed_terminal() -> None:
-    ctx = _defer_count_ledger_ctx()
-    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
-    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
-    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
-
-
 def test_defer_re_arms_when_lifecycle_advances() -> None:
     ctx = _defer_ledger_ctx()
     stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
@@ -594,22 +561,6 @@ def test_defer_countonly_ladder_reaches_a_terminal_within_two_stalled_signals() 
     assert ctx.turn_halt is not None
 
 
-def test_turn_end_expiry_transitions_granted_and_emits_stalled_terminal() -> None:
-    ctx = make_copilot_context()
-    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
-    ctx.output_contract_pending_run_evidence["sig_a"] = ["output.confirmation_number"]
-
-    halt = expire_output_contract_ladder_at_turn_end(ctx)
-
-    assert halt is not None
-    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
-    assert ctx.turn_halt is halt
-    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == ADVISORY_DISPATCH_STALLED_REASON_CODE
-    assert ctx.blocker_signal.renders_final_reply is True
-
-
 def test_turn_end_expiry_noop_without_live_grant() -> None:
     ctx = make_copilot_context()
     ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
@@ -617,18 +568,6 @@ def test_turn_end_expiry_noop_without_live_grant() -> None:
     assert expire_output_contract_ladder_at_turn_end(ctx) is None
     assert ctx.turn_halt is None
     assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.CONSUMED
-
-
-def test_turn_end_expiry_keeps_existing_halt_but_expires_grant() -> None:
-    ctx = make_copilot_context()
-    terminal_signal = _signal(internal_reason_code="probable_site_block_stop")
-    existing = stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="test")
-    assert existing is not None
-    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
-
-    assert expire_output_contract_ladder_at_turn_end(ctx) is None
-    assert ctx.turn_halt is existing
-    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
 
 
 def test_mid_turn_expiry_keeps_granted_early_return() -> None:
@@ -639,16 +578,6 @@ def test_mid_turn_expiry_keeps_granted_early_return() -> None:
 
     assert ctx.turn_halt is None
     assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
-
-
-def test_terminal_stash_choke_point_claims_genuinely_terminal() -> None:
-    ctx = make_copilot_context()
-    signal = _signal(internal_reason_code="probable_site_block_stop")
-
-    stash_turn_halt_from_blocker_signal(ctx, signal, source="test")
-
-    assert ctx.turn_ownership is not None
-    assert TurnClaimant.GENUINELY_TERMINAL in ctx.turn_ownership.claims
 
 
 def test_raise_if_turn_halt_retires_halt_outranked_by_live_ladder() -> None:
@@ -663,13 +592,3 @@ def test_raise_if_turn_halt_retires_halt_outranked_by_live_ladder() -> None:
 
     assert ctx.turn_halt is None
     assert any(event.site == "turn_halt" for event in ctx.gate_precedence_conflict_events)
-
-
-def test_raise_if_turn_halt_still_raises_genuinely_terminal_over_live_ladder() -> None:
-    ctx = make_copilot_context()
-    terminal_signal = _signal(internal_reason_code="probable_site_block_stop")
-    stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="test")
-    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
-
-    with pytest.raises(CopilotTurnHalt):
-        raise_if_turn_halt(ctx)

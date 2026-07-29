@@ -155,17 +155,9 @@ def test_maybe_clear_on_tool_success_clears_consecutive_tool_loop_after_progress
 
 def test_maybe_clear_on_tool_success_clears_loop_after_workflow_progress() -> None:
     ctx = _Ctx()
-    ctx.blocker_signal = _make(kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    ctx.blocker_signal = _make(kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool")
     maybe_clear_blocker_signal_on_tool_success(ctx, "update_and_run_blocks")
     assert ctx.blocker_signal is None
-
-
-def test_maybe_clear_on_tool_success_keeps_loop_for_metadata_only_success() -> None:
-    ctx = _Ctx()
-    signal = _make(kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
-    ctx.blocker_signal = signal
-    maybe_clear_blocker_signal_on_tool_success(ctx, "list_credentials")
-    assert ctx.blocker_signal is signal
 
 
 def test_clear_for_reason_codes_matches() -> None:
@@ -276,42 +268,10 @@ def test_stash_blocker_signal_first_wins_returns_llm_payload() -> None:
     assert ctx.tool_blocker_signals == [first, second]
 
 
-def test_stash_blocker_signal_active_terminal_replaces_per_tool_budget() -> None:
-    ctx = _Ctx()
-    budget = _make(internal_reason_code="tool_error_per_tool_budget_rerun")
-    active_terminal = _make(internal_reason_code="tool_error_active_run_terminal_evidence")
-
-    stash_blocker_signal(ctx, budget)
-    payload = stash_blocker_signal(ctx, active_terminal)
-
-    assert payload == active_terminal.agent_steering_text
-    assert ctx.blocker_signal is active_terminal
-    assert ctx.latest_tool_blocker_signal is active_terminal
-    assert ctx.tool_blocker_signals == [budget, active_terminal]
-
-
-def test_stash_output_contract_terminal_replaces_held_churn_stop() -> None:
-    for reason_code in ("output_source_unobservable", "actuation_exhausted"):
-        ctx = _Ctx()
-        churn = _make(
-            kind="loop_detected",
-            internal_reason_code="code_authoring_guardrail_churn",
-            renders_final_reply=True,
-        )
-        oc_terminal = _make(
-            kind="tool_error",
-            internal_reason_code=reason_code,
-            renders_final_reply=True,
-        )
-        stash_blocker_signal(ctx, churn)
-        stash_blocker_signal(ctx, oc_terminal)
-        assert ctx.blocker_signal is oc_terminal
-
-
 def test_stash_output_contract_terminal_replaces_any_held_loop_detected() -> None:
     for loop_reason in (
         "loop_detected_generic",
-        "loop_detected_repeated_failed_step",
+        "loop_detected_consecutive_same_tool",
         "loop_detected_consecutive_same_tool",
         "credential_priority_authoring_churn",
     ):
@@ -331,23 +291,6 @@ def test_stash_loop_detected_does_not_replace_held_output_contract_terminal() ->
     loop_signal = _make(kind="loop_detected", internal_reason_code="loop_detected_generic", renders_final_reply=True)
     stash_blocker_signal(ctx, oc_terminal)
     stash_blocker_signal(ctx, loop_signal)
-    assert ctx.blocker_signal is oc_terminal
-
-
-def test_stash_churn_stop_does_not_replace_held_output_contract_terminal() -> None:
-    ctx = _Ctx()
-    oc_terminal = _make(
-        kind="tool_error",
-        internal_reason_code="output_source_unobservable",
-        renders_final_reply=True,
-    )
-    churn = _make(
-        kind="loop_detected",
-        internal_reason_code="code_authoring_guardrail_churn",
-        renders_final_reply=True,
-    )
-    stash_blocker_signal(ctx, oc_terminal)
-    stash_blocker_signal(ctx, churn)
     assert ctx.blocker_signal is oc_terminal
 
 

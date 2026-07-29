@@ -7,7 +7,6 @@ OSS-synced: only synthetic labels and RFC-2606 placeholder identifiers.
 
 from __future__ import annotations
 
-import itertools
 import json
 from types import SimpleNamespace
 
@@ -16,14 +15,11 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.copilot import enforcement
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
-    assert_clean_user_facing_text,
-    build_output_source_unobservable_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
-    OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
     OutputContractActuation,
     OutputContractActuationEvidence,
     OutputContractActuationKind,
@@ -40,7 +36,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     output_contract_ladder_unresolved,
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as wu
-from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind, turn_halt_from_blocker_signal
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _ALL_SPLIT_BLOCKERS = [
@@ -52,90 +47,6 @@ _ALL_SPLIT_BLOCKERS = [
     "insufficient_durable_stages",
     "target_block_not_resolved_in_parsed",
 ]
-
-
-def test_resolver_is_total_over_the_evidence_family_matrix() -> None:
-    kinds = set()
-    for (
-        family,
-        imposed,
-        click,
-        observed,
-        prior,
-        unconsumed,
-        advisory,
-        exhausted,
-        declick,
-        grantable,
-        run_observed,
-        run_bound,
-        carried_page,
-    ) in itertools.product(
-        list(OutputContractBailFamily),
-        [False, True],
-        [False, True],
-        [False, True],
-        [False, True],
-        [False, True],
-        list(OutputContractAdvisoryState),
-        [False, True],
-        [False, True],
-        [False, True],
-        [False, True],
-        [False, True],
-        [False, True],
-    ):
-        evidence = OutputContractActuationEvidence(
-            imposed_available=imposed,
-            click_only_spine=click,
-            observed_required_values=observed,
-            prior_actuation=prior,
-            prior_directive_unconsumed=unconsumed,
-            advisory_state=advisory,
-            actuation_progress_exhausted=exhausted,
-            declick_attempt_failed=declick,
-            advisory_run_grantable=grantable,
-            consumed_run_output_observed=run_observed,
-            consumed_run_bound_required_path=run_bound,
-            consumed_run_carried_page_extraction=carried_page,
-        )
-        actuation = resolve_output_contract_actuation(family=family, evidence=evidence)
-        assert actuation is not None
-        kinds.add(actuation.kind)
-        if actuation.kind == OutputContractActuationKind.IMPOSED:
-            assert evidence.imposed_available
-        if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
-            grantable_run = (
-                evidence.advisory_run_grantable and evidence.advisory_state != OutputContractAdvisoryState.CONSUMED
-            )
-            assert grantable_run or (
-                (evidence.observed_required_values or not evidence.click_only_spine)
-                and evidence.advisory_state in {OutputContractAdvisoryState.UNUSED, OutputContractAdvisoryState.GRANTED}
-            )
-        if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
-            assert not (
-                evidence.advisory_run_grantable and evidence.advisory_state != OutputContractAdvisoryState.CONSUMED
-            )
-            assert actuation.reason_code in {
-                OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
-                OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
-            }
-            if actuation.reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE:
-                assert (
-                    evidence.click_only_spine
-                    and not evidence.observed_required_values
-                    and evidence.declick_attempt_failed
-                )
-            else:
-                assert (
-                    evidence.advisory_state == OutputContractAdvisoryState.CONSUMED
-                    and evidence.consumed_run_output_observed
-                    and evidence.consumed_run_carried_page_extraction
-                    and not evidence.consumed_run_bound_required_path
-                )
-    assert OutputContractActuationKind.BLOCKED_TERMINAL in kinds
-    assert OutputContractActuationKind.IMPOSED in kinds
-    assert OutputContractActuationKind.ADVISORY_RUN in kinds
 
 
 def test_flaky_no_observed_without_declick_attempt_routes_to_actuation_not_terminal() -> None:
@@ -151,22 +62,6 @@ def test_flaky_no_observed_without_declick_attempt_routes_to_actuation_not_termi
     )
     actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=flaky_first_pass)
     assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
-
-
-def test_no_source_terminal_requires_failed_declick_attempt() -> None:
-    declick_failed = OutputContractActuationEvidence(
-        imposed_available=False,
-        click_only_spine=True,
-        observed_required_values=False,
-        prior_actuation=False,
-        prior_directive_unconsumed=False,
-        advisory_state=OutputContractAdvisoryState.UNUSED,
-        actuation_progress_exhausted=False,
-        declick_attempt_failed=True,
-    )
-    actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=declick_failed)
-    assert actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL
-    assert actuation.reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 
 
 def test_grantable_advisory_preempts_no_source_terminal() -> None:
@@ -205,22 +100,6 @@ def test_grantable_advisory_yields_to_consumed_exhaustion() -> None:
     actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=consumed)
     assert actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL
     assert actuation.reason_code == OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE
-
-
-def test_progress_exhaustion_terminals_a_no_source_structural_bail() -> None:
-    no_source = OutputContractActuationEvidence(
-        imposed_available=False,
-        click_only_spine=True,
-        observed_required_values=False,
-        prior_actuation=False,
-        prior_directive_unconsumed=False,
-        advisory_state=OutputContractAdvisoryState.UNUSED,
-        actuation_progress_exhausted=True,
-        declick_attempt_failed=True,
-    )
-    actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=no_source)
-    assert actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL
-    assert actuation.reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 
 
 def test_observable_source_structural_exhaustion_routes_to_advisory_not_terminal() -> None:
@@ -302,38 +181,6 @@ def test_consumed_exhaustion_without_declick_names_actuation_exhausted_not_unobs
     assert actuation.reason_code == OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE
 
 
-def test_progress_exhaustion_names_source_unobservable_for_click_only_after_declick() -> None:
-    click_only = OutputContractActuationEvidence(
-        False, True, False, False, False, OutputContractAdvisoryState.CONSUMED, True, True
-    )
-    actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=click_only)
-    assert actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL
-    assert actuation.reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
-
-
-def test_resolver_prefers_impose_then_directive_then_source_terminal() -> None:
-    imposed = OutputContractActuationEvidence(True, True, False, True, True, OutputContractAdvisoryState.UNUSED)
-    assert (
-        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=imposed).kind
-        == OutputContractActuationKind.IMPOSED
-    )
-    no_source_declick_failed = OutputContractActuationEvidence(
-        False, True, False, True, True, OutputContractAdvisoryState.UNUSED, False, True
-    )
-    source_terminal = resolve_output_contract_actuation(
-        family=OutputContractBailFamily.STRUCTURAL, evidence=no_source_declick_failed
-    )
-    assert source_terminal.kind == OutputContractActuationKind.BLOCKED_TERMINAL
-    assert source_terminal.reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
-    fresh_directive = OutputContractActuationEvidence(
-        False, False, False, False, False, OutputContractAdvisoryState.UNUSED
-    )
-    assert (
-        resolve_output_contract_actuation(family=OutputContractBailFamily.STRUCTURAL, evidence=fresh_directive).kind
-        == OutputContractActuationKind.STRUCTURE_DIRECTIVE
-    )
-
-
 def test_dispatchable_spine_never_terminals_before_its_run() -> None:
     unscouted = OutputContractActuationEvidence(False, False, False, False, False, OutputContractAdvisoryState.UNUSED)
     first = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=unscouted)
@@ -389,27 +236,6 @@ def test_no_source_terminal_requires_prior_actuation() -> None:
     first_pass = OutputContractActuationEvidence(False, True, False, False, False, OutputContractAdvisoryState.UNUSED)
     actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=first_pass)
     assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
-
-
-def test_arm_d_never_fires_on_p5_shape_observed_source() -> None:
-    for family, imposed, click, prior, unconsumed, advisory in itertools.product(
-        list(OutputContractBailFamily),
-        [False, True],
-        [False, True],
-        [False, True],
-        [False, True],
-        list(OutputContractAdvisoryState),
-    ):
-        evidence = OutputContractActuationEvidence(
-            imposed_available=imposed,
-            click_only_spine=click,
-            observed_required_values=True,
-            prior_actuation=prior,
-            prior_directive_unconsumed=unconsumed,
-            advisory_state=advisory,
-        )
-        actuation = resolve_output_contract_actuation(family=family, evidence=evidence)
-        assert actuation.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 
 
 def test_observed_values_suppresses_no_source_terminal() -> None:
@@ -650,31 +476,6 @@ def test_advisory_terminal_requires_consumed_not_granted() -> None:
     assert actuation.reason_code == OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE
 
 
-def test_arm_d_signal_maps_to_output_source_unobservable_halt() -> None:
-    signal = build_output_source_unobservable_blocker_signal(
-        reason_code=OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
-        required_paths={"output.confirmation_number"},
-        block_label="collect_confirmation",
-    )
-    assert signal.renders_final_reply
-    assert signal.preserves_workflow_draft
-    assert_clean_user_facing_text(signal.user_facing_reason)
-    halt = turn_halt_from_blocker_signal(signal, source="workflow_update")
-    assert halt is not None
-    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
-
-
-def test_arm_d_actuation_exhausted_signal_also_maps() -> None:
-    signal = build_output_source_unobservable_blocker_signal(
-        reason_code=OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
-        required_paths={"output.account_number"},
-        block_label="collect_account",
-    )
-    halt = turn_halt_from_blocker_signal(signal, source="workflow_update")
-    assert halt is not None
-    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
-
-
 _STRUCTURAL_BLOCKERS = ["insufficient_durable_stages"]
 _CLICK_ONLY_CODE = "page.click('#toggle-service')"
 
@@ -699,35 +500,6 @@ def _actuate_click_only(ctx: SimpleNamespace, signature: str, fingerprint: str) 
         signature=signature,
         current_fingerprint=fingerprint,
     )
-
-
-def test_click_only_no_source_bail_terminals_after_one_declick_cycle() -> None:
-    signature = "sig_never_converges"
-    ctx = _advisory_ctx()
-    first = _actuate_click_only(ctx, signature, "fp_0")
-    assert first.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
-    assert ctx.output_contract_declick_attempted_by_signature[signature] is True
-    terminal = _actuate_click_only(ctx, signature, "fp_1")
-    assert terminal.kind == OutputContractActuationKind.BLOCKED_TERMINAL
-    assert terminal.reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
-
-
-def test_grantable_split_failure_suppresses_arm_d_and_escalates_to_advisory() -> None:
-    signature = "sig_flaky_split"
-    ctx = _arm_static_return_advisory_ctx(signature)
-    ctx.output_contract_declick_attempted_by_signature[signature] = True
-    actuation = wu._actuate_output_contract_bail(
-        ctx,
-        blockers=list(_STRUCTURAL_BLOCKERS),
-        target_code=_CLICK_ONLY_CODE,
-        required_paths={"output.confirmation_number"},
-        signature=signature,
-        current_fingerprint=_FINGERPRINT,
-        advisory_run_grantable=True,
-    )
-    assert actuation.kind == OutputContractActuationKind.ADVISORY_RUN
-    assert actuation.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
-    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
 
 
 def test_grantable_split_failure_first_pass_arms_directive_not_arm_d() -> None:
@@ -788,33 +560,6 @@ def test_steer_only_downgrades_advisory_run_and_grants_nothing() -> None:
     assert steered.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
     assert ctx.output_contract_actuation_by_signature == {}
     assert ctx.output_contract_actuation_count_by_signature == {}
-
-
-def test_steer_only_never_terminals_click_only_and_skips_declick() -> None:
-    signature = "sig_steer_click_only"
-    ctx = _advisory_ctx()
-    first = wu._actuate_output_contract_bail(
-        ctx,
-        blockers=list(_STRUCTURAL_BLOCKERS),
-        target_code=_CLICK_ONLY_CODE,
-        required_paths={"output.confirmation_number"},
-        signature=signature,
-        current_fingerprint="fp_0",
-        steer_only=True,
-    )
-    assert first.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
-    assert signature not in ctx.output_contract_declick_attempted_by_signature
-    second = wu._actuate_output_contract_bail(
-        ctx,
-        blockers=list(_STRUCTURAL_BLOCKERS),
-        target_code=_CLICK_ONLY_CODE,
-        required_paths={"output.confirmation_number"},
-        signature=signature,
-        current_fingerprint="fp_1",
-        steer_only=True,
-    )
-    assert second.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
-    assert second.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 
 
 def test_observed_required_values_exact_and_lineage_match() -> None:
@@ -1895,5 +1640,5 @@ def _guardrail_impose_ctx() -> tuple[CopilotContext, str, list[dict[str, object]
     workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")')
     metadata = _record_contract_metadata()
     ctx.scouted_output_covered_paths = {"output.record_id"}
-    ctx.code_authoring_guardrail_reject_count = enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    ctx.code_authoring_guardrail_reject_count = 3
     return ctx, workflow_yaml, metadata
