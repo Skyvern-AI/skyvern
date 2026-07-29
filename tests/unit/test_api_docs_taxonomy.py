@@ -45,6 +45,13 @@ RETIRED_TAGS = {
     "server",
     "scheduler",
 }
+# Sections deliberately hidden from the rendered reference (SKY-13151): ops keep their tag and
+# stay in the schema via x-hidden, so the SDK surface is unchanged, but Mintlify renders no section.
+HIDDEN_SECTION_TAGS = {
+    "Tags",
+    "Scripts",
+    "Custom LLMs",
+}
 # The endpoints this change re-tagged → their clean resource tag.
 RETAGGED_PATH_TAGS = {
     "/v1/folders": "Folders",
@@ -84,7 +91,10 @@ def test_no_lowercase_visible_tags() -> None:
 
 def test_visible_tags_are_approved_resource_names() -> None:
     tags = _visible_tags(_committed_spec())
-    assert {"Folders", "Tags", "Server"} <= tags, "the public sub-resources must each keep a section"
+    assert {"Folders", "Server"} <= tags, "the public sub-resources must each keep a section"
+    assert tags.isdisjoint(HIDDEN_SECTION_TAGS), (
+        f"hidden sections leaked back into the rendered reference: {sorted(tags & HIDDEN_SECTION_TAGS)}"
+    )
     assert tags <= APPROVED_TAGS, (
         f"unapproved tag(s) — justify and add to APPROVED_TAGS: {sorted(tags - APPROVED_TAGS)}"
     )

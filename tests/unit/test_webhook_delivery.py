@@ -42,3 +42,11 @@ async def test_valid_https_url_reaches_delivery(monkeypatch: pytest.MonkeyPatch)
     )
     assert out.status_code == 200
     deliver.assert_awaited_once()
+
+
+def test_describe_delivery_error_uses_type_name_for_empty_message() -> None:
+    assert webhook_delivery.describe_delivery_error(httpx.ReadTimeout("")) == "ReadTimeout"
+
+
+def test_describe_delivery_error_includes_message_when_present() -> None:
+    assert webhook_delivery.describe_delivery_error(httpx.ConnectError("boom")) == "ConnectError: boom"
