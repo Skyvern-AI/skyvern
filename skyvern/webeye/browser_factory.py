@@ -178,9 +178,15 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
-async def resolve_video_path(video: Video, timeout_seconds: float) -> str | None:
-    """Wait for video.path() without ever cancelling patchright's shared artifact future"""
-    path_task = asyncio.ensure_future(video.path())
+async def resolve_artifact_path(source: Video | Download, timeout_seconds: float) -> str | None:
+    """Await source.path() without ever cancelling a shared artifact future another awaiter may hold.
+
+    Patchright's Video resolves path() from one future shared across awaiters, so a bare
+    timeout-cancel on any awaiter poisons it for the others (SKY-12852 / SKY-12860). Download.path()
+    resolves via a fresh per-call future today and is not exposed, but is routed here too so a pin
+    bump that reintroduces a shared Download future cannot revive that orphan-hang class.
+    """
+    path_task = asyncio.ensure_future(source.path())
     # Consume the task's eventual outcome even when it outlives this wait (timeout / caller
     # cancelled), so a late PlaywrightError on page close doesn't log "Task exception was
     # never retrieved".
@@ -214,7 +220,7 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
             video = page.video
             if not video:
                 return
-            video_path_or_none = await resolve_video_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
+            video_path_or_none = await resolve_artifact_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
             if video_path_or_none is None:
                 try:
                     page_origin = urlparse(page.url).hostname or "unknown"
@@ -264,72 +270,76 @@ def set_download_file_listener(
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
         task_id = (context.task_id if context else None) or kwargs.get("task_id")
         try:
-            async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
-                file_path = await download.path()
-                if not file_path.exists():
-                    # On an adopted persistent session the bytes live on the run connection, not
-                    # this worker connection; saving is the run side's job, so skip rather than crash.
-                    LOG.debug(
-                        "Download artifact absent on this connection; skipping worker-side rename",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        suggested_filename=download.suggested_filename,
-                    )
-                    return
-                if file_path.suffix:
-                    return
-
-                LOG.info(
-                    "No file extensions, going to add file extension automatically",
+            # Route path() through resolve_artifact_path so a timeout can never cancel a shared
+            # artifact future (see resolve_artifact_path). Everything after the await is synchronous
+            # filesystem work, so it does not need to run under a timeout.
+            resolved_path = await resolve_artifact_path(download, download_timeout or BROWSER_DOWNLOAD_TIMEOUT)
+            if resolved_path is None:
+                LOG.error(
+                    "timeout to download file, going to cancel the download",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                )
+                await download.cancel()
+                return
+            file_path = Path(resolved_path)
+            if not file_path.exists():
+                # On an adopted persistent session the bytes live on the run connection, not
+                # this worker connection; saving is the run side's job, so skip rather than crash.
+                LOG.debug(
+                    "Download artifact absent on this connection; skipping worker-side rename",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                     suggested_filename=download.suggested_filename,
-                    url=_redact_url_query(download.url),
                 )
-                suffix = Path(download.suggested_filename).suffix
-                if suffix:
-                    LOG.info(
-                        "Add extension according to suggested filename",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        filepath=str(file_path) + suffix,
-                    )
-                    file_path.rename(str(file_path) + suffix)
-                    return
+                return
+            if file_path.suffix:
+                return
 
-                parsed_url = urlparse(download.url)
-                parsed_qs = parse_qsl(parsed_url.query)
-                for key, value in parsed_qs:
-                    if key.lower() == "filename":
-                        suffix = Path(value).suffix
-                        if suffix:
-                            LOG.info(
-                                "Add extension according to the parsed query params of download url",
-                                workflow_run_id=workflow_run_id,
-                                task_id=task_id,
-                                filename=value,
-                            )
-                            file_path.rename(str(file_path) + suffix)
-                            return
-
-                suffix = Path(parsed_url.path).suffix
-                if suffix:
-                    LOG.info(
-                        "Add extension according to download url path",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        filepath=str(file_path) + suffix,
-                    )
-                    file_path.rename(str(file_path) + suffix)
-                    return
-                # TODO: maybe should try to parse it from URL response
-        except asyncio.TimeoutError:
-            LOG.error(
-                "timeout to download file, going to cancel the download",
+            LOG.info(
+                "No file extensions, going to add file extension automatically",
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
+                suggested_filename=download.suggested_filename,
+                url=_redact_url_query(download.url),
             )
-            await download.cancel()
+            suffix = Path(download.suggested_filename).suffix
+            if suffix:
+                LOG.info(
+                    "Add extension according to suggested filename",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    filepath=str(file_path) + suffix,
+                )
+                file_path.rename(str(file_path) + suffix)
+                return
+
+            parsed_url = urlparse(download.url)
+            parsed_qs = parse_qsl(parsed_url.query)
+            for key, value in parsed_qs:
+                if key.lower() == "filename":
+                    suffix = Path(value).suffix
+                    if suffix:
+                        LOG.info(
+                            "Add extension according to the parsed query params of download url",
+                            workflow_run_id=workflow_run_id,
+                            task_id=task_id,
+                            filename=value,
+                        )
+                        file_path.rename(str(file_path) + suffix)
+                        return
+
+            suffix = Path(parsed_url.path).suffix
+            if suffix:
+                LOG.info(
+                    "Add extension according to download url path",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    filepath=str(file_path) + suffix,
+                )
+                file_path.rename(str(file_path) + suffix)
+                return
+            # TODO: maybe should try to parse it from URL response
 
         except Exception:
             LOG.exception(

@@ -143,7 +143,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
@@ -829,7 +829,7 @@ async def _persist_captured_download(
                 return _CapturedDownloadPersistence(None, "download_failed")
             if target is None:
                 try:
-                    local_path_value = await download.path()
+                    local_path_value = await resolve_artifact_path(download, timeout)
                     if local_path_value and (local_path := Path(local_path_value)).is_file():
                         if local_path.stat().st_size:
                             return _CapturedDownloadPersistence(local_path, "local_path")
