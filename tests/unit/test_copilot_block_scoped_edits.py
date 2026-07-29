@@ -45,6 +45,13 @@ class TestAnchoredCodeEdit:
             apply_block_edit(_WORKFLOW, "read_total", expected_code='"#stale"', replacement_code='"#x"')
         assert "changed since you read it" in str(exc.value)
 
+    def test_a_failed_anchor_carries_the_current_code(self) -> None:
+        """Without the current code in hand the cheapest next move is resending the same edit, which
+        a repeated-failure loop guard then counts as being stuck."""
+        with pytest.raises(BlockEditError) as exc:
+            apply_block_edit(_WORKFLOW, "read_total", expected_code='"#stale"', replacement_code='"#x"')
+        assert 'total = await page.inner_text("#total")' in str(exc.value)
+
     def test_an_ambiguous_anchor_is_refused(self) -> None:
         workflow = _WORKFLOW.replace(
             'total = await page.inner_text("#total")',

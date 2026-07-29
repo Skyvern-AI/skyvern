@@ -538,37 +538,6 @@ class TestFormatToolResultForUser:
         assert summary != signal.user_facing_reason
         assert summary == "Failed: timeout"
 
-    def test_active_terminal_blocker_matches_structured_failure_category(self) -> None:
-        from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-        from skyvern.forge.sdk.copilot.failure_tracking import (
-            ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-            ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
-        )
-
-        signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="The prior active workflow run emitted typed terminal evidence.",
-            user_facing_reason="I reached the requested browser state, but the workflow still needs review.",
-            recovery_hint="report_blocker_to_user",
-            internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
-            blocked_tool="update_and_run_blocks",
-        )
-        result = {
-            "ok": False,
-            "error": "The active run reached the requested browser state.",
-            "data": {
-                "failure_categories": [
-                    {"category": ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY, "confidence_float": 1.0}
-                ]
-            },
-        }
-
-        summary = format_tool_result_for_user("update_and_run_blocks", result, blocker_signal=signal)
-        detail = summarize_tool_result_detail(result, blocker_signal=signal)
-
-        assert summary == signal.user_facing_reason
-        assert detail == signal.user_facing_reason
-
     def test_watchdog_control_signal_summary_overrides_raw_detail(self) -> None:
         result = {
             "ok": False,

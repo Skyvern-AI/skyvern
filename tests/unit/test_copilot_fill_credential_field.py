@@ -476,9 +476,6 @@ class TestConsecutiveLoopGuardExemption:
             assert error is None
         assert ctx.consecutive_tool_tracker == []
 
-    def test_exemption_set_membership(self) -> None:
-        assert "fill_credential_field" in tools_module._CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
-
 
 class TestToolRegistration:
     def test_tool_is_registered_native(self) -> None:

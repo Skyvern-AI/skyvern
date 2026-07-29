@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -46,6 +47,9 @@ time.sleep(60)
 """
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _set_home(monkeypatch, home: Path) -> None:
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
@@ -59,6 +63,7 @@ def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_
 
     fake_session_manager = types.ModuleType("skyvern.cli.core.session_manager")
     fake_session_manager.set_stateless_http_mode = lambda _enabled: None
+    fake_session_manager.set_stdio_local_file_access_enabled = lambda _enabled: None
 
     fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
     fake_telemetry.configure_mcp_telemetry_runtime = lambda **_kwargs: None
@@ -300,6 +305,7 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
     fake_session_manager = types.ModuleType("skyvern.cli.core.session_manager")
     fake_session_manager.set_stateless_http_mode = lambda enabled: events.append(f"stateless:{enabled}")
+    fake_session_manager.set_stdio_local_file_access_enabled = lambda enabled: events.append(f"stdio_local:{enabled}")
 
     fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
 
@@ -353,9 +359,11 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
         "sweep",
         "telemetry:local_cli:stdio",
         "stateless:False",
+        "stdio_local:True",
         "run:stdio",
         "cleanup",
         "stateless:False",
+        "stdio_local:False",
     ]
 
 
@@ -754,12 +762,15 @@ def test_quickstart_interactive_choice_reprompts_invalid_alias(monkeypatch) -> N
     monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: True)
 
     result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="wat\nserver\nn\n")
+    # Rich colourises this prompt when it believes it is on a terminal, which splices escape codes
+    # through the phrase and breaks a raw substring match.
+    output = _ANSI_ESCAPE_RE.sub("", result.output)
 
     assert result.exit_code == 1
-    assert "Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3." in result.output
-    assert "Please select a valid option:" not in result.output
-    assert "Install the missing server dependencies now?" in result.output
-    assert 'Install: pip install "skyvern[server]"' in result.output
+    assert "Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3." in output
+    assert "Please select a valid option:" not in output
+    assert "Install the missing server dependencies now?" in output
+    assert 'Install: pip install "skyvern[server]"' in output
 
 
 def test_quickstart_interactive_eof_falls_back_to_default(monkeypatch) -> None:

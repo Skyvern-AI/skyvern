@@ -252,9 +252,10 @@ def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> No
     prompt = _code_only_browser_authoring_prompt()
 
     assert "Credentialed login code must be idempotent" in prompt
-    assert "already-authenticated page anchor" in prompt
-    assert "only fill username/password" in prompt
-    assert "login fields are visible" in prompt
+    # One wait on the two states together, then a no-wait branch — waiting on the login form alone
+    # spends the whole timeout proving it is absent on an already-authenticated session.
+    assert ".or_(" in prompt
+    assert "is_visible()" in prompt
     assert "await solve_captcha(page)" in prompt
     assert "platform-managed verification challenge" in prompt
     assert "await <credential_key>.otp()" in prompt
@@ -759,3 +760,14 @@ def test_pre_hook_and_post_emission_reject_share_constant() -> None:
     assert hasattr(tools_module, "_get_block_schema_post_hook")
     assert hasattr(tools_module, "_detect_new_banned_blocks")
     assert hasattr(tools_module, "_banned_block_reject_message")
+
+
+def test_schema_guidance_teaches_a_no_wait_branch_between_two_page_states() -> None:
+    # A `wait_for` on a branch that may legitimately be absent spends its whole timeout proving the
+    # absence, and every repair attempt pays it again.
+    from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_schema_guidance
+
+    guidance = " ".join(_code_only_browser_schema_guidance())
+
+    assert ".or_(" in guidance
+    assert "is_visible()" in guidance or "count()" in guidance
