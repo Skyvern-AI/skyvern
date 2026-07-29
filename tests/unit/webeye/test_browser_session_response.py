@@ -42,6 +42,7 @@ async def test_browser_session_response_never_exposes_upstream_routing_fields() 
         browser_address="wss://proxy.example/pbs_123/token/devtools/browser/test",
         upstream_cdp_url="ws://10.0.0.7:9222/devtools/browser/test",
         browser_vendor="websocket",
+        browser_id="upstream-session-cafebabe",
         created_at=now,
         modified_at=now,
     )
@@ -54,7 +55,7 @@ async def test_browser_session_response_never_exposes_upstream_routing_fields() 
         response = await BrowserSessionResponse.from_browser_session(session)
 
     serialized = response.model_dump_json()
-    for leaked in ("10.0.0.7", "upstream_cdp_url", "browser_vendor"):
+    for leaked in ("10.0.0.7", "upstream_cdp_url", "browser_vendor", "browser_id", "upstream-session-cafebabe"):
         assert leaked not in serialized
     assert response.browser_address == "wss://proxy.example/pbs_123/token/devtools/browser/test"
 

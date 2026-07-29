@@ -984,6 +984,10 @@ class WorkflowParametersRepository(BaseRepository):
             "confidence_float": action.confidence_float,
             "created_by": action.created_by,
         }
+        if action.created_at is not None:
+            values["created_at"] = action.created_at
+        if action.modified_at is not None:
+            values["modified_at"] = action.modified_at
         async with self.Session() as session:
             stmt = pg_insert(ActionModel).values(**values)
             stmt = stmt.on_conflict_do_update(
@@ -991,7 +995,7 @@ class WorkflowParametersRepository(BaseRepository):
                 set_={
                     "screenshot_artifact_id": stmt.excluded.screenshot_artifact_id,
                     "action_json": stmt.excluded.action_json,
-                    "modified_at": datetime.now(timezone.utc),
+                    "modified_at": stmt.excluded.modified_at,
                 },
             )
             await session.execute(stmt)
