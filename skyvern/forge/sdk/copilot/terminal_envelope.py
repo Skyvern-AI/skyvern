@@ -83,12 +83,18 @@ def assemble_terminal_envelope(
     )
 
 
-def finalize_applied_state(envelope: TerminalOutcomeEnvelope, *, applied: bool) -> TerminalOutcomeEnvelope:
+def finalize_applied_state(
+    envelope: TerminalOutcomeEnvelope, *, applied: bool, proposal_present: bool = False
+) -> TerminalOutcomeEnvelope:
     if envelope.user_action_required:
         next_state: TerminalNextState = "awaiting_user_input"
     elif envelope.verified and applied:
         next_state = "completed"
-    elif envelope.next_state == "proposal_pending":
+    # A verified un-applied proposal is pending review even though its
+    # auto_applicable disposition would otherwise fall through to "stopped":
+    # verified fixes no longer auto-commit. Unverified builds keep the
+    # built-unverified stop.
+    elif envelope.next_state == "proposal_pending" or (proposal_present and not applied and envelope.verified):
         next_state = "proposal_pending"
     else:
         next_state = "stopped"

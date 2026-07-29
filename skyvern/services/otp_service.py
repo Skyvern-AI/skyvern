@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,14 @@ from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 
 LOG = structlog.get_logger()
+
+_RAW_OTP_REPARSE_LIMIT = 3
+
+
+@dataclass
+class RawOTPVerificationContext:
+    misses: set[tuple[str, OTPType]] = field(default_factory=set)
+
 
 _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
 # Keys that contain an MFA hint but are TOTP *metadata*, not actual OTP codes.
@@ -78,6 +87,11 @@ async def parse_otp_login(
     organization_id: str,
     enforced_otp_type: OTPType | None = None,
 ) -> OTPValue | None:
+    # Gate the paid extraction before spending on the LLM: an org that is out of
+    # credits should not incur the secondary-LLM cost only to be charged for it.
+    if not await app.AGENT_FUNCTION.has_sufficient_credit_for_otp_parse(organization_id):
+        LOG.info("Skipping OTP parse; organization has insufficient credits", organization_id=organization_id)
+        return None
     prompt = prompt_engine.load_prompt(
         "parse-otp-login",
         content=content,
@@ -86,6 +100,9 @@ async def parse_otp_login(
     resp = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, prompt_name="parse-otp-login", organization_id=organization_id
     )
+    # The LLM call succeeded, so the extraction work is billable regardless of
+    # whether a code is ultimately found. Charging is best-effort and never raises.
+    await app.AGENT_FUNCTION.charge_for_otp_parse(organization_id)
     try:
         otp_result = OTPResultParsedByLLM.model_validate(resp)
     except ValidationError as e:
@@ -379,7 +396,7 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     return try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
 
 
-async def resolve_otp_value(task: "Task") -> OTPValue | None:
+async def resolve_otp_value(task: "Task", expected_otp_type: OTPType | None = None) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
     Priority is payload -> credential-backed TOTP -> webhook polling. The
@@ -419,6 +436,7 @@ async def resolve_otp_value(task: "Task") -> OTPValue | None:
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
             created_after=run_started_at,
+            expected_otp_type=expected_otp_type,
         )
 
     return None
@@ -433,6 +451,7 @@ async def poll_otp_value(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
     created_after: datetime | None = None,
+    expected_otp_type: OTPType | None = None,
 ) -> OTPValue | None:
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
@@ -449,6 +468,7 @@ async def poll_otp_value(
     last_error_reason: str | None = None
     org_token: OrganizationAuthToken | None = None
     gmail_otp_context = GmailOTPVerificationContext()
+    raw_otp_context = RawOTPVerificationContext()
     while True:
         await asyncio.sleep(10)
         if datetime.utcnow() > timeout_datetime:
@@ -511,6 +531,8 @@ async def poll_otp_value(
                     workflow_id=workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
                     created_after=db_created_after,
+                    expected_otp_type=expected_otp_type,
+                    raw_context=raw_otp_context,
                 )
         except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
@@ -672,6 +694,8 @@ async def _get_otp_value_from_db(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
     created_after: datetime | None = None,
+    expected_otp_type: OTPType | None = None,
+    raw_context: RawOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     # Email/SMS deliveries can arrive through /v1/credentials/totp without run
     # scope, so include both exact run matches and unscoped rows in SQL.
@@ -692,4 +716,53 @@ async def _get_otp_value_from_db(
         if totp_code.expired_at and totp_code.expired_at < datetime.utcnow():
             continue
         return OTPValue(value=totp_code.code, type=totp_code.otp_type)
+    if expected_otp_type is None:
+        return None
+    context = raw_context or RawOTPVerificationContext()
+    raw_rows = await app.DATABASE.otp.get_raw_otp_codes(
+        organization_id=organization_id,
+        totp_identifier=totp_identifier,
+        workflow_run_id=workflow_run_id,
+        include_unscoped_workflow_run=workflow_run_id is not None,
+        created_after=created_after,
+        excluded_ids={row_id for row_id, otp_type in context.misses if otp_type == expected_otp_type},
+    )
+    attempts = 0
+    for row in raw_rows:
+        cache_key = (row.totp_code_id, expected_otp_type)
+        if row.workflow_run_id and workflow_run_id and row.workflow_run_id != workflow_run_id:
+            continue
+        if row.workflow_id and workflow_id and row.workflow_id != workflow_id:
+            continue
+        if row.task_id and row.task_id != task_id:
+            continue
+        if row.expired_at and row.expired_at < datetime.utcnow():
+            continue
+        if attempts >= _RAW_OTP_REPARSE_LIMIT:
+            break
+        attempts += 1
+        try:
+            otp_value = await parse_otp_login(row.content, organization_id, enforced_otp_type=expected_otp_type)
+        except Exception:
+            LOG.warning(
+                "Raw OTP reparse failed", totp_code_id=row.totp_code_id, otp_type=expected_otp_type, exc_info=True
+            )
+            continue
+        if otp_value is None or otp_value.get_otp_type() != expected_otp_type:
+            context.misses.add(cache_key)
+            continue
+        await app.DATABASE.otp.promote_raw_otp_code(
+            totp_code_id=row.totp_code_id,
+            organization_id=organization_id,
+            code=otp_value.value,
+            otp_type=expected_otp_type,
+        )
+        LOG.info(
+            "Promoted raw OTP content",
+            organization_id=organization_id,
+            totp_code_id=row.totp_code_id,
+            otp_type=expected_otp_type,
+            content_length=len(row.content),
+        )
+        return otp_value
     return None

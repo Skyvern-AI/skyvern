@@ -53,6 +53,7 @@ import { cn } from "@/util/utils";
 import {
   BookmarkFilledIcon,
   ChevronDownIcon,
+  DotsHorizontalIcon,
   LightningBoltIcon,
   MixerHorizontalIcon,
   Pencil2Icon,
@@ -82,7 +83,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { NarrativeCard } from "./components/header/NarrativeCard";
 import { BulkActionBar } from "./components/BulkActionBar";
-import { WorkflowRowContextMenu } from "./components/WorkflowRowContextMenu";
+import { WorkflowRowActions } from "./components/WorkflowRowActions";
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
@@ -962,11 +963,19 @@ function WorkflowsFlat() {
                               <Button size="icon" variant="ghost" disabled>
                                 <Pencil2Icon className="h-4 w-4" />
                               </Button>
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                disabled
+                                aria-label={`Actions for ${workflow.title}`}
+                              >
+                                <DotsHorizontalIcon className="h-4 w-4" />
+                              </Button>
                             </div>
                           </TableCell>
                         </TableRow>
                       ) : (
-                        <WorkflowRowContextMenu
+                        <WorkflowRowActions
                           workflow={workflow}
                           tagKeys={tagKeys}
                           labelSuggestions={labelSuggestions}
@@ -982,134 +991,193 @@ function WorkflowsFlat() {
                             replaceSelection(next);
                           }}
                         >
-                          <TableRow
-                            className="group/row cursor-pointer select-none"
-                            data-state={isRowSelected ? "selected" : undefined}
-                          >
-                            {showCheckbox && (
-                              <SelectionCheckboxCell
-                                className="select-none"
-                                index={selectableIndex}
-                                checked={isRowSelected}
-                                hasSelection={selected.size > 0}
-                                onSelect={handleSelect}
-                                ariaLabel={`Select ${workflow.title}`}
-                              />
-                            )}
-                            <TableCell
-                              onClick={(event) => {
-                                handleRowClick(
-                                  event,
-                                  workflow.workflow_permanent_id,
-                                );
-                              }}
+                          {(kebab) => (
+                            <TableRow
+                              className="group/row cursor-pointer select-none"
+                              data-state={
+                                isRowSelected ? "selected" : undefined
+                              }
                             >
-                              <div
-                                className="truncate font-mono text-xs text-muted-foreground"
-                                title={workflow.workflow_permanent_id}
-                              >
-                                <HighlightText
-                                  text={workflow.workflow_permanent_id}
-                                  query={debouncedSearch}
+                              {showCheckbox && (
+                                <SelectionCheckboxCell
+                                  className="select-none"
+                                  index={selectableIndex}
+                                  checked={isRowSelected}
+                                  hasSelection={selected.size > 0}
+                                  onSelect={handleSelect}
+                                  ariaLabel={`Select ${workflow.title}`}
                                 />
-                              </div>
-                            </TableCell>
-                            <TableCell
-                              onClick={(event) => {
-                                handleRowClick(
-                                  event,
-                                  workflow.workflow_permanent_id,
-                                );
-                              }}
-                            >
-                              <div className="flex min-w-0 flex-col gap-1">
-                                <div className="flex min-w-0 items-center gap-2">
-                                  <span
-                                    className="truncate"
-                                    title={workflow.title}
-                                  >
-                                    <HighlightText
-                                      text={workflow.title}
-                                      query={debouncedSearch}
-                                    />
-                                  </span>
-                                  {workflow.is_template && (
-                                    <TooltipProvider>
-                                      <Tooltip>
-                                        <TooltipTrigger asChild>
-                                          <BookmarkFilledIcon className="h-3.5 w-3.5 shrink-0 text-blue-500" />
-                                        </TooltipTrigger>
-                                        <TooltipContent>
-                                          Template
-                                        </TooltipContent>
-                                      </Tooltip>
-                                    </TooltipProvider>
-                                  )}
-                                  <WorkflowReliabilityBadge
-                                    reliability={
-                                      workflowReliabilityMap[
-                                        workflow.workflow_permanent_id
-                                      ]
-                                    }
+                              )}
+                              <TableCell
+                                onClick={(event) => {
+                                  handleRowClick(
+                                    event,
+                                    workflow.workflow_permanent_id,
+                                  );
+                                }}
+                              >
+                                <div
+                                  className="truncate font-mono text-xs text-muted-foreground"
+                                  title={workflow.workflow_permanent_id}
+                                >
+                                  <HighlightText
+                                    text={workflow.workflow_permanent_id}
+                                    query={debouncedSearch}
                                   />
                                 </div>
-                                {taggingEnabled &&
-                                workflowTags &&
-                                workflowTags.length > 0 ? (
-                                  <TagChipList
-                                    tags={workflowTags}
-                                    descriptions={tagDescriptions}
-                                    colors={tagColors}
-                                  />
-                                ) : null}
-                              </div>
-                            </TableCell>
-                            <TableCell
-                              onClick={(event) => {
-                                handleRowClick(
-                                  event,
-                                  workflow.workflow_permanent_id,
-                                );
-                              }}
-                            >
-                              {workflow.folder_id ? (
-                                <div className="flex min-w-0 items-center gap-1.5">
-                                  <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
-                                  <span
-                                    className="truncate text-sm"
-                                    title={
-                                      foldersMap.get(workflow.folder_id)
-                                        ?.title || workflow.folder_id
-                                    }
-                                  >
-                                    <HighlightText
-                                      text={
+                              </TableCell>
+                              <TableCell
+                                onClick={(event) => {
+                                  handleRowClick(
+                                    event,
+                                    workflow.workflow_permanent_id,
+                                  );
+                                }}
+                              >
+                                <div className="flex min-w-0 flex-col gap-1">
+                                  <div className="flex min-w-0 items-center gap-2">
+                                    <span
+                                      className="truncate"
+                                      title={workflow.title}
+                                    >
+                                      <HighlightText
+                                        text={workflow.title}
+                                        query={debouncedSearch}
+                                      />
+                                    </span>
+                                    {workflow.is_template && (
+                                      <TooltipProvider>
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <BookmarkFilledIcon className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                                          </TooltipTrigger>
+                                          <TooltipContent>
+                                            Template
+                                          </TooltipContent>
+                                        </Tooltip>
+                                      </TooltipProvider>
+                                    )}
+                                    <WorkflowReliabilityBadge
+                                      reliability={
+                                        workflowReliabilityMap[
+                                          workflow.workflow_permanent_id
+                                        ]
+                                      }
+                                    />
+                                  </div>
+                                  {taggingEnabled &&
+                                  workflowTags &&
+                                  workflowTags.length > 0 ? (
+                                    <TagChipList
+                                      tags={workflowTags}
+                                      descriptions={tagDescriptions}
+                                      colors={tagColors}
+                                    />
+                                  ) : null}
+                                </div>
+                              </TableCell>
+                              <TableCell
+                                onClick={(event) => {
+                                  handleRowClick(
+                                    event,
+                                    workflow.workflow_permanent_id,
+                                  );
+                                }}
+                              >
+                                {workflow.folder_id ? (
+                                  <div className="flex min-w-0 items-center gap-1.5">
+                                    <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
+                                    <span
+                                      className="truncate text-sm"
+                                      title={
                                         foldersMap.get(workflow.folder_id)
                                           ?.title || workflow.folder_id
                                       }
-                                      query={debouncedSearch}
-                                    />
+                                    >
+                                      <HighlightText
+                                        text={
+                                          foldersMap.get(workflow.folder_id)
+                                            ?.title || workflow.folder_id
+                                        }
+                                        query={debouncedSearch}
+                                      />
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <span className="text-muted-foreground">
+                                    -
                                   </span>
-                                </div>
-                              ) : (
-                                <span className="text-muted-foreground">-</span>
-                              )}
-                            </TableCell>
-                            <TableCell
-                              onClick={(event) => {
-                                handleRowClick(
-                                  event,
-                                  workflow.workflow_permanent_id,
-                                );
-                              }}
-                              className="text-muted-foreground"
-                              title={basicTimeFormat(workflow.created_at)}
-                            >
-                              {compactLocalDateTime(workflow.created_at)}
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex justify-end gap-0.5">
-                                {hasParameters && (
+                                )}
+                              </TableCell>
+                              <TableCell
+                                onClick={(event) => {
+                                  handleRowClick(
+                                    event,
+                                    workflow.workflow_permanent_id,
+                                  );
+                                }}
+                                className="text-muted-foreground"
+                                title={basicTimeFormat(workflow.created_at)}
+                              >
+                                {compactLocalDateTime(workflow.created_at)}
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex justify-end gap-0.5">
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="inline-flex">
+                                          <Button
+                                            size="icon"
+                                            variant="ghost"
+                                            className="text-muted-foreground hover:text-foreground"
+                                            disabled={!hasParameters}
+                                            aria-label={
+                                              isExpanded
+                                                ? "Hide parameters"
+                                                : "Show parameters"
+                                            }
+                                            onClick={() =>
+                                              toggleParametersExpanded(
+                                                workflow.workflow_permanent_id,
+                                              )
+                                            }
+                                          >
+                                            <MixerHorizontalIcon className="h-4 w-4" />
+                                          </Button>
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        {!hasParameters
+                                          ? "No parameters defined"
+                                          : isExpanded
+                                            ? "Hide parameters"
+                                            : "Show parameters"}
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <Button
+                                          size="icon"
+                                          variant="ghost"
+                                          className="text-cta hover:text-cta"
+                                          onClick={(event) => {
+                                            handleIconClick(
+                                              event,
+                                              `/agents/${workflow.workflow_permanent_id}/run`,
+                                            );
+                                          }}
+                                        >
+                                          <PlayIcon className="h-4 w-4" />
+                                        </Button>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        Create New Run
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
                                   <TooltipProvider>
                                     <Tooltip>
                                       <TooltipTrigger asChild>
@@ -1117,74 +1185,30 @@ function WorkflowsFlat() {
                                           size="icon"
                                           variant="ghost"
                                           className="text-muted-foreground hover:text-foreground"
-                                          onClick={() =>
-                                            toggleParametersExpanded(
-                                              workflow.workflow_permanent_id,
-                                            )
-                                          }
+                                          onClick={(event) => {
+                                            handleIconClick(
+                                              event,
+                                              workflowEditorPath(
+                                                workflow.workflow_permanent_id,
+                                                studioEnabled,
+                                              ),
+                                            );
+                                          }}
                                         >
-                                          <MixerHorizontalIcon className="h-4 w-4" />
+                                          <Pencil2Icon className="h-4 w-4" />
                                         </Button>
                                       </TooltipTrigger>
                                       <TooltipContent>
-                                        {isExpanded
-                                          ? "Hide parameters"
-                                          : "Show parameters"}
+                                        Open in Editor
                                       </TooltipContent>
                                     </Tooltip>
                                   </TooltipProvider>
-                                )}
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <Button
-                                        size="icon"
-                                        variant="ghost"
-                                        className="text-cta hover:text-cta"
-                                        onClick={(event) => {
-                                          handleIconClick(
-                                            event,
-                                            `/agents/${workflow.workflow_permanent_id}/run`,
-                                          );
-                                        }}
-                                      >
-                                        <PlayIcon className="h-4 w-4" />
-                                      </Button>
-                                    </TooltipTrigger>
-                                    <TooltipContent>
-                                      Create New Run
-                                    </TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <Button
-                                        size="icon"
-                                        variant="ghost"
-                                        className="text-muted-foreground hover:text-foreground"
-                                        onClick={(event) => {
-                                          handleIconClick(
-                                            event,
-                                            workflowEditorPath(
-                                              workflow.workflow_permanent_id,
-                                              studioEnabled,
-                                            ),
-                                          );
-                                        }}
-                                      >
-                                        <Pencil2Icon className="h-4 w-4" />
-                                      </Button>
-                                    </TooltipTrigger>
-                                    <TooltipContent>
-                                      Open in Editor
-                                    </TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        </WorkflowRowContextMenu>
+                                  {kebab}
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </WorkflowRowActions>
                       )}
 
                       {/* Expanded parameters section */}

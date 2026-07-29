@@ -24,6 +24,12 @@ def _make_descendant_locator(interactive_count: int) -> MagicMock:
     return descendant
 
 
+def _make_raising_descendant_locator(error: Exception) -> MagicMock:
+    descendant = MagicMock()
+    descendant.count = AsyncMock(side_effect=error)
+    return descendant
+
+
 def _make_label_locator(interactive_count: int) -> MagicMock:
     label = MagicMock()
     label.count = AsyncMock(return_value=1)
@@ -105,3 +111,44 @@ class TestFindBoundLabelByDirectParentAnchorFiltering:
     async def test_non_label_parent_returns_none(self) -> None:
         elem = _make_input_for_direct_parent(_make_parent_label_locator(interactive_count=0, tag="DIV"))
         assert await elem.find_bound_label_by_direct_parent() is None
+
+
+class TestLabelClickForwardsToDescendantProbeFallback:
+    """The descendant probe can raise on a destroyed context or detached frame. The
+    fallback is caller-selected: OSS bound-label callers keep the pre-PR fail-open
+    default, while the Cloud setup path opts into fail-closed."""
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_defaults_to_not_forwarding(self) -> None:
+        label = MagicMock()
+        label.locator = MagicMock(return_value=_make_raising_descendant_locator(RuntimeError("detached frame")))
+        assert await SkyvernElement._label_click_forwards_to_descendant(label) is False
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_fails_closed_when_requested(self) -> None:
+        label = MagicMock()
+        label.locator = MagicMock(return_value=_make_raising_descendant_locator(RuntimeError("detached frame")))
+        assert await SkyvernElement._label_click_forwards_to_descendant(label, fail_closed=True) is True
+
+    @pytest.mark.asyncio
+    async def test_no_descendant_is_not_forwarding(self) -> None:
+        label = MagicMock()
+        label.locator = MagicMock(return_value=_make_descendant_locator(0))
+        assert await SkyvernElement._label_click_forwards_to_descendant(label) is False
+
+    @pytest.mark.asyncio
+    async def test_attr_id_fallback_keeps_label_when_probe_raises(self) -> None:
+        label = MagicMock()
+        label.count = AsyncMock(return_value=1)
+        label.locator = MagicMock(return_value=_make_raising_descendant_locator(RuntimeError("destroyed context")))
+        elem = _make_input_for_attr_id(label)
+        assert await elem.find_bound_label_by_attr_id() is label
+
+    @pytest.mark.asyncio
+    async def test_direct_parent_fallback_keeps_label_when_probe_raises(self) -> None:
+        parent = MagicMock()
+        parent.count = AsyncMock(return_value=1)
+        parent.evaluate = AsyncMock(return_value="LABEL")
+        parent.locator = MagicMock(return_value=_make_raising_descendant_locator(RuntimeError("destroyed context")))
+        elem = _make_input_for_direct_parent(parent)
+        assert await elem.find_bound_label_by_direct_parent() is parent

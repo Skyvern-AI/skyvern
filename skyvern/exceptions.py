@@ -1,4 +1,5 @@
 import re
+from collections.abc import Sequence
 from http import HTTPStatus
 from importlib.util import find_spec
 from typing import NoReturn
@@ -175,6 +176,21 @@ def get_user_facing_exception_message(exception: Exception) -> str:
 class DisabledBlockExecutionError(SkyvernHTTPException):
     def __init__(self, message: str | None = None):
         super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
+
+
+class BrowserActionPolicyNotEnforceable(SkyvernHTTPException):
+    """A workflow version was enrolled in a browser action policy the runtime cannot uphold.
+
+    `reasons` are stable codes describing the configuration only — never workflow content, origins
+    or identifiers — because they are rendered to callers and stamped on failed runs.
+    """
+
+    def __init__(self, reasons: Sequence[str]):
+        self.reasons = tuple(reasons)
+        super().__init__(
+            f"Workflow cannot run under a browser action policy: {', '.join(self.reasons)}",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 class RateLimitExceeded(SkyvernHTTPException):
@@ -614,6 +630,10 @@ class StepNotFound(SkyvernHTTPException):
 class FailedToTakeScreenshot(SkyvernException):
     def __init__(self, error_message: str) -> None:
         super().__init__(f"Failed to take screenshot. Error message: {error_message}")
+
+
+class ScreenshotTargetClosed(FailedToTakeScreenshot):
+    pass
 
 
 class EmptyScrapePage(SkyvernException):

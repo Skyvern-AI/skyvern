@@ -196,7 +196,7 @@ class TestPlaceholderPlumbing:
                 return ScrapeFrameDecision(exclude=False)
             return ScrapeFrameDecision(exclude=True, placeholder=dict(_PLACEHOLDER))
 
-        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude=_exclude)
+        elements, element_tree, _destinations = await get_interactable_element_tree(page, scrape_exclude=_exclude)
 
         tree_texts = [str(node.get("text", "")) for node in _flatten(element_tree)]
         assert "placeholder signal" in tree_texts
@@ -215,6 +215,6 @@ class TestPlaceholderPlumbing:
         page = await page_factory("<html><body><input id='name' type='text' /></body></html>")
 
         exclude = AsyncMock(return_value=ScrapeFrameDecision(exclude=False))
-        _, element_tree = await get_interactable_element_tree(page, scrape_exclude=exclude)
+        _, element_tree, _ = await get_interactable_element_tree(page, scrape_exclude=exclude)
 
         assert all("placeholder signal" not in str(node.get("text", "")) for node in _flatten(element_tree))

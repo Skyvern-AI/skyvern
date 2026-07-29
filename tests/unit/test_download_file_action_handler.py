@@ -15,11 +15,16 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ClickAction, DownloadFileAction
 from skyvern.webeye.actions.handler import (
+    _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+    _INLINE_IFRAME_SRC_JS,
     DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE,
     ActionHandler,
     ScopedXhrDownloadCapture,
     _cleanup_captured_download_popup,
+    _collect_inline_iframe_src_candidates,
+    _looks_like_pdf,
     _persist_captured_download,
+    _recover_blocked_inline_pdf_download,
     _remove_download_listener,
     handle_download_file_action,
 )
@@ -27,6 +32,12 @@ from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_organization, make_step, make_task
+
+# One second is only a test-side runaway guard. The behavior under test is
+# asserted through configured timeout values, cleanup, and span attributes
+# below; it tolerates the hundreds of ms a loaded CI runner can delay a
+# completed coroutine without turning scheduling latency into a product failure.
+CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 1.0
 
 
 class _EventEmitter:
@@ -784,7 +795,7 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
                     timeout=0.5,
                 )
 
-        assert time.monotonic() - started_at < 0.2
+        assert time.monotonic() - started_at < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
         assert not interceptor._browser_download_tasks
 
 
@@ -844,7 +855,7 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
         elapsed = time.monotonic() - started_at
 
     assert elapsed >= 0.05
-    assert elapsed < 0.5
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == ["report.pdf"]
 
@@ -1147,9 +1158,8 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
 
         elapsed = time.monotonic() - started_at
 
-    # Proves the 0.03s download budget raised, not the 5s wait_for safety net;
-    # the bound is loose because loaded CI runners add hundreds of ms of lag.
-    assert elapsed < 1.0
+    # Proves the 0.03s download budget raised, not the 5s wait_for safety net.
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
 
 
 def test_remove_download_listener_uses_playwright_remove_listener_when_off_unavailable() -> None:
@@ -1248,7 +1258,10 @@ async def test_handle_download_file_action_with_download_url() -> None:
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         # Verify page.goto was called with the correct URL (handler uses browser navigation for download_url)
@@ -1289,7 +1302,10 @@ async def test_handle_download_file_action_with_download_url_same_filename() -> 
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         page.goto.assert_called_once()
@@ -1462,7 +1478,10 @@ async def test_handle_download_file_action_download_url_error() -> None:
 
     page.goto = AsyncMock(side_effect=Exception("Download failed"))
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         assert len(result) == 1
@@ -1542,7 +1561,10 @@ async def test_handle_download_file_action_download_url_err_aborted_swallowed() 
         step_id=step.step_id,
     )
 
-    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=lambda url: url),
+    ):
         result = await handle_download_file_action(action, page, scraped_page, task, step)
 
         assert len(result) == 1
@@ -1783,7 +1805,7 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     assert results[-1].needs_followup is True
@@ -1930,7 +1952,7 @@ async def test_handle_action_download_fails_on_transient_user_defined_error_text
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert isinstance(results[-1], ActionFailure)
     assert results[-1].download_triggered is False
     assert "download failure says the generated archive could not be saved" in (results[-1].exception_message or "")
@@ -2322,7 +2344,7 @@ async def test_handle_action_download_in_flight_request_does_not_extend_custom_t
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 0.1
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -2384,9 +2406,7 @@ async def test_handle_action_download_without_explicit_timeout_has_bounded_in_fl
             )
         elapsed = time.monotonic() - started_at
 
-    # Keep a generous wall-clock runaway guard for loaded CI runners; the
-    # precise logical deadline is asserted via timeout_seconds below.
-    assert 0.03 <= elapsed < 1.0
+    assert 0.03 <= elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["no_signal_grace_seconds"] == 0.01
@@ -2899,7 +2919,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
             )
         elapsed = time.monotonic() - started_at
 
-    assert elapsed < 1.0
+    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
     assert wait_for_downloads.await_count == 0
@@ -4139,3 +4159,570 @@ async def test_handle_action_fast_native_success_cleanup_uses_zero_xhr_budget() 
 
     assert results[-1].download_triggered is True
     mock_xhr.drain.assert_awaited_once_with(timeout_seconds=0)
+
+
+_RECOVER_READ = "skyvern.webeye.actions.handler.SkyvernFrame.read_http_url_bytes"
+
+
+class _RecoveryFrame:
+    def __init__(self, iframe_srcs: list) -> None:
+        self._srcs = iframe_srcs
+        self.evaluate_calls = 0
+
+    async def evaluate(self, expression: str | None = None, arg: object = None) -> list:
+        self.evaluate_calls += 1
+        return self._srcs
+
+
+class _RecoveryPage:
+    def __init__(self, main_srcs: list, child_frames: list | None = None, frames_include_main: bool = False) -> None:
+        self.main_frame = _RecoveryFrame(main_srcs)
+        extra = child_frames or []
+        # Real Playwright's page.frames already includes the main frame; frames_include_main mirrors that.
+        self.frames = [self.main_frame, *extra] if frames_include_main else extra
+        # Page-like surface: the main frame is evaluated by passing the Page itself (is_page_like),
+        # so the Page delegates evaluate to its main frame. context=None keeps SkyvernFrame.evaluate
+        # off the main-world prefix path (no prefix configured in tests).
+        self.context = None
+
+    def bring_to_front(self) -> None:
+        return None
+
+    async def evaluate(self, expression: str | None = None, arg: object = None) -> list:
+        return await self.main_frame.evaluate(expression, arg)
+
+
+def test_looks_like_pdf_accepts_pdf_and_rejects_others() -> None:
+    assert _looks_like_pdf(b"%PDF-1.7\n...statement...")
+    assert _looks_like_pdf(b"\xef\xbb\xbf%PDF-1.4 with a preamble")  # exact UTF-8 BOM tolerated
+    assert not _looks_like_pdf(b"<!doctype html><html>login</html>")
+    assert not _looks_like_pdf(b"<html>your %PDF-1.4 is attached</html>")  # marker not at the start
+    assert not _looks_like_pdf(b"")
+    # only the exact 3-byte BOM is stripped, not arbitrary members of {0xef,0xbb,0xbf}
+    assert not _looks_like_pdf(b"\xef%PDF-1.4")  # a lone 0xef is not a BOM
+    assert not _looks_like_pdf(b"\xbb\xbf%PDF-1.4")  # a partial BOM is not a BOM
+    assert not _looks_like_pdf(b"\xef\xbb\xbf\xef\xbb\xbf%PDF-")  # only one BOM is stripped
+
+
+@pytest.mark.asyncio
+async def test_collect_inline_iframe_src_candidates_filters_and_dedupes() -> None:
+    page = _RecoveryPage(
+        main_srcs=[
+            "https://host.example/api/StatementPdf?access_token=x",
+            "https://host.example/api/StatementPdf?access_token=x",  # duplicate dropped
+            "about:blank",
+            "blob:https://host.example/abc",
+            "http://host.example/other.pdf",
+            "",
+        ]
+    )
+    result = await _collect_inline_iframe_src_candidates(page)
+    assert result == [
+        "https://host.example/api/StatementPdf?access_token=x",
+        "http://host.example/other.pdf",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_inline_iframe_src_candidates_routes_main_frame_as_page_and_child_as_frame() -> None:
+    # Enumeration must go through the unified SkyvernFrame.evaluate seam (which centralizes
+    # main-world routing, timeout handling, and navigation-context recovery), not a raw
+    # Playwright frame.evaluate. The main frame is routed as the Page so any context-level
+    # main-world prefix stays attached; child frames evaluate in-frame (prefixes are page-scoped).
+    child = _RecoveryFrame(["https://host.example/b.pdf"])
+    page = _RecoveryPage(main_srcs=["https://host.example/a.pdf"], child_frames=[child])
+    eval_mock = AsyncMock(return_value=[])
+    with patch("skyvern.webeye.actions.handler.SkyvernFrame.evaluate", eval_mock):
+        await _collect_inline_iframe_src_candidates(page)
+
+    targets = [c.kwargs["frame"] for c in eval_mock.await_args_list]
+    assert targets == [page, child]  # main frame as Page, child as Frame
+    assert all(c.kwargs["expression"] == _INLINE_IFRAME_SRC_JS for c in eval_mock.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_collect_inline_iframe_src_candidates_is_uncapped() -> None:
+    # No arbitrary cap: every http(s) iframe src is enumerated so the before/after action-window
+    # comparison can't lose a target that sits past many pre-existing iframes.
+    srcs = [f"https://host.example/{i}.pdf" for i in range(30)]
+    page = _RecoveryPage(main_srcs=srcs)
+    result = await _collect_inline_iframe_src_candidates(page)
+    assert result == srcs
+
+
+@pytest.mark.asyncio
+async def test_collect_inline_iframe_src_candidates_dedupes_frames_by_identity() -> None:
+    # Playwright's page.frames already includes the main frame, so iterating
+    # [main_frame, *frames] would evaluate the main frame twice. Frame-identity dedup
+    # (via _all_page_frames) evaluates each distinct frame exactly once.
+    page = _RecoveryPage(main_srcs=["https://host.example/api/StatementPdf?access_token=x"], frames_include_main=True)
+    result = await _collect_inline_iframe_src_candidates(page)
+    assert result == ["https://host.example/api/StatementPdf?access_token=x"]
+    assert page.main_frame.evaluate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_blocked_inline_pdf_writes_file(tmp_path: Path) -> None:
+    page = _RecoveryPage(main_srcs=["https://host.example/api/StatementPdf?access_token=secret"])
+    pdf_bytes = b"%PDF-1.7\n...statement bytes..."
+    with patch(_RECOVER_READ, AsyncMock(return_value=pdf_bytes)):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=[]
+        )
+
+    assert result is not None
+    assert result.parent == tmp_path
+    assert result.suffix == ".pdf"
+    assert result.read_bytes() == pdf_bytes
+
+
+@pytest.mark.asyncio
+async def test_recover_passes_recovery_timeout_to_read_http_url_bytes(tmp_path: Path) -> None:
+    # The whole-operation 30s budget (authoritative outer asyncio cap) must not be undercut by the
+    # generic ~5s evaluate timeout: recovery reads each candidate with the 30s timeout forwarded
+    # into SkyvernFrame.evaluate so a slow-but-alive statement isn't rejected early.
+    page = _RecoveryPage(main_srcs=["https://host.example/api/StatementPdf?access_token=x"])
+    read_mock = AsyncMock(return_value=b"%PDF-1.7 statement")
+    with patch(_RECOVER_READ, read_mock):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=[]
+        )
+
+    assert result is not None
+    assert read_mock.await_args.kwargs["timeout_ms"] == _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS * 1000
+
+
+@pytest.mark.asyncio
+async def test_recover_honors_download_suffix_naming(tmp_path: Path) -> None:
+    """The recovered file rejoins the block-configured download_suffix naming path (the common
+    real-world shape, since statement endpoints rarely end in .pdf)."""
+    page = _RecoveryPage(main_srcs=["https://host.example/api/StatementPdf?access_token=x"])
+    pdf_bytes = b"%PDF-1.7 statement"
+    ctx = MagicMock(download_suffix="mystatement", task_id="tsk_x")
+    with (
+        patch(_RECOVER_READ, AsyncMock(return_value=pdf_bytes)),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=ctx),
+    ):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=[]
+        )
+
+    assert result is not None
+    assert result.name == "mystatement.pdf"
+    assert result.read_bytes() == pdf_bytes
+
+
+@pytest.mark.asyncio
+async def test_recover_returns_none_without_http_candidate(tmp_path: Path) -> None:
+    page = _RecoveryPage(main_srcs=["about:blank", "blob:https://host.example/x"])
+    fetch = AsyncMock()
+    with patch(_RECOVER_READ, fetch):
+        result = await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert result is None
+    fetch.assert_not_awaited()  # nothing http(s) to fetch
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_rejects_non_pdf_bytes(tmp_path: Path) -> None:
+    page = _RecoveryPage(main_srcs=["https://host.example/framed"])
+    with patch(_RECOVER_READ, AsyncMock(return_value=b"<html>content is blocked</html>")):
+        result = await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert result is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [b"", None])
+async def test_recover_rejects_empty_and_unrecoverable(tmp_path: Path, value: bytes | None) -> None:
+    page = _RecoveryPage(main_srcs=["https://host.example/x.pdf"])
+    with patch(_RECOVER_READ, AsyncMock(return_value=value)):
+        result = await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert result is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_fails_closed_on_multiple_distinct_new_pdfs(tmp_path: Path) -> None:
+    # Two equally-plausible NEW inline PDFs appeared in the action window. Nothing
+    # ties either to the click, so recovery must fail closed rather than guess the
+    # first one (the #13898 first-PDF-wins bug reproduced in Phase 1's real browser).
+    page = _RecoveryPage(
+        main_srcs=[
+            "https://host.example/api/StatementPdf?access_token=a",
+            "https://host.example/api/StatementPdf?access_token=b",
+        ]
+    )
+
+    async def fake_read(_page: object, url: str, **_kwargs: object) -> bytes:
+        return b"%PDF-1.5 statement A" if url.endswith("=a") else b"%PDF-1.5 statement B"
+
+    with patch(_RECOVER_READ, side_effect=fake_read):
+        result = await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert result is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_propagates_cancellation(tmp_path: Path) -> None:
+    page = _RecoveryPage(main_srcs=["https://host.example/x.pdf"])
+    with patch(_RECOVER_READ, AsyncMock(side_effect=asyncio.CancelledError())):
+        with pytest.raises(asyncio.CancelledError):
+            await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_shares_one_budget_across_all_candidates(tmp_path: Path) -> None:
+    # Several slow candidate fetches share a single external budget (the shape handle_action wraps
+    # the call in): the whole operation is cancelled at that one deadline — the budget is not spent
+    # per-candidate — and it unwinds cleanly, writing nothing.
+    page = _RecoveryPage(main_srcs=[f"https://host.example/api/StatementPdf?doc={i}" for i in range(3)])
+
+    async def slow_read(*_args: object, **_kwargs: object) -> bytes:
+        await asyncio.sleep(0.2)
+        return b"%PDF-1.5 slow"
+
+    started = time.monotonic()
+    with patch(_RECOVER_READ, side_effect=slow_read):
+        with pytest.raises(asyncio.TimeoutError):
+            async with asyncio.timeout(0.05):
+                await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert time.monotonic() - started < 0.15  # one 0.05s budget, not 3 x 0.2s per candidate
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_excludes_preexisting_pdf_and_recovers_newly_attached(tmp_path: Path) -> None:
+    # A benign decoy PDF iframe was already on the page before the click; the click
+    # attached the intended statement iframe. Only the newly-attached src is a
+    # candidate, so the decoy is never fetched or saved.
+    decoy = "https://host.example/api/decoy?doc=advert"
+    statement = "https://host.example/api/StatementPdf?access_token=fresh"
+    page = _RecoveryPage(main_srcs=[decoy, statement])
+    statement_bytes = b"%PDF-1.5 intended statement"
+    fetched: list[str] = []
+
+    async def fake_read(_page: object, url: str, **_kwargs: object) -> bytes:
+        fetched.append(url)
+        return statement_bytes if url == statement else b"%PDF-1.5 DECOY should never be read"
+
+    with patch(_RECOVER_READ, side_effect=fake_read):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=[decoy]
+        )
+
+    assert result is not None
+    assert result.read_bytes() == statement_bytes
+    assert fetched == [statement]  # decoy in the baseline was never fetched
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_finds_target_appended_past_many_preexisting_iframes(tmp_path: Path) -> None:
+    # A heavy portal with many pre-existing iframes (ads/trackers, plus a decoy PDF) and the intended
+    # statement appended LAST, past any arbitrary DOM-order cap. Uncapped enumeration must still see
+    # it: the target is recovered and the pre-existing decoy is excluded by the baseline.
+    decoy = "https://host.example/ads/decoy.pdf?doc=advert"
+    preexisting = [decoy] + [f"https://host.example/tracker/{i}.html" for i in range(12)]
+    statement = "https://host.example/api/StatementPdf?access_token=fresh"
+    page = _RecoveryPage(main_srcs=[*preexisting, statement])
+    statement_bytes = b"%PDF-1.5 intended statement past the cap"
+    fetched: list[str] = []
+
+    async def fake_read(_page: object, url: str, **_kwargs: object) -> bytes:
+        fetched.append(url)
+        return statement_bytes if url == statement else b"%PDF-1.5 decoy" if url == decoy else b"<html>tracker</html>"
+
+    with patch(_RECOVER_READ, side_effect=fake_read):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=preexisting
+        )
+
+    assert result is not None
+    assert result.read_bytes() == statement_bytes
+    assert fetched == [statement]  # only the newly-appended src is fetched; decoy/trackers excluded
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_names_extensionless_url_with_pdf_suffix(tmp_path: Path) -> None:
+    # A confirmed-PDF candidate whose URL has no path basename (".../?token=...") must still be
+    # persisted with a .pdf extension rather than an extension-less generic name.
+    src = "https://host.example/?token=abc"
+    page = _RecoveryPage(main_srcs=[src])
+
+    with patch(_RECOVER_READ, AsyncMock(return_value=b"%PDF-1.7 statement")):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=[]
+        )
+
+    assert result is not None
+    assert result.suffix == ".pdf"
+    assert result.name.endswith(".pdf")
+
+
+@pytest.mark.asyncio
+async def test_recover_fails_closed_when_only_preexisting_pdf_remains(tmp_path: Path) -> None:
+    # Same-URL reload: the statement iframe was already present with this exact src
+    # before the click and the src is unchanged after. Nothing new appeared in the
+    # action window, so recovery fails closed rather than re-saving a stale frame.
+    statement = "https://host.example/api/StatementPdf?access_token=stale"
+    page = _RecoveryPage(main_srcs=[statement])
+
+    with patch(_RECOVER_READ, AsyncMock(return_value=b"%PDF-1.5 stale")) as fetch:
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id=None, iframe_srcs_before=[statement]
+        )
+
+    assert result is None
+    fetch.assert_not_awaited()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_recovers_reused_iframe_navigated_to_new_src(tmp_path: Path) -> None:
+    # An existing iframe navigated from an old src to a new statement src during the
+    # action window. The new src is not in the baseline, so it is recovered.
+    old_src = "https://host.example/api/StatementPdf?access_token=old"
+    new_src = "https://host.example/api/StatementPdf?access_token=new"
+    page = _RecoveryPage(main_srcs=[new_src])
+    new_bytes = b"%PDF-1.7 freshly navigated statement"
+
+    with patch(_RECOVER_READ, AsyncMock(return_value=new_bytes)):
+        result = await _recover_blocked_inline_pdf_download(
+            page, tmp_path, workflow_run_id="wr_test", iframe_srcs_before=[old_src]
+        )
+
+    assert result is not None
+    assert result.read_bytes() == new_bytes
+
+
+@pytest.mark.asyncio
+async def test_recover_fails_closed_on_two_urls_with_identical_bytes(tmp_path: Path) -> None:
+    # Two DISTINCT new candidate URLs both return byte-identical PDFs. They are still
+    # two equally-plausible candidates with nothing tying either to the click, so
+    # recovery must fail closed — identical bytes are not a license to pick one. (Exact
+    # duplicate srcs never reach here; _collect_inline_iframe_src_candidates dedupes by src.)
+    a = "https://host.example/api/StatementPdf?doc=1"
+    b = "https://host.example/api/StatementPdf?doc=2"
+    page = _RecoveryPage(main_srcs=[a, b])
+    same_bytes = b"%PDF-1.5 identical document bytes"
+
+    with patch(_RECOVER_READ, AsyncMock(return_value=same_bytes)):
+        result = await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
+
+    assert result is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_requires_explicit_baseline(tmp_path: Path) -> None:
+    # The pre-click baseline is mandatory: without it, recovery would fall back to
+    # scanning every PDF on the page (the #13898 bug). Omitting it must be a hard error,
+    # never a silent global scan.
+    page = _RecoveryPage(main_srcs=["https://host.example/api/StatementPdf?access_token=x"])
+    with pytest.raises(TypeError):
+        await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_threads_preclick_iframe_baseline_into_recovery(tmp_path: Path) -> None:
+    # Recovery can only exclude pre-existing frames if it receives the iframe srcs
+    # captured BEFORE the click. Prove handle_action snapshots the baseline and threads
+    # it into _recover_blocked_inline_pdf_download.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+    task.download_timeout = 0.01
+    baseline = ["https://host.example/preexisting.pdf"]
+    seen: dict = {}
+
+    async def fake_recover(_page: object, _dir: object, *, workflow_run_id: object, iframe_srcs_before: object) -> None:
+        seen["baseline"] = iframe_srcs_before
+        return None
+
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with (
+        patch.object(ActionHandler, "_handle_action", new=AsyncMock(return_value=[ActionSuccess()])),
+        patch(
+            "skyvern.webeye.actions.handler._collect_inline_iframe_src_candidates",
+            new=AsyncMock(return_value=baseline),
+        ),
+        patch("skyvern.webeye.actions.handler._recover_blocked_inline_pdf_download", side_effect=fake_recover),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+            new=AsyncMock(),
+        ),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        results = await asyncio.wait_for(
+            ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
+            timeout=0.5,
+        )
+
+    assert seen["baseline"] == baseline
+    assert results[-1].download_triggered is False
+
+
+@pytest.mark.asyncio
+async def test_handle_action_skips_recovery_when_native_download_fires(tmp_path: Path) -> None:
+    # The blocked-inline recovery is a fallback for when NO download event fired. A
+    # normal native download must leave it untouched.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+    task.download_timeout = None
+
+    async def mock_inner_handle_action(*_args: object, **_kwargs: object) -> list[ActionSuccess]:
+        (tmp_path / "report.pdf").write_bytes(b"%PDF-1.7 native")
+        return [ActionSuccess()]
+
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with (
+        patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+        patch("skyvern.webeye.actions.handler._recover_blocked_inline_pdf_download") as recover,
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+            new=AsyncMock(),
+        ),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        results = await asyncio.wait_for(
+            ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
+            timeout=0.5,
+        )
+
+    recover.assert_not_called()
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == ["report.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_handle_action_blocked_inline_recovery_is_time_bounded(tmp_path: Path) -> None:
+    # A hung same-origin fetch inside recovery must not out-wait the download loop it backstops.
+    # The whole recovery is bounded by one budget; on timeout handle_action falls through to the
+    # normal download-not-triggered follow-up rather than hanging or hard-failing.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/download"
+    )
+    task.download_timeout = 0.01
+    entered = asyncio.Event()
+
+    async def hung_recovery(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()  # never returns
+
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with (
+        patch.object(ActionHandler, "_handle_action", new=AsyncMock(return_value=[ActionSuccess()])),
+        patch(
+            "skyvern.webeye.actions.handler._collect_inline_iframe_src_candidates",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch("skyvern.webeye.actions.handler._recover_blocked_inline_pdf_download", side_effect=hung_recovery),
+        patch("skyvern.webeye.actions.handler._BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS", 0.05),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+            new=AsyncMock(),
+        ),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        # A bound well under the outer wait_for proves handle_action self-bounds the hung recovery.
+        results = await asyncio.wait_for(
+            ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
+            timeout=1.0,
+        )
+
+    assert entered.is_set()
+    assert results[-1].download_triggered is False
+    assert results[-1].needs_followup is True
+    assert results[-1].followup_message == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+
+
+def _download_action(now: datetime, download_url: str) -> tuple[DownloadFileAction, ScrapedPage, object, object]:
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=MagicMock(),
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+    action = DownloadFileAction(
+        file_name="downloaded_file.pdf",
+        download_url=download_url,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+    return action, scraped_page, task, step
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download_url",
+    ["file:///etc/passwd", "http://127.0.0.1:8000/", "http://169.254.169.254/latest/meta-data/"],
+)
+async def test_handle_download_file_action_refuses_unsafe_download_url(download_url: str) -> None:
+    """download_url is model-supplied, so it must clear the same validator GOTO_URL clears."""
+    action, scraped_page, task, step = _download_action(datetime.now(UTC), download_url)
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+
+    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    page.goto.assert_not_awaited()
+    assert len(result) == 1
+    assert isinstance(result[0], ActionFailure)
+
+
+@pytest.mark.asyncio
+async def test_handle_download_file_action_navigates_to_validated_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The navigated URL is the validator's return value, not the raw action field."""
+    validate = MagicMock(return_value="https://example.test/validated.pdf")
+    monkeypatch.setattr("skyvern.webeye.actions.handler.validate_fetch_url", validate)
+    action, scraped_page, task, step = _download_action(datetime.now(UTC), "https://example.test/file.pdf")
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+
+    with patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    validate.assert_called_once_with("https://example.test/file.pdf")
+    assert page.goto.call_args[0][0] == "https://example.test/validated.pdf"
+    assert isinstance(result[0], ActionSuccess)

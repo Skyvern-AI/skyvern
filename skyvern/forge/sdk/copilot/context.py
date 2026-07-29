@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -146,7 +146,6 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentClassifierResult
@@ -279,6 +278,13 @@ class StructuredContext(BaseModel):
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
     loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
     fill_carry: list[FillCarry] = Field(default_factory=list)
+    entrypoint_url: str | None = None
+    # Passwordless sign-in identity, carried so a follow-up turn the classifier reads as an
+    # ordinary login does not fall back to demanding a password the site does not have.
+    # Scoped by host: reusing it anywhere else would suppress the password ask on a site
+    # that never established it was passwordless.
+    signin_email: str = ""
+    signin_email_host: str = ""
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
@@ -583,6 +589,8 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
     scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
     raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    raw_entrypoint_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    resolved_entrypoint_url = raw_entrypoint_url if isinstance(raw_entrypoint_url, str) else None
     fill_carry = _fill_carry_from_scout_trajectory(
         [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
         credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
@@ -594,9 +602,12 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
         and not flow_evidence
         and not loaded_result_targets
         and not fill_carry
+        and not resolved_entrypoint_url
     ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
+    if resolved_entrypoint_url:
+        sc.entrypoint_url = resolved_entrypoint_url
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
@@ -635,13 +646,35 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     return sc.to_json_str()
 
 
+def record_signin_email_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
+    policy = ctx.request_policy
+    if policy is None or not policy.resolved_signin_email or not policy.resolved_signin_host:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    if sc.signin_email == policy.resolved_signin_email and sc.signin_email_host == policy.resolved_signin_host:
+        return raw_context
+    sc.signin_email = policy.resolved_signin_email
+    sc.signin_email_host = policy.resolved_signin_host
+    return sc.to_json_str()
+
+
+def prior_signin_email_from_context(raw_context: str | None, hosts: Collection[str]) -> str:
+    """The carried address, only when this turn targets the host it was resolved for."""
+    sc = StructuredContext.from_json_str(raw_context)
+    if not sc.signin_email or sc.signin_email_host not in hosts:
+        return ""
+    return sc.signin_email
+
+
 def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
-    """Take the model's context but keep `approved_credentials` server-owned.
+    """Take the model's context but keep `approved_credentials` and `signin_email` server-owned.
 
     Approval is recorded only from server-resolved credentials; an entry the model
     supplied would be promoted into `resolved_credentials` on the next turn and clear
     the unapproved-credential gate for a credential the user never named. Membership
-    of the org is not evidence the user named it.
+    of the org is not evidence the user named it. A model-authored `signin_email` is the
+    same promotion in the other gate: it marks the next turn passwordless and suppresses
+    the password-credential ask for a site that does need one.
     """
     trusted = StructuredContext.from_json_str(trusted_raw)
     structured = trusted
@@ -653,6 +686,8 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
     elif isinstance(model_raw, str):
         structured = StructuredContext.from_json_str(model_raw)
     structured.approved_credentials = list(trusted.approved_credentials)
+    structured.signin_email = trusted.signin_email
+    structured.signin_email_host = trusted.signin_email_host
     return structured
 
 
@@ -678,9 +713,6 @@ class AgentResult:
     cancelled: bool = False
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
-    # Successful code-only build turns can be applied without requiring the
-    # chat's sticky "Always accept" setting.
-    apply_without_review: bool = False
     output_policy_diagnostics: dict[str, Any] | None = None
     turn_outcome: TurnOutcome | None = None
     turn_id: str | None = None
@@ -778,7 +810,6 @@ class CopilotContext(AgentContext):
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
-    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.
@@ -870,7 +901,6 @@ class CopilotContext(AgentContext):
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
     repeated_failure_streak_count: int = 0
-    last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
     # Unlike the progress-gated repair ceiling, this climbs even when every
     # rejection is different; it resets only on an accepted persist.

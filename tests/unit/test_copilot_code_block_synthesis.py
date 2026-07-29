@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -2161,8 +2160,6 @@ class TestPreflightSurfacesSyntaxError:
         [
             ("await page.request.post('https://example.com/collect')", "AUTHOR_PAGE_REQUEST"),
             ("state = await page.context.storage_state()", "AUTHOR_PAGE_CONTEXT"),
-            ("text = await page.evaluate('() => document.body.innerText')", "AUTHOR_PAGE_EVALUATE"),
-            ("handle = await page.evaluate_handle('() => document.body')", "AUTHOR_PAGE_EVALUATE"),
         ],
     )
     def test_denied_page_api_attributes_surface_preflight_reason_codes(self, code: str, reason: str) -> None:
@@ -2171,12 +2168,31 @@ class TestPreflightSurfacesSyntaxError:
         assert [diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")] == [reason]
         assert any("not allowed in persisted workflow code blocks" in diagnostic.message for diagnostic in diagnostics)
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "text = await page.evaluate('() => document.body.innerText')",
+            "handle = await page.evaluate_handle('() => document.body')",
+        ],
+    )
+    def test_in_page_javascript_is_not_an_author_time_security_error(self, code: str) -> None:
+        assert author_time_code_security_errors(label="search_registry", code=code) == []
+        assert [
+            diagnostic.code
+            for diagnostic in preflight_code_block(code, parameter_keys=())
+            if diagnostic.code.startswith("AUTHOR_PAGE_")
+        ] == []
+
+    def test_unparseable_code_is_not_silently_approved_at_author_time(self) -> None:
+        errors = author_time_code_security_errors(label="search_registry", code="text = await page.evaluate(")
+
+        assert [error.reason_code for error in errors] == ["AUTHOR_SYNTAX_ERROR"]
+        assert "does not parse as Python" in str(errors[0])
+
     def test_denied_page_api_preflight_reason_codes_match_author_time_security_source(self) -> None:
         code = """
         await page.request.post("https://example.com/collect")
         state = await page.context.storage_state()
-        text = await page.evaluate("() => document.body.innerText")
-        handle = await page.evaluate_handle("() => document.body")
         """
 
         normalized_code = textwrap.dedent(code).strip()
@@ -2193,7 +2209,6 @@ class TestPreflightSurfacesSyntaxError:
             == {
                 "AUTHOR_PAGE_REQUEST",
                 "AUTHOR_PAGE_CONTEXT",
-                "AUTHOR_PAGE_EVALUATE",
             }
         )
 
@@ -4573,20 +4588,6 @@ def _dynamic_row_click(*, source_url: str = "https://example.com/statements") ->
     return interaction
 
 
-def test_dynamic_row_evidence_fingerprint_is_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
-    evidence = _dynamic_row_click()["dynamic_row_evidence"]
-    payload = {key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
-
-    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-alpha")
-    fingerprint_a = dynamic_row_evidence_fingerprint(**payload)
-    monkeypatch.setattr(settings, "SECRET_KEY", "dynamic-row-key-beta")
-    fingerprint_b = dynamic_row_evidence_fingerprint(**payload)
-
-    assert len(fingerprint_a) == 64
-    assert len(fingerprint_b) == 64
-    assert fingerprint_a != fingerprint_b
-
-
 def test_valid_unused_dynamic_row_evidence_preserves_generic_positional_synthesis() -> None:
     interaction = _dynamic_row_click()
     evidence = interaction["dynamic_row_evidence"]
@@ -4849,7 +4850,10 @@ class _FakePage:
 
 
 def _run_synthesized_block(code: str, page: _FakePage, portal: object) -> None:
-    namespace: dict[str, Any] = {}
+    async def solve_captcha(_page: object) -> None:
+        return None
+
+    namespace: dict[str, Any] = {"solve_captcha": solve_captcha}
     exec("async def _block(page, portal):\n" + code, namespace)
     asyncio.run(namespace["_block"](page, portal))
 
@@ -5005,6 +5009,55 @@ def test_type_text_secret_bypass_is_not_carried_into_synthesized_block() -> None
     assert f"{credential_param['key']}.username" in result.code
 
 
+def test_login_submit_emits_solve_captcha_after_navigation_commit() -> None:
+    trajectory = [
+        _credential_fill(
+            selector="#username", credential_id="cred_x", credential_field="username", source_url=_LOGIN_HOST
+        ),
+        _credential_fill(
+            selector="#password", credential_id="cred_x", credential_field="password", source_url=_LOGIN_HOST
+        ),
+        _interaction("click", selector="button[type=submit]", source_url=_LOGIN_HOST),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    submit_position = result.code.index('await page.locator("button[type=submit]").click()')
+    navigation_position = result.code.index('await page.wait_for_load_state("domcontentloaded")', submit_position)
+    captcha_position = result.code.index("await solve_captcha(page)", navigation_position)
+    assert submit_position < navigation_position < captcha_position
+    assert result.code.count("await solve_captcha(page)") == 1
+
+
+def test_typed_challenge_boundary_emits_solve_captcha() -> None:
+    trajectory = [
+        _interaction(
+            "click",
+            selector="#continue",
+            source_url="https://example.com/challenge",
+            challenge_state={"detected": True, "evidence_source": "challenge_state"},
+        )
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert result.code.count("await solve_captcha(page)") == 1
+    assert result.code.index("await solve_captcha(page)") > result.code.index('await page.locator("#continue").click()')
+
+
+def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
+    trajectory = [
+        _interaction("click", selector="#download-report", source_url="https://example.com/reports"),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert "solve_captcha" not in result.code
+
+
 class TestScoutedSpineOmissionDigest:
     @staticmethod
     def _record(selector: str, index: int = 1) -> dict[str, Any]:
@@ -5023,3 +5076,34 @@ class TestScoutedSpineOmissionDigest:
     def test_digest_is_cross_process_stable_sha256_not_salted_hash(self) -> None:
         digest = _scouted_spine_omission_digest([self._record("#search-submit", 0)])
         assert digest == "8065b147a155c4e35cab8b3b35da9beab958cddc9c355b6200bac957878954ec"
+
+
+def _captcha_click(challenge_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    click: dict[str, Any] = {
+        "tool_name": "click",
+        "selector": "button.btn--login",
+        "source_url": "https://example.com/login",
+        "trajectory_index": 0,
+    }
+    if challenge_state is not None:
+        click["challenge_state"] = challenge_state
+    return click
+
+
+def test_stamped_challenge_carrier_emits_solve_captcha_after_the_click() -> None:
+    result = synthesize_code_block(
+        [_captcha_click({"evidence_source": "challenge_state"})],
+        strict_selectors=True,
+    )
+    assert result is not None
+    lines = [line.strip() for line in result.code.splitlines() if line.strip()]
+    click_index = next(i for i, line in enumerate(lines) if ".click()" in line)
+    solve_index = next(i for i, line in enumerate(lines) if line == "await solve_captcha(page)")
+    assert solve_index > click_index
+    assert lines[click_index + 1 : solve_index] == ['await page.wait_for_load_state("domcontentloaded")']
+
+
+def test_unstamped_click_emits_no_solve_captcha() -> None:
+    result = synthesize_code_block([_captcha_click()], strict_selectors=True)
+    assert result is not None
+    assert "solve_captcha" not in result.code

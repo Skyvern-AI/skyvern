@@ -6,14 +6,12 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
-    METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     BlockerKind,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
     build_llm_tool_error_payload,
     build_loop_blocker_signal,
-    build_metadata_reject_same_key_terminal_signal,
     clear_blocker_signal_for_reason_codes,
     maybe_clear_blocker_signal_on_tool_success,
     refresh_held_loop_blocker_evidence,
@@ -85,38 +83,6 @@ def test_to_trace_data_namespaces_extra_so_it_cannot_shadow_explicit_fields() ->
     trace = to_trace_data(signal)
     assert trace["blocker_kind"] == "authority_denied"
     assert trace["extra"] == {"blocker_kind": "evil", "custom_metric": 7}
-
-
-def test_metadata_same_key_terminal_names_gate_and_exact_missing_fields() -> None:
-    missing_fields = {"extract_record": ["declared_goal", "claimed_outcomes", "evidence_refs_or_observation_refs"]}
-
-    signal = build_metadata_reject_same_key_terminal_signal(
-        structural_key="same-key",
-        reject_family="missing_code_artifact_metadata",
-        missing_fields_by_label=missing_fields,
-    )
-
-    assert signal.internal_reason_code == METADATA_REJECT_SAME_KEY_TERMINAL_REASON_CODE
-    assert signal.preserves_workflow_draft is True
-    assert signal.renders_final_reply is True
-    assert "code_artifact_metadata" in signal.user_facing_reason
-    assert '"extract_record"' in signal.user_facing_reason
-    assert signal.extra["gate_id"] == "code_artifact_metadata"
-    assert signal.extra["missing_fields_by_label"] == missing_fields
-
-
-def test_metadata_same_key_terminal_degrades_leaky_label_in_user_facing_reason() -> None:
-    missing_fields = {"safe_reason_code": ["declared_goal"]}
-
-    signal = build_metadata_reject_same_key_terminal_signal(
-        structural_key="same-key",
-        reject_family="missing_code_artifact_metadata",
-        missing_fields_by_label=missing_fields,
-    )
-
-    assert "safe_reason_code" not in signal.user_facing_reason
-    assert signal.extra["missing_fields_by_label"] == missing_fields
-    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool=signal.blocked_tool)
 
 
 @pytest.mark.parametrize("token", _LEAK_DENY_TOKENS)
@@ -385,84 +351,6 @@ def test_stash_churn_stop_does_not_replace_held_output_contract_terminal() -> No
     assert ctx.blocker_signal is oc_terminal
 
 
-def test_stash_grounding_replaces_synthesized_persistence_tool_error() -> None:
-    ctx = _Ctx()
-    existing = _make(
-        kind="tool_error",
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-        renders_final_reply=False,
-    )
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-
-    stash_blocker_signal(ctx, existing)
-    payload = stash_blocker_signal(ctx, grounding)
-
-    assert payload == grounding.agent_steering_text
-    assert ctx.blocker_signal is grounding
-    assert ctx.latest_tool_blocker_signal is grounding
-    assert ctx.tool_blocker_signals == [existing, grounding]
-
-
-def test_stash_grounding_replaces_generic_non_final_tool_error() -> None:
-    ctx = _Ctx()
-    existing = _make(kind="tool_error", internal_reason_code="tool_error_generic", renders_final_reply=False)
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-
-    stash_blocker_signal(ctx, existing)
-    stash_blocker_signal(ctx, grounding)
-
-    assert ctx.blocker_signal is grounding
-
-
-def test_stash_grounding_does_not_replace_final_reply_blocker() -> None:
-    ctx = _Ctx()
-    existing = _make(
-        kind="tool_error",
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-        renders_final_reply=True,
-    )
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-
-    stash_blocker_signal(ctx, existing)
-    stash_blocker_signal(ctx, grounding)
-
-    assert ctx.blocker_signal is existing
-    assert ctx.latest_tool_blocker_signal is grounding
-
-
-def test_stash_repair_ceiling_replaces_non_final_grounding_blocker() -> None:
-    ctx = _Ctx()
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-    repair_ceiling = _make(
-        kind="loop_detected",
-        internal_reason_code="repair_ceiling_reached",
-        renders_final_reply=True,
-    )
-
-    stash_blocker_signal(ctx, grounding)
-    payload = stash_blocker_signal(ctx, repair_ceiling)
-
-    assert payload == repair_ceiling.agent_steering_text
-    assert ctx.blocker_signal is repair_ceiling
-    assert ctx.latest_tool_blocker_signal is repair_ceiling
-
-
 def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> None:
     """The field is declared on both AgentContext (parent) and CopilotContext
     (child) per the field-shadowing convention. Default values must stay in
@@ -503,6 +391,28 @@ _LATE_RECORDED_REASON = (
     "on a public registry site with a search form and expandable result rows. "
     "Add an end-state confirmation (an extraction or validation block) that observes the outcome, then re-run."
 )
+
+
+def test_stash_non_final_signal_does_not_replace_a_held_final_reply_blocker() -> None:
+    """A non-final incoming signal must not displace a held final-reply blocker, while
+    latest_tool_blocker_signal still advances to it."""
+    ctx = _Ctx()
+    existing = _make(
+        kind="tool_error",
+        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+        renders_final_reply=True,
+    )
+    incoming = _make(
+        kind="missing_required_context",
+        internal_reason_code="tool_error_post_budget_page_inspection_required",
+        renders_final_reply=False,
+    )
+
+    stash_blocker_signal(ctx, existing)
+    stash_blocker_signal(ctx, incoming)
+
+    assert ctx.blocker_signal is existing
+    assert ctx.latest_tool_blocker_signal is incoming
 
 
 def test_stash_refreshes_held_loop_signal_with_evidence_recorded_after_the_stash() -> None:

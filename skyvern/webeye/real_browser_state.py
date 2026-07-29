@@ -29,7 +29,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_video_path
+from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
@@ -150,7 +150,7 @@ class RealBrowserState(BrowserState):
         except Exception:
             pass
         try:
-            path = await resolve_video_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
+            path = await resolve_artifact_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
         except Exception:
             LOG.warning("Could not get video path to discard orphaned artifact", page_origin=page_origin, exc_info=True)
             return
@@ -599,6 +599,7 @@ class RealBrowserState(BrowserState):
         support_empty_page: bool = False,
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
+        allow_transient_ui_suppression: bool = False,
     ) -> ScrapedPage:
         page = await self.get_working_page()
         if page is not None:
@@ -618,6 +619,7 @@ class RealBrowserState(BrowserState):
             support_empty_page=support_empty_page,
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
+            allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
 
     async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None:

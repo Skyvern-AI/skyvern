@@ -1,7 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { CredentialApiResponse } from "@/api/types";
 import { FolderIcon } from "@/components/icons/FolderIcon";
-import { GarbageIcon } from "@/components/icons/GarbageIcon";
+import { TrashSolidIcon } from "@/components/icons/TrashSolidIcon";
 import { SelectionBar, SelectionBarDivider } from "@/components/SelectionBar";
 import { Button } from "@/components/ui/button";
 import {
@@ -167,7 +167,7 @@ function CredentialsBulkBar({
             })
           }
         >
-          <GarbageIcon className="mr-1.5 h-4 w-4" />
+          <TrashSolidIcon className="mr-1.5 h-4 w-4" />
           Delete
         </Button>
       </SelectionBar>

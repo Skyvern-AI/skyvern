@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
@@ -62,6 +68,16 @@ vi.mock("@/components/ui/scroll-area", () => ({
     <div>{children}</div>
   ),
 }));
+// The header's "…" menu (Radix DropdownMenu) scrolls its focused item into
+// view on open; jsdom implements neither that nor ResizeObserver.
+Element.prototype.scrollIntoView = () => {};
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
 }));
@@ -320,9 +336,10 @@ describe("RunView view toggles", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    // status · duration · run id — the counts live in the timeline's own
-    // header row, so the strip carries no stat boxes.
-    expect(scope.getByText("wr_1")).not.toBeNull();
+    // status · duration — the run id lives in the top bar's "View Run" tab,
+    // and the counts live in the timeline's own header row, so the strip
+    // carries no id chip and no stat boxes.
+    expect(scope.queryByText("wr_1")).toBeNull();
     expect(
       scope.getAllByText("completed", { exact: false }).length,
     ).toBeGreaterThan(0);
@@ -330,7 +347,44 @@ describe("RunView view toggles", () => {
     expect(scope.queryByText("Credits")).toBeNull();
   });
 
-  test("Inputs view shows the run's input metadata", () => {
+  test("Inputs view shows the run's input metadata, including TOTP diagnostics", () => {
+    seedCompletedRun({
+      webhook_callback_url: "https://example.test/hook",
+      totp_verification_url: "https://example.test/totp",
+      totp_identifier: "totp-identifier-1",
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("Webhook URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/hook")).not.toBeNull();
+    expect(scope.getByText("TOTP URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/totp")).not.toBeNull();
+    expect(scope.getByText("TOTP identifier")).not.toBeNull();
+    expect(scope.getByText("totp-identifier-1")).not.toBeNull();
+  });
+
+  test("Inputs view sources TOTP from task_v2 when the top-level run omits it", () => {
+    seedCompletedRun({
+      totp_verification_url: null,
+      totp_identifier: null,
+      task_v2: {
+        totp_verification_url: "https://example.test/totp-v2",
+        totp_identifier: "totp-identifier-v2",
+      },
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("TOTP URL")).not.toBeNull();
+    expect(scope.getByText("https://example.test/totp-v2")).not.toBeNull();
+    expect(scope.getByText("TOTP identifier")).not.toBeNull();
+    expect(scope.getByText("totp-identifier-v2")).not.toBeNull();
+  });
+
+  test("Inputs view omits TOTP rows when the run carries no TOTP config", () => {
     seedCompletedRun({
       webhook_callback_url: "https://example.test/hook",
     });
@@ -339,25 +393,31 @@ describe("RunView view toggles", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
     expect(scope.getByText("Webhook URL")).not.toBeNull();
-    expect(scope.getByText("https://example.test/hook")).not.toBeNull();
+    expect(scope.queryByText("TOTP URL")).toBeNull();
+    expect(scope.queryByText("TOTP identifier")).toBeNull();
   });
 
-  test("Code view renders the shared WorkflowRunCode surface", () => {
+  test("the '…' menu's Code item renders the shared WorkflowRunCode surface", async () => {
     seedCompletedRun();
     const { container } = renderRunView();
     const scope = within(container);
 
     expect(scope.queryByTestId("workflow-run-code")).toBeNull();
-    fireEvent.click(scope.getByRole("button", { name: "Code" }));
+    // The Code view lives in the header's "…" overflow menu, not a toggle.
+    fireEvent.pointerDown(scope.getByRole("button", { name: "More views" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Code" }));
     expect(scope.queryByTestId("workflow-run-code")).not.toBeNull();
-    // The Code toggle exposes aria-pressed once it's the active view, matching
-    // the sibling view toggles (defends the shared ViewToggle disabled-prop add).
+    // The menu trigger exposes aria-pressed while Code is the active view,
+    // matching the sibling view toggles.
     expect(
-      scope.getByRole("button", { name: "Code", pressed: true }),
+      scope.getByRole("button", { name: "More views", pressed: true }),
     ).not.toBeNull();
   });
 
-  test("the Code toggle shows a spinner while cached code is generating", () => {
+  test("the '…' trigger shows a spinner while cached code is generating", () => {
     seedCompletedRun();
     mocks.codeGenerating = true;
     const { container } = renderRunView();
@@ -571,8 +631,42 @@ describe("RunView failure banner", () => {
       "Login page rejected the credentials",
     );
 
-    fireEvent.click(scope.getByRole("button", { name: "Retry as-is" }));
+    fireEvent.click(scope.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  test("splits the banner into a headline and de-emphasized detail", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "for_loop block failed. failure reason: Failed to execute code block. Reason: Exception: boom",
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    const headline = scope.getByText("for_loop block failed");
+    expect(headline.className).toContain("font-semibold");
+    expect(
+      scope.getByText(/Failed to execute code block\. Reason: Exception: boom/),
+    ).not.toBeNull();
+    // Short detail → no expand toggle.
+    expect(scope.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+
+  test("long failure detail clamps behind a Show more toggle", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: `for_loop block failed. failure reason: ${"x".repeat(300)}`,
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    const detail = scope.getByText(/^x+$/);
+    expect(detail.className).toContain("line-clamp-3");
+    fireEvent.click(scope.getByRole("button", { name: "Show more" }));
+    expect(scope.getByText(/^x+$/).className).not.toContain("line-clamp-3");
+    fireEvent.click(scope.getByRole("button", { name: "Show less" }));
+    expect(scope.getByText(/^x+$/).className).toContain("line-clamp-3");
   });
 
   test("dismiss hides the failure banner", () => {
@@ -787,6 +881,24 @@ describe("RunView output signals", () => {
 
     expect(scope.getByText("Extracted information")).not.toBeNull();
     expect(scope.getByText("Run outputs")).not.toBeNull();
+  });
+
+  test("shows a code block's returned outputs when there is no extracted information", () => {
+    seedCompletedRun({
+      outputs: {
+        get_stars_output: { star_count: 22600, evidence_text: "22.6k stars" },
+        extracted_information: [],
+      },
+    });
+
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+
+    expect(scope.queryByText("No outputs for this run")).toBeNull();
+    expect(scope.getByText("Run outputs")).not.toBeNull();
+    expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {

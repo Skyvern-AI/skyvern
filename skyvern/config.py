@@ -2,7 +2,7 @@ import logging
 import os
 import platform
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -109,6 +109,9 @@ class Settings(BaseSettings):
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
+    # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
+    # an exact approval, so an enforcing value must be unrepresentable rather than merely unused.
+    BROWSER_ACTION_POLICY_MODE: Literal["disabled", "observe"] = "disabled"
     POPUP_VIDEO_PATH_TIMEOUT_SECONDS: float = 3.0
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
     # Page readiness settings for cached action execution
@@ -190,7 +193,6 @@ class Settings(BaseSettings):
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     # Consecutive repair runs that make no newly-verified forward progress before the
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
@@ -212,7 +214,6 @@ class Settings(BaseSettings):
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
-    WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
@@ -596,6 +597,8 @@ class Settings(BaseSettings):
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
+    TOTP_RAW_FALLBACK_ENABLED: bool = False
+    TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
@@ -945,6 +948,18 @@ class Settings(BaseSettings):
             mapping["claude-fable-5"] = {
                 "llm_key": "ANTHROPIC_CLAUDE5_FABLE",
                 "label": "Anthropic Claude Fable 5",
+            }
+
+        # Anthropic Claude Opus 5: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-opus-5"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Opus 5",
+            }
+        else:
+            mapping["claude-opus-5"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5_OPUS",
+                "label": "Anthropic Claude Opus 5",
             }
 
         try:

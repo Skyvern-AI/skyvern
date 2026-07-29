@@ -75,6 +75,7 @@ async def _run_workflow_and_build_response(
         totp_verification_url=totp_verification_url,
         browser_session_id=run_block_request.browser_session_id,
         browser_profile_id=run_block_request.browser_profile_id,
+        start_fresh_browser=run_block_request.start_fresh_browser,
         browser_address=run_block_request.browser_address,
         max_screenshot_scrolls=run_block_request.max_screenshot_scrolling_times,
         extra_http_headers=run_block_request.extra_http_headers,
@@ -113,11 +114,13 @@ async def _run_workflow_and_build_response(
             totp_identifier=totp_identifier,
             browser_session_id=run_block_request.browser_session_id,
             browser_profile_id=run_block_request.browser_profile_id,
+            start_fresh_browser=run_block_request.start_fresh_browser,
             max_screenshot_scrolls=run_block_request.max_screenshot_scrolling_times,
         ),
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=run_block_request.browser_session_id,
-        browser_profile_id=run_block_request.browser_profile_id,
+        browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
     )
 
 

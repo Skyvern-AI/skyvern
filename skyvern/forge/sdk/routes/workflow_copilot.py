@@ -203,7 +203,6 @@ def _reason_category_for_copilot_code_mode_opt_out(
 ) -> str:
     if (
         prior_turn_outcome.copilot_last_code_build_failed
-        or prior_turn_outcome.copilot_repair_ceiling_hit
         or prior_turn_outcome.terminal_reason == COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
     ):
         return "failure"
@@ -236,7 +235,6 @@ def _capture_copilot_code_mode_opt_out(
                 "to_mode": to_mode,
                 "reason_category": _reason_category_for_copilot_code_mode_opt_out(prior_turn_outcome),
                 "last_code_build_failed": prior_turn_outcome.copilot_last_code_build_failed,
-                "repair_ceiling_hit": prior_turn_outcome.copilot_repair_ceiling_hit,
                 "pending_capability": prior_turn_outcome.copilot_pending_capability,
                 "org_id": organization_id,
                 "workflow_permanent_id": workflow_permanent_id,
@@ -403,10 +401,15 @@ def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
 
 
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """Only auto-applicable proposals may honor ``auto_accept=True``."""
+    """Only auto-applicable proposals may honor ``auto_accept=True``.
+
+    Auto-apply requires the chat's explicit ``auto_accept`` opt-in — a verified
+    build never commits on the user's behalf; it lands as a pending proposal for
+    the review gate.
+    """
     if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
         return False
-    return auto_accept is True or getattr(agent_result, "apply_without_review", False) is True
+    return auto_accept is True
 
 
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
@@ -513,6 +516,7 @@ def _finalized_terminal_envelope(
         finalized = finalize_applied_state(
             TerminalOutcomeEnvelope.model_validate(payload),
             applied=workflow_applied and proposal_present,
+            proposal_present=proposal_present,
         )
         payload = finalized.model_dump(mode="json")
     except Exception:
@@ -725,18 +729,13 @@ async def _persist_proposed_workflow_state(
         (restored and not keep_pending_proposal)
         or agent_result.clear_proposed_workflow
         or _should_commit_staged_workflow(chat.auto_accept, agent_result)
-        or (
-            getattr(agent_result, "apply_without_review", False) is True
-            and auto_accept_effective
-            and not _output_policy_blocked_final_response(agent_result)
-        )
     ):
         # Null any persisted proposed_workflow the assistant just invalidated
         # so a reload does not resurrect a stale Accept/Reject card. Runs
         # under both auto_accept values — a stale proposal can survive an
         # auto-accept toggle. The staged-commit clause always wins over
-        # keep_pending_proposal: this turn's own auto-commit already
-        # overwrote canonical, so an earlier bypassed proposal is now stale
+        # keep_pending_proposal: this turn's own auto-accept commit already
+        # overwrote canonical, so an earlier pending proposal is now stale
         # regardless of the client's preservation request.
         await _clear_proposed_workflow(chat)
     elif (
@@ -768,19 +767,21 @@ async def _persist_cancel_turn(
     audio_artifact_id: str | None = None,
     turn_id: str | None = None,
     keep_pending_proposal: bool = False,
+    prior_global_llm_context: str | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
     Pass the agent's ``AgentResult`` for cancels during the agent run so
     rollback uses the same ``workflow_was_persisted`` source of truth as
-    the success path; pass ``None`` for pre-agent cancels.
+    the success path; pass ``None`` for pre-agent cancels. A pre-agent cancel
+    carries ``prior_global_llm_context`` forward so durable state survives.
     """
     turn_outcome: TurnOutcome | None
     workflow_applied = False
     if agent_result is None:
         user_response = "Cancelled by user."
         updated_workflow = None
-        updated_global_llm_context = None
+        updated_global_llm_context = prior_global_llm_context
         total_tokens = None
         response_type = "REPLY"
         output_policy_diagnostics = None
@@ -2073,6 +2074,7 @@ async def _new_copilot_chat_post(
                         audio_artifact_id=chat_request.audio_artifact_id,
                         turn_id=turn_id,
                         keep_pending_proposal=chat_request.keep_pending_proposal,
+                        prior_global_llm_context=global_llm_context,
                     )
                 )
                 terminal_frame_emitted = True

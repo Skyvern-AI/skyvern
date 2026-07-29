@@ -1,4 +1,4 @@
-import { GarbageIcon } from "@/components/icons/GarbageIcon";
+import { TrashSolidIcon } from "@/components/icons/TrashSolidIcon";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -48,7 +48,7 @@ function DeleteCredentialFolderButton({ folderId, folderTitle }: Props) {
                 className="rounded p-1.5 text-red-400 transition-colors hover:bg-red-500/20 hover:text-red-300"
                 aria-label="Delete folder"
               >
-                <GarbageIcon className="h-4 w-4" />
+                <TrashSolidIcon className="h-4 w-4" />
               </button>
             </DialogTrigger>
           </TooltipTrigger>

@@ -923,8 +923,8 @@ async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPa
     assert event is not None
     expected_keys = set(
         "event log_level family workflow_run_id task_id organization_id step_id entry_action_type selection_group_id "
-        "select_depth family_gate_enabled assigned gate_error encountered eligible match_tier option_count attempted "
-        "click_attempted verified_success outcome llm_fallback_requested duration_ms".split()
+        "select_depth script_mode family_gate_enabled assigned gate_error encountered eligible match_tier "
+        "option_count attempted click_attempted verified_success outcome llm_fallback_requested duration_ms".split()
     )
     expected_outcomes = set(
         "llm_fallback_gate_error llm_fallback_eval_error llm_fallback_family_off llm_fallback_control "
@@ -1081,7 +1081,11 @@ async def test_execution_disabled_reads_precommit_state_without_clicking(
 
 @pytest.mark.asyncio
 async def test_converted_route_reports_input_text_converted(monkeypatch: pytest.MonkeyPatch) -> None:
-    element = MagicMock(is_disabled=AsyncMock(return_value=False), get_selectable=AsyncMock(return_value=True))
+    element = MagicMock(
+        is_disabled=AsyncMock(return_value=False),
+        get_selectable=AsyncMock(return_value=True),
+        supports_text_input=AsyncMock(return_value=True),
+    )
     element.get_tag_name.return_value, element.get_id.return_value = "input", "field"
     monkeypatch.setattr(
         handler, "DomUtil", Mock(return_value=MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element)))
@@ -1099,3 +1103,21 @@ async def test_converted_route_reports_input_text_converted(monkeypatch: pytest.
         MagicMock(),
     )
     assert select.await_args.kwargs["entry_action_type"] == "input_text_converted"
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_readback_threads_engine_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    selection = object()
+    element = MagicMock()
+    element.get_tag_name.return_value = "input"
+    element.get_locator.return_value = MagicMock()
+    get_input_value = AsyncMock(return_value="Choice")
+    monkeypatch.setattr(handler, "get_input_value", get_input_value)
+
+    assert await handler._verify_autocomplete_input_readback(
+        skyvern_element=element,
+        matched_index=0,
+        matched_label="Choice",
+        engine_selection=selection,
+    )
+    get_input_value.assert_awaited_once_with("input", element.get_locator(), engine_selection=selection)

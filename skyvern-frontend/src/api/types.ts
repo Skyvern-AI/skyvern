@@ -717,6 +717,12 @@ export type EvalApiResponse = Array<
   EvalWorkflow | EvalTask | EvalBrowserSession
 >;
 
+export interface EvalModelTierStat {
+  total: number;
+  perfect_count: number;
+  pass_rate: number | null;
+}
+
 export interface EvalModelSummary {
   model: string | null;
   total: number;
@@ -726,6 +732,7 @@ export interface EvalModelSummary {
   rubric_avg: number | null;
   duration_avg_s: number | null;
   last_started_at: string | null;
+  tiers?: Partial<Record<"easy" | "medium" | "hard", EvalModelTierStat>>;
 }
 
 export interface EvalSummaryResponse {
@@ -830,6 +837,8 @@ export type WorkflowRunStatusApiResponse = {
   status: Status;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
   queued_at: string | null;
@@ -871,6 +880,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   status: Status;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
   queued_at: string | null;
@@ -1029,6 +1040,7 @@ export type CredentialApiResponse = {
   credential_type: "password" | "credit_card" | "secret";
   name: string;
   browser_profile_id?: string | null;
+  pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
@@ -1072,6 +1084,8 @@ export type CreateCredentialRequest = {
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
   rotate_proxy_session_id?: boolean;
+  browser_profile_id?: string | null;
+  pin_saved_session_ip?: boolean;
 };
 
 export type PasswordCredential = {

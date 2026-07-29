@@ -1,13 +1,45 @@
 from abc import ABC, abstractmethod
-from typing import BinaryIO
+from collections.abc import Awaitable, Callable
+from typing import BinaryIO, cast
 
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+
+# Hour-granularity equivalent of the sensitive cap for the GCS/Azure signing
+# clients, whose APIs take hours; max() keeps a future sub-hour cap from
+# truncating to zero.
+SENSITIVE_SHARE_URL_EXPIRY_HOURS = max(1, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS // 3600)
+
+
+async def presign_with_sensitive_cap(
+    artifacts: list[Artifact],
+    presign: Callable[[list[str]], Awaitable[list[str] | None]],
+    presign_sensitive: Callable[[list[str]], Awaitable[list[str] | None]],
+) -> list[str] | None:
+    """Batch-presign artifact URIs, routing screenshots/recordings through the
+    TTL-capped variant (SKY-12527). Order-preserving; None when any underlying
+    call fails, matching the clients' all-or-nothing batch contract.
+    """
+    sensitive = [i for i, artifact in enumerate(artifacts) if artifact.artifact_type in SENSITIVE_ARTIFACT_TYPES]
+    if not sensitive:
+        return await presign([artifact.uri for artifact in artifacts])
+    other = [i for i, artifact in enumerate(artifacts) if artifact.artifact_type not in SENSITIVE_ARTIFACT_TYPES]
+    urls: list[str | None] = [None] * len(artifacts)
+    for indices, mint in ((sensitive, presign_sensitive), (other, presign)):
+        if not indices:
+            continue
+        minted = await mint([artifacts[i].uri for i in indices])
+        if minted is None:
+            return None
+        for index, url in zip(indices, minted, strict=True):
+            urls[index] = url
+    return cast(list[str], urls)
 
 
 async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type: ArtifactType) -> list[FileInfo]:
@@ -201,9 +233,25 @@ class BaseStorage(ABC):
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve a browser profile to a temporary directory."""
 
+    async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
+        """Whether a stored profile archive exists (has content). Non-destructive probe — some backends
+        (local) return the live directory, not a temp copy, so this must never delete what it finds.
+        Backends with a cheap existence check (S3 head, local stat) override this.
+        ponytail: for object backends this may download a temp copy; acceptable — only opt-in seed
+        workflows reach it, and correctness (never deleting real state) beats saving one download."""
+        return bool(await self.retrieve_browser_profile(organization_id, profile_id))
+
+    async def get_browser_profile_etag(self, organization_id: str, profile_id: str) -> str | None:
+        """A cheap fingerprint of the stored profile archive that changes iff its bytes change, used by
+        the freshness guard to detect a concurrent write between a run's seed and its write-back. None
+        means "can't tell" — the caller then falls back to a full write. Object backends override with a
+        head request; backends without one (local) leave it None (no concurrent-writer race there)."""
+        return None
+
     @abstractmethod
-    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
-        """Delete a stored browser profile. Best-effort: a missing object is not an error."""
+    async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
+        """Delete a stored browser profile. Best-effort: a missing object is not an error.
+        hard_delete purges all object versions (true erasure); only S3 bucket-versioning distinguishes it."""
 
     @abstractmethod
     async def list_downloaded_files_in_browser_session(

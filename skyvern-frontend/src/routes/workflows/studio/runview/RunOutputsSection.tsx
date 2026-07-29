@@ -7,6 +7,7 @@ import {
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 
+import { outputFieldEntries } from "../runProjections";
 import { OverviewCodeBlock } from "./OverviewCodeBlock";
 import { OverviewField } from "./OverviewField";
 import { RunFieldValue } from "./RunFieldValue";
@@ -175,26 +176,21 @@ export function RunOutputsSection({
     extractedInformation != null &&
     Object.values(extractedInformation).some((value) => value !== null);
   const hasErrors = hasRenderableErrors(errors);
-  if (
-    !hasExtracted &&
-    files.length === 0 &&
-    !hasErrors &&
-    observerOutput == null &&
-    !webhookFailureReason
-  ) {
+  // extracted_information renders in its own section, so the remaining keys are the
+  // per-block returned values. Gate the run-outputs block on real per-field content
+  // or a persisted summary — an empty header + Summarize would render over nothing.
+  const outputFields = outputFieldEntries(outputs);
+  const hasAgentRunOutputs = outputFields.length > 0 || summary !== null;
+  const hasAnyOutput =
+    hasExtracted ||
+    files.length > 0 ||
+    hasErrors ||
+    observerOutput != null ||
+    Boolean(webhookFailureReason) ||
+    hasAgentRunOutputs;
+  if (!hasAnyOutput) {
     return null;
   }
-
-  // extracted_information has its own dedicated section above, so drop it from the
-  // per-block field list to avoid rendering it twice.
-  const outputFields = outputs
-    ? Object.entries(outputs).filter(([key]) => key !== "extracted_information")
-    : [];
-  // Gate the block on real per-field content or a persisted summary: an outputs
-  // bag holding only extracted_information yields no fields, and that content
-  // already renders in its dedicated section above — so an empty header +
-  // Summarize button would otherwise render over nothing.
-  const hasAgentRunOutputs = outputFields.length > 0 || summary !== null;
 
   return (
     <div className="flex flex-col gap-5">

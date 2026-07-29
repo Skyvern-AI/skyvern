@@ -557,19 +557,36 @@ class RealBrowserManager(BrowserManager):
                 workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
             )
             if browser_state:
-                # always keep the browser state for the workflow run and the parent workflow run synced
-                self.pages[workflow_run_id] = browser_state
-                if parent_workflow_run_id:
-                    self.pages[parent_workflow_run_id] = browser_state
-                # The workflow-run streaming endpoint reads ``{workflow_run_id}.png``, so the
-                # child needs its own publisher even when reusing the parent's browser state —
-                # the parent's publisher writes a different key.
-                await self._start_frame_publisher(
-                    browser_state=browser_state,
+                # A parent_workflow_run_id entry is shared by every child run of the same parent.
+                # Independent children dispatched to one long-lived worker (e.g. a sequential
+                # fan-out) can therefore find an earlier, already-completed sibling's torn-down
+                # browser here. This early-return path skips get_or_create_page, so returning a
+                # page-less state would fail the run's first browser block with a missing page.
+                # Only adopt the inherited browser when it still has a working page; otherwise
+                # drop the stale entry and fall through to create a fresh browser for this run.
+                if await browser_state.get_working_page() is not None:
+                    # always keep the browser state for the workflow run and the parent workflow run synced
+                    self.pages[workflow_run_id] = browser_state
+                    if parent_workflow_run_id:
+                        self.pages[parent_workflow_run_id] = browser_state
+                    # The workflow-run streaming endpoint reads ``{workflow_run_id}.png``, so the
+                    # child needs its own publisher even when reusing the parent's browser state —
+                    # the parent's publisher writes a different key.
+                    await self._start_frame_publisher(
+                        browser_state=browser_state,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=workflow_run.organization_id,
+                    )
+                    return browser_state
+                LOG.warning(
+                    "Inherited parent browser state has no working page; creating a fresh browser",
                     workflow_run_id=workflow_run_id,
-                    organization_id=workflow_run.organization_id,
+                    parent_workflow_run_id=parent_workflow_run_id,
                 )
-                return browser_state
+                for stale_key in (workflow_run_id, parent_workflow_run_id):
+                    if stale_key and self.pages.get(stale_key) is browser_state:
+                        self.pages.pop(stale_key, None)
+                browser_state = None
 
         if browser_session_id:
             LOG.info(

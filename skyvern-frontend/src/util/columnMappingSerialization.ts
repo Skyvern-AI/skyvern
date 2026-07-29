@@ -5,6 +5,14 @@ export type ColumnMappingEntry = {
   _id?: string;
 };
 
+export function formatDestinationLabel(header: {
+  letter: string;
+  name: string;
+}): string {
+  const name = header.name.trim();
+  return name ? `${header.letter} - ${name}` : header.letter;
+}
+
 export function newEntryId(): string {
   if (
     typeof crypto !== "undefined" &&
@@ -53,9 +61,10 @@ export function resolveDestination(
 ): string {
   const trimmed = input.trim();
   if (!trimmed) return "";
-  const match = headers.find(
-    (h) => h.name.toLowerCase() === trimmed.toLowerCase(),
-  );
+  const lowered = trimmed.toLowerCase();
+  const match =
+    headers.find((h) => formatDestinationLabel(h).toLowerCase() === lowered) ??
+    headers.find((h) => h.name.toLowerCase() === lowered);
   if (match) return match.letter;
   const upper = trimmed.toUpperCase();
   if (LETTER_RE.test(upper)) return upper;

@@ -15,11 +15,21 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from skyvern.exceptions import InvalidCredentialId, MissingValueForParameter, WorkflowRunParameterPersistenceError
+from skyvern.exceptions import (
+    InvalidCredentialId,
+    InvalidWorkflowParameter,
+    MissingValueForParameter,
+    WorkflowRunParameterPersistenceError,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    BitwardenCreditCardDataParameter,
+    BitwardenLoginCredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -51,6 +61,7 @@ def _make_service_with_mocks(
     persist_browser_session: bool = False,
     browser_profile_id: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
+    definition_parameters: list | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
     service = WorkflowService()
@@ -71,7 +82,7 @@ def _make_service_with_mocks(
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=WorkflowDefinition(blocks=[], parameters=[]),
+        workflow_definition=WorkflowDefinition(blocks=[], parameters=definition_parameters or []),
     )
     workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
 
@@ -87,6 +98,10 @@ def _make_service_with_mocks(
     else:
         service.create_workflow_run_parameter = AsyncMock()  # type: ignore[method-assign]
     service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    service.get_workflow_output_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    # Seed resolution is exercised in test_seed_precedence_engine; here it is a pass-through so these
+    # setup_workflow_run tests (param batching / tagging / trigger types) don't need seed fixtures.
+    service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
     organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
     return service, organization, workflow_run
@@ -104,6 +119,7 @@ async def test_apply_initial_run_metadata_tags_uses_system_source_for_fallback_c
     explicit_context = TagWriteContext(caller_id="user_test", source=TagSource.MANUAL, caller_type=CallerType.USER)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
 
         await WorkflowService._apply_initial_run_metadata_tags(
@@ -135,6 +151,7 @@ async def test_setup_workflow_run_writes_run_metadata_as_run_tags() -> None:
     tag_context = TagWriteContext(caller_id="user_test", source=TagSource.MANUAL, caller_type=CallerType.USER)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
@@ -162,6 +179,7 @@ async def test_setup_workflow_run_continues_when_initial_run_tag_write_fails() -
     request = WorkflowRequestBody(data={}, run_metadata={"env": "prod"})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock(side_effect=RuntimeError("tag write failed"))
@@ -192,6 +210,7 @@ async def test_setup_workflow_run_writes_create_time_system_tags() -> None:
             return_value="known_platform",
         ),
     ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
@@ -227,6 +246,7 @@ async def test_setup_workflow_run_writes_trigger_tag_when_target_domain_is_unava
             return_value=None,
         ),
     ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
@@ -257,6 +277,7 @@ async def test_setup_workflow_run_continues_when_creation_tag_write_fails() -> N
             return_value="known_platform",
         ),
     ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock(side_effect=RuntimeError("tag write failed"))
@@ -287,6 +308,7 @@ async def test_setup_workflow_run_writes_provenance_tags_when_platform_detection
             side_effect=RuntimeError("detector unavailable"),
         ),
     ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
@@ -316,6 +338,7 @@ async def test_setup_workflow_run_raises_on_missing_required_parameters() -> Non
     request = WorkflowRequestBody(data={})  # no data for api_key
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -361,6 +384,7 @@ async def test_setup_workflow_run_persistence_error_identifies_specific_failing_
     request = WorkflowRequestBody(data={"alpha_count": 5, "middle_label": "test", "zebra_url": "https://z.com"})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -393,6 +417,7 @@ async def test_setup_workflow_run_raises_on_non_string_credential_id() -> None:
     request = WorkflowRequestBody(data={"credential": 12345})  # not a string
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -421,11 +446,12 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
     service._validate_credential_ids = AsyncMock(  # type: ignore[method-assign]
         side_effect=InvalidCredentialId("Credential not found")
     )
-    service._prepare_persisted_workflow_browser_profile = AsyncMock()  # type: ignore[method-assign]
+    service._resolve_and_stamp_run_seed = AsyncMock()  # type: ignore[method-assign]
 
     request = WorkflowRequestBody(data={"credential": "cred_missing"})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -438,7 +464,7 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
             )
 
     service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization)
-    service._prepare_persisted_workflow_browser_profile.assert_not_awaited()
+    service._resolve_and_stamp_run_seed.assert_not_awaited()
     service.create_workflow_run_parameters.assert_not_awaited()
     service.mark_workflow_run_as_failed.assert_awaited_once()
 
@@ -459,6 +485,7 @@ async def test_setup_workflow_run_batches_credential_validation() -> None:
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -490,6 +517,7 @@ async def test_setup_workflow_run_skips_credential_lookup_when_no_credentials() 
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -518,6 +546,7 @@ async def test_setup_workflow_run_raises_invalid_credential_when_missing() -> No
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -550,6 +579,7 @@ async def test_setup_workflow_run_surfaces_all_missing_credentials() -> None:
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -588,6 +618,7 @@ async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -612,6 +643,7 @@ async def test_setup_workflow_run_defaults_missing_trigger_type_to_api() -> None
     service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -649,6 +681,7 @@ async def test_setup_workflow_run_inherits_missing_trigger_type_from_parent_cont
     )
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -684,6 +717,7 @@ async def test_setup_workflow_run_explicit_trigger_type_overrides_parent_context
     )
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -721,6 +755,7 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     skyvern_context.set(parent_context)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -765,6 +800,7 @@ async def test_setup_workflow_run_opens_one_outer_session() -> None:
 
     request = WorkflowRequestBody(data={"k": "v"})
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -820,6 +856,7 @@ async def test_setup_workflow_run_rolls_back_outer_session_on_batch_failure() ->
 
     request = WorkflowRequestBody(data={"a": "1", "b": "2"})
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
@@ -851,6 +888,7 @@ async def test_setup_workflow_run_skips_browser_inheritance_for_fallback_retry()
     request = WorkflowRequestBody(data={}, browser_profile_id=None, browser_session_id=None, cdp_connect_headers=None)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -878,6 +916,7 @@ async def test_setup_workflow_run_inherits_browser_profile_for_normal_run() -> N
     request = WorkflowRequestBody(data={}, browser_profile_id=None, browser_session_id=None, cdp_connect_headers=None)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -890,3 +929,205 @@ async def test_setup_workflow_run_inherits_browser_profile_for_normal_run() -> N
 
     assert request.browser_profile_id == "bp_workflow"
     assert request.cdp_connect_headers == {"authorization": "Bearer workflow"}
+
+
+def _make_bitwarden_login_parameter(bitwarden_item_id: str | None) -> BitwardenLoginCredentialParameter:
+    now = datetime.now(tz=timezone.utc)
+    return BitwardenLoginCredentialParameter(
+        bitwarden_login_credential_parameter_id="blcp_test",
+        workflow_id="wf_test",
+        key="bw_login",
+        bitwarden_client_id_aws_secret_key="client_id",
+        bitwarden_client_secret_aws_secret_key="client_secret",
+        bitwarden_master_password_aws_secret_key="master_password",
+        bitwarden_item_id=bitwarden_item_id,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _make_bitwarden_credit_card_parameter(bitwarden_item_id: str) -> BitwardenCreditCardDataParameter:
+    now = datetime.now(tz=timezone.utc)
+    return BitwardenCreditCardDataParameter(
+        bitwarden_credit_card_data_parameter_id="bccdp_test",
+        workflow_id="wf_test",
+        key="bw_credit_card",
+        bitwarden_client_id_aws_secret_key="client_id",
+        bitwarden_client_secret_aws_secret_key="client_secret",
+        bitwarden_master_password_aws_secret_key="master_password",
+        bitwarden_collection_id="collection",
+        bitwarden_item_id=bitwarden_item_id,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+async def _run_setup_with_bitwarden_item_id(
+    *,
+    bitwarden_item_id: str | None,
+    request_data: dict | None,
+    workflow_parameters: list[WorkflowParameter] | None = None,
+    output_parameter_keys: list[str] | None = None,
+    credential_parameter: BitwardenCreditCardDataParameter | None = None,
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    service, organization, workflow_run = _make_service_with_mocks(
+        workflow_parameters=workflow_parameters or [],
+        definition_parameters=[credential_parameter or _make_bitwarden_login_parameter(bitwarden_item_id)],
+    )
+    service.get_workflow_output_parameters = AsyncMock(  # type: ignore[method-assign]
+        return_value=[SimpleNamespace(key=key) for key in output_parameter_keys or []]
+    )
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.is_browser_memory_engine_enabled = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data=request_data),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+    return result, service
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_uuid_bitwarden_item_id_from_run_parameter_template() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="{{ item_ref }}",
+            request_data={"item_ref": "test"},
+            workflow_parameters=[_make_workflow_parameter("item_ref")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_uuid_bitwarden_item_id_from_bare_key_reference() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="item_ref",
+            request_data={"item_ref": "test"},
+            workflow_parameters=[_make_workflow_parameter("item_ref")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_uuid_literal_bitwarden_item_id() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(bitwarden_item_id="not-a-uuid", request_data=None)
+
+
+@pytest.mark.asyncio
+async def test_setup_marks_run_failed_on_invalid_bitwarden_item_id() -> None:
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[],
+        definition_parameters=[_make_bitwarden_login_parameter("not-a-uuid")],
+    )
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
+        with pytest.raises(InvalidWorkflowParameter):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=WorkflowRequestBody(data=None),
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+    service.mark_workflow_run_as_failed.assert_awaited_once()
+    failure_reason = service.mark_workflow_run_as_failed.await_args.kwargs["failure_reason"]
+    assert "Bitwarden item ID" in failure_reason
+
+
+@pytest.mark.asyncio
+async def test_setup_accepts_valid_uuid_bitwarden_item_id_from_run_parameter() -> None:
+    result, _ = await _run_setup_with_bitwarden_item_id(
+        bitwarden_item_id="{{ item_ref }}",
+        request_data={"item_ref": "3d8b857e-31d0-44b2-8276-b28900b7f112"},
+        workflow_parameters=[_make_workflow_parameter("item_ref")],
+    )
+    assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_bitwarden_item_id_only_resolvable_at_run_time() -> None:
+    for source in ("{{ login_block.item_id }}", None, ""):
+        result, _ = await _run_setup_with_bitwarden_item_id(bitwarden_item_id=source, request_data=None)
+        assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_bitwarden_item_id_referencing_real_output_parameter() -> None:
+    result, _ = await _run_setup_with_bitwarden_item_id(
+        bitwarden_item_id="extract_output",
+        request_data=None,
+        output_parameter_keys=["extract_output"],
+    )
+    assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_output_suffixed_literal_without_matching_output_parameter() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(bitwarden_item_id="test_output", request_data=None)
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_string_bitwarden_item_id_from_run_parameter() -> None:
+    for value in (123, True, ["3d8b857e-31d0-44b2-8276-b28900b7f112"]):
+        with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+            await _run_setup_with_bitwarden_item_id(
+                bitwarden_item_id="{{ item_ref }}",
+                request_data={"item_ref": value},
+                workflow_parameters=[
+                    _make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)
+                ],
+            )
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_falsy_bare_key_item_id_for_login_parameter() -> None:
+    result, _ = await _run_setup_with_bitwarden_item_id(
+        bitwarden_item_id="item_ref",
+        request_data={"item_ref": 0},
+        workflow_parameters=[_make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)],
+    )
+    assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_falsy_template_item_id_for_login_parameter() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="{{ item_ref }}",
+            request_data={"item_ref": 0},
+            workflow_parameters=[
+                _make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_falsy_item_id_for_credit_card_parameter() -> None:
+    for value in (0, False):
+        with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+            await _run_setup_with_bitwarden_item_id(
+                bitwarden_item_id=None,
+                request_data={"item_ref": value},
+                workflow_parameters=[
+                    _make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)
+                ],
+                credential_parameter=_make_bitwarden_credit_card_parameter("item_ref"),
+            )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_composite_template_item_id_with_known_parameters() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="{{ prefix }}-{{ suffix }}",
+            request_data={"prefix": "abc", "suffix": "def"},
+            workflow_parameters=[_make_workflow_parameter("prefix"), _make_workflow_parameter("suffix")],
+        )

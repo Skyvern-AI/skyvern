@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import hmac
 import io
 import json
 import keyword
@@ -25,7 +24,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
     SameMonthFileMatchTransform,
@@ -33,6 +31,7 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     same_month_file_match_transform_fingerprint,
     same_month_file_match_transform_is_valid,
 )
+from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     FrozenRequestedOutputExtractionCandidate,
@@ -68,8 +67,6 @@ _READONLY_DEFERRED_VAR = "_scout_readonly_actual"
 _MONTH_HELPER_VAR = "_scout_month_to_iso"
 _ISO_DATE_HELPER_VAR = "_scout_iso_date_to_year_month"
 _PERIOD_DATE_PATTERN_HELPER_VAR = "_scout_period_date_pattern"
-_DYNAMIC_ROW_EVIDENCE_FINGERPRINT_DOMAIN = b"skyvern.copilot.dynamic_row_evidence.v1"
-_DYNAMIC_ROW_EVIDENCE_SCRYPT_N = 1 << 14
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
@@ -255,6 +252,31 @@ def first_matched_post_fill_submit_index(
     return None
 
 
+def _captcha_boundary_indices(trajectory: Sequence[Mapping[str, Any]]) -> set[int]:
+    """Return typed challenge points plus credential-associated submit boundaries."""
+    boundaries = {
+        index for index, interaction in enumerate(trajectory) if composition_challenge_carrier(interaction) is not None
+    }
+    latest_credential_fill_by_source: dict[str, int] = {}
+    for index, interaction in enumerate(trajectory):
+        if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        if str(interaction.get("credential_field") or "").strip() not in _CREDENTIAL_FIELDS:
+            continue
+        source_url = str(interaction.get("source_url") or "").strip()
+        if source_url:
+            latest_credential_fill_by_source[source_url] = index
+    for source_url, latest_fill_index in latest_credential_fill_by_source.items():
+        submit_index = first_matched_post_fill_submit_index(
+            trajectory,
+            latest_fill_index,
+            frozenset({source_url}),
+        )
+        if submit_index is not None:
+            boundaries.add(submit_index)
+    return boundaries
+
+
 def credential_scout_gap(
     trajectory: Sequence[Mapping[str, Any]],
     requirements: Sequence[tuple[AbstractSet[str], AbstractSet[str]]],
@@ -340,6 +362,7 @@ _RESERVED_PARAM_NAMES = frozenset(
         "totp",
         "totp_identifier",
         "otp",
+        "solve_captcha",
         "print",
         "len",
         "range",
@@ -861,7 +884,6 @@ def dynamic_row_evidence_fingerprint(
     period_matches: Sequence[Mapping[str, Any]],
     selected_index: int,
 ) -> str:
-    """Return a keyed integrity tag for potentially sensitive captured row evidence."""
     payload = {
         "source_url": source_url,
         "target_selector": target_selector,
@@ -872,15 +894,7 @@ def dynamic_row_evidence_fingerprint(
         "period_matches": [dict(item) for item in period_matches],
         "selected_index": selected_index,
     }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.scrypt(
-        serialized,
-        salt=_DYNAMIC_ROW_EVIDENCE_FINGERPRINT_DOMAIN + b"\x00" + settings.SECRET_KEY.encode(),
-        n=_DYNAMIC_ROW_EVIDENCE_SCRYPT_N,
-        r=8,
-        p=1,
-        dklen=32,
-    ).hex()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDynamicRowEvidence | None:
@@ -928,18 +942,16 @@ def _validated_dynamic_row_evidence(interaction: Mapping[str, Any]) -> ScoutedDy
         or selected_index < 0
         or selected_index >= row_selector_count
         or not isinstance(evidence_fingerprint, str)
-        or not hmac.compare_digest(
-            evidence_fingerprint,
-            dynamic_row_evidence_fingerprint(
-                source_url=source_url,
-                target_selector=selector,
-                row_selector=row_selector.strip(),
-                row_text=" ".join(row_text.split()),
-                row_selector_count=row_selector_count,
-                row_text_match_count=row_text_match_count,
-                period_matches=period_matches,
-                selected_index=selected_index,
-            ),
+        or evidence_fingerprint
+        != dynamic_row_evidence_fingerprint(
+            source_url=source_url,
+            target_selector=selector,
+            row_selector=row_selector.strip(),
+            row_text=" ".join(row_text.split()),
+            row_selector_count=row_selector_count,
+            row_text_match_count=row_text_match_count,
+            period_matches=period_matches,
+            selected_index=selected_index,
         )
     ):
         return None
@@ -2461,6 +2473,7 @@ def synthesize_code_block(
         return _INDENT
 
     snapshot_recovery_emitted = False
+    captcha_boundary_indices = _captcha_boundary_indices(trajectory)
 
     def emit_snapshot_recovery(trajectory_index: int, action_indent: str) -> None:
         nonlocal snapshot_recovery_emitted
@@ -2540,6 +2553,8 @@ def synthesize_code_block(
                 lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
                 record_emission(trajectory_index, tool_name, "press", "page.keyboard", line_start=line_start)
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+            if trajectory_index in captcha_boundary_indices:
+                lines.append(f"{action_indent}await solve_captcha(page)")
             append_step(f"Press {key}", "keypress", line_start)
             emitted += 1
             continue
@@ -2608,6 +2623,8 @@ def synthesize_code_block(
                     )
                 lines.append(f"{action_indent}await {locator}.click()")
                 lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+                if trajectory_index in captcha_boundary_indices:
+                    lines.append(f"{action_indent}await solve_captcha(page)")
                 record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":

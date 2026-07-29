@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_testing,
     anchor_recovers_entrypoint,
     extract_anchor_entry_url,
+    extract_in_turn_entry_url,
     initial_build_phase,
 )
 from skyvern.forge.sdk.copilot.request_policy import build_transcript_context
@@ -330,6 +331,71 @@ def test_anchor_recovery_adopts_earliest_url_on_url_less_corrective_pivot() -> N
     )
 
 
+_SLOT_A = "http://localhost:8955/analytics_console/pathfold/?date_from=-7d"
+_SLOT_B = "http://localhost:8955/analytics_console/other/"
+
+_YAML_WITH_B = """
+title: T
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open
+      url: http://localhost:8955/analytics_console/other/
+"""
+
+
+@pytest.mark.parametrize(
+    "user_message,agent_message,workflow_yaml,expected",
+    [
+        ("go to http://localhost:8955/x", "", "", "http://localhost:8955/x"),
+        ("keep going", "earlier: http://localhost:8955/y", "", "http://localhost:8955/y"),
+        ("run it", "run it", _YAML_WITH_B, _SLOT_B),
+        ("keep going", "keep going", "", None),
+        ("", "", "", None),
+    ],
+)
+def test_extract_in_turn_entry_url(
+    user_message: str, agent_message: str, workflow_yaml: str, expected: str | None
+) -> None:
+    assert extract_in_turn_entry_url(user_message, agent_message, workflow_yaml) == expected
+
+
+def test_initial_build_phase_slot_supplies_composing_when_anchor_blanked() -> None:
+    # >10 retained messages blank the anchor; a bare follow-up carries no in-turn
+    # URL, so only the persisted slot can move the turn to COMPOSING.
+    assert (
+        initial_build_phase(
+            _ti(TurnIntentMode.BUILD),
+            "keep going",
+            "keep going",
+            "",
+            "",
+            persisted_entrypoint_url=_SLOT_A,
+        )
+        == BuildPhase.COMPOSING
+    )
+
+
+def test_initial_build_phase_stays_initial_without_slot_or_url() -> None:
+    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "keep going", "keep going", "", "") == BuildPhase.INITIAL
+
+
+def test_in_turn_url_wins_over_persisted_slot() -> None:
+    assert extract_in_turn_entry_url(f"actually go to {_SLOT_B}", "", "") == _SLOT_B
+    assert (
+        initial_build_phase(
+            _ti(TurnIntentMode.BUILD),
+            f"actually go to {_SLOT_B}",
+            "",
+            "",
+            "",
+            persisted_entrypoint_url=_SLOT_A,
+        )
+        == BuildPhase.COMPOSING
+    )
+
+
 def test_initial_build_phase_none_turn_intent_acts_like_unknown_mode() -> None:
     # turn_intent=None is treated as if mode is UNKNOWN — eligible for INITIAL
     # when no URL signal exists. The phase gate then blocks mutation until
@@ -496,7 +562,7 @@ def test_phase_tool_error_returns_none_when_phase_attr_missing() -> None:
             BuildPhase.COMPOSING,
             "build_phase_discovery_disallowed_post_compose",
             "retry_with_different_tool",
-            frozenset({"update_workflow", "update_and_run_blocks"}),
+            frozenset({"update_workflow", "update_and_run_blocks", "edit_block"}),
         ),
         (
             "navigate_browser",
@@ -569,3 +635,34 @@ def test_discovery_during_mutation_user_facing_reason_is_truthful_and_not_future
     user_facing_reason_lower = signal.user_facing_reason.lower()
     for phrase in forbidden_phrases:
         assert phrase not in user_facing_reason_lower
+
+
+def test_transcript_anchor_disabled_env_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.copilot.agent import _transcript_anchor_disabled
+
+    monkeypatch.delenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", raising=False)
+    assert _transcript_anchor_disabled() is False
+
+    for falsy in ("", "0", "false", "no"):
+        monkeypatch.setenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", falsy)
+        assert _transcript_anchor_disabled() is False
+
+    for truthy in ("1", "true", "TRUE", " yes "):
+        monkeypatch.setenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", truthy)
+        assert _transcript_anchor_disabled() is True
+
+
+def test_in_turn_url_strips_trailing_sentence_punctuation() -> None:
+    """A sentence-final URL must not persist the punctuation into the slot.
+
+    A trailing '.' survives urlparse into the path, so the stored entrypoint
+    stops matching inspected-page evidence and re-fires the discovery nudge.
+    """
+    from skyvern.forge.sdk.copilot.enforcement import _same_page
+
+    extracted = extract_in_turn_entry_url("go to https://ex.com/login.", "", None)
+    assert extracted == "https://ex.com/login"
+    assert _same_page(extracted, "https://ex.com/login")
+
+    assert extract_in_turn_entry_url("see https://ex.com/a), then stop", "", None) == "https://ex.com/a"
+    assert extract_in_turn_entry_url("plain https://ex.com/x", "", None) == "https://ex.com/x"

@@ -57,7 +57,7 @@ function BrowserProfileUsageList({ usage, isLoading }: Props) {
       {workflows.length > 0 && (
         <div className="space-y-1">
           <p className="font-medium">
-            Used by {plural(workflows.length, "workflow")}
+            Used by {plural(workflows.length, "agent")}
           </p>
           <ul className="list-disc space-y-0.5 pl-5 text-muted-foreground">
             {workflows.map((workflow) => (

@@ -55,7 +55,7 @@ from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.schemas.llm import (
     LLMAllowedFailsPolicy,
     LLMConfig,
@@ -860,8 +860,10 @@ class LLMAPIHandlerFactory:
             "anthropic/claude-opus-4-7",
             "anthropic/claude-opus-4-8",
             "anthropic/claude-fable-5",
+            "anthropic/claude-opus-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
+            "anthropic-claude-opus-5",
         }
 
     @staticmethod
@@ -1300,7 +1302,7 @@ class LLMAPIHandlerFactory:
                 # staging before the LLM call. The hot cost is inside the non-bundled
                 # branch (prepare_llm_artifact → S3 upload).
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                with traced_span(_tracer, "skyvern.llm.artifact.pre_request") as _pre_span:
                     apply_context_attrs(_pre_span)
                     _pre_span.set_attribute("bundled", bool(_should_bundle))
                     _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
@@ -1835,7 +1837,9 @@ class LLMAPIHandlerFactory:
                     content = response.choices[0].message.content if response.choices else None
                     parsed_response = content or ""
                 else:
-                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                    parsed_response = parse_api_response(
+                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                    )
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -1941,7 +1945,7 @@ class LLMAPIHandlerFactory:
                 # does the S3 uploads + DB rows for every LLM artifact queued during
                 # this request; the bundled-path archive accumulate is fast in-memory.
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                with traced_span(_tracer, "skyvern.llm.artifact.post_response") as _post_span:
                     apply_context_attrs(_post_span)
                     _post_span.set_attribute("bundled", bool(_should_bundle))
                     # Count underlying artifacts (main + screenshots per request), not request wrappers.
@@ -2094,7 +2098,7 @@ class LLMAPIHandlerFactory:
                 # staging before the LLM call. The hot cost is inside the non-bundled
                 # branch (prepare_llm_artifact → S3 upload).
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+                with traced_span(_tracer, "skyvern.llm.artifact.pre_request") as _pre_span:
                     apply_context_attrs(_pre_span)
                     _pre_span.set_attribute("bundled", bool(_should_bundle))
                     _pre_span.set_attribute("persist", bool(should_persist_llm_artifacts))
@@ -2391,7 +2395,9 @@ class LLMAPIHandlerFactory:
                     content = response.choices[0].message.content if response.choices else None
                     parsed_response = content or ""
                 else:
-                    parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
+                    parsed_response = parse_api_response(
+                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                    )
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
                     if _should_bundle:
@@ -2506,7 +2512,7 @@ class LLMAPIHandlerFactory:
                 # does the S3 uploads + DB rows for every LLM artifact queued during
                 # this request; the bundled-path archive accumulate is fast in-memory.
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+                with traced_span(_tracer, "skyvern.llm.artifact.post_response") as _post_span:
                     apply_context_attrs(_post_span)
                     _post_span.set_attribute("bundled", bool(_should_bundle))
                     # Count underlying artifacts (main + screenshots per request), not request wrappers.
@@ -2747,7 +2753,7 @@ class LLMCaller:
                         if "display_width_px" in tool:
                             tool["display_width_px"] = target_dimension["width"]
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.llm.screenshot_resize") as _resize_span:
+                with traced_span(_tracer, "skyvern.llm.screenshot_resize") as _resize_span:
                     apply_context_attrs(_resize_span)
                     _resize_span.set_attribute("input_count", len(screenshots))
                     _resize_span.set_attribute("input_bytes", sum(len(s) for s in screenshots))
@@ -2761,7 +2767,7 @@ class LLMCaller:
             # staging before the LLM call. The hot cost is inside the non-bundled
             # branch (prepare_llm_artifact → S3 upload).
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.llm.artifact.pre_request") as _pre_span:
+            with traced_span(_tracer, "skyvern.llm.artifact.pre_request") as _pre_span:
                 apply_context_attrs(_pre_span)
                 _pre_span.set_attribute("bundled", bool(_should_bundle))
                 _pre_span.set_attribute("persist", bool(prompt and should_persist_llm_artifacts))
@@ -2992,7 +2998,9 @@ class LLMCaller:
             if raw_response:
                 return response.model_dump(exclude_none=True)
 
-            parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
+            parsed_response = parse_api_response(
+                response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
+            )
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if should_persist_llm_artifacts:
                 if _should_bundle:
@@ -3047,7 +3055,7 @@ class LLMCaller:
             # the S3 uploads + DB rows for every LLM artifact queued during this
             # request; the bundled-path archive accumulate is fast in-memory.
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.llm.artifact.post_response") as _post_span:
+            with traced_span(_tracer, "skyvern.llm.artifact.post_response") as _post_span:
                 apply_context_attrs(_post_span)
                 _post_span.set_attribute("bundled", bool(_should_bundle))
                 # Count underlying artifacts (main + screenshots per request), not request wrappers.

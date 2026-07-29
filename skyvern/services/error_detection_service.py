@@ -86,10 +86,11 @@ async def detect_user_defined_errors_for_task(
     except Exception:
         # Gracefully handle any errors during detection
         # Error detection failure should never prevent task from failing
-        LOG.exception(
+        LOG.warning(
             "Failed to detect user-defined errors, continuing with task failure",
             task_id=task.task_id,
             step_id=step.step_id,
+            exc_info=True,
         )
         return []
 
@@ -154,10 +155,11 @@ async def _detect_errors_from_page(
         return user_defined_errors
 
     except Exception:
-        LOG.exception(
+        LOG.warning(
             "Failed to detect errors from page",
             task_id=task.task_id,
             step_id=step.step_id,
+            exc_info=True,
         )
         return []
 
@@ -259,9 +261,10 @@ async def _detect_errors_from_context(
         return user_defined_errors
 
     except Exception:
-        LOG.exception(
+        LOG.warning(
             "Failed to detect errors from context",
             task_id=task.task_id,
             step_id=step.step_id,
+            exc_info=True,
         )
         return []

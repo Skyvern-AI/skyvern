@@ -4,8 +4,9 @@ import ast
 import re
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
+import structlog
 import yaml
 
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -16,6 +17,10 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     wrapped_code_ast,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_param_ids, workflow_blocks
+
+LOG = structlog.get_logger()
+
+_Verdict = Literal["matched", "other", "unresolvable"]
 
 _FILL_METHODS = frozenset({"fill", "type", "press_sequentially"})
 # `wrapped_code_ast` re-indents every line by four spaces, so AST columns are shifted by that much.
@@ -116,6 +121,49 @@ def scouted_selector_source_urls(scout_trajectory: Sequence[Mapping[str, Any]] |
             continue
         by_selector.setdefault(selector, set()).add(source_url)
     return {selector: frozenset(urls) for selector, urls in by_selector.items()}
+
+
+def scouted_element_fingerprints(scout_trajectory: Sequence[Mapping[str, Any]] | None) -> dict[str, dict[str, str]]:
+    """Extract element fingerprint from fill_credential_field interactions by scouted selector, dropping any
+    selector scouted with differing fingerprints across pages. `scouted_selector_source_urls` keeps every
+    page a selector was scouted on, so keeping one page's fingerprint would compare a fill on another page
+    against the wrong element and resolve 'other'; an ambiguous selector falls to the fail-closed backstop."""
+    fingerprints: dict[str, dict[str, str]] = {}
+    conflicted: set[str] = set()
+    for interaction in scout_trajectory or []:
+        if not isinstance(interaction, Mapping):
+            continue
+        if str(interaction.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        selector = str(interaction.get("selector") or "").strip()
+        if not selector:
+            continue
+        fp = {}
+        for key in {
+            "element_fingerprint_id",
+            "element_fingerprint_name",
+            "element_fingerprint_type",
+            "element_fingerprint_placeholder",
+            "element_fingerprint_label",
+            "element_fingerprint_test_id",
+            "element_fingerprint_tag",
+            "element_fingerprint_probed",
+            "role",
+            "accessible_name",
+        }:
+            value = str(interaction.get(key) or "").strip()
+            if value:
+                attr_name = key.replace("element_fingerprint_", "")
+                fp[attr_name] = value
+        if fp:
+            existing = fingerprints.get(selector)
+            if existing is not None and existing != fp:
+                conflicted.add(selector)
+                continue
+            fingerprints.setdefault(selector, fp)
+    for selector in conflicted:
+        fingerprints.pop(selector, None)
+    return fingerprints
 
 
 def _existing_param_key(parameters: Sequence[object], credential_id: str) -> str | None:
@@ -405,6 +453,7 @@ def _rebind_block_code(
     targets: Mapping[str, tuple[str, str]],
     param_key_for: Callable[[str], str],
     source_urls_by_selector: Mapping[str, frozenset[str]],
+    fingerprints_by_selector: Mapping[str, dict[str, str]] | None = None,
 ) -> tuple[str, list[str], set[str]]:
     rebound: list[str] = []
     used_params: set[str] = set()
@@ -412,6 +461,8 @@ def _rebind_block_code(
     new_code = code
     block_goto_urls = {_normalize_page_url(url) for url in _GOTO_RE.findall(code)}
     alias_selectors = _locator_alias_selectors(code)
+    if fingerprints_by_selector is None:
+        fingerprints_by_selector = {}
 
     for selector, (credential_id, field) in targets.items():
         if _block_page_incompatible(block_goto_urls, source_urls_by_selector.get(selector, frozenset())):
@@ -458,6 +509,44 @@ def _rebind_block_code(
         for pattern in patterns:
             new_code = pattern.sub(_substitute, new_code)
 
+    for receiver, _value, _node, _stmt in _inline_literal_fill_receivers(new_code):
+        if receiver.kind == "css" and receiver.css_selector in targets:
+            continue
+        verdict, matched = _best_fingerprint_verdict(
+            receiver, targets, fingerprints_by_selector, source_urls_by_selector, block_goto_urls
+        )
+        LOG.info(
+            "copilot credential fill fingerprint verdict",
+            receiver=receiver.css_selector or receiver.method or "unresolvable",
+            verdict=verdict,
+            matched_attributes=_receiver_attributes(receiver) if verdict == "matched" else [],
+        )
+
+    for _ in range(len(_inline_literal_fill_receivers(new_code)) + 1):
+        repaired = False
+        for receiver, _value, _node, fill_stmt in _inline_literal_fill_receivers(new_code):
+            if fill_stmt is None or (receiver.kind == "css" and receiver.css_selector in targets):
+                continue
+            _verdict, matched = _best_fingerprint_verdict(
+                receiver, targets, fingerprints_by_selector, source_urls_by_selector, block_goto_urls
+            )
+            if matched is None:
+                continue
+            scouted_selector, credential_id, field = matched
+            param_key = param_key_for(credential_id)
+            new_src = _replace_fill_statement(
+                new_code, fill_stmt, f"page.locator({_py_selector(scouted_selector)})", param_key, field
+            )
+            if new_src is None:
+                continue
+            new_code = new_src
+            rebound.append(f"{param_key}.{field}")
+            used_params.add(param_key)
+            repaired = True
+            break
+        if not repaired:
+            break
+
     for identifier in replaced_identifiers:
         new_code = _drop_dead_string_assignment(new_code, identifier)
 
@@ -469,23 +558,21 @@ def _residual_raw_credential_fills(
     targets: Mapping[str, tuple[str, str]],
     source_urls_by_selector: Mapping[str, frozenset[str]],
     assigned: Mapping[str, str],
+    fingerprints_by_selector: Mapping[str, dict[str, str]] | None = None,
 ) -> list[str]:
-    """After rewriting, a fill that still types an inline-literal value at the scouted selector is an
-    un-neutralized secret. A literal fill at a receiver we cannot resolve to a selector at all (``get_by_*``
-    locators, conflicted aliases, arbitrary call chains) counts too — but only while the scouted obligation
-    is UNSATISFIED: a credential typed through an unrecognizable locator necessarily leaves its sanctioned
-    fill missing, whereas a draft whose credential fills are all sanctioned may legitimately fill a search
-    box or date field with a literal, and rejecting that would refuse a correct attempt (the disease this
-    module exists to cure). The net keys on the VALUE shape, never on recognizing the receiver; the
-    output-policy scan misses the bare ``.fill(...)`` shapes, so the caller must fail closed on these."""
+    """A leftover inline literal at the scouted selector fails closed; any other inline-literal fill is
+    resolved against the target fingerprint, where 'matched'/'unresolvable' fail closed and only a provably
+    'other' element is admitted. Rejection is unconditional — a satisfied sanctioned fill no longer masks an
+    extra unresolved literal."""
+    if fingerprints_by_selector is None:
+        fingerprints_by_selector = {}
     residual: list[str] = []
     for selector, (credential_id, field) in targets.items():
         param_key = assigned.get(credential_id)
         if param_key is None:
             continue
         target_source_urls = source_urls_by_selector.get(selector, frozenset())
-        satisfied = False
-        flagged = False
+        fingerprint = fingerprints_by_selector.get(selector, {})
         for block in blocks:
             if not isinstance(block, dict):
                 continue
@@ -494,25 +581,244 @@ def _residual_raw_credential_fills(
                 continue
             if _block_page_incompatible({_normalize_page_url(u) for u in _GOTO_RE.findall(code)}, target_source_urls):
                 continue
-            fills, unrecognized_values = _scan_block_fills(code)
-            if any(fsel == selector and _value_is_param_field(fval, param_key, field) for fsel, fval, _n, _s in fills):
-                satisfied = True
+            fills, _ = _scan_block_fills(code)
             recognized_literal = any(
                 fsel == selector
                 and _value_is_inline_literal_fill(fval, code)
                 and not _value_is_param_field(fval, param_key, field)
                 for fsel, fval, _n, _s in fills
             )
-            unrecognized_literal = any(_value_is_inline_literal_fill(value, code) for value in unrecognized_values)
-            if recognized_literal:
-                residual.append(selector)
-                flagged = True
+            flagged = recognized_literal or any(
+                not (receiver.kind == "css" and receiver.css_selector in targets)
+                and _fingerprint_verdict(receiver, fingerprint) in ("matched", "unresolvable")
+                for receiver, _value, _node, _stmt in _inline_literal_fill_receivers(code)
+            )
+            if flagged:
+                if selector not in residual:
+                    residual.append(selector)
                 break
-            if unrecognized_literal:
-                flagged = True
-        if flagged and not satisfied and selector not in residual:
-            residual.append(selector)
     return residual
+
+
+_SEMANTIC_METHOD_ATTR = {
+    "get_by_placeholder": "placeholder",
+    "get_by_label": "label",
+    "get_by_test_id": "test_id",
+}
+_CSS_ATTR_KEYS = {"type": "type", "name": "name", "placeholder": "placeholder", "data-testid": "test_id"}
+_CSS_ATTR_RE = re.compile(r"\[\s*([\w-]+)\s*=\s*(['\"]?)(.*?)\2\s*\]")
+_CSS_UNSUPPORTED_CHARS = set(" >+~.:*/|,")
+# HTML matches tag names and the `type` attribute case-insensitively, so comparing them exactly would
+# resolve 'other' for a selector that still reaches the credential element.
+_CSS_CASE_INSENSITIVE_ATTRS = frozenset({"tag", "type"})
+# `get_by_test_id` matches exactly; the other semantic locators default to Playwright's relaxed matching.
+_SEMANTIC_EXACT_METHODS = frozenset({"get_by_test_id"})
+
+
+@dataclass(frozen=True)
+class _FillReceiver:
+    kind: Literal["css", "semantic", "unresolvable"]
+    css_selector: str | None = None
+    method: str | None = None
+    argument: str | None = None
+    role: str | None = None
+    accessible_name: str | None = None
+
+
+def _constant_str(node: ast.AST | None) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _semantic_receiver(node: ast.Call) -> _FillReceiver:
+    """Classify a non-CSS fill receiver as a semantic locator (get_by_placeholder/label/test_id/role) or
+    unresolvable. Any locator whose identifying argument is not a single string literal (regex, extra
+    kwargs, unknown get_by_*) fails closed to 'unresolvable'."""
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return _FillReceiver(kind="unresolvable")
+    base = func.value
+    while isinstance(base, ast.Attribute) and base.attr in {"first", "last"}:
+        base = base.value
+    if not (isinstance(base, ast.Call) and isinstance(base.func, ast.Attribute)):
+        return _FillReceiver(kind="unresolvable")
+    method = base.func.attr
+    if method in _SEMANTIC_METHOD_ATTR:
+        if len(base.args) != 1 or base.keywords:
+            return _FillReceiver(kind="unresolvable")
+        argument = _constant_str(base.args[0])
+        if argument is None:
+            return _FillReceiver(kind="unresolvable")
+        return _FillReceiver(kind="semantic", method=method, argument=argument)
+    if method == "get_by_role":
+        role = _constant_str(base.args[0]) if base.args else None
+        if role is None:
+            return _FillReceiver(kind="unresolvable")
+        name = next((_constant_str(kw.value) for kw in base.keywords if kw.arg == "name"), None)
+        return _FillReceiver(kind="semantic", method=method, role=role, accessible_name=name)
+    return _FillReceiver(kind="unresolvable")
+
+
+def _inline_literal_fill_receivers(code: str) -> list[tuple[_FillReceiver, ast.AST, ast.Call, ast.stmt | None]]:
+    """(receiver, value, call, standalone statement) for every fill whose value inlines a literal secret,
+    across both CSS and semantic-locator receivers."""
+    tree = wrapped_code_ast(code)
+    if tree is None:
+        return []
+    alias_selectors = _locator_alias_selectors(code)
+    standalone = _standalone_fill_statements(tree)
+    out: list[tuple[_FillReceiver, ast.AST, ast.Call, ast.stmt | None]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        found = _fill_call_selector_and_value(node, alias_selectors)
+        if found is None:
+            continue
+        selector, value = found
+        if not _value_is_inline_literal_fill(value, code):
+            continue
+        receiver = (
+            _FillReceiver(kind="css", css_selector=selector) if selector is not None else _semantic_receiver(node)
+        )
+        out.append((receiver, value, node, standalone.get(id(node))))
+    return out
+
+
+def _parse_css_selector_attributes(selector: str) -> dict[str, str]:
+    """Extract fingerprint-comparable attributes from the common CSS grammar (#id, tag, tag#id,
+    [attr="v"] over type/name/placeholder/data-testid, and combinations). Classes, combinators, pseudo
+    selectors, XPath, and unknown attributes are outside the grammar and return {} (unresolvable)."""
+    selector = (selector or "").strip()
+    if not selector:
+        return {}
+    remainder = _CSS_ATTR_RE.sub("", selector)
+    if any(ch in _CSS_UNSUPPORTED_CHARS for ch in remainder):
+        return {}
+    result: dict[str, str] = {}
+    for match in _CSS_ATTR_RE.finditer(selector):
+        key = _CSS_ATTR_KEYS.get(match.group(1).strip())
+        if key is None:
+            return {}
+        result[key] = match.group(3).strip()
+    id_match = re.search(r"#([\w-]+)", remainder)
+    if id_match:
+        result["id"] = id_match.group(1)
+    tag_match = re.match(r"([A-Za-z][\w-]*)", remainder)
+    if tag_match:
+        result["tag"] = tag_match.group(1)
+    return result
+
+
+def _receiver_attributes(receiver: _FillReceiver) -> list[str]:
+    if receiver.kind == "css" and receiver.css_selector is not None:
+        return sorted(_parse_css_selector_attributes(receiver.css_selector))
+    if receiver.kind == "semantic":
+        if receiver.method == "get_by_role":
+            return ["role", "accessible_name"]
+        attr = _SEMANTIC_METHOD_ATTR.get(receiver.method or "")
+        return [attr] if attr else []
+    return []
+
+
+def _probed_attributes(fingerprint: Mapping[str, str]) -> frozenset[str]:
+    """Attributes the capture probe actually read. Absent for a failed probe or a pre-fingerprint record,
+    which keeps those undecidable rather than reading silence as proof the element lacks the attribute."""
+    return frozenset(attr for attr in (fingerprint.get("probed") or "").split(",") if attr)
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _locator_text_matches(argument: str, fingerprint_value: str) -> bool:
+    """Playwright's default (`exact=False`) text matching: case-insensitive, whitespace-collapsed substring.
+    Comparing exactly instead would resolve 'other' for a locator that still reaches the credential element
+    at runtime, admitting its literal."""
+    return _normalized_text(argument) in _normalized_text(fingerprint_value)
+
+
+def _css_fingerprint_verdict(selector: str, fingerprint: Mapping[str, str]) -> _Verdict:
+    attrs = _parse_css_selector_attributes(selector)
+    if not attrs:
+        return "unresolvable"
+    probed = _probed_attributes(fingerprint)
+    verdict: _Verdict = "matched"
+    for attr, val in attrs.items():
+        fp_val = fingerprint.get(attr)
+        if not fp_val:
+            if attr in probed:
+                return "other"
+            # Unprobed silence outranks a mismatch already seen: identity is undecidable, and only
+            # "unresolvable" fails closed while "other" admits the literal.
+            return "unresolvable"
+        if attr in _CSS_CASE_INSENSITIVE_ATTRS:
+            if fp_val.strip().casefold() != val.strip().casefold():
+                verdict = "other"
+        elif fp_val.strip() != val.strip():
+            verdict = "other"
+    return verdict
+
+
+def _semantic_fingerprint_verdict(receiver: _FillReceiver, fingerprint: Mapping[str, str]) -> _Verdict:
+    if receiver.method == "get_by_role":
+        role_fp = fingerprint.get("role")
+        name_fp = fingerprint.get("accessible_name")
+        if not role_fp or not name_fp or receiver.role is None or receiver.accessible_name is None:
+            return "unresolvable"
+        role_ok = _normalized_text(receiver.role) == _normalized_text(role_fp)
+        name_ok = _locator_text_matches(receiver.accessible_name, name_fp)
+        return "matched" if role_ok and name_ok else "other"
+    attr = _SEMANTIC_METHOD_ATTR.get(receiver.method or "")
+    if attr is None or receiver.argument is None:
+        return "unresolvable"
+    fp_val = fingerprint.get(attr)
+    if not fp_val:
+        return "other" if attr in _probed_attributes(fingerprint) else "unresolvable"
+    if receiver.method in _SEMANTIC_EXACT_METHODS:
+        return "matched" if receiver.argument.strip() == fp_val.strip() else "other"
+    return "matched" if _locator_text_matches(receiver.argument, fp_val) else "other"
+
+
+def _fingerprint_verdict(receiver: _FillReceiver, fingerprint: Mapping[str, str]) -> _Verdict:
+    """Three-valued identity verdict of a fill receiver against a scouted element fingerprint. An empty
+    fingerprint (capture degraded) and any attribute the probe never read both resolve 'unresolvable' so
+    the caller fails closed; a mismatch, or an attribute the probe read and found absent, earns 'other'."""
+    if not fingerprint:
+        return "unresolvable"
+    if receiver.kind == "css" and receiver.css_selector is not None:
+        return _css_fingerprint_verdict(receiver.css_selector, fingerprint)
+    if receiver.kind == "semantic":
+        return _semantic_fingerprint_verdict(receiver, fingerprint)
+    return "unresolvable"
+
+
+def _best_fingerprint_verdict(
+    receiver: _FillReceiver,
+    targets: Mapping[str, tuple[str, str]],
+    fingerprints_by_selector: Mapping[str, dict[str, str]],
+    source_urls_by_selector: Mapping[str, frozenset[str]],
+    block_goto_urls: set[str],
+) -> tuple[_Verdict, tuple[str, str, str] | None]:
+    """Resolve a fill receiver against every scouted credential target reachable from this block. A single
+    matched target repairs; otherwise 'other' (provably a different element) beats 'unresolvable' so a
+    benign literal is admitted rather than failed closed."""
+    best: _Verdict = "unresolvable"
+    matched: list[tuple[str, str, str]] = []
+    for selector, (credential_id, field) in targets.items():
+        if _block_page_incompatible(block_goto_urls, source_urls_by_selector.get(selector, frozenset())):
+            continue
+        verdict = _fingerprint_verdict(receiver, fingerprints_by_selector.get(selector, {}))
+        if verdict == "matched":
+            matched.append((selector, credential_id, field))
+        elif verdict == "other":
+            best = "other"
+    if len({(credential_id, field) for _selector, credential_id, field in matched}) > 1:
+        # A coarse receiver (e.g. `input[type="password"]`) can match a password and a confirm-password
+        # target alike. Repairing to whichever came first would bind the wrong credential, so ambiguity
+        # fails closed here exactly as a conflicting scouted selector does in `scouted_credential_targets`.
+        return "unresolvable", None
+    if matched:
+        return "matched", matched[0]
+    return best, None
 
 
 def rebind_scouted_credential_literals(
@@ -540,6 +846,7 @@ def rebind_scouted_credential_literals(
         )
 
     source_urls_by_selector = scouted_selector_source_urls(scout_trajectory)
+    fingerprints_by_selector = scouted_element_fingerprints(scout_trajectory)
     try:
         parsed = yaml.safe_load(workflow_yaml)
     except yaml.YAMLError:
@@ -574,7 +881,9 @@ def rebind_scouted_credential_literals(
         code = block.get("code")
         if not isinstance(code, str) or not code.strip():
             continue
-        new_code, rebound, used_params = _rebind_block_code(code, targets, param_key_for, source_urls_by_selector)
+        new_code, rebound, used_params = _rebind_block_code(
+            code, targets, param_key_for, source_urls_by_selector, fingerprints_by_selector
+        )
         if not rebound:
             continue
         block["code"] = new_code
@@ -595,7 +904,9 @@ def rebind_scouted_credential_literals(
         blocks, targets, source_urls_by_selector, assigned, minted_for, credential_keys
     )
 
-    residual = tuple(_residual_raw_credential_fills(blocks, targets, source_urls_by_selector, assigned))
+    residual = tuple(
+        _residual_raw_credential_fills(blocks, targets, source_urls_by_selector, assigned, fingerprints_by_selector)
+    )
 
     if not all_rebound and not authored:
         return CredentialRebindResult(

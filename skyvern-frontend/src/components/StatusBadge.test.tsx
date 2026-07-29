@@ -66,13 +66,21 @@ describe("StatusBadge collapsible", () => {
     expect(label.classList.contains("md:not-sr-only")).toBe(false);
   });
 
-  test("sizes to the icon until the container is wide", () => {
+  test("hugs its label when expanded instead of the table column width", () => {
     const { container } = renderCollapsible(Status.Completed);
 
     const badge = container.querySelector('[aria-label="completed"]');
     expect(
       badge?.classList.contains("[@container_status_(min-width:384px)]:w-28"),
+    ).toBe(false);
+    expect(
+      badge?.classList.contains("[@container_status_(min-width:384px)]:px-2.5"),
     ).toBe(true);
+    expect(
+      badge?.classList.contains(
+        "[@container_status_(min-width:384px)]:justify-start",
+      ),
+    ).toBe(false);
     expect(badge?.classList.contains("md:w-28")).toBe(false);
   });
 

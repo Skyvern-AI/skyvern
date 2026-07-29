@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -8,6 +14,7 @@ import {
   Status,
   type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 import { RunSummaryStrip } from "./RunSummaryStrip";
 
@@ -33,7 +40,10 @@ function makeRun(
 function renderStrip(run: WorkflowRunStatusApiResponseWithWorkflow) {
   return render(
     <MemoryRouter>
-      <RunSummaryStrip workflowRun={run} />
+      {/* The studio shell provides this in production (StudioShell root). */}
+      <TooltipProvider delayDuration={0}>
+        <RunSummaryStrip workflowRun={run} />
+      </TooltipProvider>
     </MemoryRouter>,
   );
 }
@@ -60,41 +70,61 @@ describe("RunSummaryStrip browser session/profile links", () => {
     expect(screen.queryByTitle("Browser profile")).toBeNull();
   });
 
-  test("renders the run id but no resource links when the run has neither", () => {
+  test("renders no id chips at all when the run has neither", () => {
+    // The run id itself lives in the top bar's "View Run" tab, not the strip.
     renderStrip(makeRun());
-    expect(screen.getByText("wr_123")).toBeTruthy();
+    expect(screen.queryByText("wr_123")).toBeNull();
     expect(screen.queryByRole("link")).toBeNull();
   });
 
-  test("groups the run id with the browser session and profile ids", () => {
+  test("groups the session and profile chips without the run id", () => {
     renderStrip(
       makeRun({
         browser_session_id: "pbs_abc",
         browser_profile_id: "bp_def",
       }),
     );
-    expect(screen.getByText("wr_123")).toBeTruthy();
+    expect(screen.queryByText("wr_123")).toBeNull();
     expect(screen.getByText("pbs_abc")).toBeTruthy();
     expect(screen.getByText("bp_def")).toBeTruthy();
   });
 });
 
-describe("RunSummaryStrip visible dates", () => {
-  test("shows started and finished as separate chips for a finalized run", () => {
+describe("RunSummaryStrip duration", () => {
+  test("shows a single elapsed chip for a finalized run", () => {
     renderStrip(makeRun());
-    expect(screen.getByText(/^Started /)).toBeTruthy();
-    expect(screen.getByText(/^Finished /)).toBeTruthy();
+    expect(screen.getByText("Ran for 5m 0s")).toBeTruthy();
+    expect(screen.queryByText(/^Started /)).toBeNull();
+    expect(screen.queryByText(/^Finished /)).toBeNull();
   });
 
-  test("shows started without finished while the run is not finalized", () => {
+  test("hovering/focusing the chip breaks down all four run times", async () => {
+    renderStrip(makeRun());
+    fireEvent.focus(screen.getByText("Ran for 5m 0s"));
+    const tooltip = await screen.findByRole("tooltip");
+    const breakdown = within(tooltip);
+    expect(breakdown.getByText(/Created /)).toBeTruthy();
+    expect(breakdown.getByText(/Queued /)).toBeTruthy();
+    expect(breakdown.getByText(/Started /)).toBeTruthy();
+    expect(breakdown.getByText(/Finished /)).toBeTruthy();
+  });
+
+  test("shows started without an elapsed chip while the run is not finalized", () => {
     renderStrip(makeRun({ status: Status.Running }));
     expect(screen.getByText(/^Started /)).toBeTruthy();
-    expect(screen.queryByText(/^Finished /)).toBeNull();
+    expect(screen.queryByText(/^Ran for /)).toBeNull();
+  });
+
+  test("a finalized run that never started falls back to the raw chips", () => {
+    renderStrip(makeRun({ status: Status.Failed, started_at: null }));
+    expect(screen.getByText(/^Finished /)).toBeTruthy();
+    expect(screen.queryByText(/^Ran for /)).toBeNull();
   });
 
   test("renders no dates when the run has not started", () => {
     renderStrip(makeRun({ status: Status.Running, started_at: null }));
     expect(screen.queryByText(/^Started /)).toBeNull();
+    expect(screen.queryByText(/^Ran for /)).toBeNull();
   });
 });
 

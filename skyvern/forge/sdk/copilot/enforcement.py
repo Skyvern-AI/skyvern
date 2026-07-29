@@ -21,7 +21,6 @@ from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
     RAW_SECRET_LEAK_REASON_CODE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-    UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
     compose_loop_blocker_user_facing_reason,
@@ -32,11 +31,9 @@ from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAP
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
-    author_time_reject_missing_output_paths,
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_authoring_repair_context,
-    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -49,9 +46,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
-    locator_selector_literals,
     missing_rung_text,
-    normalized_scout_selector,
     obligation_finding_reason_code,
     obligation_finding_selector,
     render_missing_rung_call_sources,
@@ -101,7 +96,6 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
-    DiagnosisRepairContract,
     RepairLoopState,
     RepairNextAction,
 )
@@ -147,9 +141,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    AuthorTimeGateAblationPayload,
     PostRunPagePathInteractionWindow,
-    record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
@@ -161,7 +153,6 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
-    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
@@ -170,6 +161,7 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_and_stash_blocker_signal,
     claim_turn,
+    claim_would_succeed,
     claimant_outranks,
     current_turn_owner,
     emit_blocker_signal_payload,
@@ -420,39 +412,6 @@ def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
     return state if isinstance(state, RepairLoopState) else None
 
 
-def _needs_repair_ceiling_halt(ctx: Any) -> bool:
-    state = _repair_loop_state(ctx)
-    return state is not None and state.ceiling_reached is True and run_backed_repair_evidence_exists(ctx)
-
-
-def repair_ceiling_stop_signal(
-    ctx: Any,
-    contract: DiagnosisRepairContract | None,
-    config: CopilotConfig | None = None,
-) -> CopilotToolBlockerSignal:
-    state = contract.repair_loop_state if isinstance(contract, DiagnosisRepairContract) else None
-    count = state.consecutive_identical_repair_count if state is not None else 0
-    evidence = loop_blocker_evidence_from_ctx(ctx)
-    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
-        "repair_ceiling_reached", evidence, blocked_tool="update_and_run_blocks"
-    )
-    agent_steering = (
-        f"This repair has made no verified progress across {count} attempts; "
-        "stop retrying and report the recorded blocker from the preserved draft."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=evidence.has_draft,
-        renders_final_reply=True,
-        internal_reason_code="repair_ceiling_reached",
-        blocked_tool="update_and_run_blocks",
-    )
-
-
 def code_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
     count = _get_int(ctx, "code_authoring_guardrail_reject_count")
     evidence = loop_blocker_evidence_from_ctx(ctx)
@@ -627,6 +586,29 @@ def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
     return nudge
 
 
+def _code_authoring_reject_count_resets(repeated_outcome: bool | None, frontier_unchanged: bool) -> bool:
+    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
+    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
+    return repeated_outcome is False and not frontier_unchanged
+
+
+def code_authoring_churn_stop_would_claim(ctx: AgentContext, *, frontier_unchanged: bool = False) -> bool:
+    """Read-only predicate: would recording one more plain (non-credential) guardrail reject reach
+    the churn ceiling AND win the turn? Mirrors _record_code_authoring_guardrail_reject's threshold,
+    terminal-defer, and claim precedence without mutating ctx."""
+    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
+    base = (
+        0
+        if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged)
+        else ctx.code_authoring_guardrail_reject_count
+    )
+    if base + 1 < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
+        return False
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return False
+    return claim_would_succeed(ctx, TurnClaimant.CODE_AUTHORING_CHURN)
+
+
 def _record_code_authoring_guardrail_reject(
     ctx: AgentContext,
     *,
@@ -636,9 +618,7 @@ def _record_code_authoring_guardrail_reject(
 ) -> None:
     # Callers record the current build-test outcome first so repeat detection compares that key to history.
     repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
-    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
-    if repeated_outcome is False and not frontier_unchanged:
+    if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged):
         ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
@@ -1645,19 +1625,6 @@ def _check_enforcement(
     if built_unverified_repair_inert_context(ctx) or built_complete_without_evaluated_outcome(ctx):
         raise CopilotBuiltUnverified()
 
-    if _needs_repair_ceiling_halt(ctx):
-        contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-        state = _repair_loop_state(ctx)
-        # Backstop: detection-time latch normally raises this above; catches a run-backed increment that bypassed it.
-        signal = repair_ceiling_stop_signal(ctx, contract, config)
-        stash_blocker_signal(ctx, signal)
-        stash_repair_ceiling_turn_halt(
-            ctx,
-            signal,
-            consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
-        )
-        raise_if_turn_halt(ctx, verified=verified)
-
     # A pending credential pause pre-empts every hygiene nudge below, not just
     # the failed-test one: a credential-blocked update_and_run_blocks call
     # satisfies post_update (test not run) and, when the diagnosis contract
@@ -2416,11 +2383,7 @@ def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
 
 
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
-    if ctx.synthesized_block_reopened_for_output_coverage:
-        return True
     if ctx.synthesized_block_reopened_for_credential_scout:
-        return True
-    if getattr(ctx, "synthesized_block_reopened_for_capture_obligation", False):
         return True
     if synthesized_goal_completion_landing_pending(ctx):
         return True
@@ -3178,22 +3141,6 @@ def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> s
     return "allow"
 
 
-def _uncovered_output_reject_rescout_key(canonical_paths: set[str], structural_failure_identity: str) -> str:
-    return f"{structural_failure_identity}|{','.join(sorted(canonical_paths))}"
-
-
-def _active_uncovered_output_reject_paths(ctx: AgentContext) -> set[str]:
-    canonical = {
-        _canonical_output_path(path)
-        for path in author_time_reject_missing_output_paths(ctx.latest_recorded_build_test_outcome)
-    }
-    return canonical & uncovered_requested_output_paths(ctx) if canonical else set()
-
-
-def _uncovered_output_reject_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
-    return tool_name == "evaluate" and bool(_active_uncovered_output_reject_paths(ctx))
-
-
 def _actuation_obligation_live_fill_delivery_required(ctx: CopilotContext) -> bool:
     turn_intent = getattr(ctx, "turn_intent", None)
     if (
@@ -3259,101 +3206,6 @@ def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool
 
 def _credential_scout_reopen_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
     return tool_name == "evaluate" and bool(ctx.synthesized_block_reopened_for_credential_scout)
-
-
-def _never_captured_obligation_admits_expected_tool(
-    ctx: CopilotContext, tool_name: str, arguments: Mapping[str, Any] | None
-) -> bool:
-    obligation = getattr(ctx, "never_captured_obligation", None)
-    if (
-        obligation is None
-        or obligation.state != "armed"
-        or obligation.turn_id != ctx.turn_id
-        or tool_name != obligation.expected_tool_name
-        or not isinstance(arguments, Mapping)
-    ):
-        return False
-    selector = arguments.get("selector")
-    if not isinstance(selector, str) or not selector.strip():
-        return False
-    expected_selectors = {
-        normalized_scout_selector(candidate) for candidate in locator_selector_literals(obligation.normalized_receiver)
-    }
-    if normalized_scout_selector(selector.strip()) not in expected_selectors:
-        return False
-    expected_argument = obligation.expected_argument_literal
-    if expected_argument is None:
-        return True
-    argument_key = {"press_key": "key", "select_option": "value", "type_text": "text"}.get(tool_name)
-    return argument_key is not None and str(arguments.get(argument_key) or "") == expected_argument
-
-
-def consume_uncovered_output_reopen_event(ctx: CopilotContext) -> bool:
-    """Arm a one-shot scout-window reopen for the first author-time reject citing an uncovered
-    requested-output path. Returns True only on that first reject per structural identity; a
-    repeat identical reject falls through so it counts normally toward the repair ceiling."""
-    active = _active_uncovered_output_reject_paths(ctx)
-    if not active:
-        return False
-    latest = ctx.latest_recorded_build_test_outcome
-    if latest is None:
-        return False
-    key = _uncovered_output_reject_rescout_key(active, latest.structural_failure_identity)
-    if ctx.uncovered_output_rescout_context_key == key:
-        return False
-    ctx.uncovered_output_rescout_context_key = key
-    ctx.synthesized_block_reopened_for_output_coverage = True
-    return True
-
-
-def uncovered_output_reject_scout_steer_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    if tool_name not in _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS:
-        return None
-    if not ctx.synthesized_block_reopened_for_output_coverage:
-        return None
-    active = _active_uncovered_output_reject_paths(ctx)
-    if not active:
-        return None
-    latest = ctx.latest_recorded_build_test_outcome
-    if latest is None:
-        return None
-    key = _uncovered_output_reject_rescout_key(active, latest.structural_failure_identity)
-    if ctx.uncovered_output_rescout_steer_key == key:
-        return None
-    payload: AuthorTimeGateAblationPayload = {
-        "uncovered_output_paths": sorted(active),
-        "structural_failure_identity": latest.structural_failure_identity,
-    }
-    if record_author_time_gate_ablation_event(
-        ctx,
-        gate_id="uncovered_output_rescout_steer",
-        reason_code=UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
-        fingerprint=key,
-        blocked_tool=tool_name,
-        payload=payload,
-    ):
-        return None
-    # Commit-after-claim: a yielded steer must not burn the one-shot rescout key.
-    if claim_turn(ctx, TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER) is ClaimOutcome.YIELDED:
-        return None
-    ctx.uncovered_output_rescout_steer_key = key
-    named_paths = ", ".join(sorted(active))
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "The authored workflow still leaves these requested output paths unobserved: "
-            f"{named_paths}. Do NOT re-author yet. Call evaluate to scout the page where those values "
-            "appear until they are observed, then author a block that returns them."
-        ),
-        user_facing_reason="I need to view the page with the requested details before saving the workflow.",
-        recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({"evaluate"}),
-        preserves_workflow_draft=True,
-        renders_final_reply=False,
-        internal_reason_code=UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
-        blocked_tool=tool_name,
-        extra={"uncovered_output_paths": sorted(active)},
-    )
 
 
 def _should_block_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
@@ -3532,13 +3384,8 @@ def synthesized_block_persistence_signal(
     ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
     if ambiguous_selector_rescout_state == "allow":
         return None
-    if _uncovered_output_reject_admits_evaluate(ctx, tool_name):
-        return None
     if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN)
-        return None
-    if _never_captured_obligation_admits_expected_tool(ctx, tool_name, arguments):
-        claim_turn(ctx, TurnClaimant.CAPTURE_OBLIGATION_REOPEN)
         return None
     if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)

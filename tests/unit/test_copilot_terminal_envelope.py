@@ -187,6 +187,22 @@ def test_finalize_applied_state_blocks_completed_when_not_applied() -> None:
     assert finalized.response_kind == "stopped"
 
 
+def test_finalize_applied_state_marks_unapplied_proposal_pending() -> None:
+    # A verified code-only fix is auto_applicable but no longer auto-commits; when
+    # not applied it must render as a pending proposal (ReviewGateCard), not stopped.
+    envelope = _assemble(verified=True, workflow_applied=False, proposal_disposition="auto_applicable")
+    assert envelope.next_state == "stopped"
+
+    finalized = finalize_applied_state(envelope, applied=False, proposal_present=True)
+
+    assert finalized.workflow_applied is False
+    assert finalized.next_state == "proposal_pending"
+    assert finalized.response_kind == "update"
+
+    # No proposal present (a genuine stop) stays stopped.
+    assert finalize_applied_state(envelope, applied=False).next_state == "stopped"
+
+
 def test_finalize_applied_state_keeps_question_for_user_action_required() -> None:
     envelope = _assemble(
         response_type="ASK_QUESTION", verified=True, workflow_applied=False, proposal_disposition="no_proposal"

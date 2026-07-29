@@ -1,7 +1,9 @@
+import ast
 import asyncio
 import copy
 import json
 import string
+import textwrap
 from datetime import UTC, datetime
 from typing import Any
 
@@ -13,6 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
     FailedToSendWebhook,
+    ScreenshotTargetClosed,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
@@ -43,8 +46,10 @@ from skyvern.forge.sdk.schemas.task_v2 import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
+    CodeBlock,
     ExtractionBlock,
     ForLoopBlock,
     NavigationBlock,
@@ -67,6 +72,7 @@ from skyvern.schemas.workflows import (
     PARAMETER_YAML_TYPES,
     BlockResult,
     BlockStatus,
+    CodeBlockYAML,
     ContextParameterYAML,
     ExtractionBlockYAML,
     ForLoopBlockYAML,
@@ -77,7 +83,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
@@ -306,6 +312,8 @@ async def initialize_task_v2(
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
+    browser_profile_id: str | None = None,
+    start_fresh_browser: bool = False,
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
@@ -360,6 +368,8 @@ async def initialize_task_v2(
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
+                start_fresh_browser=start_fresh_browser,
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
@@ -542,9 +552,11 @@ async def run_task_v2(
     workflow, workflow_run = None, None
     parent_context = skyvern_context.current()
     current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
-    # Carry trigger_type + use_flex_llm_routing forward from the parent context (set in
-    # scripts/run_task_v2.py at worker boot) so flex routing eligibility persists into the
-    # scoped TaskV2 execution context.
+    # Carry trigger_type, use_flex_llm_routing, and the execution-start transient-UI capture arm
+    # forward from the parent context (set in scripts/run_task_v2.py at worker boot). scoped() takes
+    # a wholesale replacement context, so any field not copied here is dropped for the scope; without
+    # the arm fields the boot resolution would be lost and TaskV2 would re-resolve (or run off) before
+    # its first capture.
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
@@ -557,6 +569,10 @@ async def run_task_v2(
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
         consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
+        preserve_transient_ui_capture=parent_context.preserve_transient_ui_capture if parent_context else None,
+        preserve_transient_ui_capture_resolved=(
+            parent_context.preserve_transient_ui_capture_resolved if parent_context else False
+        ),
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
@@ -774,6 +790,10 @@ async def run_task_v2_helper(
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
     max_iterations = _resolve_max_iterations(max_iterations_override)
 
+    # Only advertise the compute task type to the planner when CodeBlock execution is available
+    # for this org; otherwise the planner would emit compute steps that fail at execution.
+    compute_enabled = await app.AGENT_FUNCTION.has_code_block_access(organization_id)
+
     # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
     # The max_iterations limit applies to this single TaskV2 execution
@@ -880,6 +900,9 @@ async def run_task_v2_helper(
                 )
                 if page is None:
                     page = await browser_state.get_working_page()
+            except ScreenshotTargetClosed:
+                LOG.warning("Skipping task v2 iteration because the browser target closed", iteration=i, url=url)
+                continue
             except Exception:
                 LOG.exception(
                     "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url
@@ -901,6 +924,7 @@ async def run_task_v2_helper(
                 task_history=task_history,
                 open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
+                compute_enabled=compute_enabled,
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -1055,6 +1079,23 @@ async def run_task_v2_helper(
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
                         failure_reason="Failed to generate the loop.",
+                    )
+                    break
+            elif task_type == "compute":
+                try:
+                    block, block_yaml_list, parameter_yaml_list = await _generate_compute_task(
+                        task_v2=task_v2,
+                        workflow_id=workflow_id,
+                        plan=plan,
+                        task_history=task_history,
+                    )
+                    task_history_record = {"type": task_type, "task": plan}
+                except Exception:
+                    LOG.exception("Failed to generate compute task")
+                    task_v2 = await mark_task_v2_as_failed(
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                        failure_reason="Failed to generate the compute task.",
                     )
                     break
             else:
@@ -1757,6 +1798,156 @@ async def _generate_extraction_task(
     )
 
 
+def _strip_code_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+class ComputeTaskError(Exception):
+    """Raised when a compute task cannot be generated (e.g. no gathered data to compute over)."""
+
+
+# Names the compute sandbox exposes (or builtins it must not reach) that data-only synthesis must
+# never touch: the live browser page (SSRF/exfiltration), the OTP secret fetcher, async primitives,
+# the regex engine (ReDoS), and dynamic-exec builtins. is_safe_code does not block these as bare
+# names, so compute validates against this list separately.
+_COMPUTE_FORBIDDEN_NAMES = frozenset({"page", "otp", "asyncio", "sleep", "re", "eval", "exec", "compile"})
+# Attributes that defeat the no-dunder guarantee: str.format/format_map interpret dunders inside the
+# format string at runtime (e.g. "{x.__class__}".format_map(...)), which is_safe_code cannot see.
+_COMPUTE_FORBIDDEN_ATTRS = frozenset({"format", "format_map"})
+
+
+def _build_compute_code(gathered: list[dict], snippet: str) -> str:
+    """Prepend the gathered data as a json.loads literal so it is in scope for the snippet."""
+    # Dedent first: generate_async_user_function re-indents the whole body, so a uniformly-indented
+    # snippet concatenated after the zero-indent injection line would break under the wrapper indent.
+    # Hex-escape brace/percent in the data literal: CodeBlock.execute Jinja-renders the code before
+    # exec, so {{ }} / {% %} in web data would be corrupted or resolve secrets. Python decodes the
+    # escapes back at runtime, but the rendered source contains no Jinja markers.
+    literal = repr(json.dumps(gathered, default=str))
+    literal = literal.replace("{", "\\x7b").replace("}", "\\x7d").replace("%", "\\x25")
+    body = textwrap.dedent(snippet).strip("\n")
+    return f"gathered_data = json.loads({literal})\n{body}\n"
+
+
+def _assert_compute_code_safe(code: str) -> None:
+    """Validate that compute code is data-only, bounded, and ends with the output contract."""
+    # is_safe_code blocks imports/dunders/blocked-attrs but not the browser/async/regex/exec names
+    # the sandbox exposes, not unbounded loops, not the .format dunder escape, and not a guarded or
+    # nested return that falls through to captured locals. Raise InsecureCodeDetected (caught by the
+    # regenerate loop) on violation.
+    # CodeBlock.execute Jinja-renders the whole code string before exec, and CODE blocks resolve
+    # real secrets (is_safe_block_for_secrets=True). The gathered-data literal is hex-escaped in
+    # _build_compute_code, so any opening Jinja tag here is from the LLM snippet body — e.g.
+    # "{{ <param>_real_password }}" would render a live secret into the output. Fail closed.
+    if "{{" in code or "{%" in code or "{#" in code:
+        raise InsecureCodeDetected("compute code may not contain Jinja markers ({{, {%, or {#)")
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor, ast.AsyncWith)):
+            raise InsecureCodeDetected("compute code must be synchronous (no await/async)")
+        if isinstance(node, (ast.While,)):
+            raise InsecureCodeDetected("compute code may not use while loops")
+        if isinstance(node, ast.Name) and node.id in _COMPUTE_FORBIDDEN_NAMES:
+            raise InsecureCodeDetected(f"compute code may not reference '{node.id}'")
+        if isinstance(node, ast.Attribute) and node.attr in _COMPUTE_FORBIDDEN_ATTRS:
+            raise InsecureCodeDetected(f"compute code may not call '.{node.attr}'")
+    # The deliverable must be the unconditional final statement. A guarded (`if x: return {...}`) or
+    # nested return validates but falls through at runtime to the wrapper's captured-locals return,
+    # leaking gathered_data instead of producing the output.
+    last = tree.body[-1] if tree.body else None
+    if not (
+        isinstance(last, ast.Return)
+        and isinstance(last.value, ast.Dict)
+        and any(isinstance(k, ast.Constant) and k.value == "output" for k in last.value.keys)
+    ):
+        raise InsecureCodeDetected('compute code must end with `return {"output": ...}` as the final statement')
+
+
+async def _generate_compute_task(
+    task_v2: TaskV2,
+    workflow_id: str,
+    plan: str,
+    task_history: list[dict] | None = None,
+) -> tuple[CodeBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
+    LOG.info("Generating compute task", plan=plan)
+    context = skyvern_context.ensure_context()
+    gathered = [record for record in (task_history or []) if record.get("extracted_data") is not None]
+    if not gathered:
+        raise ComputeTaskError("compute task generated without any gathered extracted_data in the task history")
+
+    max_attempts = 3
+    safe_code: str | None = None
+    last_error: Exception | None = None
+    prior_attempt: str | None = None
+    safety_error: str | None = None
+    for attempt in range(max_attempts):
+        compute_prompt = prompt_engine.load_prompt(
+            "task_v2_generate_compute_code",
+            user_goal=task_v2.prompt,
+            plan=plan,
+            gathered_data=json.dumps(gathered, indent=2, default=str),
+            local_datetime=datetime.now(context.tz_info).isoformat(),
+            prior_attempt=prior_attempt,
+            safety_error=safety_error,
+        )
+        compute_response = await app.LLM_API_HANDLER(
+            compute_prompt,
+            task_v2=task_v2,
+            prompt_name="task_v2_generate_compute_code",
+            organization_id=task_v2.organization_id,
+            system_prompt=task_v2.workflow_system_prompt,
+        )
+        snippet = _strip_code_fences(str(compute_response.get("code") or ""))
+        if not snippet.strip():
+            last_error = InsecureCodeDetected("compute code generation returned empty code")
+            prior_attempt = ""
+            safety_error = 'You returned no code. Return a non-empty Python snippet ending with return {"output": ...}.'
+            LOG.warning("Compute code generation returned empty code, retrying", attempt=attempt + 1)
+            continue
+        candidate = _build_compute_code(gathered, snippet)
+        try:
+            CodeBlock.is_safe_code(candidate)
+            _assert_compute_code_safe(candidate)
+            safe_code = candidate
+            break
+        except (InsecureCodeDetected, SyntaxError) as e:
+            LOG.warning(
+                "Generated compute code failed safety validation, retrying",
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                error=str(e),
+            )
+            last_error = e
+            prior_attempt = snippet
+            safety_error = str(e)
+
+    if safe_code is None:
+        raise last_error or InsecureCodeDetected("Failed to synthesize safe compute code")
+
+    label = f"compute_{generate_random_string()}"
+    code_block_yaml = CodeBlockYAML(label=label, code=safe_code)
+    output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
+        workflow_id=workflow_id,
+        block_yaml=code_block_yaml,
+    )
+    return (
+        CodeBlock(
+            label=label,
+            code=safe_code,
+            parameters=[],
+            output_parameter=output_parameter,
+        ),
+        [code_block_yaml],
+        [],
+    )
+
+
 async def _generate_navigation_task(
     workflow_id: str,
     workflow_permanent_id: str,
@@ -1988,6 +2179,7 @@ async def mark_task_v2_as_timed_out(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     failure_reason: str | None = None,
+    fallback_workflow_run: WorkflowRun | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
@@ -1995,7 +2187,19 @@ async def mark_task_v2_as_timed_out(
         status=TaskV2Status.timed_out,
     )
     if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+        if fallback_workflow_run is None:
+            # Current callers with a linked run already supply this row. Keep
+            # the lookup for future direct callers so a failed status CAS still
+            # has a safe fallback if the follow-up refresh also fails.
+            fallback_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id,
+                organization_id=organization_id,
+            )
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(
+            workflow_run_id,
+            failure_reason,
+            fallback_workflow_run=fallback_workflow_run,
+        )
 
     # Add task timed out tag to trace
     otel_trace.get_current_span().set_attribute("task.completion_status", "timed_out")
@@ -2027,7 +2231,7 @@ def _get_extracted_data_from_block_result(
 
     Args:
         block_result: The result from block execution
-        task_type: Type of task ("extract", "navigate", or "loop")
+        task_type: Type of task ("extract", "navigate", "loop", or "compute")
         task_v2_id: Optional ID for logging
         workflow_run_id: Optional ID for logging
 
@@ -2083,6 +2287,13 @@ def _get_extracted_data_from_block_result(
                             inner_loop_output_overall.append(output_value["extracted_information"])
                 loop_output_overall.append(inner_loop_output_overall)
             return loop_output_overall if loop_output_overall else None
+    elif task_type == "compute":
+        if (
+            isinstance(block_result.output_parameter_value, dict)
+            and "output" in block_result.output_parameter_value
+            and block_result.output_parameter_value["output"] is not None
+        ):
+            return block_result.output_parameter_value["output"]
     return None
 
 
@@ -2386,14 +2597,36 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        resp = await deliver_webhook_with_retries(
-            url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
-            timeout_seconds=30.0,
-            organization_id=task_v2.organization_id,
-            run_id=task_v2.observer_cruise_id,
-        )
+        try:
+            resp = await deliver_webhook_with_retries(
+                url=task_v2.webhook_callback_url,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=30.0,
+                organization_id=task_v2.organization_id,
+                run_id=task_v2.observer_cruise_id,
+            )
+        except Exception as delivery_error:
+            LOG.warning(
+                "Task v2 webhook delivery failed after attempting delivery",
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                error=describe_delivery_error(delivery_error),
+                exc_info=True,
+            )
+            try:
+                await app.DATABASE.observer.update_task_v2(
+                    task_v2_id=task_v2.observer_cruise_id,
+                    organization_id=task_v2.organization_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record task v2 webhook delivery error",
+                    task_v2_id=task_v2.observer_cruise_id,
+                    exc_info=True,
+                )
+            raise
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",

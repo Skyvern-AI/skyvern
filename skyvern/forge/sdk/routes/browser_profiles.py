@@ -875,7 +875,13 @@ async def _create_profile_from_workflow_run(
         )
         raise WorkflowNotFound(workflow_id=workflow_run.workflow_id)
 
-    if not getattr(workflow, "persist_browser_session", False):
+    # Flag-off orgs keep the legacy immediate 400 when the workflow doesn't persist. Under the engine a
+    # plain picked profile is a living sink even without persist, so archive-presence is the gate — the
+    # poll below decides (it also serves the run's browser_sink_profile_id), not persist_browser_session.
+    if (
+        not await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id)
+        and not workflow.persist_browser_session
+    ):
         LOG.warning(
             "Workflow does not persist browser sessions",
             organization_id=organization_id,

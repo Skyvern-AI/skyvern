@@ -207,6 +207,7 @@ async def test_run_credential_override_persists_for_rotation_parameter() -> None
     repo = _SelectionRepo()
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.workflow_run_credential_selections = repo
         overrides = await service._apply_run_credential_parameter_overrides(
             workflow=workflow,
@@ -251,6 +252,7 @@ async def test_run_credential_override_rejects_conflicting_existing_selection() 
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
         pytest.raises(SkyvernHTTPException, match="conflicts with an existing credential selection"),
     ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.workflow_run_credential_selections = repo
         await service._apply_run_credential_parameter_overrides(
             workflow=workflow,
@@ -521,6 +523,7 @@ async def test_workflow_save_validation_rejects_unknown_credential_id() -> None:
     parameter = _credential_parameter(credential_ids=["cred_missing"])
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
         with pytest.raises(InvalidCredentialId):
             await service._validate_and_normalize_credential_rotation_parameters([parameter], org)
@@ -544,6 +547,7 @@ async def test_workflow_save_validation_normalizes_credential_id_to_first_rotati
     existing = [SimpleNamespace(credential_id="cred_a"), SimpleNamespace(credential_id="cred_b")]
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=existing)
         await service._validate_and_normalize_credential_rotation_parameters([parameter], org)
 
@@ -565,6 +569,7 @@ async def test_workflow_save_validation_dedupes_credential_ids_preserving_order(
     ]
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_get_credentials = AsyncMock(return_value=existing)
         mock_app.DATABASE.credentials.get_credentials_by_ids = mock_get_credentials
         await service._validate_and_normalize_credential_rotation_parameters([parameter], org)
@@ -635,6 +640,7 @@ async def test_resolve_login_block_credential_ids_returns_selected_rotating_id()
     block = SimpleNamespace(parameters=[parameter])
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts = {"wr_test": context}
         credential_ids = await service._resolve_login_block_credential_ids(
             block=block,
@@ -666,7 +672,9 @@ def _setup_workflow_with_rotating_credential(browser_profile_key: str | None = "
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=SimpleNamespace(parameters=[_credential_parameter(credential_ids=["cred_a", "cred_b"])]),
+        workflow_definition=SimpleNamespace(
+            parameters=[_credential_parameter(credential_ids=["cred_a", "cred_b"])], blocks=[]
+        ),
     )
 
 
@@ -675,7 +683,11 @@ def _setup_workflow_run() -> SimpleNamespace:
         workflow_run_id="wr_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        browser_session_id=None,
         browser_profile_id=None,
+        browser_seed_source=None,
+        browser_sink_profile_id=None,
+        retried_from_workflow_run_id=None,
         proxy_location=None,
     )
 
@@ -724,8 +736,10 @@ async def _attempt_setup_rotation_profile_run(
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock),
     ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.is_browser_memory_engine_enabled = AsyncMock(return_value=False)
         mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile = AsyncMock(
             return_value=(
                 SimpleNamespace(browser_profile_id=profile_id, is_managed=True, proxy_session_id=None),

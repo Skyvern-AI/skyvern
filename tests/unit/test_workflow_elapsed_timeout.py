@@ -225,6 +225,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -308,6 +309,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -396,6 +398,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -487,6 +490,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -582,6 +586,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -653,6 +658,7 @@ async def test_shield_post_run_elapsed_timeout_waits_for_status_write_after_canc
     mark_workflow_run_as_timed_out.assert_awaited_once_with(
         workflow_run_id="wr_1",
         failure_reason="timed out",
+        fallback_workflow_run=running_run,
     )
 
 
@@ -691,6 +697,7 @@ async def test_shield_post_run_elapsed_timeout_falls_back_when_handler_fails_aft
     mark_workflow_run_as_timed_out.assert_awaited_once_with(
         workflow_run_id="wr_1",
         failure_reason="timed out",
+        fallback_workflow_run=running_run,
     )
 
 
@@ -759,6 +766,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -786,7 +794,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
+async def test_execute_workflow_refreshes_failed_status_after_finally_write_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     started_at = datetime.now(timezone.utc)
@@ -817,7 +825,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
     )
     database = SimpleNamespace(
         workflow_runs=SimpleNamespace(
-            get_workflow_run=AsyncMock(return_value=failed_run),
+            get_workflow_run=AsyncMock(side_effect=[running_run, failed_run]),
         ),
     )
     timeout_seconds = iter([10.0, 0.01])
@@ -850,6 +858,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -857,7 +866,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
-    monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(failed_run, set())))
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(running_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
     monkeypatch.setattr(svc, "should_run_script", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "_update_workflow_run_status", update_workflow_run_status)
@@ -873,11 +882,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
 
     assert result is failed_run
     mark_workflow_run_as_timed_out.assert_not_awaited()
-    update_workflow_run_status.assert_awaited_once_with(
-        workflow_run_id="wr_1",
-        status=WorkflowRunStatus.running,
-        failure_reason=None,
-    )
+    update_workflow_run_status.assert_not_awaited()
     execute_finally_block_if_configured.assert_awaited_once()
     finalize_workflow_run_status.assert_awaited_once()
     clean_up_workflow.assert_awaited_once()
@@ -933,12 +938,13 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
     svc = WorkflowService()
     mark_workflow_run_as_timed_out = AsyncMock(return_value=timed_out_run)
     update_workflow_run_status = AsyncMock(return_value=running_run)
-    execute_finally_block_if_configured = AsyncMock()
+    execute_finally_block_if_configured = AsyncMock(return_value=None)
     finalize_workflow_run_status = AsyncMock(return_value=timed_out_run)
     clean_up_workflow = AsyncMock()
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -1020,6 +1026,7 @@ async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_te
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
@@ -1079,6 +1086,7 @@ async def test_finalize_completed_noops_when_backstop_already_failed_run(
 
     assert result.status == WorkflowRunStatus.failed
     conditional.assert_awaited_once()
+    assert conditional.await_args is not None
     assert conditional.await_args.kwargs["status"] == WorkflowRunStatus.completed
     cascade.assert_not_awaited()
 
@@ -1177,6 +1185,7 @@ async def test_execute_workflow_skips_interrupted_finalize_for_cancellation(
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running_run))
     monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))

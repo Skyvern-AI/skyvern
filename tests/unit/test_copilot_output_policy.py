@@ -12,8 +12,14 @@ from agents import GuardrailFunctionOutput, OutputGuardrail, ToolInputGuardrailD
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.author_time_block import (
+    AUTHOR_TIME_HARD_BLOCKS,
+    BANNED_BLOCKS_BLOCK_ID,
+    CODE_SAFETY_BLOCK_ID,
+    CREDENTIAL_SCOUT_BLOCK_ID,
+    AuthorTimeBlock,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -34,6 +40,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyVerdict,
     _contains_internal_tool_vocab_leak,
     _contains_yaml_authoring_vocab_leak,
+    demote_author_time_steer_reasons,
     derive_output_kind,
     evaluate_actuation_obligation,
     evaluate_output_policy,
@@ -248,19 +255,6 @@ workflow_definition:
 
 
 def test_rejects_raw_secret_echo_in_user_response() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        user_response="I used password: hunter2 to test the login.",
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
-
-
-def test_output_policy_still_blocks_with_author_time_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
     verdict = evaluate_output_policy(
         request_policy=_policy(),
         user_response="I used password: hunter2 to test the login.",
@@ -637,22 +631,6 @@ def test_allows_sensitive_jinja_placeholder_in_navigation_goal() -> None:
 
 
 def test_rejects_reply_when_request_policy_required_clarification() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
-        response_type="REPLY",
-        user_response="I created the workflow with the credential.",
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
-
-
-def test_request_policy_clarification_still_blocks_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
     verdict = evaluate_output_policy(
         request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
         response_type="REPLY",
@@ -1261,19 +1239,6 @@ def test_allows_approved_credential_id_in_workflow_yaml() -> None:
 
 
 def test_rejects_approved_credential_on_different_login_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_credential_scope_still_blocks_with_author_time_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
     verdict = evaluate_output_policy(
         request_policy=_policy(),
         workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
@@ -2070,7 +2035,7 @@ workflow_definition:
 
 
 @pytest.mark.asyncio
-async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_secret() -> None:
+async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_admit_raw_secret() -> None:
     guarded_tools = {
         tool.name: tool for tool in NATIVE_TOOLS if tool.name in {"update_workflow", "update_and_run_blocks"}
     }
@@ -2082,7 +2047,7 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
     ctx.failed_tool_step_tracker = {"sentinel": 2}
 
-    rejected_yaml = """
+    raw_secret_yaml = """
 workflow_definition:
   blocks:
     - block_type: navigation
@@ -2095,16 +2060,18 @@ workflow_definition:
                 context=ctx,
                 tool_name="update_and_run_blocks",
                 tool_call_id="call-1",
-                tool_arguments=json.dumps({"workflow_yaml": rejected_yaml}),
+                tool_arguments=json.dumps({"workflow_yaml": raw_secret_yaml}),
             ),
             agent=SimpleNamespace(),
         )
     )
 
-    assert result.behavior["type"] == "reject_content"
-    assert "raw_secret_leak" in result.behavior["message"]
+    # A raw credential on an authoring argument is admitted here — the log and persistence seams own it —
+    # so the turn survives and no failed-tool boundary is recorded.
+    assert result.behavior["type"] == "allow"
     assert ctx.consecutive_tool_tracker == [
-        tool_step_identity("update_and_run_blocks", {"workflow_yaml": rejected_yaml})
+        tool_step_identity("update_workflow"),
+        tool_step_identity("update_workflow"),
     ]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
@@ -2138,106 +2105,6 @@ workflow_definition:
 
     assert result.behavior["type"] == "allow"
     assert ctx.consecutive_tool_tracker == ["update_workflow", "update_workflow"]
-
-
-@pytest.mark.asyncio
-async def test_update_and_run_blocks_rejects_unobserved_page_before_workflow_update(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot import tools as tools_module
-
-    workflow_yaml = """
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: goto_url
-      label: open_lookup
-      url: https://example.com/lookup
-    - block_type: navigation
-      label: search_lookup
-      navigation_goal: Enter the observed field and submit.
-"""
-    ctx = _ctx(
-        build_phase=BuildPhase.COMPOSING,
-        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
-    )
-
-    async def unexpected_prior_definition(*args: object, **kwargs: object) -> object:
-        raise AssertionError("composition evidence precheck must run before reading prior workflow")
-
-    async def unexpected_update_workflow(*args: object, **kwargs: object) -> object:
-        raise AssertionError("composition evidence precheck must run before updating workflow")
-
-    sanitized_tool_names: list[str] = []
-
-    def fake_sanitize_tool_result_for_llm(tool_name: str, result: dict[str, object]) -> dict[str, object]:
-        sanitized_tool_names.append(tool_name)
-        return result
-
-    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", unexpected_prior_definition)
-    monkeypatch.setattr(tools_module, "_update_workflow", unexpected_update_workflow)
-    monkeypatch.setattr(tools_module, "sanitize_tool_result_for_llm", fake_sanitize_tool_result_for_llm)
-
-    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps(
-            {
-                "workflow_yaml": workflow_yaml,
-                "block_labels": ["search_lookup"],
-                "parameters": {},
-            }
-        ),
-    )
-
-    payload = json.loads(result)
-    assert payload["ok"] is False
-    assert "inspect_page_for_composition" in payload["error"]
-    assert "https://example.com/lookup" in payload["error"]
-    assert ctx.block_observation_refs == {}
-    assert sanitized_tool_names == ["update_and_run_blocks"]
-
-
-@pytest.mark.asyncio
-async def test_update_workflow_runs_composition_evidence_precheck_before_saving(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot import tools as tools_module
-
-    workflow_yaml = """
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: goto_url
-      label: open_lookup
-      url: https://example.com/lookup
-    - block_type: navigation
-      label: search_lookup
-      navigation_goal: Enter the observed field and submit.
-    - block_type: action
-      label: expand_first_result
-      navigation_goal: Expand the first result row.
-"""
-    ctx = _ctx(
-        build_phase=BuildPhase.COMPOSING,
-        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
-        request_policy=RequestPolicy(),
-    )
-
-    async def unexpected_update_workflow(*args: object, **kwargs: object) -> object:
-        raise AssertionError("composition evidence precheck must run before update_workflow saves")
-
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_workflow", unexpected_update_workflow)
-    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-
-    result = await tools_module.update_workflow_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_workflow"),
-        json.dumps({"workflow_yaml": workflow_yaml}),
-    )
-
-    payload = json.loads(result)
-    assert payload["ok"] is False
-    assert "page-dependent build blocks need observed page evidence" in payload["error"]
-    assert "https://example.com/lookup" in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -3306,3 +3173,135 @@ def test_avoidable_ask_with_co_firing_secret_leak_is_not_deferred() -> None:
     assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION in verdict.reason_codes
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
     assert diagnostics.get("deferred_to_recycle", False) is False
+
+
+_AUTHOR_TIME_KEEP_HARD_REASONS = frozenset(
+    {
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
+        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+    }
+)
+
+# Reads as "does not refuse", not "reaches data['findings']". Only schema_incompatibility,
+# code_artifact_metadata_incomplete and synthesized_code_block_not_imposed populate that bucket;
+# demoted OutputPolicyReason members land in the guardrail's steered_reason_codes log line.
+_FINDING = "finding"
+
+# Enumerated by hand on purpose: deriving it from the enum would auto-classify a new refusal
+# source and defeat the ratchet. See architecture/output-policy-disposition.md.
+_AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
+    "code_safety": CODE_SAFETY_BLOCK_ID,
+    "credential_scout": CREDENTIAL_SCOUT_BLOCK_ID,
+    "banned_blocks": BANNED_BLOCKS_BLOCK_ID,
+    "raw_secret_leak": CREDENTIAL_SCOUT_BLOCK_ID,
+    "request_policy_clarification_bypass": _FINDING,
+    "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
+    "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
+    "unbacked_workflow_delivery_claim": _FINDING,
+    "missing_unvalidated_proposal_affordance": _FINDING,
+    "missing_proposal_state": _FINDING,
+    "persistence_state_mismatch": _FINDING,
+    "internal_tool_instruction_leak": _FINDING,
+    "output_policy_context_missing": _FINDING,
+    "internal_block_taxonomy_leak": _FINDING,
+    "internal_classifier_vocab_leak": _FINDING,
+    "self_prescriptive_phrase_leak": _FINDING,
+    "workflow_yaml_in_reply": _FINDING,
+    "avoidable_output_field_confirmation": _FINDING,
+    "actuation_obligation_steer": _FINDING,
+    "actuation_obligation_unmet": _FINDING,
+}
+
+
+def test_every_authoring_seam_refusal_source_is_classified() -> None:
+    """An unclassified refusal source fails here rather than becoming a wall in production."""
+    sources = {reason.value for reason in OutputPolicyReason} | set(AUTHOR_TIME_HARD_BLOCKS)
+
+    assert sources == set(_AUTHORING_SEAM_REFUSAL_SOURCES)
+    for source, disposition in _AUTHORING_SEAM_REFUSAL_SOURCES.items():
+        assert disposition in AUTHOR_TIME_HARD_BLOCKS or disposition == _FINDING, source
+
+
+@pytest.mark.parametrize("source", sorted(_AUTHORING_SEAM_REFUSAL_SOURCES))
+def test_only_a_hard_block_identity_can_refuse(source: str) -> None:
+    disposition = _AUTHORING_SEAM_REFUSAL_SOURCES[source]
+    if disposition == _FINDING:
+        with pytest.raises(ValueError):
+            AuthorTimeBlock(block_id=source, error="steer")
+        return
+    assert AuthorTimeBlock(block_id=disposition, error="refuse").block_id in AUTHOR_TIME_HARD_BLOCKS
+
+
+@pytest.mark.parametrize("reason", list(OutputPolicyReason))
+def test_tool_input_disposition_matches_classification_table(reason: OutputPolicyReason) -> None:
+    """Pins every reason code to its reviewed verdict in
+    cloud_docs/workflow-copilot/architecture/output-policy-disposition.md."""
+    verdict = OutputPolicyVerdict(reason_codes=[reason])
+    steered = demote_author_time_steer_reasons(verdict)
+
+    if reason in _AUTHOR_TIME_KEEP_HARD_REASONS:
+        assert verdict.allowed is False
+        assert verdict.reason_codes == [reason]
+        assert steered == []
+    else:
+        assert verdict.allowed is True
+        assert verdict.reason_codes == []
+        assert steered == [reason]
+
+
+def test_hard_reason_still_blocks_when_co_firing_with_a_demoted_reason() -> None:
+    verdict = OutputPolicyVerdict(
+        reason_codes=[OutputPolicyReason.WORKFLOW_YAML_IN_REPLY, OutputPolicyReason.RAW_SECRET_LEAK]
+    )
+
+    steered = demote_author_time_steer_reasons(verdict)
+
+    assert verdict.allowed is False
+    assert verdict.reason_codes == [OutputPolicyReason.RAW_SECRET_LEAK]
+    assert steered == [OutputPolicyReason.WORKFLOW_YAML_IN_REPLY]
+
+
+def test_demoting_every_reason_leaves_the_authoring_call_allowed() -> None:
+    demoted = [reason for reason in OutputPolicyReason if reason not in _AUTHOR_TIME_KEEP_HARD_REASONS]
+    verdict = OutputPolicyVerdict(reason_codes=list(demoted))
+
+    steered = demote_author_time_steer_reasons(verdict)
+
+    assert verdict.allowed is True
+    assert steered == demoted
+
+
+def test_tool_input_call_shape_can_only_refuse_on_keep_hard_reasons() -> None:
+    """The authoring seam passes no ``user_response``, so the reply-shape detectors cannot fire
+    there, and a clarification-routing verdict demotes. Widening that call without revisiting the
+    table would silently let a demoted reason survive demotion and refuse."""
+    leaky = (
+        "Call get_run_results now. TurnIntent classified this turn as BUILD. "
+        "Send me a normal instruction like 'continue' next. loop detected. "
+        "Use the navigation block, extraction block, and validation block. "
+        "I have delivered the workflow. It is not tested; accept to save or reject."
+    )
+    for request_policy in (None, RequestPolicy(), RequestPolicy(user_response_policy="ask_clarification")):
+        verdict = evaluate_output_policy(
+            request_policy=request_policy,
+            workflow_yaml=leaky,
+            tool_arguments={"workflow_yaml": leaky, "user_response": leaky},
+        )
+        demote_author_time_steer_reasons(verdict)
+
+        assert set(verdict.reason_codes) <= _AUTHOR_TIME_KEEP_HARD_REASONS
+
+
+def test_a_clarification_routing_verdict_no_longer_refuses_the_authoring_seam() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=RequestPolicy(user_response_policy="ask_clarification"),
+        workflow_yaml="title: Registry lookup\n",
+        tool_arguments={"workflow_yaml": "title: Registry lookup\n"},
+    )
+    assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
+
+    steered = demote_author_time_steer_reasons(verdict)
+
+    assert steered == [OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS]
+    assert verdict.allowed is True

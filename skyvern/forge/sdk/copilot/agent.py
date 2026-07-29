@@ -11,6 +11,7 @@ import binascii
 import contextlib
 import json
 import math
+import os
 import re
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -50,7 +51,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase, anchor_recovers_entrypoint, initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import (
+    BuildPhase,
+    anchor_recovers_entrypoint,
+    extract_in_turn_entry_url,
+    initial_build_phase,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -101,6 +107,7 @@ from skyvern.forge.sdk.copilot.context import (
     finalize_discovery_counter_in_global_llm_context,
     parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
+    record_signin_email_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
@@ -149,6 +156,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyVerdict,
     actuation_obligation_key,
     build_output_policy_diagnostics,
+    demote_author_time_steer_reasons,
     derive_output_kind,
     evaluate_actuation_obligation,
     evaluate_output_policy,
@@ -183,10 +191,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
     _browser_context_is_attachable,
-    cache_copilot_author_time_gate_log_only_ids,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import SECRET_KEYWORD_ASSIGNMENT_PATTERN
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
@@ -232,7 +239,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
-from skyvern.forge.sdk.trace import apply_context_attrs
+from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -298,7 +305,7 @@ def _copilot_turn_span(
     turn_id: str | None = None,
 ) -> Iterator[Any]:
     tracer = otel_trace.get_tracer("skyvern")
-    with tracer.start_as_current_span(_COPILOT_TURN_SPAN_NAME) as span:
+    with traced_span(tracer, _COPILOT_TURN_SPAN_NAME) as span:
         span.set_attribute("skyvern.span.role", "wrapper")
         span.set_attribute("copilot.turn_index", _derive_turn_index(chat_history, turn_index))
         if turn_id is not None:
@@ -604,6 +611,11 @@ def _turn_context_log_fields(packet: TurnContextPacket | None) -> dict[str, Any]
 
 def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, str]:
     return {key: str(value) for key, value in _turn_context_log_fields(packet).items()}
+
+
+def _transcript_anchor_disabled() -> bool:
+    """Test-isolation knob: COPILOT_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
+    return os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
@@ -1237,7 +1249,10 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "workflow and skip the browser run with a credential setup message. "
             + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run blocks, "
             + "and tell the user to store the redacted secret as a saved credential before testing. "
-            + "If `resolved_credentials` are present, use those `credential_id` values."
+            + "If `resolved_credentials` are present, use those `credential_id` values. "
+            + "If `resolved_signin_email` is present, that address signs in: bind it to the workflow as a "
+            + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
+            + "under a different address, and do not ask for a saved password credential for that login."
         )
         return (
             prompt
@@ -1879,8 +1894,11 @@ def _make_agent_result(
     normal translate-result, missing-SDK fallback, unexpected-error fallback).
     """
     final_context = (
-        record_approved_credentials_in_global_llm_context(
-            ctx, finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+        record_signin_email_in_global_llm_context(
+            ctx,
+            record_approved_credentials_in_global_llm_context(
+                ctx, finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+            ),
         )
         if ctx is not None
         else global_llm_context
@@ -1951,8 +1969,6 @@ def _make_agent_result(
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None and result.turn_outcome is not None:
         result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
-    if ctx is not None and not result.apply_without_review:
-        result.apply_without_review = _should_apply_code_only_success_without_review(ctx, result.proposal_disposition)
     if ctx is not None and result.completion_criteria_turn_state is None:
         result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     if ctx is not None and result.code_artifact_metadata is None:
@@ -1965,19 +1981,6 @@ def _make_agent_result(
         elif isinstance(ctx_metadata, dict) and ctx_metadata:
             result.code_artifact_metadata = ctx_metadata
     return result
-
-
-def _should_apply_code_only_success_without_review(ctx: CopilotContext, disposition: object) -> bool:
-    return (
-        disposition == "auto_applicable"
-        and verified_goal_claim_authorized(ctx)
-        and ctx.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-        and ctx.last_test_ok is True
-        and ctx.last_full_workflow_test_ok is True
-        and not ctx.last_test_suspicious_success
-        and ctx.has_staged_proposal
-        and ctx.staged_workflow is not None
-    )
 
 
 def _build_outcome_adjudication_payload(ctx: CopilotContext) -> NarrativeOutcomeAdjudication | None:
@@ -2315,7 +2318,7 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
     )
 
 
-_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED})
 _SCOUTED_SPINE_MISSING_STEPS_PREFIX = "This draft is still missing steps you demonstrated:"
 
 
@@ -3893,8 +3896,8 @@ def _inline_replace_workflow_credential_verdict(
     ctx: CopilotContext, action_data: dict[str, Any], resp_type: str, user_response: str
 ) -> tuple[str, OutputPolicyVerdict, OutputPolicyVerdict]:
     """Rebind scouted credential literals into ``action_data['workflow_yaml']`` and evaluate the inline
-    REPLACE_WORKFLOW output policy, recording churn when the hard-block verdict rejects. Returns the
-    effective YAML plus the raw and hard-block verdicts."""
+    REPLACE_WORKFLOW output policy, recording churn when the author-time verdict rejects. Returns the
+    effective YAML plus the raw and author-time verdicts."""
     workflow_yaml = action_data.get("workflow_yaml", "")
     inline_rebind = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
     if inline_rebind.changed:
@@ -3921,18 +3924,31 @@ def _inline_replace_workflow_credential_verdict(
         has_workflow_proposal=True,
         output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
     )
-    hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
-    if inline_rebind.residual_selectors and hard_block_verdict.allowed:
+    # This surface persists a draft, so it is graded like the update_workflow tool body rather than
+    # like a final reply: only what a later test-run cannot undo refuses here, and every other reason
+    # steers the next authoring attempt.
+    author_time_verdict = OutputPolicyVerdict(
+        allowed=raw_verdict.allowed,
+        output_kind=raw_verdict.output_kind,
+        reason_codes=list(raw_verdict.reason_codes),
+    )
+    steered_reasons = demote_author_time_steer_reasons(author_time_verdict)
+    if steered_reasons:
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW output policy reasons demoted to steering",
+            steered_reason_codes=[reason.value for reason in steered_reasons],
+        )
+    if inline_rebind.residual_selectors and author_time_verdict.allowed:
         # This path bypasses the update_workflow guardrail, and the output-policy scan does not catch a bare
         # `page.fill(sel, ...)`, so an inline secret the rebind could not neutralize would slip through here.
         LOG.info(
             "copilot inline REPLACE_WORKFLOW credential residual raw fill fail-closed",
             residual_raw_credential_fill_selectors=list(inline_rebind.residual_selectors),
         )
-        hard_block_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
-    if not hard_block_verdict.allowed:
-        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, hard_block_verdict)
-    return workflow_yaml, raw_verdict, hard_block_verdict
+        author_time_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
+    if not author_time_verdict.allowed:
+        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, author_time_verdict)
+    return workflow_yaml, raw_verdict, author_time_verdict
 
 
 async def _translate_to_agent_result(
@@ -4041,23 +4057,24 @@ async def _translate_to_agent_result(
             # The final-output policy pass still runs below; leave last_workflow
             # / last_workflow_yaml unchanged until this candidate survives the
             # inline checks.
+            from skyvern.forge.sdk.copilot.author_time_block import (
+                BANNED_BLOCKS_BLOCK_ID,
+                CODE_SAFETY_BLOCK_ID,
+                AuthorTimeBlock,
+            )
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
+                _code_block_safety_errors,
                 _detect_new_banned_blocks,
                 _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
                 _stale_block_metadata_message,
-                _timing_only_challenge_wait_reject_message,
                 composition_page_evidence_error,
                 workflow_target_url,
             )
             from skyvern.forge.sdk.copilot.tools.banned_blocks import _copilot_banned_block_types
+            from skyvern.forge.sdk.copilot.tools.workflow_update import _human_facing_code_safety_errors
 
-            wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
-            if wait_block_error:
-                user_response = _with_inline_reject_note(user_response, wait_block_error)
-                ctx.last_test_ok = None
-                workflow_yaml = ""
             banned_items = _detect_new_banned_blocks(
                 workflow_yaml,
                 ctx.last_workflow_yaml,
@@ -4065,23 +4082,43 @@ async def _translate_to_agent_result(
             )
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
-                user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items, ctx))
+                inline_banned_blocks_block = AuthorTimeBlock(
+                    block_id=BANNED_BLOCKS_BLOCK_ID,
+                    error=_banned_block_reject_message(banned_items, ctx),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_banned_blocks_block.error)
                 workflow_yaml = ""
+            # This surface persists a draft without the update_workflow tool, so it needs the same
+            # code-safety block: unsafe in-page code on a page holding a filled credential is the
+            # one thing a later test-run cannot undo. Constructed as an AuthorTimeBlock rather than
+            # discarded on a bare error string, so this refusal is bound by the same three-identity
+            # check as the tool seam and a new inline gate cannot join it silently.
+            inline_code_safety_errors = _human_facing_code_safety_errors(
+                _code_block_safety_errors(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
+            )
+            if inline_code_safety_errors:
+                inline_code_safety_block = AuthorTimeBlock(
+                    block_id=CODE_SAFETY_BLOCK_ID,
+                    error="\n".join(str(error) for error in inline_code_safety_errors),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_code_safety_block.error)
+                workflow_yaml = ""
+            # Stale metadata and missing page evidence are both authoring quality, not disclosure: a
+            # later test-run is what settles whether the draft works. They surface as a finding and
+            # clear the test credit, so the draft survives but cannot be reported as verified.
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
                 user_response = _with_inline_reject_note(user_response, _stale_block_metadata_message(stale_metadata))
                 ctx.last_test_ok = None
-                workflow_yaml = ""
             composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
             if composition_evidence_error:
                 LOG.info(
-                    "copilot inline composition page evidence rejected workflow",
+                    "copilot inline composition page evidence finding",
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     target_url=workflow_target_url(workflow_yaml),
                 )
                 user_response = _with_inline_reject_note(user_response, composition_evidence_error)
                 ctx.last_test_ok = None
-                workflow_yaml = ""
         if workflow_yaml:
             # Inline REPLACE_WORKFLOW bypasses the update_workflow tool, so apply the same default here.
             workflow_yaml = default_data_write_continue_on_failure(
@@ -4094,6 +4131,7 @@ async def _translate_to_agent_result(
                     organization_id=organization_id,
                     workflow_yaml=workflow_yaml,
                     settings_fallback_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml,
+                    credential_scrub_values=registered_scrub_values(ctx),
                 )
                 last_workflow_yaml = workflow_yaml
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
@@ -5229,29 +5267,6 @@ def _reconcile_turn_end_ownership(
         return result
 
 
-async def _cache_copilot_author_time_gate_log_only_ids(ctx: CopilotContext) -> None:
-    try:
-        resolved_ids = await app.AGENT_FUNCTION.resolve_copilot_author_time_gate_log_only_ids(
-            turn_id=ctx.turn_id,
-            organization_id=ctx.organization_id,
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to resolve Copilot author-time gate log-only registry",
-            turn_id=ctx.turn_id,
-            organization_id=ctx.organization_id,
-            exc_info=True,
-        )
-        resolved_ids = frozenset()
-    cache_copilot_author_time_gate_log_only_ids(ctx, resolved_ids)
-    selected_gate_ids = sorted(ctx.author_time_gate_log_only_ids)
-    LOG.info(
-        "copilot_author_time_gate_log_only_registry_resolved",
-        selected_gate_ids=selected_gate_ids,
-        selected_gate_count=len(selected_gate_ids),
-    )
-
-
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -5317,7 +5332,7 @@ async def run_copilot_agent(
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     exc_info=True,
                 )
-                turn_span.record_exception(exc)
+                record_span_exception(turn_span, exc, set_error_status=False)
                 ctx = CopilotContext(
                     organization_id=organization_id,
                     workflow_id=chat_request.workflow_id,
@@ -5469,7 +5484,6 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
-    await _cache_copilot_author_time_gate_log_only_ids(ctx)
     if ctx_sink is not None:
         ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(
@@ -5557,13 +5571,26 @@ async def _run_copilot_turn_impl(
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
     ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
-    transcript_anchor = _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
+    persisted_entrypoint_url = prior_structured_context.entrypoint_url
+    # Blanking the anchor disables both its consumers below; the env knob exists so an
+    # E2E can prove the persisted slot alone carries recovery. Never set in production.
+    transcript_anchor = (
+        ""
+        if persisted_entrypoint_url or _transcript_anchor_disabled()
+        else _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
+    )
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
         agent_user_message or "",
         chat_request.workflow_yaml or "",
         transcript_anchor,
+        persisted_entrypoint_url=persisted_entrypoint_url,
+    )
+    in_turn_entrypoint = extract_in_turn_entry_url(
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
     )
     anchor_entrypoint = anchor_recovers_entrypoint(
         ctx.turn_intent,
@@ -5572,8 +5599,10 @@ async def _run_copilot_turn_impl(
         chat_request.workflow_yaml or "",
         transcript_anchor,
     )
-    if anchor_entrypoint is not None and ctx.resolved_discovery_entrypoint_url is None:
-        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint
+    if in_turn_entrypoint is not None:
+        ctx.resolved_discovery_entrypoint_url = in_turn_entrypoint
+    elif ctx.resolved_discovery_entrypoint_url is None:
+        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint or persisted_entrypoint_url
     LOG.info(
         "copilot.build_phase_initial",
         build_phase=ctx.build_phase.value,

@@ -7,12 +7,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import (
     CredentialCheck,
     StructuredContext,
+    adopt_model_authored_context,
     record_approved_credentials_in_global_llm_context,
+    record_signin_email_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason
 from skyvern.forge.sdk.copilot.request_policy import (
     _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
     _LOGIN_CREDENTIAL_QUESTION,
@@ -24,7 +26,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _can_defer_unresolved_credential_name_for_draft,
     _classification_from_raw,
+    _clean_email_list,
     _resolve_credentials,
+    _saved_credential_names_mentioned,
     _should_defer_repeated_unresolved_credential_question,
     _workflow_credential_inputs_unbound,
     build_request_policy,
@@ -442,28 +446,6 @@ def test_credential_prompt_reason_policy_none_is_safe() -> None:
     assert credential_prompt_reason(None, "Everything is set, no action needed.") is None
 
 
-@pytest.mark.asyncio
-async def test_request_policy_resolver_still_blocks_raw_secret_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
-    policy = await build_request_policy(
-        user_message="Use password: Hunter99! to sign in.",
-        workflow_yaml="",
-        chat_history=[],
-        global_llm_context="",
-        organization_id="o_test",
-        handler=None,
-    )
-
-    assert policy.raw_secret_detected is True
-    assert policy.user_response_policy == "ask_clarification"
-    assert policy.allow_update_workflow is False
-    assert policy.allow_run_blocks is False
-
-
 def _cred(
     name: str,
     credential_id: str,
@@ -484,9 +466,12 @@ async def _build_with_forced_classifier(
     get_credentials_by_ids: AsyncMock | None = None,
     workflow_yaml: str = "",
     global_llm_context: str = "",
+    connected_gmail: str | None = None,
+    gmail_lookup: AsyncMock | None = None,
 ) -> RequestPolicy:
     load_mock = get_credentials or AsyncMock(return_value=org_credentials)
     by_ids_mock = get_credentials_by_ids or AsyncMock(return_value=[])
+    gmail_mock = gmail_lookup or AsyncMock(return_value=connected_gmail)
     with (
         patch(
             "skyvern.forge.sdk.copilot.request_policy._classify_request",
@@ -494,6 +479,7 @@ async def _build_with_forced_classifier(
         ),
         patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock),
         patch("skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids", new=by_ids_mock),
+        patch("skyvern.forge.sdk.copilot.request_policy.connected_gmail_address", new=gmail_mock),
     ):
         return await build_request_policy(
             user_message=user_message,
@@ -2345,3 +2331,381 @@ async def test_carried_credential_satisfies_the_login_reachability_ask() -> None
 
     assert turn_two.clarification_reason != "login_credentials_unresolved"
     assert "cred_portal" in {c.credential_id for c in turn_two.resolved_credentials}
+
+
+def _email_signin_policy(**overrides: object) -> RequestPolicy:
+    defaults: dict[str, object] = {
+        "login_intent": True,
+        "email_signin_intent": True,
+        "credential_input_kind": "none",
+        "login_page_urls": ["https://console.example.com/signin"],
+        "classifier_status": "success",
+    }
+    defaults.update(overrides)
+    return RequestPolicy(**defaults)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_an_address_named_in_the_request_outranks_the_connected_gmail_account() -> None:
+    """Naming an address is an explicit instruction; a connected inbox is only the default
+    for when none was named, and must not quietly substitute a different identity."""
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin with typed@example.com and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=["typed@example.com"]),
+        org_credentials=[],
+        connected_gmail="connected@example.com",
+    )
+
+    assert policy.resolved_signin_email == "typed@example.com"
+    assert policy.clarification_reason == "none"
+    assert policy.user_response_policy == "proceed"
+
+
+@pytest.mark.asyncio
+async def test_the_connected_account_is_not_even_looked_up_when_the_request_named_one() -> None:
+    lookup = AsyncMock(return_value="connected@example.com")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin with typed@example.com and extract it.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=["typed@example.com"]),
+        org_credentials=[],
+        gmail_lookup=lookup,
+    )
+
+    assert policy.resolved_signin_email == "typed@example.com"
+    assert lookup.await_count == 0, "named address should short-circuit the Gmail network call"
+
+
+@pytest.mark.asyncio
+async def test_the_connected_gmail_account_is_used_when_the_request_named_no_address() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin by email and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=[]),
+        org_credentials=[],
+        connected_gmail="connected@example.com",
+    )
+
+    assert policy.resolved_signin_email == "connected@example.com"
+    assert policy.clarification_reason == "none"
+
+
+@pytest.mark.asyncio
+async def test_address_from_the_request_is_used_when_no_gmail_is_connected() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin with typed@example.com and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=["typed@example.com"]),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.resolved_signin_email == "typed@example.com"
+    assert policy.clarification_reason == "none"
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_neither_source_asks_for_an_address_and_never_for_a_saved_credential() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=[]),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.resolved_signin_email is None
+    assert policy.clarification_reason == "signin_email_unresolved"
+    assert policy.clarification_question == "Which email address should I sign in with?"
+    assert "cred_" not in (policy.clarification_question or "")
+    assert policy.clarification_reason not in CREDENTIAL_PROMPT_CLARIFICATION_REASONS
+
+
+@pytest.mark.asyncio
+async def test_email_signin_with_no_org_credentials_never_draws_the_login_credential_ask() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin with typed@example.com and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=["typed@example.com"]),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert not policy.requires_user_clarification
+
+
+@pytest.mark.asyncio
+async def test_a_password_login_with_no_credential_still_blocks_exactly_as_before() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log in to https://portal.example.com/login and download this month's invoices.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            email_signin_intent=False,
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[],
+        connected_gmail="connected@example.com",
+    )
+
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert "cred_" in (policy.clarification_question or "")
+    assert policy.resolved_signin_email is None
+
+
+@pytest.mark.asyncio
+async def test_email_signin_does_not_reach_the_interactive_credential_card() -> None:
+    # Sibling path: the card and the terminal ask both hang off login_credentials_unresolved,
+    # so a fix that only silenced the terminal text would still demand a credential here.
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin with typed@example.com and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=["typed@example.com"]),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
+
+
+@pytest.mark.asyncio
+async def test_skip_test_email_signin_defers_without_asking_for_an_address() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Draft a workflow that signs in to https://console.example.com/signin. Don't run it.",
+        classifier_policy=_email_signin_policy(testing_intent="skip_test", signin_email_candidates=[]),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.clarification_reason != "signin_email_unresolved"
+    assert policy.resolved_signin_email is None
+
+
+@pytest.mark.asyncio
+async def test_a_named_saved_credential_keeps_password_resolution_even_with_email_intent() -> None:
+    """Referenced credential material outranks email intent, so a misread flag cannot
+    silently drop the credential requirement from a real password login."""
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://portal.example.com/login using my saved credential portal-login.",
+        classifier_policy=_email_signin_policy(
+            email_signin_intent=True,
+            credential_input_kind="credential_name",
+            credential_refs=["portal-login"],
+            login_page_urls=["https://portal.example.com/login"],
+        ),
+        org_credentials=[],
+        connected_gmail="connected@example.com",
+    )
+
+    assert policy.resolved_signin_email is None
+    assert policy.clarification_reason != "signin_email_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_first_touch_email_signin_with_no_site_yet_asks_nothing_about_an_address() -> None:
+    """No site, workflow, or URL yet: the address is not the question the user still owes."""
+    policy = await _build_with_forced_classifier(
+        user_message="I want to sign in with my email address.",
+        classifier_policy=_email_signin_policy(login_page_urls=[], signin_email_candidates=[]),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.clarification_reason != "signin_email_unresolved"
+    assert policy.resolved_signin_email is None
+
+
+@pytest.mark.asyncio
+async def test_the_email_signin_flag_is_the_only_thing_that_lifts_the_credential_ask() -> None:
+    """The discriminator itself: identical policy but email_signin_intent=False must still
+    block. Without this, the pass-path could be reached by any credential-less login."""
+    policy = await _build_with_forced_classifier(
+        user_message="Log in to https://console.example.com/signin as someone@example.com and extract the balance.",
+        classifier_policy=_email_signin_policy(email_signin_intent=False),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.resolved_signin_email is None
+
+
+@pytest.mark.asyncio
+async def test_email_signin_never_overwrites_a_clarification_the_user_already_owes() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Put the invoice blocks in a loop and sign in with my email.",
+        classifier_policy=_email_signin_policy(
+            signin_email_candidates=[],
+            clarification_reason="ambiguous_loop_edit",
+            requires_user_clarification=True,
+        ),
+        org_credentials=[],
+        connected_gmail=None,
+    )
+
+    assert policy.clarification_reason == "ambiguous_loop_edit"
+    assert policy.clarification_reason != "signin_email_unresolved"
+
+
+def test_classifier_supplied_addresses_are_shape_checked_before_use() -> None:
+    assert _clean_email_list(["  ok@example.com  "]) == ["ok@example.com"]
+    assert _clean_email_list(["ok@example.com", "ok@example.com"]) == ["ok@example.com"]
+    # A workflow parameter default is built from this value, so template and markup
+    # syntax must not survive the boundary.
+    assert _clean_email_list(["{{evil}}@example.com"]) == []
+    assert _clean_email_list(["<img src=x>@example.com"]) == []
+    assert _clean_email_list([f"{'a' * 300}@example.com"]) == []
+    assert _clean_email_list(["not an email", "", "@nope.com", None, 123]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_matching_org_credential_does_not_pull_a_passwordless_turn_into_a_credential_ask() -> None:
+    """A stored credential for the same host must not reroute the turn into the URL
+    credential tier, which asks for a saved credential under a different reason."""
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin with typed@example.com and extract it.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=["typed@example.com"]),
+        org_credentials=[
+            _cred("console-one", "cred_one", tested_url="https://console.example.com/signin"),
+            _cred("console-two", "cred_two", tested_url="https://console.example.com/signin"),
+        ],
+        connected_gmail=None,
+    )
+
+    assert policy.clarification_reason == "none"
+    assert policy.clarification_question is None
+    assert policy.resolved_signin_email == "typed@example.com"
+    assert not policy.resolved_credentials
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_turn_keeps_the_sign_in_identity_the_earlier_turn_resolved() -> None:
+    """The classifier reads a terse follow-up as an ordinary login, so without a carry the
+    original bug returns one turn later."""
+    carried = record_signin_email_in_global_llm_context(
+        SimpleNamespace(
+            request_policy=RequestPolicy(
+                resolved_signin_email="typed@example.com",
+                resolved_signin_host="https://console.example.com",
+            )
+        ),
+        None,
+    )
+
+    policy = await _build_with_forced_classifier(
+        user_message="also download the invoices from https://console.example.com/invoices",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            email_signin_intent=False,
+            credential_input_kind="none",
+            classifier_status="success",
+        ),
+        org_credentials=[],
+        connected_gmail=None,
+        global_llm_context=carried or "",
+    )
+
+    assert policy.clarification_reason != "login_credentials_unresolved"
+    assert policy.resolved_signin_email == "typed@example.com"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resolution_asks_for_the_address_rather_than_building_without_one() -> None:
+    """The credential requirement is already lifted for this shape, so a silent fall-through
+    would author a login with no identity and no question asked."""
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in to https://console.example.com/signin by email and extract the balance.",
+        classifier_policy=_email_signin_policy(signin_email_candidates=[]),
+        org_credentials=[],
+        gmail_lookup=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    assert policy.clarification_reason == "signin_email_unresolved"
+    assert policy.resolved_signin_email is None
+
+
+@pytest.mark.asyncio
+async def test_a_carried_identity_does_not_follow_the_user_to_a_different_site() -> None:
+    """Reusing it anywhere else would suppress the password ask on a site that never
+    established it was passwordless."""
+    carried = record_signin_email_in_global_llm_context(
+        SimpleNamespace(
+            request_policy=RequestPolicy(
+                resolved_signin_email="typed@example.com",
+                resolved_signin_host="https://console.example.com",
+            )
+        ),
+        None,
+    )
+
+    policy = await _build_with_forced_classifier(
+        user_message="Log in to https://portal.example.com/login and download this month's invoices.",
+        classifier_policy=RequestPolicy(
+            login_intent=True,
+            email_signin_intent=False,
+            credential_input_kind="none",
+            classifier_status="success",
+        ),
+        org_credentials=[],
+        connected_gmail=None,
+        global_llm_context=carried or "",
+    )
+
+    assert policy.clarification_reason == "login_credentials_unresolved"
+    assert policy.resolved_signin_email is None
+
+
+def test_a_model_authored_signin_identity_is_discarded_in_favour_of_the_trusted_one() -> None:
+    """The model can author the context blob; a signin_email it invents would mark the next
+    turn passwordless and suppress the password ask for a site that needs one."""
+    trusted = record_signin_email_in_global_llm_context(
+        SimpleNamespace(
+            request_policy=RequestPolicy(
+                resolved_signin_email="trusted@example.com",
+                resolved_signin_host="https://console.example.com",
+            )
+        ),
+        None,
+    )
+
+    adopted = adopt_model_authored_context(
+        trusted,
+        {"signin_email": "attacker@example.com", "signin_email_host": "https://portal.example.com"},
+    )
+
+    assert adopted.signin_email == "trusted@example.com"
+    assert adopted.signin_email_host == "https://console.example.com"
+
+
+def test_a_model_authored_identity_cannot_appear_where_the_server_resolved_none() -> None:
+    adopted = adopt_model_authored_context(
+        None,
+        {"signin_email": "attacker@example.com", "signin_email_host": "https://portal.example.com"},
+    )
+
+    assert adopted.signin_email == ""
+    assert adopted.signin_email_host == ""
+
+
+def test_a_named_credential_resolves_without_the_word_credential() -> None:
+    """ "use skyvern-datadog to login" names the credential outright. The pattern-based candidates
+    only fire when the message also says "credential", which left this resolving nothing."""
+    credentials = [SimpleNamespace(name="skyvern-datadog"), SimpleNamespace(name="skyvern-posthog")]
+
+    assert _saved_credential_names_mentioned("use skyvern-datadog to login.", credentials) == ["skyvern-datadog"]
+
+
+@pytest.mark.asyncio
+async def test_a_named_credential_resolves_when_the_classifier_misses_login_intent() -> None:
+    """`login_intent` is a model-authored hint that varies run to run. Gating the saved-name scan on
+    it alone let the classifier veto a message that says "log in" outright — the very case this
+    resolves. The deterministic login phrasing must reach the scan on its own."""
+    named = SimpleNamespace(credential_id="cred_datadog", name="skyvern-datadog", credential_type="password")
+    policy = RequestPolicy(credential_input_kind="skyvern_stored_credential", login_intent=False)
+
+    await _resolve_direct(policy, user_message="use skyvern-datadog to login.", org_credentials=[named])
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_datadog"]
+
+
+def test_a_negated_saved_name_is_not_treated_as_a_reference() -> None:
+    credentials = [SimpleNamespace(name="skyvern-datadog")]
+
+    assert _saved_credential_names_mentioned("do not use skyvern-datadog", credentials) == []

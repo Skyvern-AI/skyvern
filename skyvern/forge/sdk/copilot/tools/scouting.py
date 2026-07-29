@@ -19,15 +19,23 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
 )
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_EVIDENCE_SOURCE_KEY,
+    ChallengeEvidenceSource,
+    challenge_evidence_unsettled,
+    challenge_signal_regressed,
+    composition_challenge_carrier,
+    interactive_challenge_controls,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _is_positional_selector,
     dynamic_row_evidence_fingerprint,
     dynamic_row_period_matches_match_selected_row,
-    locator_selector_literals,
-    normalized_locator_expr,
     normalized_scout_selector,
-    synthesize_code_block,
     validated_dynamic_row_period_matches,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    enclosing_form_submit_controls_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     role_name_match_count_expression as _role_name_match_count_expression,
@@ -76,6 +84,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     resolve_browser_state_for_context,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -486,6 +496,125 @@ async def _resolve_scout_role_name(
     return "", ""
 
 
+# Attributes the one-shot probe always reads off a resolved element, recorded only when that probe
+# succeeded. An attribute absent from a fingerprint carrying this marker proves the element has none;
+# without the marker (probe failed, element gone, older record) absence stays undecidable and fails closed.
+# `label` is excluded: it is only read via `label[for=id]`, so its absence does not prove there is no label.
+_FINGERPRINT_PROBED_ATTRS = "id,name,placeholder,tag,test_id,type"
+
+
+def _element_fingerprint_expression(css_selector: str) -> str:
+    """Capture element identity fingerprint (tag, id, name, type, placeholder, data-testid, label) for
+    credential-fill resolution. Returns attributes only, never values."""
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        f"  const el = document.querySelector({sel});"
+        "  if (!el) return null;"
+        "  const attr = (name) => el.getAttribute(name) || '';"
+        "  const result = {"
+        "    tag: (el.tagName || '').toLowerCase(),"
+        "    id: attr('id'),"
+        "    name: attr('name'),"
+        "    type: attr('type'),"
+        "    placeholder: attr('placeholder'),"
+        "    test_id: attr('data-testid'),"
+        "  };"
+        "  const label = document.querySelector(`label[for=\"${attr('id')}\"]`);"
+        "  if (label) result.label = (label.textContent || '').trim().slice(0, 200);"
+        "  return result;"
+        "})()"
+    )
+
+
+async def _capture_element_fingerprint(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> dict[str, str]:
+    """Capture element identity fingerprint (id, name, type, placeholder, label, test-id, tag)
+    for credential-fill resolution. Returns empty dict on failure, never None."""
+    selector = _selector_text(selector)
+    if not selector:
+        return {}
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return {}
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _element_fingerprint_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {}
+    fingerprint = (result.get("data") or {}).get("result")
+    if not isinstance(fingerprint, dict):
+        return {}
+    captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
+    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
+    return captured
+
+
+async def _capture_post_interaction_screenshot(
+    ctx: AgentContext, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> None:
+    """Attach a look at the page after a state-changing action. Reading the DOM answers "what is
+    on the page" but not "did that work" -- a filled password reads as empty, and a dialog covering
+    the content reads as an ordinary node. Only the most recent screenshot is retained.
+    """
+    # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
+    if not getattr(ctx, "supports_vision", False):
+        return
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_screenshot", {}),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return
+    if isinstance(result, dict) and result.get("ok"):
+        enqueue_screenshot_from_result(ctx, result)
+
+
+async def _capture_enclosing_form_submits(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> list[dict[str, str]]:
+    """Submit controls of the form holding a just-filled field, so submitting what was filled is not
+    a guess among the page's other prominent buttons. Returns an empty list on failure."""
+    selector = _selector_text(selector)
+    if not selector:
+        return []
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return []
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": enclosing_form_submit_controls_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return []
+    if not isinstance(result, dict) or not result.get("ok"):
+        return []
+    controls = (result.get("data") or {}).get("result")
+    if not isinstance(controls, list):
+        return []
+    return [
+        {"label": str(entry.get("label") or "")[:80], "selector": str(entry.get("selector") or "")[:160]}
+        for entry in controls
+        if isinstance(entry, dict) and (entry.get("label") or entry.get("selector"))
+    ]
+
+
 def _capped_with_eviction_accounting(
     items: list[ScoutedInteraction],
     *,
@@ -519,87 +648,6 @@ def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
     return highest + 1 if highest >= 0 else len(trajectory)
 
 
-def _maybe_complete_never_captured_obligation(
-    ctx: AgentContext, *, interaction: ScoutedInteraction, trajectory_index: int
-) -> None:
-    obligation = getattr(ctx, "never_captured_obligation", None)
-    if obligation is None or obligation.state != "armed":
-        return
-    if obligation.turn_id != str(getattr(ctx, "turn_id", "")):
-        return
-    tool_name = str(interaction.get("tool_name") or "")
-    if tool_name != obligation.expected_tool_name or trajectory_index <= obligation.armed_after_trajectory_index:
-        return
-    # Bare locator obligations can reject unrelated same-tool events without paying for a full
-    # trajectory synthesis. Non-bare canonical locators still fall through to the exact emitted
-    # interaction comparison below.
-    if obligation.normalized_receiver.startswith("page.locator("):
-        expected_selectors = {
-            normalized_scout_selector(candidate)
-            for candidate in locator_selector_literals(obligation.normalized_receiver)
-        }
-        captured_selector = str(interaction.get("selector") or "").strip()
-        if normalized_scout_selector(captured_selector) not in expected_selectors:
-            return
-    expected_argument = obligation.expected_argument_literal
-    if expected_argument is not None:
-        if tool_name == "press_key":
-            captured_argument = str(interaction.get("key") or "")
-        elif tool_name == "select_option":
-            captured_argument = str(interaction.get("value") or "")
-        elif tool_name == "type_text":
-            captured_argument = str(interaction.get("raw_typed_value") or interaction.get("typed_value") or "")
-        else:
-            captured_argument = ""
-        if captured_argument != expected_argument:
-            return
-    synthesized = synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-    if synthesized is None:
-        return
-    current_position = next(
-        (
-            position
-            for position, item in enumerate(ctx.scout_trajectory)
-            if item.get("trajectory_index") == trajectory_index
-        ),
-        None,
-    )
-    if current_position is None:
-        return
-    emitted = next(
-        (
-            record
-            for record in synthesized.diagnostics.emitted_interactions
-            if record.get("trajectory_index") == current_position
-        ),
-        None,
-    )
-    if emitted is None:
-        return
-    method = str(emitted.get("method") or "")
-    locator = normalized_locator_expr(str(emitted.get("locator") or ""))
-    if method != obligation.method or locator != obligation.normalized_receiver:
-        return
-    ctx.never_captured_obligation = replace(
-        obligation,
-        captured_trajectory_index=trajectory_index,
-        state="captured",
-    )
-    ctx.synthesized_block_reopened_for_capture_obligation = True
-    LOG.info(
-        "copilot_never_captured_obligation_completed",
-        identity_digest=obligation.identity_digest,
-        turn_id=obligation.turn_id,
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        draft_fingerprint=obligation.draft_fingerprint,
-        block_label=obligation.block_label,
-        site=obligation.site,
-        trajectory_index=trajectory_index,
-        method=method,
-        locator=locator,
-    )
-
-
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -619,6 +667,14 @@ def _record_scouted_interaction(
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
+    element_fingerprint_id: str | None = None,
+    element_fingerprint_name: str | None = None,
+    element_fingerprint_type: str | None = None,
+    element_fingerprint_placeholder: str | None = None,
+    element_fingerprint_label: str | None = None,
+    element_fingerprint_test_id: str | None = None,
+    element_fingerprint_tag: str | None = None,
+    element_fingerprint_probed: str | None = None,
     ambiguous: bool = False,
     dynamic_row_evidence: ScoutedDynamicRowEvidence | None = None,
 ) -> None:
@@ -665,6 +721,22 @@ def _record_scouted_interaction(
         artifact["credential_field"] = credential_field
     if credential_name:
         artifact["credential_name"] = credential_name
+    if element_fingerprint_id:
+        artifact["element_fingerprint_id"] = element_fingerprint_id
+    if element_fingerprint_name:
+        artifact["element_fingerprint_name"] = element_fingerprint_name
+    if element_fingerprint_type:
+        artifact["element_fingerprint_type"] = element_fingerprint_type
+    if element_fingerprint_placeholder:
+        artifact["element_fingerprint_placeholder"] = element_fingerprint_placeholder
+    if element_fingerprint_label:
+        artifact["element_fingerprint_label"] = element_fingerprint_label
+    if element_fingerprint_test_id:
+        artifact["element_fingerprint_test_id"] = element_fingerprint_test_id
+    if element_fingerprint_tag:
+        artifact["element_fingerprint_tag"] = element_fingerprint_tag
+    if element_fingerprint_probed:
+        artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
     if dynamic_row_evidence is not None:
@@ -687,11 +759,6 @@ def _record_scouted_interaction(
     trajectory_artifact["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(trajectory_artifact)
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
-    _maybe_complete_never_captured_obligation(
-        ctx,
-        interaction=trajectory_artifact,
-        trajectory_index=trajectory_artifact["trajectory_index"],
-    )
 
     LOG.info(
         "copilot_scout_interaction_captured",
@@ -705,6 +772,125 @@ def _record_scouted_interaction(
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
     record_reached_terminal_action_observation(ctx)
+
+
+_MAX_CHALLENGE_SOLVE_ATTEMPTS = 3
+
+
+def _challenge_identity(evidence: dict[str, Any]) -> str:
+    """Identify the challenge, not the page, so a later distinct one still gets attempts.
+
+    Deliberately ignores ``src``: the common widgets carry a per-render cache-buster there, so
+    keying on it would mint a fresh identity on every re-render and never reach the cap.
+    """
+    marks = []
+    for control in interactive_challenge_controls(evidence.get("challenge_controls")):
+        mark = control.get("data_sitekey") or control.get("selector") or control.get("id")
+        if mark:
+            marks.append(str(mark))
+    return "|".join(sorted(marks)) or str(evidence.get("current_url") or "")
+
+
+def _record_challenge_encounter(
+    ctx: AgentContext,
+    carrier: ChallengeEvidenceSource,
+    *,
+    outcome: str,
+) -> None:
+    """Record on the interaction that met the challenge, whether or not it was passed.
+
+    Synthesis derives boundaries from ``composition_challenge_carrier`` over the recorded
+    interaction itself, so the carrier has to ride on a tool_name it already emits for; a
+    standalone solve_captcha interaction has no emitter and would be dropped.
+    """
+    trajectory = list(ctx.scout_trajectory)
+    if not trajectory:
+        return
+    entry = trajectory[-1]
+    challenge_state = dict(entry.get("challenge_state") or {})
+    challenge_state[CHALLENGE_EVIDENCE_SOURCE_KEY] = carrier.value
+    challenge_state["outcome"] = outcome
+    stamped = dict(entry)
+    stamped["challenge_state"] = challenge_state
+    trajectory[-1] = cast(ScoutedInteraction, stamped)
+    ctx.scout_trajectory = trajectory
+
+
+async def solve_challenge_when_evidence_settles(
+    ctx: AgentContext,
+    evidence: dict[str, Any] | None,
+    *,
+    url: str | None,
+    observed_after_interaction: bool,
+) -> bool:
+    """Try the shared solve routes on a challenge in just-settled evidence; True if it passed.
+
+    Call from a capture exit, never a tool hook: a settled packet describes the page as it now
+    is, and ``observed_after_interaction`` follows from the seam — the act-observe capture runs
+    after a recorded interaction, an inspection capture has none to attribute.
+    """
+    if not evidence:
+        return False
+    carrier = composition_challenge_carrier(evidence)
+    if carrier is None:
+        return False
+
+    # Record on detection rather than on success: an unsolved challenge is a fact the draft
+    # carries forward, and exploration continues either way. Nothing below terminates the turn.
+    if observed_after_interaction:
+        _record_challenge_encounter(ctx, carrier, outcome="detected")
+
+    # Cost gate, deliberately after the record above: a challenge that cannot be solved must stop
+    # being paid for, but must never stop being reported to synthesis.
+    # Counted before the attempt, so a transient failure spends one too — deliberate, because the
+    # alternative lets a route that keeps erroring retry without bound.
+    identity = _challenge_identity(evidence)
+    attempts = ctx.challenge_solve_attempts.get(identity, 0)
+    if attempts >= _MAX_CHALLENGE_SOLVE_ATTEMPTS:
+        return False
+    ctx.challenge_solve_attempts[identity] = attempts + 1
+
+    # Read once so the handlers below report a failure without touching the context again.
+    organization_id = ctx.organization_id
+    try:
+        # Resolving the browser is inside the guard because it can raise, and a challenge the
+        # scout merely failed to solve must never be what ends exploration.
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return False
+        page = await browser_state.get_working_page()
+        if page is None:
+            return False
+        # In-DOM checkbox, then the Turnstile extension, then the reCAPTCHA token route.
+        await _code_block_solve_captcha_builtin(page, organization_id=organization_id)
+    except CodeBlockCaptchaError:
+        LOG.info(
+            "copilot_scout_captcha_solve_failed",
+            url=url,
+            organization_id=organization_id,
+        )
+        if observed_after_interaction:
+            _record_challenge_encounter(ctx, carrier, outcome="unsolved")
+        return False
+    except Exception:
+        LOG.warning(
+            "copilot_scout_captcha_solve_exception",
+            url=url,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+    # "attempted", not "solved": the routes return normally when their probes match nothing, so a
+    # carrier asserted by challenge_state alone can complete here without anything being solved.
+    if observed_after_interaction:
+        _record_challenge_encounter(ctx, carrier, outcome="attempted")
+    LOG.info(
+        "copilot_scout_captcha_solved",
+        url=url,
+        organization_id=organization_id,
+    )
+    return True
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:
@@ -914,7 +1100,9 @@ def _mint_current_loaded_result_source(
     return loaded_results
 
 
-async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
+async def _scout_act_observe_page_evidence(
+    ctx: AgentContext, *, url: str, observed_after_interaction: bool = False
+) -> dict[str, Any] | None:
     """Run the bounded page-side extractor right after a scout interaction.
 
     Degrades to None on timeout or error so the interaction result is never
@@ -936,8 +1124,9 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         outcome = "error"
     else:
         outcome = _scout_act_observe_capture_outcome(parsed, started=started, timeout_seconds=timeout_seconds)
-        if outcome == "hollow" and parsed is not None:
-            first_hollow = parsed
+        if parsed is not None and (outcome == "hollow" or challenge_evidence_unsettled(parsed)):
+            first_packet = parsed
+            first_outcome = outcome
             remaining_seconds = timeout_seconds - (time.monotonic() - started)
             if remaining_seconds <= 0:
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
@@ -954,15 +1143,15 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                         ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
                     )
                 except Exception:
-                    parsed = first_hollow
-                    outcome = "hollow"
+                    parsed = first_packet
+                    outcome = first_outcome
                     ctx.last_scout_act_observe_recapture_result = (
                         "timeout" if time.monotonic() - started >= timeout_seconds else "error"
                     )
                 else:
                     if recaptured is None:
-                        parsed = first_hollow
-                        outcome = "hollow"
+                        parsed = first_packet
+                        outcome = first_outcome
                         ctx.last_scout_act_observe_recapture_result = _scout_act_observe_no_payload_result(
                             started=started, timeout_seconds=timeout_seconds
                         )
@@ -970,8 +1159,17 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                         recaptured_outcome = _scout_act_observe_capture_outcome(
                             recaptured, started=started, timeout_seconds=timeout_seconds
                         )
-                        parsed = recaptured
-                        outcome = recaptured_outcome
+                        # Never trade down: a page that navigated mid-recapture would otherwise
+                        # lose the form the first capture proved, or erase the challenge signal
+                        # that justified re-looking while still reporting a bounded schema.
+                        if (
+                            first_outcome == "attached" and recaptured_outcome != "attached"
+                        ) or challenge_signal_regressed(first_packet, recaptured):
+                            parsed = first_packet
+                            outcome = first_outcome
+                        else:
+                            parsed = recaptured
+                            outcome = recaptured_outcome
                         ctx.last_scout_act_observe_recapture_result = recaptured_outcome
     ctx.last_scout_act_observe_outcome = outcome
     ctx.last_scout_act_observe_packet = parsed
@@ -984,6 +1182,9 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
+    )
+    await solve_challenge_when_evidence_settles(
+        ctx, parsed, url=url, observed_after_interaction=observed_after_interaction
     )
     return parsed
 
@@ -1008,7 +1209,7 @@ async def _register_scout_interaction_observation(
         evidence["interaction_source_url"] = source_url.strip()
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
-        parsed = await _scout_act_observe_page_evidence(ctx, url=url)
+        parsed = await _scout_act_observe_page_evidence(ctx, url=url, observed_after_interaction=True)
         # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
         # that rendered witnessed value content is bindable even when it exposes no actionable schema.
         if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
@@ -1491,6 +1692,10 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
         role=role,
         accessible_name=accessible_name,
     )
+    # This path records its click after the capture, so the encounter is attributed here instead.
+    auto_act_carrier = composition_challenge_carrier(post_evidence) if post_evidence else None
+    if auto_act_carrier is not None:
+        _record_challenge_encounter(ctx, auto_act_carrier, outcome="detected")
 
     for key in ("next_action", "next_action_reason", "actionable_targets"):
         data.pop(key, None)

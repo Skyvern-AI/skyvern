@@ -34,6 +34,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
@@ -864,6 +865,7 @@ class ScriptSkyvernPage(SkyvernPage):
                     workflow_run_id=workflow_run_id,
                     totp_verification_url=totp_url,
                     totp_identifier=totp_identifier,
+                    expected_otp_type=OTPType.TOTP,
                 )
                 if totp_value:
                     # use the totp verification code

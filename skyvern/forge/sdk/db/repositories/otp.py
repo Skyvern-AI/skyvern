@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, asc, or_, select
+from sqlalchemy import and_, asc, or_, select, update
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.models import TOTPCodeModel
-from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
 
 
 class OTPRepository(BaseRepository):
@@ -46,6 +46,7 @@ class OTPRepository(BaseRepository):
                 select(TOTPCodeModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(totp_identifier=totp_identifier)
+                .filter_by(parse_status="parsed")
                 .filter(
                     TOTPCodeModel.created_at > datetime.now(timezone.utc) - timedelta(minutes=valid_lifespan_minutes)
                 )
@@ -86,6 +87,7 @@ class OTPRepository(BaseRepository):
             query = (
                 select(TOTPCodeModel)
                 .filter_by(organization_id=organization_id)
+                .filter_by(parse_status="parsed")
                 .filter(
                     TOTPCodeModel.created_at > datetime.now(timezone.utc) - timedelta(minutes=valid_lifespan_minutes)
                 )
@@ -113,7 +115,7 @@ class OTPRepository(BaseRepository):
         workflow_run_id filtering.
         """
         async with self.Session() as session:
-            query = select(TOTPCodeModel).filter_by(organization_id=organization_id)
+            query = select(TOTPCodeModel).filter_by(organization_id=organization_id).filter_by(parse_status="parsed")
 
             if valid_lifespan_minutes is not None:
                 query = query.filter(
@@ -150,9 +152,11 @@ class OTPRepository(BaseRepository):
                 totp_identifier=totp_identifier,
                 content=content,
                 code=code,
-                task_id=task_id,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run_id,
+                # These columns are FKs: a blank string from an API caller is "not set",
+                # but only NULL satisfies the constraint.
+                task_id=task_id or None,
+                workflow_id=workflow_id or None,
+                workflow_run_id=workflow_run_id or None,
                 source=source,
                 expired_at=expired_at,
                 otp_type=otp_type,
@@ -161,3 +165,97 @@ class OTPRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_totp_code)
             return TOTPCode.model_validate(new_totp_code)
+
+    @db_operation("create_raw_otp_code")
+    async def create_raw_otp_code(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        content: str,
+        task_id: str | None = None,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        source: str | None = None,
+        expired_at: datetime | None = None,
+    ) -> RawTOTPCode:
+        async with self.Session() as session:
+            row = TOTPCodeModel(
+                organization_id=organization_id,
+                totp_identifier=totp_identifier,
+                content=content,
+                code=None,
+                otp_type=None,
+                parse_status="raw",
+                task_id=task_id or None,
+                workflow_id=workflow_id or None,
+                workflow_run_id=workflow_run_id or None,
+                source=source,
+                expired_at=expired_at,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return RawTOTPCode.model_validate(row)
+
+    @db_operation("get_raw_otp_codes")
+    async def get_raw_otp_codes(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        workflow_run_id: str | None = None,
+        include_unscoped_workflow_run: bool = False,
+        created_after: datetime | None = None,
+        excluded_ids: set[str] | None = None,
+        limit: int | None = None,
+    ) -> list[RawTOTPCode]:
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel)
+                .filter_by(
+                    organization_id=organization_id,
+                    totp_identifier=totp_identifier,
+                    parse_status="raw",
+                )
+                .filter(
+                    TOTPCodeModel.created_at > datetime.now(timezone.utc) - timedelta(minutes=valid_lifespan_minutes)
+                )
+            )
+            if workflow_run_id is not None and include_unscoped_workflow_run:
+                query = query.filter(
+                    or_(TOTPCodeModel.workflow_run_id == workflow_run_id, TOTPCodeModel.workflow_run_id.is_(None))
+                )
+            elif workflow_run_id is not None:
+                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
+            if created_after is not None:
+                query = query.filter(TOTPCodeModel.created_at >= created_after)
+            if excluded_ids:
+                query = query.filter(TOTPCodeModel.totp_code_id.not_in(excluded_ids))
+            query = query.order_by(TOTPCodeModel.created_at.desc())
+            if limit is not None:
+                query = query.limit(limit)
+            rows = (await session.scalars(query)).all()
+            return [RawTOTPCode.model_validate(row) for row in rows]
+
+    @db_operation("promote_raw_otp_code")
+    async def promote_raw_otp_code(
+        self,
+        totp_code_id: str,
+        organization_id: str,
+        code: str,
+        otp_type: OTPType,
+    ) -> TOTPCode | None:
+        async with self.Session() as session:
+            query = (
+                update(TOTPCodeModel)
+                .where(
+                    TOTPCodeModel.totp_code_id == totp_code_id,
+                    TOTPCodeModel.organization_id == organization_id,
+                    TOTPCodeModel.parse_status == "raw",
+                )
+                .values(code=code, otp_type=otp_type, parse_status="parsed", modified_at=datetime.now(timezone.utc))
+                .returning(TOTPCodeModel)
+            )
+            row = (await session.scalars(query)).one_or_none()
+            await session.commit()
+            return TOTPCode.model_validate(row) if row else None

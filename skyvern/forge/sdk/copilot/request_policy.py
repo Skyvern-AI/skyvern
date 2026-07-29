@@ -18,7 +18,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
+from skyvern.forge.sdk.copilot.context import (
+    StructuredContext,
+    prior_signin_email_from_context,
+    sanitize_global_llm_context_for_prompt,
+)
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
@@ -37,6 +41,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.signin_email import connected_gmail_address, is_email_address
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
@@ -98,12 +103,15 @@ ClarificationReason = Literal[
     "missing_target_context",
     "workflow_credential_inputs_unbound",
     "login_credentials_unresolved",
+    "signin_email_unresolved",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
 # Only deterministic post-resolution code may mint these; a classifier emission would
 # skip the concrete-target and credential-reachability checks the reason stands for.
-_DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset({"login_credentials_unresolved"})
+_DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"login_credentials_unresolved", "signin_email_unresolved"}
+)
 # Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
@@ -162,6 +170,7 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
+_SIGNIN_EMAIL_QUESTION = "Which email address should I sign in with?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
@@ -305,6 +314,7 @@ ExpectedOutputShape = Literal[
     "money_amount",
     "owner_label",
     "goal_judgment_boolean",
+    "value_present",
 ]
 RequestedOutputEvidenceSource = Literal[
     "runtime_output",
@@ -543,6 +553,12 @@ class RequestPolicy:
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
     login_intent: bool = False
+    # Sign-in that identifies the user by email address instead of a stored password, so
+    # resolving *which address* is the whole credential question — there is no password to find.
+    email_signin_intent: bool = False
+    signin_email_candidates: list[str] = field(default_factory=list)
+    resolved_signin_email: str | None = None
+    resolved_signin_host: str | None = None
     requires_user_clarification: bool = False
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
@@ -583,6 +599,8 @@ class RequestPolicy:
             "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
             "login_intent": self.login_intent,
+            "email_signin_intent": self.email_signin_intent,
+            "signin_email_resolved": bool(self.resolved_signin_email),
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
@@ -695,6 +713,8 @@ class RequestPolicy:
             lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
+        if self.resolved_signin_email:
+            lines.append(f"resolved_signin_email: {self.resolved_signin_email}")
         graded_criteria = self.graded_completion_criteria()
         requested_output_path_literals = sorted(
             {
@@ -981,6 +1001,10 @@ def build_transcript_context(
 
 def _clean_list(values: list[Any]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _clean_email_list(values: list[Any]) -> list[str]:
+    return [value for value in _clean_list(values) if is_email_address(value)]
 
 
 def _credential_ids(text: str) -> list[str]:
@@ -2012,12 +2036,31 @@ def _omitted_request_slot_criterion(
     )
 
 
+def _canonical_mint_path(path: str) -> str:
+    return path.strip().removeprefix("output.")
+
+
+def _minted_path_has_typed_child(path: str, sibling_output_paths: frozenset[str]) -> bool:
+    """True when another requested-output path is nested under ``path`` (``path.x`` or
+    ``path[].x``), i.e. ``path`` is a collection parent whose contract is carried by its
+    typed children -- so it should floor-rekey, not mint a loose value_present criterion.
+    Paths are compared canonically so a child written without the ``output.`` prefix still
+    suppresses the mint."""
+    parent = _canonical_mint_path(path)
+    return any(
+        (child := _canonical_mint_path(sibling)) != parent
+        and (child.startswith(f"{parent}.") or child.startswith(f"{parent}["))
+        for sibling in sibling_output_paths
+    )
+
+
 def _bind_criterion_to_request_slot(
     criterion: CompletionCriterion,
     *,
     slot: CanonicalRequestSlotV1,
     source_quote: str,
     allow_canonical_path_fallback: bool = True,
+    sibling_output_paths: frozenset[str] = frozenset(),
 ) -> CompletionCriterion:
     pinability = cast(Pinability, slot.pinability.value)
     lexical_interrogative_key = _interrogative_slot_classification_output_key(
@@ -2058,7 +2101,25 @@ def _bind_criterion_to_request_slot(
         and _has_boolean_output_signal(criterion)
     )
     degraded = degraded or malformed_shapeless_boolean or assertive_shapeless_boolean
-    rekeyed = degraded or pinability == "shapeless_valid"
+
+    minted_output_path = criterion.output_path or (
+        f"output.{criterion.classification_output_key}" if criterion.classification_output_key is not None else None
+    )
+    # A single named non-boolean run-plane value keeps its computed output_path with a
+    # presence-only shape so the grounding gate can check it, without claiming an exact value.
+    minted_requested_output = (
+        pinability == "shapeless_valid"
+        and slot.plane.value == "run"
+        and minted_output_path is not None
+        and not _minted_path_has_typed_child(minted_output_path, sibling_output_paths)
+        and not _has_boolean_output_signal(criterion)
+        and not neutral_boolean_candidate
+        and not malformed_shapeless_boolean
+        and not assertive_shapeless_boolean
+        and antecedent_family in {"unconditional", "blocker"}
+    )
+
+    rekeyed = degraded or (pinability == "shapeless_valid" and not minted_requested_output)
 
     expected_output_value = criterion.expected_output_value
     expected_output_shape = criterion.expected_output_shape
@@ -2080,6 +2141,8 @@ def _bind_criterion_to_request_slot(
         expected_output_shape = None
         expected_classification = None
         judgment_truth_condition = None
+    if minted_requested_output:
+        expected_output_shape = "value_present"
     if malformed_shapeless_boolean:
         requested_output_evidence_source = "runtime_output"
         classification_output_key = None
@@ -2096,6 +2159,11 @@ def _bind_criterion_to_request_slot(
         kind = "outcome"
         classification_output_key = None
     output_path = None if rekeyed else criterion.output_path
+    if minted_requested_output:
+        kind = "outcome"
+        classification_output_key = None
+        if output_path is None:
+            output_path = minted_output_path
     if neutral_boolean_key is not None:
         original_output_path = f"output.{neutral_boolean_key}"
     requested_output_floor_rekeyed = rekeyed and neutral_boolean_key is None and original_output_path is not None
@@ -2120,6 +2188,12 @@ def _bind_criterion_to_request_slot(
             original_output_path=original_output_path,
             requested_output_evidence_source=criterion.requested_output_evidence_source,
             outcome=(criterion.outcome or source_quote or "")[:80],
+        )
+    if minted_requested_output:
+        LOG.info(
+            "copilot_request_slot_criterion_minted_requested_output",
+            slot_id=slot.slot_id,
+            output_path=output_path,
         )
     return replace(
         criterion,
@@ -2161,7 +2235,9 @@ def _parse_fresh_request_slot_criteria(
         trusted_bindings_by_slot_id.setdefault(binding.slot_id, []).append(binding)
     bound_by_slot_id: dict[str, CompletionCriterion] = {}
     non_slot_criteria: list[CompletionCriterion] = []
-    for item, criterion in _parse_completion_criterion_entries(raw):
+    entries = list(_parse_completion_criterion_entries(raw))
+    sibling_output_paths = frozenset(criterion.output_path for _item, criterion in entries if criterion.output_path)
+    for item, criterion in entries:
         criterion_index = criterion_index_by_item_id[id(item)]
         anchor = _request_slot_anchor(item)
         slot = (
@@ -2202,6 +2278,7 @@ def _parse_fresh_request_slot_criteria(
             criterion,
             slot=slot,
             source_quote=anchor[1],
+            sibling_output_paths=sibling_output_paths,
         )
 
     for slot in request_slot_contract.slots:
@@ -2218,6 +2295,7 @@ def _parse_fresh_request_slot_criteria(
             slot=slot,
             source_quote=source_quote,
             allow_canonical_path_fallback=False,
+            sibling_output_paths=sibling_output_paths,
         )
     return ([bound_by_slot_id[slot.slot_id] for slot in request_slot_contract.slots] + non_slot_criteria)[
         :_MAX_COMPLETION_CRITERIA
@@ -2276,6 +2354,8 @@ def _classification_from_raw(
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         login_intent=bool(raw.get("login_intent")),
+        email_signin_intent=bool(raw.get("email_signin_intent")),
+        signin_email_candidates=_clean_email_list(raw.get("signin_email_candidates") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
         completion_criteria=completion_criteria,
@@ -2352,6 +2432,11 @@ def _parse_completion_criterion_entries(
             item.get("expected_output_value")
         )
         expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        if expected_output_shape == "value_present":
+            # value_present is minted by the policy only (see _bind_criterion_to_request_slot); a
+            # classifier-supplied one on a pinned slot would be credited by presence and bypass the
+            # exact-value bar. Drop it here so only the mint can set it.
+            expected_output_shape = None
         requested_output_evidence_source = _coerce_requested_output_evidence_source(
             item.get("requested_output_evidence_source")
         )
@@ -2929,6 +3014,9 @@ def _requested_output_mint_state(
 ) -> tuple[MintDisposition, MintDegrade | None]:
     if isinstance(expected_value, bool) or expected_shape == "goal_judgment_boolean" or judgment_condition is not None:
         return "pending", None
+    if expected_shape == "value_present":
+        # A minted single-value extraction is decidable by presence, not an undecidable judgment.
+        return "decidable", None
     if expected_shape == "status_label" or (expected_value is None and expected_shape is not None):
         return "degraded", "undecidable_judgment"
     return "decidable", None
@@ -4316,6 +4404,41 @@ def _credential_name_candidates(user_message: str) -> list[str]:
     return _exact_credential_name_candidates(user_message)
 
 
+_CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH = 4
+
+
+def _explicit_login_action_asserted(user_message: str) -> bool:
+    """Whether the message asks for a login in its own words, ignoring phrasings that refuse one.
+
+    Shares the negation rule with saved-name matching, so "do not log in with prod" authorizes neither.
+    """
+    text = _credential_authority_text(user_message or "")
+    return any(
+        not _credential_reference_is_negated(text, match.start()) for match in _EXPLICIT_LOGIN_ACTION_RE.finditer(text)
+    )
+
+
+def _saved_credential_names_mentioned(user_message: str, credentials: list[Credential]) -> list[str]:
+    """Saved names a message states outright, e.g. "use skyvern-datadog to login".
+
+    The saved names are known, so match on them rather than on the prose around them.
+    """
+    text = _credential_authority_text(user_message or "")
+    mentioned: list[str] = []
+    for credential in credentials:
+        name = (credential.name or "").strip()
+        if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+            continue
+        for match in re.finditer(rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])", text, re.IGNORECASE):
+            if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
+                text, match.start()
+            ):
+                continue
+            mentioned.append(name)
+            break
+    return _clean_list(mentioned)
+
+
 def _explicit_credential_ids(user_message: str) -> list[str]:
     text = _credential_authority_text(user_message or "")
     explicit: list[str] = []
@@ -4522,6 +4645,10 @@ def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, work
     """
     if not policy.login_intent or policy.raw_secret_detected:
         return False
+    if _is_passwordless_email_signin(policy):
+        # Nothing a password credential could satisfy: _resolve_signin_email owns this shape,
+        # and asking for a saved credential here is unanswerable on an email-only site.
+        return False
     if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
         return False
     if policy.clarification_reason not in _LOGIN_CREDENTIAL_OVERRIDABLE_REASONS:
@@ -4529,6 +4656,55 @@ def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, work
     if not _login_target_is_concrete(policy, user_message, workflow_yaml):
         return False
     return not (policy.resolved_credentials or policy.discovered_credentials or policy.existing_workflow_credential_ids)
+
+
+def _signin_target_hosts(policy: RequestPolicy, user_message: str) -> list[str]:
+    return [parts[1] for url in _login_url_candidates(policy, user_message) if (parts := _url_parts(url))]
+
+
+def _is_passwordless_email_signin(policy: RequestPolicy) -> bool:
+    """Email-address sign-in with no credential material referenced anywhere in the request."""
+    return (
+        (policy.email_signin_intent or bool(policy.resolved_signin_email))
+        and policy.login_intent
+        and not policy.raw_secret_detected
+        and policy.credential_input_kind == "none"
+        and not policy.credential_refs
+    )
+
+
+async def _resolve_signin_email(
+    policy: RequestPolicy,
+    organization_id: str,
+    *,
+    user_message: str,
+    workflow_yaml: str,
+) -> None:
+    """Settle which address signs in, or ask for one — never ask for a password credential."""
+    if not _is_passwordless_email_signin(policy):
+        return
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return
+    # Same first-touch rule the password path uses: with no site yet, the address is not
+    # the question the user still owes.
+    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
+        return
+    # A clarification already on the policy is a different question the user still owes;
+    # _block would overwrite it and lose it, so this ask waits for a later turn. A question
+    # without a reason set counts, which is why this checks the flag and not just the reason.
+    if policy.requires_user_clarification or policy.clarification_reason != "none":
+        return
+
+    named = next(iter(policy.signin_email_candidates), None)
+    if named:
+        # An explicit instruction outranks both a carried identity and the connected account.
+        policy.resolved_signin_email = named
+    elif not policy.resolved_signin_email:
+        policy.resolved_signin_email = await connected_gmail_address(organization_id)
+    if not policy.resolved_signin_email:
+        _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
+        return
+    policy.resolved_signin_host = next(iter(_signin_target_hosts(policy, user_message)), None)
 
 
 def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
@@ -4691,10 +4867,21 @@ async def _resolve_credentials(
             policy.allow_missing_credentials_in_draft = True
         return
 
+    # `login_intent` is a classifier-authored hint that misses on runs where the model does not set
+    # it, so a message asking for a login in its own words must still count. A classifier that failed
+    # outright is a different case: a degraded turn never enumerates the org's saved credentials.
+    login_phrase_asserted = _explicit_login_action_asserted(user_message)
+    may_scan_saved_names = policy.login_intent or (policy.classifier_status != "fallback" and login_phrase_asserted)
     name_candidates = _credential_name_candidates(user_message)
     credentials: list[Credential] | None = None
-    if name_candidates:
+    # Only a request that already asserts a login or credential intent may be matched against the
+    # org's saved names; without that gate an unrelated message would scan the credential list.
+    if not name_candidates and may_scan_saved_names:
         credentials = await _load_credentials(organization_id)
+        name_candidates = _saved_credential_names_mentioned(user_message, credentials)
+    if name_candidates:
+        if credentials is None:
+            credentials = await _load_credentials(organization_id)
         named_matches = _deduplicate_credentials(
             [credential for credential in credentials if credential.name in name_candidates]
         )
@@ -4751,7 +4938,11 @@ async def _resolve_credentials(
     message_url_candidates = _clean_list(
         [candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)]
     )
-    current_turn_login_authorized = policy.login_intent or bool(_EXPLICIT_LOGIN_ACTION_RE.search(user_message))
+    # A passwordless turn must not reach the URL credential tiers below: a host match there
+    # asks for a saved credential under a different reason, which is the same dead end.
+    current_turn_login_authorized = (
+        policy.login_intent or login_phrase_asserted
+    ) and not _is_passwordless_email_signin(policy)
     url_candidates: list[str] = []
     allow_host_fallback = False
     if (
@@ -4991,6 +5182,12 @@ async def build_request_policy(
             exc_info=True,
         )
     _prioritize_credential_clarification(policy)
+    # Before credential resolution, so a carried sign-in identity also keeps this turn out of
+    # the URL credential tiers.
+    carried = prior_signin_email_from_context(global_llm_context, _signin_target_hosts(policy, user_message))
+    policy.resolved_signin_email = policy.resolved_signin_email or (
+        carried if carried and is_email_address(carried) else None
+    )
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
         policy.testing_intent = "skip_test"
@@ -5102,6 +5299,24 @@ async def build_request_policy(
         policy.user_response_policy = "proceed"
         policy.clarification_reason = "none"
         policy.clarification_question = None
+
+    try:
+        await _resolve_signin_email(
+            policy,
+            organization_id,
+            user_message=user_message,
+            workflow_yaml=workflow_yaml,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy sign-in email resolution failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        # The credential requirement is already lifted for this shape, so falling through
+        # would build a login with no identity and no question asked.
+        if _is_passwordless_email_signin(policy) and not policy.requires_user_clarification:
+            _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
 
     if _login_credentials_unresolved(policy, user_message, workflow_yaml):
         if policy.clarification_reason == "none":

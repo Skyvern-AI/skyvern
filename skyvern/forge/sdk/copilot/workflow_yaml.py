@@ -1,5 +1,6 @@
 """Copilot workflow-YAML normalization, chain repair, and Workflow conversion."""
 
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
 
@@ -365,17 +366,54 @@ def _yaml_pin_saved_session_ip(workflow_yaml: str | None) -> bool | None:
     return _yaml_bool_setting(workflow_yaml, "pin_saved_session_ip")
 
 
+def _redact_credentials_before_persistence(
+    workflow_yaml: str, workflow_permanent_id: str, credential_values: Collection[str]
+) -> str:
+    """Last line of defence before a workflow reaches the database.
+
+    A credential value should already have been rebound to a parameter reference upstream; reaching
+    here with a live value means that failed, so redact rather than store it. The redacted workflow
+    will not run as authored — that is the intended trade, and the error line is the signal to fix
+    the upstream rebind.
+
+    ``credential_values`` must be scoped to the authoring session. Replacing values registered by
+    other sessions would let one org's short secret rewrite another org's stored workflow.
+    """
+    from skyvern.forge.sdk.copilot.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
+
+    redactable = {
+        value for value in credential_values if isinstance(value, str) and len(value) >= MIN_PERSISTED_REDACTION_LENGTH
+    }
+    redacted_count = 0
+    # Longest first so an overlapping shorter value never splits a longer one.
+    for secret in sorted(redactable, key=len, reverse=True):
+        if secret in workflow_yaml:
+            redacted_count += workflow_yaml.count(secret)
+            workflow_yaml = workflow_yaml.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+    if redacted_count:
+        LOG.error(
+            "copilot redacted a raw credential value at the workflow persistence seam",
+            workflow_permanent_id=workflow_permanent_id,
+            redacted_occurrences=redacted_count,
+        )
+    return workflow_yaml
+
+
 async def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
     organization_id: str,
     workflow_yaml: str,
     settings_fallback_yaml: str | None = None,
+    credential_scrub_values: Collection[str] = (),
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
     # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
     # fallbacks would otherwise surface "No steps yet").
+    workflow_yaml = _redact_credentials_before_persistence(
+        workflow_yaml, workflow_permanent_id, credential_scrub_values
+    )
     workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
 
@@ -444,3 +482,96 @@ async def _process_workflow_yaml(
         created_at=now,
         modified_at=now,
     )
+
+
+class BlockEditError(Exception):
+    """A block-scoped edit that could not be applied as asked."""
+
+
+def _workflow_blocks(parsed: Any) -> list[Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return None
+    blocks = definition.get("blocks")
+    return blocks if isinstance(blocks, list) else None
+
+
+def _block_by_label(blocks: list[Any], label: str) -> dict[str, Any]:
+    matches = [b for b in blocks if isinstance(b, dict) and str(b.get("label") or "") == label]
+    if not matches:
+        known = ", ".join(sorted(str(b.get("label") or "") for b in blocks if isinstance(b, dict)))
+        raise BlockEditError(f"No block labelled {label!r}. The workflow has: {known or '(no labelled blocks)'}.")
+    if len(matches) > 1:
+        raise BlockEditError(f"{len(matches)} blocks share the label {label!r}; labels must be unique to edit one.")
+    return matches[0]
+
+
+def apply_block_edit(
+    stored_yaml: str,
+    label: str,
+    *,
+    expected_code: str | None = None,
+    replacement_code: str | None = None,
+    fields: dict[str, Any] | None = None,
+) -> str:
+    """Apply an edit to one block and return the whole workflow, leaving every other block untouched.
+
+    A code edit is anchored: ``expected_code`` must appear exactly once in the block's current code, so
+    an edit written against a stale copy fails loudly instead of overwriting whatever is there now.
+    """
+    try:
+        parsed = safe_load_no_dates(stored_yaml)
+    except Exception as exc:
+        raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
+    blocks = _workflow_blocks(parsed)
+    if blocks is None:
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    block = _block_by_label(blocks, label)
+
+    if expected_code is not None or replacement_code is not None:
+        if expected_code is None or replacement_code is None:
+            raise BlockEditError("A code edit needs both expected_code and replacement_code.")
+        current = block.get("code")
+        if not isinstance(current, str):
+            raise BlockEditError(f"Block {label!r} has no code to edit; use fields for its settings.")
+        occurrences = current.count(expected_code)
+        if occurrences == 0:
+            raise BlockEditError(
+                f"expected_code was not found in block {label!r}. It has changed since you read it — "
+                "re-read the block and rewrite the edit against its current code."
+            )
+        if occurrences > 1:
+            raise BlockEditError(
+                f"expected_code appears {occurrences} times in block {label!r}; include enough "
+                "surrounding lines to identify one occurrence."
+            )
+        block["code"] = current.replace(expected_code, replacement_code, 1)
+
+    for key, value in (fields or {}).items():
+        block[key] = value
+
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
+def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
+    """Remove one block by label and return the whole workflow.
+
+    Deletion is an operation rather than an absence, so a submission that simply omits a block can
+    never be mistaken for a request to remove it.
+    """
+    try:
+        parsed = safe_load_no_dates(stored_yaml)
+    except Exception as exc:
+        raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
+    blocks = _workflow_blocks(parsed)
+    if blocks is None:
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    _block_by_label(blocks, label)
+    remaining = [b for b in blocks if not (isinstance(b, dict) and str(b.get("label") or "") == label)]
+    for other in remaining:
+        if isinstance(other, dict) and other.get("next_block_label") == label:
+            other["next_block_label"] = None
+    parsed["workflow_definition"]["blocks"] = remaining
+    return yaml.safe_dump(parsed, sort_keys=False)

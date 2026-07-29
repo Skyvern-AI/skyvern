@@ -846,7 +846,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await send_error(message.kind, str(exc))
                 except Exception:
                     # The target URL is user-controlled; log it server-side
-                    # but don't reflect it back in the toast.
+                    # but don't reflect it back in the toast. BlockedHost from the
+                    # destination check lands here deliberately rather than in the ValueError
+                    # branch above: naming the rejected host would let a caller tell "blocked
+                    # internal" from "unreachable" and enumerate internal ranges from the toast.
                     LOG.exception(
                         f"{class_name} failed to navigate.",
                         url=message.url,
@@ -961,6 +964,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         for task in done:
             if task.exception() is not None:
                 raise t.cast(Exception, task.exception())
+    except (WebSocketDisconnect, ConnectionClosedError):
+        # Expected teardown: the frontend closed its live-stream tab. The child loop
+        # already logged this at debug (frontend_to_backend) before re-raising it here.
+        LOG.debug(f"{class_name} frontend disconnected; ending message channel stream.", **message_channel.identity)
     except Exception:
         LOG.exception(f"{class_name} An exception occurred in loop message channel stream.", **message_channel.identity)
     finally:

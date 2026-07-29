@@ -6,6 +6,7 @@ the dir must be rebound to downloads/<workflow_run_id>/ so downloads land
 run-scoped and the listener logs the real run identity.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -236,18 +237,18 @@ async def test_apply_download_behaviour_falls_back_to_workflow_run_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_listener_logs_run_identity_from_context() -> None:
+async def test_listener_logs_run_identity_from_context(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
     def capture_log(_msg: str, **kwargs: object) -> None:
         captured.update(kwargs)
 
+    extensionless_file = tmp_path / "statement"
+    extensionless_file.write_bytes(b"data")
     download = MagicMock()
-    download.suggested_filename = "statement.pdf"
+    download.suggested_filename = "statement"
     download.url = "https://example.com/d"
-    path = MagicMock()
-    path.suffix = ""
-    download.path = AsyncMock(return_value=path)
+    download.path = AsyncMock(return_value=extensionless_file)
 
     captured_handler: dict[str, object] = {}
 
@@ -277,18 +278,18 @@ async def test_listener_logs_run_identity_from_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_listener_falls_back_to_kwargs_without_context() -> None:
+async def test_listener_falls_back_to_kwargs_without_context(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
     def capture_log(_msg: str, **kwargs: object) -> None:
         captured.update(kwargs)
 
+    extensionless_file = tmp_path / "statement"
+    extensionless_file.write_bytes(b"data")
     download = MagicMock()
-    download.suggested_filename = "statement.pdf"
+    download.suggested_filename = "statement"
     download.url = "https://example.com/d"
-    path = MagicMock()
-    path.suffix = ""
-    download.path = AsyncMock(return_value=path)
+    download.path = AsyncMock(return_value=extensionless_file)
 
     captured_handler: dict[str, object] = {}
     browser_context = MagicMock()
