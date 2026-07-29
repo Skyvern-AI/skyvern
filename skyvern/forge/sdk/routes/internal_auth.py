@@ -41,9 +41,12 @@ def _is_local_request(request: Request) -> bool:
     except ValueError:
         LOG.warning("Invalid IP address in request", host=host)
         return False
-    # Check if request is from Docker host (gateway IP)
-    # Docker typically uses 172.x.x.x or 192.168.x.x for bridge networks
-    is_local = addr.is_loopback or addr.is_private
+    # Only loopback (127.0.0.1 / ::1) is trusted as local. Private RFC1918
+    # addresses (e.g. a Docker bridge address like 172.17.0.2) must NOT bypass
+    # the localhost-only gate: these internal routes mint/return a real API key,
+    # so trusting the whole private network is a credential-disclosure hole.
+    # See Skyvern-AI/skyvern#6890.
+    is_local = addr.is_loopback
     LOG.info(
         "Checking if request is local",
         host=host,
