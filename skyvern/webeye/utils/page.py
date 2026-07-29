@@ -88,37 +88,9 @@ def _wrap_js_in_isolated_scope(script: str) -> str:
     # lexical binding with the same name. Scope the script in an IIFE and export via
     # property writes, which never collide; typeof guards drop names the column-0 regex
     # matched inside block comments.
-    # Export via defineProperty, never a bare assignment. A page that installs a setter on one of
-    # these globals BEFORE injection has `globalThis.x = x` hand it our genuine function
-    # synchronously, letting it serve a wrapper from a getter and drive our own builder with
-    # arguments we never passed (SKY-12875 M2: forcing destination capture on in disabled mode).
-    # defineProperty redefines the slot instead of invoking a setter.
     names = sorted(set(_JS_TOP_LEVEL_DECL_RE.findall(script)))
-    exporter = """
-const __skyvernExport = (name, value) => {
-  const existing = Object.getOwnPropertyDescriptor(globalThis, name);
-  if (existing && !existing.configurable) {
-    // A page's own top-level `var element = ...` makes a non-configurable WRITABLE data property,
-    // and several exported names are ordinary words — so this case is ordinary pages, not attack,
-    // and a plain write is correct there (a data property has no setter to invoke). A locked
-    // ACCESSOR is the interposition this export exists to refuse, and a locked read-only slot
-    // would silently leave the page's value in place; both fail loudly instead.
-    if (existing.get || existing.set || !existing.writable) {
-      throw new Error("skyvern: refusing to export over locked global " + name);
-    }
-    globalThis[name] = value;
-    return;
-  }
-  Object.defineProperty(globalThis, name, {
-    value,
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
-};
-"""
-    exports = "\n".join(f'if (typeof {name} !== "undefined") __skyvernExport("{name}", {name});' for name in names)
-    return f"(() => {{\n{script}\n{exporter}\n{exports}\n}})();"
+    exports = "\n".join(f'if (typeof {name} !== "undefined") globalThis.{name} = {name};' for name in names)
+    return f"(() => {{\n{script}\n{exports}\n}})();"
 
 
 def load_js_script() -> str:
