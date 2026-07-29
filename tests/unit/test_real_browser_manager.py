@@ -151,9 +151,10 @@ async def test_non_pbs_workflow_run_cache_hit_on_second_call() -> None:
 
 @pytest.mark.asyncio
 async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
-    """Non-PBS child runs must still inherit the parent's browser when no browser_session_id."""
+    """Non-PBS child runs must still inherit a healthy parent browser when no browser_session_id."""
     manager = RealBrowserManager()
     parent_state = MagicMock()
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
     manager.pages["wfr_parent"] = parent_state
 
     workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
@@ -168,6 +169,46 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
     # Both entries should be synced
     assert manager.pages["wfr_child"] is parent_state
     assert manager.pages["wfr_parent"] is parent_state
+
+
+@pytest.mark.asyncio
+async def test_child_run_does_not_adopt_stale_sibling_browser_without_page() -> None:
+    """A parent_workflow_run_id entry is shared by every child run of the same parent.
+
+    When independent child runs are dispatched to one long-lived worker (e.g. a
+    sequential fan-out), a later child can find an earlier, already-completed
+    sibling's torn-down browser under the parent key. It must NOT be adopted:
+    its page is gone, so the first browser block would raise
+    ``MissingBrowserStatePage`` ("Browser state page is missing"). The manager
+    must instead evict the stale entry and create a fresh browser for the run.
+    """
+    manager = RealBrowserManager()
+    # Sibling C1 completed and left a torn-down browser under the shared parent key.
+    stale_state = MagicMock()
+    stale_state.get_working_page = AsyncMock(return_value=None)
+    manager.pages["wfr_parent"] = stale_state
+
+    workflow_run = make_workflow_run("wfr_child_2", parent_workflow_run_id="wfr_parent")
+
+    fresh_state = MagicMock()
+    fresh_state.get_or_create_page = AsyncMock()
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as mock_create:
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id=None,
+        )
+
+    # A brand-new browser must be created, not the stale sibling state.
+    mock_create.assert_awaited_once()
+    assert result is fresh_state
+    assert result is not stale_state
+    # The fresh browser gets a page (the parent early-return path skips this).
+    fresh_state.get_or_create_page.assert_awaited_once()
+    # The stale entry must be replaced by the fresh browser, not left dangling.
+    assert manager.pages["wfr_child_2"] is fresh_state
+    assert manager.pages["wfr_parent"] is fresh_state
 
 
 def make_task(
@@ -720,6 +761,7 @@ async def test_non_pbs_workflow_run_does_not_rebind() -> None:
     """The own-browser (no browser_session_id) path must run zero new download-rebind code (SKY-11083 regression guard)."""
     manager = RealBrowserManager()
     parent_state = MagicMock()
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
     manager.pages["wfr_parent"] = parent_state
 
     workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
