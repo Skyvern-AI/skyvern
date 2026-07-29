@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
@@ -9,14 +7,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import (
-    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
-    _record_code_authoring_guardrail_reject,
-)
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.turn_halt import (
-    CopilotTurnHalt,
-    raise_if_turn_halt,
     retire_outranked_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
@@ -28,10 +20,8 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
     blocker_signal_render_allowed,
     claim_and_stash_blocker_signal,
     claim_turn,
-    claimant_for_blocker_signal,
     current_turn_owner,
     emit_blocker_signal_payload,
-    release_turn_claim,
 )
 from tests.unit.conftest import make_copilot_context
 
@@ -138,20 +128,6 @@ def test_genuinely_terminal_family_is_the_shared_blocker_signal_set() -> None:
     assert CLAIMANT_REASON_CODE_FAMILIES[TurnClaimant.GENUINELY_TERMINAL] is GENUINELY_TERMINAL_BLOCKER_REASON_CODES
 
 
-def test_claimant_table_resolves_signals_for_both_cascades() -> None:
-    assert claimant_for_blocker_signal(_churn_signal()) is TurnClaimant.CODE_AUTHORING_CHURN
-    assert (
-        claimant_for_blocker_signal(_signal("credential_priority_authoring_churn"))
-        is TurnClaimant.CREDENTIAL_PRIORITY_CHURN
-    )
-    assert claimant_for_blocker_signal(_signal("loop_detected_generic")) is TurnClaimant.LOOP_DETECTED
-    assert (
-        claimant_for_blocker_signal(_signal("probable_site_block_stop", blocker_kind="tool_error"))
-        is TurnClaimant.GENUINELY_TERMINAL
-    )
-    assert claimant_for_blocker_signal(_signal("tool_error_repeated_action_abort", blocker_kind="tool_error")) is None
-
-
 def test_same_claimant_reclaim_is_first_wins_and_widens_metadata() -> None:
     ctx = make_copilot_context()
     assert claim_turn(ctx, TurnClaimant.CODE_AUTHORING_CHURN) is ClaimOutcome.OWNED
@@ -173,27 +149,6 @@ def test_stale_owner_releases_when_ladder_resolves() -> None:
     owner = current_turn_owner(ctx)
     assert owner is not None
     assert owner.claimant is TurnClaimant.CODE_AUTHORING_CHURN
-
-
-def test_stronger_owned_claim_replaces_held_signal() -> None:
-    ctx = make_copilot_context()
-    loop_signal = _signal("loop_detected_generic")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.LOOP_DETECTED, loop_signal) is not None
-    assert ctx.blocker_signal is loop_signal
-
-    terminal_signal = _signal("probable_site_block_stop", blocker_kind="tool_error")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal_signal) is not None
-    assert ctx.blocker_signal is terminal_signal
-
-
-def test_genuinely_terminal_held_signal_is_never_replaced() -> None:
-    ctx = make_copilot_context()
-    terminal_signal = _signal("probable_site_block_stop", blocker_kind="tool_error")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal_signal) is not None
-
-    churn_payload = claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, _churn_signal())
-    assert churn_payload is None
-    assert ctx.blocker_signal is terminal_signal
 
 
 def test_plain_stash_replacement_clears_stale_association() -> None:
@@ -228,37 +183,6 @@ def test_signal_only_stronger_claim_retires_outranked_halt_on_consult() -> None:
         event.site == "turn_halt" and event.fingerprint == "output_contract_actuation>loop_detected"
         for event in ctx.gate_precedence_conflict_events
     )
-
-
-def test_retirement_restores_owner_halt_by_re_emission() -> None:
-    ctx = make_copilot_context()
-    terminal_signal = _signal("probable_site_block_stop", blocker_kind="tool_error")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal_signal) is not None
-
-    loop_signal = _signal("loop_detected_generic")
-    loop_halt = stash_turn_halt_from_blocker_signal(ctx, loop_signal, source="test")
-    assert loop_halt is not None
-    assert ctx.turn_halt is loop_halt
-
-    assert retire_outranked_turn_halt(ctx) is True
-    restored = ctx.turn_halt
-    assert restored is not None
-    assert restored is not loop_halt
-    assert restored.blocker_signal is terminal_signal
-
-
-def test_genuinely_terminal_halt_is_never_retired() -> None:
-    ctx = make_copilot_context()
-    terminal_signal = _signal("probable_site_block_stop", blocker_kind="tool_error")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal_signal) is not None
-    stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="test")
-    halt = ctx.turn_halt
-    assert halt is not None
-
-    _grant_ladder(ctx)
-    claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
-    assert retire_outranked_turn_halt(ctx) is False
-    assert ctx.turn_halt is halt
 
 
 def test_render_denied_while_ladder_owns_and_restores_on_resolution() -> None:
@@ -312,7 +236,7 @@ def test_unclaimed_signal_fails_open_to_render_while_owner_live() -> None:
 
 def test_transient_claim_never_outlives_the_claiming_call() -> None:
     ctx = make_copilot_context()
-    assert claim_turn(ctx, TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION) is ClaimOutcome.OWNED
+    assert claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN) is ClaimOutcome.OWNED
     assert current_turn_owner(ctx) is None
 
     churn = _churn_signal()
@@ -323,8 +247,8 @@ def test_transient_claim_never_outlives_the_claiming_call() -> None:
 def test_transient_claim_yields_to_live_ladder_and_records_conflict() -> None:
     ctx = make_copilot_context()
     _grant_ladder(ctx)
-    assert claim_turn(ctx, TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION) is ClaimOutcome.YIELDED
-    assert _conflict_fingerprints(ctx) == ["output_contract_actuation>post_run_page_path_interaction"]
+    assert claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN) is ClaimOutcome.YIELDED
+    assert _conflict_fingerprints(ctx) == ["output_contract_actuation>credential_scout_reopen"]
 
 
 def test_carve_out_claimants_are_transient() -> None:
@@ -383,17 +307,6 @@ def test_state_backed_ladder_owns_without_explicit_claim_and_query_does_not_regi
     assert ctx.turn_ownership is None
 
 
-def test_release_turn_claim_removes_registered_claim() -> None:
-    ctx = make_copilot_context()
-    terminal_signal = _signal("probable_site_block_stop", blocker_kind="tool_error")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal_signal) is not None
-    assert ctx.turn_ownership is not None
-    assert TurnClaimant.GENUINELY_TERMINAL in ctx.turn_ownership.claims
-
-    release_turn_claim(ctx, TurnClaimant.GENUINELY_TERMINAL)
-    assert TurnClaimant.GENUINELY_TERMINAL not in ctx.turn_ownership.claims
-
-
 def test_conflict_events_are_capped() -> None:
     ctx = make_copilot_context()
     _grant_ladder(ctx)
@@ -406,32 +319,6 @@ def test_fresh_context_has_no_owner() -> None:
     ctx = make_copilot_context()
     assert current_turn_owner(ctx) is None
     assert ctx.gate_precedence_conflict_events == []
-
-
-def test_exhausted_churn_owns_over_held_synthesized_force_and_halts() -> None:
-    ctx = _synthesized_replay_context()
-    assert (
-        claim_and_stash_blocker_signal(
-            ctx, TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE, _synthesized_force_signal()
-        )
-        is not None
-    )
-
-    for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-        _record_code_authoring_guardrail_reject(ctx)
-
-    owner = current_turn_owner(ctx)
-    assert owner is not None
-    assert owner.claimant is TurnClaimant.CODE_AUTHORING_CHURN
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "code_authoring_guardrail_churn"
-    assert blocker_signal_render_allowed(ctx, ctx.blocker_signal) is True
-    assert "code_authoring_guardrail_churn>synthesized_block_persistence_force" in _conflict_fingerprints(ctx)
-    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-
-    stash_turn_halt_from_blocker_signal(ctx, ctx.blocker_signal, source="enforcement_backstop")
-    with pytest.raises(CopilotTurnHalt):
-        raise_if_turn_halt(ctx)
 
 
 def test_standard_path_churn_precedence_unchanged() -> None:

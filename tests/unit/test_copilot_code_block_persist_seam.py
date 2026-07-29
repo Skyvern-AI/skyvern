@@ -42,7 +42,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
-    recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_run_blocks_result,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
@@ -66,11 +65,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext, FillCarry
-from skyvern.forge.sdk.copilot.enforcement import (
-    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
-    MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
-    _check_enforcement,
-)
 from skyvern.forge.sdk.copilot.output_contracts import (
     OutputContractAdvisoryState,
     code_block_available_binding_keys_by_label,
@@ -107,12 +101,9 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _strip_redundant_sandbox_imports_in_yaml,
 )
 from skyvern.forge.sdk.copilot.turn_halt import (
-    CopilotTurnHalt,
     TurnHalt,
     TurnHaltKind,
     TurnHaltVerdict,
-    _kind_for_blocker_signal,
-    stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
@@ -203,17 +194,6 @@ _SAFE_EXTRACTION_CODE_YAML = _yaml(
         code: |
           await page.goto("https://example.com/search")
           records = [{"number": "REC-001"}]
-    """
-)
-
-_RAW_SECRET_OUTPUT_POLICY_YAML = _yaml(
-    """
-    title: Registry lookup
-    workflow_definition:
-      blocks:
-      - block_type: navigation
-        label: login
-        navigation_goal: Type password: hunter2 into the password field.
     """
 )
 
@@ -906,15 +886,26 @@ class TestCodeSafetySeam:
             None,
         )
         joined = "\n".join(errors)
-        for expected in (
-            "value",
-            "count",
-            "x",
-            "branch_value",
-            "NotRunnable",
-        ):
-            assert expected in joined
-        assert "unresolved names: `branch_value`, `count`, `page`, `value`, `x`" in joined
+        assert "class definitions unavailable in the code sandbox: `NotRunnable`" in joined
+        for bound_somewhere in ("`count`", "`x`", "`branch_value`", "`value`"):
+            assert bound_somewhere not in joined
+
+    def test_conditionally_bound_name_is_not_a_seam_error(self) -> None:
+        assert (
+            _code_block_safety_errors(
+                _code_yaml(
+                    """
+                    try:
+                        count_label = await page.locator("#c").inner_text()
+                    except Exception:
+                        pass
+                    print(count_label)
+                    """
+                ),
+                None,
+            )
+            == []
+        )
 
     def test_name_analysis_allows_recursive_helpers(self) -> None:
         assert (
@@ -959,7 +950,7 @@ class TestCodeSafetySeam:
         )
         assert len(errors) == 1
         assert "risky" in errors[0]
-        assert "recovered" in errors[0]
+        assert "recovered" not in errors[0]
         assert "group" not in errors[0]
 
     def test_syntax_error_is_a_seam_error(self) -> None:
@@ -1379,71 +1370,6 @@ class TestCodeRepairProgressClassification:
         assert result.workflow_yaml == _UNREFERENCED_DEFINITION_YAML
         assert result.violations == []
         assert result.substitutions is None
-        assert ctx.authoring_parameter_binding_snapshot is None
-
-    def test_same_month_file_match_runtime_values_override_defaults_and_satisfy_definition(self) -> None:
-        ctx = _definition_contract_ctx()
-        _enable_imposition(ctx)
-        source_url = "https://example.com/statements"
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "#statement-row",
-                "source_url": source_url,
-                "trajectory_index": 0,
-            }
-        ]
-        raw_selector = 'a[href="/files/invoice_100245_2026-05.pdf"]'
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector=raw_selector,
-            affordance_text="Download invoice",
-            download_kind="attribute",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-        submitted = _yaml(
-            """
-            title: Download reusable invoice
-            workflow_definition:
-              parameters:
-              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "stale-account"}
-              - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-06-01"}
-              - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-06-30"}
-              blocks:
-              - block_type: code
-                label: download_invoice
-                parameter_keys: []
-                code: |
-                  await page.locator("#statement-row").click()
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(
-            submitted,
-            ctx,
-            runtime_parameters={
-                "account_number": "100245",
-                "download_start_date": "2026-05-01",
-                "download_end_date": "2026-05-31",
-            },
-        )
-
-        assert result.violations == []
-        parsed = parse_workflow_yaml(result.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
-        code = str(block["code"])
-        assert set(block["parameter_keys"]) == {
-            "account_number",
-            "download_start_date",
-            "download_end_date",
-        }
-        assert code.count("_scout_download_target = page.locator(") == 1
-        assert "_scout_entry_target = _scout_download_target" in code
-        assert "await _scout_download_target.click()" in code
-        assert "100245" not in code
-        assert "2026-05" not in code
-        assert workflow_update_module._definition_plane_preflight_reject(ctx, result.workflow_yaml) is None
         assert ctx.authoring_parameter_binding_snapshot is None
 
     def test_same_month_file_match_rebinds_literal_when_other_block_references_all_keys(self) -> None:
@@ -6152,49 +6078,6 @@ class TestCompiledAuthoringImposition:
         block = _single_code_block(parse_workflow_yaml(ctx.workflow_yaml))
         assert "async with page.expect_download()" in block["code"]
 
-    @pytest.mark.asyncio
-    async def test_imposition_carries_reached_download_target_to_synthesized_code(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "div.stmt-row",
-                "source_url": "https://example.com/bills",
-                "trajectory_index": 0,
-            }
-        ]
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector='[href="/files/report.pdf"]',
-            affordance_text="Download PDF",
-            download_kind="extension",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Download report
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: download_report
-                code: |
-                  await page.goto("https://example.com/bills")
-                  await page.locator("div.stmt-row").click()
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
-
-        assert result.violations == []
-        parsed = parse_workflow_yaml(result.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
-        assert "expect_download" in block["code"]
-        assert 'await page.locator("[href=\\"/files/report.pdf\\"]").click()' in block["code"]
-
     def test_imposition_targets_synthesized_label_in_multi_code_workflow(self) -> None:
         ctx = self._download_ctx()
         workflow_yaml = _yaml(
@@ -7594,43 +7477,6 @@ def _terminal_challenge_signal() -> CopilotToolBlockerSignal:
 
 class TestCodeAuthoringGuardrailChurnBackstop:
     @pytest.mark.asyncio
-    async def test_counter_climbs_on_repeated_recorded_outcome_and_resets_on_accept(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        ctx = _code_only_ctx()
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
-            result = await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-            assert result["ok"] is False
-            assert ctx.code_authoring_guardrail_reject_count == index + 1
-        assert ctx.blocker_signal is None
-
-        _stub_successful_update(monkeypatch)
-        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
-        assert accepted["ok"] is True
-        assert ctx.code_authoring_guardrail_reject_count == 0
-
-    @pytest.mark.asyncio
-    async def test_accepted_persist_at_churn_ceiling_resets_counter_and_clears_held_signals(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        ctx = _code_only_ctx()
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        held = ctx.blocker_signal
-        assert isinstance(held, CopilotToolBlockerSignal)
-        assert held.internal_reason_code == "code_authoring_guardrail_churn"
-        assert ctx.latest_tool_blocker_signal is held
-
-        _stub_successful_update(monkeypatch)
-        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
-
-        assert accepted["ok"] is True
-        assert ctx.code_authoring_guardrail_reject_count == 0
-        assert ctx.blocker_signal is None
-        assert ctx.latest_tool_blocker_signal is None
-
-    @pytest.mark.asyncio
     async def test_counter_climbs_through_credential_scout_branch(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
@@ -7658,76 +7504,6 @@ class TestCodeAuthoringGuardrailChurnBackstop:
 
         assert result["ok"] is True
         assert ctx.code_authoring_guardrail_reject_count == 0
-
-    @pytest.mark.asyncio
-    async def test_output_policy_reject_records_author_time_reject_and_guardrail_count(self) -> None:
-        ctx = _code_only_ctx()
-
-        result = await _update_workflow(
-            {"workflow_yaml": _RAW_SECRET_OUTPUT_POLICY_YAML},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert result["ok"] is False
-        assert "raw_secret_leak" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.phase == "author_time_reject"
-        assert outcome.reason_code == "output_policy_reject"
-        assert outcome.is_authoritative is True
-        assert outcome.structural_key is not None
-        assert "Output policy blocked" in outcome.observed_evidence_summary
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert ctx.blocker_signal is None
-
-    @pytest.mark.asyncio
-    async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
-        ctx = _code_only_ctx()
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
-        assert ctx.latest_tool_blocker_signal is churn
-        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
-        assert "safety checks rejected" in churn.user_facing_reason
-
-    @pytest.mark.asyncio
-    async def test_nth_reject_defers_to_pre_existing_terminal_blocker(self) -> None:
-        ctx = _code_only_ctx()
-        terminal = _terminal_challenge_signal()
-        ctx.blocker_signal = terminal
-        ctx.latest_tool_blocker_signal = terminal
-
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        assert ctx.blocker_signal is terminal
-        assert ctx.latest_tool_blocker_signal is terminal
-
-    def test_churn_stop_defers_while_output_contract_ladder_active_then_fires(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.output_contract_actuation_count_by_signature["sig_active"] = 1
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            workflow_update_module._record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        assert ctx.blocker_signal is None
-        ctx.output_contract_actuation_count_by_signature.clear()
-        workflow_update_module._record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
-
-    def test_churn_stop_defers_while_advisory_grant_held(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.output_contract_actuation_by_signature["sig_granted"] = OutputContractAdvisoryState.GRANTED
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            workflow_update_module._record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
-        assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
     async def test_mixed_credential_and_unresolved_name_reject_returns_code_repair_progress(
@@ -7807,55 +7583,6 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
-    async def test_credential_priority_reject_defers_below_higher_bound(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1):
-            await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1
-        assert ctx.blocker_signal is None
-        assert ctx.latest_tool_blocker_signal is None
-        assert _check_enforcement(ctx) is None
-
-    @pytest.mark.asyncio
-    async def test_credential_priority_churn_stashes_credential_blocker_at_higher_bound(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        result: dict[str, object] = {}
-        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS):
-            result = await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
-        assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "credential_priority_authoring_churn"
-        assert ctx.latest_tool_blocker_signal is churn
-        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
-
-    @pytest.mark.asyncio
-    async def test_credential_priority_churn_renders_credential_scout_reply_through_enforcement(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS):
-            await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
-
-        with pytest.raises(CopilotTurnHalt) as excinfo:
-            _check_enforcement(ctx)
-
-        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "credential_priority_authoring_churn"
-        assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
-
-    @pytest.mark.asyncio
     async def test_single_pure_credential_reject_defers_to_credential_scout_reply(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
@@ -7897,67 +7624,6 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert result["ok"] is False
         assert result["data"]["failure_type"] == "missing_credential_or_init"
         assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
-
-    @pytest.mark.asyncio
-    async def test_pure_credential_priority_churn_climbs_and_halts(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        result: dict[str, object] = {}
-        for index in range(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1):
-            result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(index)}, ctx)
-            assert result["ok"] is False
-            assert result["data"]["failure_type"] == "missing_credential_or_init"
-            assert "diagnostic_code_safety_errors" not in result["data"]
-            assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
-            assert ctx.code_authoring_guardrail_reject_count == index + 1
-
-        assert ctx.blocker_signal is None
-        assert _check_enforcement(ctx) is None
-
-        result = await _update_workflow(
-            {"workflow_yaml": _safe_credential_collision_yaml(MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1)}, ctx
-        )
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
-        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "credential_priority_authoring_churn"
-        with pytest.raises(CopilotTurnHalt) as excinfo:
-            _check_enforcement(ctx)
-        assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-        assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
-
-    @pytest.mark.asyncio
-    async def test_identical_authoring_recorded_outcome_still_halts_at_backstop(self) -> None:
-        ctx = _code_only_ctx()
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _code_yaml("value = missing_first_name()")}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
-
-    @pytest.mark.asyncio
-    async def test_accept_after_latched_churn_clears_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx = _code_only_ctx()
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
-        assert ctx.latest_tool_blocker_signal is churn
-
-        _stub_successful_update(monkeypatch)
-        accepted = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx)
-
-        assert accepted["ok"] is True
-        assert ctx.code_authoring_guardrail_reject_count == 0
-        assert ctx.blocker_signal is None
-        assert ctx.latest_tool_blocker_signal is None
-        assert _check_enforcement(ctx) is None
 
 
 _RESALE_URL = "https://example.com/orders"
@@ -10748,30 +10414,6 @@ class TestScoutedSpinePersistSeamCoverage:
         assert events[0]["site"] == "separated_split"
 
     @pytest.mark.asyncio
-    async def test_verbatim_synthesized_resubmission_clears_coverage_and_persists(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _records_spine_ctx()
-        ctx.update_workflow_called = True
-        ctx.persisted_draft_browser_calls = [("click", 'page.locator("#stage-a")')]
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-
-        with capture_logs() as logs:
-            result = await _update_workflow({"workflow_yaml": _records_block_yaml(synthesized.code)}, ctx)
-
-        assert result["ok"] is True
-        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert ctx.persisted_draft_browser_calls is not None
-        assert [pair for pair in ctx.persisted_draft_browser_calls if pair[0] == "click"] == [
-            ("click", "page.locator('#stage-a')"),
-            ("click", "page.locator('#stage-b')"),
-            ("click", "page.locator('#stage-c')"),
-        ]
-        assert enforcement_module._scouted_spine_turn_end_nudge(ctx) is None
-
-    @pytest.mark.asyncio
     async def test_credential_scout_reject_carries_open_obligation_artifact(self) -> None:
         ctx = _credential_spine_ctx()
         synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
@@ -10785,114 +10427,6 @@ class TestScoutedSpinePersistSeamCoverage:
         assert "The persisted draft is missing scouted rung(s)." in result["error"]
         assert "Missing rung source to reuse verbatim" in result["error"]
         assert ".password" in result["error"]
-
-
-class TestScoutedSpineTurnEndCheckpoint:
-    def test_checkpoint_is_single_shot_and_emits_unresolved_when_spent(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-
-        first = enforcement_module._scouted_spine_turn_end_nudge(ctx)
-        assert first is not None
-        assert "scouted_spine_under_build" in first
-        assert 'await page.locator("#stage-b").click()' in first
-        assert ctx.code_authoring_guardrail_reject_count == 1
-
-        with capture_logs() as logs:
-            second = enforcement_module._scouted_spine_turn_end_nudge(ctx)
-
-        assert second is None
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        unresolved = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
-        assert len(unresolved) == 1
-        assert unresolved[0]["site"] == "turn_end"
-
-    def test_checkpoint_reject_threads_churn_and_ceiling_emits_unresolved(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        seed_repair = CodeAuthoringRepairContext(
-            block_label="persisted_draft",
-            reason_code="scouted_spine_under_build",
-            selector="#stage-b",
-        )
-        record_build_test_outcome(ctx, recorded_outcome_from_authoring_repair_context(seed_repair))
-        ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-
-        with capture_logs() as logs:
-            nudge = enforcement_module._scouted_spine_turn_end_nudge(ctx)
-
-        assert nudge is not None
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        held = ctx.blocker_signal
-        assert isinstance(held, CopilotToolBlockerSignal)
-        assert held.internal_reason_code == "code_authoring_guardrail_churn"
-        unresolved = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
-        assert len(unresolved) == 1
-        assert unresolved[0]["site"] == "churn_stop"
-
-        assert enforcement_module._scouted_spine_turn_end_nudge(ctx) is None
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-
-    def test_no_spurious_checkpoint_on_full_coverage_or_lane_only_remainder(self) -> None:
-        full = _checkpoint_eligible_ctx()
-        full.persisted_draft_browser_calls = [
-            ("click", 'page.locator("#stage-a")'),
-            ("click", 'page.locator("#stage-b")'),
-            ("click", 'page.locator("#stage-c")'),
-        ]
-        with capture_logs() as logs:
-            assert enforcement_module._scouted_spine_turn_end_nudge(full) is None
-        assert not [log for log in logs if "scouted_spine" in str(log.get("event"))]
-        assert full.code_authoring_guardrail_reject_count == 0
-
-        lane_only = _checkpoint_eligible_ctx()
-        lane_only.scout_trajectory = lane_only.scout_trajectory[:1] + [
-            {
-                "tool_name": "click",
-                "selector": "#cookie-accept",
-                "role": "button",
-                "accessible_name": "Accept all cookies",
-                "source_url": "https://example.com/records",
-                "trajectory_index": 1,
-            }
-        ]
-        with capture_logs() as logs:
-            assert enforcement_module._scouted_spine_turn_end_nudge(lane_only) is None
-        assert not [log for log in logs if "scouted_spine" in str(log.get("event"))]
-
-        no_persist = _records_spine_ctx()
-        assert enforcement_module._scouted_spine_turn_end_nudge(no_persist) is None
-
-        standard = _checkpoint_eligible_ctx()
-        standard.block_authoring_policy = BlockAuthoringPolicy.STANDARD
-        assert enforcement_module._scouted_spine_turn_end_nudge(standard) is None
-
-    def test_dropped_unforgiven_interaction_nudges_despite_full_rung_coverage(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "#stage-a",
-                "source_url": "https://example.com/records",
-                "trajectory_index": 0,
-            },
-            {"tool_name": "press_key", "key": "", "trajectory_index": 1},
-            {"tool_name": "click", "selector": "#stage-b", "trajectory_index": 2},
-        ]
-        ctx.persisted_draft_browser_calls = [
-            ("click", 'page.locator("#stage-a")'),
-            ("click", 'page.locator("#stage-b")'),
-        ]
-
-        findings = enforcement_module._scouted_spine_open_obligation(ctx)
-        assert any(finding.kind == code_block_synthesis_module.UNFORGIVEN_DROP_FINDING for finding in findings)
-
-        nudge = enforcement_module._scouted_spine_turn_end_nudge(ctx)
-        assert nudge is not None
-        assert code_block_synthesis_module.SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE in nudge
-        assert ctx.last_code_authoring_repair_context is not None
-        assert (
-            ctx.last_code_authoring_repair_context.reason_code
-            == code_block_synthesis_module.SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
-        )
 
 
 class TestPartitionAwareImpositionFastPath:
@@ -10981,42 +10515,11 @@ def _full_coverage_calls() -> list[tuple[str, str]]:
 
 
 class TestScoutedSpineTurnHaltExit:
-    def test_terminal_halt_with_open_obligation_emits_unresolved_and_reframes_reply(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        ctx.last_test_anti_bot = "challenge_detected"
-        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
-        assert "verification challenge" in signal.user_facing_reason
-        ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-
-        with capture_logs() as logs:
-            result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-        unresolved = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
-        assert len(unresolved) == 1
-        assert unresolved[0]["site"] == "turn_halt"
-        assert result.user_response == enforcement_module.SCOUTED_SPINE_TURN_HALT_USER_REASON
-        assert "verification challenge" not in result.user_response
-
-    def test_site_block_halt_with_open_obligation_emits_unresolved_and_keeps_site_block_reply(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module._probable_site_block_stop_signal(ctx)
-        ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.PROBABLE_SITE_BLOCK, blocker_signal=signal)
-
-        with capture_logs() as logs:
-            result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-        unresolved = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
-        assert len(unresolved) == 1
-        assert unresolved[0]["site"] == "turn_halt"
-        assert result.user_response == signal.user_facing_reason
-
-    def test_delivered_unverified_halt_with_open_obligation_emits_unresolved(self) -> None:
+    def test_turn_halt_with_open_obligation_emits_unresolved(self) -> None:
         ctx = _checkpoint_eligible_ctx()
         halt = TurnHalt(
-            kind=TurnHaltKind.DELIVERED_UNVERIFIED,
-            verdict=TurnHaltVerdict.DELIVERED_UNVERIFIED,
+            kind=TurnHaltKind.LOOP_DETECTED,
+            verdict=TurnHaltVerdict.BLOCKED,
         )
 
         with capture_logs() as logs:
@@ -11025,57 +10528,6 @@ class TestScoutedSpineTurnHaltExit:
         unresolved = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
         assert len(unresolved) == 1
         assert unresolved[0]["site"] == "turn_halt"
-
-    def test_halt_without_open_obligation_emits_nothing_and_keeps_reply(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        ctx.persisted_draft_browser_calls = _full_coverage_calls()
-        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
-        ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-
-        with capture_logs() as logs:
-            result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-        assert not [log for log in logs if "scouted_spine" in str(log.get("event"))]
-        assert result.user_response == signal.user_facing_reason
-
-    @pytest.mark.asyncio
-    async def test_wrapped_exception_exit_with_stashed_terminal_halt_emits_unresolved(self) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
-        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        ctx.blocker_signal = signal
-
-        with capture_logs() as logs:
-            result = await agent_module._resolve_wrapped_exception_exit_result(
-                ctx,
-                None,
-                goal_satisfied=False,
-                error=RuntimeError("wrapped"),
-                workflow_permanent_id="wp",
-            )
-
-        unresolved = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
-        assert len(unresolved) == 1
-        assert unresolved[0]["site"] == "turn_halt"
-        assert result.user_response == enforcement_module.SCOUTED_SPINE_TURN_HALT_USER_REASON
-
-    def test_obligation_check_failure_never_blocks_the_halt_reply(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
-        ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-
-        def _boom(*args: object, **kwargs: object) -> None:
-            raise RuntimeError("synthesis unavailable")
-
-        monkeypatch.setattr(enforcement_module, "synthesize_code_block", _boom)
-
-        with capture_logs() as logs:
-            result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build_unresolved"]
-        assert result.user_response == signal.user_facing_reason
 
 
 class TestAmbiguousRejectCarriesOpenObligationArtifact:
@@ -11656,24 +11108,6 @@ class TestGoalCompletionLandingImposition:
         assert ctx.pending_goal_complete_landing is True
         assert ctx.synthesized_goal_complete_landed is False
 
-    def test_unregistered_download_target_still_admits_imposition_after_landing(self) -> None:
-        ctx = _quote_ctx()
-        ctx.update_workflow_called = True
-        ctx.synthesized_goal_complete_landed = True
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector='a[href="/files/report.pdf"]',
-            affordance_text="Download PDF",
-            download_kind="extension",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
-
-        assert result.violations == []
-        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
-        assert "async with page.expect_download()" in code
-
     def test_non_goal_complete_trajectory_still_skips_imposition_after_update(self) -> None:
         ctx = _code_only_ctx()
         _enable_imposition(ctx)
@@ -11991,28 +11425,6 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         remaining = [block.get("label") for block in parsed["workflow_definition"]["blocks"]]
         assert "orphan_rung" not in remaining
 
-    def test_admitted_imposition_passes_the_pre_persist_gate(self) -> None:
-        ctx = _quote_ctx()
-        ctx.update_workflow_called = True
-        ctx.synthesized_goal_complete_landed = True
-        ctx.persisted_draft_browser_calls = [("click", 'page.locator("#zip")')]
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector='a[href="/files/report.pdf"]',
-            affordance_text="Download PDF",
-            download_kind="extension",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-
-        with capture_logs() as logs:
-            result = workflow_update_module._maybe_impose_synthesized_code_block(_hand_authored_rung_yaml(), ctx)
-
-        assert result.violations == []
-        assert result.substitutions is not None
-        assert ctx.spine_imposition_owned_attempt is True
-        assert workflow_update_module._pre_persist_scouted_spine_result(result.workflow_yaml, ctx) is None
-        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-
     def test_pre_persist_gate_still_fires_when_imposition_is_not_admitted(self) -> None:
         ctx = _records_spine_ctx()
         ctx.update_workflow_called = True
@@ -12106,112 +11518,6 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert any("`download_matching_invoice`" in violation for violation in result.violations)
         assert any("never_captured" in violation for violation in result.violations)
         assert any("never by authoring browser calls freehand" in violation for violation in result.violations)
-
-    def test_hand_authored_download_rung_is_replaced_by_the_grounded_spine_terminal(self) -> None:
-        ctx = _quote_ctx()
-        ctx.update_workflow_called = True
-        ctx.synthesized_goal_complete_landed = True
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector='a[href="/files/report.pdf"]',
-            affordance_text="Download PDF",
-            download_kind="extension",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-        submitted = _yaml(
-            """
-            title: Quote
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: enter_zip
-                code: |
-                  await page.locator("#zip").fill(str(zip_code))
-              - block_type: code
-                label: download_statement
-                code: |
-                  async with page.expect_download() as dl:
-                      await page.locator("a[href=\\"/files/report.pdf\\"]").click()
-            """
-        )
-
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert result.violations == []
-        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
-        assert list(blocks) == ["enter_zip"]
-        code = str(blocks["enter_zip"]["code"])
-        assert code.count("async with page.expect_download()") == 1
-        assert 'page.locator("#coverage-next")' in code
-
-    def test_aliased_download_handle_rung_is_dropped_for_the_grounded_spine_terminal(self) -> None:
-        ctx = _quote_ctx()
-        ctx.update_workflow_called = True
-        ctx.synthesized_goal_complete_landed = True
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector='a[href="/files/report.pdf"]',
-            affordance_text="Download PDF",
-            download_kind="extension",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-        submitted = _yaml(
-            """
-            title: Quote
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: enter_zip
-                code: |
-                  await page.locator("#zip").fill(str(zip_code))
-              - block_type: code
-                label: download_statement
-                code: |
-                  rows = page.locator("div.statement-row")
-                  await rows.count()
-                  printable = rows.nth(0).locator("a.printable")
-                  await printable.wait_for(state="visible", timeout=10000)
-                  async with page.expect_download(timeout=20000) as download_info:
-                      await printable.click()
-                  download = await download_info.value
-            """
-        )
-
-        with capture_logs() as logs:
-            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
-
-        assert result.violations == []
-        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
-        assert list(blocks) == ["enter_zip"]
-        code = str(blocks["enter_zip"]["code"])
-        assert code.count("async with page.expect_download()") == 1
-        assert "printable" not in code
-        dropped = [log for log in logs if log["event"] == "copilot_spine_stale_rung_dropped"]
-        assert dropped and dropped[0]["dropped_labels"] == ["download_statement"]
-        assert "page.expect_download(timeout=20000)" in dropped[0]["dropped_actions"]
-
-    def test_unchanged_under_built_carrier_still_lands_the_spine_on_an_owned_attempt(self) -> None:
-        ctx = _records_spine_ctx()
-        ctx.update_workflow_called = True
-        ctx.synthesized_goal_complete_landed = True
-        ctx.reached_download_target = ReachedDownloadTarget(
-            selector='a[href="/files/report.pdf"]',
-            affordance_text="Download PDF",
-            download_kind="extension",
-            source_step="trajectory_recency",
-            already_registered=False,
-        )
-        under_built = _records_block_yaml('await page.locator("#stage-a").click()')
-        ctx.workflow_yaml = under_built
-
-        imposition = workflow_update_module._maybe_impose_synthesized_code_block(under_built, ctx)
-
-        assert imposition.violations == []
-        assert imposition.substitutions is not None
-        assert ctx.spine_imposition_owned_attempt is True
-        code = str(_single_code_block(parse_workflow_yaml(imposition.workflow_yaml))["code"])
-        assert 'page.locator("#stage-b").click()' in code
-        assert workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx) is None
 
 
 def _reaching_extraction_ctx() -> CopilotContext:

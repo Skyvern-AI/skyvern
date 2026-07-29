@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
-    MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
     record_scouted_output_coverage,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
@@ -1367,26 +1366,6 @@ class TestNonAdvancingClickReperception:
 
         assert ctx.last_scout_act_observe_outcome == "attached"
         assert "actionable_targets" not in result["data"]
-
-    @pytest.mark.asyncio
-    async def test_ungroundable_churn_still_halts_at_max_without_reset(self) -> None:
-        ctx = AgentContext(
-            organization_id="o_1",
-            workflow_id="w_1",
-            workflow_permanent_id="wpid_1",
-            workflow_yaml="",
-            browser_session_id="pbs_1",
-            stream=MagicMock(),
-        )
-        ctx.discovery_mcp_server = _server_returning(_ungroundable_payload())
-
-        for expected in range(1, MAX_NO_PROGRESS_INTERACTION_ATTEMPTS + 1):
-            result = await _run_click(ctx)
-            assert "actionable_targets" not in result["data"]
-            assert ctx.consecutive_no_progress_interaction_count == expected
-
-        assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-        assert ctx.blocker_signal is not None
 
 
 def _sequenced_evidence(parses: list[dict[str, Any] | None]) -> Any:

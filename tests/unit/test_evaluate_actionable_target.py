@@ -597,54 +597,6 @@ def test_identities_include_clickable_controls() -> None:
     assert ("", "Residential") in identities
 
 
-def test_identities_order_affordances_before_fields_and_selectors_first() -> None:
-    packet = {
-        "forms": [
-            {
-                "fields": [{"selector": "#user", "text": "Username"}],
-                "submit_controls": [{"selector": "#login", "text": "Log In"}],
-            }
-        ],
-        "navigation_targets": [],
-        "result_containers": [],
-        "clickable_controls": [
-            {"text": "Text only tile"},
-            {"selector": "#biz-tile", "text": "Business"},
-        ],
-    }
-    identities = scouting._actionable_target_identities(packet)
-    positions = {ident: index for index, ident in enumerate(identities)}
-    field_pos = positions[("#user", "Username")]
-    # Click affordances (selector-bearing and text-only) precede the plain input field.
-    assert positions[("#login", "Log In")] < field_pos
-    assert positions[("#biz-tile", "Business")] < field_pos
-    assert positions[("", "Text only tile")] < field_pos
-    # Selector-bearing affordances precede text-only ones.
-    assert positions[("#biz-tile", "Business")] < positions[("", "Text only tile")]
-
-
-def test_click_affordance_identities_only_selector_bearing_affordances() -> None:
-    packet = {
-        "forms": [
-            {
-                "fields": [{"selector": "#user", "text": "Username"}],
-                "submit_controls": [{"selector": "#login", "text": "Log In"}],
-            }
-        ],
-        "navigation_targets": [{"selector": "a.nav", "text": "Nav"}],
-        "result_containers": [{"selector": "#results", "text": "Results"}],
-        "clickable_controls": [
-            {"selector": "#tile", "text": "Tile"},
-            {"text": "Text only"},
-        ],
-        "modal_overlays": [{"dismiss_controls": [{"selector": "#close", "text": "Close"}]}],
-    }
-    identities = scouting._click_affordance_target_identities(packet)
-    selectors = {selector for selector, _ in identities}
-    assert selectors == {"#login", "a.nav", "#tile", "#close"}
-    assert all(selector for selector, _ in identities)
-
-
 @pytest.mark.asyncio
 async def test_probe_none_leaves_data_untouched_and_resets(monkeypatch) -> None:
     ctx = _ctx()

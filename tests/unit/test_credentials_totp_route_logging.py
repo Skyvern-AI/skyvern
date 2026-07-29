@@ -88,10 +88,110 @@ async def test_send_totp_code_parse_failure_log_redacts_identifier_and_content(
     assert error_log["totp_identifier"] == "[REDACTED_OTP_IDENTIFIER]"
     assert error_log["content_length"] == len(raw_content)
     assert "content" not in error_log
+    assert all(record.get("event") != "Skipping OTP parse; organization has insufficient credits" for record in logs)
     _assert_raw_values_not_logged(logs, raw_identifier, raw_content, "135790")
 
 
-def test_send_totp_code_openapi_declares_distinct_200_and_202_schemas() -> None:
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_fallback_enabled", "raw_content_max_length"),
+    [
+        (False, 1_000),
+        (True, 10),
+    ],
+)
+async def test_send_totp_code_insufficient_credits_returns_402_when_raw_fallback_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_fallback_enabled: bool,
+    raw_content_max_length: int,
+) -> None:
+    raw_identifier = "relay@example.test"
+    raw_content = "Long relayed message without a verification code."
+    create_otp_code = AsyncMock()
+    create_raw_otp_code = AsyncMock()
+    llm_handler = AsyncMock()
+    charge = AsyncMock()
+    monkeypatch.setattr(
+        credentials.app,
+        "DATABASE",
+        _database_with_otp_create(create_otp_code, create_raw_otp_code),
+    )
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            has_sufficient_credit_for_otp_parse=AsyncMock(return_value=False),
+            charge_for_otp_parse=charge,
+        ),
+    )
+    monkeypatch.setattr(credentials.app, "SECONDARY_LLM_API_HANDLER", llm_handler)
+    monkeypatch.setattr(credentials.settings, "TOTP_RAW_FALLBACK_ENABLED", raw_fallback_enabled)
+    monkeypatch.setattr(credentials.settings, "TOTP_RAW_CONTENT_MAX_LENGTH", raw_content_max_length)
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(HTTPException) as exc_info:
+            await credentials.send_totp_code(
+                TOTPCodeCreate(totp_identifier=raw_identifier, content=raw_content),
+                curr_org=SimpleNamespace(organization_id="o_test"),
+            )
+
+    assert exc_info.value.status_code == 402
+    assert exc_info.value.detail == "Insufficient credits to parse OTP content"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert all(record.get("event") != "Failed to parse otp login" for record in logs)
+    assert any(record.get("event") == "Skipping OTP parse; organization has insufficient credits" for record in logs)
+    _assert_raw_values_not_logged(logs, raw_identifier, raw_content)
+    llm_handler.assert_not_awaited()
+    charge.assert_not_awaited()
+    create_otp_code.assert_not_awaited()
+    create_raw_otp_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_totp_code_insufficient_credits_preserves_enabled_raw_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_identifier = "relay@example.test"
+    raw_content = "Long relayed message without a verification code."
+    create_otp_code = AsyncMock()
+    create_raw_otp_code = AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_raw"))
+    llm_handler = AsyncMock()
+    charge = AsyncMock()
+    monkeypatch.setattr(
+        credentials.app,
+        "DATABASE",
+        _database_with_otp_create(create_otp_code, create_raw_otp_code),
+    )
+    monkeypatch.setattr(
+        credentials.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            has_sufficient_credit_for_otp_parse=AsyncMock(return_value=False),
+            charge_for_otp_parse=charge,
+        ),
+    )
+    monkeypatch.setattr(credentials.app, "SECONDARY_LLM_API_HANDLER", llm_handler)
+    monkeypatch.setattr(credentials.settings, "TOTP_RAW_FALLBACK_ENABLED", True)
+
+    with structlog.testing.capture_logs() as logs:
+        response = await credentials.send_totp_code(
+            TOTPCodeCreate(totp_identifier=raw_identifier, content=raw_content),
+            curr_org=SimpleNamespace(organization_id="o_test"),
+        )
+
+    assert response.status_code == 202
+    assert json.loads(response.body) == {"totp_code_id": "otp_raw", "status": "raw_pending"}
+    assert all(record.get("event") != "Failed to parse otp login" for record in logs)
+    assert any(record.get("event") == "Skipping OTP parse; organization has insufficient credits" for record in logs)
+    _assert_raw_values_not_logged(logs, raw_identifier, raw_content)
+    llm_handler.assert_not_awaited()
+    charge.assert_not_awaited()
+    create_otp_code.assert_not_awaited()
+    create_raw_otp_code.assert_awaited_once()
+
+
+def test_send_totp_code_openapi_declares_distinct_success_and_credit_responses() -> None:
     fastapi_app = FastAPI()
     fastapi_app.include_router(base_router, prefix="/v1")
     fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
@@ -99,9 +199,11 @@ def test_send_totp_code_openapi_declares_distinct_200_and_202_schemas() -> None:
     responses = fastapi_app.openapi()["paths"]["/v1/credentials/totp"]["post"]["responses"]
     assert responses["200"]["content"]["application/json"]["schema"]["$ref"].endswith("/TOTPCode")
     assert responses["202"]["content"]["application/json"]["schema"]["$ref"].endswith("/RawTOTPCodeAccepted")
+    assert responses["402"]["description"] == "Insufficient credits to parse OTP content"
 
     legacy_route = next(route for route in legacy_base_router.routes if route.path == "/totp")
     assert legacy_route.responses[202]["model"].__name__ == "RawTOTPCodeAccepted"
+    assert legacy_route.responses[402]["description"] == "Insufficient credits to parse OTP content"
 
 
 @pytest.mark.asyncio

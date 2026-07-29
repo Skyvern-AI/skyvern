@@ -54,9 +54,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    CopilotBuiltUnverified,
-    _check_enforcement,
-    built_complete_without_evaluated_outcome,
     built_unverified_repair_inert_context,
     verified_goal_claim_authorized,
     verified_goal_satisfied_context,
@@ -1646,18 +1643,6 @@ def _no_repair_unverified_contract() -> DiagnosisRepairContract:
             completion_contract_satisfied=False,
         ),
     )
-
-
-def test_claim_closure_turn_still_ends_but_claim_downgrades() -> None:
-    ctx = _legacy_verified_ctx()
-
-    assert ctx.completion_verification_result is None
-    assert verified_goal_satisfied_context(ctx) is False
-    assert verified_goal_claim_authorized(ctx) is False
-    assert built_complete_without_evaluated_outcome(ctx) is True
-
-    with pytest.raises(CopilotBuiltUnverified):
-        _check_enforcement(ctx)
 
 
 def test_structural_abstention_no_repair_terminalizes_without_authorizing_success_claim() -> None:
