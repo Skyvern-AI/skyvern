@@ -18,7 +18,6 @@ cross-layer sync-guard test at the end asserts neither symbol is ripped out.
 
 from __future__ import annotations
 
-import json
 import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -311,40 +310,37 @@ _NAV_BLOCK = '{"block_type": "navigation", "label": "x", "url": "https://e.com",
 
 @pytest.mark.parametrize("alias", ["block", "block_definition", "definition", "block_yaml"])
 @pytest.mark.asyncio
-async def test_validate_block_pre_hook_normalizes_misnamed_arg_to_block_json(alias: str, ctx: MagicMock) -> None:
+async def test_validate_block_pre_hook_inspects_misnamed_arg_without_mutating(alias: str, ctx: MagicMock) -> None:
     """SKY-11133: the model calls validate_block with the block under a shorter
-    key (e.g. `block`). The pre-hook must promote it to `block_json` so the call
-    no longer dies at FastMCP signature validation."""
+    key (e.g. `block`). The pre-hook inspects a normalized copy for policy while
+    shared FastMCP middleware owns the actual repair."""
     params = {alias: _NAV_BLOCK}
 
     result = await _validate_block_pre_hook(params, ctx)
 
     assert result is None
-    assert params["block_json"] == _NAV_BLOCK
-    assert alias not in params
+    assert params == {alias: _NAV_BLOCK}
 
 
 @pytest.mark.asyncio
-async def test_validate_block_pre_hook_serializes_dict_alias_value(ctx: MagicMock) -> None:
+async def test_validate_block_pre_hook_inspects_dict_alias_without_mutating(ctx: MagicMock) -> None:
     block = {"block_type": "navigation", "label": "x", "url": "https://e.com", "navigation_goal": "g"}
     params: dict = {"block": block}
 
     result = await _validate_block_pre_hook(params, ctx)
 
     assert result is None
-    assert json.loads(params["block_json"]) == block
-    assert "block" not in params
+    assert params == {"block": block}
 
 
 @pytest.mark.asyncio
-async def test_validate_block_pre_hook_strips_stray_alias_without_clobbering_block_json(ctx: MagicMock) -> None:
+async def test_validate_block_pre_hook_preserves_conflicting_alias(ctx: MagicMock) -> None:
     params = {"block_json": _NAV_BLOCK, "block": '{"block_type": "extraction", "label": "y"}'}
 
     result = await _validate_block_pre_hook(params, ctx)
 
     assert result is None
-    assert params["block_json"] == _NAV_BLOCK
-    assert "block" not in params
+    assert params == {"block_json": _NAV_BLOCK, "block": '{"block_type": "extraction", "label": "y"}'}
 
 
 @pytest.mark.asyncio
@@ -358,8 +354,7 @@ async def test_validate_block_pre_hook_normalizes_alias_before_code_only_gate(co
     assert result is not None
     assert result["ok"] is False
     assert "validate real code blocks through update_and_run_blocks" in result["error"]
-    assert params["block_json"]
-    assert "block" not in params
+    assert params == {"block": '{"block_type": "code", "label": "x", "code": "pass"}'}
 
 
 @pytest.mark.asyncio
@@ -369,7 +364,7 @@ async def test_validate_block_pre_hook_alias_allows_helper_under_code_only(code_
     result = await _validate_block_pre_hook(params, code_only_ctx)
 
     assert result is None
-    assert params["block_json"] == '{"block_type": "conditional", "label": "x"}'
+    assert params == {"block": '{"block_type": "conditional", "label": "x"}'}
 
 
 # ---------- Post-emission: YAML-level detector ----------
