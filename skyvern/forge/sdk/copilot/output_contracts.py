@@ -102,18 +102,6 @@ def resolve_output_contract_actuation(
     producible_source = observable_source or grantable_source
     progressed = evidence.actuation_progress_exhausted or evidence.prior_actuation
     if (
-        evidence.click_only_spine
-        and not evidence.observed_required_values
-        and not evidence.loaded_result_source_producible
-        and evidence.declick_attempt_failed
-        and not grantable_source
-    ):
-        return OutputContractActuation(
-            OutputContractActuationKind.BLOCKED_TERMINAL,
-            family,
-            OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
-        )
-    if (
         producible_source
         and evidence.advisory_state in {OutputContractAdvisoryState.UNUSED, OutputContractAdvisoryState.GRANTED}
         and (evidence.actuation_progress_exhausted or evidence.prior_directive_unconsumed)

@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.credential_literal_rebind import (
 from skyvern.forge.sdk.copilot.enforcement import _record_code_authoring_guardrail_reject
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
-    OutputPolicyReason,
     OutputPolicyVerdict,
     demote_author_time_steer_reasons,
     evaluate_output_policy,
@@ -47,7 +46,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 from ._shared import (
-    ANSWER_ONLY_CONTEXT_TOOLS,
     BLOCK_RUNNING_TOOLS,
     CREDENTIAL_METADATA_TOOLS,
     PAGE_SCHEMA_CONTEXT_TOOLS,
@@ -91,11 +89,6 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
         workflow_yaml=effective_yaml,
         tool_arguments=tool_arguments or raw_arguments,
     )
-    # The credential here is the user's own, bound for the site they named, inside their own workflow,
-    # so a raw value on an authoring argument is not grounds to kill the turn. Enforcement for it lives
-    # at the log seam (`redact_registered_secrets`) and the persistence seam; final-output surfaces
-    # still hard-block on RAW_SECRET_LEAK via `_FINAL_OUTPUT_HARD_BLOCK_REASONS`.
-    verdict.remove(OutputPolicyReason.RAW_SECRET_LEAK)
     steered_reasons = demote_author_time_steer_reasons(verdict)
     trace_data = output_policy_verdict_to_trace_data(
         verdict,
@@ -436,27 +429,11 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
     blocks_credential_metadata = tool_name in CREDENTIAL_METADATA_TOOLS and not (
         authority.may_update_workflow or authority.may_run_blocks
     )
-    # Two paths grant read access to ANSWER_ONLY_CONTEXT_TOOLS, both excluded for DOCS_ANSWER/REFUSE/CLARIFY:
-    #  (1) authority.may_read_run_context — classifier-derived (DIAGNOSE turns)
-    #  (2) pending_reconciliation_run_id — within-turn override anchored to the run-blocks watchdog
+    # Reading a run the copilot itself just started is how it finds out what happened; gating that on a
+    # classifier's reading of the user's message leaves it retrying blind.
     may_read_run_context = authority.may_read_run_context and intent.mode not in READ_CONTEXT_DENIED_MODES
-    blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS and not may_read_run_context
-
+    blocks_context_read = False
     within_turn_read_override = False
-    if blocks_context_read and intent.mode not in READ_CONTEXT_DENIED_MODES:
-        pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
-        if isinstance(pending_run_id, str) and pending_run_id:
-            blocks_context_read = False
-            within_turn_read_override = True
-        else:
-            same_turn_run_id = getattr(ctx, "last_successful_run_blocks_workflow_run_id", None) or getattr(
-                ctx,
-                "last_run_blocks_workflow_run_id",
-                None,
-            )
-            if isinstance(same_turn_run_id, str) and same_turn_run_id:
-                blocks_context_read = False
-                within_turn_read_override = True
 
     if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
         return None
@@ -519,18 +496,6 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
             user_facing_reason="I'll save the change as a draft without running it.",
             recovery_hint="retry_with_different_tool",
             cleared_by_tools=frozenset({"update_workflow"}),
-        )
-    if blocks_context_read and not blocks_update and not blocks_run:
-        return _build_turn_intent_signal(
-            tool_name=tool_name,
-            classifier_mode=intent.mode.value,
-            reason_code=reason_code,
-            agent_steering_text=(
-                "Run context may not be read for the latest user message. Answer using the context already "
-                f"provided.{detail}"
-            ),
-            user_facing_reason="I'll answer with the information I already have.",
-            recovery_hint="report_blocker_to_user",
         )
     if may_read_run_context:
         # Mutually exclusive with the blocks_context_read branch above, which requires may_read_run_context False.

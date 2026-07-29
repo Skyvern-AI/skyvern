@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_composing,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
@@ -22,7 +23,9 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
+from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 
@@ -267,12 +270,18 @@ async def _evaluate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    expr = params.get("expression", "").lower()
+    # Cleared up front so an early reject cannot leave a prior evaluate's expression for this
+    # call's post-hook to consume.
+    ctx.pending_scout_read_expression = None
+    raw_expression = params.get("expression")
+    expr = raw_expression.lower() if isinstance(raw_expression, str) else ""
     if ".click()" in expr or ".click(" in expr:
         return {
             "ok": False,
             "error": "Do not use evaluate to click elements. Use the 'click' tool with a CSS selector instead.",
         }
+    if isinstance(raw_expression, str) and raw_expression.strip():
+        ctx.pending_scout_read_expression = raw_expression
     return None
 
 
@@ -870,6 +879,37 @@ async def _type_text_post_hook(
     return result
 
 
+def _record_scouted_read(ctx: AgentContext, *, expression: str, data: dict[str, Any], url: str) -> None:
+    """Keep a read the scout proved on the live page so authoring replays it instead of guessing a
+    locator for a value it has already seen. A structured result is kept as readily as a scalar: the
+    shape is what a later binding needs. Naming never gates keeping the evidence."""
+    result = data.get("result")
+    if not expression or result is None or result == "":
+        return
+    if isinstance(result, (list, dict)) and not result:
+        return
+    output_path = "output.scouted_read"
+    policy = ctx.request_policy
+    if isinstance(policy, RequestPolicy):
+        requested = requested_output_paths(policy.graded_completion_criteria())
+        named = sorted(path for path in requested if not is_canonical_request_slot_path(path))
+        # A rekeyed requested output carries a digest instead of a word, which still keys the
+        # producer to the criterion it has to satisfy. Reading into an anonymous path instead leaves
+        # completion verification with no evidence for an outcome the scout already demonstrated.
+        candidates = named or sorted(requested)
+        if len(candidates) == 1:
+            output_path = candidates[0]
+    interaction: ScoutedInteraction = {
+        "tool_name": "read_value",
+        "read_expression": expression,
+        "read_output_path": output_path,
+        "read_result_shape": type(result).__name__,
+    }
+    if url:
+        interaction["source_url"] = url
+    ctx.scout_trajectory.append(interaction)
+
+
 async def _evaluate_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -902,6 +942,18 @@ async def _evaluate_post_hook(
     if observation_step is not None:
         result["observation_step"] = observation_step
         data["observation_step"] = observation_step
+    # The MCP response never echoes the expression; the pre-hook stashed it from the invocation.
+    read_expression = ctx.pending_scout_read_expression or ""
+    ctx.pending_scout_read_expression = None
+    trajectory_len_before = len(ctx.scout_trajectory)
+    _record_scouted_read(ctx, expression=read_expression, data=data, url=url)
+    if len(ctx.scout_trajectory) > trajectory_len_before:
+        LOG.info(
+            "copilot_scouted_read_recorded",
+            read_result_shape=ctx.scout_trajectory[-1].get("read_result_shape"),
+            read_output_path=ctx.scout_trajectory[-1].get("read_output_path"),
+            trajectory_len=len(ctx.scout_trajectory),
+        )
     if _copilot_block_authoring_policy(
         ctx
     ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
