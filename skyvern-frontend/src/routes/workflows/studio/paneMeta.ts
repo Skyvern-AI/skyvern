@@ -48,9 +48,16 @@ export function paneAccessibleName(id: StudioPaneId): string {
   return paneLabel(id);
 }
 
-// The rail tab / stage-launcher tile label. The run pane's tab is the "Past
-// Runs" selector (it opens the run history rather than toggling a pane), so it
-// reads "Past Runs"; every other tab matches its pane's accessible name.
-export function railLabel(id: StudioPaneId): string {
-  return id === "overview" ? "Past Runs" : paneAccessibleName(id);
+// The rail tab / stage-launcher tile label. The run pane's tab is the run
+// selector (it opens the run history rather than toggling a pane): it names the
+// inspected run with its FULL id ("View Run: wr_55380…" — the top bar is where
+// people read and copy run ids, so no truncation) when callers pass one, and
+// reads "Past Runs" otherwise (no run inspected, or surfaces like the stage
+// launcher that don't resolve a run). Every other tab matches its pane's
+// accessible name.
+export function railLabel(id: StudioPaneId, runId?: string | null): string {
+  if (id === "overview") {
+    return runId ? `View Run: ${runId}` : "Past Runs";
+  }
+  return paneAccessibleName(id);
 }
