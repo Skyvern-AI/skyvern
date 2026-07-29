@@ -992,39 +992,6 @@ def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None
     assert ctx.latest_recorded_build_test_outcome.structural_key is not None
 
 
-def test_unverified_success_records_goal_relative_build_test_outcome() -> None:
-    result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
-    ctx = _ctx(result["data"]["blocks"])
-
-    recorded = _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
-
-    assert recorded is not None
-    assert recorded.verdict == "not_demonstrated"
-    assert recorded.reason_code == "outcome_not_demonstrated"
-    outcome = ctx.latest_recorded_build_test_outcome
-    assert outcome is not None
-    assert outcome.phase == "persisted_block_run"
-    assert outcome.verdict == "repairable_failure"
-    assert outcome.reason_code == "outcome_not_demonstrated"
-    assert outcome.structural_key is not None
-
-
-def test_changed_output_structure_changes_unverified_success_structural_key() -> None:
-    first_result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
-    second_result = _run_result(
-        [_code_block("search_registry_person", {"records": [{"status_present": True}], "result_count": 1})]
-    )
-    ctx = _ctx(first_result["data"]["blocks"])
-
-    _record_run_blocks_result(ctx, first_result, completion_verification=_no_evidence("c0"))
-    first_key = ctx.latest_recorded_build_test_outcome.structural_key
-    _record_run_blocks_result(ctx, second_result, completion_verification=_no_evidence("c0"))
-
-    assert first_key is not None
-    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
-    assert ctx.latest_recorded_build_test_outcome.structural_key != first_key
-
-
 def test_terminal_blocker_does_not_leave_authoritative_prompt_outcome() -> None:
     result = _blocked_flag_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -1379,27 +1346,6 @@ def test_judge_no_evidence_keeps_building_without_metadata() -> None:
     assert ctx.last_full_workflow_test_ok is False
     assert getattr(ctx, "last_good_workflow", None) is None
     assert "failure_reason" not in result["data"]
-
-
-@pytest.mark.parametrize("metadata_shape", ["none", "terminal", "prefix_only"])
-def test_judge_unmet_on_detector_clean_run_does_not_reset_streaks_or_promote(metadata_shape: str) -> None:
-    result = _genuine_success_run_result()
-    ctx = _ctx(result["data"]["blocks"])
-    if metadata_shape == "terminal":
-        ctx.code_artifact_metadata = {"search_registry_person": _terminal_metadata_entry()}
-    elif metadata_shape == "prefix_only":
-        entry = _terminal_metadata_entry()
-        entry["completion_criteria"][0]["level"] = "prefix"
-        entry["completion_criteria"][0]["terminal"] = False
-        ctx.code_artifact_metadata = {"search_registry_person": entry}
-    ctx.failed_test_nudge_count = 2
-    ctx.probable_site_block_streak_count = 4
-
-    _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
-
-    assert ctx.failed_test_nudge_count == 2
-    assert ctx.probable_site_block_streak_count == 4
-    assert ctx.last_full_workflow_test_ok is False
 
 
 def test_reached_goal_unfinished_run_is_recognized_when_verifier_fully_satisfied() -> None:

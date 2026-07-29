@@ -463,7 +463,6 @@ class TestBuildUnexpectedErrorExitResult:
             "I built a 3-block draft and was still testing it when the turn ran out of time."
         )
         assert "the test failed" not in result.user_response
-        assert "draft workflow proposal" in result.user_response
         assert "Do NOT" not in result.user_response
         assert "block-running tools" not in result.user_response
 

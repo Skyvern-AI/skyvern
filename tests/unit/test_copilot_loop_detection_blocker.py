@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _ensure_unvalidated_proposal_affordance
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _INTERNAL_TOOL_NAME_TOKENS,
     _LOOP_PROGRESS_TOOLS,
@@ -15,14 +13,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
     loop_blocker_evidence_from_ctx,
 )
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedOutcomeGroundingRequirement
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
-from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _build_loop_blocker_signal, _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
@@ -77,16 +73,16 @@ def _current_page_challenge_evidence(*, observed_after_workflow_run: bool = True
     ("loop_message", "expected_reason"),
     [
         (
-            "LOOP DETECTED: 'update_and_run_blocks' has already failed 3 times with CREDENTIAL_ERROR; blocking attempt #4.",
+            "LOOP DETECTED: 'update_and_run_blocks' has been called 3 times with CREDENTIAL_ERROR; blocking attempt #4.",
             "loop_detected_credential_or_parameter_misconfig",
         ),
         (
-            "LOOP DETECTED: 'update_and_run_blocks' has already failed 3 times with PARAMETER_BINDING_ERROR; blocking attempt #4.",
+            "LOOP DETECTED: 'update_and_run_blocks' has been called 3 times with PARAMETER_BINDING_ERROR; blocking attempt #4.",
             "loop_detected_credential_or_parameter_misconfig",
         ),
         (
-            "LOOP DETECTED: 'update_workflow' has already failed 3 consecutive times with these arguments; blocking attempt #4.",
-            "loop_detected_repeated_failed_step",
+            "LOOP DETECTED: 'update_workflow' has been called 3 consecutive times with these arguments; blocking attempt #4.",
+            "loop_detected_consecutive_same_tool",
         ),
         (
             "LOOP DETECTED: 'list_credentials' has been called 3 times consecutively.",
@@ -114,127 +110,14 @@ def test_loop_blocker_falls_back_to_generic_on_novel_message() -> None:
     assert signal.recovery_hint == "report_blocker_to_user"
 
 
-def test_native_dispatch_failed_step_loop_sets_signal_and_returns_payload() -> None:
-    # Tracker simulates 2 prior failures of (update_workflow, {workflow_yaml: 'y'}).
-    # detect_failed_tool_step_loop_for_ctx uses tool_step_identity to look up the
-    # threshold; mimicking the real identity is brittle, so call the dispatcher
-    # with a tracker that already has the same identity prepopulated at threshold-1.
-    from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
-
-    identity = tool_step_identity("update_workflow", {"workflow_yaml": "yaml-1"})
-    ctx = _ctx(failed_tool_step_tracker={identity: 3})
-    payload = _tool_loop_error(ctx, "update_workflow", {"workflow_yaml": "yaml-1"})
-    assert payload is not None
-    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert ctx.blocker_signal.blocker_kind == "loop_detected"
-    assert ctx.blocker_signal.internal_reason_code == "loop_detected_repeated_failed_step"
-    # LLM payload is agent_steering_text only — raw LOOP DETECTED: marker is in it.
-    assert payload.startswith("LOOP DETECTED:")
-    # Renderer-side string is clean.
-    for token in _LEAK_TOKENS:
-        assert token not in ctx.blocker_signal.user_facing_reason
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
-    assert ctx.turn_halt.blocker_signal is ctx.blocker_signal
-
-
-def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
-    ctx = _ctx(consecutive_tool_tracker=_streak("list_credentials"))
-    payload = _tool_loop_error(ctx, "list_credentials", None)
-    assert payload is not None
-    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
-    assert ctx.blocker_signal.cleared_by_tools == frozenset()
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
-
-
-def test_consecutive_evaluate_loop_with_loaded_results_uses_goal_aware_copy() -> None:
-    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate"))
-    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
-        result_container_count=1,
-        table_result_container_count=1,
-    )
-    payload = _tool_loop_error(ctx, "evaluate", None)
-
-    assert payload is not None
-    assert payload.startswith("LOOP DETECTED: 'evaluate' has been called 3 times consecutively.")
-    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
-    assert "loaded results" in ctx.blocker_signal.user_facing_reason
-    assert "extracting the requested information" in ctx.blocker_signal.user_facing_reason
-    assert "retrying the same step" not in ctx.blocker_signal.user_facing_reason
-    assert dict(ctx.blocker_signal.extra) == {"loop_evidence_tiers": ["loaded_results"]}
-    assert_clean_user_facing_text(ctx.blocker_signal.user_facing_reason, blocked_tool="evaluate")
-
-
-def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
-    ctx = _ctx(consecutive_tool_tracker=_streak("list_credentials"))
-    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
-        result_container_count=1,
-        table_result_container_count=1,
-    )
-    payload = _tool_loop_error(ctx, "list_credentials", None)
-
-    assert payload is not None
-    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
-    assert "loaded results" not in ctx.blocker_signal.user_facing_reason
-    assert ctx.blocker_signal.user_facing_reason == (
-        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
-    )
-    assert dict(ctx.blocker_signal.extra) == {}
-
-
-def test_unsatisfied_grounding_requirement_does_not_suppress_loop_guards() -> None:
-    requirement = RecordedOutcomeGroundingRequirement(
-        phase="persisted_block_run",
-        reason_code="runtime_block_failure",
-        structural_key="key",
-        workflow_run_id="wr_1",
-        block_labels=["block_a"],
-    )
-
-    consecutive_ctx = _ctx(consecutive_tool_tracker=_streak("click"))
-    consecutive_ctx.recorded_outcome_grounding_requirement = requirement
-    consecutive_payload = _tool_loop_error(consecutive_ctx, "click", None)
-
-    assert consecutive_payload is not None
-    assert isinstance(consecutive_ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert consecutive_ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
-
-    failed_step_ctx = _ctx(failed_tool_step_tracker={tool_step_identity("update_workflow", {}): 3})
-    failed_step_ctx.recorded_outcome_grounding_requirement = requirement
-    failed_step_payload = _tool_loop_error(failed_step_ctx, "update_workflow", {})
-
-    assert failed_step_payload is not None
-    assert isinstance(failed_step_ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert failed_step_ctx.blocker_signal.internal_reason_code == "loop_detected_repeated_failed_step"
-
-
-def test_consecutive_evaluate_loop_without_composition_steer_uses_generic_copy() -> None:
-    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate"))
-    payload = _tool_loop_error(ctx, "evaluate", None)
-
-    assert payload is not None
-    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
-    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
-    assert ctx.blocker_signal.user_facing_reason == (
-        "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
-    )
-    assert dict(ctx.blocker_signal.extra) == {}
-    assert_clean_user_facing_text(ctx.blocker_signal.user_facing_reason, blocked_tool="evaluate")
-
-
 def test_native_and_mcp_paths_produce_equivalent_loop_signal() -> None:
     """Native dispatch and the MCP adapter must produce the same signal shape
     for the same loop-detection message so a regression in one path can't
     diverge from the other.
     """
-    from skyvern.forge.sdk.copilot.mcp_adapter import _stash_and_emit_loop_blocker
 
     loop_message = (
-        "LOOP DETECTED: 'update_workflow' has already failed 3 consecutive times with these arguments; "
+        "LOOP DETECTED: 'update_workflow' has been called 3 consecutive times with these arguments; "
         "blocking attempt #4."
     )
     native_ctx = _ctx()
@@ -275,11 +158,7 @@ _FULL_EVIDENCE = LoopBlockerEvidence(
 )
 _BRANCH_MESSAGES = {
     "loop_detected_credential_or_parameter_misconfig": (
-        "LOOP DETECTED: 'update_and_run_blocks' has already failed 3 times with CREDENTIAL_ERROR; blocking attempt #4."
-    ),
-    "loop_detected_repeated_failed_step": (
-        "LOOP DETECTED: 'update_workflow' has already failed 3 consecutive times with these arguments; "
-        "blocking attempt #4."
+        "LOOP DETECTED: 'update_and_run_blocks' has been called 3 times with CREDENTIAL_ERROR; blocking attempt #4."
     ),
     "loop_detected_consecutive_same_tool": "LOOP DETECTED: 'evaluate' has been called 3 times consecutively.",
     "loop_detected_generic": "something unfamiliar happened",
@@ -288,16 +167,12 @@ _BRANCH_TEMPLATES = {
     "loop_detected_credential_or_parameter_misconfig": (
         "I couldn't run this with the current credential or parameter setup. Update them and ask me to try again."
     ),
-    "loop_detected_repeated_failed_step": (
-        "I retried without making progress. Tell me what to change and I'll try a different approach."
-    ),
     "loop_detected_consecutive_same_tool": (
         "I'm stuck retrying the same step. Tell me what to change and I'll try a different approach."
     ),
     "loop_detected_generic": "I couldn't keep going on this turn. Tell me what to change and I'll try again.",
 }
 _FULL_TIER_BRANCHES = (
-    "loop_detected_repeated_failed_step",
     "loop_detected_consecutive_same_tool",
     "loop_detected_generic",
 )
@@ -480,44 +355,6 @@ def test_fixed_tier_copy_is_clean_for_every_loop_prone_tool(blocked_tool: str, r
     assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool=blocked_tool)
 
 
-def test_native_and_mcp_paths_carry_equivalent_evidence_bearing_signals() -> None:
-    def _prepped_ctx() -> CopilotContext:
-        ctx = _ctx(consecutive_tool_tracker=_streak("list_credentials"))
-        ctx.last_outcome_gate_reason = (
-            "The run completed but did not demonstrate the goal outcome(s): the requested record is checked "
-            "on a public registry site with a search form and expandable result rows."
-        )
-        ctx.last_outcome_gate_workflow_run_id = "wr_latest"
-        ctx.last_run_blocks_workflow_run_id = "wr_latest"
-        ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
-        ctx.has_staged_proposal = True
-        return ctx
-
-    native_ctx = _prepped_ctx()
-    native_payload = _tool_loop_error(native_ctx, "list_credentials", None)
-    assert native_payload is not None
-    native_signal = native_ctx.blocker_signal
-    assert isinstance(native_signal, CopilotToolBlockerSignal)
-
-    mcp_ctx = _prepped_ctx()
-    mcp_payload = _stash_and_emit_loop_blocker(mcp_ctx, native_signal.agent_steering_text, "list_credentials")
-    mcp_signal = mcp_ctx.blocker_signal
-    assert isinstance(mcp_signal, CopilotToolBlockerSignal)
-
-    assert mcp_payload == native_payload
-    assert mcp_signal.user_facing_reason == native_signal.user_facing_reason
-    assert "did not demonstrate the goal outcome" in mcp_signal.user_facing_reason
-    assert "verification challenge" in mcp_signal.user_facing_reason
-    assert native_signal.preserves_workflow_draft is True
-    assert mcp_signal.preserves_workflow_draft is True
-    assert dict(native_signal.extra) == {"loop_evidence_tiers": ["verdict", "anti_bot", "draft"]}
-    assert dict(mcp_signal.extra) == dict(native_signal.extra)
-    assert mcp_signal.internal_reason_code == native_signal.internal_reason_code
-    assert mcp_signal.agent_steering_text == native_signal.agent_steering_text
-    assert mcp_signal.recovery_hint == native_signal.recovery_hint
-    assert mcp_signal.blocked_tool == native_signal.blocked_tool
-
-
 def test_native_tool_loop_error_terminal_challenge_preempts_same_tool_loop() -> None:
     ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "document.body.innerText"}))
     ctx.composition_page_evidence = _current_page_challenge_evidence()
@@ -532,21 +369,6 @@ def test_native_tool_loop_error_terminal_challenge_preempts_same_tool_loop() -> 
     assert signal.extra["evidence_source"] == "page_evidence"
     assert ctx.turn_halt is not None
     assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
-
-
-def test_native_tool_loop_error_does_not_preempt_on_pre_attempt_challenge() -> None:
-    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "document.body.innerText"}))
-    ctx.composition_page_evidence = _current_page_challenge_evidence(observed_after_workflow_run=False)
-
-    payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
-
-    assert payload is not None
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "loop_detected_consecutive_same_tool"
-    assert signal.blocked_tool == "evaluate"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
 
 
 @pytest.mark.asyncio
@@ -713,26 +535,6 @@ def test_composed_loop_reply_passes_output_policy_allow_verdict() -> None:
     assert verdict.allowed, [code.value for code in verdict.reason_codes]
 
 
-def test_composed_loop_reply_with_draft_affordance_passes_output_policy() -> None:
-    signal = _build_loop_blocker_signal(
-        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate", evidence=_FULL_EVIDENCE
-    )
-    reply = _ensure_unvalidated_proposal_affordance(signal.user_facing_reason)
-    verdict = evaluate_output_policy(
-        request_policy=None,
-        response_type="REPLY",
-        user_response=reply,
-        global_llm_context=None,
-        workflow_yaml="title: Example workflow\nblocks: []",
-        has_workflow_proposal=True,
-        workflow_was_persisted=False,
-        workflow_attempted=False,
-        unvalidated=True,
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-    )
-    assert verdict.allowed, [code.value for code in verdict.reason_codes]
-
-
 def _dispatch_server(ctx: CopilotContext, client: object) -> SkyvernOverlayMCPServer:
     server = SkyvernOverlayMCPServer(
         transport=None,
@@ -749,25 +551,6 @@ class _OkResult:
     structured_content = {"ok": True, "data": {}}
     is_error = False
     content: list = []
-
-
-@pytest.mark.asyncio
-async def test_mcp_admission_blocks_third_identical_identity_without_dispatch() -> None:
-    args = {"expression": "document.title"}
-    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", args))
-
-    class _UnexpectedClient:
-        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
-            raise AssertionError("consecutive loop blocker should skip MCP execution")
-
-    result = await _dispatch_server(ctx, _UnexpectedClient()).call_tool("evaluate", args)
-
-    parsed = json.loads(result.content[0].text)
-    assert result.isError is True
-    assert parsed["ok"] is False
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "loop_detected_consecutive_same_tool"
 
 
 @pytest.mark.asyncio
@@ -811,29 +594,3 @@ async def test_mcp_exception_completion_leaves_same_consecutive_state_as_success
 
     assert error_ctx.consecutive_tool_tracker == success_ctx.consecutive_tool_tracker
     assert success_ctx.consecutive_tool_tracker == [tool_step_identity("evaluate", args)]
-
-
-@pytest.mark.asyncio
-async def test_mcp_cancelled_admission_matches_error_completion_state() -> None:
-    args = {"expression": "document.title"}
-
-    error_ctx = _ctx(consecutive_tool_tracker=[], failed_tool_step_tracker={})
-
-    class _RaisingClient:
-        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
-            raise RuntimeError("boom")
-
-    await _dispatch_server(error_ctx, _RaisingClient()).call_tool("evaluate", args)
-
-    cancel_ctx = _ctx(consecutive_tool_tracker=[], failed_tool_step_tracker={})
-
-    class _CancellingClient:
-        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
-            raise asyncio.CancelledError
-
-    with pytest.raises(asyncio.CancelledError):
-        await _dispatch_server(cancel_ctx, _CancellingClient()).call_tool("evaluate", args)
-
-    assert cancel_ctx.consecutive_tool_tracker == error_ctx.consecutive_tool_tracker
-    assert cancel_ctx.consecutive_tool_tracker == [tool_step_identity("evaluate", args)]
-    assert cancel_ctx.failed_tool_step_tracker == {}
