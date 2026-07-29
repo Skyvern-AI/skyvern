@@ -1299,6 +1299,22 @@ class PersistentBrowserSessionModel(Base):
             "status",
             desc("created_at"),
         ),
+        # The orphan sweep (SKY-13158) is deliberately cross-organization, so it matches neither
+        # index above. The partial predicate is what does the work: it restricts the index to live
+        # vendor-held rows, a small subset, which is why plain column keys are enough even though
+        # the sweep orders by COALESCE(last_activity_at, started_at).
+        # Do NOT "fix" the keys to that COALESCE expression: alembic cannot reliably compare
+        # expression-based indexes, so an expression key here reads as drift and fails `alembic
+        # check`. Its postgresql_where is never compared, so the partial predicate is safe.
+        Index(
+            "idx_pbs_vendor_held_lease",
+            "last_activity_at",
+            "started_at",
+            postgresql_where=text(
+                "upstream_cdp_url IS NOT NULL AND browser_address IS NULL "
+                "AND completed_at IS NULL AND deleted_at IS NULL"
+            ),
+        ),
     )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)

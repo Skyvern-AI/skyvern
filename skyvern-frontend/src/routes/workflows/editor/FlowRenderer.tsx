@@ -107,6 +107,7 @@ import {
   START_ANCHOR_MIN_ZOOM,
   startAnchoredViewport,
 } from "./paneFit";
+import { useBlockerExit } from "./useBlockerExit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { FlowJumpControls } from "./controls/FlowJumpControls";
@@ -751,8 +752,7 @@ function FlowRenderer({
       nextLocation.pathname !== currentLocation.pathname
     );
   });
-  const blockerRef = useRef(blocker);
-  blockerRef.current = blocker;
+  const blockerExit = useBlockerExit(blocker);
 
   // Studio-only: list what changed inside the leave/run unsaved-changes modal.
   // Memoized on the blocked state so it runs once when the modal opens (the
@@ -2165,10 +2165,7 @@ function FlowRenderer({
           open={blocker.state === "blocked"}
           onOpenChange={(open) => {
             if (!open) {
-              const current = blockerRef.current;
-              if (current.state === "blocked") {
-                current.reset?.();
-              }
+              blockerExit.reset();
             }
           }}
         >
@@ -2185,10 +2182,7 @@ function FlowRenderer({
               <Button
                 variant="secondary"
                 onClick={() => {
-                  const current = blockerRef.current;
-                  if (current.state === "blocked") {
-                    current.proceed?.();
-                  }
+                  blockerExit.proceed();
                 }}
               >
                 Continue without saving
@@ -2196,9 +2190,8 @@ function FlowRenderer({
               <Button
                 onClick={() => {
                   handleSave().then((ok) => {
-                    const current = blockerRef.current;
-                    if (ok && current.state === "blocked") {
-                      current.proceed?.();
+                    if (ok) {
+                      blockerExit.proceed();
                     }
                   });
                 }}

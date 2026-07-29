@@ -15,6 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
     FailedToSendWebhook,
+    ScreenshotTargetClosed,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
@@ -82,7 +83,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
@@ -893,6 +894,9 @@ async def run_task_v2_helper(
                 )
                 if page is None:
                     page = await browser_state.get_working_page()
+            except ScreenshotTargetClosed:
+                LOG.warning("Skipping task v2 iteration because the browser target closed", iteration=i, url=url)
+                continue
             except Exception:
                 LOG.exception(
                     "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url
@@ -2587,14 +2591,36 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        resp = await deliver_webhook_with_retries(
-            url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
-            timeout_seconds=30.0,
-            organization_id=task_v2.organization_id,
-            run_id=task_v2.observer_cruise_id,
-        )
+        try:
+            resp = await deliver_webhook_with_retries(
+                url=task_v2.webhook_callback_url,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=30.0,
+                organization_id=task_v2.organization_id,
+                run_id=task_v2.observer_cruise_id,
+            )
+        except Exception as delivery_error:
+            LOG.warning(
+                "Task v2 webhook delivery failed after attempting delivery",
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                error=describe_delivery_error(delivery_error),
+                exc_info=True,
+            )
+            try:
+                await app.DATABASE.observer.update_task_v2(
+                    task_v2_id=task_v2.observer_cruise_id,
+                    organization_id=task_v2.organization_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record task v2 webhook delivery error",
+                    task_v2_id=task_v2.observer_cruise_id,
+                    exc_info=True,
+                )
+            raise
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",
