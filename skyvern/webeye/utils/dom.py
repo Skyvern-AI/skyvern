@@ -876,14 +876,17 @@ class SkyvernElement:
         return await dom.get_skyvern_element_by_id(unique_id)
 
     @staticmethod
-    async def _label_click_forwards_to_descendant(label_locator: Locator) -> bool:
+    async def _label_click_forwards_to_descendant(label_locator: Locator, *, fail_closed: bool = False) -> bool:
         # HTML forwards a <label> click to its control only when the pointer does not
         # land on interactive content nested inside; an <a href>/<button> descendant
         # handles the click itself (navigating) instead of toggling the control.
+        # On a probe failure (detached frame, destroyed context) the caller chooses the
+        # fallback: fail_closed=True treats the label as forwarding so it is refused
+        # rather than clicked unvetted.
         try:
             return await label_locator.locator("a[href], button").count() > 0
         except Exception:
-            return False
+            return fail_closed
 
     async def is_safe_for_checkbox_direct_click(self) -> bool:
         # A checkbox blocker is safe to click directly only when the click cannot be
