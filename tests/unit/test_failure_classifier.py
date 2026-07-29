@@ -321,3 +321,25 @@ async def test_non_timeout_scraping_reason_stays_data_extraction() -> None:
     generic_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=False)
     assert "timeout" not in generic_reason.lower()
     assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]
+
+
+def test_exception_name_classifies_when_instance_absent() -> None:
+    """A bare cause-type name classifies via exception_name — the Temporal activity-failure
+    path only carries the class name across the serialization boundary, not the instance."""
+    result = classify_from_failure_reason(None, exception_name="BitwardenVaultError", fallback_to_unknown=True)
+
+    assert result is not None
+    assert result[0]["category"] == "CREDENTIAL_ERROR"
+
+
+def test_exception_name_is_ignored_when_instance_provided() -> None:
+    result = classify_from_failure_reason(
+        "boom", exception=ElementNotFoundError(), exception_name="BitwardenVaultError"
+    )
+
+    assert result is not None
+    assert result[0]["category"] == "ELEMENT_NOT_FOUND"
+
+
+def test_exception_name_alone_returns_none_when_unrecognized() -> None:
+    assert classify_from_failure_reason(None, exception_name="ValueError") is None
