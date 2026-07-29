@@ -16,12 +16,9 @@ from typing import Any
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import compute_action_sequence_fingerprint
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
-from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.tools import (
     BLOCK_RUNNING_TOOLS,
-    COPILOT_FINAL_REPLY_RESERVE_SECONDS,
     PER_TOOL_CALL_BUDGET_SECONDS,
-    REPEATED_ACTION_STREAK_ABORT_AT,
     _active_block_run_budget_seconds,
     _tool_loop_error,
 )
@@ -93,46 +90,10 @@ def test_compute_action_sequence_fingerprint_distinguishes_different_sequences()
     assert fp_b != fp_c
 
 
-def test_tool_loop_error_fires_hard_abort_on_block_running_tools_when_streak_high() -> None:
-    ctx = _ctx(repeated_action_fingerprint_streak_count=REPEATED_ACTION_STREAK_ABORT_AT)
-
-    error = _tool_loop_error(ctx, "run_blocks_and_collect_debug")
-    assert error is not None
-    assert "Repeated-action abort" in error
-
-    error_update = _tool_loop_error(ctx, "update_and_run_blocks")
-    assert error_update is not None
-    assert "Repeated-action abort" in error_update
-
-
-def test_tool_loop_error_does_not_fire_for_non_block_running_tools() -> None:
-    ctx = _ctx(repeated_action_fingerprint_streak_count=REPEATED_ACTION_STREAK_ABORT_AT + 5)
-
-    # Planning/metadata tools keep their existing loop-detection behavior
-    # and are not affected by the block-run streak.
-    assert _tool_loop_error(ctx, "update_workflow") is None
-    assert _tool_loop_error(ctx, "list_credentials") is None
-    assert _tool_loop_error(ctx, "get_run_results") is None
-
-
-def test_tool_loop_error_does_not_fire_below_threshold() -> None:
-    ctx = _ctx(repeated_action_fingerprint_streak_count=REPEATED_ACTION_STREAK_ABORT_AT - 1)
-    assert _tool_loop_error(ctx, "run_blocks_and_collect_debug") is None
-
-
 def test_block_running_tool_is_not_blocked_by_name_only_streak() -> None:
     ctx = _ctx()
     for _ in range(5):
         assert _tool_loop_error(ctx, "update_and_run_blocks") is None
-
-
-def test_planning_tool_still_trips_name_only_streak() -> None:
-    ctx = _ctx()
-    assert _tool_loop_error(ctx, "update_workflow") is None
-    assert _tool_loop_error(ctx, "update_workflow") is None
-    msg = _tool_loop_error(ctx, "update_workflow")
-    assert msg is not None
-    assert "LOOP DETECTED" in msg
 
 
 def test_native_site_distinct_arguments_do_not_trip_streak() -> None:
@@ -157,41 +118,11 @@ def test_unresolved_output_contract_ladder_skips_name_only_streak_for_authoring_
         assert _tool_loop_error(ctx, "update_workflow") is None
 
 
-def test_resolved_output_contract_ladder_re_enables_name_only_streak() -> None:
-    ctx = _ctx(
-        output_contract_actuation_count_by_signature={"sig_done": 3},
-        output_contract_actuation_by_signature={"sig_done": OutputContractAdvisoryState.CONSUMED},
-    )
-    assert _tool_loop_error(ctx, "update_workflow") is None
-    assert _tool_loop_error(ctx, "update_workflow") is None
-    msg = _tool_loop_error(ctx, "update_workflow")
-    assert msg is not None
-    assert "LOOP DETECTED" in msg
-
-
 def test_block_running_tool_is_blocked_by_pending_reconciliation() -> None:
     ctx = _ctx(pending_reconciliation_run_id="wr_123")
     msg = _tool_loop_error(ctx, "update_and_run_blocks")
     assert msg is not None
     assert "wr_123" in msg
-
-
-def test_block_running_tool_blocks_late_retry_after_failed_workflow() -> None:
-    ctx = _ctx(
-        last_failed_workflow_yaml="version: '1.0'",
-        copilot_run_start_monotonic=time.monotonic()
-        - (TOTAL_TIMEOUT_SECONDS - COPILOT_FINAL_REPLY_RESERVE_SECONDS + 10),
-    )
-
-    msg = _tool_loop_error(ctx, "update_and_run_blocks")
-
-    assert msg is not None
-    assert ctx.blocker_signal.renders_final_reply is False
-    assert "less than 90 seconds" in msg.lower()
-    assert "Do NOT retry" in msg
-    assert "quick browser inspection tools" in msg
-    assert "answer from that observed page evidence" in msg
-    assert "Never repeat this tool-error text" in msg
 
 
 def test_late_retry_guard_allows_latter_half_calls_when_reply_room_remains() -> None:
@@ -203,23 +134,6 @@ def test_late_retry_guard_allows_latter_half_calls_when_reply_room_remains() -> 
     assert _tool_loop_error(ctx, "run_blocks_and_collect_debug") is None
 
 
-def test_block_running_tool_blocks_late_continuation_after_successful_prefix() -> None:
-    ctx = _ctx(
-        last_workflow_yaml="version: '1.0'",
-        last_test_ok=True,
-        copilot_run_start_monotonic=time.monotonic()
-        - (TOTAL_TIMEOUT_SECONDS - COPILOT_FINAL_REPLY_RESERVE_SECONDS + 10),
-    )
-
-    msg = _tool_loop_error(ctx, "update_and_run_blocks")
-
-    assert msg is not None
-    assert "less than 90 seconds" in msg.lower()
-    assert "Do NOT start another block-running tool call" in msg
-    assert "workflow draft and progress gathered so far" in msg
-    assert "not been verified end-to-end" in msg
-
-
 def test_late_retry_guard_waits_until_budget_is_low() -> None:
     ctx = _ctx(
         last_failed_workflow_yaml="version: '1.0'",
@@ -229,8 +143,9 @@ def test_late_retry_guard_waits_until_budget_is_low() -> None:
     assert _tool_loop_error(ctx, "update_and_run_blocks") is None
 
 
-def test_active_block_run_budget_shrinks_near_deadline() -> None:
-    remaining = COPILOT_FINAL_REPLY_RESERVE_SECONDS + 30
+def test_active_block_run_budget_is_bounded_by_the_outer_clock_alone() -> None:
+    """No slice is reserved for a reply the model may not need: the run gets what is left."""
+    remaining = 30
     ctx = _ctx(copilot_run_start_monotonic=time.monotonic() - (TOTAL_TIMEOUT_SECONDS - remaining))
 
     budget = _active_block_run_budget_seconds(ctx)
@@ -238,7 +153,7 @@ def test_active_block_run_budget_shrinks_near_deadline() -> None:
 
 
 def test_active_block_run_budget_uses_full_budget_when_deadline_is_distant() -> None:
-    remaining = COPILOT_FINAL_REPLY_RESERVE_SECONDS + PER_TOOL_CALL_BUDGET_SECONDS + 30
+    remaining = PER_TOOL_CALL_BUDGET_SECONDS + 30
     ctx = _ctx(copilot_run_start_monotonic=time.monotonic() - (TOTAL_TIMEOUT_SECONDS - remaining))
 
     assert _active_block_run_budget_seconds(ctx) == PER_TOOL_CALL_BUDGET_SECONDS

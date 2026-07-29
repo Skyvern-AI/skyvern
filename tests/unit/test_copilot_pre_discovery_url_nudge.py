@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _response_coverage_nudge,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
@@ -321,6 +322,58 @@ def _output_schema_ask(refs: list[str]) -> dict[str, object]:
         "ask_subject": "output_schema",
         "refs": refs,
     }
+
+
+_ANONYMOUS_SLOT_PATH = f"output.request_slot_{'0c17ba10d580ed2c63c2996d0605e690f1746286a92698ab':.48}_00"
+
+
+def _anonymous_slot_contract_policy() -> RequestPolicy:
+    return _output_path_contract_policy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="count",
+                outcome="The number of azure errors is returned.",
+                output_path=_ANONYMOUS_SLOT_PATH,
+            ),
+        ],
+    )
+
+
+def test_output_schema_ask_auto_answers_when_the_contract_only_holds_anonymous_slots() -> None:
+    # A request that named no output key pins an anonymous slot, so no name the model proposes can
+    # ever be cited back — the coverage check is unsatisfiable and the ask must still be answered.
+    assert is_canonical_request_slot_path(_ANONYMOUS_SLOT_PATH)
+    ctx = _mid_build_ctx(_anonymous_slot_contract_policy())
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask(["output.azure_error_count"]))
+
+    assert nudge is not None
+    assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert "yours to choose" in nudge
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+    assert len(events) == 1
+    assert events[0]["resolved_refs"] == []
+
+
+def test_output_schema_ask_passes_through_when_any_requested_path_is_nameable() -> None:
+    policy = _output_path_contract_policy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="count", outcome="The azure error count is returned.", output_path=_ANONYMOUS_SLOT_PATH
+            ),
+            CompletionCriterion(
+                id="signups", outcome="The new signup count is returned.", output_path=_REQUESTED_OUTPUT_PATHS[0]
+            ),
+        ],
+    )
+    ctx = _mid_build_ctx(policy)
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask(["output.unknown_field"]))
+
+    assert nudge is None
+    assert not [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
 
 
 def test_output_schema_ask_with_covering_refs_auto_answers() -> None:

@@ -343,3 +343,70 @@ def test_exception_name_is_ignored_when_instance_provided() -> None:
 
 def test_exception_name_alone_returns_none_when_unrecognized() -> None:
     assert classify_from_failure_reason(None, exception_name="ValueError") is None
+
+
+_LOCATOR_WAIT_TIMEOUT = (
+    "Failed to execute code block. Reason: TimeoutError: Locator.wait_for: Timeout 60000ms exceeded. "
+    'Call log: - waiting for locator("button[aria-label=\\"Log in\\"]")'
+)
+
+
+def test_locator_wait_timeout_is_an_element_state_failure_not_a_page_load_one() -> None:
+    categories = [result["category"] for result in _classify(_LOCATOR_WAIT_TIMEOUT)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+
+
+def test_navigation_timeout_is_still_a_page_load_failure() -> None:
+    categories = [result["category"] for result in _classify("Page.goto: Timeout 30000ms exceeded")]
+
+    assert "PAGE_LOAD_TIMEOUT" in categories
+    assert "ELEMENT_STATE_TIMEOUT" not in categories
+
+
+def test_a_selector_naming_a_password_field_is_not_an_auth_failure() -> None:
+    # The word is part of the locator the wait timed out on, not evidence that login was rejected.
+    reason = 'TimeoutError: Locator.wait_for: Timeout 10000ms exceeded. Call log: - waiting for locator("#password")'
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "AUTH_FAILURE" not in categories
+
+
+def test_a_genuine_auth_failure_still_classifies() -> None:
+    categories = [result["category"] for result in _classify("login failed: incorrect password")]
+
+    assert "AUTH_FAILURE" in categories
+
+
+def test_a_bare_waiting_for_locator_timeout_is_an_element_state_failure() -> None:
+    # Truncated Playwright messages drop the "Locator.method:" prefix and keep only the call log.
+    reason = "Timeout 30000ms exceeded waiting for locator('#password')"
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+    assert "AUTH_FAILURE" not in categories
+
+
+def test_a_waiting_for_selector_timeout_is_an_element_state_failure() -> None:
+    reason = "Timeout 30000ms exceeded waiting for selector '#login-btn'"
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+    assert "AUTH_FAILURE" not in categories
+
+
+def test_a_genuine_auth_failure_survives_an_appended_element_timeout() -> None:
+    # Page-derived text can carry both; the element timeout must not silence the auth signal.
+    reason = "Login failed: incorrect password; Timeout 5000ms exceeded on wait_for_selector"
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "AUTH_FAILURE" in categories
+    assert "ELEMENT_STATE_TIMEOUT" in categories
