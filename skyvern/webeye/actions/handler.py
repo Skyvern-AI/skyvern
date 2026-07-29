@@ -539,8 +539,11 @@ async def _verify_autocomplete_input_readback(
     skyvern_element: SkyvernElement,
     matched_index: int,
     matched_label: str,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bool:
-    actual_value = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
+    actual_value = await get_input_value(
+        skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
+    )
     if _normalize_select_shadow_text(actual_value) == _normalize_select_shadow_text(matched_label):
         return True
 
@@ -1659,9 +1662,10 @@ async def verify_phone_input_digits(
     allow_nanp_country_prefix: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> None:
     # Compare normalized digits only — never the raw value, which may be a secret.
-    actual_value = await get_input_value(tag_name=tag_name, locator=locator)
+    actual_value = await get_input_value(tag_name=tag_name, locator=locator, engine_selection=engine_selection)
     expected_digits = _phone_digits(expected_value)
     actual_digits = _phone_digits(actual_value)
     # A field rendering a literal "+1" over the typed digits asserts NANP for itself; trust it only
@@ -1694,6 +1698,7 @@ async def _verify_tel_input_after_fill(
     allow_nanp_country_prefix: bool,
     pattern: str | None = None,
     maxlength: str | None = None,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> None:
     await verify_phone_input_digits(
         tag_name=tag_name,
@@ -1702,6 +1707,7 @@ async def _verify_tel_input_after_fill(
         allow_nanp_country_prefix=allow_nanp_country_prefix,
         pattern=pattern,
         maxlength=maxlength,
+        engine_selection=engine_selection,
     )
 
 
@@ -1713,6 +1719,7 @@ async def _fill_nanp_tel_with_readback(
     e164_fallback: str | None,
     pattern: str | None = None,
     maxlength: str | None = None,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> PhoneNumberInputMismatch | None:
     """Fill affirmative NANP digits and verify every attempt.
     Retry atomically with national digits before constraint-safe E.164 for the least invasive recovery.
@@ -1736,6 +1743,7 @@ async def _fill_nanp_tel_with_readback(
                 allow_nanp_country_prefix=e164_fallback is not None,
                 pattern=pattern,
                 maxlength=maxlength,
+                engine_selection=engine_selection,
             )
         except PhoneNumberInputMismatch as mismatch:
             if attempt_index == len(attempts) - 1:
@@ -1754,12 +1762,22 @@ async def _fill_nanp_tel_with_readback(
 
 
 async def _log_tel_fallback_fill_digit_counts(
-    *, skyvern_element: SkyvernElement, tag_name: str, expected_value: str, task_id: str | None, step_id: str | None
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    expected_value: str,
+    task_id: str | None,
+    step_id: str | None,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> None:
     # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
     # otherwise invisible. Count-only (values may be secrets) and never fails the action.
     try:
-        actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+        actual_value = await get_input_value(
+            tag_name=tag_name,
+            locator=skyvern_element.get_locator(),
+            engine_selection=engine_selection,
+        )
         expected_digit_count = len(_phone_digits(expected_value))
         actual_digit_count = len(_phone_digits(actual_value))
         LOG.info(
@@ -1862,19 +1880,28 @@ async def _is_card_number_field(skyvern_element: SkyvernElement) -> bool:
 
 
 async def _fill_card_number_with_readback(
-    *, skyvern_element: SkyvernElement, tag_name: str, text: str, expected_digits: str
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    text: str,
+    expected_digits: str,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> ActionFailure | None:
     # Type the card number, then read the rendered digits back. Character-by-character typing races an
     # auto-formatting field's caret restore and can scramble the value (SKY-11720); a single atomic
     # value-set formats once, without the race, so a mismatch is re-entered atomically before failing.
     await skyvern_element.input_sequentially(text=text)
-    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    actual_value = await get_input_value(
+        tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+    )
     if not _card_readback_is_mismatch(expected_digits, actual_value):
         return None
 
     await skyvern_element.input_clear()
     await skyvern_element.input_fill(text=text)
-    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    actual_value = await get_input_value(
+        tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+    )
     # Success after re-entry must be positively confirmed: a clean digit match. An empty/masked/
     # unreadable or still-mismatched retry read-back is NOT success -- fail loudly rather than silently
     # proceed with a value we deleted-and-could-not-verify.
@@ -1956,7 +1983,13 @@ def _secret_readback_matches(expected: str, actual_value: str | None) -> bool:
 
 
 async def _fill_secret_with_readback(
-    *, skyvern_element: SkyvernElement, tag_name: str, text: str, input_type: str, maxlength: str | None
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    text: str,
+    input_type: str,
+    maxlength: str | None,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> ActionFailure | None:
     # Character-by-character credential entry can race a hardened field's caret restore and rotate the
     # value, or be dropped by a controlled field and truncate it, while the block still completes --
@@ -1977,7 +2010,9 @@ async def _fill_secret_with_readback(
         )
         return None
 
-    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    actual_value = await get_input_value(
+        tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+    )
     # Exact equality first: a value that round-trips exactly is confirmed, even one made only of mask-like
     # characters -- so an all-"*" secret is a match, never misclassified as an unreadable mask.
     if not _secret_readback_is_mismatch(text, actual_value):
@@ -1992,7 +2027,9 @@ async def _fill_secret_with_readback(
 
     await skyvern_element.input_clear()
     await skyvern_element.input_fill(text=text)
-    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    actual_value = await get_input_value(
+        tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+    )
     if _secret_readback_matches(text, actual_value):
         return None
 
@@ -4616,6 +4653,7 @@ async def handle_input_text_action(
                     tag_name=tag_name,
                     text=text,
                     expected_digits=card_expected_digits,
+                    engine_selection=engine_selection,
                 )
                 if card_failure is not None:
                     return [card_failure]
@@ -4627,6 +4665,7 @@ async def handle_input_text_action(
                     e164_fallback=tel_e164_fallback,
                     pattern=tel_pattern,
                     maxlength=tel_maxlength,
+                    engine_selection=engine_selection,
                 )
                 if phone_mismatch is not None:
                     LOG.warning(
@@ -4643,6 +4682,7 @@ async def handle_input_text_action(
                     text=text,
                     input_type=secret_input_type,
                     maxlength=secret_maxlength,
+                    engine_selection=engine_selection,
                 )
                 if secret_failure is not None:
                     return [secret_failure]
@@ -4662,6 +4702,7 @@ async def handle_input_text_action(
                         expected_value=text,
                         task_id=task.task_id,
                         step_id=step.step_id,
+                        engine_selection=engine_selection,
                     )
 
             incremental_element = await incremental_scraped.get_incremental_element_tree(
@@ -6651,9 +6692,8 @@ async def choose_auto_completion_dropdown(
 
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
-    incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
-    )
+    engine_selection = resolve_engine_selection_for_task(task)
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
     try:
@@ -6760,6 +6800,7 @@ async def choose_auto_completion_dropdown(
                                     skyvern_element=skyvern_element,
                                     matched_index=matched_index,
                                     matched_label=matched_label,
+                                    engine_selection=engine_selection,
                                 ):
                                     clear_input = False
                                     result.action_result = ActionSuccess()
