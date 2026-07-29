@@ -90,7 +90,7 @@ vi.mock("./tagging/TagPickerCommand", () => ({
   ),
 }));
 
-import { WorkflowRowContextMenu } from "./WorkflowRowContextMenu";
+import { WorkflowRowActions } from "./WorkflowRowActions";
 import type { WorkflowApiResponse } from "../types/workflowTypes";
 
 function buildWorkflow(): WorkflowApiResponse {
@@ -109,7 +109,7 @@ function renderMenu(props?: {
 }) {
   return render(
     <MemoryRouter>
-      <WorkflowRowContextMenu
+      <WorkflowRowActions
         workflow={buildWorkflow()}
         tagKeys={[]}
         labelSuggestions={[]}
@@ -119,8 +119,8 @@ function renderMenu(props?: {
         selectedCount={props?.selectedCount ?? 1}
         onDeleted={props?.onDeleted}
       >
-        <div>row</div>
-      </WorkflowRowContextMenu>
+        {() => <div>row</div>}
+      </WorkflowRowActions>
     </MemoryRouter>,
   );
 }
@@ -131,7 +131,7 @@ afterEach(() => {
   applyWorkflowTags.mockClear();
 });
 
-describe("WorkflowRowContextMenu single-row delete", () => {
+describe("WorkflowRowActions single-row delete", () => {
   it("notifies onDeleted with the workflow id after a successful delete", () => {
     const onDeleted = vi.fn();
     renderMenu({ selectedCount: 1, onDeleted });
