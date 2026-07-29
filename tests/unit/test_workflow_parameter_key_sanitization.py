@@ -81,6 +81,54 @@ def test_single_rename_still_updates_source_parameter_key() -> None:
     assert ctx["source_parameter_key"] == "bad_key"
 
 
+def test_jinja_default_value_reference_follows_renamed_key_without_chaining() -> None:
+    # "my-key" -> "my_key", "my_key" -> "my_key_2". A {{ my-key }} reference in a later
+    # parameter default must land on "my_key", not chain through to "my_key_2".
+    workflow_yaml = {
+        "workflow_definition": {
+            "parameters": [
+                {"key": "my-key", "parameter_type": "workflow", "workflow_parameter_type": "string"},
+                {"key": "my_key", "parameter_type": "workflow", "workflow_parameter_type": "string"},
+                {
+                    "key": "greeting",
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "string",
+                    "default_value": "hello {{ my-key }}",
+                },
+            ],
+            "blocks": [],
+        }
+    }
+    sanitized = sanitize_workflow_yaml_with_references(workflow_yaml)
+    params = sanitized["workflow_definition"]["parameters"]
+    greeting = next(param for param in params if param["key"] == "greeting")
+    assert greeting["default_value"] == "hello {{ my_key }}"
+
+
+def test_jinja_block_reference_follows_renamed_key_without_chaining() -> None:
+    # Same collision, but the {{ my-key }} reference lives in a block field. It must resolve
+    # to the renamed "my_key" parameter, and the untouched {{ my_key }} reference to "my_key_2".
+    workflow_yaml = {
+        "workflow_definition": {
+            "parameters": [
+                {"key": "my-key", "parameter_type": "workflow", "workflow_parameter_type": "string"},
+                {"key": "my_key", "parameter_type": "workflow", "workflow_parameter_type": "string"},
+            ],
+            "blocks": [
+                {
+                    "label": "task1",
+                    "block_type": "task",
+                    "url": "https://example.com",
+                    "navigation_goal": "use {{ my-key }} and {{ my_key }}",
+                }
+            ],
+        }
+    }
+    sanitized = sanitize_workflow_yaml_with_references(workflow_yaml)
+    block = sanitized["workflow_definition"]["blocks"][0]
+    assert block["navigation_goal"] == "use {{ my_key }} and {{ my_key_2 }}"
+
+
 def test_already_valid_keys_are_untouched() -> None:
     workflow_yaml = {
         "workflow_definition": {
