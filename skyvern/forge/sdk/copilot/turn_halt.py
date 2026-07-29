@@ -21,7 +21,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_tool_blocker_signals_for_reason_codes,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -53,20 +52,16 @@ ADVISORY_DISPATCH_STALLED_REASON_CODE = "advisory_dispatch_stalled"
 class TurnHaltKind(StrEnum):
     LOOP_DETECTED = "loop_detected"
     ACTIVE_TERMINAL_CHALLENGE = "active_terminal_challenge"
-    PROBABLE_SITE_BLOCK = "probable_site_block"
     OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
-    DELIVERED_UNVERIFIED = "delivered_unverified"
 
 
 class TurnHaltVerdict(StrEnum):
     BLOCKED = "blocked"
-    DELIVERED_UNVERIFIED = "delivered_unverified"
 
 
 _LOOP_TERMINAL_REASON_CODES = frozenset(
     {
         "loop_detected_credential_or_parameter_misconfig",
-        "loop_detected_repeated_failed_step",
         "loop_detected_consecutive_same_tool",
         "loop_detected_generic",
         "code_authoring_guardrail_churn",
@@ -77,7 +72,6 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     {
-        ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
         TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
         # Back-compat sentinel for pre-TERMINAL_CHALLENGE_BLOCKER traces.
         "tool_error_run_output_terminal_blocker",
@@ -85,7 +79,6 @@ _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
         "tool_error_challenge_gated_submit_disabled",
     }
 )
-_PROBABLE_SITE_BLOCK_REASON_CODES = frozenset({"probable_site_block_stop"})
 _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -100,15 +93,10 @@ _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
 _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
     {
         TurnHaltKind.LOOP_DETECTED,
-        TurnHaltKind.PROBABLE_SITE_BLOCK,
         TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE,
     }
 )
-_INVOLUNTARY_BLOCKER_REASON_CODES = (
-    _LOOP_TERMINAL_REASON_CODES | _PROBABLE_SITE_BLOCK_REASON_CODES | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
-)
-_VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
-_VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_SOURCES = frozenset({"run_execution"})
+_INVOLUNTARY_BLOCKER_REASON_CODES = _LOOP_TERMINAL_REASON_CODES | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
 
 
 @dataclass(frozen=True)
@@ -133,8 +121,6 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.LOOP_DETECTED
     if reason in _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES:
         return TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
-    if reason in _PROBABLE_SITE_BLOCK_REASON_CODES:
-        return TurnHaltKind.PROBABLE_SITE_BLOCK
     if reason in _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES:
         return TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
     return None
@@ -288,22 +274,6 @@ def stash_turn_halt_from_blocker_signal(ctx: Any, signal: object, *, source: str
     return halt
 
 
-def stash_delivered_unverified_turn_halt(ctx: AgentContext, *, workflow_run_id: str | None) -> TurnHalt | None:
-    if isinstance(ctx.turn_halt, TurnHalt):
-        return ctx.turn_halt
-    run_refs = {"workflow_run_id": workflow_run_id} if workflow_run_id else {}
-    halt = TurnHalt(
-        kind=TurnHaltKind.DELIVERED_UNVERIFIED,
-        verdict=TurnHaltVerdict.DELIVERED_UNVERIFIED,
-        run_refs=run_refs,
-        extra={"source": "run_execution"},
-    )
-    ctx.turn_halt = halt
-    claim_turn(ctx, TurnClaimant.GENUINELY_TERMINAL, renders_final_reply=True)
-    LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
-    return halt
-
-
 def _restored_owner_halt(ctx: AgentContext, owner_claimant: TurnClaimant) -> TurnHalt | None:
     held = ctx.blocker_signal
     if held is None or effective_signal_claimant(ctx, held) is not owner_claimant:
@@ -361,16 +331,7 @@ def raise_if_turn_halt(ctx: Any, *, verified: bool = False) -> None:
         if not isinstance(halt, TurnHalt):
             return
     suppressible_reason_codes = _INVOLUNTARY_BLOCKER_REASON_CODES
-    if (
-        halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
-        and halt.blocker_signal is not None
-        and halt.blocker_signal.internal_reason_code in _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES
-        and halt.extra.get("source") in _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_SOURCES
-    ):
-        suppressible_reason_codes = (
-            _INVOLUNTARY_BLOCKER_REASON_CODES | _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES
-        )
-    elif halt.kind not in _INVOLUNTARY_TURN_HALT_KINDS:
+    if halt.kind not in _INVOLUNTARY_TURN_HALT_KINDS:
         suppressible_reason_codes = frozenset()
     if verified and suppressible_reason_codes:
         ctx.turn_halt = None
