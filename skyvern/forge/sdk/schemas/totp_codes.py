@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -83,3 +84,23 @@ class TOTPCode(TOTPCodeCreate):
     created_at: datetime = Field(..., description="The timestamp when the TOTP code was created.")
     modified_at: datetime = Field(..., description="The timestamp when the TOTP code was modified.")
     otp_type: OTPType | None = Field(None, description="The type of the OTP code.")
+
+
+class RawTOTPCode(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    totp_code_id: str
+    totp_identifier: str
+    organization_id: str
+    content: str
+    task_id: str | None
+    workflow_id: str | None
+    workflow_run_id: str | None
+    source: str | None
+    created_at: datetime
+    expired_at: datetime | None
+
+
+class RawTOTPCodeAccepted(BaseModel):
+    totp_code_id: str
+    status: Literal["raw_pending"] = "raw_pending"

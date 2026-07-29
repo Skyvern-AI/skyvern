@@ -552,9 +552,11 @@ async def run_task_v2(
     workflow, workflow_run = None, None
     parent_context = skyvern_context.current()
     current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
-    # Carry trigger_type + use_flex_llm_routing forward from the parent context (set in
-    # scripts/run_task_v2.py at worker boot) so flex routing eligibility persists into the
-    # scoped TaskV2 execution context.
+    # Carry trigger_type, use_flex_llm_routing, and the execution-start transient-UI capture arm
+    # forward from the parent context (set in scripts/run_task_v2.py at worker boot). scoped() takes
+    # a wholesale replacement context, so any field not copied here is dropped for the scope; without
+    # the arm fields the boot resolution would be lost and TaskV2 would re-resolve (or run off) before
+    # its first capture.
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
@@ -567,6 +569,10 @@ async def run_task_v2(
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
         consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
+        preserve_transient_ui_capture=parent_context.preserve_transient_ui_capture if parent_context else None,
+        preserve_transient_ui_capture_resolved=(
+            parent_context.preserve_transient_ui_capture_resolved if parent_context else False
+        ),
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
