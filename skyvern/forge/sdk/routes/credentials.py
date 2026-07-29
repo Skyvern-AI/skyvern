@@ -111,7 +111,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     TestConnectionResponse,
 )
-from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCodeAccepted, TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -405,11 +405,15 @@ async def fetch_credential_item_background(item_id: str) -> None:
         LOG.exception("Failed to fetch credential item from Bitwarden in background", item_id=item_id, error=str(e))
 
 
-@legacy_base_router.post("/totp")
+@legacy_base_router.post(
+    "/totp",
+    responses={202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"}},
+)
 @legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
+    responses={202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"}},
     summary="Send TOTP code",
     description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
@@ -428,6 +432,7 @@ async def fetch_credential_item_background(item_id: str) -> None:
 @base_router.post(
     "/credentials/totp/",
     response_model=TOTPCode,
+    responses={202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"}},
     include_in_schema=False,
 )
 async def send_totp_code(
@@ -488,16 +493,40 @@ async def send_totp_code(
         )
 
     if not otp_value:
-        LOG.error(
-            "Failed to parse otp login",
+        if not settings.TOTP_RAW_FALLBACK_ENABLED:
+            LOG.error(
+                "Failed to parse otp login",
+                organization_id=curr_org.organization_id,
+                totp_identifier=redacted_totp_identifier,
+                task_id=data.task_id,
+                workflow_id=data.workflow_id,
+                workflow_run_id=data.workflow_run_id,
+                content_length=len(data.content),
+            )
+            raise HTTPException(status_code=400, detail="Failed to parse otp login")
+        if len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
+            raise HTTPException(status_code=400, detail="Failed to parse otp login")
+        raw_row = await app.DATABASE.otp.create_raw_otp_code(
             organization_id=curr_org.organization_id,
-            totp_identifier=redacted_totp_identifier,
+            totp_identifier=data.totp_identifier,
+            content=data.content,
             task_id=data.task_id,
             workflow_id=data.workflow_id,
             workflow_run_id=data.workflow_run_id,
+            source=data.source,
+            expired_at=data.expired_at,
+        )
+        LOG.info(
+            "Persisted raw OTP content",
+            organization_id=curr_org.organization_id,
+            totp_identifier=redacted_totp_identifier,
+            totp_code_id=raw_row.totp_code_id,
             content_length=len(data.content),
         )
-        raise HTTPException(status_code=400, detail="Failed to parse otp login")
+        pending = RawTOTPCodeAccepted(totp_code_id=raw_row.totp_code_id)
+        return Response(  # type: ignore[return-value]
+            content=pending.model_dump_json(), status_code=202, media_type="application/json"
+        )
 
     return await app.DATABASE.otp.create_otp_code(
         organization_id=curr_org.organization_id,

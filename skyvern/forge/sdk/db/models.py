@@ -1085,12 +1085,13 @@ class TOTPCodeModel(Base):
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
     content = Column(String, nullable=False)
-    code = Column(String, nullable=False)
+    code = Column(String)
     source = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
     otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
+    parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
 
 
 class ActionModel(Base):

@@ -997,6 +997,7 @@ async def generate_cua_fallback_actions(
                     workflow_run_id=task.workflow_run_id,
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
+                    expected_otp_type=OTPType.MAGIC_LINK,
                 )
                 if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
                     raise NoTOTPVerificationCodeFound()
@@ -1047,7 +1048,7 @@ async def generate_cua_fallback_actions(
 
     elif skyvern_action_type == "get_verification_code":
         try:
-            otp_value = await resolve_otp_value(task)
+            otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
         except NoTOTPVerificationCodeFound:
             otp_value = None
             reasoning_suffix = "No verification code found"
