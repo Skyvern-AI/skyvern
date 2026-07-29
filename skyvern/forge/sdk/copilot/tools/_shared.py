@@ -243,13 +243,7 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
 
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
-_CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS = BLOCK_RUNNING_TOOLS | {"fill_credential_field"}
-
-
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
-
-
-ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})

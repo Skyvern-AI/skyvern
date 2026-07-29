@@ -13,8 +13,6 @@ from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
 from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
@@ -351,9 +349,7 @@ def _blocker_signal_matches_result(signal: CopilotToolBlockerSignal, result: dic
     steering = signal.agent_steering_text
     if error == steering or steering in error:
         return True
-    return signal.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE and _has_failure_category(
-        result, ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
-    )
+    return False
 
 
 def _failure_categories(result: dict[str, Any]) -> list[Any]:
