@@ -142,7 +142,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.browser_engine import BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
@@ -195,17 +195,6 @@ COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
 # Cross-process re-resolution is deterministic under stable flag config.
 _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, ttl=86_400)
-
-
-def resolve_engine_selection_for_task(task: Task) -> BrowserEngineSelection | None:
-    """The logical run's pinned browser engine, resolved from its live browser state.
-
-    Threaded into ``IncrementalScrapePage`` so its wait-until-finished retry classifies driver-native
-    analysis timeouts against THIS run's selected engine. Returns None when no browser state is
-    registered for the run, which keeps the stock Playwright timeout identity (unchanged default).
-    """
-    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
-    return browser_state.engine_selection if browser_state is not None else None
 
 
 def _is_selected_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
@@ -572,7 +561,7 @@ async def _reset_autocomplete_for_llm_fallback(
     await skyvern_element.input_clear()
 
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
     await skyvern_element.press_fill(text)
@@ -1277,7 +1266,12 @@ def check_existed_but_not_option_element_in_dom_factory(
             return False
         try:
             locator = frame.locator(f"[{SKYVERN_ID_ATTR}={element_id}]")
-            current_element = SkyvernElement(locator=locator, frame=frame, static_element=element_dict)
+            current_element = SkyvernElement(
+                locator=locator,
+                frame=frame,
+                static_element=element_dict,
+                engine_selection=dom.engine_selection,
+            )
             if await current_element.is_custom_option():
                 return False
             return await dom.check_id_in_dom(element_id)
@@ -3570,7 +3564,8 @@ async def handle_click_action(
         try:
             skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
             incremental_scraped = IncrementalScrapePage(
-                skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+                skyvern_frame=skyvern_frame,
+                engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
             )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -4151,7 +4146,7 @@ async def handle_input_text_action(
                 skyvern_element = retargeted_element
                 can_input_text = True
 
-    engine_selection = resolve_engine_selection_for_task(task)
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
@@ -5012,7 +5007,9 @@ async def handle_upload_file_action(
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            await _wait_for_upload_processing(page, engine_selection=resolve_engine_selection_for_task(task))
+            await _wait_for_upload_processing(
+                page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+            )
 
             return [ActionSuccess()]
         else:
@@ -5319,7 +5316,7 @@ async def handle_select_option_action(
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     )
     is_open = False
     suggested_value: str | None = None
@@ -5331,7 +5328,10 @@ async def handle_select_option_action(
         await skyvern_element.scroll_into_view()
 
         await skyvern_element.click(
-            page=page, dom=dom, timeout=timeout, engine_selection=resolve_engine_selection_for_task(task)
+            page=page,
+            dom=dom,
+            timeout=timeout,
+            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
         )
         # The click opens the widget: mark it open now (not only on the incremental path below) so the
         # finally cleanup dismisses it on every exit — including an emerging-path optional miss that
@@ -6267,7 +6267,7 @@ async def chain_click(
     # Pin the run's selected engine before the first dispatch so every
     # post-dispatch classification below uses one stable authority — a later
     # browser-state removal/replacement must not drift it.
-    engine_selection = resolve_engine_selection_for_task(task)
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     # Tracks the return value so the finally block can inspect click success.
     action_results: list[ActionResult] = []
     try:
@@ -6689,10 +6689,10 @@ async def choose_auto_completion_dropdown(
     preserved_elements = preserved_elements or []
     clear_input = True
     result = AutoCompletionResult()
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
 
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
-    engine_selection = resolve_engine_selection_for_task(task)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -6999,9 +6999,10 @@ async def choose_auto_completion_dropdown(
             locator=locator,
             frame=current_frame,
             static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+            engine_selection=engine_selection,
         )
         await selected_element.scroll_into_view()
-        await selected_element.click(page=page, engine_selection=resolve_engine_selection_for_task(task))
+        await selected_element.click(page=page, engine_selection=engine_selection)
         clear_input = False
         return result
 
@@ -7240,7 +7241,7 @@ async def discover_and_select_from_full_dropdown(
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task)
+        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -7275,7 +7276,7 @@ async def discover_and_select_from_full_dropdown(
             try:
                 await skyvern_element.press_key("ArrowDown")
             except Exception as exc:
-                if not _is_selected_engine_timeout(exc, resolve_engine_selection_for_task(task)):
+                if not _is_selected_engine_timeout(exc, resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)):
                     raise
                 LOG.info(
                     "Timeout pressing ArrowDown in discover fallback, continuing",
@@ -8288,7 +8289,9 @@ async def _select_deterministic_custom_option(
         click_attempted = True
         if on_click_attempted is not None:
             on_click_attempted()
-        await selected_element.click(page=page, engine_selection=resolve_engine_selection_for_task(task))
+        await selected_element.click(
+            page=page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+        )
         verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
             readback_scope_element=readback_scope_element,
@@ -8324,7 +8327,9 @@ async def _select_deterministic_custom_option(
         # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
         # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
         reset_verified = await _reset_custom_select_combobox_input(
-            readback_scope_element, page, engine_selection=resolve_engine_selection_for_task(task)
+            readback_scope_element,
+            page,
+            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
         )
         if reset_verified:
             LOG.info(
@@ -8598,7 +8603,7 @@ async def select_from_emerging_elements(
         current_text = await get_input_value(
             input_element.get_tag_name(),
             input_element.get_locator(),
-            engine_selection=resolve_engine_selection_for_task(task),
+            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
         )
         if current_text == actual_value:
             return ActionSuccess()
@@ -8620,7 +8625,9 @@ async def select_from_emerging_elements(
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
     await selected_element.scroll_into_view()
-    await selected_element.click(page=page, engine_selection=resolve_engine_selection_for_task(task))
+    await selected_element.click(
+        page=page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+    )
     return ActionSuccess()
 
 
@@ -8794,7 +8801,7 @@ async def select_from_dropdown(
             current_text = await get_input_value(
                 input_element.get_tag_name(),
                 input_element.get_locator(),
-                engine_selection=resolve_engine_selection_for_task(task),
+                engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
             )
             if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
@@ -8844,7 +8851,9 @@ async def select_from_dropdown(
 
         await selected_element.scroll_into_view()
         await selected_element.click(
-            page=page, timeout=timeout, engine_selection=resolve_engine_selection_for_task(task)
+            page=page,
+            timeout=timeout,
+            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
         )
         single_select_result.action_result = ActionSuccess()
         return single_select_result

@@ -56,6 +56,7 @@ from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDe
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.browser_engine import BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -413,6 +414,18 @@ def _mark_element_as_dropped(element: dict, *, hashed_key: str | None) -> None:
     element["isDropped"] = True
 
 
+def _resolve_engine_selection(task: Task | None) -> BrowserEngineSelection | None:
+    """Resolve the run's pinned engine without touching the browser manager on the task-less path.
+
+    Element scraping runs the SVG/CSS-shape conversions with ``task=None`` (e.g. cache-warm passes),
+    where no run is registered. Reading ``app.BROWSER_MANAGER`` eagerly would break those callers when
+    the manager is absent, so short-circuit before dereferencing it.
+    """
+    if task is None:
+        return None
+    return resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+
+
 async def _check_svg_eligibility(
     skyvern_frame: SkyvernFrame,
     element: dict,
@@ -443,7 +456,12 @@ async def _check_svg_eligibility(
             _mark_element_as_dropped(element, hashed_key=None)
             return False
 
-        skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
+        skyvern_element = SkyvernElement(
+            locator=locater,
+            frame=skyvern_frame.get_frame(),
+            static_element=element,
+            engine_selection=_resolve_engine_selection(task),
+        )
 
         _, blocked = await skyvern_frame.get_blocking_element_id(
             await skyvern_element.get_element_handler(timeout=1000)
@@ -624,7 +642,12 @@ async def _convert_css_shape_to_string(
                 )
                 return None
 
-            skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
+            skyvern_element = SkyvernElement(
+                locator=locater,
+                frame=skyvern_frame.get_frame(),
+                static_element=element,
+                engine_selection=_resolve_engine_selection(task),
+            )
 
             _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
             if blocked:

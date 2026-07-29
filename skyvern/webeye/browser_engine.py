@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import importlib.metadata
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import structlog
 from playwright.async_api import Error as _PlaywrightError
@@ -39,6 +39,10 @@ from skyvern.webeye.browser_errors import (
     BrowserErrorFamiliesConfigError,
     classify_browser_error,
 )
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.schemas.tasks import Task
+    from skyvern.webeye.browser_manager import BrowserManager
 
 LOG = structlog.get_logger()
 
@@ -227,6 +231,15 @@ class BrowserEngineSelection:
             "browser_engine_version": self.metadata.version,
             "browser_engine_selection_reason": self.selection_reason,
         }
+
+
+def resolve_engine_selection_for_task(
+    task: Task | None, browser_manager: BrowserManager
+) -> BrowserEngineSelection | None:
+    if task is None:
+        return None
+    browser_state = browser_manager.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+    return browser_state.engine_selection if browser_state is not None else None
 
 
 @dataclass(frozen=True)
