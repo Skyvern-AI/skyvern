@@ -114,6 +114,12 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
+from skyvern.forge.sdk.experimentation.transient_ui_capture import (
+    decide_transient_ui_suppression,
+    emit_transient_ui_popup_telemetry,
+    resolve_transient_ui_capture_arm,
+    transient_ui_capture_arm,
+)
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
@@ -3446,6 +3452,24 @@ class ForgeAgent:
 
         if engine in CUA_ENGINES:
             scrolling_number = 0
+        elif scrolling_number > 0 and skyvern_frame is not None:
+            arm = transient_ui_capture_arm(context)
+            if arm != "off":
+                # Shadow-detect an open transient popup in control; only treatment suppresses the
+                # scroll that would dismiss it (e.g. a portal date-picker popup) before the next step.
+                # This post-action screenshot shares the per-run consecutive-suppression cap with the
+                # agent-step scrape so a stale expanded trigger cannot pin captures at one viewport.
+                popup_trigger = await skyvern_frame.get_open_aria_popup_trigger()
+                _span.set_attribute("transient_ui_arm", arm)
+                if popup_trigger is not None:
+                    _span.set_attribute("transient_ui_detected", True)
+                    emit_transient_ui_popup_telemetry(_span, popup_trigger)
+                decision = decide_transient_ui_suppression(context, arm, detected=popup_trigger is not None)
+                if decision.suppress:
+                    scrolling_number = 0
+                    _span.set_attribute("transient_ui_scroll_suppressed", True)
+                elif decision.capped:
+                    _span.set_attribute("transient_ui_suppression_capped", True)
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
         screenshot_artifact_id: str | None = None
@@ -3661,6 +3685,9 @@ class ForgeAgent:
             max_screenshot_number=max_screenshot_number,
             draw_boxes=draw_boxes,
             scroll=scroll,
+            # Only this agent-step scrape opts into transient-UI scroll suppression (SKY-12735);
+            # verification / extraction / error-detection scrapes keep legacy scrolling.
+            allow_transient_ui_suppression=True,
         )
 
     @traced(name="skyvern.agent.scrape_and_prompt", role="wrapper")
@@ -3751,6 +3778,8 @@ class ForgeAgent:
                         task_id=task.task_id,
                     )
                     context.use_artifact_bundling = False
+
+                await resolve_transient_ui_capture_arm(context)
 
             # start the async tasks while running scrape_website
             if engine not in CUA_ENGINES:

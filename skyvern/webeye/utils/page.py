@@ -1076,6 +1076,23 @@ class SkyvernFrame:
         js_script = "() => getScrollXY()"
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
+    async def get_open_aria_popup_trigger(self) -> dict | None:
+        """Return structural details of an open ARIA popup trigger on this frame, or None.
+
+        Fails open (returns None) on any evaluation error so screenshot-scroll policy keeps the
+        current scrolling behavior rather than breaking the scrape/action loop. Detection
+        semantics live in getOpenAriaPopupTrigger in domUtils.js.
+        """
+        try:
+            result = await self.evaluate(frame=self.frame, expression="() => getOpenAriaPopupTrigger()")
+        except Exception:
+            LOG.warning(
+                "Failed to detect open ARIA popup trigger; using default scrolling behavior",
+                exc_info=True,
+            )
+            return None
+        return result if isinstance(result, dict) else None
+
     async def get_scroll_width_and_height(self) -> tuple[int, int]:
         js_script = "() => getScrollWidthAndHeight()"
         return await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)

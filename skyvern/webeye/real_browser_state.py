@@ -599,6 +599,7 @@ class RealBrowserState(BrowserState):
         support_empty_page: bool = False,
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
+        allow_transient_ui_suppression: bool = False,
     ) -> ScrapedPage:
         page = await self.get_working_page()
         if page is not None:
@@ -618,6 +619,7 @@ class RealBrowserState(BrowserState):
             support_empty_page=support_empty_page,
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
+            allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
 
     async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None:
