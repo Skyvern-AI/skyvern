@@ -1,30 +1,54 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.request_logging import redact_sensitive_fields
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
+from skyvern.forge.sdk.copilot.context import (
+    StructuredContext,
+    prior_signin_email_from_context,
+    sanitize_global_llm_context_for_prompt,
+)
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+from skyvern.forge.sdk.copilot.request_slots import (
+    CanonicalRequestSlotV1,
+    RequestSlotContractV1,
+    RequestSlotDatumTargetV1,
+    RequestSlotProducerInputV1,
+    produce_request_slots,
+    request_slot_request_digest,
+    request_slot_source_text,
+    request_slot_sources,
+)
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.signin_email import connected_gmail_address, is_email_address
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids, workflow_credential_origins
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    URL_CANDIDATE_RE,
+    workflow_credential_ids,
+    workflow_credential_origins,
+)
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -54,6 +78,7 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "credential_input_kind",
     "credential_refs",
     "login_page_urls",
+    "login_intent",
     "requires_user_clarification",
     "completion_contract",
     "completion_criteria",
@@ -61,13 +86,12 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "raw_secret_handling",
     "clarification_reason",
 }
-REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
-    {
-        "output.downloaded_files",
-        "output.downloaded_file_urls",
-        "output.downloaded_file_artifact_ids",
-    }
+_TERMINAL_ACTION_RECONCILIATION_RESPONSE_FIELDS = frozenset({"version", "criterion_id", "terminal_action_family"})
+_TERMINAL_ACTION_RECONCILABLE_CREDENTIAL_KINDS = frozenset(
+    {"credential_id", "credential_name", "website_stored_credential"}
 )
+_LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH = "output.downloaded_files"
+REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -78,16 +102,29 @@ ClarificationReason = Literal[
     "missing_conditional_condition",
     "missing_target_context",
     "workflow_credential_inputs_unbound",
+    "login_credentials_unresolved",
+    "signin_email_unresolved",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
+# Only deterministic post-resolution code may mint these; a classifier emission would
+# skip the concrete-target and credential-reachability checks the reason stands for.
+_DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"login_credentials_unresolved", "signin_email_unresolved"}
+)
 # Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 )
 # Broader: any reason credential_prompt_reason() should surface an add-credential CTA for.
 CREDENTIAL_PROMPT_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"raw_secret", "credential_name_unresolved", "credential_invention_requested", "workflow_credential_inputs_unbound"}
+    {
+        "raw_secret",
+        "credential_name_unresolved",
+        "credential_invention_requested",
+        "workflow_credential_inputs_unbound",
+        "login_credentials_unresolved",
+    }
 )
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "credential_invention_requested",
@@ -96,6 +133,11 @@ _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "missing_conditional_condition",
     "missing_target_context",
 }
+# A failed credential lookup under explicit login intent is the same condition
+# login_credentials_unresolved names, so it may be upgraded; other planes may not.
+_LOGIN_CREDENTIAL_OVERRIDABLE_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"none", "credential_name_unresolved"}
+)
 _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
     "ambiguous_loop_edit",
     "invalid_conditional_container",
@@ -118,10 +160,17 @@ _RAW_SECRET_QUESTION = (
 )
 _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
 _SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
+_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX = (
+    "This request needs to sign in, and no saved credential for it is available yet. "
+    "Please connect one, or reply with its exact saved credential name or a credential ID beginning with cred_."
+)
+_LOGIN_CREDENTIAL_QUESTION = f"{_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
     "Which website or login page should I use to look up the stored credential?"
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
+_AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
+_SIGNIN_EMAIL_QUESTION = "Which email address should I sign in with?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
@@ -156,7 +205,70 @@ _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
 )
+_DIRECT_CREDENTIAL_TOKEN_RE = re.compile(
+    r"\b(?:use|using|with)\s+(?:the\s+)?(?:saved\s+)?credential"
+    r"(?:\s+(?:named|called))?\s+([A-Za-z0-9_.@:-]{2,100})\b",
+    re.I,
+)
+_POSTFIX_CREDENTIAL_TOKEN_RE = re.compile(
+    r"\b(?:use|using|with)\s+(?:my\s+|the\s+)?(?:saved\s+)?([A-Za-z0-9_.@:-]{2,100})\s+credential\b",
+    re.I,
+)
+_EXPLICIT_CREDENTIAL_ID_CONTEXT_RE = re.compile(
+    r"\b(?:use|using|with|select|choose)\s+"
+    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?(?:credential(?:\s+id)?\s*)?"
+    r"(?::\s*)?$",
+    re.I,
+)
+_CREDENTIAL_ID_LABEL_CONTEXT_RE = re.compile(r"\bcredential\s+id\s*$", re.I)
+_CREDENTIAL_ID_COORDINATOR_RE = re.compile(r"\s*,?\s*(?:and|or)\s*$", re.I)
+_CREDENTIAL_REPLACEMENT_TARGET_RES = (
+    re.compile(
+        r"\bswitch(?:ing)?\s+to\b"
+        r"(?=\s+(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?"
+        r"(?:credential\b|cred_|[A-Za-z0-9_.@:-]{2,100}\s+credential\b))",
+        re.I,
+    ),
+    re.compile(
+        r"\breplace\s+(?:(?:it|this|that)\b|cred_[A-Za-z0-9_-]+|"
+        r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?credential"
+        r"(?:\s+(?:(?:id|named|called)\s+)?[A-Za-z0-9_.@:-]{2,100})?)"
+        r"\s+with\b"
+        r"(?=\s+(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?"
+        r"(?:credential\b|cred_|[A-Za-z0-9_.@:-]{2,100}\s+credential\b))",
+        re.I,
+    ),
+)
+_REPLACEMENT_CONTEXT_RE = re.compile(
+    r"\breplace\b(?P<object>[^.!?\n,;]{1,80}?)\bwith\s+"
+    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?"
+    r"(?:credential(?:\s+(?:id|named|called))?\s*)?$",
+    re.I,
+)
+_CREDENTIAL_REPLACEMENT_OBJECT_RE = re.compile(
+    r"\s*(?:(?:it|this|that)|cred_[A-Za-z0-9_-]+|"
+    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?credential"
+    r"(?:\s+(?:(?:id|named|called)\s+)?[A-Za-z0-9_.@:-]{2,100})?)\s*",
+    re.I,
+)
 _CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
+_NEGATED_CREDENTIAL_CONTEXT_RE = re.compile(
+    r"(?:"
+    r"\b(?:do\s+not|don't|never|without|avoid(?:ing)?|exclud(?:e|ed|es|ing))\b"
+    r"(?:(?!\b(?:but|instead)\b)[^.!?\n,;])*"
+    r"|\b(?:instead\s+of|rather\s+than|not|except)\s+"
+    r"(?:(?:the|a)\s+)?(?:(?:saved\s+)?credential(?:\s+id)?\s*)?"
+    r")$",
+    re.I,
+)
+_EXPLICIT_LOGIN_ACTION_RE = re.compile(
+    r"(?<![/\w-])(?:log[\s-]?in|login|sign[\s-]?in)\b"
+    r"(?!\s+(?:form|page|path|route|screen|url)\b)",
+    re.I,
+)
+_CREDENTIAL_REFERENCE_STOPWORDS = frozenset(
+    {"a", "an", "credential", "for", "login", "my", "saved", "stored", "the", "to"}
+)
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
 _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
@@ -170,6 +282,7 @@ _COMPLETION_CRITERION_EXPECTED_VALUE_MAX_CHARS = 500
 _COMPLETION_CRITERION_CLASSIFICATION_TARGET_MAX_CHARS = 120
 _CLASSIFICATION_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CONTINGENT_ANTECEDENT_OUTPUT_PATH_RE = re.compile(r"^output\.[A-Za-z_][A-Za-z0-9_]*$")
+_REQUEST_SLOT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUESTED_OUTPUT_CRITERION_ID_PREFIX = "__copilot_requested_output__"
 _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS: dict[str, tuple[str, bool]] = {
     "output.login_only": ("login_only", True),
@@ -189,6 +302,7 @@ CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
 CriterionKind = Literal["outcome", "terminal_action", "validation_classification"]
 TerminalActionFamily = Literal["request", "application", "form", "order"]
+TerminalActionVerificationMode = Literal["family_record_v1", "semantic_outcome_v1"]
 ClassificationTarget = str | bool
 ExpectedOutputValue = str | bool
 ExpectedOutputShape = Literal[
@@ -200,6 +314,7 @@ ExpectedOutputShape = Literal[
     "money_amount",
     "owner_label",
     "goal_judgment_boolean",
+    "value_present",
 ]
 RequestedOutputEvidenceSource = Literal[
     "runtime_output",
@@ -208,13 +323,23 @@ RequestedOutputEvidenceSource = Literal[
     "registered_artifact_content",
 ]
 JudgmentPredicate = Literal["login_gate_blocks_target"]
+MintDisposition = Literal["pending", "decidable", "degraded"]
+Pinability = Literal["pinned", "shapeless_valid", "unpinnable"]
+AntecedentFamily = Literal["unconditional", "blocker", "undecidable"]
 _JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
-MintDegrade = Literal["turn_unsatisfiable_fallback", "contingent_missing_antecedent"]
+MintDegrade = Literal[
+    "turn_unsatisfiable_fallback",
+    "contingent_missing_antecedent",
+    "undecidable_judgment",
+]
 MINT_DEGRADE_VALUES: frozenset[str] = frozenset(get_args(MintDegrade))
+ANTECEDENT_FAMILY_VALUES: frozenset[str] = frozenset(get_args(AntecedentFamily))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
 _REQUESTED_OUTPUT_EVIDENCE_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputEvidenceSource))
+RequestedOutputPathMintSource = Literal["classifier_default", "classifier_declared"]
+REQUESTED_OUTPUT_PATH_MINT_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputPathMintSource))
 
 _OUTPUT_INTENT_RE = re.compile(
     r"\b(?:read|capture|extract|output|return|returns|returned|include|includes|including|"
@@ -251,6 +376,15 @@ _OUTPUT_FIELD_WORDS = frozenset(
     "amount amounts domain domains name names number numbers owner owners phone phones rate rates specialties specialty "
     "status statuses taxonomy total totals url urls website websites".split()
 )
+# When one of these is followed by "of <noun phrase>" the field is the noun phrase, not the
+# quantifier; the head-at-end window below cannot reach a subject that trails the field word.
+_OUTPUT_QUANTIFIER_HEAD_WORDS = frozenset(
+    "number numbers count counts total totals amount amounts sum sums quantity quantities "
+    "average averages percentage percentages proportion proportions share shares".split()
+)
+# Words that end a quantifier's noun phrase: a scope/time qualifier ("... in the past 7 days") or another
+# preposition begins here, so the field name stops before it.
+_OUTPUT_PHRASE_BOUNDARY_WORDS = frozenset("in on over during within for per by from since between as at with".split())
 # Intentionally distinct from enforcement._COVERAGE_GENERIC_TOKENS: this list filters intent prose when
 # parsing requested-output field names, so it drops phrase-level noise ("each", "profile", "structured");
 # the coverage list filters path leaf tokens only. Not unified — the consumers differ.
@@ -283,10 +417,14 @@ class CompletionCriterion:
     outcome: str
     contingent_on: str | None = None
     contingent_antecedent_output_path: str | None = None
+    antecedent_family: AntecedentFamily | None = None
     deliverable_kind: Literal["registered_download"] | None = None
     # Author-time seam signal only: unlike ``deliverable_kind`` it survives canonicalization onto
     # non-canonical output paths, so it is never rendered to the completion verifier.
     declared_deliverable_kind: Literal["registered_download"] | None = None
+    # Classifier-authored license for the plain-outcome abstention: non-null only when this
+    # criterion's separate observation may abstain behind the confirmed canonical download.
+    deliverable_confirmation_criterion_id: str | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -296,8 +434,12 @@ class CompletionCriterion:
     expected_output_value: ExpectedOutputValue | None = None
     expected_output_shape: ExpectedOutputShape | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource = "runtime_output"
+    requested_output_path_mint_source: RequestedOutputPathMintSource | None = None
     kind: CriterionKind = "outcome"
     terminal_action_family: TerminalActionFamily | None = None
+    # Native terminal actions retain the historical structured-family grader. A criterion
+    # promoted from a generic outcome must opt into semantic verification instead.
+    terminal_action_verification_mode: TerminalActionVerificationMode = "family_record_v1"
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
@@ -305,6 +447,102 @@ class CompletionCriterion:
     judgment_truth_condition: JudgmentTruthCondition | None = None
     requested_output_floor_rekeyed: bool = False
     floor_rekeyed_from_path: str | None = None
+    # Typed request-slot metadata. Assertion identity, deduplication, and reconciliation
+    # intentionally exclude these fields.
+    request_slot_id: str | None = None
+    pinability: Pinability | None = None
+    mint_disposition: MintDisposition = "decidable"
+
+
+@dataclass(frozen=True)
+class TerminalActionReconciliationV1:
+    version: Literal["1"]
+    criterion_id: str | None
+    terminal_action_family: TerminalActionFamily | None
+
+
+@dataclass(frozen=True)
+class RequestSlotFailureSurfaceV1:
+    version: Literal["1"]
+    reason: Literal["request_slot_failure"]
+    failure_kind: Literal["request_slot_failure"]
+    retryable: Literal[False]
+    request_slot_failure_kind: str
+
+
+RequestSlotDatumField = Literal["output_path", "classification_output_key"]
+
+
+@dataclass(frozen=True)
+class RequestSlotDatumBindingV1:
+    version: Literal["1"]
+    criterion_index: int
+    datum_field: RequestSlotDatumField
+    datum_value: str
+    source_id: str
+    source_quote: str
+
+
+@dataclass(frozen=True)
+class RequestSlotDatumBindingTargetV1:
+    criterion_index: int
+    datum_field: RequestSlotDatumField
+    datum_value: str
+    criterion_outcome_sha256: str
+
+
+@dataclass(frozen=True)
+class TrustedRequestSlotDatumBindingV1:
+    version: Literal["1"]
+    criterion_index: int
+    datum_field: RequestSlotDatumField
+    datum_value: str
+    criterion_outcome_sha256: str
+    source_id: str
+    source_quote: str
+    slot_id: str
+
+
+DatumBindingApplicationPredicate = Literal[
+    "accepted",
+    "invalid_criteria_container",
+    "invalid_contract",
+    "anchor_incoherent",
+    "anchor_not_unique",
+]
+
+
+@dataclass(frozen=True)
+class RequestSlotDatumBindingApplicationDecisionV1:
+    version: Literal["1"]
+    predicate: DatumBindingApplicationPredicate
+    criterion_index: int | None = None
+    accepted_payload: dict[str, Any] | None = None
+    trusted_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = ()
+
+
+AnchorCorrectionPredicate = Literal[
+    "accepted",
+    "invalid_criteria_container",
+    "criterion_count_changed",
+    "payload_semantics_changed",
+    "criteria_semantics_changed",
+    "criterion_not_object",
+    "criterion_semantics_changed",
+    "missing_corrected_anchor",
+    "original_quote_not_admissible",
+    "missing_request_slot_fields",
+    "corrected_anchor_not_admissible",
+    "unexpected_anchor_change",
+]
+
+
+@dataclass(frozen=True)
+class RequestSlotAnchorCorrectionDecisionV1:
+    version: Literal["1"]
+    predicate: AnchorCorrectionPredicate
+    criterion_index: int | None = None
+    accepted_payload: dict[str, Any] | None = None
 
 
 @dataclass
@@ -314,6 +552,13 @@ class RequestPolicy:
     credential_input_kind: str = "none"
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
+    login_intent: bool = False
+    # Sign-in that identifies the user by email address instead of a stored password, so
+    # resolving *which address* is the whole credential question — there is no password to find.
+    email_signin_intent: bool = False
+    signin_email_candidates: list[str] = field(default_factory=list)
+    resolved_signin_email: str | None = None
+    resolved_signin_host: str | None = None
     requires_user_clarification: bool = False
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
@@ -343,6 +588,7 @@ class RequestPolicy:
     classifier_retry_count: int = 0
     classifier_non_runtime_requested_output_evidence_sources: list[str] = field(default_factory=list)
     completion_contract_status: str = "absent"
+    request_slot_failure_kind: str | None = None
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -352,6 +598,9 @@ class RequestPolicy:
             "testing_intent": self.testing_intent,
             "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
+            "login_intent": self.login_intent,
+            "email_signin_intent": self.email_signin_intent,
+            "signin_email_resolved": bool(self.resolved_signin_email),
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
@@ -365,6 +614,11 @@ class RequestPolicy:
             ),
             "completion_criteria_method_mandated_count": sum(
                 1 for criterion in self.completion_criteria if criterion.method_mandated
+            ),
+            "completion_criteria_terminal_action_count": sum(
+                1
+                for criterion in self.completion_criteria
+                if criterion.kind == "terminal_action" and not criterion.method_mandated
             ),
             "raw_secret_detected": self.raw_secret_detected,
             "has_raw_secret_evidence": self.raw_secret_evidence is not None,
@@ -388,6 +642,16 @@ class RequestPolicy:
             criterion for criterion in self.graded_completion_criteria() if criterion.output_path is not None
         ]
         data["requested_output_criteria_count"] = len(requested_output_criteria)
+        if self.request_slot_failure_kind is not None:
+            data["request_slot_failure_kind"] = self.request_slot_failure_kind
+        family_criteria = [
+            criterion for criterion in self.graded_completion_criteria() if criterion.antecedent_family is not None
+        ]
+        data["antecedent_family_criterion_count"] = len(family_criteria)
+        for index, criterion in enumerate(family_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"antecedent_family_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_antecedent_family"] = criterion.antecedent_family
         for index, criterion in enumerate(requested_output_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
             prefix = f"requested_output_criterion_{index}"
             data[f"{prefix}_id"] = criterion.id
@@ -396,7 +660,12 @@ class RequestPolicy:
             data[f"{prefix}_has_exact_value"] = criterion.expected_output_value is not None
             if criterion.mint_degrade is not None:
                 data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
+            data[f"{prefix}_mint_disposition"] = criterion.mint_disposition
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
+            if criterion.request_slot_id is not None:
+                data[f"{prefix}_request_slot_id"] = criterion.request_slot_id
+            if criterion.pinability is not None:
+                data[f"{prefix}_pinability"] = criterion.pinability
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
         mint_degraded_criteria = [
@@ -407,6 +676,24 @@ class RequestPolicy:
             prefix = f"mint_degraded_criterion_{index}"
             data[f"{prefix}_id"] = criterion.id
             data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
+        neutral_reported_booleans = [
+            criterion for criterion in self.completion_criteria if is_neutral_reported_boolean_criterion(criterion)
+        ]
+        data["neutral_reported_boolean_criterion_count"] = len(neutral_reported_booleans)
+        for index, criterion in enumerate(neutral_reported_booleans[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"neutral_reported_boolean_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_kind"] = criterion.kind
+            data[f"{prefix}_classification_output_key"] = criterion.classification_output_key
+            data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
+            data[f"{prefix}_expected_output_value"] = criterion.expected_output_value
+            data[f"{prefix}_expected_classification"] = criterion.expected_classification
+            data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
+            data[f"{prefix}_request_slot_id"] = criterion.request_slot_id
+            data[f"{prefix}_pinability"] = criterion.pinability
+            data[f"{prefix}_mint_disposition"] = criterion.mint_disposition
+            data[f"{prefix}_requested_output_floor_rekeyed"] = criterion.requested_output_floor_rekeyed
+            data[f"{prefix}_floor_rekeyed_from_path"] = criterion.floor_rekeyed_from_path
         return data
 
     def prompt_summary(self) -> str:
@@ -426,6 +713,20 @@ class RequestPolicy:
             lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
+        if self.resolved_signin_email:
+            lines.append(f"resolved_signin_email: {self.resolved_signin_email}")
+        graded_criteria = self.graded_completion_criteria()
+        requested_output_path_literals = sorted(
+            {
+                criterion.output_path
+                for criterion in graded_criteria
+                if criterion.output_path and criterion.level != "definition"
+            }
+            | floor_rekeyed_requested_output_paths(graded_criteria)
+        )
+        if requested_output_path_literals:
+            lines.append("requested_output_paths:")
+            lines += [f"- {path}" for path in requested_output_path_literals]
         validation_classification_criteria = [
             criterion
             for criterion in self.graded_completion_criteria()
@@ -456,6 +757,23 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     if request_policy is None:
         return False
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def floor_rekeyed_requested_output_paths(
+    criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion],
+) -> set[str]:
+    """Identity of runtime-output criteria whose slot rekey cleared ``output_path``; the rekey
+    preserves it in ``floor_rekeyed_from_path``, and without it they vanish from the requested set."""
+    return {
+        criterion.floor_rekeyed_from_path
+        for criterion in criteria
+        if criterion.requested_output_floor_rekeyed
+        and criterion.floor_rekeyed_from_path
+        and criterion.kind == "outcome"
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.requested_output_evidence_source == "runtime_output"
+    }
 
 
 def is_defer_authoring_durable_fill_criterion(criterion: CompletionCriterion) -> bool:
@@ -491,6 +809,21 @@ def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | Non
 def _is_judgment_boolean_criterion(criterion: CompletionCriterion) -> bool:
     return (
         isinstance(criterion.expected_output_value, bool) or criterion.expected_output_shape == "goal_judgment_boolean"
+    )
+
+
+def is_judgment_finalization_candidate(criterion: CompletionCriterion) -> bool:
+    """Whether accepted-artifact evidence must decide or degrade this criterion."""
+    if criterion.pinability in {"shapeless_valid", "unpinnable"}:
+        return False
+    return (
+        criterion.judgment_truth_condition is not None
+        or _is_judgment_boolean_criterion(criterion)
+        or (
+            criterion.kind == "validation_classification"
+            and criterion.classification_output_key is not None
+            and (isinstance(criterion.expected_classification, bool) or criterion.mint_disposition == "pending")
+        )
     )
 
 
@@ -670,6 +1003,10 @@ def _clean_list(values: list[Any]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
+def _clean_email_list(values: list[Any]) -> list[str]:
+    return [value for value in _clean_list(values) if is_email_address(value)]
+
+
 def _credential_ids(text: str) -> list[str]:
     text = text or ""
     canonical = _CREDENTIAL_ID_RE.findall(text)
@@ -698,7 +1035,7 @@ def _verify_raw_secret_evidence(evidence: str | None, user_message: str) -> bool
 
 
 def _coerce_clarification_reason(value: Any) -> ClarificationReason:
-    if value in _VALID_CLARIFICATION_REASONS:
+    if value in _VALID_CLARIFICATION_REASONS and value not in _DETERMINISTIC_ONLY_CLARIFICATION_REASONS:
         return cast(ClarificationReason, value)
     return "none"
 
@@ -785,7 +1122,1205 @@ def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     return raw
 
 
-def _classification_from_raw(raw: Any) -> RequestPolicy:
+def _parse_terminal_action_reconciliation(raw: Any) -> TerminalActionReconciliationV1 | None:
+    if isinstance(raw, str):
+        raw = parse_final_response(raw)
+    if not isinstance(raw, dict) or set(raw) != _TERMINAL_ACTION_RECONCILIATION_RESPONSE_FIELDS:
+        return None
+    if raw.get("version") != "1":
+        return None
+    criterion_id = raw.get("criterion_id")
+    family = raw.get("terminal_action_family")
+    if criterion_id is None and family is None:
+        return TerminalActionReconciliationV1(version="1", criterion_id=None, terminal_action_family=None)
+    if not isinstance(criterion_id, str) or not criterion_id.strip():
+        return None
+    if not isinstance(family, str) or family not in _TERMINAL_ACTION_FAMILIES:
+        return None
+    return TerminalActionReconciliationV1(
+        version="1",
+        criterion_id=criterion_id,
+        terminal_action_family=cast(TerminalActionFamily, family),
+    )
+
+
+def _request_slot_anchor(item: dict[str, Any]) -> tuple[str, str] | None:
+    source_id = item.get("request_slot_source_id")
+    source_quote = item.get("request_slot_source_quote")
+    if not isinstance(source_id, str) or not isinstance(source_quote, str) or not source_quote:
+        return None
+    return source_id, source_quote
+
+
+def _item_claims_request_slot_fields(item: dict[str, Any]) -> bool:
+    return any(
+        item.get(field) is not None
+        for field in (
+            "output_path",
+            "classification_output_key",
+            "expected_output_value",
+            "expected_output_shape",
+            "expected_classification",
+        )
+    )
+
+
+def _item_claims_request_slot(item: dict[str, Any]) -> bool:
+    return any(item.get(field) is not None for field in ("request_slot_source_id", "request_slot_source_quote")) or (
+        _item_claims_request_slot_fields(item)
+    )
+
+
+def _request_slot_anchor_is_valid(
+    item: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    anchor = _request_slot_anchor(item)
+    if anchor is None:
+        return False
+    source_id, source_quote = anchor
+    source = next(
+        (source for source in request_slot_sources(request_slot_request) if source.source_id == source_id),
+        None,
+    )
+    if source is None:
+        return False
+    start = source.text.find(source_quote)
+    return start >= 0 and source.text.find(source_quote, start + 1) < 0
+
+
+def _request_slot_datum_binding(
+    item: dict[str, Any],
+    *,
+    criterion_index: int,
+) -> RequestSlotDatumBindingV1 | None:
+    raw = item.get("request_slot_datum_binding")
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "criterion_index",
+        "datum_field",
+        "datum_value",
+        "source_id",
+        "source_quote",
+    }:
+        return None
+    version = raw.get("version")
+    raw_index = raw.get("criterion_index")
+    datum_field = raw.get("datum_field")
+    datum_value = raw.get("datum_value")
+    source_id = raw.get("source_id")
+    source_quote = raw.get("source_quote")
+    if (
+        version != "1"
+        or type(raw_index) is not int
+        or raw_index != criterion_index
+        or datum_field not in {"output_path", "classification_output_key"}
+        or not isinstance(datum_value, str)
+        or not datum_value
+        or not isinstance(source_id, str)
+        or not isinstance(source_quote, str)
+        or not source_quote
+    ):
+        return None
+    return RequestSlotDatumBindingV1(
+        version="1",
+        criterion_index=raw_index,
+        datum_field=cast(RequestSlotDatumField, datum_field),
+        datum_value=datum_value,
+        source_id=source_id,
+        source_quote=source_quote,
+    )
+
+
+def _request_slot_datum_binding_is_valid(
+    item: dict[str, Any],
+    *,
+    criterion_index: int,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    binding = _request_slot_datum_binding(item, criterion_index=criterion_index)
+    if binding is None:
+        return False
+    anchor = _request_slot_anchor(item)
+    kind = _coerce_criterion_kind(item.get("kind"))
+    if kind == "validation_classification":
+        expected_datum_field: RequestSlotDatumField | None = "classification_output_key"
+        active_datum_value = _coerce_classification_output_key(item.get("classification_output_key"))
+    elif isinstance(item.get("output_path"), str) and item["output_path"].strip():
+        expected_datum_field = "output_path"
+        active_datum_value = item[expected_datum_field].strip()
+    else:
+        expected_datum_field = None
+        active_datum_value = None
+    return (
+        binding.datum_field == expected_datum_field
+        and active_datum_value is not None
+        and item.get(binding.datum_field) == active_datum_value == binding.datum_value
+        and anchor == (binding.source_id, binding.source_quote)
+        and _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request)
+    )
+
+
+def _trusted_request_slot_datum_binding_is_valid(
+    item: dict[str, Any],
+    *,
+    binding: TrustedRequestSlotDatumBindingV1,
+    criterion_index: int,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    raw_binding = item.get("request_slot_datum_binding")
+    outcome = item.get("outcome")
+    return _type_strict_json_equal(
+        raw_binding,
+        {
+            "version": binding.version,
+            "criterion_index": binding.criterion_index,
+            "datum_field": binding.datum_field,
+            "datum_value": binding.datum_value,
+            "criterion_outcome_sha256": binding.criterion_outcome_sha256,
+            "source_id": binding.source_id,
+            "source_quote": binding.source_quote,
+        },
+    ) and (
+        binding.criterion_index == criterion_index
+        and item.get(binding.datum_field) == binding.datum_value
+        and isinstance(outcome, str)
+        and hashlib.sha256(outcome.encode()).hexdigest() == binding.criterion_outcome_sha256
+        and _request_slot_anchor(item) == (binding.source_id, binding.source_quote)
+        and _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request)
+    )
+
+
+def _request_slot_anchor_matches_criterion_datum(item: dict[str, Any]) -> bool:
+    anchor = _request_slot_anchor(item)
+    if anchor is None:
+        return False
+    _source_id, source_quote = anchor
+    quote_tokens = re.findall(r"[a-z0-9]+", source_quote.casefold())
+    for field_name in ("output_path", "classification_output_key"):
+        value = item.get(field_name)
+        if not isinstance(value, str) or not value:
+            continue
+        datum = value.rsplit(".", 1)[-1]
+        datum_tokens = re.findall(r"[a-z0-9]+", datum.casefold())
+        if not datum_tokens:
+            continue
+        width = len(datum_tokens)
+        return any(
+            quote_tokens[index : index + width] == datum_tokens for index in range(len(quote_tokens) - width + 1)
+        )
+    return True
+
+
+def _request_slot_anchor_is_admissible(
+    item: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    criterion_index: int | None = None,
+    trusted_binding: TrustedRequestSlotDatumBindingV1 | None = None,
+    allow_embedded_binding: bool = False,
+) -> bool:
+    if (
+        criterion_index is not None
+        and trusted_binding is not None
+        and _trusted_request_slot_datum_binding_is_valid(
+            item,
+            binding=trusted_binding,
+            criterion_index=criterion_index,
+            request_slot_request=request_slot_request,
+        )
+    ):
+        return True
+    if (
+        criterion_index is not None
+        and allow_embedded_binding
+        and _request_slot_datum_binding_is_valid(
+            item,
+            criterion_index=criterion_index,
+            request_slot_request=request_slot_request,
+        )
+    ):
+        return True
+    return _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request) and (
+        _request_slot_anchor_matches_criterion_datum(item)
+    )
+
+
+def _type_strict_json_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_type_strict_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _type_strict_json_equal(left_item, right_item) for left_item, right_item in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
+def _request_slot_datum_target(
+    item: dict[str, Any],
+    *,
+    criterion_index: int,
+) -> RequestSlotDatumBindingTargetV1 | None:
+    outcome = item.get("outcome")
+    if not isinstance(outcome, str) or not outcome:
+        return None
+    kind = _coerce_criterion_kind(item.get("kind"))
+    if kind == "validation_classification":
+        datum_value = _coerce_classification_output_key(item.get("classification_output_key"))
+        datum_field: RequestSlotDatumField = "classification_output_key"
+    elif kind == "terminal_action":
+        return None
+    else:
+        raw_output_path = item.get("output_path")
+        datum_value = raw_output_path.strip() if isinstance(raw_output_path, str) and raw_output_path.strip() else None
+        datum_field = "output_path"
+    if datum_value is None:
+        return None
+    return RequestSlotDatumBindingTargetV1(
+        criterion_index=criterion_index,
+        datum_field=datum_field,
+        datum_value=datum_value,
+        criterion_outcome_sha256=hashlib.sha256(outcome.encode()).hexdigest(),
+    )
+
+
+def _request_slot_datum_binding_targets(
+    raw_criteria: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> tuple[RequestSlotDatumBindingTargetV1, ...]:
+    if not isinstance(raw_criteria, list):
+        return ()
+    targets: list[RequestSlotDatumBindingTargetV1] = []
+    for criterion_index, item in enumerate(raw_criteria):
+        if not isinstance(item, dict):
+            continue
+        target = _request_slot_datum_target(item, criterion_index=criterion_index)
+        if target is None:
+            continue
+        # First-pass model assertions are not provenance. Only the unchanged legacy
+        # lexical check or a server-joined producer contract may license the datum.
+        if _request_slot_anchor_is_valid(item, request_slot_request=request_slot_request) and (
+            _request_slot_anchor_matches_criterion_datum(item)
+        ):
+            continue
+        targets.append(target)
+    return tuple(targets)
+
+
+def _interrogative_slot_classification_output_key(
+    source_quote: str,
+    *,
+    preserve_path_subject: bool = False,
+) -> str | None:
+    tokens = _word_tokens(source_quote)
+    if not tokens or tokens[0] != "whether":
+        return None
+    tokens = tokens[1:]
+    while tokens and tokens[0] in {"a", "an", "the"}:
+        tokens = tokens[1:]
+    if tokens[:2] == ["path", "is"]:
+        tokens = [tokens[0], *tokens[2:]] if preserve_path_subject else tokens[2:]
+    if not tokens:
+        return None
+    output_key = "_".join(tokens)
+    return output_key if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(output_key) is not None else None
+
+
+def _omitted_request_slot_datum_binding_targets(
+    raw_criteria: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+    existing_targets: tuple[RequestSlotDatumBindingTargetV1, ...],
+) -> tuple[RequestSlotDatumBindingTargetV1, ...]:
+    represented_slot_ids = {binding.slot_id for binding in request_slot_contract.datum_bindings}
+    if isinstance(raw_criteria, list):
+        for item in raw_criteria:
+            if not isinstance(item, dict) or not _request_slot_anchor_is_valid(
+                item,
+                request_slot_request=request_slot_request,
+            ):
+                continue
+            slot = _request_slot_for_anchor(
+                _request_slot_anchor(item),
+                request_slot_request=request_slot_request,
+                request_slot_contract=request_slot_contract,
+            )
+            if slot is not None:
+                represented_slot_ids.add(slot.slot_id)
+    represented_output_keys = {target.datum_value for target in existing_targets}
+    next_criterion_index = len(raw_criteria) if isinstance(raw_criteria, list) else 0
+    targets: list[RequestSlotDatumBindingTargetV1] = []
+    for slot in request_slot_contract.slots:
+        if (
+            slot.slot_id in represented_slot_ids
+            or slot.plane.value != "run"
+            or slot.pinability.value != "shapeless_valid"
+        ):
+            continue
+        source_quote = request_slot_source_text(request_slot_request, slot)
+        output_key = _interrogative_slot_classification_output_key(source_quote)
+        if output_key is None or output_key in represented_output_keys:
+            continue
+        outcome = f"The run reports whether {output_key.replace('_', ' ')}."
+        targets.append(
+            RequestSlotDatumBindingTargetV1(
+                criterion_index=next_criterion_index,
+                datum_field="classification_output_key",
+                datum_value=output_key,
+                criterion_outcome_sha256=hashlib.sha256(outcome.encode()).hexdigest(),
+            )
+        )
+        represented_output_keys.add(output_key)
+        next_criterion_index += 1
+    return tuple(targets)
+
+
+def _trusted_omitted_request_slot_datum_bindings(
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+    omitted_targets: tuple[RequestSlotDatumBindingTargetV1, ...],
+) -> tuple[TrustedRequestSlotDatumBindingV1, ...]:
+    target_by_key = {(target.criterion_index, target.datum_field): target for target in omitted_targets}
+    trusted: list[TrustedRequestSlotDatumBindingV1] = []
+    for binding in request_slot_contract.datum_bindings:
+        target = target_by_key.get((binding.criterion_index, binding.datum_field))
+        if (
+            target is None
+            or binding.datum_value != target.datum_value
+            or binding.criterion_outcome_sha256 != target.criterion_outcome_sha256
+        ):
+            continue
+        resolved_slot = _request_slot_for_anchor(
+            (binding.source_id, binding.source_quote),
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+        )
+        if resolved_slot is None or binding.slot_id != resolved_slot.slot_id:
+            continue
+        trusted.append(
+            TrustedRequestSlotDatumBindingV1(
+                version="1",
+                criterion_index=target.criterion_index,
+                datum_field=target.datum_field,
+                datum_value=target.datum_value,
+                criterion_outcome_sha256=target.criterion_outcome_sha256,
+                source_id=binding.source_id,
+                source_quote=binding.source_quote,
+                slot_id=binding.slot_id,
+            )
+        )
+    return tuple(trusted)
+
+
+def _apply_request_slot_datum_bindings(
+    original: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+    datum_binding_targets: tuple[RequestSlotDatumBindingTargetV1, ...] | None = None,
+) -> RequestSlotDatumBindingApplicationDecisionV1:
+    criteria = original.get("completion_criteria")
+    if not isinstance(criteria, list):
+        return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_criteria_container")
+    if request_slot_contract.request_digest != request_slot_request_digest(request_slot_request):
+        return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_contract")
+
+    targets = datum_binding_targets or _request_slot_datum_binding_targets(
+        criteria,
+        request_slot_request=request_slot_request,
+    )
+    target_by_key = {(target.criterion_index, target.datum_field): target for target in targets}
+    all_binding_by_key = {
+        (binding.criterion_index, binding.datum_field): binding for binding in request_slot_contract.datum_bindings
+    }
+    all_decline_by_key = {
+        (decline.criterion_index, decline.datum_field): decline for decline in request_slot_contract.datum_declines
+    }
+    request_target_by_key = {
+        (target.criterion_index, target.datum_field): target for target in request_slot_request.datum_targets
+    }
+    binding_by_key = {key: binding for key, binding in all_binding_by_key.items() if key in target_by_key}
+    decline_by_key = {key: decline for key, decline in all_decline_by_key.items() if key in target_by_key}
+    if (
+        len(all_binding_by_key) != len(request_slot_contract.datum_bindings)
+        or len(all_decline_by_key) != len(request_slot_contract.datum_declines)
+        or set(all_binding_by_key) & set(all_decline_by_key)
+        or set(all_binding_by_key) | set(all_decline_by_key) != set(request_target_by_key)
+        or set(binding_by_key) | set(decline_by_key) != set(target_by_key)
+        or any(
+            (request_target := request_target_by_key.get(key)) is None
+            or request_target.criterion_index != target.criterion_index
+            or request_target.datum_field != target.datum_field
+            or request_target.datum_value != target.datum_value
+            or request_target.criterion_outcome_sha256 != target.criterion_outcome_sha256
+            for key, target in target_by_key.items()
+        )
+    ):
+        return RequestSlotDatumBindingApplicationDecisionV1(version="1", predicate="invalid_contract")
+
+    for key, decline in decline_by_key.items():
+        target = target_by_key[key]
+        if (
+            decline.datum_value != target.datum_value
+            or decline.criterion_outcome_sha256 != target.criterion_outcome_sha256
+        ):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+
+    trusted_bindings: list[TrustedRequestSlotDatumBindingV1] = []
+    for key, binding in binding_by_key.items():
+        target = target_by_key[key]
+        criterion = criteria[target.criterion_index]
+        if not isinstance(criterion, dict):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+        outcome = criterion.get("outcome")
+        if (
+            binding.datum_value != target.datum_value
+            or binding.criterion_outcome_sha256 != target.criterion_outcome_sha256
+        ):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+        if (
+            not isinstance(outcome, str)
+            or hashlib.sha256(outcome.encode()).hexdigest() != target.criterion_outcome_sha256
+        ):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="anchor_incoherent", criterion_index=target.criterion_index
+            )
+        candidate = {
+            **criterion,
+            "request_slot_source_id": binding.source_id,
+            "request_slot_source_quote": binding.source_quote,
+        }
+        if not _request_slot_anchor_is_valid(candidate, request_slot_request=request_slot_request):
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="anchor_not_unique", criterion_index=target.criterion_index
+            )
+        resolved_slot = _request_slot_for_anchor(
+            (binding.source_id, binding.source_quote),
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+        )
+        if resolved_slot is None or binding.slot_id != resolved_slot.slot_id:
+            return RequestSlotDatumBindingApplicationDecisionV1(
+                version="1", predicate="invalid_contract", criterion_index=target.criterion_index
+            )
+        trusted_bindings.append(
+            TrustedRequestSlotDatumBindingV1(
+                version="1",
+                criterion_index=target.criterion_index,
+                datum_field=target.datum_field,
+                datum_value=target.datum_value,
+                criterion_outcome_sha256=target.criterion_outcome_sha256,
+                source_id=binding.source_id,
+                source_quote=binding.source_quote,
+                slot_id=binding.slot_id,
+            )
+        )
+
+    accepted_payload = copy.deepcopy(original)
+    accepted_criteria = accepted_payload["completion_criteria"]
+    for trusted_binding in trusted_bindings:
+        accepted_item = accepted_criteria[trusted_binding.criterion_index]
+        accepted_item["request_slot_source_id"] = trusted_binding.source_id
+        accepted_item["request_slot_source_quote"] = trusted_binding.source_quote
+        accepted_item["request_slot_datum_binding"] = {
+            "version": trusted_binding.version,
+            "criterion_index": trusted_binding.criterion_index,
+            "datum_field": trusted_binding.datum_field,
+            "datum_value": trusted_binding.datum_value,
+            "criterion_outcome_sha256": trusted_binding.criterion_outcome_sha256,
+            "source_id": trusted_binding.source_id,
+            "source_quote": trusted_binding.source_quote,
+        }
+    return RequestSlotDatumBindingApplicationDecisionV1(
+        version="1",
+        predicate="accepted",
+        accepted_payload=accepted_payload,
+        trusted_bindings=tuple(trusted_bindings),
+    )
+
+
+def _request_slot_claims_need_anchor_correction(
+    raw_criteria: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    return isinstance(raw_criteria, list) and any(
+        isinstance(item, dict)
+        and _item_claims_request_slot(item)
+        and not _request_slot_anchor_is_admissible(
+            item,
+            request_slot_request=request_slot_request,
+            criterion_index=criterion_index,
+        )
+        for criterion_index, item in enumerate(raw_criteria)
+    )
+
+
+def _accept_request_slot_anchor_correction(
+    original: dict[str, Any],
+    corrected: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> RequestSlotAnchorCorrectionDecisionV1:
+    original_criteria = original.get("completion_criteria")
+    corrected_criteria = corrected.get("completion_criteria")
+    if not isinstance(original_criteria, list) or not isinstance(corrected_criteria, list):
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="invalid_criteria_container")
+    if len(original_criteria) != len(corrected_criteria):
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="criterion_count_changed")
+
+    anchor_fields = {"request_slot_source_id", "request_slot_source_quote"}
+    if _classifier_payload_semantics(original) != _classifier_payload_semantics(corrected):
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="payload_semantics_changed")
+    original_semantic_criteria = [
+        {key: value for key, value in item.items() if key not in anchor_fields}
+        for item in original_criteria
+        if isinstance(item, dict)
+    ]
+    corrected_semantic_criteria = [
+        {key: value for key, value in item.items() if key not in anchor_fields}
+        for item in corrected_criteria
+        if isinstance(item, dict)
+    ]
+    if _parse_completion_criteria(original_semantic_criteria, emit_mint_events=False) != _parse_completion_criteria(
+        corrected_semantic_criteria, emit_mint_events=False
+    ):
+        return RequestSlotAnchorCorrectionDecisionV1(version="1", predicate="criteria_semantics_changed")
+
+    accepted_criteria: list[dict[str, Any]] = []
+    binding_absent = object()
+    for criterion_index, (original_item, corrected_item) in enumerate(
+        zip(original_criteria, corrected_criteria, strict=True)
+    ):
+        if not isinstance(original_item, dict) or not isinstance(corrected_item, dict):
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="criterion_not_object", criterion_index=criterion_index
+            )
+        if not _type_strict_json_equal(
+            original_item.get("request_slot_datum_binding", binding_absent),
+            corrected_item.get("request_slot_datum_binding", binding_absent),
+        ):
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="criterion_semantics_changed", criterion_index=criterion_index
+            )
+        original_without_anchors = {key: value for key, value in original_item.items() if key not in anchor_fields}
+        corrected_without_anchors = {key: value for key, value in corrected_item.items() if key not in anchor_fields}
+        if _classifier_criterion_semantics(original_without_anchors) != _classifier_criterion_semantics(
+            corrected_without_anchors
+        ):
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="criterion_semantics_changed", criterion_index=criterion_index
+            )
+        accepted_item = dict(original_item)
+        if _item_claims_request_slot(original_item):
+            original_quote = original_item.get("request_slot_source_quote")
+            corrected_anchor = _request_slot_anchor(corrected_item)
+            if corrected_anchor is None:
+                return RequestSlotAnchorCorrectionDecisionV1(
+                    version="1", predicate="missing_corrected_anchor", criterion_index=criterion_index
+                )
+            corrected_source_id, corrected_quote = corrected_anchor
+            if isinstance(original_quote, str) and original_quote:
+                corrected_source_for_original_quote = {
+                    **original_item,
+                    "request_slot_source_id": corrected_source_id,
+                }
+                if not _request_slot_anchor_is_admissible(
+                    corrected_source_for_original_quote,
+                    request_slot_request=request_slot_request,
+                    criterion_index=criterion_index,
+                    allow_embedded_binding=True,
+                ):
+                    return RequestSlotAnchorCorrectionDecisionV1(
+                        version="1", predicate="original_quote_not_admissible", criterion_index=criterion_index
+                    )
+                accepted_item["request_slot_source_id"] = corrected_source_id
+            else:
+                if not _item_claims_request_slot_fields(original_item):
+                    return RequestSlotAnchorCorrectionDecisionV1(
+                        version="1", predicate="missing_request_slot_fields", criterion_index=criterion_index
+                    )
+                corrected_anchor_for_original_datum = {
+                    **original_item,
+                    "request_slot_source_id": corrected_source_id,
+                    "request_slot_source_quote": corrected_quote,
+                }
+                if not _request_slot_anchor_is_admissible(
+                    corrected_anchor_for_original_datum,
+                    request_slot_request=request_slot_request,
+                    criterion_index=criterion_index,
+                    allow_embedded_binding=True,
+                ):
+                    return RequestSlotAnchorCorrectionDecisionV1(
+                        version="1", predicate="corrected_anchor_not_admissible", criterion_index=criterion_index
+                    )
+                accepted_item["request_slot_source_id"] = corrected_source_id
+                accepted_item["request_slot_source_quote"] = corrected_quote
+        elif any(corrected_item.get(field) != original_item.get(field) for field in anchor_fields):
+            return RequestSlotAnchorCorrectionDecisionV1(
+                version="1", predicate="unexpected_anchor_change", criterion_index=criterion_index
+            )
+        accepted_criteria.append(accepted_item)
+    return RequestSlotAnchorCorrectionDecisionV1(
+        version="1",
+        predicate="accepted",
+        accepted_payload={**original, "completion_criteria": accepted_criteria},
+    )
+
+
+def _redact_anchor_correction_capture_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_raw_secrets_for_prompt(value)
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            if key == "raw_secret_evidence":
+                redacted[key] = None if item is None else "[REDACTED_SECRET]"
+            else:
+                redacted[key] = _redact_anchor_correction_capture_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_anchor_correction_capture_value(item) for item in value]
+    return value
+
+
+def _anchor_correction_rejection_capture(
+    original: dict[str, Any],
+    corrected: dict[str, Any],
+) -> dict[str, str] | None:
+    try:
+        original_redacted = _redact_anchor_correction_capture_value(redact_sensitive_fields(original))
+        corrected_redacted = _redact_anchor_correction_capture_value(redact_sensitive_fields(corrected))
+        original_json = json.dumps(original_redacted, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        corrected_json = json.dumps(corrected_redacted, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        pair_json = json.dumps(
+            {"corrected": corrected_redacted, "original": original_redacted},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return {
+        "original_payload_json": original_json,
+        "corrected_payload_json": corrected_json,
+        "original_sha256": hashlib.sha256(original_json.encode()).hexdigest(),
+        "corrected_sha256": hashlib.sha256(corrected_json.encode()).hexdigest(),
+        "pair_sha256": hashlib.sha256(pair_json.encode()).hexdigest(),
+    }
+
+
+def _classifier_payload_semantics(payload: dict[str, Any]) -> RequestPolicy:
+    return _classification_from_raw({**payload, "completion_criteria": []})
+
+
+def _classifier_criterion_semantics(item: dict[str, Any]) -> CompletionCriterion | None:
+    entries = _parse_completion_criterion_entries([item], emit_mint_events=False)
+    return entries[0][1] if entries else None
+
+
+def _request_slot_anchor_correction_prompt(
+    prompt: str,
+    *,
+    raw_payload: dict[str, Any],
+) -> str:
+    correction = {
+        "instruction": (
+            "Return the same JSON object with identical criterion count and identical non-anchor fields. "
+            "For each criterion that already has request_slot_source_quote, preserve that quote byte-for-byte "
+            "and only add or replace request_slot_source_id with the source containing that exact unique quote. "
+            "For a criterion with structured requested-output fields but no request_slot_source_quote, add "
+            "request_slot_source_id and one exact unique source quote that contains the full datum named by its "
+            "output_path or classification_output_key. Do not add anchors to any other criterion."
+        ),
+        "original_payload": raw_payload,
+    }
+    return f"{prompt}\n\nREQUEST SLOT ANCHOR CORRECTION (one pass):\n{json.dumps(correction, ensure_ascii=True, separators=(',', ':'))}"
+
+
+def _request_slot_has_exact_requirement(criterion: CompletionCriterion) -> bool:
+    if criterion.kind == "validation_classification":
+        return criterion.expected_classification is not None
+    return criterion.expected_output_value is not None or criterion.expected_output_shape is not None
+
+
+def _top_level_output_key(output_path: str | None) -> str | None:
+    if output_path is None or not output_path.startswith("output."):
+        return None
+    key = output_path.removeprefix("output.")
+    return key if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(key) else None
+
+
+def _boolean_output_signal_count(criterion: CompletionCriterion) -> int:
+    return sum(
+        (
+            isinstance(criterion.expected_output_value, bool),
+            criterion.expected_output_shape == "goal_judgment_boolean",
+            isinstance(criterion.expected_classification, bool),
+        )
+    )
+
+
+def _has_boolean_output_signal(criterion: CompletionCriterion) -> bool:
+    return _boolean_output_signal_count(criterion) > 0
+
+
+def _shapeless_boolean_output_binding_key(criterion: CompletionCriterion) -> str | None:
+    if _boolean_output_signal_count(criterion) != 1:
+        return None
+    bindings: list[str] = []
+    if criterion.output_path is not None:
+        output_key = _top_level_output_key(criterion.output_path)
+        if output_key is None:
+            return None
+        bindings.append(output_key)
+    if criterion.classification_output_key is not None:
+        if _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(criterion.classification_output_key) is None:
+            return None
+        bindings.append(criterion.classification_output_key)
+    return bindings[0] if len(bindings) == 1 else None
+
+
+def is_neutral_reported_boolean_criterion(criterion: CompletionCriterion) -> bool:
+    output_key = criterion.classification_output_key
+    return (
+        criterion.kind == "outcome"
+        and criterion.output_path is None
+        and criterion.expected_output_value is None
+        and criterion.expected_classification is None
+        and criterion.expected_output_shape == "goal_judgment_boolean"
+        and criterion.requested_output_evidence_source == "independent_run_evidence"
+        and output_key is not None
+        and criterion.requested_output_floor_rekeyed is False
+        and criterion.floor_rekeyed_from_path is None
+        and criterion.request_slot_id is not None
+        and _REQUEST_SLOT_ID_RE.fullmatch(criterion.request_slot_id) is not None
+        and criterion.id == criterion.request_slot_id
+        and _CLASSIFICATION_OUTPUT_KEY_RE.fullmatch(output_key) is not None
+        and criterion.pinability == "shapeless_valid"
+        and criterion.mint_disposition == "decidable"
+        and criterion.mint_degrade is None
+        and criterion.judgment_truth_condition is None
+        and criterion.antecedent_family in {"unconditional", "blocker"}
+    )
+
+
+def _is_legacy_floor_marked_neutral_reported_boolean_criterion(criterion: CompletionCriterion) -> bool:
+    if not (
+        criterion.requested_output_floor_rekeyed
+        and criterion.classification_output_key is not None
+        and criterion.floor_rekeyed_from_path == f"output.{criterion.classification_output_key}"
+    ):
+        return False
+    return is_neutral_reported_boolean_criterion(
+        replace(
+            criterion,
+            requested_output_floor_rekeyed=False,
+            floor_rekeyed_from_path=None,
+        )
+    )
+
+
+def normalize_neutral_reported_boolean_criterion(criterion: CompletionCriterion) -> CompletionCriterion:
+    claims_neutral_reported_boolean = criterion.kind == "outcome" and (
+        criterion.classification_output_key is not None
+        or (criterion.pinability == "shapeless_valid" and _has_boolean_output_signal(criterion))
+    )
+    if not claims_neutral_reported_boolean:
+        return criterion
+    if is_neutral_reported_boolean_criterion(criterion):
+        return criterion
+    if _is_legacy_floor_marked_neutral_reported_boolean_criterion(criterion):
+        return replace(
+            criterion,
+            requested_output_floor_rekeyed=False,
+            floor_rekeyed_from_path=None,
+        )
+    return replace(
+        criterion,
+        output_path=None,
+        expected_output_value=None,
+        expected_output_shape=None,
+        requested_output_evidence_source="runtime_output",
+        classification_output_key=None,
+        expected_classification=None,
+        judgment_truth_condition=None,
+        antecedent_family="undecidable",
+        requested_output_floor_rekeyed=False,
+        floor_rekeyed_from_path=None,
+        mint_disposition="degraded",
+        mint_degrade="undecidable_judgment",
+    )
+
+
+def _degrade_unbound_request_slot_criterion(criterion: CompletionCriterion) -> CompletionCriterion:
+    return replace(
+        criterion,
+        output_path=None,
+        expected_output_value=None,
+        expected_output_shape=None,
+        classification_output_key=None,
+        expected_classification=None,
+        judgment_truth_condition=None,
+        kind="outcome",
+        antecedent_family="undecidable",
+        mint_disposition="degraded",
+        mint_degrade="undecidable_judgment",
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path=criterion.output_path,
+    )
+
+
+def _request_slot_for_anchor(
+    anchor: tuple[str, str] | None,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+) -> CanonicalRequestSlotV1 | None:
+    if anchor is None:
+        return None
+    source_id, source_quote = anchor
+    source = next((item for item in request_slot_sources(request_slot_request) if item.source_id == source_id), None)
+    if source is None:
+        return None
+    start = source.text.find(source_quote)
+    if start < 0 or source.text.find(source_quote, start + 1) >= 0:
+        return None
+    end = start + len(source_quote)
+    matches = [
+        slot
+        for slot in request_slot_contract.slots
+        if slot.source_id == source_id and slot.source_start < end and start < slot.source_end
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _omitted_request_slot_criterion(
+    *,
+    slot: CanonicalRequestSlotV1,
+    source_quote: str,
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...],
+) -> CompletionCriterion:
+    criterion = CompletionCriterion(id="c0", outcome=source_quote)
+    if len(trusted_datum_bindings) != 1:
+        return criterion
+    binding = trusted_datum_bindings[0]
+    classification_output_key = _coerce_classification_output_key(binding.datum_value)
+    if not (
+        binding.slot_id == slot.slot_id
+        and binding.source_id == slot.source_id
+        and binding.source_quote == source_quote
+        and binding.datum_field == "classification_output_key"
+        and classification_output_key == binding.datum_value
+    ):
+        return criterion
+    return replace(
+        criterion,
+        kind="validation_classification",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        classification_output_key=classification_output_key,
+        mint_disposition="pending",
+    )
+
+
+def _canonical_mint_path(path: str) -> str:
+    return path.strip().removeprefix("output.")
+
+
+def _minted_path_has_typed_child(path: str, sibling_output_paths: frozenset[str]) -> bool:
+    """True when another requested-output path is nested under ``path`` (``path.x`` or
+    ``path[].x``), i.e. ``path`` is a collection parent whose contract is carried by its
+    typed children -- so it should floor-rekey, not mint a loose value_present criterion.
+    Paths are compared canonically so a child written without the ``output.`` prefix still
+    suppresses the mint."""
+    parent = _canonical_mint_path(path)
+    return any(
+        (child := _canonical_mint_path(sibling)) != parent
+        and (child.startswith(f"{parent}.") or child.startswith(f"{parent}["))
+        for sibling in sibling_output_paths
+    )
+
+
+def _bind_criterion_to_request_slot(
+    criterion: CompletionCriterion,
+    *,
+    slot: CanonicalRequestSlotV1,
+    source_quote: str,
+    allow_canonical_path_fallback: bool = True,
+    sibling_output_paths: frozenset[str] = frozenset(),
+) -> CompletionCriterion:
+    pinability = cast(Pinability, slot.pinability.value)
+    lexical_interrogative_key = _interrogative_slot_classification_output_key(
+        source_quote,
+        preserve_path_subject=True,
+    )
+    if (
+        pinability == "shapeless_valid"
+        and slot.plane.value == "run"
+        and lexical_interrogative_key is not None
+        and criterion.classification_output_key is not None
+        and lexical_interrogative_key == f"path_{criterion.classification_output_key}"
+    ):
+        criterion = replace(criterion, classification_output_key=lexical_interrogative_key)
+    has_exact_requirement = _request_slot_has_exact_requirement(criterion)
+    antecedent_family = cast(AntecedentFamily, slot.antecedent_family.value)
+    degraded = (
+        pinability == "unpinnable"
+        or (pinability == "pinned" and not has_exact_requirement)
+        or antecedent_family == "undecidable"
+    )
+    neutral_boolean_candidate = (
+        slot.plane.value == "run"
+        and criterion.level == "run"
+        and pinability == "shapeless_valid"
+        and lexical_interrogative_key is not None
+        and not degraded
+    )
+    neutral_boolean_key = _shapeless_boolean_output_binding_key(criterion) if neutral_boolean_candidate else None
+    malformed_shapeless_boolean = (
+        neutral_boolean_candidate and _has_boolean_output_signal(criterion) and neutral_boolean_key is None
+    )
+    assertive_shapeless_boolean = (
+        slot.plane.value == "run"
+        and criterion.level == "run"
+        and pinability == "shapeless_valid"
+        and lexical_interrogative_key is None
+        and _has_boolean_output_signal(criterion)
+    )
+    degraded = degraded or malformed_shapeless_boolean or assertive_shapeless_boolean
+
+    minted_output_path = criterion.output_path or (
+        f"output.{criterion.classification_output_key}" if criterion.classification_output_key is not None else None
+    )
+    # A single named non-boolean run-plane value keeps its computed output_path with a
+    # presence-only shape so the grounding gate can check it, without claiming an exact value.
+    minted_requested_output = (
+        pinability == "shapeless_valid"
+        and slot.plane.value == "run"
+        and minted_output_path is not None
+        and not _minted_path_has_typed_child(minted_output_path, sibling_output_paths)
+        and not _has_boolean_output_signal(criterion)
+        and not neutral_boolean_candidate
+        and not malformed_shapeless_boolean
+        and not assertive_shapeless_boolean
+        and antecedent_family in {"unconditional", "blocker"}
+    )
+
+    rekeyed = degraded or (pinability == "shapeless_valid" and not minted_requested_output)
+
+    expected_output_value = criterion.expected_output_value
+    expected_output_shape = criterion.expected_output_shape
+    requested_output_evidence_source = criterion.requested_output_evidence_source
+    expected_classification = criterion.expected_classification
+    kind = criterion.kind
+    classification_output_key = criterion.classification_output_key
+    judgment_truth_condition = criterion.judgment_truth_condition
+    original_output_path = (
+        criterion.output_path
+        or (f"output.{classification_output_key}" if classification_output_key is not None else None)
+        or (slot.canonical_path if allow_canonical_path_fallback else None)
+    )
+    if rekeyed and neutral_boolean_key is None and original_output_path is None:
+        degraded = True
+        antecedent_family = "undecidable"
+    if pinability != "pinned" or degraded:
+        expected_output_value = None
+        expected_output_shape = None
+        expected_classification = None
+        judgment_truth_condition = None
+    if minted_requested_output:
+        expected_output_shape = "value_present"
+    if malformed_shapeless_boolean:
+        requested_output_evidence_source = "runtime_output"
+        classification_output_key = None
+        antecedent_family = "undecidable"
+    if neutral_boolean_key is not None:
+        kind = "outcome"
+        outcome = f"The run reports whether {neutral_boolean_key.replace('_', ' ')}."
+        expected_output_shape = "goal_judgment_boolean"
+        requested_output_evidence_source = "independent_run_evidence"
+        classification_output_key = neutral_boolean_key
+    else:
+        outcome = criterion.outcome or source_quote
+    if rekeyed and kind == "validation_classification":
+        kind = "outcome"
+        classification_output_key = None
+    output_path = None if rekeyed else criterion.output_path
+    if minted_requested_output:
+        kind = "outcome"
+        classification_output_key = None
+        if output_path is None:
+            output_path = minted_output_path
+    if neutral_boolean_key is not None:
+        original_output_path = f"output.{neutral_boolean_key}"
+    requested_output_floor_rekeyed = rekeyed and neutral_boolean_key is None and original_output_path is not None
+
+    pending = pinability == "pinned" and (
+        isinstance(expected_output_value, bool)
+        or expected_output_shape == "goal_judgment_boolean"
+        or isinstance(expected_classification, bool)
+        or judgment_truth_condition is not None
+    )
+    if rekeyed:
+        LOG.info(
+            "copilot_request_slot_criterion_rekeyed",
+            slot_id=slot.slot_id,
+            canonical_path=slot.canonical_path,
+            pinability=pinability,
+            antecedent_family=antecedent_family,
+            has_exact_requirement=has_exact_requirement,
+            degraded=degraded,
+            rekeyed_reason="degraded" if degraded else "shapeless_valid",
+            kind=kind,
+            original_output_path=original_output_path,
+            requested_output_evidence_source=criterion.requested_output_evidence_source,
+            outcome=(criterion.outcome or source_quote or "")[:80],
+        )
+    if minted_requested_output:
+        LOG.info(
+            "copilot_request_slot_criterion_minted_requested_output",
+            slot_id=slot.slot_id,
+            output_path=output_path,
+        )
+    return replace(
+        criterion,
+        id=slot.slot_id,
+        outcome=outcome,
+        level=cast(CriterionLevel, slot.plane.value),
+        output_path=output_path,
+        expected_output_value=expected_output_value,
+        expected_output_shape=expected_output_shape,
+        requested_output_evidence_source=requested_output_evidence_source,
+        kind=kind,
+        classification_output_key=classification_output_key,
+        expected_classification=expected_classification,
+        judgment_truth_condition=judgment_truth_condition,
+        antecedent_family=antecedent_family,
+        request_slot_id=slot.slot_id,
+        pinability=pinability,
+        mint_disposition="degraded" if degraded else ("pending" if pending else "decidable"),
+        mint_degrade="undecidable_judgment" if degraded else None,
+        requested_output_floor_rekeyed=requested_output_floor_rekeyed,
+        floor_rekeyed_from_path=original_output_path if requested_output_floor_rekeyed else None,
+    )
+
+
+def _parse_fresh_request_slot_criteria(
+    raw: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = (),
+) -> list[CompletionCriterion]:
+    if request_slot_contract.version != "1" or not isinstance(raw, list):
+        return []
+    criterion_index_by_item_id = {id(item): index for index, item in enumerate(raw) if isinstance(item, dict)}
+    trusted_bindings_by_index: dict[int, list[TrustedRequestSlotDatumBindingV1]] = {}
+    trusted_bindings_by_slot_id: dict[str, list[TrustedRequestSlotDatumBindingV1]] = {}
+    for binding in trusted_datum_bindings:
+        trusted_bindings_by_index.setdefault(binding.criterion_index, []).append(binding)
+        trusted_bindings_by_slot_id.setdefault(binding.slot_id, []).append(binding)
+    bound_by_slot_id: dict[str, CompletionCriterion] = {}
+    non_slot_criteria: list[CompletionCriterion] = []
+    entries = list(_parse_completion_criterion_entries(raw))
+    sibling_output_paths = frozenset(criterion.output_path for _item, criterion in entries if criterion.output_path)
+    for item, criterion in entries:
+        criterion_index = criterion_index_by_item_id[id(item)]
+        anchor = _request_slot_anchor(item)
+        slot = (
+            _request_slot_for_anchor(
+                anchor,
+                request_slot_request=request_slot_request,
+                request_slot_contract=request_slot_contract,
+            )
+            if _request_slot_anchor_is_admissible(
+                item,
+                request_slot_request=request_slot_request,
+                criterion_index=criterion_index,
+                trusted_binding=(
+                    trusted_bindings_by_index[criterion_index][0]
+                    if len(trusted_bindings_by_index.get(criterion_index, ())) == 1
+                    else None
+                ),
+                allow_embedded_binding=False,
+            )
+            else None
+        )
+        if anchor is None or slot is None:
+            if _item_claims_request_slot(item):
+                criterion = _degrade_unbound_request_slot_criterion(criterion)
+            non_slot_criteria.append(
+                replace(
+                    criterion,
+                    id=f"c{len(non_slot_criteria)}",
+                )
+            )
+            continue
+        if slot.slot_id in bound_by_slot_id:
+            # The producer owns slot membership and one slot can yield only one criterion.
+            # Preserve the first classifier row in source order; later aliases cannot widen
+            # or replace the already-bound contract member.
+            continue
+        bound_by_slot_id[slot.slot_id] = _bind_criterion_to_request_slot(
+            criterion,
+            slot=slot,
+            source_quote=anchor[1],
+            sibling_output_paths=sibling_output_paths,
+        )
+
+    for slot in request_slot_contract.slots:
+        if slot.slot_id in bound_by_slot_id:
+            continue
+        source_quote = request_slot_source_text(request_slot_request, slot)
+        slot_bindings = tuple(trusted_bindings_by_slot_id.get(slot.slot_id, ()))
+        bound_by_slot_id[slot.slot_id] = _bind_criterion_to_request_slot(
+            _omitted_request_slot_criterion(
+                slot=slot,
+                source_quote=source_quote,
+                trusted_datum_bindings=slot_bindings,
+            ),
+            slot=slot,
+            source_quote=source_quote,
+            allow_canonical_path_fallback=False,
+            sibling_output_paths=sibling_output_paths,
+        )
+    return ([bound_by_slot_id[slot.slot_id] for slot in request_slot_contract.slots] + non_slot_criteria)[
+        :_MAX_COMPLETION_CRITERIA
+    ]
+
+
+def _fresh_request_slot_failure_criteria(raw: Any) -> list[CompletionCriterion]:
+    if not isinstance(raw, list):
+        return []
+    criteria: list[CompletionCriterion] = []
+    for item, criterion in _parse_completion_criterion_entries(raw):
+        if _item_claims_request_slot(item):
+            criterion = _degrade_unbound_request_slot_criterion(criterion)
+        criteria.append(replace(criterion, id=f"c{len(criteria)}"))
+    return criteria
+
+
+def _classification_from_raw(
+    raw: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1 | None = None,
+    request_slot_contract: RequestSlotContractV1 | None = None,
+    request_slot_failure_kind: str | None = None,
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = (),
+) -> RequestPolicy:
     raw = _coerce_classifier_payload(raw)
     if raw is None:
         return RequestPolicy()
@@ -796,20 +2331,40 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
     evidence_raw = raw.get("raw_secret_evidence")
     raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
+    raw_criteria = raw.get("completion_criteria")
+    claims_request_slots = isinstance(raw_criteria, list) and any(
+        isinstance(item, dict) and _item_claims_request_slot(item) for item in raw_criteria
+    )
+    if request_slot_request is not None and request_slot_contract is not None:
+        completion_criteria = _parse_fresh_request_slot_criteria(
+            raw_criteria,
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+            trusted_datum_bindings=trusted_datum_bindings,
+        )
+    elif claims_request_slots:
+        completion_criteria = _fresh_request_slot_failure_criteria(raw_criteria)
+        request_slot_failure_kind = request_slot_failure_kind or "missing_request_slot_contract"
+    else:
+        completion_criteria = _parse_completion_criteria(raw_criteria)
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
         authoring_intent=authoring_intent if authoring_intent in _AUTHORING_INTENTS else "author_now",
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
+        login_intent=bool(raw.get("login_intent")),
+        email_signin_intent=bool(raw.get("email_signin_intent")),
+        signin_email_candidates=_clean_email_list(raw.get("signin_email_candidates") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
-        completion_criteria=_parse_completion_criteria(raw.get("completion_criteria")),
+        completion_criteria=completion_criteria,
         raw_secret_evidence=raw_secret_evidence,
         raw_secret_handling=_coerce_raw_secret_handling(raw.get("raw_secret_handling")),
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
         classifier_status="success",
         classifier_failure_kind="none",
+        request_slot_failure_kind=request_slot_failure_kind,
     )
     if policy.credential_input_kind == "raw_secret":
         policy.clarification_reason = "raw_secret"
@@ -840,7 +2395,11 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
     return None
 
 
-def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
+def _parse_completion_criterion_entries(
+    raw: Any,
+    *,
+    emit_mint_events: bool = True,
+) -> list[tuple[dict[str, Any], CompletionCriterion]]:
     """Build outcome criteria from the classifier output.
 
     IDs are assigned server-side by index after de-duplication; any id the
@@ -849,8 +2408,15 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     """
     if not isinstance(raw, list):
         return []
-    criteria: list[CompletionCriterion] = []
+    entries: list[tuple[dict[str, Any], CompletionCriterion]] = []
     seen: set[tuple[str, ...]] = set()
+    registered_download_item_count = sum(
+        1
+        for candidate in raw
+        if isinstance(candidate, dict)
+        and _normalize_deliverable_kind(candidate.get("deliverable_kind")) == "registered_download"
+        and _coerce_criterion_kind(candidate.get("kind")) != "validation_classification"
+    )
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -866,6 +2432,11 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             item.get("expected_output_value")
         )
         expected_output_shape = _coerce_expected_output_shape(item.get("expected_output_shape"))
+        if expected_output_shape == "value_present":
+            # value_present is minted by the policy only (see _bind_criterion_to_request_slot); a
+            # classifier-supplied one on a pinned slot would be credited by presence and bypass the
+            # exact-value bar. Drop it here so only the mint can set it.
+            expected_output_shape = None
         requested_output_evidence_source = _coerce_requested_output_evidence_source(
             item.get("requested_output_evidence_source")
         )
@@ -901,18 +2472,76 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             if kind == "validation_classification"
             else None
         )
+        boolean_classification = kind == "validation_classification" and (
+            isinstance(expected_classification, bool)
+            or (expected_classification is None and expected_output_shape == "goal_judgment_boolean")
+        )
         if kind == "validation_classification":
+            if boolean_classification and classification_output_key is not None:
+                outcome = f"The run classifies whether {classification_output_key.replace('_', ' ')}."
+                expected_classification = None
             output_path = None
             expected_output_value = None
-            expected_output_shape = None
-            requested_output_evidence_source = "runtime_output"
+            expected_output_shape = "goal_judgment_boolean" if boolean_classification else None
+            requested_output_evidence_source = (
+                "independent_run_evidence" if boolean_classification else "runtime_output"
+            )
         elif isinstance(expected_output_value, bool) or expected_output_shape == "goal_judgment_boolean":
             requested_output_evidence_source = "independent_run_evidence"
+        requested_output_path_mint_source: RequestedOutputPathMintSource | None = None
+        if (
+            output_path is None
+            and expected_output_value is None
+            and deliverable_kind == "registered_download"
+            and kind != "validation_classification"
+            and registered_download_item_count == 1
+        ):
+            output_path = _LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH
+            requested_output_path_mint_source = "classifier_default"
+            if emit_mint_events:
+                LOG.info(
+                    "copilot_registered_download_requested_output_minted",
+                    output_path=output_path,
+                    requested_output_path_mint_source=requested_output_path_mint_source,
+                    criterion_id=f"c{len(entries)}",
+                )
+        elif (
+            output_path is not None
+            and expected_output_value is None
+            and deliverable_kind == "registered_download"
+            and kind != "validation_classification"
+            and output_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+        ):
+            requested_output_path_mint_source = "classifier_declared"
+            if emit_mint_events:
+                LOG.info(
+                    "copilot_registered_download_requested_output_minted",
+                    output_path=output_path,
+                    requested_output_path_mint_source=requested_output_path_mint_source,
+                    criterion_id=f"c{len(entries)}",
+                )
+        method_mandated = bool(item.get("method_mandated"))
+        level_raw = item.get("level")
+        level = (
+            cast(CriterionLevel, level_raw) if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS else "run"
+        )
+        deliverable_confirmation_criterion_id = _normalize_deliverable_confirmation_criterion_id(
+            item.get("deliverable_confirmation_criterion_id")
+        )
+        if (
+            level != "run"
+            or kind != "outcome"
+            or output_path is not None
+            or deliverable_kind is not None
+            or method_mandated
+        ):
+            deliverable_confirmation_criterion_id = None
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
             output_path or classification_output_key or normalized_criterion_outcome_key(outcome),
             deliverable_kind or "",
+            deliverable_confirmation_criterion_id or "",
             kind,
             str(expected_classification) if expected_classification is not None else "",
             typed_expected_output_value_key(expected_output_value),
@@ -923,42 +2552,59 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
         if key in seen:
             continue
         seen.add(key)
-        level_raw = item.get("level")
-        criteria.append(
-            CompletionCriterion(
-                id=f"c{len(criteria)}",
-                outcome=outcome,
-                contingent_on=contingent_on,
-                contingent_antecedent_output_path=contingent_antecedent_output_path,
-                deliverable_kind=deliverable_kind,
-                declared_deliverable_kind=deliverable_kind,
-                implicit=bool(item.get("implicit")),
-                method_mandated=bool(item.get("method_mandated")),
-                level=cast(CriterionLevel, level_raw)
-                if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
-                else "run",
-                output_path=output_path,
-                expected_output_value=expected_output_value,
-                expected_output_shape=expected_output_shape,
-                requested_output_evidence_source=requested_output_evidence_source,
-                kind=kind,
-                terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
-                classification_output_key=classification_output_key,
-                expected_classification=expected_classification,
-                judgment_truth_condition=judgment_truth_condition,
+        entries.append(
+            (
+                item,
+                CompletionCriterion(
+                    id=f"c{len(entries)}",
+                    outcome=outcome,
+                    contingent_on=contingent_on,
+                    contingent_antecedent_output_path=contingent_antecedent_output_path,
+                    deliverable_kind=deliverable_kind,
+                    deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
+                    declared_deliverable_kind=deliverable_kind,
+                    implicit=bool(item.get("implicit")),
+                    method_mandated=method_mandated,
+                    level=level,
+                    output_path=output_path,
+                    expected_output_value=expected_output_value,
+                    expected_output_shape=expected_output_shape,
+                    requested_output_evidence_source=requested_output_evidence_source,
+                    requested_output_path_mint_source=requested_output_path_mint_source,
+                    kind=kind,
+                    terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
+                    classification_output_key=classification_output_key,
+                    expected_classification=expected_classification,
+                    judgment_truth_condition=judgment_truth_condition,
+                    mint_disposition=(
+                        "pending"
+                        if (
+                            isinstance(expected_output_value, bool)
+                            or expected_output_shape == "goal_judgment_boolean"
+                            or boolean_classification
+                        )
+                        else "decidable"
+                    ),
+                ),
             )
         )
-        if judgment_truth_condition is not None:
+        if judgment_truth_condition is not None and emit_mint_events:
             LOG.info(
                 "copilot_judgment_truth_condition_minted",
                 mint_source="classifier",
                 predicate=judgment_truth_condition.predicate,
                 polarity_when_holds=judgment_truth_condition.polarity_when_holds,
-                criterion_id=criteria[-1].id,
+                criterion_id=entries[-1][1].id,
             )
-        if len(criteria) >= _MAX_COMPLETION_CRITERIA:
+        if len(entries) >= _MAX_COMPLETION_CRITERIA:
             break
-    return criteria
+    return entries
+
+
+def _parse_completion_criteria(raw: Any, *, emit_mint_events: bool = True) -> list[CompletionCriterion]:
+    return [
+        criterion for _item, criterion in _parse_completion_criterion_entries(raw, emit_mint_events=emit_mint_events)
+    ]
 
 
 def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
@@ -970,6 +2616,10 @@ def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
 
 def _normalize_deliverable_kind(raw: Any) -> Literal["registered_download"] | None:
     return "registered_download" if raw == "registered_download" else None
+
+
+def _normalize_deliverable_confirmation_criterion_id(raw: object) -> str | None:
+    return REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID if raw == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID else None
 
 
 def normalized_criterion_outcome_key(outcome: str) -> str:
@@ -1115,6 +2765,26 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
         return None
     if all(word in _OUTPUT_GENERIC_WORDS for word in normalized_words):
         return None
+    quantifier_index = next(
+        (
+            index
+            for index, word in enumerate(normalized_words)
+            if word in _OUTPUT_QUANTIFIER_HEAD_WORDS
+            and index + 1 < len(normalized_words)
+            and normalized_words[index + 1] == "of"
+        ),
+        None,
+    )
+    if quantifier_index is not None:
+        subject_words: list[str] = []
+        for word, normalized_word in zip(words[quantifier_index + 2 :], normalized_words[quantifier_index + 2 :]):
+            if normalized_word in _OUTPUT_PHRASE_BOUNDARY_WORDS:
+                break
+            if normalized_word in _OUTPUT_GENERIC_WORDS:
+                continue
+            subject_words.append(word)
+        if subject_words:
+            return " ".join(subject_words)
     field_indexes = [i for i, word in enumerate(normalized_words) if word in _OUTPUT_FIELD_WORDS]
     if not field_indexes:
         return None
@@ -1337,6 +3007,21 @@ def _requested_output_criterion_id(output_path: str) -> str:
     return f"{_REQUESTED_OUTPUT_CRITERION_ID_PREFIX}{slug}"
 
 
+def _requested_output_mint_state(
+    expected_value: ExpectedOutputValue | None,
+    expected_shape: ExpectedOutputShape | None,
+    judgment_condition: JudgmentTruthCondition | None,
+) -> tuple[MintDisposition, MintDegrade | None]:
+    if isinstance(expected_value, bool) or expected_shape == "goal_judgment_boolean" or judgment_condition is not None:
+        return "pending", None
+    if expected_shape == "value_present":
+        # A minted single-value extraction is decidable by presence, not an undecidable judgment.
+        return "decidable", None
+    if expected_shape == "status_label" or (expected_value is None and expected_shape is not None):
+        return "degraded", "undecidable_judgment"
+    return "decidable", None
+
+
 def _generic_completion_criterion(criterion: CompletionCriterion) -> bool:
     key = normalized_criterion_outcome_key(criterion.outcome)
     if is_fallback_floor_criterion(criterion):
@@ -1354,6 +3039,8 @@ def _generic_completion_criterion(criterion: CompletionCriterion) -> bool:
 
 
 def _criterion_drop_priority(criterion: CompletionCriterion, requested_output_paths: set[str]) -> int:
+    if criterion.deliverable_confirmation_criterion_id is not None:
+        return 0
     if criterion.output_path in requested_output_paths:
         return 0
     if criterion.requested_output_corroborator:
@@ -1454,21 +3141,31 @@ def _source_requested_output_corroborator(
     requested_fields: list[str],
     requested_output_paths: set[str],
 ) -> CompletionCriterion | None:
-    for criterion in criteria:
-        if criterion.level != "run" or criterion.kind != "outcome" or criterion.method_mandated:
-            continue
-        if _validation_classification_output_path(criterion.output_path):
-            continue
-        if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
-            criterion, requested_fields
-        ):
-            return replace(
-                criterion,
-                output_path=None,
-                expected_output_value=None,
-                expected_output_shape=None,
-                requested_output_corroborator=True,
-            )
+    if len(requested_output_paths) == 1:
+        for criterion in criteria:
+            if (
+                criterion.level != "run"
+                or criterion.kind != "outcome"
+                or criterion.method_mandated
+                or criterion.output_path is None
+            ):
+                continue
+            if is_judgment_finalization_candidate(criterion):
+                continue
+            if criterion.requested_output_evidence_source == "independent_run_evidence":
+                continue
+            if _validation_classification_output_path(criterion.output_path):
+                continue
+            if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
+                criterion, requested_fields
+            ):
+                return replace(
+                    criterion,
+                    output_path=None,
+                    expected_output_value=None,
+                    expected_output_shape=None,
+                    requested_output_corroborator=True,
+                )
     for criterion in criteria:
         if is_fallback_floor_base_criterion(criterion):
             return replace(criterion, requested_output_corroborator=True)
@@ -1495,7 +3192,9 @@ def _apply_classifier_typed_requested_output_corroborators(policy: RequestPolicy
         and criterion.kind == "outcome"
         and not criterion.method_mandated
         and criterion.output_path is not None
+        and criterion.requested_output_evidence_source != "independent_run_evidence"
         and not _validation_classification_output_path(criterion.output_path)
+        and not is_judgment_finalization_candidate(criterion)
         and not criterion.id.startswith(_REQUESTED_OUTPUT_CRITERION_ID_PREFIX)
     ]
     if not source_criteria:
@@ -1605,23 +3304,34 @@ def _apply_requested_output_completion_criteria(
             forbidden_output_paths,
         )
     ]
-    canonical_requested_criteria = [
-        CompletionCriterion(
-            id=_requested_output_criterion_id(output_path),
-            outcome=f"The returned record includes {field_label}.",
-            level="run",
-            output_path=output_path,
-            expected_output_value=value_by_output_path.get(output_path),
-            expected_output_shape=shape_by_output_path.get(output_path),
-            requested_output_evidence_source=source_by_output_path.get(output_path, "runtime_output"),
-            contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
-            contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
-            deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
-            declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
-            judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
+    canonical_requested_criteria: list[CompletionCriterion] = []
+    for _field_name, output_path, field_label in requested_specs:
+        expected_value = value_by_output_path.get(output_path)
+        expected_shape = shape_by_output_path.get(output_path)
+        judgment_condition = judgment_condition_by_output_path.get(output_path)
+        mint_disposition, mint_degrade = _requested_output_mint_state(
+            expected_value,
+            expected_shape,
+            judgment_condition,
         )
-        for _field_name, output_path, field_label in requested_specs
-    ]
+        canonical_requested_criteria.append(
+            CompletionCriterion(
+                id=_requested_output_criterion_id(output_path),
+                outcome=f"The returned record includes {field_label}.",
+                level="run",
+                output_path=output_path,
+                expected_output_value=expected_value,
+                expected_output_shape=expected_shape,
+                requested_output_evidence_source=source_by_output_path.get(output_path, "runtime_output"),
+                contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
+                contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
+                deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+                declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
+                judgment_truth_condition=judgment_condition,
+                mint_degrade=mint_degrade,
+                mint_disposition=mint_disposition,
+            )
+        )
     criteria = preserved_criteria + canonical_requested_criteria
     if not any(_non_requested_output_run_corroborator(criterion) for criterion in criteria):
         corroborator = _source_requested_output_corroborator(
@@ -1662,18 +3372,22 @@ def _apply_validation_classification_completion_criteria(policy: RequestPolicy) 
         target = _validation_classification_target_for_legacy_criterion(criterion)
         if target is not None:
             output_key, expected = target
+            boolean_classification = isinstance(expected, bool)
             criterion = replace(
                 criterion,
                 kind="validation_classification",
                 output_path=None,
                 expected_output_value=None,
-                expected_output_shape=None,
-                requested_output_evidence_source="runtime_output",
+                expected_output_shape="goal_judgment_boolean" if boolean_classification else None,
+                requested_output_evidence_source=(
+                    "independent_run_evidence" if boolean_classification else "runtime_output"
+                ),
                 deliverable_kind=None,
                 declared_deliverable_kind=None,
                 terminal_action_family=None,
                 classification_output_key=output_key,
                 expected_classification=expected,
+                mint_disposition="pending" if boolean_classification else "decidable",
             )
         if criterion.kind == "validation_classification":
             target_key = (
@@ -1706,6 +3420,8 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["contingent_antecedent_output_path"] = criterion.contingent_antecedent_output_path
         if criterion.deliverable_kind:
             item["deliverable_kind"] = criterion.deliverable_kind
+        if criterion.deliverable_confirmation_criterion_id:
+            item["deliverable_confirmation_criterion_id"] = criterion.deliverable_confirmation_criterion_id
         if criterion.output_path:
             item["output_path"] = criterion.output_path
         if criterion.expected_output_value is not None:
@@ -2011,10 +3727,16 @@ def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, us
     policy.clarification_question = None
 
 
-async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any | None, str, int]:
+async def _run_request_policy_classifier(
+    handler: LLMAPIHandler,
+    prompt: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[Any | None, str, int]:
     # Diverges from turn-intent on purpose: a retriable provider error (429/5xx) retries once
     # within the budget, while a timeout is never retried (retrying cannot beat the budget).
-    deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
     retry_count = 0
     while True:
         remaining = deadline - time.monotonic()
@@ -2036,12 +3758,173 @@ async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any
             return None, "provider_error", retry_count
 
 
+def _terminal_action_reconciliation_candidates(policy: RequestPolicy) -> list[CompletionCriterion]:
+    return [
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.kind == "outcome" and not criterion.method_mandated
+    ]
+
+
+def _render_terminal_action_reconciliation_criteria(criteria: list[CompletionCriterion]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": criterion.id,
+                "outcome": criterion.outcome,
+                "contingent_on": criterion.contingent_on,
+                "implicit": criterion.implicit,
+                "method_mandated": criterion.method_mandated,
+                "level": criterion.level,
+                "output_path": criterion.output_path,
+                "kind": criterion.kind,
+            }
+            for criterion in criteria
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _policy_needs_terminal_action_reconciliation(policy: RequestPolicy) -> bool:
+    if policy.requires_user_clarification:
+        return False
+    if policy.credential_input_kind not in _TERMINAL_ACTION_RECONCILABLE_CREDENTIAL_KINDS:
+        return False
+    return not any(
+        criterion.kind == "terminal_action" and not criterion.method_mandated
+        for criterion in policy.completion_criteria
+    )
+
+
+def _log_terminal_action_reconciliation_omitted(
+    policy: RequestPolicy,
+    *,
+    reason: str,
+    failure_kind: str = "none",
+    retry_count: int = 0,
+) -> None:
+    request_slot_failure_kind = policy.request_slot_failure_kind
+    if request_slot_failure_kind:
+        surface = RequestSlotFailureSurfaceV1(
+            version="1",
+            reason="request_slot_failure",
+            failure_kind="request_slot_failure",
+            retryable=False,
+            request_slot_failure_kind=request_slot_failure_kind,
+        )
+        LOG.info(
+            "copilot_terminal_action_reconciliation_omitted",
+            reason=surface.reason,
+            failure_kind=surface.failure_kind,
+            retryable=surface.retryable,
+            request_slot_failure_kind=surface.request_slot_failure_kind,
+            retry_count=retry_count,
+            credential_input_kind=policy.credential_input_kind,
+            completion_criteria_count=len(policy.completion_criteria),
+        )
+        return
+    LOG.info(
+        "copilot_terminal_action_reconciliation_omitted",
+        reason=reason,
+        failure_kind=failure_kind,
+        retry_count=retry_count,
+        credential_input_kind=policy.credential_input_kind,
+        completion_criteria_count=len(policy.completion_criteria),
+    )
+
+
+async def _reconcile_missing_terminal_action(
+    policy: RequestPolicy,
+    *,
+    user_message: str,
+    handler: LLMAPIHandler,
+) -> None:
+    if not _policy_needs_terminal_action_reconciliation(policy):
+        return
+    candidates = _terminal_action_reconciliation_candidates(policy)
+    if not candidates:
+        _log_terminal_action_reconciliation_omitted(policy, reason="no_eligible_criteria")
+        return
+
+    prompt = prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        terminal_action_reconciliation=True,
+        user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
+        reconciliation_credential_input_kind=policy.credential_input_kind,
+        reconciliation_criteria=escape_code_fences(_render_terminal_action_reconciliation_criteria(candidates)),
+    )
+    raw, failure_kind, retry_count = await _run_request_policy_classifier(
+        handler,
+        prompt,
+    )
+    if raw is None:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="classifier_failed",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+    reconciliation = _parse_terminal_action_reconciliation(raw)
+    if reconciliation is None:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="malformed_response",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+    if reconciliation.criterion_id is None:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="model_abstained",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+
+    matching_indexes = [
+        index for index, criterion in enumerate(candidates) if criterion.id == reconciliation.criterion_id
+    ]
+    if len(matching_indexes) != 1:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="unknown_or_ambiguous_criterion",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+    selected = candidates[matching_indexes[0]]
+    policy_index = next(
+        (index for index, criterion in enumerate(policy.completion_criteria) if criterion is selected),
+        None,
+    )
+    if policy_index is None:
+        _log_terminal_action_reconciliation_omitted(policy, reason="criterion_not_in_policy")
+        return
+    policy.completion_criteria[policy_index] = replace(
+        selected,
+        kind="terminal_action",
+        terminal_action_family=reconciliation.terminal_action_family,
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    LOG.info(
+        "copilot_terminal_action_reconciled",
+        criterion_id=selected.id,
+        terminal_action_family=reconciliation.terminal_action_family,
+        credential_input_kind=policy.credential_input_kind,
+        completion_criteria_count=len(policy.completion_criteria),
+        retry_count=retry_count,
+    )
+
+
 async def _classify_request(
     user_message: str,
     workflow_yaml: str,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
-    handler: Any,
+    handler: LLMAPIHandler | None,
     *,
     active_criteria: list[CompletionCriterion] | None = None,
     config: CopilotConfig | None = None,
@@ -2080,8 +3963,27 @@ async def _classify_request(
     safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
     safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
+    request_slot_request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=safe_user_message[:16_384],
+        workflow_context=workflow_yaml[:32_768],
+        earliest_user_turn=""
+        if transcript.earliest_user_turn == _EMPTY_SLOT_SENTINEL
+        else transcript.earliest_user_turn,
+        latest_prior_user_turn=(
+            "" if transcript.latest_prior_user_turn == _EMPTY_SLOT_SENTINEL else transcript.latest_prior_user_turn
+        ),
+        latest_assistant_turn=(
+            "" if transcript.latest_assistant_turn == _EMPTY_SLOT_SENTINEL else transcript.latest_assistant_turn
+        ),
+        retained_history=(
+            () if transcript.retained_history == _EMPTY_SLOT_SENTINEL else (transcript.retained_history,)
+        ),
+        global_context=safe_global_llm_context[:32_768],
+    )
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
+        terminal_action_reconciliation=False,
         user_message=escape_code_fences(safe_user_message),
         raw_secret_present=str(raw_secret_present).lower(),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
@@ -2091,8 +3993,23 @@ async def _classify_request(
         retained_history=transcript.retained_history,
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
         active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
+        request_slot_sources=json.dumps(
+            # The classifier needs the same bounded, byte-exact source set as the
+            # producer so it can nominate an unambiguous source ID + quote. This is
+            # intentionally repeated alongside the role-labelled transcript context;
+            # the latter supplies conversational meaning, while this block supplies
+            # server-verifiable identity.
+            [source.model_dump(mode="json") for source in request_slot_sources(request_slot_request)],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
     )
-    raw, failure_kind, retry_count = await _run_request_policy_classifier(handler, prompt)
+    classifier_deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
+    raw, failure_kind, retry_count = await _run_request_policy_classifier(
+        handler,
+        prompt,
+        deadline=classifier_deadline,
+    )
     if raw is None:
         LOG.warning("request-policy classifier failed", failure_kind=failure_kind, retry_count=retry_count)
         return _classifier_fallback_policy(
@@ -2110,13 +4027,220 @@ async def _classify_request(
         return _classifier_fallback_policy(
             ids,
             raw_secret_present=raw_secret_present,
-            failure_kind="provider_error",
+            failure_kind=failure_kind if failure_kind != "none" else "provider_error",
             retry_count=retry_count,
             user_message=user_message,
             requested_output_path_aliases=requested_output_path_aliases,
         )
 
-    policy = _classification_from_raw(raw_payload)
+    # The primary classifier may describe candidate criteria, but it cannot mint
+    # provenance for itself. Datum bindings become trusted only after the separate
+    # producer-owned envelope is mechanically joined below.
+    raw_payload = copy.deepcopy(raw_payload)
+    raw_criteria = raw_payload.get("completion_criteria")
+    if isinstance(raw_criteria, list):
+        for item in raw_criteria:
+            if isinstance(item, dict):
+                item.pop("request_slot_datum_binding", None)
+
+    request_slot_contract: RequestSlotContractV1 | None = None
+    request_slot_contract_request = request_slot_request
+    request_slot_failure_kind: str | None = None
+    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = ()
+    datum_binding_targets = _request_slot_datum_binding_targets(
+        raw_criteria,
+        request_slot_request=request_slot_request,
+    )
+    if datum_binding_targets:
+        targeted_request_data = request_slot_request.model_dump()
+        try:
+            targeted_request_data["datum_targets"] = tuple(
+                RequestSlotDatumTargetV1(
+                    criterion_index=target.criterion_index,
+                    datum_field=target.datum_field,
+                    datum_value=target.datum_value,
+                    criterion_outcome_sha256=target.criterion_outcome_sha256,
+                )
+                for target in datum_binding_targets
+            )
+            targeted_request = RequestSlotProducerInputV1.model_validate(targeted_request_data)
+        except ValueError:
+            targeted_request = None
+            request_slot_failure_kind = "invalid_output"
+            LOG.warning(
+                "request-policy request-slot target construction failed",
+                failure_kind=request_slot_failure_kind,
+                target_count=len(datum_binding_targets),
+            )
+        if targeted_request is not None:
+            request_slot_result = await produce_request_slots(request=targeted_request, handler=handler)
+            if request_slot_result.status == "success":
+                request_slot_contract = request_slot_result.contract
+                request_slot_contract_request = targeted_request
+            else:
+                request_slot_failure_kind = (
+                    request_slot_result.failure_kind.value
+                    if request_slot_result.failure_kind is not None
+                    else "unknown"
+                )
+                LOG.warning(
+                    "request-policy request-slot producer failed",
+                    failure_kind=request_slot_failure_kind,
+                    attempts=request_slot_result.attempts,
+                )
+        if request_slot_contract is not None:
+            datum_binding_decision = _apply_request_slot_datum_bindings(
+                raw_payload,
+                request_slot_request=targeted_request,
+                request_slot_contract=request_slot_contract,
+                datum_binding_targets=datum_binding_targets,
+            )
+            if datum_binding_decision.accepted_payload is not None:
+                raw_payload = datum_binding_decision.accepted_payload
+                raw_criteria = raw_payload.get("completion_criteria")
+                trusted_datum_bindings = datum_binding_decision.trusted_bindings
+            else:
+                request_slot_failure_kind = "invalid_anchor_correction"
+                request_slot_contract = None
+                LOG.warning(
+                    "copilot_request_slot_datum_binding_contract_rejected",
+                    event_version="1",
+                    predicate=datum_binding_decision.predicate,
+                    criterion_index=datum_binding_decision.criterion_index,
+                )
+    elif _request_slot_claims_need_anchor_correction(
+        raw_criteria,
+        request_slot_request=request_slot_request,
+    ):
+        correction_prompt = _request_slot_anchor_correction_prompt(
+            prompt,
+            raw_payload=raw_payload,
+        )
+        corrected_raw, correction_failure_kind, correction_retry_count = await _run_request_policy_classifier(
+            handler,
+            correction_prompt,
+        )
+        retry_count += correction_retry_count
+        corrected_payload = _coerce_classifier_payload(corrected_raw)
+        anchor_correction_decision = (
+            _accept_request_slot_anchor_correction(
+                raw_payload,
+                corrected_payload,
+                request_slot_request=request_slot_request,
+            )
+            if corrected_payload is not None
+            else None
+        )
+        accepted_payload = (
+            anchor_correction_decision.accepted_payload if anchor_correction_decision is not None else None
+        )
+        if accepted_payload is not None:
+            raw_payload = accepted_payload
+            raw_criteria = raw_payload.get("completion_criteria")
+        else:
+            request_slot_failure_kind = "invalid_anchor_correction"
+            capture = (
+                _anchor_correction_rejection_capture(raw_payload, corrected_payload)
+                if corrected_payload is not None
+                else None
+            )
+            if anchor_correction_decision is not None and capture is not None:
+                LOG.warning(
+                    "copilot_request_slot_anchor_correction_rejected",
+                    event_version="1",
+                    predicate=anchor_correction_decision.predicate,
+                    criterion_index=anchor_correction_decision.criterion_index,
+                    **capture,
+                )
+            LOG.warning(
+                "request-policy request-slot anchor correction failed",
+                failure_kind=correction_failure_kind,
+                predicate=(anchor_correction_decision.predicate if anchor_correction_decision is not None else None),
+                criterion_index=(
+                    anchor_correction_decision.criterion_index if anchor_correction_decision is not None else None
+                ),
+            )
+    if request_slot_failure_kind is None and request_slot_contract is None:
+        # The independent producer owns slot membership as well as type. Run it even
+        # when the primary classifier declares no slots so an omitted conditional
+        # fallback cannot disappear from the completion contract.
+        request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
+        if request_slot_result.status == "success":
+            request_slot_contract = request_slot_result.contract
+            request_slot_contract_request = request_slot_request
+        else:
+            request_slot_failure_kind = (
+                request_slot_result.failure_kind.value if request_slot_result.failure_kind is not None else "unknown"
+            )
+            LOG.warning(
+                "request-policy request-slot producer failed",
+                failure_kind=request_slot_failure_kind,
+                attempts=request_slot_result.attempts,
+            )
+    if request_slot_failure_kind is None and request_slot_contract is not None:
+        omitted_targets = _omitted_request_slot_datum_binding_targets(
+            raw_criteria,
+            request_slot_request=request_slot_contract_request,
+            request_slot_contract=request_slot_contract,
+            existing_targets=datum_binding_targets,
+        )
+        if omitted_targets:
+            completed_request_data = request_slot_request.model_dump()
+            completed_request_data["datum_targets"] = tuple(
+                RequestSlotDatumTargetV1(
+                    criterion_index=target.criterion_index,
+                    datum_field=target.datum_field,
+                    datum_value=target.datum_value,
+                    criterion_outcome_sha256=target.criterion_outcome_sha256,
+                )
+                for target in (*datum_binding_targets, *omitted_targets)
+            )
+            try:
+                completed_request = RequestSlotProducerInputV1.model_validate(completed_request_data)
+            except ValueError:
+                completed_request = None
+                request_slot_failure_kind = "invalid_output"
+                request_slot_contract = None
+            if completed_request is not None:
+                completed_result = await produce_request_slots(request=completed_request, handler=handler)
+                if completed_result.status == "success" and completed_result.contract is not None:
+                    request_slot_contract = completed_result.contract
+                    request_slot_contract_request = completed_request
+                    if datum_binding_targets:
+                        datum_binding_decision = _apply_request_slot_datum_bindings(
+                            raw_payload,
+                            request_slot_request=completed_request,
+                            request_slot_contract=request_slot_contract,
+                            datum_binding_targets=datum_binding_targets,
+                        )
+                        if datum_binding_decision.accepted_payload is None:
+                            request_slot_failure_kind = "invalid_anchor_correction"
+                            request_slot_contract = None
+                        else:
+                            raw_payload = datum_binding_decision.accepted_payload
+                            raw_criteria = raw_payload.get("completion_criteria")
+                            trusted_datum_bindings = datum_binding_decision.trusted_bindings
+                    if request_slot_contract is not None:
+                        trusted_datum_bindings = (
+                            *trusted_datum_bindings,
+                            *_trusted_omitted_request_slot_datum_bindings(
+                                request_slot_request=completed_request,
+                                request_slot_contract=request_slot_contract,
+                                omitted_targets=omitted_targets,
+                            ),
+                        )
+                else:
+                    request_slot_failure_kind = (
+                        completed_result.failure_kind.value if completed_result.failure_kind is not None else "unknown"
+                    )
+                    request_slot_contract = None
+    policy = _classification_from_raw(
+        raw_payload,
+        request_slot_request=request_slot_contract_request,
+        request_slot_contract=request_slot_contract,
+        request_slot_failure_kind=request_slot_failure_kind,
+        trusted_datum_bindings=trusted_datum_bindings,
+    )
     policy.classifier_retry_count = retry_count
     policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
         {
@@ -2169,10 +4293,12 @@ async def _classify_request(
         policy.clarification_reason = "none"
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
-    _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
-    _apply_validation_classification_completion_criteria(policy)
-    _apply_classifier_typed_requested_output_corroborators(policy)
     _degrade_pathless_contingent_criteria(policy)
+    await _reconcile_missing_terminal_action(
+        policy,
+        user_message=safe_user_message,
+        handler=handler,
+    )
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )
@@ -2194,65 +4320,166 @@ def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
     return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
 
 
-def _exact_credential_name_candidates(user_message: str) -> list[str]:
-    text = user_message or ""
-    candidates: list[str] = []
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
-        value = next((group for group in match.groups() if group), "").strip()
-        if value and _quote_in_credential_context(text, match.start()):
-            candidates.append(value)
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
-        value = match.group(1).strip()
-        if value:
-            candidates.append(value)
-    return _clean_list(candidates)
-
-
-def _exact_credential_name_scan_eligible(policy: RequestPolicy) -> bool:
-    if policy.raw_secret_detected:
-        return False
-    if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
-        return False
-    if policy.credential_input_kind == "credential_name" and policy.credential_refs:
-        return False
-    return policy.credential_input_kind in ("none", "credential_name", "website_stored_credential")
-
-
-async def _apply_exact_credential_name_scope(
-    policy: RequestPolicy,
-    *,
-    user_message: str,
-    organization_id: str,
-) -> None:
-    if not _exact_credential_name_scan_eligible(policy):
-        return
-    candidates = _exact_credential_name_candidates(user_message)
-    if not candidates:
-        return
-    credentials = await _load_credentials(organization_id)
-    if (
-        policy.credential_input_kind == "website_stored_credential"
-        and policy.login_page_urls
-        and _match_by_url(credentials, policy.login_page_urls)
+def _credential_reference_is_negated(user_message: str, reference_start: int) -> bool:
+    clause_start = max(user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ";"))
+    context = user_message[clause_start + 1 : reference_start]
+    context = re.sub(r",\s*(?=credential\b)", " ", context, flags=re.I)
+    if context.rstrip().endswith(",") and re.match(
+        r"\s*(?:credential\b|cred_|[`'\"])",
+        user_message[reference_start:],
+        re.I,
     ):
-        return
-    matched_names = _clean_list(
-        [candidate for candidate in candidates if any(credential.name == candidate for credential in credentials)]
+        context = f"{context.rstrip()[:-1]} "
+    return bool(_NEGATED_CREDENTIAL_CONTEXT_RE.search(context))
+
+
+def _credential_reference_is_unrelated_replacement(user_message: str, reference_start: int) -> bool:
+    clause_start = max(
+        user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ",", ";")
     )
-    if len(matched_names) == 1:
-        policy.credential_input_kind = "credential_name"
-        policy.credential_refs = matched_names
-        policy.requires_user_clarification = False
-        policy.clarification_reason = "none"
-        policy.clarification_question = None
-    elif len(matched_names) > 1:
-        matches = [credential for credential in credentials if credential.name in matched_names]
-        _block(
-            policy,
-            "I found multiple saved credentials named in your request. Which one should I use?",
-            matches,
-            reason="credential_name_unresolved",
+    replacement = _REPLACEMENT_CONTEXT_RE.search(user_message[clause_start + 1 : reference_start])
+    return bool(replacement and not _CREDENTIAL_REPLACEMENT_OBJECT_RE.fullmatch(replacement.group("object")))
+
+
+def _credential_authority_text(user_message: str) -> str:
+    replacement_targets = [
+        match.end()
+        for pattern in _CREDENTIAL_REPLACEMENT_TARGET_RES
+        for match in pattern.finditer(user_message)
+        if not _credential_reference_is_negated(user_message, match.start())
+    ]
+    if not replacement_targets:
+        return user_message
+    return f"use {user_message[max(replacement_targets) :].lstrip()}"
+
+
+def _exact_credential_name_candidates(user_message: str) -> list[str]:
+    text = _credential_authority_text(user_message or "")
+    mentions: list[tuple[str, int, bool, bool]] = []
+
+    def add_mention(value: str, start: int, *, context_matches: bool = True) -> None:
+        value = value.strip()
+        if not context_matches or not value or value.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+            return
+        mentions.append(
+            (
+                value,
+                start,
+                _credential_reference_is_negated(text, start),
+                _credential_reference_is_unrelated_replacement(text, start),
+            )
         )
+
+    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
+        group_index = next((index for index, group in enumerate(match.groups(), start=1) if group), 1)
+        value = (match.group(group_index) or "").strip()
+        add_mention(
+            value,
+            match.start(),
+            context_matches=_quote_in_credential_context(text, match.start()),
+        )
+    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
+        add_mention(match.group(1), match.start(1))
+    for match in _DIRECT_CREDENTIAL_TOKEN_RE.finditer(text):
+        add_mention(match.group(1), match.start(1))
+    for match in _POSTFIX_CREDENTIAL_TOKEN_RE.finditer(text):
+        add_mention(match.group(1), match.start(1))
+
+    last_negated_mention = {
+        value: start for value, start, is_negated, is_unrelated in mentions if is_negated and not is_unrelated
+    }
+    return _clean_list(
+        [
+            value
+            for value, start, is_negated, is_unrelated in mentions
+            if not is_negated and not is_unrelated and last_negated_mention.get(value, -1) < start
+        ]
+    )
+
+
+def _credential_name_candidates(user_message: str) -> list[str]:
+    # Classifier refs are model-authored hints, not current-turn credential
+    # authority. Resolve names only from deterministic, affirmative references
+    # in the latest user message.
+    return _exact_credential_name_candidates(user_message)
+
+
+_CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH = 4
+
+
+def _explicit_login_action_asserted(user_message: str) -> bool:
+    """Whether the message asks for a login in its own words, ignoring phrasings that refuse one.
+
+    Shares the negation rule with saved-name matching, so "do not log in with prod" authorizes neither.
+    """
+    text = _credential_authority_text(user_message or "")
+    return any(
+        not _credential_reference_is_negated(text, match.start()) for match in _EXPLICIT_LOGIN_ACTION_RE.finditer(text)
+    )
+
+
+def _saved_credential_names_mentioned(user_message: str, credentials: list[Credential]) -> list[str]:
+    """Saved names a message states outright, e.g. "use skyvern-datadog to login".
+
+    The saved names are known, so match on them rather than on the prose around them.
+    """
+    text = _credential_authority_text(user_message or "")
+    mentioned: list[str] = []
+    for credential in credentials:
+        name = (credential.name or "").strip()
+        if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+            continue
+        for match in re.finditer(rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])", text, re.IGNORECASE):
+            if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
+                text, match.start()
+            ):
+                continue
+            mentioned.append(name)
+            break
+    return _clean_list(mentioned)
+
+
+def _explicit_credential_ids(user_message: str) -> list[str]:
+    text = _credential_authority_text(user_message or "")
+    explicit: list[str] = []
+    matches = sorted(
+        [(match, match.group(0)) for match in _CREDENTIAL_ID_RE.finditer(text)]
+        + [(match, f"cred_{match.group(1)}") for match in _MALFORMED_CREDENTIAL_ID_RE.finditer(text)],
+        key=lambda item: item[0].start(),
+    )
+    last_negated_mention = {
+        credential_id: match.start()
+        for match, credential_id in matches
+        if _credential_reference_is_negated(text, match.start())
+    }
+    last_explicit_end: int | None = None
+    for match, credential_id in matches:
+        if last_negated_mention.get(credential_id, -1) > match.start():
+            continue
+        if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
+            text, match.start()
+        ):
+            continue
+        context = text[max(0, match.start() - 64) : match.start()]
+        if (
+            _EXPLICIT_CREDENTIAL_ID_CONTEXT_RE.search(context)
+            or _CREDENTIAL_ID_LABEL_CONTEXT_RE.search(context)
+            or match.group(0).strip() == text.strip()
+            or (
+                last_explicit_end is not None
+                and _CREDENTIAL_ID_COORDINATOR_RE.fullmatch(text[last_explicit_end : match.start()])
+            )
+        ):
+            explicit.append(credential_id)
+            last_explicit_end = match.end()
+    return _clean_list(explicit)
+
+
+def _deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
+    by_id: dict[str, Credential] = {}
+    for credential in credentials:
+        by_id.setdefault(credential.credential_id, credential)
+    return list(by_id.values())
 
 
 def _safe_label(credential: Credential) -> str:
@@ -2284,23 +4511,41 @@ def _url_parts(url: str) -> tuple[str, str] | None:
         return None
     host = parsed.netloc.lower()
     path = parsed.path.rstrip("/")
-    return f"{parsed.scheme.lower()}://{host}{path}", f"{parsed.scheme.lower()}://{host}"
+    # Login pages can differ only by query (?tenant=a vs ?tenant=b), so the
+    # exact tier keys on the full URL with a param-order-insensitive query.
+    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    exact = f"{parsed.scheme.lower()}://{host}{path}"
+    if query:
+        exact = f"{exact}?{query}"
+    return exact, f"{parsed.scheme.lower()}://{host}"
 
 
-def _match_by_url(credentials: list[Credential], urls: list[str]) -> list[Credential]:
+def _match_by_url(
+    credentials: list[Credential], urls: list[str], *, allow_host_fallback: bool = True
+) -> list[Credential]:
     indexed = [
         (credential, parts)
         for credential in credentials
         if credential.tested_url and (parts := _url_parts(credential.tested_url))
     ]
     requested = [parts for url in urls if (parts := _url_parts(url))]
-    for index in range(2):
+    for index in range(2 if allow_host_fallback else 1):
         matches = [
             credential for credential, parts in indexed if any(parts[index] == target[index] for target in requested)
         ]
         if matches:
             return matches
     return []
+
+
+def _login_url_candidates(policy: RequestPolicy, user_message: str) -> list[str]:
+    if policy.login_page_urls:
+        return _clean_list(policy.login_page_urls)
+    candidates = _clean_list([candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)])
+    candidate_hosts = {parts[1] for candidate in candidates if (parts := _url_parts(candidate))}
+    if len(candidate_hosts) > 1:
+        return []
+    return candidates
 
 
 _CLARIFICATION_DECISION_PREFIX = "request-policy clarification required:"
@@ -2361,14 +4606,105 @@ def _clarification_question(policy: RequestPolicy, global_llm_context: str = "")
     return "I need one more detail before I can build and test this workflow safely."
 
 
-def _has_resolvable_credential_scope(policy: RequestPolicy) -> bool:
-    if policy.credential_input_kind == "credential_id":
-        return any(ref.startswith("cred_") for ref in policy.credential_refs)
-    if policy.credential_input_kind == "credential_name":
-        return bool(policy.credential_refs)
-    if policy.credential_input_kind == "website_stored_credential":
-        return bool(policy.login_page_urls)
-    return False
+def _has_resolvable_credential_scope(policy: RequestPolicy, user_message: str = "") -> bool:
+    if policy.raw_secret_detected:
+        return False
+    if _explicit_credential_ids(user_message):
+        return True
+    if _credential_name_candidates(user_message):
+        return True
+    if policy.login_page_urls:
+        return True
+    if not policy.login_intent:
+        return False
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return False
+    return bool(_login_url_candidates(policy, user_message))
+
+
+def _login_target_is_concrete(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
+    """A login phrase with no site, workflow, or URL yet has nothing to hold a credential.
+
+    Asking there would demand a credential on first touch, before the task and URL
+    clarification the user still owes.
+    """
+    return bool(
+        policy.login_page_urls
+        or workflow_yaml.strip()
+        or policy.existing_workflow_credential_ids
+        or URL_CANDIDATE_RE.search(user_message)
+    )
+
+
+def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
+    """Login was explicitly requested against a concrete target and no credential is reachable.
+
+    Evaluated after ``_resolve_credentials`` so an org/URL/name match counts as
+    resolved; a user-named credential keeps ``credential_name_unresolved`` because
+    naming one makes the lookup failure, not the absence of login credentials, the ask.
+    """
+    if not policy.login_intent or policy.raw_secret_detected:
+        return False
+    if _is_passwordless_email_signin(policy):
+        # Nothing a password credential could satisfy: _resolve_signin_email owns this shape,
+        # and asking for a saved credential here is unanswerable on an email-only site.
+        return False
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return False
+    if policy.clarification_reason not in _LOGIN_CREDENTIAL_OVERRIDABLE_REASONS:
+        return False
+    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
+        return False
+    return not (policy.resolved_credentials or policy.discovered_credentials or policy.existing_workflow_credential_ids)
+
+
+def _signin_target_hosts(policy: RequestPolicy, user_message: str) -> list[str]:
+    return [parts[1] for url in _login_url_candidates(policy, user_message) if (parts := _url_parts(url))]
+
+
+def _is_passwordless_email_signin(policy: RequestPolicy) -> bool:
+    """Email-address sign-in with no credential material referenced anywhere in the request."""
+    return (
+        (policy.email_signin_intent or bool(policy.resolved_signin_email))
+        and policy.login_intent
+        and not policy.raw_secret_detected
+        and policy.credential_input_kind == "none"
+        and not policy.credential_refs
+    )
+
+
+async def _resolve_signin_email(
+    policy: RequestPolicy,
+    organization_id: str,
+    *,
+    user_message: str,
+    workflow_yaml: str,
+) -> None:
+    """Settle which address signs in, or ask for one — never ask for a password credential."""
+    if not _is_passwordless_email_signin(policy):
+        return
+    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+        return
+    # Same first-touch rule the password path uses: with no site yet, the address is not
+    # the question the user still owes.
+    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
+        return
+    # A clarification already on the policy is a different question the user still owes;
+    # _block would overwrite it and lose it, so this ask waits for a later turn. A question
+    # without a reason set counts, which is why this checks the flag and not just the reason.
+    if policy.requires_user_clarification or policy.clarification_reason != "none":
+        return
+
+    named = next(iter(policy.signin_email_candidates), None)
+    if named:
+        # An explicit instruction outranks both a carried identity and the connected account.
+        policy.resolved_signin_email = named
+    elif not policy.resolved_signin_email:
+        policy.resolved_signin_email = await connected_gmail_address(organization_id)
+    if not policy.resolved_signin_email:
+        _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
+        return
+    policy.resolved_signin_host = next(iter(_signin_target_hosts(policy, user_message)), None)
 
 
 def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
@@ -2413,6 +4749,35 @@ async def _seed_discovered_credentials(
     )
 
 
+def _prior_approved_credential_ids_from_context(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
+    }
+
+
+async def _seed_prior_approved_credentials(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    prior_ids = _prior_approved_credential_ids_from_context(global_llm_context)
+    carry_ids = sorted(prior_ids - {credential.credential_id for credential in policy.resolved_credentials})
+    if not carry_ids:
+        return
+    carried = await app.DATABASE.credentials.get_credentials_by_ids(carry_ids, organization_id=organization_id)
+    if not carried:
+        return
+    policy.resolved_credentials = list(policy.resolved_credentials) + carried
+    LOG.info(
+        "request-policy prior approved credentials carried",
+        organization_id=organization_id,
+        carried_credential_ids=[credential.credential_id for credential in carried],
+        carried_count=len(carried),
+    )
+
+
 def _last_assistant_message_was_saved_credential_question(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
 ) -> bool:
@@ -2429,10 +4794,16 @@ def _can_defer_unresolved_credential_name_for_draft(
     policy: RequestPolicy,
     *,
     global_llm_context: str,
+    user_message: str,
 ) -> bool:
     if policy.clarification_reason != "credential_name_unresolved":
         return False
-    if _has_resolvable_credential_scope(policy):
+    # A classifier-carried name may justify leaving an unvalidated placeholder
+    # in a draft, but _credential_name_candidates still requires current-turn
+    # anchoring before the name can enter resolved_credentials and authorize a run.
+    if policy.credential_refs:
+        return True
+    if _has_resolvable_credential_scope(policy, user_message):
         return True
     if _previous_credential_clarification_was_asked(global_llm_context):
         return True
@@ -2443,13 +4814,14 @@ def _should_defer_repeated_unresolved_credential_question(
     policy: RequestPolicy,
     *,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
+    user_message: str,
 ) -> bool:
     if not _last_assistant_message_was_saved_credential_question(chat_history):
         return False
     return (
         policy.credential_input_kind in ("none", "credential_name")
         and policy.clarification_reason == "credential_name_unresolved"
-        and not _has_resolvable_credential_scope(policy)
+        and not _has_resolvable_credential_scope(policy, user_message)
     )
 
 
@@ -2468,12 +4840,17 @@ async def _resolve_credentials(
     policy: RequestPolicy,
     organization_id: str,
     *,
+    user_message: str,
     defer_unresolved_credential_name: bool = False,
 ) -> None:
-    if policy.credential_input_kind == "credential_id":
-        ids = _clean_list([ref for ref in policy.credential_refs if ref.startswith("cred_")])
-        if not ids:
-            return
+    if policy.raw_secret_detected:
+        return
+
+    # Explicit IDs are deterministic current-turn authority and must win
+    # regardless of the classifier label. Do not trust stale/model-authored
+    # credential_refs that are absent from the latest user message.
+    ids = _explicit_credential_ids(user_message)
+    if ids:
         existing = await app.DATABASE.credentials.get_credentials_by_ids(ids, organization_id=organization_id)
         found = {credential.credential_id for credential in existing}
         policy.resolved_credentials = existing
@@ -2490,7 +4867,154 @@ async def _resolve_credentials(
             policy.allow_missing_credentials_in_draft = True
         return
 
-    if policy.credential_input_kind == "credential_name" and not policy.credential_refs:
+    # `login_intent` is a classifier-authored hint that misses on runs where the model does not set
+    # it, so a message asking for a login in its own words must still count. A classifier that failed
+    # outright is a different case: a degraded turn never enumerates the org's saved credentials.
+    login_phrase_asserted = _explicit_login_action_asserted(user_message)
+    may_scan_saved_names = policy.login_intent or (policy.classifier_status != "fallback" and login_phrase_asserted)
+    name_candidates = _credential_name_candidates(user_message)
+    credentials: list[Credential] | None = None
+    # Only a request that already asserts a login or credential intent may be matched against the
+    # org's saved names; without that gate an unrelated message would scan the credential list.
+    if not name_candidates and may_scan_saved_names:
+        credentials = await _load_credentials(organization_id)
+        name_candidates = _saved_credential_names_mentioned(user_message, credentials)
+    if name_candidates:
+        if credentials is None:
+            credentials = await _load_credentials(organization_id)
+        named_matches = _deduplicate_credentials(
+            [credential for credential in credentials if credential.name in name_candidates]
+        )
+        if len(named_matches) == 1:
+            policy.resolved_credentials = named_matches
+            if (
+                policy.classifier_status == "fallback"
+                and policy.credential_input_kind == "none"
+                and not policy.credential_refs
+            ):
+                # Preserve the pre-existing fallback telemetry contract while
+                # keeping successful classifier labels advisory.
+                policy.credential_input_kind = "credential_name"
+                policy.credential_refs = [named_matches[0].name]
+            return
+        if named_matches:
+            if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
+                policy.allow_run_blocks = False
+                policy.allow_missing_credentials_in_draft = True
+                return
+            question = (
+                "I found multiple stored credentials with that exact name. Which one should I use?"
+                if len(name_candidates) == 1
+                else "I found multiple saved credentials named in your request. Which one should I use?"
+            )
+            _block(
+                policy,
+                question,
+                named_matches,
+                reason="credential_name_unresolved",
+            )
+            return
+        if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
+            policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
+            if defer_unresolved_credential_name:
+                _defer_unresolved_credential_for_draft(policy)
+            return
+        if policy.allow_missing_credentials_in_draft:
+            policy.allow_run_blocks = False
+            return
+        question = (
+            f"I could not find a stored credential named `{name_candidates[0]}`. Please choose an existing credential "
+            "by exact name or a credential ID beginning with cred_."
+            if policy.credential_input_kind == "credential_name"
+            else _clarification_question(policy)
+        )
+        _block(
+            policy,
+            question,
+            reason="credential_name_unresolved",
+        )
+        return
+
+    message_url_candidates = _clean_list(
+        [candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)]
+    )
+    # A passwordless turn must not reach the URL credential tiers below: a host match there
+    # asks for a saved credential under a different reason, which is the same dead end.
+    current_turn_login_authorized = (
+        policy.login_intent or login_phrase_asserted
+    ) and not _is_passwordless_email_signin(policy)
+    url_candidates: list[str] = []
+    allow_host_fallback = False
+    if (
+        current_turn_login_authorized
+        and policy.testing_intent != "skip_test"
+        and not policy.allow_missing_credentials_in_draft
+    ):
+        url_candidates = _login_url_candidates(policy, user_message)
+        allow_host_fallback = bool(policy.login_page_urls)
+    elif policy.credential_input_kind == "website_stored_credential" and message_url_candidates:
+        # A URL explicitly supplied by the current user is independent
+        # authority for the URL tier; classifier-only URLs are not.
+        url_candidates = message_url_candidates
+
+    if url_candidates:
+        if credentials is None:
+            credentials = await _load_credentials(organization_id)
+        url_credentials = credentials
+        if current_turn_login_authorized:
+            # Card/secret credentials can carry a tested_url too; a
+            # login turn must only ever auto-bind a password credential.
+            url_credentials = [
+                credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD
+            ]
+        matches = _match_by_url(
+            url_credentials,
+            url_candidates,
+            # A URL merely mentioned in prose is a weaker signal than a
+            # classifier-extracted login page; require an exact tested-URL hit.
+            allow_host_fallback=allow_host_fallback,
+        )
+        matches = _deduplicate_credentials(matches)
+        if len(matches) == 1:
+            policy.resolved_credentials = matches
+            return
+        if matches:
+            # Found-but-unbound keeps the unresolved-login override from
+            # relabeling this disambiguation ask as a missing-credential turn.
+            policy.discovered_credentials = matches
+            _block(
+                policy,
+                _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+                matches,
+                reason="credential_name_unresolved",
+            )
+            return
+        if current_turn_login_authorized:
+            # URL-matched password credentials rank first. If neither URL
+            # tier matches, credentials saved without a tested URL remain
+            # valid login candidates.
+            urlless = _deduplicate_credentials(
+                [credential for credential in url_credentials if not credential.tested_url]
+            )
+            if len(urlless) == 1:
+                policy.resolved_credentials = urlless
+                return
+            if urlless:
+                policy.discovered_credentials = urlless
+                _block(
+                    policy,
+                    _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+                    urlless,
+                    reason="credential_name_unresolved",
+                )
+                return
+
+    if policy.credential_input_kind == "credential_name":
+        if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
+            policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
+            if defer_unresolved_credential_name:
+                _defer_unresolved_credential_for_draft(policy)
+            return
         if policy.allow_missing_credentials_in_draft:
             policy.allow_run_blocks = False
             return
@@ -2500,54 +5024,15 @@ async def _resolve_credentials(
             reason="credential_name_unresolved",
         )
         return
-    if policy.credential_input_kind == "website_stored_credential" and not policy.login_page_urls:
-        _block(
-            policy,
-            _STORED_CREDENTIAL_URL_QUESTION,
-            reason="missing_target_context",
-        )
-        return
-    if policy.credential_input_kind not in ("credential_name", "website_stored_credential"):
-        return
 
-    credentials = await _load_credentials(organization_id)
-    if policy.credential_input_kind == "credential_name":
-        for ref in policy.credential_refs:
-            matches = [credential for credential in credentials if credential.name == ref]
-            if len(matches) == 1:
-                policy.resolved_credentials.append(matches[0])
-            elif matches:
-                _block(
-                    policy,
-                    "I found multiple stored credentials with that exact name. Which one should I use?",
-                    matches,
-                    reason="credential_name_unresolved",
-                )
-                return
-            elif policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
-                policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
-                if defer_unresolved_credential_name:
-                    _defer_unresolved_credential_for_draft(policy)
-            else:
-                _block(
-                    policy,
-                    f"I could not find a stored credential named `{ref}`. Please choose an existing credential by exact name or a credential ID beginning with cred_.",
-                    reason="credential_name_unresolved",
-                )
-                return
-        return
-
-    matches = _match_by_url(credentials, policy.login_page_urls)
-    if len(matches) == 1:
-        policy.resolved_credentials = matches
-    elif matches:
-        _block(
-            policy,
-            "I found multiple stored credentials for that login page. Which one should I use?",
-            matches,
-            reason="credential_name_unresolved",
-        )
-    else:
+    if policy.credential_input_kind == "website_stored_credential":
+        if not policy.login_page_urls:
+            _block(
+                policy,
+                _STORED_CREDENTIAL_URL_QUESTION,
+                reason="missing_target_context",
+            )
+            return
         _block(
             policy,
             "I could not find a stored credential for that login page. Please select a saved credential by exact name or a credential ID beginning with cred_, or create one in the Credentials UI.",
@@ -2663,7 +5148,7 @@ async def build_request_policy(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
     organization_id: str,
-    handler: Any,
+    handler: LLMAPIHandler | None,
     active_criteria: list[CompletionCriterion] | None = None,
     config: CopilotConfig | None = None,
 ) -> RequestPolicy:
@@ -2681,18 +5166,6 @@ async def build_request_policy(
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
-    try:
-        await _apply_exact_credential_name_scope(
-            policy,
-            user_message=user_message,
-            organization_id=organization_id,
-        )
-    except Exception:
-        LOG.warning(
-            "request-policy exact credential-name extraction failed",
-            organization_id=organization_id,
-            exc_info=True,
-        )
     # This narrows classifier output only after the classifier has identified
     # credential intent; running it earlier would be overwritten by the model verdict.
     _apply_explicit_code_block_credential_draft_policy(policy, user_message)
@@ -2709,6 +5182,12 @@ async def build_request_policy(
             exc_info=True,
         )
     _prioritize_credential_clarification(policy)
+    # Before credential resolution, so a carried sign-in identity also keeps this turn out of
+    # the URL credential tiers.
+    carried = prior_signin_email_from_context(global_llm_context, _signin_target_hosts(policy, user_message))
+    policy.resolved_signin_email = policy.resolved_signin_email or (
+        carried if carried and is_email_address(carried) else None
+    )
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
         policy.testing_intent = "skip_test"
@@ -2737,6 +5216,7 @@ async def build_request_policy(
                 and not _can_defer_unresolved_credential_name_for_draft(
                     policy,
                     global_llm_context=global_llm_context,
+                    user_message=user_message,
                 )
             ):
                 policy.requires_user_clarification = True
@@ -2748,6 +5228,7 @@ async def build_request_policy(
     if _should_defer_repeated_unresolved_credential_question(
         policy,
         chat_history=chat_history,
+        user_message=user_message,
     ):
         policy.requires_user_clarification = False
         policy.allow_update_workflow = True
@@ -2763,9 +5244,16 @@ async def build_request_policy(
             question,
             reason="raw_secret",
         )
-    elif policy.requires_user_clarification and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+    elif (
+        policy.requires_user_clarification
+        and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS
+        and not (
+            policy.clarification_reason == "missing_target_context"
+            and _has_resolvable_credential_scope(policy, user_message)
+        )
+    ):
         _block(policy, _clarification_question(policy, global_llm_context))
-    elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy):
+    elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy, user_message):
         _block(policy, _clarification_question(policy, global_llm_context))
     else:
         try:
@@ -2776,6 +5264,7 @@ async def build_request_policy(
             await _resolve_credentials(
                 policy,
                 organization_id,
+                user_message=user_message,
                 defer_unresolved_credential_name=_last_assistant_message_was_saved_credential_question(chat_history),
             )
         except Exception:
@@ -2789,6 +5278,51 @@ async def build_request_policy(
                 policy,
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
+
+    # Seeded before the login-credential reachability check so a credential approved on an
+    # earlier turn counts as reachable and a confirmation-only turn does not re-ask for it.
+    try:
+        await _seed_prior_approved_credentials(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy prior approved credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+
+    if policy.resolved_credentials and policy.clarification_reason == "missing_target_context":
+        policy.requires_user_clarification = False
+        policy.user_response_policy = "proceed"
+        policy.clarification_reason = "none"
+        policy.clarification_question = None
+
+    try:
+        await _resolve_signin_email(
+            policy,
+            organization_id,
+            user_message=user_message,
+            workflow_yaml=workflow_yaml,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy sign-in email resolution failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        # The credential requirement is already lifted for this shape, so falling through
+        # would build a login with no identity and no question asked.
+        if _is_passwordless_email_signin(policy) and not policy.requires_user_clarification:
+            _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
+
+    if _login_credentials_unresolved(policy, user_message, workflow_yaml):
+        if policy.clarification_reason == "none":
+            _block(policy, _LOGIN_CREDENTIAL_QUESTION, reason="login_credentials_unresolved")
+        else:
+            policy.clarification_reason = "login_credentials_unresolved"
 
     if policy.authoring_intent == "defer_authoring":
         policy.allow_update_workflow = False

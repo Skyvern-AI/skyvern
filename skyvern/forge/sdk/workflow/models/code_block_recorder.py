@@ -10,6 +10,8 @@ from typing import Any, Awaitable, Callable
 import pydantic
 import structlog
 
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 
@@ -273,9 +275,12 @@ class _Recorder:
         description: str | None = None,
     ) -> Any:
         started = time.monotonic()
+        started_wall = naive_utc_now()
         # Input values may be credentials (incl. derived TOTP codes); never describe them.
         describe_args = () if action_type == ActionType.INPUT_TEXT else args
         common_fields = dict(
+            # Stable id assigned once so the streamed write and the end-of-block batch upsert the same row.
+            action_id=generate_action_id(),
             action_type=action_type,
             status=ActionStatus.completed,
             action_order=len(self.actions),
@@ -299,6 +304,8 @@ class _Recorder:
             raise
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)
+            action.created_at = started_wall
+            action.modified_at = naive_utc_now()
             if isinstance(action.output, dict):
                 action.output["duration_ms"] = duration_ms
             self.actions.append(action)

@@ -32,6 +32,7 @@ class RunStatus(StrEnum):
     created = "created"
     queued = "queued"
     running = "running"
+    paused = "paused"
     timed_out = "timed_out"
     failed = "failed"
     terminated = "terminated"

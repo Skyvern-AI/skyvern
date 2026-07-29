@@ -24,6 +24,7 @@ import re
 import time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 import yaml
@@ -81,6 +82,44 @@ _COMPOSITION_CONTEXT_TOOLS: frozenset[str] = frozenset({"inspect_page_for_compos
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"\)]+", re.IGNORECASE)
 
+# Two discovery failures with no resolvable entrypoint end the turn with one ask.
+DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD = 2
+
+_ANCHOR_URL_TRAILING_PUNCTUATION = ",.;:!?)]}'\"`"
+_ANCHOR_URL_MARKDOWN_WRAPPERS = frozenset("*_~")
+_ANCHOR_TRUNCATION_SENTINEL = "…"
+
+
+def extract_anchor_entry_url(text: str | None) -> str | None:
+    """Extract the first well-formed http(s) URL from a transcript anchor.
+
+    Consulted last and read-side only, so a stale URL from an unrelated turn
+    cannot leak. Matches abutting the `_safe_slot` middle-truncation marker are
+    rejected because the URL may be mangled across the splice.
+    """
+    if not text:
+        return None
+    for match in _URL_IN_TEXT_RE.finditer(text):
+        start, end = match.span()
+        if text[end : end + 1] == "<" or text[start - 1 : start] == ">":
+            continue
+        if _ANCHOR_TRUNCATION_SENTINEL in text[max(0, start - 2) : end + 2]:
+            continue
+        candidate = match.group(0).rstrip(_ANCHOR_URL_TRAILING_PUNCTUATION)
+        preceding = text[start - 1 : start]
+        if preceding in _ANCHOR_URL_MARKDOWN_WRAPPERS:
+            candidate = candidate.rstrip(preceding)
+        try:
+            parsed = urlparse(candidate)
+            port = parsed.port
+        except ValueError:
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        if "." in parsed.hostname or port is not None or parsed.hostname == "localhost":
+            return candidate
+    return None
+
 
 def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
     if not workflow_yaml:
@@ -98,16 +137,40 @@ def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
     return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
 
 
-def _yaml_has_target_url(workflow_yaml: str | None) -> bool:
-    """True when the YAML carries a goto_url or navigation block with a non-empty url."""
+def _first_yaml_target_url(workflow_yaml: str | None) -> str | None:
+    """The first goto_url/navigation block url in the YAML, or None."""
     for block in _parse_workflow_blocks(workflow_yaml):
         block_type = block.get("block_type")
         if block_type not in {"goto_url", "navigation"}:
             continue
         url = block.get("url")
         if isinstance(url, str) and url.strip():
-            return True
-    return False
+            return url.strip()
+    return None
+
+
+def _yaml_has_target_url(workflow_yaml: str | None) -> bool:
+    """True when the YAML carries a goto_url or navigation block with a non-empty url."""
+    return _first_yaml_target_url(workflow_yaml) is not None
+
+
+def extract_in_turn_entry_url(
+    user_message: str,
+    agent_user_message: str,
+    workflow_yaml: str | None,
+) -> str | None:
+    """The in-turn entrypoint URL (latest message, rewritten input, or YAML), or None.
+
+    Unlike the anchor extractor this applies no truncation/markdown rejection:
+    these are live in-turn sources, not a spliced transcript anchor.
+    """
+    for text in (user_message, agent_user_message):
+        match = _URL_IN_TEXT_RE.search(text or "")
+        if match:
+            candidate = match.group(0).rstrip(_ANCHOR_URL_TRAILING_PUNCTUATION)
+            if candidate:
+                return candidate
+    return _first_yaml_target_url(workflow_yaml)
 
 
 def initial_build_phase(
@@ -115,6 +178,8 @@ def initial_build_phase(
     user_message: str,
     agent_user_message: str,
     workflow_yaml: str | None,
+    transcript_earliest_user_turn: str = "",
+    persisted_entrypoint_url: str | None = None,
 ) -> BuildPhase:
     """Decide the initial build phase for this turn.
 
@@ -133,11 +198,15 @@ def initial_build_phase(
     alternative is to let mutation through on an ambiguous turn, which is
     worse than asking discovery to resolve or falling through to ASK_QUESTION.
 
-    Signals considered (this-turn only — never prior visited URLs or chat
-    history, which can leak stale URLs across unrelated turns):
+    Signals considered, in order:
     - The raw latest user message.
     - The rewritten agent input (request-policy may carry the prior request).
     - The current workflow YAML's first goto_url/navigation block.
+    - The persisted entrypoint slot carried across turns in durable state.
+    - The earliest-user-turn transcript anchor, consulted last and read-side
+      only. The anchor IS the original request, so it recovers the URL an
+      abnormally-ended turn dropped without reviving stale URLs from prior
+      visited pages or middle history turns.
     """
     mode_value = getattr(getattr(turn_intent, "mode", None), "value", None)
     if mode_value in _PHASE_NON_BUILD_MODE_VALUES:
@@ -146,10 +215,37 @@ def initial_build_phase(
         _URL_IN_TEXT_RE.search(user_message or "")
         or _URL_IN_TEXT_RE.search(agent_user_message or "")
         or _yaml_has_target_url(workflow_yaml)
+        or persisted_entrypoint_url
+        or extract_anchor_entry_url(transcript_earliest_user_turn)
     )
     if not has_url_signal:
         return BuildPhase.INITIAL
     return BuildPhase.COMPOSING
+
+
+def anchor_recovers_entrypoint(
+    turn_intent: TurnIntent | None,
+    user_message: str,
+    agent_user_message: str,
+    workflow_yaml: str | None,
+    transcript_earliest_user_turn: str = "",
+) -> str | None:
+    """The transcript-anchor URL to record as the resolved entrypoint, or None.
+
+    Returns a URL only when the anchor is the sole entrypoint signal this turn:
+    an in-turn URL (message, rewritten input, or YAML) is authoritative and
+    must not be overridden by the older anchor, so any of those returns None.
+    """
+    mode_value = getattr(getattr(turn_intent, "mode", None), "value", None)
+    if mode_value in _PHASE_NON_BUILD_MODE_VALUES:
+        return None
+    if (
+        _URL_IN_TEXT_RE.search(user_message or "")
+        or _URL_IN_TEXT_RE.search(agent_user_message or "")
+        or _yaml_has_target_url(workflow_yaml)
+    ):
+        return None
+    return extract_anchor_entry_url(transcript_earliest_user_turn)
 
 
 def _log_transition(ctx: CopilotContext, *, prev: BuildPhase, new: BuildPhase, reason: str) -> None:
@@ -191,6 +287,29 @@ def advance_to_testing(ctx: CopilotContext) -> None:
     _log_transition(ctx, prev=prev, new=ctx.build_phase, reason="update_workflow_succeeded")
 
 
+# The complete vocabulary the build-phase plane may refuse with. It exists for the same reason
+# AUTHOR_TIME_HARD_BLOCKS and LOOP_PLANE_REFUSAL_REASON_CODES do: a phase gate added here cannot
+# wall a turn without appearing in this set.
+BUILD_PHASE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "build_phase_discovery_disallowed_post_compose",
+        "build_phase_composition_inspection_blocked_pre_compose",
+        "build_phase_browser_blocked_pre_compose",
+        "build_phase_mutation_blocked_pre_compose",
+    }
+)
+
+
+def _declared_phase_refusal(signal: CopilotToolBlockerSignal) -> CopilotToolBlockerSignal:
+    reason = signal.internal_reason_code
+    if reason not in BUILD_PHASE_REFUSAL_REASON_CODES:
+        raise ValueError(
+            f"{reason!r} is not a declared build-phase refusal. A phase gate that ends a turn must be "
+            f"declared; anything else steers. Declared: {sorted(BUILD_PHASE_REFUSAL_REASON_CODES)}"
+        )
+    return signal
+
+
 def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
     """Phase-aware authority blocker, parallel to `_turn_intent_tool_error` / `_request_policy_tool_error`."""
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
@@ -203,63 +322,79 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
     in_mutation = phase in MUTATION_PERMITTED_PHASES
 
     if tool_name in _DISCOVERY_TOOLS and in_mutation:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "discover_workflow_entrypoint is only available before the entrypoint is resolved. "
-                "The workflow already has a target URL — scout it with the browser tools and author with update_workflow. "
-                "safe_reason_code=build_phase_discovery_disallowed_post_compose."
-            ),
-            user_facing_reason="I already have a target for this workflow — I'll keep working on it instead of starting over.",
-            recovery_hint="retry_with_different_tool",
-            cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
-            internal_reason_code="build_phase_discovery_disallowed_post_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "discover_workflow_entrypoint is only available before the entrypoint is resolved. "
+                    "The workflow already has a target URL — scout it with the browser tools and author with update_workflow. "
+                    "safe_reason_code=build_phase_discovery_disallowed_post_compose."
+                ),
+                user_facing_reason="I kept the existing target for this workflow instead of starting over.",
+                recovery_hint="retry_with_different_tool",
+                cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks", "edit_block"}),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_discovery_disallowed_post_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     if tool_name in _COMPOSITION_CONTEXT_TOOLS and in_discovery:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "Page inspection for composition is only available after an entrypoint URL is known. "
-                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
-                "safe_reason_code=build_phase_composition_inspection_blocked_pre_compose."
-            ),
-            user_facing_reason="I need to know what page to inspect before I can read its form controls.",
-            recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
-            internal_reason_code="build_phase_composition_inspection_blocked_pre_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "Page inspection for composition is only available after an entrypoint URL is known. "
+                    "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
+                    "safe_reason_code=build_phase_composition_inspection_blocked_pre_compose."
+                ),
+                user_facing_reason="I need to know what page to inspect before I can read its form controls.",
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_composition_inspection_blocked_pre_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     if tool_name in _BROWSER_PRIMITIVE_TOOLS and in_discovery:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "Direct browser tools are not callable before composition. "
-                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL. "
-                "safe_reason_code=build_phase_browser_blocked_pre_compose."
-            ),
-            user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
-            recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
-            internal_reason_code="build_phase_browser_blocked_pre_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "Direct browser tools are not callable before composition. "
+                    "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL. "
+                    "safe_reason_code=build_phase_browser_blocked_pre_compose."
+                ),
+                user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset(
+                    {"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}
+                ),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_browser_blocked_pre_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     if tool_name in _MUTATION_TOOLS and in_discovery:
-        return CopilotToolBlockerSignal(
-            blocker_kind="phase_gated",
-            agent_steering_text=(
-                "Workflow mutation is gated to composition. "
-                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
-                "safe_reason_code=build_phase_mutation_blocked_pre_compose."
-            ),
-            user_facing_reason="I need to know what site to work on before I can build a workflow. What URL should I use?",
-            recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
-            internal_reason_code="build_phase_mutation_blocked_pre_compose",
-            blocked_tool=tool_name,
+        return _declared_phase_refusal(
+            CopilotToolBlockerSignal(
+                blocker_kind="phase_gated",
+                agent_steering_text=(
+                    "Workflow mutation is gated to composition. "
+                    "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
+                    "safe_reason_code=build_phase_mutation_blocked_pre_compose."
+                ),
+                user_facing_reason="I need to know what site to work on before I can build a workflow. What URL should I use?",
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset(
+                    {"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}
+                ),
+                renders_final_reply=False,
+                internal_reason_code="build_phase_mutation_blocked_pre_compose",
+                blocked_tool=tool_name,
+            )
         )
 
     return None

@@ -225,8 +225,11 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
         except ResourceNotFoundError:
             return None
         except Exception:
+            # Propagate transient/authz failures so callers that must distinguish "missing" from
+            # "unreadable" (the browser-profile content probe) don't treat a flaky read as not-found and
+            # overwrite a saved archive. Graceful callers wrap this via _get_object_info_safe / their own try.
             LOG.exception("Failed to get blob properties", uri=uri)
-            return None
+            raise
 
     async def blob_exists(self, uri: str) -> bool:
         parsed = AzureUri(uri)

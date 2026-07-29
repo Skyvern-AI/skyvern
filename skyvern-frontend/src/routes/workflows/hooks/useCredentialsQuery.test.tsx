@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
+import { useCredentialQuery } from "./useCredentialQuery";
 import { useCredentialsQuery } from "./useCredentialsQuery";
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -106,6 +107,30 @@ describe("useCredentialsQuery in a read-only comparison scope", () => {
       () => useCredentialsQuery({ enabled: true, page_size: 100 }),
       { wrapper: makeComparisonWrapper() },
     );
+
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(getMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useCredentialQuery", () => {
+  it("fetches a credential by its encoded id", async () => {
+    const getMock = stubClient();
+
+    renderHook(() => useCredentialQuery("cred/test"), {
+      wrapper: makeWrapper(),
+    });
+
+    await waitFor(() => expect(getMock).toHaveBeenCalled());
+    expect(getMock).toHaveBeenCalledWith("/credentials/cred%2Ftest");
+  });
+
+  it("does not fetch without a credential id", () => {
+    const getMock = stubClient();
+
+    const { result } = renderHook(() => useCredentialQuery(undefined), {
+      wrapper: makeWrapper(),
+    });
 
     expect(result.current.fetchStatus).toBe("idle");
     expect(getMock).not.toHaveBeenCalled();

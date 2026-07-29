@@ -18,5 +18,6 @@ export interface HttpRequestBlockYaml {
     follow_redirects?: boolean;
     download_filename?: string;
     save_response_as_file?: boolean;
+    secret_response_paths?: string[];
     parameter_keys?: string[];
 }

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ActivityEntry,
   BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   applyNarrativeEvent,
   computeTurnSummary,
+  condenseActivityEntries,
   effectiveMode,
   hydrateHistoryNarrative,
   hydrateNarrativeFromPayload,
@@ -14,9 +16,11 @@ import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
+  WorkflowCopilotNarrationUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
+  WorkflowCopilotToolResultUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
@@ -74,6 +78,28 @@ const toolCall = (
   tool_input: {},
   iteration: 0,
   tool_call_id: "call-1",
+  ...overrides,
+});
+
+const toolResult = (
+  overrides: Partial<WorkflowCopilotToolResultUpdate> = {},
+): WorkflowCopilotToolResultUpdate => ({
+  type: "tool_result",
+  tool_name: "update_and_run_blocks",
+  success: true,
+  summary: "Testing workflow successful",
+  iteration: 0,
+  tool_call_id: "call-1",
+  ...overrides,
+});
+
+const narration = (
+  overrides: Partial<WorkflowCopilotNarrationUpdate> = {},
+): WorkflowCopilotNarrationUpdate => ({
+  type: "narration",
+  narration: "Reading the page…",
+  iteration: 0,
+  timestamp: "2026-05-25T00:00:04Z",
   ...overrides,
 });
 
@@ -349,6 +375,274 @@ describe("applyNarrativeEvent — activity", () => {
       text: "Testing workflow…",
     });
     expect(s.designActivity[0]?.text).not.toContain("update_and_run_blocks");
+  });
+
+  it("co-locates a run tool's result with its call after a block starts running (SKY-12831)", () => {
+    // The call lands in designActivity (no block running yet); the run then
+    // flips a block to running. The result must rejoin the call in
+    // designActivity so the pair folds — not land in the block card.
+    const afterCall = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolCall({ tool_call_id: "call-1" }),
+    );
+    const afterBlock = applyNarrativeEvent(
+      afterCall,
+      blockProgress({ block_label: "step_1", status: "running" }),
+    );
+    const s = applyNarrativeEvent(
+      afterBlock,
+      toolResult({ tool_call_id: "call-1" }),
+    );
+
+    expect(s.designActivity.map((e) => e.id)).toEqual([
+      "tc-call-1",
+      "tr-call-1",
+    ]);
+    expect(
+      s.blocks.find((b) => b.label === "step_1")?.activity ?? [],
+    ).toHaveLength(0);
+    expect(condenseActivityEntries(s.designActivity)).toHaveLength(1);
+  });
+});
+
+describe("condenseActivityEntries", () => {
+  function reduceEvents(events: Parameters<typeof applyNarrativeEvent>[1][]) {
+    return events.reduce(
+      (state: TurnNarrativeState, event) => applyNarrativeEvent(state, event),
+      EMPTY_NARRATIVE,
+    );
+  }
+
+  it("folds a resolved tool_call/tool_result pair into one row (no leftover calling… chatter)", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "evaluate" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "evaluate",
+        success: true,
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({ kind: "tool_result", success: true });
+  });
+
+  it("REGRESSION PIN: substitutes the humanized tool name for the backend's bare 'OK' fallback (celal QA catch)", () => {
+    // A tool with no dedicated backend summary falls back to a literal
+    // "OK" — condensing already removed the "<tool> · calling…" row that
+    // used to give it context, so a bare "OK" reads as meaningless.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "evaluate" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "evaluate",
+        summary: "OK",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]?.text).toBe("Inspecting page");
+    expect(condensed[0]?.text).not.toBe("OK");
+  });
+
+  it("leaves a real (non-fallback) backend summary untouched, even if a mapped tool", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "evaluate" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "evaluate",
+        summary: "Evaluated JavaScript — returned a string",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed[0]?.text).toBe("Evaluated JavaScript — returned a string");
+  });
+
+  it("folds a failed attempt then a retry into one row, terminal outcome only", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "extract" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "extract",
+        success: false,
+        summary: "no results",
+      }),
+      toolCall({ tool_call_id: "call-2", tool_name: "extract" }),
+      toolResult({
+        tool_call_id: "call-2",
+        tool_name: "extract",
+        success: true,
+        summary: "top 5 titles",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({
+      success: true,
+      attempts: 2,
+      text: "top 5 titles",
+    });
+  });
+
+  it("folds a 3-attempt retry chain into one row with attempts=3", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c3", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c3", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({ success: true, attempts: 3 });
+  });
+
+  it("folds a retry across a narration sitting between two attempts (narration never breaks the fold)", () => {
+    // Array position can't reliably tell "narration between attempts" from
+    // "narration mid-flight during the retry itself" (see the regression
+    // pin below, where the same ordered shape arises from a genuinely
+    // different case) — so narration is never treated as a fold-breaking
+    // gap, full stop.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      narration(),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    // Narration arrived before the merged (2nd-attempt) result, so the
+    // fold keeps that order — narration first, not stranded after a row
+    // whose content is chronologically later than it.
+    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
+    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+  });
+
+  it("REGRESSION PIN: folds a retry when the narration fires mid-flight during the RETRY itself (Codex catch)", () => {
+    // Ordering fix (pass 1) puts this narration in the identical array
+    // position as narration genuinely between two attempts — attempt 1's
+    // clean result already sits before attempt 2's call, so the retry's
+    // own mid-flight narration lands right after it either way. Only a
+    // narration-agnostic fold (last TOOL row, not literal adjacency)
+    // survives this case.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      narration(),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    // The merge must not leave the (chronologically later) result parked
+    // at attempt 1's old position, ahead of narration that streamed
+    // before it arrived.
+    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
+    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+  });
+
+  it("REGRESSION PIN: folds a retry even when the narration fires mid-flight, during the FIRST attempt (reviewer catch)", () => {
+    // The narrator can emit a progress narration while a call is still
+    // pending. Pairing (pass 1) then places attempt 1's result at attempt
+    // 1's call position, ahead of that narration — which used to make the
+    // narration look like it sat BETWEEN the two attempts and break the
+    // fold, even though nothing genuinely interrupted the retry.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      narration(),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
+    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+  });
+
+  it("does not fold two consecutive different-tool results", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "navigate_browser" }),
+      toolResult({
+        tool_call_id: "c1",
+        tool_name: "navigate_browser",
+        success: false,
+      }),
+      toolCall({ tool_call_id: "c2", tool_name: "evaluate" }),
+      toolResult({ tool_call_id: "c2", tool_name: "evaluate", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(2);
+  });
+
+  it("keeps an orphaned tool_result (its call was evicted) as its own row instead of dropping it", () => {
+    const entries: ActivityEntry[] = [
+      {
+        kind: "tool_result",
+        text: "done",
+        iteration: 0,
+        toolName: "evaluate",
+        success: true,
+        id: "tr-orphan-1",
+      },
+    ];
+    expect(condenseActivityEntries(entries)).toEqual(entries);
+  });
+
+  it("REGRESSION PIN: still pairs a call/result whose sliced tool_call_id is an empty string (Claude catch)", () => {
+    // toolCallIdOf returns "" (falsy but defined) for an id like "tc-" —
+    // a truthiness check would treat that as "no id" and never pair it,
+    // inconsistent with hasPendingToolCall's unconditional `?? ""`.
+    const entries: ActivityEntry[] = [
+      {
+        kind: "tool_call",
+        text: "Extracting…",
+        iteration: 0,
+        toolName: "extract",
+        id: "tc-",
+      },
+      {
+        kind: "tool_result",
+        text: "done",
+        iteration: 0,
+        toolName: "extract",
+        success: true,
+        id: "tr-",
+      },
+    ];
+    expect(condenseActivityEntries(entries)).toHaveLength(1);
+  });
+
+  it("an orphaned same-tool result immediately after a failed attempt still folds as its retry outcome", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+    ]);
+    const orphan: ActivityEntry = {
+      kind: "tool_result",
+      text: "top 5 titles + links",
+      iteration: 1,
+      toolName: "extract",
+      success: true,
+      id: "tr-evicted-call-2",
+    };
+    const condensed = condenseActivityEntries([...s.designActivity, orphan]);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({
+      success: true,
+      attempts: 2,
+      text: "top 5 titles + links",
+    });
+  });
+
+  it("leaves a still-pending retry visible, tagged with the attempt count", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({ kind: "tool_call", attempts: 2 });
   });
 });
 
@@ -687,6 +981,177 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.glyph).toBe("✦");
   });
 
+  it("renders non-build REPLY + not_demonstrated as Outcome not confirmed", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        verifiedSuccess: false,
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          displayReason: "The run never reached the target page.",
+          activitySeqAtVerdict: 3,
+        },
+      }),
+    );
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("uses hydrated not_demonstrated block outcomes when lastRunOutcome is absent", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        verifiedSuccess: false,
+        blocks: [
+          {
+            ...reproBlock("open_registry_find_registrant"),
+            outcome: "demonstrated",
+          },
+          {
+            ...reproBlock("search_jane_doe_credential_a"),
+            outcome: "not_demonstrated",
+            outcomeReason: "A verification challenge prevented confirmation.",
+          },
+          {
+            ...reproBlock("expand_and_extract_certifications"),
+            outcome: "demonstrated",
+          },
+        ],
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("keeps the Question headline when response_type is ASK_QUESTION", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        verifiedSuccess: false,
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          displayReason: "The run never reached the target page.",
+          activitySeqAtVerdict: 3,
+        },
+      }),
+    );
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("keeps the Question headline for ASK_QUESTION even when hydrated blocks carry not_demonstrated", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        verifiedSuccess: false,
+        blocks: [
+          {
+            ...reproBlock("open_registry_find_registrant"),
+            outcome: "not_demonstrated",
+            outcomeReason: "A verification challenge prevented confirmation.",
+          },
+          {
+            ...reproBlock("search_jane_doe_credential_a"),
+            outcome: "demonstrated",
+          },
+          {
+            ...reproBlock("expand_and_extract_certifications"),
+            outcome: "demonstrated",
+          },
+        ],
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("treats build-kind ASK_QUESTION as an ask when no draft review is pending", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "no_proposal",
+      responseKind: "build",
+      responseType: "ASK_QUESTION",
+      verifiedSuccess: true,
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+
+    const uxSummary = computeTurnSummary(turn, { uxV1: true });
+    expect(uxSummary.headline).toBe("Needs your input");
+    expect(uxSummary.accent).toBe("qa");
+    expect(uxSummary.glyph).toBe("✦");
+  });
+
+  it("keeps review disposition precedence over build-kind ASK_QUESTION", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_untested",
+      responseKind: "build",
+      responseType: "ASK_QUESTION",
+      verifiedSuccess: true,
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Draft needs review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("keeps build-kind REPLY summary behavior unchanged", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "no_proposal",
+      responseKind: "build",
+      responseType: "REPLY",
+      verifiedSuccess: true,
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Built and tested the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
+  it("keeps legacy non-build behavior unchanged when responseType and verdict are absent", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        verifiedSuccess: false,
+      }),
+    );
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("keeps legacy non-build behavior unchanged when hydrated turns have neither signal", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        verifiedSuccess: false,
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    expect(
+      turn.blocks.some((block) => block.outcome === "not_demonstrated"),
+    ).toBe(false);
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
   it("keeps the factual stats line on an adjudicated clarify build turn", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({ responseKind: "clarify", verifiedSuccess: false }),
@@ -951,7 +1416,11 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
 
   it("renames the pure-ask clarify headline to Needs your input", () => {
     const summary = computeTurnSummary(
-      buildTurn({ responseKind: "clarify", verifiedSuccess: false }),
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        verifiedSuccess: false,
+      }),
       { uxV1: true },
     );
     expect(summary.headline).toBe("Needs your input");

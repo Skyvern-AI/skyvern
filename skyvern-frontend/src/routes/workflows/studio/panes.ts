@@ -29,13 +29,16 @@ const STUDIO_PANE_ID_ALIASES: Record<string, StudioPaneId> = {
   timeline: "overview",
 };
 
+// Cold-entry edit-class default when no deep link or saved layout decides:
+// Editor on the left, Browser on the right — the legacy studio edit view.
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "editor",
   "browser",
 ];
 
-// In-app run starts (full run or block ▶) append the run surfaces to whatever
-// is already open — they never rearrange or close panes.
+// The run surfaces: cold-entry run-class views open exactly these, and in-app
+// run starts (full run or block ▶) append them to whatever is already open —
+// appends never rearrange or close panes.
 export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
   "browser",
   "overview",
@@ -72,17 +75,6 @@ export const STUDIO_STAGE_GAP_PX = 12;
 
 function isStudioPaneId(value: string): value is StudioPaneId {
   return (STUDIO_PANE_IDS as readonly string[]).includes(value);
-}
-
-// Cold-entry defaults when no deep link decides: an empty agent starts on
-// prompt-and-watch (Copilot builds, the Browser shows it work — the Editor
-// auto-appends once a build lands); a built agent adds the Editor.
-export function defaultPanesForWorkflowState(state: {
-  hasBlocks: boolean;
-}): StudioPaneId[] {
-  return state.hasBlocks
-    ? ["copilot", "browser", "editor"]
-    : [...DEFAULT_STUDIO_PANES];
 }
 
 export function panesListEqual(
@@ -159,12 +151,12 @@ export function panesFromDeepLink(
     return ["editor", "browser", "overview"];
   }
   if (params.runId) {
-    return learnedRunPanes
-      ? [...learnedRunPanes]
-      : ["copilot", "browser", "overview"];
+    return learnedRunPanes ? [...learnedRunPanes] : [...RUN_APPEND_PANES];
   }
   if (params.active) {
-    return ["copilot", "browser", "overview"];
+    // Unlike a bare ?wr=, ?active= does not restore the learned run layout — an
+    // action reference always opens the default watch-and-review surfaces.
+    return [...RUN_APPEND_PANES];
   }
   return [...defaultPanes];
 }
@@ -229,6 +221,24 @@ export function withPaneClosed(
 export function toReadableSearch(params: URLSearchParams): string {
   const raw = params.toString().replace(/%2C/g, ",");
   return raw ? `?${raw}` : "";
+}
+
+// The pane layout keys the focused run off ?wr=; the short /runs/{wr} URL carries
+// it in the path instead, so pane RESOLUTION runs against a search that reflects
+// that run. This is never written back — the address bar stays paramless.
+export function searchWithRunReference(
+  search: string,
+  runId: string | undefined,
+): string {
+  if (!runId) {
+    return search;
+  }
+  const params = new URLSearchParams(search);
+  if (params.has("wr")) {
+    return search;
+  }
+  params.set("wr", runId);
+  return toReadableSearch(params);
 }
 
 // Serialize the open list into a search string, preserving unrelated params.

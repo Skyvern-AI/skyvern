@@ -37,20 +37,14 @@ import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionOccupiedBy } from "./BrowserSessionOccupiedBy";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
+import { BrowserSessionTimeline } from "./BrowserSessionTimeline";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
-
-type TabName = "stream" | "recordings" | "downloads" | "runs";
+import { getBrowserSessionTabFromPathname } from "./BrowserSession.utils";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
   const location = useLocation();
-  const activeTab: TabName = location.pathname.endsWith("/recordings")
-    ? "recordings"
-    : location.pathname.endsWith("/downloads")
-      ? "downloads"
-      : location.pathname.endsWith("/runs")
-        ? "runs"
-        : "stream";
+  const activeTab = getBrowserSessionTabFromPathname(location.pathname);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isSaveProfileDialogOpen, setIsSaveProfileDialogOpen] = useState(false);
   const [vncFailed, setVncFailed] = useState(false);
@@ -175,6 +169,7 @@ function BrowserSession() {
               { label: "Stream", to: "stream" },
               { label: "Recordings", to: "recordings" },
               { label: "Downloads", to: "downloads" },
+              { label: "Timeline", to: "timeline" },
               { label: "Runs", to: "runs" },
             ]}
           />
@@ -271,6 +266,15 @@ function BrowserSession() {
             }}
           >
             <BrowserSessionDownloads />
+          </div>
+          <div
+            className="absolute left-0 top-0 h-full w-full"
+            style={{
+              visibility: activeTab === "timeline" ? "visible" : "hidden",
+              pointerEvents: activeTab === "timeline" ? "auto" : "none",
+            }}
+          >
+            <BrowserSessionTimeline />
           </div>
           <div
             className="absolute left-0 top-0 h-full w-full overflow-auto p-1"

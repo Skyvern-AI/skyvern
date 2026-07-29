@@ -619,6 +619,23 @@ def test_parse_goto_url_blocked_host_returns_null_action(url: str) -> None:
     assert isinstance(action, NullAction)
 
 
+@pytest.mark.parametrize("action_type", ["GOTO_URL", "NEW_TAB"])
+def test_parse_navigation_does_not_resolve_dns(monkeypatch: pytest.MonkeyPatch, action_type: str) -> None:
+    resolver = MagicMock(side_effect=AssertionError("action parsing must not resolve DNS"))
+    monkeypatch.setattr(
+        "skyvern.utils.url_validators.socket.getaddrinfo",
+        resolver,
+    )
+
+    action = parse_action(
+        action={"action_type": action_type, "url": "https://navigation.example.test", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+
+    assert isinstance(action, GotoUrlAction if action_type == "GOTO_URL" else NewTabAction)
+    resolver.assert_not_called()
+
+
 def test_parse_reload_page() -> None:
     action = parse_action(
         action={"action_type": "RELOAD_PAGE", "id": None, "reasoning": "test"},

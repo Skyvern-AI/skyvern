@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import {
   Tooltip,
@@ -25,7 +25,7 @@ function BlockOutputs({
   blockLabel: string;
   blockOutput: { [k: string]: unknown } | null;
 }) {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const blockOutputStore = useBlockOutputStore();
   const [pageName, setPageName] = useState<PageName>("output");
   const [overrideHasError, setOverrideHasError] = useState(false);
@@ -101,7 +101,7 @@ function BlockOutputs({
         )}
         {pageName === "override" && (
           <header className="flex w-full items-center justify-end gap-2 text-xs">
-            <Label className="text-xs font-normal text-slate-300">
+            <Label className="text-xs font-normal text-tertiary-foreground">
               Use Override
             </Label>
             <HelpTooltip content="Use this override instead of the last block output" />
@@ -134,7 +134,7 @@ function BlockOutputs({
               />
             </>
           ) : (
-            <div className="flex h-full w-full flex-1 items-center justify-center bg-slate-950">
+            <div className="flex h-full w-full flex-1 items-center justify-center bg-muted text-muted-foreground dark:bg-slate-950 dark:text-slate-100">
               No output defined
             </div>
           )}

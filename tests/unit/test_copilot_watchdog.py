@@ -26,6 +26,7 @@ Those three are where the SKY-9163 correctness properties live:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -44,6 +45,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_loop_error,
     _watchdog_error_message,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 
 
 def _fake_run(status: str = "running", modified_at: datetime | None = None) -> Any:
@@ -259,7 +261,9 @@ async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reco
     session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
     monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
 
-    ctx = SimpleNamespace(organization_id="o_test", browser_session_id="pbs_copilot")
+    ctx = SimpleNamespace(
+        organization_id="o_test", browser_session_id="pbs_copilot", turn_origin=TurnOrigin.interactive
+    )
 
     current_url, page_title = await _fallback_page_info(ctx)
 
@@ -269,6 +273,36 @@ async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reco
         session_id="pbs_copilot",
         organization_id="o_test",
     )
+
+
+@pytest.mark.asyncio
+async def test_fallback_page_info_bounds_a_title_that_never_resolves_and_keeps_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged renderer hangs `title()` rather than raising it. The bound has to return, and it
+    has to keep the url — `page.url` is synchronous, so it is already in hand when the title
+    stalls, and most callers of this helper want only the url."""
+    from skyvern.forge import app as forge_app
+    from skyvern.forge.sdk.copilot.tools import _shared
+
+    async def _never_resolves() -> str:
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    page = SimpleNamespace(url="https://example.test/wedged", title=_never_resolves)
+    browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
+    session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
+    monkeypatch.setattr(_shared, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
+
+    ctx = SimpleNamespace(
+        organization_id="o_test", browser_session_id="pbs_copilot", turn_origin=TurnOrigin.interactive
+    )
+
+    current_url, page_title = await asyncio.wait_for(_fallback_page_info(ctx), timeout=5)
+
+    assert current_url == "https://example.test/wedged"
+    assert page_title == ""
 
 
 @pytest.mark.asyncio
@@ -464,9 +498,7 @@ def test_reconciliation_guard_message_does_not_say_timed_out() -> None:
         repeated_action_fingerprint_streak_count=0,
         last_test_non_retriable_nav_error=None,
         pending_reconciliation_run_id="wr_guarded",
-        synthesized_block_reopened_for_output_coverage=False,
         output_contract_actuation_by_signature={},
-        output_contract_reject_count_by_signature={},
         output_contract_actuation_count_by_signature={},
         output_contract_armed_directive_fingerprint_by_signature={},
     )

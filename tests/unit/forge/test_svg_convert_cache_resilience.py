@@ -69,8 +69,15 @@ class _SetFailingMemoryCache:
 
 
 class _FakeLocator:
+    @property
+    def page(self) -> Any:
+        return SimpleNamespace(is_closed=lambda: False)
+
     async def count(self) -> int:
         return 1
+
+    async def is_visible(self, timeout: float) -> bool:
+        return True
 
     async def element_handle(self, timeout: float) -> object:
         return object()
@@ -361,3 +368,95 @@ async def test_css_shape_convert_keeps_result_when_cache_set_fails(monkeypatch: 
 
     assert calls == 1
     assert element["attributes"]["shape-description"] == "calendar icon"
+
+
+def _capturing_skyvern_element(captured: list[Any]) -> type:
+    class _CapturingSkyvernElement:
+        def __init__(self, *, locator: Any, frame: Any, static_element: Any, engine_selection: Any) -> None:
+            captured.append(engine_selection)
+
+        async def get_element_handler(self, timeout: float = 0.0) -> object:
+            return object()
+
+        def is_interactable(self) -> bool:
+            return True
+
+    return _CapturingSkyvernElement
+
+
+def _css_shape_element() -> dict[str, Any]:
+    return {"tagName": "span", "id": "AAAK", "attributes": {"id": "AAAK"}}
+
+
+@pytest.mark.asyncio
+async def test_svg_eligibility_taskless_path_stays_manager_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[Any] = []
+    monkeypatch.setattr(agent_functions, "app", SimpleNamespace())
+    monkeypatch.setattr(agent_functions, "SkyvernElement", _capturing_skyvern_element(captured))
+
+    eligible = await agent_functions._check_svg_eligibility(_FakeSkyvernFrame(), _svg_element(), task=None)
+
+    assert eligible is True
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
+async def test_svg_eligibility_resolves_pinned_selection_when_task_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[Any] = []
+    selection = SimpleNamespace()
+    browser_manager = SimpleNamespace(
+        get_for_task=lambda task_id, workflow_run_id: SimpleNamespace(engine_selection=selection)
+    )
+    monkeypatch.setattr(agent_functions, "app", SimpleNamespace(BROWSER_MANAGER=browser_manager))
+    monkeypatch.setattr(agent_functions, "SkyvernElement", _capturing_skyvern_element(captured))
+    task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+
+    eligible = await agent_functions._check_svg_eligibility(_FakeSkyvernFrame(), _svg_element(), task=task)  # type: ignore[arg-type]
+
+    assert eligible is True
+    assert captured == [selection]
+
+
+@pytest.mark.asyncio
+async def test_css_shape_convert_taskless_path_stays_manager_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[Any] = []
+
+    async def handler(**kwargs: Any) -> dict[str, Any]:
+        return {"shape": "calendar icon", "recognized": True}
+
+    monkeypatch.setattr(
+        agent_functions,
+        "app",
+        SimpleNamespace(CACHE=_MemoryCache(), SVG_CSS_CONVERTER_LLM_API_HANDLER=handler),
+    )
+    monkeypatch.setattr(agent_functions, "SkyvernElement", _capturing_skyvern_element(captured))
+
+    await agent_functions._convert_css_shape_to_string(_FakeSkyvernFrame(), _css_shape_element(), task=None)
+
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
+async def test_css_shape_convert_resolves_pinned_selection_when_task_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[Any] = []
+    selection = SimpleNamespace()
+
+    async def handler(**kwargs: Any) -> dict[str, Any]:
+        return {"shape": "calendar icon", "recognized": True}
+
+    browser_manager = SimpleNamespace(
+        get_for_task=lambda task_id, workflow_run_id: SimpleNamespace(engine_selection=selection)
+    )
+    monkeypatch.setattr(
+        agent_functions,
+        "app",
+        SimpleNamespace(
+            CACHE=_MemoryCache(), SVG_CSS_CONVERTER_LLM_API_HANDLER=handler, BROWSER_MANAGER=browser_manager
+        ),
+    )
+    monkeypatch.setattr(agent_functions, "SkyvernElement", _capturing_skyvern_element(captured))
+    task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+
+    await agent_functions._convert_css_shape_to_string(_FakeSkyvernFrame(), _css_shape_element(), task=task)  # type: ignore[arg-type]
+
+    assert captured == [selection]

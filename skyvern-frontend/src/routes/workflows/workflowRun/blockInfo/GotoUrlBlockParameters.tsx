@@ -12,7 +12,7 @@ function GotoUrlBlockParameters({ url, continueOnFailure }: Props) {
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">URL</h1>
-          <h2 className="text-base text-slate-400">
+          <h2 className="text-base text-muted-foreground">
             The destination Skyvern navigates to
           </h2>
         </div>
@@ -21,13 +21,13 @@ function GotoUrlBlockParameters({ url, continueOnFailure }: Props) {
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Continue on Failure</h1>
-          <h2 className="text-base text-slate-400">
+          <h2 className="text-base text-muted-foreground">
             Whether to continue if navigation fails
           </h2>
         </div>
         <div className="flex w-full items-center gap-3">
           <Switch checked={continueOnFailure} disabled />
-          <span className="text-sm text-slate-400">
+          <span className="text-sm text-muted-foreground">
             {continueOnFailure ? "Enabled" : "Disabled"}
           </span>
         </div>

@@ -2,7 +2,9 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.utils.page import SkyvernFrame
 
 
@@ -23,6 +25,44 @@ def _isolated_frame(side_effect: BaseException) -> SkyvernFrame:
     skyvern_frame._wait_for_loading_indicators_gone = AsyncMock()
     skyvern_frame._wait_for_dom_stable = AsyncMock()
     return skyvern_frame
+
+
+def _span_attrs(span_exporter: InMemorySpanExporter, name: str) -> dict:
+    span = next((span for span in span_exporter.get_finished_spans() if span.name == name), None)
+    assert span is not None
+    return dict(span.attributes or {})
+
+
+@pytest.mark.asyncio
+async def test_wait_for_page_ready_classifies_loading_indicator_skyvern_analysis_timeout(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    skyvern_frame = _isolated_frame(Exception())
+    skyvern_frame.frame.wait_for_load_state = AsyncMock()
+    skyvern_frame._wait_for_loading_indicators_gone = AsyncMock(
+        side_effect=SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
+    )
+
+    await skyvern_frame.wait_for_page_ready()
+
+    attrs = _span_attrs(span_exporter, "skyvern.browser.page_ready.loading_indicators")
+    assert attrs.get("result") == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_page_ready_classifies_dom_stability_skyvern_analysis_timeout(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    skyvern_frame = _isolated_frame(Exception())
+    skyvern_frame.frame.wait_for_load_state = AsyncMock()
+    skyvern_frame._wait_for_dom_stable = AsyncMock(
+        side_effect=SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
+    )
+
+    await skyvern_frame.wait_for_page_ready()
+
+    attrs = _span_attrs(span_exporter, "skyvern.browser.page_ready.dom_stability")
+    assert attrs.get("result") == "timeout"
 
 
 @pytest.mark.asyncio

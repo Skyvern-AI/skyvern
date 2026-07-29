@@ -1,27 +1,64 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioPaneToggles } from "./StudioPaneToggles";
 
-const { runsQueryMock, runWithWorkflowMock } = vi.hoisted(() => ({
-  runsQueryMock: vi.fn(),
-  runWithWorkflowMock: vi.fn(),
+const { runsQueryMock, runWithWorkflowMock, infiniteRunsMock, copyTextMock } =
+  vi.hoisted(() => ({
+    runsQueryMock: vi.fn(),
+    runWithWorkflowMock: vi.fn(),
+    infiniteRunsMock: vi.fn(),
+    copyTextMock: vi.fn(),
+  }));
+
+vi.mock("@/util/copyText", () => ({
+  copyText: (text: string) => copyTextMock(text),
 }));
 
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: () => runsQueryMock(),
 }));
 
+vi.mock("../hooks/useInfiniteWorkflowRunsQuery", () => ({
+  useInfiniteWorkflowRunsQuery: () => infiniteRunsMock(),
+}));
+
+function infiniteRuns(runs: Array<Record<string, unknown>>) {
+  return {
+    data: { pages: [runs] },
+    isError: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  };
+}
+
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => runWithWorkflowMock(),
 }));
+
+// Radix Popover positioning observes the anchor; jsdom has no ResizeObserver.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
 
 const initialBrowserState = useStudioBrowserStore.getState();
 
@@ -33,10 +70,13 @@ function LocationProbe() {
 function renderAt(path = "/workflows/wpid_abc/studio") {
   return render(
     <MemoryRouter initialEntries={[path]}>
-      {/* The shell provides this in production (StudioShell root). */}
-      <TooltipProvider delayDuration={0}>
-        <StudioPaneToggles />
-      </TooltipProvider>
+      {/* The shell provides these in production (StudioShell root / the
+          workflow route resolver). */}
+      <WorkflowPermanentIdContext.Provider value="wpid_abc">
+        <TooltipProvider delayDuration={0}>
+          <StudioPaneToggles />
+        </TooltipProvider>
+      </WorkflowPermanentIdContext.Provider>
       <LocationProbe />
     </MemoryRouter>,
   );
@@ -44,6 +84,12 @@ function renderAt(path = "/workflows/wpid_abc/studio") {
 
 function tab(name: RegExp | string): HTMLButtonElement {
   return screen.getByRole("button", { name }) as HTMLButtonElement;
+}
+
+// The run selector tab reads "View Run: <id>" once a run is inspected and
+// "Past Runs" otherwise; match either so tests survive both states.
+function runsTab(): HTMLButtonElement {
+  return tab(/^(Past Runs|View Run)/);
 }
 
 function currentPanes(): string | null {
@@ -56,21 +102,22 @@ beforeEach(() => {
   useStudioBrowserStore.setState(initialBrowserState, true);
   runsQueryMock.mockReturnValue({ data: [] });
   runWithWorkflowMock.mockReturnValue({ data: undefined });
+  infiniteRunsMock.mockReturnValue(infiniteRuns([]));
 });
 
 describe("StudioPaneToggles structure", () => {
   test("renders the four peer tabs with icon + label", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Overview"]) {
+    for (const label of ["Copilot", "Editor", "Browser", "Past Runs"]) {
       expect(tab(new RegExp(`^${label}`))).toBeTruthy();
     }
   });
 
-  test("reflects the default panes (copilot + browser) as expanded", () => {
+  test("reflects the default panes (editor + browser) as expanded", () => {
     renderAt();
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
 
   test("reflects an explicit ?panes= list", () => {
@@ -84,14 +131,16 @@ describe("StudioPaneToggles structure", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=copilot");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Overview/).getAttribute("aria-expanded")).toBe("false");
+    // The Past Runs tab is a popover trigger; its active state (run pane open)
+    // is aria-pressed, not aria-expanded.
+    expect(runsTab().getAttribute("aria-pressed")).toBe("false");
   });
 
-  test("a block-run deep link opens Editor, Browser and Overview", () => {
+  test("a block-run deep link opens Editor, Browser and the run pane", () => {
     renderAt("/workflows/wpid_abc/studio?wr=run_1&bl=block_1");
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Overview/).getAttribute("aria-expanded")).toBe("true");
+    expect(runsTab().getAttribute("aria-pressed")).toBe("true");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
 });
@@ -99,9 +148,9 @@ describe("StudioPaneToggles structure", () => {
 describe("StudioPaneToggles pane toggling", () => {
   test("opening a closed pane appends it in click order", () => {
     renderAt();
-    fireEvent.click(tab(/^Editor/));
-    expect(currentPanes()).toBe("copilot,browser,editor");
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(tab(/^Copilot/));
+    expect(currentPanes()).toBe("editor,browser,copilot");
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
   test("closing an open pane splices it out, keeping the rest in order", () => {
@@ -128,21 +177,101 @@ describe("StudioPaneToggles pane toggling", () => {
   });
 });
 
-describe("StudioPaneToggles Overview gating", () => {
-  test("disables the Overview tab until a run exists", () => {
-    renderAt();
-    expect(tab(/^Overview/).disabled).toBe(true);
+describe("StudioPaneToggles run tab label", () => {
+  test("names the URL's run with its full id in the top bar", () => {
+    renderAt("/workflows/wpid_abc/studio?wr=wr_556219201027773764");
+    expect(tab("View Run: wr_556219201027773764")).toBeTruthy();
   });
 
-  test("enables the Overview tab when the workflow has a prior run", () => {
-    runsQueryMock.mockReturnValue({ data: [{ status: Status.Running }] });
-    renderAt();
-    expect(tab(/^Overview/).disabled).toBe(false);
+  test("the tab's copy affordance copies the run link without opening the selector", async () => {
+    copyTextMock.mockResolvedValue(true);
+    renderAt("/workflows/wpid_abc/studio?wr=wr_556219201027773764");
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy run link" }));
+
+    await waitFor(() =>
+      expect(copyTextMock).toHaveBeenCalledWith(
+        `${window.location.origin}/agents/wpid_abc/studio?wr=wr_556219201027773764`,
+      ),
+    );
+    // The click must not bubble into the popover trigger.
+    expect(screen.queryByText("Past runs")).toBeNull();
   });
 
-  test("enables the Overview tab when the URL points at a run (?wr=)", () => {
-    renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=copilot");
-    expect(tab(/^Overview/).disabled).toBe(false);
+  test("no copy affordance renders while no run is inspected", () => {
+    renderAt();
+    expect(screen.queryByRole("button", { name: "Copy run link" })).toBeNull();
+  });
+
+  test("names the latest run when the URL names none", () => {
+    runsQueryMock.mockReturnValue({
+      data: [{ workflow_run_id: "wr_late", status: Status.Completed }],
+    });
+    renderAt();
+    expect(tab(/^View Run: wr_late/)).toBeTruthy();
+  });
+
+  test("reads 'Past Runs' while no run exists to inspect", () => {
+    renderAt();
+    expect(tab(/^Past Runs/)).toBeTruthy();
+  });
+});
+
+describe("StudioPaneToggles run selector", () => {
+  test("the Past Runs tab is enabled even with no runs", () => {
+    renderAt();
+    expect(runsTab().disabled).toBe(false);
+  });
+
+  test("clicking the Past Runs tab opens the selector without toggling the pane", async () => {
+    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    fireEvent.click(runsTab());
+    // The selector popover opens (its "Past runs" header renders)...
+    expect(await screen.findByText("Past runs")).toBeTruthy();
+    // ...and the run pane is never toggled onto the stage by opening it.
+    expect(currentPanes()).toBe("copilot");
+  });
+
+  test("selecting a run opens the run pane and closes the popover", async () => {
+    infiniteRunsMock.mockReturnValue(
+      infiniteRuns([
+        {
+          workflow_run_id: "wr_pick",
+          status: Status.Completed,
+          created_at: "2026-07-20T00:00:00Z",
+        },
+      ]),
+    );
+    // A different current run so the picked row is clickable (not the current).
+    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other");
+    fireEvent.click(runsTab());
+    fireEvent.click(await screen.findByText("wr_pick"));
+
+    // Selecting opens the run pane (overview). The row's switchRun also sets
+    // ?wr= (covered in PastRunsList.test); under MemoryRouter window.location
+    // doesn't sync between the two navigations, so ?wr= can't be co-asserted
+    // here, but the openPane merge is exercised.
+    expect(currentPanes()?.split(",")).toContain("overview");
+    await waitFor(() => expect(screen.queryByText("wr_pick")).toBeNull());
+  });
+
+  test("selecting the already-viewed run reopens the closed run pane", async () => {
+    // ?wr=wr_same names the current run but overview is NOT open (pane closed via
+    // its ✕). Clicking the current row must still reopen the pane.
+    infiniteRunsMock.mockReturnValue(
+      infiniteRuns([
+        {
+          workflow_run_id: "wr_same",
+          status: Status.Completed,
+          created_at: "2026-07-20T00:00:00Z",
+        },
+      ]),
+    );
+    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_same");
+    fireEvent.click(runsTab());
+    fireEvent.click(await screen.findByText("wr_same"));
+
+    expect(currentPanes()?.split(",")).toContain("overview");
   });
 });
 
@@ -150,27 +279,27 @@ describe("StudioPaneToggles run-status dot", () => {
   test("shows a status-colored dot for a finalized run", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt();
-    const dot = tab(/^Overview/).querySelector(
+    const dot = runsTab().querySelector(
       "span.absolute.-right-0\\.5",
     ) as HTMLElement | null;
     expect(dot).not.toBeNull();
     expect(dot?.className).toContain("bg-badge-success");
   });
 
-  test("includes the finalized run status in the Overview tab accessible name", () => {
-    runsQueryMock.mockReturnValue({ data: [{ status: Status.TimedOut }] });
+  test("includes the finalized run status in the run tab accessible name", () => {
+    runsQueryMock.mockReturnValue({
+      data: [{ workflow_run_id: "wr_tab", status: Status.TimedOut }],
+    });
     renderAt();
     expect(
-      screen.getByRole("button", { name: "Overview, timed out" }),
+      screen.getByRole("button", { name: "View Run: wr_tab, timed out" }),
     ).toBeTruthy();
   });
 
   test("omits the dot while the run is still in flight", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Running }] });
     renderAt();
-    expect(
-      tab(/^Overview/).querySelector("span.absolute.-right-0\\.5"),
-    ).toBeNull();
+    expect(runsTab().querySelector("span.absolute.-right-0\\.5")).toBeNull();
   });
 });
 
@@ -210,7 +339,7 @@ describe("StudioPaneToggles keyboard navigation", () => {
     ).toEqual([0, -1, -1]);
   });
 
-  test("ArrowRight moves focus and wraps past the disabled Overview toggle", () => {
+  test("ArrowRight moves across all four tabs and wraps", () => {
     renderAt();
     tab(/^Copilot/).focus();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowRight" });
@@ -218,16 +347,17 @@ describe("StudioPaneToggles keyboard navigation", () => {
     fireEvent.keyDown(tab(/^Editor/), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Browser/));
     fireEvent.keyDown(tab(/^Browser/), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(runsTab());
+    fireEvent.keyDown(runsTab(), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Copilot/));
   });
 
-  test("ArrowLeft wraps to the last enabled toggle and Home returns to the first", () => {
-    runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
+  test("ArrowLeft wraps to the last tab and Home returns to the first", () => {
     renderAt();
     tab(/^Copilot/).focus();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowLeft" });
-    expect(document.activeElement).toBe(tab(/^Overview/));
-    fireEvent.keyDown(tab(/^Overview/), { key: "Home" });
+    expect(document.activeElement).toBe(runsTab());
+    fireEvent.keyDown(runsTab(), { key: "Home" });
     expect(document.activeElement).toBe(tab(/^Copilot/));
   });
 
@@ -235,6 +365,6 @@ describe("StudioPaneToggles keyboard navigation", () => {
     renderAt();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowRight" });
     expect(currentPanes()).toBeNull();
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
   });
 });

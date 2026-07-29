@@ -11,7 +11,7 @@ import inspect
 import re
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -43,6 +43,20 @@ def create_mock_page() -> _PageStub:
 
 class _AiStub:
     pass
+
+
+class _SelectedEngineError(Exception):
+    pass
+
+
+class _SelectedEngineTimeout(_SelectedEngineError):
+    pass
+
+
+def _selected_engine():
+    selection = MagicMock()
+    selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, _SelectedEngineTimeout)
+    return selection
 
 
 class _ScrapedPageStub:
@@ -2037,7 +2051,11 @@ def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) ->
     return script_page
 
 
-def _skyvern_page_with_locator(mock_ai, locator: _RecordingLocator) -> SkyvernPage:
+def _skyvern_page_with_locator(
+    mock_ai,
+    locator: _RecordingLocator,
+    engine_selection=None,
+) -> SkyvernPage:
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
@@ -2046,6 +2064,7 @@ def _skyvern_page_with_locator(mock_ai, locator: _RecordingLocator) -> SkyvernPa
         skyvern_page = SkyvernPage(
             page=raw_page,
             ai=mock_ai,
+            engine_selection=engine_selection,
         )
     skyvern_page._working_frame = _RecordingLocatorScope(locator)
     return skyvern_page
@@ -2172,6 +2191,10 @@ async def test_direct_fill_dispatch_failure_does_not_regress_fill(mock_scraped_p
 
 # =============================================================================
 # Tests for selector fallback prep opt-out — SKY-12096
+#
+# Patching skyvern_page.asyncio.sleep rebinds the GLOBAL asyncio.sleep, so the mock also
+# records sleeps from coroutines running on other threads' event loops. Assert on locator
+# behavior or on this path's own sleep values — never on bare await_args.
 # =============================================================================
 
 
@@ -2193,7 +2216,7 @@ async def test_selector_fallback_default_runs_element_prep(mock_scraped_page, mo
     assert ("wait_for", "attached") in locator.calls
     assert ("wait_for", "visible") in locator.calls
     assert ("scroll_into_view_if_needed", None) in locator.calls
-    assert sleep.await_args is not None
+    assert call(0.15) in sleep.await_args_list
 
 
 @pytest.mark.asyncio
@@ -2215,9 +2238,9 @@ async def test_selector_fallback_prep_opt_out_uses_playwright_actionability(
             result = await skyvern_page.type("#target", "Noor", _skip_element_prep=True)
 
     assert result in ("#target", "Noor")
-    assert not any(call[0] == "wait_for" for call in locator.calls)
+    assert not any(recorded[0] == "wait_for" for recorded in locator.calls)
     assert ("scroll_into_view_if_needed", None) not in locator.calls
-    assert sleep.await_args is None
+    assert call(0.15) not in sleep.await_args_list
 
 
 @pytest.mark.asyncio
@@ -2225,11 +2248,12 @@ async def test_selector_click_prep_opt_out_preserves_direct_timeout_failure(mock
     locator = _RecordingLocator(click_error=PlaywrightTimeoutError("Timeout 5000ms exceeded."))
     skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
 
-    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(PlaywrightTimeoutError):
             await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
 
-    assert sleep.await_args is None
+    # A single click means the escape-dismiss retry never ran.
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [("click", None)]
 
 
 @pytest.mark.asyncio
@@ -2239,8 +2263,255 @@ async def test_selector_click_prep_opt_out_keeps_escape_retry_for_interception(m
     )
     skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
 
-    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(PlaywrightTimeoutError):
             await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
 
-    assert sleep.await_args is not None
+    # The second click is the retry after dismissing the intercepting overlay.
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [
+        ("click", None),
+        ("click", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_threads_browser_state_engine_selection():
+    engine_selection = _selected_engine()
+    browser_state = SimpleNamespace(
+        engine_selection=engine_selection,
+        must_get_working_page=AsyncMock(return_value=create_mock_page()),
+    )
+    scraped_page = SimpleNamespace(_browser_state=browser_state)
+
+    with (
+        patch.object(ScriptSkyvernPage, "create_scraped_page", new_callable=AsyncMock, return_value=scraped_page),
+        patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None),
+        patch("skyvern.core.script_generations.script_skyvern_page.RealSkyvernPageAi"),
+    ):
+        script_page = await ScriptSkyvernPage.create()
+
+    assert script_page.engine_selection is engine_selection
+
+
+def test_direct_constructor_defaults_engine_selection_to_none(mock_scraped_page, mock_ai):
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(
+            scraped_page=mock_scraped_page,
+            page=create_mock_page(),
+            ai=mock_ai,
+        )
+
+    assert script_page.engine_selection is None
+
+
+@pytest.mark.asyncio
+async def test_selector_click_prep_opt_out_uses_selected_native_timeout_for_escape_gate(mock_ai):
+    locator = _RecordingLocator(click_error=_SelectedEngineTimeout("Timeout"))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, _selected_engine())
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(_SelectedEngineTimeout):
+            await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [("click", None)]
+
+
+@pytest.mark.asyncio
+async def test_selector_click_prep_opt_out_foreign_timeout_keeps_escape_retry(mock_ai):
+    locator = _RecordingLocator(click_error=PlaywrightTimeoutError("Timeout"))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, _selected_engine())
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(PlaywrightTimeoutError):
+            await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [
+        ("click", None),
+        ("click", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_selected_native_post_dispatch_timeout_skips_duplicate_click(mock_ai):
+    message = "click action done; waiting for scheduled navigations to finish"
+    locator = _RecordingLocator(click_error=_SelectedEngineTimeout(message))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, _selected_engine())
+
+    result = await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert result == "#target"
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [("click", None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine_selection", "timeout_error"),
+    [
+        pytest.param(_selected_engine(), _SelectedEngineTimeout, id="selected-native"),
+        pytest.param(None, PlaywrightTimeoutError, id="stock"),
+    ],
+)
+async def test_post_dispatch_timeout_after_escape_skips_ai_fallback(mock_ai, engine_selection, timeout_error):
+    mock_ai.ai_click = AsyncMock()
+    locator = _RecordingLocator()
+    locator.click = AsyncMock(
+        side_effect=[
+            timeout_error("<div class='overlay'></div> intercepts pointer events"),
+            timeout_error("click action done; waiting for scheduled navigations to finish"),
+        ]
+    )
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator, engine_selection)
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+        result = await skyvern_page.click("#target", prompt="Click target", _skip_element_prep=True, timeout=5000)
+
+    assert result == "#target"
+    assert locator.click.await_count == 2
+    mock_ai.ai_click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_forwards_script_id_to_manager(monkeypatch):
+    # MUST_FIX 1: the production script caller must forward the active run's script_id so the
+    # standalone-script browser is pinned under a real id (and, in cloud, used as the flag distinct id)
+    # instead of the id being discarded and the run forced into default-only behavior.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1"))
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state()
+    finally:
+        skyvern_context.reset()
+
+    manager.get_or_create_for_script.assert_awaited_once()
+    assert manager.get_or_create_for_script.await_args.kwargs["script_id"] == "scr_1"
+    # MF2: the real organization_id is forwarded so acquisition uses the same (session, org) key as release.
+    assert manager.get_or_create_for_script.await_args.kwargs["organization_id"] == "org_1"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_sources_session_id_from_context(monkeypatch):
+    # The acquire must key browser_session_id off the run context (like organization_id/script_id), so it
+    # matches what run_script's cleanup releases. Otherwise a standalone run carrying a session id builds a
+    # non-persistent browser here but is treated as a persistent session at cleanup and leaked.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    skyvern_context.set(
+        skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1", browser_session_id="session_1")
+    )
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state()  # generated caller passes no browser_session_id
+    finally:
+        skyvern_context.reset()
+
+    assert manager.get_or_create_for_script.await_args.kwargs["browser_session_id"] == "session_1"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_records_effective_session_on_context(monkeypatch):
+    # An explicit session passed to acquire (e.g. setup(browser_session_id=...)) must be recorded on the run
+    # context, so run_script's terminal cleanup releases the same session it attached even when run_script
+    # itself was invoked without one. Otherwise cleanup closes the reusable browser and skips release.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=None)  # fresh acquisition (no cached state yet)
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1")  # no session initially
+    skyvern_context.set(ctx)
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_explicit")
+    finally:
+        skyvern_context.reset()
+
+    assert manager.get_or_create_for_script.await_args.kwargs["browser_session_id"] == "pbs_explicit"
+    assert ctx.browser_session_id == "pbs_explicit"  # recorded so terminal cleanup releases the same session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_session", [None, "pbs_A"])
+async def test_get_or_create_browser_state_fails_closed_on_mid_run_session_switch(monkeypatch, bound_session):
+    # A script's browser is pinned under script_id at first acquire; get_or_create_for_script's cache hit
+    # would return that existing state and ignore a later, different requested session. Recording the new
+    # session on context would then make cleanup release an unattached session and leak the cached browser.
+    # Fail closed BEFORE mutating context, covering cached-local (None) and cached-session-A bindings; the
+    # bound identity on context must be preserved for terminal cleanup.
+    from skyvern.exceptions import BrowserSessionSwitchNotAllowed
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=MagicMock())  # a browser is already cached for scr_1
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1", browser_session_id=bound_session)
+    skyvern_context.set(ctx)
+    try:
+        with pytest.raises(BrowserSessionSwitchNotAllowed):
+            await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_B")
+    finally:
+        skyvern_context.reset()
+
+    assert ctx.browser_session_id == bound_session  # rejected request never overwrote the bound identity
+    manager.get_or_create_for_script.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_allows_same_session_cache_reuse(monkeypatch):
+    # Re-acquiring the SAME session (or none) against a cached state is legitimate reuse — not a switch.
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=MagicMock())  # cached state exists
+    manager.get_or_create_for_script = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1", browser_session_id="pbs_A")
+    skyvern_context.set(ctx)
+    try:
+        await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_A")
+    finally:
+        skyvern_context.reset()
+
+    manager.get_or_create_for_script.assert_awaited_once()
+    assert ctx.browser_session_id == "pbs_A"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_state_does_not_record_session_on_acquire_failure(monkeypatch):
+    # A cold/evicted requested session makes get_or_create_for_script fail closed. The requested session must
+    # NOT be written to context, or run_script's terminal cleanup would release a session the script never
+    # acquired (and clear its runnable_id, detaching another run's session). The prior binding must stand.
+    from skyvern.exceptions import MissingBrowserStateForBrowserSession
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import skyvern_context
+
+    manager = MagicMock()
+    manager.get_for_script = MagicMock(return_value=None)  # fresh acquisition
+    manager.get_or_create_for_script = AsyncMock(side_effect=MissingBrowserStateForBrowserSession("pbs_cold"))
+    monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
+
+    ctx = skyvern_context.SkyvernContext(organization_id="org_1", script_id="scr_1")  # no prior session bound
+    skyvern_context.set(ctx)
+    try:
+        with pytest.raises(MissingBrowserStateForBrowserSession):
+            await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_cold")
+    finally:
+        skyvern_context.reset()
+
+    assert ctx.browser_session_id is None  # requested session not recorded because the attach failed

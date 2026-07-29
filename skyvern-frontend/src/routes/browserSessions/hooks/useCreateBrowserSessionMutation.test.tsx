@@ -81,6 +81,7 @@ describe("useCreateBrowserSessionMutation proxy pin payloads", () => {
       extensions: [],
       browser_type: null,
       generate_browser_profile: true,
+      browser_profile_id: null,
     });
     expect(mockNavigate).toHaveBeenCalledWith("/browser-session/pbs_123");
   });

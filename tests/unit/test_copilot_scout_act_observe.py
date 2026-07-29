@@ -17,6 +17,10 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    ChallengeEvidenceSource,
+    composition_challenge_carrier,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
@@ -89,6 +93,19 @@ def _bounded_extractor_payload() -> dict[str, Any]:
     }
 
 
+def _bounded_challenge_signalled_payload(challenge_controls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Login page whose schema is already bounded while the challenge widget is only
+    signalled by a keyword; ``challenge_controls`` supplies the rendered carrier."""
+    payload = _bounded_extractor_payload()
+    payload["anti_bot_indicators"] = ["captcha"]
+    payload["challenge_controls"] = challenge_controls or []
+    return payload
+
+
+def _rendered_iframe_challenge_control() -> dict[str, Any]:
+    return {"tag": "iframe", "selector": 'iframe[title="reCAPTCHA"]', "text": ""}
+
+
 def _kv_only_extractor_payload() -> dict[str, Any]:
     return {
         "page_title": "Provider Record",
@@ -117,9 +134,14 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         pending_scout_typed_value=None,
         pending_scout_role_name=None,
         pending_scout_click_selector=None,
+        pending_scout_ambiguous=None,
+        pending_scout_reanchor=None,
+        pending_scout_dynamic_row=None,
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],
+        challenge_solve_attempts={},
+        organization_id="o_test",
         prior_fill_carry=[],
         fill_carry_rebound_done=False,
         pending_scout_source_url=source_url,
@@ -129,6 +151,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         copilot_config=None,
         scout_observation_contract=None,
         scouted_output_covered_paths=set(),
+        scout_observed_terminal_criterion_ids=set(),
     )
 
 
@@ -909,6 +932,99 @@ class TestActObserveRecaptureSettle:
         assert ctx.last_scout_act_observe_outcome == "attached"
 
     @pytest.mark.asyncio
+    async def test_attached_challenge_without_carrier_settles_and_recaptures(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.6)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence(
+                [
+                    _bounded_challenge_signalled_payload(),
+                    _bounded_challenge_signalled_payload([_rendered_iframe_challenge_control()]),
+                ]
+            )
+        )
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == [0.6]
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert composition_challenge_carrier(packet) is ChallengeEvidenceSource.CHALLENGE_STATE
+
+    @pytest.mark.asyncio
+    async def test_attached_keyword_only_challenge_recapture_still_yields_no_carrier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.6)
+
+        async def record_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence(
+                [
+                    _bounded_challenge_signalled_payload(),
+                    _bounded_challenge_signalled_payload(),
+                ]
+            )
+        )
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert composition_challenge_carrier(packet) is None
+
+    @pytest.mark.asyncio
+    async def test_recapture_may_not_erase_the_challenge_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A recapture that still reports a bounded schema but has lost the challenge signal
+        must not replace the signalled packet: the signal is the visual fallback's only trigger."""
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.6)
+
+        async def record_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        unsignalled = _bounded_extractor_payload()
+        ctx = _ctx(server=_server_returning_sequence([_bounded_challenge_signalled_payload(), unsignalled]))
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert packet is not None
+        assert packet["challenge_state"]["detected"] is True
+        assert packet["challenge_state"]["indicators"] == ["captcha"]
+
+    @pytest.mark.asyncio
+    async def test_attached_packet_survives_a_hollow_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.6)
+
+        async def record_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence(
+                [
+                    _bounded_challenge_signalled_payload(),
+                    {"page_title": "Results", "forms": []},
+                ]
+            )
+        )
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert packet is not None
+        assert packet["forms"]
+
+    @pytest.mark.asyncio
     async def test_capture_log_carries_container_and_relation_counts(self) -> None:
         ctx = _ctx(server=_server_returning(_kv_only_extractor_payload()))
 
@@ -1611,3 +1727,143 @@ class TestScoutPageObservationSignal:
         scouting_module._record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#name"}]}]})
 
         assert ctx.last_scout_observation_has_password_control is False
+
+
+class TestTerminalActionObservationStampSeam:
+    _PORTAL_URL = "https://portal.example.test/login"
+    _BUSINESS_URL = "https://portal.example.test/business/start-service"
+
+    @staticmethod
+    def _terminal_action_criterion(*, method_mandated: bool = False) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="start_service_request",
+            outcome="the business start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+            method_mandated=method_mandated,
+        )
+
+    def _ctx_with(self, *criteria: CompletionCriterion) -> AgentContext:
+        ctx = AgentContext(
+            organization_id="o_1",
+            workflow_id="w_1",
+            workflow_permanent_id="wpid_1",
+            workflow_yaml="",
+            browser_session_id="pbs_1",
+            stream=MagicMock(),
+        )
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+                "selector": "#password",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "input[type='submit']",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "textbox",
+                "accessible_name": "Service Address",
+                "trajectory_index": 2,
+            },
+        ]
+        return ctx
+
+    def test_commit_past_login_stamps_terminal_action_observation(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        with capture_logs() as logs:
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="click",
+                selector="#find-address",
+                source_url=self._BUSINESS_URL,
+                role="button",
+                accessible_name="Find Address",
+            )
+        assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
+        assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
+
+    def test_demonstrated_totp_fill_is_recorded_with_a_countable_capture_log(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = []
+        with capture_logs() as logs:
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="fill_credential_field",
+                selector="#totpCode",
+                source_url=self._PORTAL_URL,
+                typed_length=6,
+                credential_id="cred_1",
+                credential_field="totp",
+                credential_name="mock-portal-login-totp",
+            )
+        assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
+        capture = next(log for log in logs if log["event"] == "copilot_scout_interaction_captured")
+        assert capture["credential_field"] == "totp"
+        assert capture["credential_id"] == "cred_1"
+
+    def test_credential_fill_records_the_element_fingerprint_without_the_secret(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = []
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="fill_credential_field",
+            selector="#pass",
+            source_url=self._PORTAL_URL,
+            typed_length=14,
+            credential_id="cred_1",
+            credential_field="password",
+            credential_name="mock-portal-login",
+            element_fingerprint_id="pass",
+            element_fingerprint_name="password",
+            element_fingerprint_type="password",
+            element_fingerprint_placeholder="Password",
+            element_fingerprint_label="Password",
+            element_fingerprint_test_id="login-password",
+            element_fingerprint_tag="input",
+        )
+        recorded = ctx.scout_trajectory[-1]
+        assert recorded["element_fingerprint_id"] == "pass"
+        assert recorded["element_fingerprint_type"] == "password"
+        assert recorded["element_fingerprint_placeholder"] == "Password"
+        assert recorded["element_fingerprint_tag"] == "input"
+        assert "Hunter2Portal!" not in str(recorded)
+
+    def test_login_only_commit_stamps_nothing(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+                "selector": "#password",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 0,
+            },
+        ]
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="input[type='submit']", source_url=self._PORTAL_URL
+        )
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+
+    def test_method_mandated_criterion_is_not_stamped(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion(method_mandated=True))
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector="#find-address",
+            source_url=self._BUSINESS_URL,
+            role="button",
+            accessible_name="Find Address",
+        )
+        assert ctx.scout_observed_terminal_criterion_ids == set()

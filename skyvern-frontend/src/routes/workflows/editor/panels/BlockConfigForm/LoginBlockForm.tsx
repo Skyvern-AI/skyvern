@@ -38,6 +38,8 @@ function LoginBlockFormBody({
       errorCodeMapping: data.errorCodeMapping,
       continueOnFailure: data.continueOnFailure,
       nextLoopOnFailure: data.nextLoopOnFailure,
+      includeActionHistoryInVerification:
+        data.includeActionHistoryInVerification,
       disableCache: data.disableCache,
       totpIdentifier: data.totpIdentifier,
       totpVerificationUrl: data.totpVerificationUrl,
@@ -53,6 +55,7 @@ function LoginBlockFormBody({
       data.errorCodeMapping,
       data.continueOnFailure,
       data.nextLoopOnFailure,
+      data.includeActionHistoryInVerification,
       data.disableCache,
       data.totpIdentifier,
       data.totpVerificationUrl,

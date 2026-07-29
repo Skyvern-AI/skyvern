@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
+from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL, has_witnessed_value_content
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
 from skyvern.forge.sdk.copilot.result_evidence import (
     _COMPOSITION_TARGET_SUMMARY_CHAR_BUDGET,
@@ -531,6 +531,92 @@ def test_mint_excludes_ambiguous_path_with_two_candidates() -> None:
     assert contract is None
 
 
+def _reveal_shape_relation(
+    *, value_text: str, value_child_index: int, key_text: str = "March 2026 statement"
+) -> dict[str, object]:
+    return {
+        "key_text": key_text,
+        "value_text": value_text,
+        "container_selector": "#result",
+        "container_match_count": 1,
+        "container_position": 0,
+        "value_child_index": value_child_index,
+        "direct_child_count": 3,
+        "visible": True,
+        "value_visible": True,
+    }
+
+
+def _reveal_shape_page_evidence(relations: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "current_url": "https://portal.example.com/statement",
+        "inspection_warnings": [],
+        "result_containers_truncated": False,
+        "key_value_relations_truncated": False,
+        "key_value_relations": relations,
+        "result_containers": [],
+    }
+
+
+def test_mint_binds_single_reveal_shape_relation() -> None:
+    evidence = _reveal_shape_page_evidence(
+        [_reveal_shape_relation(value_text="Amount due: $3,927.75", value_child_index=1)]
+    )
+    contract = mint_scout_observation_contract(
+        evidence,
+        labels_by_path={"output.amount": ("March 2026 statement",)},
+        url="https://portal.example.com/statement",
+        has_bounded_page_schema=False,
+    )
+
+    assert contract is not None
+    assert scout_observation_bound_paths(contract) == {"output.amount"}
+    assert contract.bindings[0].kind == "key_value"
+    assert contract.bindings[0].value_witness == "capture_nonempty_value"
+
+
+def test_mint_excludes_ambiguous_reveal_shape_siblings() -> None:
+    evidence = _reveal_shape_page_evidence(
+        [
+            _reveal_shape_relation(value_text="Amount due: $3,927.75", value_child_index=1),
+            _reveal_shape_relation(value_text="Billing period: Mar 1 - Mar 31, 2026", value_child_index=2),
+        ]
+    )
+    contract = mint_scout_observation_contract(
+        evidence,
+        labels_by_path={"output.amount": ("March 2026 statement",)},
+        url="https://portal.example.com/statement",
+        has_bounded_page_schema=False,
+    )
+
+    assert contract is None
+
+
+def test_reveal_shape_relation_witnesses_value_content() -> None:
+    evidence = _reveal_shape_page_evidence(
+        [_reveal_shape_relation(value_text="Amount due: $3,927.75", value_child_index=1)]
+    )
+    assert has_witnessed_value_content(evidence) is True
+
+
+def test_mint_ignores_empty_key_reveal_siblings_but_still_witnesses() -> None:
+    evidence = _reveal_shape_page_evidence(
+        [
+            _reveal_shape_relation(value_text="Amount due: $3,927.75", value_child_index=1, key_text=""),
+            _reveal_shape_relation(value_text="Billing period: Mar 1 - Mar 31, 2026", value_child_index=2, key_text=""),
+        ]
+    )
+    contract = mint_scout_observation_contract(
+        evidence,
+        labels_by_path={"output.amount": ("March 2026 statement",)},
+        url="https://portal.example.com/statement",
+        has_bounded_page_schema=False,
+    )
+
+    assert contract is None
+    assert has_witnessed_value_content(evidence) is True
+
+
 def test_mint_returns_none_on_truncated_or_warned_capture() -> None:
     truncated = _kv_page_evidence()
     truncated["result_containers_truncated"] = True
@@ -550,6 +636,39 @@ def test_mint_returns_none_on_truncated_or_warned_capture() -> None:
         )
         is None
     )
+
+
+def test_mint_returns_none_on_reveal_truncation_signal() -> None:
+    # A single-binding reveal packet binds non-None with no warning; the ONLY change below is the
+    # reveal_relations_truncated signal, so this proves that token is load-bearing (a cap-drop on an
+    # otherwise-clean reveal voids the bind) rather than the bind already being None for another reason.
+    single_binding = [_reveal_shape_relation(value_text="Amount due: $3,927.75", value_child_index=1)]
+    labels = {"output.amount": ("March 2026 statement",)}
+
+    baseline = _reveal_shape_page_evidence(single_binding)
+    baseline_contract = mint_scout_observation_contract(
+        baseline,
+        labels_by_path=labels,
+        url="https://portal.example.com/statement",
+        has_bounded_page_schema=False,
+    )
+    assert baseline_contract is not None
+    assert scout_observation_bound_paths(baseline_contract) == {"output.amount"}
+    assert has_witnessed_value_content(baseline) is True
+
+    warned = _reveal_shape_page_evidence(single_binding)
+    warned["inspection_warnings"] = ["reveal_relations_truncated"]
+    assert warned["key_value_relations_truncated"] is False
+    assert (
+        mint_scout_observation_contract(
+            warned,
+            labels_by_path=labels,
+            url="https://portal.example.com/statement",
+            has_bounded_page_schema=False,
+        )
+        is None
+    )
+    assert has_witnessed_value_content(warned) is False
 
 
 def test_mint_returns_none_without_url_or_labels() -> None:

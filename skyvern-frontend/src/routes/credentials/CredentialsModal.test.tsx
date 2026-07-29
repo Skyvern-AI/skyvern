@@ -10,7 +10,7 @@ import {
 } from "@testing-library/react";
 import { AxiosError, AxiosHeaders } from "axios";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CredentialApiResponse } from "@/api/types";
 
@@ -47,6 +47,13 @@ vi.mock("@/hooks/useCustomCredentialServiceConfig", () => ({
 
 vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
   useCredentialsQuery: () => ({ data: [] }),
+}));
+
+// Default off so the existing legacy-path tests are unaffected; the browser-memory
+// describe flips it on per-test.
+const useFeatureFlagMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: useFeatureFlagMock,
 }));
 
 function axiosErrorWithDetail(detail: unknown): AxiosError {
@@ -329,4 +336,318 @@ describe("CredentialsModal edit-mode inline test", () => {
       expect(call[0]).not.toBe("/credentials/temp-cred-id");
     }
   }, 15_000);
+
+  it("shows only the partial-save toast, not a success toast, when the metadata PATCH fails", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockRejectedValueOnce(new Error("patch failed"));
+
+    renderEditPasswordCredentialsModal();
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.change(
+      document.querySelector('input[type="password"]') as HTMLInputElement,
+      { target: { value: "rotated-password" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Partial save",
+          // Flag-off the PATCH omits browser profile / IP, so the copy must not
+          // name them — byte-identical to the legacy partial-save message.
+          description:
+            "Credential updated, but login instructions could not be saved. Please try editing again.",
+        }),
+      );
+    });
+    expect(toastMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Credential updated" }),
+    );
+  }, 15_000);
+});
+
+describe("CredentialsModal browser-memory profile section (flag on)", () => {
+  beforeEach(() => {
+    useFeatureFlagMock.mockImplementation(
+      (flag?: string) => flag === "browser_memory_v1",
+    );
+  });
+  afterEach(() => {
+    useFeatureFlagMock.mockImplementation(() => false);
+  });
+
+  it("create mode shows the auto-save caption and no profile picker", async () => {
+    renderPasswordCredentialsModal();
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    expect(
+      screen.getByText(/Skyvern saves this login.s browser state/i),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /advanced/i })).toBeNull();
+    expect(screen.queryByText("Browser profile")).toBeNull();
+  });
+
+  it("create mode submits browser_profile_id null and the IP-pin choice", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "c1", name: "credentials" },
+    });
+    renderPasswordCredentialsModal();
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.change(
+      document.querySelector('input[type="password"]') as HTMLInputElement,
+      { target: { value: "password" } },
+    );
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials",
+        expect.objectContaining({
+          browser_profile_id: null,
+          pin_saved_session_ip: true,
+        }),
+      );
+    });
+  }, 10_000);
+
+  it("edit mode shows the Browser profile select inline — no Advanced gate, no create caption", async () => {
+    getMock.mockImplementation((url: string) =>
+      url.includes("/browser_profiles/")
+        ? Promise.resolve({
+            data: {
+              browser_profile_id: "existing-profile-id",
+              name: "Saved login",
+              is_managed: false,
+              linked_credential_name: "Acme Login",
+            },
+          })
+        : Promise.resolve({ data: [] }),
+    );
+    renderEditPasswordCredentialsModal();
+    await waitFor(() => {
+      expect(screen.getByText("Browser profile")).toBeTruthy();
+    });
+    expect(screen.getByRole("combobox")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /advanced/i })).toBeNull();
+    expect(
+      screen.queryByText(/Skyvern saves this login.s browser state/i),
+    ).toBeNull();
+  });
+
+  it("keeps the proxy IP-pin UI for card credentials under the flag", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.CREDIT_CARD}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // The password-only "Keep the same IP" checkbox does not cover card/secret,
+    // so the proxy-pin UI must stay for them even when the flag is on.
+    await waitFor(() => {
+      expect(screen.getByText("Use a consistent IP address")).toBeTruthy();
+    });
+    expect(
+      screen.queryByText(/Skyvern saves this login.s browser state/i),
+    ).toBeNull();
+  });
+
+  const pinnedEditCredential: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    proxy_session_id: "psi_9f8a7b6c5d4e3f2a1b",
+    pin_saved_session_ip: true,
+  };
+
+  const pinnedNoSessionCredential: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    proxy_session_id: null,
+    pin_saved_session_ip: true,
+  };
+
+  function renderEditModalFor(cred: CredentialApiResponse) {
+    getMock.mockImplementation((url: string) =>
+      url.includes("/browser_profiles/")
+        ? Promise.resolve({
+            data: {
+              browser_profile_id: "existing-profile-id",
+              name: "Saved login",
+              is_managed: false,
+              linked_credential_name: "Acme Login",
+            },
+          })
+        : Promise.resolve({ data: [] }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            editingCredential={cred}
+            onStartBackgroundTest={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("shows the IP session identity and Rotate when the credential is pinned", async () => {
+    renderEditModalFor(pinnedEditCredential);
+    await waitFor(() => {
+      expect(screen.getByText(/psi_9f8a7b/)).toBeTruthy();
+    });
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeTruthy();
+  });
+
+  it("hides the IP session identity and Rotate when no session is pinned", async () => {
+    renderEditModalFor(pinnedNoSessionCredential);
+    await waitFor(() => {
+      expect(
+        screen.getByText("Keep the same IP for this credential"),
+      ).toBeTruthy();
+    });
+    expect(screen.queryByRole("button", { name: "Rotate" })).toBeNull();
+    expect(screen.queryByText(/IP session:/)).toBeNull();
+  });
+
+  it("Rotate sends rotate_proxy_session_id on save", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditModalFor(pinnedEditCredential);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Rotate" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Rotate" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ rotate_proxy_session_id: true }),
+      );
+    });
+  }, 10_000);
+});
+
+describe("CredentialsModal copilot-context tested_url default", () => {
+  function renderCopilotPasswordModal(opts: {
+    defaultTestUrl?: string;
+    onCredentialCreated?: (id: string, name?: string) => void;
+  }) {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            defaultTestUrl={opts.defaultTestUrl}
+            onCredentialCreated={opts.onCredentialCreated}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  async function fillUsernameAndPassword() {
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    expect(usernameInput).toBeTruthy();
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    const passwordInput = document.querySelector('input[type="password"]');
+    expect(passwordInput).toBeTruthy();
+    fireEvent.change(passwordInput as HTMLInputElement, {
+      target: { value: "password" },
+    });
+  }
+
+  it("persists tested_url from defaultTestUrl on a plain create (no test run)", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-x", name: "credentials" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({
+      defaultTestUrl: "https://news.ycombinator.com/login",
+      onCredentialCreated,
+    });
+    await fillUsernameAndPassword();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith("/credentials", expect.anything()),
+    );
+    await waitFor(() =>
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/cred-x",
+        expect.objectContaining({
+          tested_url: "https://news.ycombinator.com/login",
+        }),
+      ),
+    );
+    expect(onCredentialCreated).toHaveBeenCalledWith("cred-x", "credentials");
+  }, 10_000);
+
+  it("sends no tested_url when defaultTestUrl is absent (modal from elsewhere)", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-y", name: "credentials" },
+    });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({ onCredentialCreated });
+    await fillUsernameAndPassword();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith("cred-y", "credentials"),
+    );
+    expect(patchMock).not.toHaveBeenCalled();
+  }, 10_000);
 });

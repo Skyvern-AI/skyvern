@@ -25,11 +25,13 @@ from skyvern.forge.sdk.api.files import (
     wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
@@ -224,11 +226,17 @@ class S3Storage(BaseStorage):
         return dict(pairs)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        share_urls = await self.async_client.create_presigned_urls([artifact.uri])
+        share_urls = await self.get_share_links([artifact])
         return share_urls[0] if share_urls else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return await self.async_client.create_presigned_urls([artifact.uri for artifact in artifacts])
+        return await presign_with_sensitive_cap(
+            artifacts,
+            presign=self.async_client.create_presigned_urls,
+            presign_sensitive=lambda uris: self.async_client.create_presigned_urls(
+                uris, expires_in=min(settings.PRESIGNED_URL_EXPIRATION, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS)
+            ),
+        )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, os.path.getsize(path))
@@ -242,7 +250,7 @@ class S3Storage(BaseStorage):
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc)
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_SCREENSHOTS)
@@ -255,6 +263,7 @@ class S3Storage(BaseStorage):
             storage_class=sc,
         )
         await self.async_client.upload_file_from_path(to_path, from_path, storage_class=sc)
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
@@ -305,20 +314,30 @@ class S3Storage(BaseStorage):
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to S3."""
         temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
+        # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
+        # removes. Name it up front and clean it in a finally that also covers the archive step, so a
+        # partial .zip from an archive that fails partway can't leak into TEMP_PATH.
+        zip_file_path = f"{temp_zip_file.name}.zip"
         profile_uri = (
             f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
-        LOG.debug(
-            "Storing browser profile",
-            organization_id=organization_id,
-            profile_id=profile_id,
-            zip_file_path=zip_file_path,
-            profile_uri=profile_uri,
-            storage_class=sc,
-        )
-        await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
+        try:
+            # Off the event loop: the credential living-profile engine calls this mid-run, where a
+            # sync archive of a large profile dir would stall every other coroutine on the worker.
+            await asyncio.to_thread(shutil.make_archive, temp_zip_file.name, "zip", directory)
+            LOG.debug(
+                "Storing browser profile",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                zip_file_path=zip_file_path,
+                profile_uri=profile_uri,
+                storage_class=sc,
+            )
+            await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
+        finally:
+            if os.path.exists(zip_file_path):
+                os.remove(zip_file_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from S3."""
@@ -333,12 +352,52 @@ class S3Storage(BaseStorage):
         temp_zip_file_path = temp_zip_file.name
 
         temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
+        try:
+            unzip_files(temp_zip_file_path, temp_dir)
+        finally:
+            # The downloaded archive is a delete=False temp file; remove it so cookie-bearing zips
+            # don't accumulate in TEMP_PATH on every profile retrieve (e.g. each cookie-only bank).
+            temp_zip_file.close()
+            os.unlink(temp_zip_file_path)
         return temp_dir
 
-    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
-        """Delete a browser profile from S3."""
+    async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
+        """Cheap existence check (head_object) — avoids downloading the archive just to know it exists."""
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        try:
+            await self.async_client.get_object_info(profile_uri)
+        except ClientError as exc:
+            if self.async_client._is_not_found_error(exc):
+                return False
+            # Transient/authz errors propagate so the has-content fail-safe treats a flaky read as
+            # existing content instead of reseeding a run to fresh and overwriting its saved archive.
+            raise
+        return True
+
+    async def get_browser_profile_etag(self, organization_id: str, profile_id: str) -> str | None:
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        try:
+            info = await self.async_client.get_object_info(profile_uri)
+        except ClientError as exc:
+            if self.async_client._is_not_found_error(exc):
+                # Missing object = no prior version = no conflict possible → a full write is fine.
+                return None
+            # Transient/authz errors propagate: the write path skips this run rather than reading None
+            # as "unchanged" and fail-open overwriting a possibly-concurrently-updated archive.
+            raise
+        etag = info.get("ETag") if info else None
+        return str(etag) if etag else None
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
+        """Delete a browser profile from S3. The bucket is Suspended (no versioning), so a plain
+        DeleteObject genuinely erases the single profile archive. hard_delete=True RAISES on an S3
+        failure so the caller can't falsely report a cookie-bearing archive erased (the reap then leaves
+        the profile row for retry/discovery instead of a silent orphan); soft delete is best-effort — a
+        reap failure must not break the promote or the soft-delete that triggered it."""
         profile_uri = (
             f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )
@@ -347,10 +406,11 @@ class S3Storage(BaseStorage):
             organization_id=organization_id,
             profile_id=profile_id,
             profile_uri=profile_uri,
+            hard_delete=hard_delete,
         )
-        # DeleteObject is idempotent: deleting a missing key is a no-op. Best-effort — log and
-        # swallow so a reap failure never breaks the promote or the soft-delete that triggered it.
-        await self.async_client.delete_file(profile_uri, log_exception=True)
+        # DeleteObject is idempotent: deleting a missing key is a no-op. A hard delete propagates a real
+        # failure (raise_on_error) so the erasure is never silently reported complete; soft delete swallows.
+        await self.async_client.delete_file(profile_uri, log_exception=True, raise_on_error=hard_delete)
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str

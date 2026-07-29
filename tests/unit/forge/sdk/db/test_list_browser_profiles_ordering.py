@@ -10,7 +10,7 @@ import pytest_asyncio
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from skyvern.forge.sdk.db.models import Base, BrowserProfileModel
+from skyvern.forge.sdk.db.models import Base, BrowserProfileModel, CredentialModel
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 
 ORG = "o_ordering"
@@ -23,7 +23,8 @@ async def repo_and_session() -> tuple:
         await conn.run_sync(
             lambda sync_conn: Base.metadata.create_all(
                 sync_conn,
-                tables=[BrowserProfileModel.__table__],
+                # list_browser_profiles now batch-reads credentials to enrich the credential-login role.
+                tables=[BrowserProfileModel.__table__, CredentialModel.__table__],
             )
         )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)

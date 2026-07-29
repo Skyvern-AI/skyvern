@@ -24,10 +24,16 @@ from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionCriterion,
+    CriterionKind,
+    CriterionLevel,
+    RequestedOutputPathMintSource,
     TerminalActionFamily,
     is_contingent_missing_antecedent_degraded,
     is_fallback_floor_base_criterion,
+    is_judgment_finalization_candidate,
+    is_neutral_reported_boolean_criterion,
     is_turn_unsatisfiable_fallback_degraded,
     redact_raw_secrets_for_prompt,
 )
@@ -46,7 +52,6 @@ _STRUCTURAL_ABSTENTION_REASON_CODE = "structurally_abstained"
 _CONTINGENT_ABSTENTION_REASON_CODES = frozenset(
     {"unknown", "no_evidence", "evidence_contradicts", "missing_exact_field", "unproducible"}
 )
-REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
 TERMINAL_RECORD_CORROBORATION_CRITERION_ID = "__copilot_terminal_record_corroboration__"
 _REGISTERED_DOWNLOAD_COUNT_KEYS = (
     "downloaded_file_count",
@@ -80,6 +85,12 @@ EvidenceSourceKind = Literal[
     "terminal_record",
     "registered_output_parameter",
     "registered_artifact_content",
+    "registered_download",
+]
+AuthoritativeDeliverableSource = Literal[
+    "independent_page_evidence",
+    "registered_artifact_content",
+    "registered_download",
 ]
 
 
@@ -91,7 +102,9 @@ class CriterionVerdict:
     evidence_ref: str | None = None
     missing_evidence: str | None = None
     output_path: str | None = None
-    grounding_mode: Literal["exact_value", "shape", "missing", "terminal_record", "judgment_boolean"] | None = None
+    grounding_mode: (
+        Literal["exact_value", "shape", "missing", "terminal_record", "judgment_boolean", "presence"] | None
+    ) = None
     expected_output_shape: str | None = None
     has_exact_value: bool = False
     requested_output_evidence_source: str | None = None
@@ -104,6 +117,22 @@ class CriterionVerdict:
 
 
 @dataclass(frozen=True)
+class PlainOutcomeNoEvidenceAbstentionDecision:
+    criterion_ids: tuple[str, ...]
+    confirming_deliverable_criterion_ids: tuple[str, ...]
+    confirming_deliverable_sources: tuple[AuthoritativeDeliverableSource, ...]
+
+
+@dataclass(frozen=True)
+class RegisteredBlockerEvidence:
+    block_label: str
+    output_path: str
+    registered_output_key: str
+    registered_output_id: str | None
+    value: Any
+
+
+@dataclass(frozen=True)
 class CompletionVerificationResult:
     status: VerificationStatus
     criterion_ids: list[str] = field(default_factory=list)
@@ -112,6 +141,7 @@ class CompletionVerificationResult:
     contingent_criterion_ids: list[str] = field(default_factory=list)
     contingent_on_by_criterion_id: dict[str, str] = field(default_factory=dict)
     contingent_antecedent_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
+    antecedent_family_by_criterion_id: dict[str, str] = field(default_factory=dict)
     structural_unfired_criterion_ids: list[str] = field(default_factory=list)
     degraded_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_criterion_ids: list[str] = field(default_factory=list)
@@ -119,11 +149,22 @@ class CompletionVerificationResult:
     floor_rekeyed_backed_by_criterion_id: dict[str, bool] = field(default_factory=dict)
     contingent_degraded_criterion_ids: list[str] = field(default_factory=list)
     requested_output_criteria_count: int = 0
+    criterion_level_by_id: dict[str, CriterionLevel] = field(default_factory=dict)
+    criterion_kind_by_id: dict[str, CriterionKind] = field(default_factory=dict)
+    criterion_output_path_by_id: dict[str, str] = field(default_factory=dict)
+    criterion_deliverable_kind_by_id: dict[str, Literal["registered_download"]] = field(default_factory=dict)
+    criterion_requested_output_mint_source_by_id: dict[str, RequestedOutputPathMintSource] = field(default_factory=dict)
+    deliverable_confirmation_criterion_id_by_id: dict[str, str] = field(default_factory=dict)
+    registered_blocker_evidence_by_request_slot_id: dict[str, tuple[RegisteredBlockerEvidence, ...]] = field(
+        default_factory=dict
+    )
 
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
             return False
         verdict_by_id = {verdict.criterion_id: verdict for verdict in self.verdicts}
+        plain_outcome_decision = plain_outcome_no_evidence_abstention_decision(self, verdict_by_id)
+        plain_outcome_abstained_ids = set(plain_outcome_decision.criterion_ids) if plain_outcome_decision else set()
         has_observed_reach_state = any(
             _is_satisfied_observed_end_state_verdict(verdict) for verdict in verdict_by_id.values()
         )
@@ -153,7 +194,7 @@ class CompletionVerificationResult:
                 return False
             # A structurally-unfired contingent criterion is N/A for this run: it neither vetoes nor
             # earns credit, so success must derive from the remaining genuinely-satisfied criteria.
-            if criterion_id in abstained_id_set:
+            if criterion_id in abstained_id_set or criterion_id in plain_outcome_abstained_ids:
                 continue
             # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
@@ -194,43 +235,79 @@ class CompletionVerificationResult:
         return _is_contingent_abstention(verdict, self.abstained_criterion_ids())
 
     def to_trace_data(self) -> dict[str, Any]:
-        unmet = [
-            verdict
-            for verdict in self.verdicts
-            if not verdict.satisfied and not self.is_structural_contingent_abstention(verdict)
-        ]
+        plain_outcome_decision = plain_outcome_no_evidence_abstention_decision(self)
+        unmet = effective_unmet_verdicts(self, plain_outcome_decision=plain_outcome_decision)
         missing_evidence: list[str] = []
         for verdict in unmet:
             detail = verdict_missing_evidence(verdict)
             if detail:
                 missing_evidence.append(f"{verdict.criterion_id}: {detail}")
+        trace_state_by_criterion_id = {
+            verdict.criterion_id: self._trace_state_and_reason(verdict) for verdict in self.verdicts
+        }
         data: dict[str, Any] = {
             "status": self.status,
             "criterion_count": len(self.criterion_ids),
-            "satisfied_count": sum(1 for verdict in self.verdicts if verdict.state == "satisfied"),
-            "unsatisfied_count": sum(1 for verdict in self.verdicts if verdict.state == "unsatisfied"),
-            "unknown_count": sum(1 for verdict in self.verdicts if verdict.state == "unknown"),
+            "satisfied_count": sum(
+                1 for state, _reason in trace_state_by_criterion_id.values() if state == "satisfied"
+            ),
+            "unsatisfied_count": sum(
+                1 for state, _reason in trace_state_by_criterion_id.values() if state == "unsatisfied"
+            ),
+            "unknown_count": sum(1 for state, _reason in trace_state_by_criterion_id.values() if state == "unknown"),
             "fully_satisfied": self.is_fully_satisfied(),
             "no_gradeable_run_plane": self.no_gradeable_run_plane,
             "requested_output_criteria_count": self.requested_output_criteria_count,
-            "reason_codes": [verdict.reason_code for verdict in self.verdicts],
+            "reason_codes": [trace_state_by_criterion_id[verdict.criterion_id][1] for verdict in self.verdicts],
             "unmet_criterion_ids": [verdict.criterion_id for verdict in unmet],
             "missing_evidence": missing_evidence,
         }
+        if plain_outcome_decision is not None:
+            data.update(
+                {
+                    "plain_outcome_no_evidence_abstention_engaged": True,
+                    "plain_outcome_no_evidence_abstention_abstained_criterion_ids": list(
+                        plain_outcome_decision.criterion_ids
+                    ),
+                    "plain_outcome_no_evidence_abstention_confirming_deliverable_criterion_ids": list(
+                        plain_outcome_decision.confirming_deliverable_criterion_ids
+                    ),
+                    "plain_outcome_no_evidence_abstention_confirming_deliverable_sources": list(
+                        plain_outcome_decision.confirming_deliverable_sources
+                    ),
+                    "plain_outcome_no_evidence_abstention_criterion_plane": "run",
+                    "plain_outcome_no_evidence_abstention_criterion_kind": "outcome",
+                    "plain_outcome_no_evidence_abstention_reason_code": "no_evidence",
+                    "plain_outcome_no_evidence_abstention_confirmed_independent_deliverable": True,
+                    "plain_outcome_no_evidence_abstention_confirming_deliverable_mint_sources": [
+                        self.criterion_requested_output_mint_source_by_id[criterion_id]
+                        for criterion_id in plain_outcome_decision.confirming_deliverable_criterion_ids
+                        if criterion_id in self.criterion_requested_output_mint_source_by_id
+                    ],
+                }
+            )
         if self.contingent_criterion_ids:
             data["contingent_criterion_ids"] = list(self.contingent_criterion_ids)
         if self.structural_unfired_criterion_ids:
             data["structural_unfired_criterion_ids"] = list(self.structural_unfired_criterion_ids)
         if self.contingent_degraded_criterion_ids:
             data["contingent_degraded_criterion_ids"] = list(self.contingent_degraded_criterion_ids)
+        if self.antecedent_family_by_criterion_id:
+            data["antecedent_family_by_criterion_id"] = dict(self.antecedent_family_by_criterion_id)
         contingent_id_set = set(self.contingent_criterion_ids)
         structural_unfired_id_set = set(self.structural_unfired_criterion_ids)
+        plain_outcome_abstained_id_set = set(plain_outcome_decision.criterion_ids) if plain_outcome_decision else set()
         for index, verdict in enumerate(self.verdicts[:_MAX_TRACE_VERDICTS]):
             prefix = f"verdict_{index}"
+            structural_abstention = self.is_structural_contingent_abstention(verdict)
             data[f"{prefix}_criterion_id"] = verdict.criterion_id
-            data[f"{prefix}_state"] = verdict.state
-            data[f"{prefix}_satisfied"] = verdict.satisfied
-            data[f"{prefix}_reason_code"] = verdict.reason_code
+            data[f"{prefix}_state"] = "unknown" if structural_abstention else verdict.state
+            data[f"{prefix}_satisfied"] = False if structural_abstention else verdict.satisfied
+            data[f"{prefix}_reason_code"] = (
+                _STRUCTURAL_ABSTENTION_REASON_CODE if structural_abstention else verdict.reason_code
+            )
+            if structural_abstention:
+                data[f"{prefix}_abstention_reason_code"] = "unfired_contingent_antecedent"
             if verdict.output_path:
                 data[f"{prefix}_output_path"] = verdict.output_path
             if verdict.grounding_mode:
@@ -256,21 +333,45 @@ class CompletionVerificationResult:
                 data[f"{prefix}_contingent_on"] = contingent_on
             if contingent_path := self.contingent_antecedent_output_path_by_criterion_id.get(verdict.criterion_id):
                 data[f"{prefix}_contingent_antecedent_output_path"] = contingent_path
+            if antecedent_family := self.antecedent_family_by_criterion_id.get(verdict.criterion_id):
+                data[f"{prefix}_antecedent_family"] = antecedent_family
+            registered_blocker_evidence = self.registered_blocker_evidence_by_request_slot_id.get(
+                verdict.criterion_id, ()
+            )
+            if len(registered_blocker_evidence) == 1:
+                registered_source = registered_blocker_evidence[0]
+                data[f"{prefix}_antecedent_evidence_source"] = "registered_output_parameter"
+                data[f"{prefix}_antecedent_producer_block_label"] = registered_source.block_label
+                data[f"{prefix}_antecedent_output_path"] = registered_source.output_path
+                data[f"{prefix}_antecedent_registered_output_key"] = registered_source.registered_output_key
+                if registered_source.registered_output_id is not None:
+                    data[f"{prefix}_antecedent_registered_output_id"] = registered_source.registered_output_id
             if verdict.criterion_id in contingent_id_set or verdict.criterion_id in structural_unfired_id_set:
                 data[f"{prefix}_structural_unfired"] = verdict.criterion_id in structural_unfired_id_set
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
-            detail = None if self.is_structural_contingent_abstention(verdict) else verdict_missing_evidence(verdict)
+            detail = (
+                None
+                if self.is_structural_contingent_abstention(verdict)
+                or verdict.criterion_id in plain_outcome_abstained_id_set
+                else verdict_missing_evidence(verdict)
+            )
             if detail:
                 data[f"{prefix}_missing_evidence"] = detail
         return data
 
+    def _trace_state_and_reason(self, verdict: CriterionVerdict) -> tuple[CriterionState, str]:
+        if self.is_structural_contingent_abstention(verdict):
+            return "unknown", _STRUCTURAL_ABSTENTION_REASON_CODE
+        return verdict.state, verdict.reason_code
+
     def verdict_state_counts(self) -> dict[str, int]:
+        trace_states = [self._trace_state_and_reason(verdict)[0] for verdict in self.verdicts]
         return {
-            "satisfied": sum(1 for verdict in self.verdicts if verdict.state == "satisfied"),
-            "unsatisfied": sum(1 for verdict in self.verdicts if verdict.state == "unsatisfied"),
-            "unknown": sum(1 for verdict in self.verdicts if verdict.state == "unknown"),
+            "satisfied": trace_states.count("satisfied"),
+            "unsatisfied": trace_states.count("unsatisfied"),
+            "unknown": trace_states.count("unknown"),
         }
 
 
@@ -284,6 +385,13 @@ class RunEvidenceSnapshot:
     workflow_run_id: str | None = None
     block_outputs: dict[str, Any] = field(default_factory=dict)
     block_output_sources: dict[str, EvidenceSourceKind] = field(default_factory=dict)
+    registered_output_values: dict[str, Any] = field(default_factory=dict)
+    registered_blocker_evidence_by_request_slot_id: dict[str, tuple[RegisteredBlockerEvidence, ...]] = field(
+        default_factory=dict
+    )
+    registered_output_evidence_by_request_slot_id: dict[str, tuple[RegisteredBlockerEvidence, ...]] = field(
+        default_factory=dict
+    )
     current_url: str | None = None
     page_title: str | None = None
     run_terminal_status: str | None = None
@@ -334,8 +442,7 @@ class RunEvidenceSnapshot:
         if self.block_outputs:
             lines.append("produced_block_outputs:")
             for label, payload in list(self.block_outputs.items())[:_MAX_BLOCK_OUTPUTS]:
-                serialized = payload if isinstance(payload, str) else json.dumps(payload, default=str)
-                serialized = " ".join(serialized.split())[:_EVIDENCE_VALUE_MAX_CHARS]
+                serialized = _render_evidence_value(payload)
                 source = self.block_output_sources.get(label)
                 source_detail = f" [{source}]" if source else ""
                 lines.append(f"  - {label}{source_detail}: {serialized}")
@@ -345,10 +452,94 @@ class RunEvidenceSnapshot:
             if key in self.page_evidence and self.page_evidence[key] not in (None, "", [], {})
         }
         if page_evidence:
-            serialized = json.dumps(page_evidence, default=str)
-            serialized = " ".join(serialized.split())[:_EVIDENCE_VALUE_MAX_CHARS]
-            lines.append(f"page_evidence: {serialized}")
+            lines.append(f"page_evidence: {_render_evidence_value(page_evidence)}")
         return redact_raw_secrets_for_prompt("\n".join(lines))
+
+    def rendered_evidence_catalog(self) -> dict[str, RenderedEvidenceRecord]:
+        catalog = {
+            label: _rendered_evidence_record(payload, source=self.block_output_sources.get(label))
+            for label, payload in list(self.block_outputs.items())[:_MAX_BLOCK_OUTPUTS]
+        }
+        if self.current_url:
+            _add_reserved_evidence_record(
+                catalog,
+                "observed_end_state_url",
+                _rendered_evidence_record(self.current_url),
+            )
+        if self.page_title:
+            _add_reserved_evidence_record(
+                catalog,
+                "observed_end_state_page_title",
+                _rendered_evidence_record(self.page_title),
+            )
+        scalar_and_list_records: tuple[tuple[str, Any], ...] = (
+            ("run_terminal_status", self.run_terminal_status),
+            ("verified_context_block_labels", self.verified_context_block_labels),
+            ("executed_block_labels", self.executed_block_labels),
+            ("failed_block_labels", self.failed_block_labels),
+            ("failure_classes", self.failure_classes),
+            ("failure_reasons", self.failure_reasons),
+        )
+        for label, value in scalar_and_list_records:
+            if value:
+                _add_reserved_evidence_record(catalog, label, _rendered_evidence_record(value))
+        rendered_page_evidence = {
+            key: self.page_evidence[key]
+            for key in _PAGE_EVIDENCE_KEYS
+            if key in self.page_evidence and self.page_evidence[key] not in (None, "", [], {})
+        }
+        if rendered_page_evidence:
+            _add_reserved_evidence_record(
+                catalog,
+                "page_evidence",
+                _rendered_evidence_record(
+                    rendered_page_evidence,
+                    source="independent_page_evidence",
+                ),
+            )
+        return catalog
+
+
+@dataclass(frozen=True)
+class RenderedEvidenceRecord:
+    value: Any
+    source: EvidenceSourceKind | None = None
+
+
+def _add_reserved_evidence_record(
+    catalog: dict[str, RenderedEvidenceRecord],
+    label: str,
+    record: RenderedEvidenceRecord,
+) -> None:
+    if label in catalog:
+        # A runtime output must never shadow, or be shadowed by, server-owned
+        # evidence. Remove the ambiguous label so any citation fails closed.
+        catalog.pop(label)
+        return
+    catalog[label] = record
+
+
+def _render_evidence_value(value: Any) -> str:
+    serialized = value if isinstance(value, str) else json.dumps(value, default=str)
+    bounded = " ".join(serialized.split())[:_EVIDENCE_VALUE_MAX_CHARS]
+    return redact_raw_secrets_for_prompt(bounded)
+
+
+def _rendered_evidence_record(
+    value: Any,
+    *,
+    source: EvidenceSourceKind | None = None,
+) -> RenderedEvidenceRecord:
+    rendered = _render_evidence_value(value)
+    rendered_value: Any = rendered
+    if not isinstance(value, str):
+        try:
+            rendered_value = json.loads(rendered)
+        except (TypeError, ValueError):
+            # A truncated or redaction-invalidated structure was not present as a complete
+            # judge-visible record. Keep its rendered text so nested citations fail closed.
+            pass
+    return RenderedEvidenceRecord(value=rendered_value, source=source)
 
 
 _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
@@ -399,6 +590,7 @@ def grade_registered_download_criteria(
                 state="satisfied",
                 reason_code="evidence_confirms",
                 evidence_ref=f"block_outputs:{label}",
+                evidence_source="registered_download",
             )
             for criterion in registered_criteria
         ]
@@ -448,9 +640,11 @@ def _missing_verdict(criterion_id: str) -> CriterionVerdict:
 
 def summarize_unsatisfied_outcomes(result: CompletionVerificationResult, criteria: list[CompletionCriterion]) -> str:
     outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
-    satisfied = {verdict.criterion_id for verdict in result.verdicts if verdict.satisfied}
-    unmet = [outcome_by_id[cid] for cid in result.criterion_ids if cid not in satisfied and cid in outcome_by_id]
-    return "; ".join(unmet)
+    return "; ".join(
+        outcome_by_id[verdict.criterion_id]
+        for verdict in effective_unmet_verdicts(result)
+        if verdict.criterion_id in outcome_by_id
+    )
 
 
 def _render_criteria(criteria: list[CompletionCriterion]) -> str:
@@ -467,6 +661,7 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
             if criterion.contingent_antecedent_output_path
             else ""
         )
+        antecedent_family = f" [antecedent_family={criterion.antecedent_family}]" if criterion.antecedent_family else ""
         deliverable_kind = f" [deliverable_kind={criterion.deliverable_kind}]" if criterion.deliverable_kind else ""
         output_path = f" [required_output_path={criterion.output_path}]" if criterion.output_path else ""
         classification_output_key = (
@@ -482,7 +677,7 @@ def _render_criteria(criteria: list[CompletionCriterion]) -> str:
         parts.append(
             f"- {criterion.id}: {criterion.outcome}"
             f" [kind={criterion.kind}]"
-            f"{contingent_on}{antecedent_output_path}{deliverable_kind}{output_path}"
+            f"{contingent_on}{antecedent_output_path}{antecedent_family}{deliverable_kind}{output_path}"
             f"{classification_output_key}{expected_classification}{flags}"
         )
     return "\n".join(parts)
@@ -499,7 +694,12 @@ def _contingent_metadata_for_criteria(
         for criterion in criteria
         if criterion.contingent_antecedent_output_path is not None
     }
-    contingent_ids = list(dict.fromkeys([*contingent_on_by_id, *contingent_antecedent_output_path_by_id]))
+    family_contingent_ids = [
+        criterion.id for criterion in criteria if criterion.antecedent_family in {"blocker", "undecidable"}
+    ]
+    contingent_ids = list(
+        dict.fromkeys([*contingent_on_by_id, *contingent_antecedent_output_path_by_id, *family_contingent_ids])
+    )
     return contingent_ids, contingent_on_by_id, contingent_antecedent_output_path_by_id
 
 
@@ -524,7 +724,6 @@ def _find_structured_field_values(value: Any, field_names: Collection[str]) -> I
 
 
 _BLOCKER_PATH_FIELDS = frozenset({"blocker", "manual_service_blocker"})
-_BLOCKER_FIELDS = frozenset({"blocker", "blocker_output", "manual_service_blocker", "manual_service_blocker_output"})
 
 
 def structural_unfired_contingent_criterion_ids(
@@ -533,12 +732,24 @@ def structural_unfired_contingent_criterion_ids(
 ) -> list[str]:
     unfired_ids: list[str] = []
     for criterion in criteria:
+        if criterion.antecedent_family == "blocker":
+            if _blocker_criterion_may_structurally_abstain(criterion, snapshot):
+                unfired_ids.append(criterion.id)
+            continue
+        if criterion.antecedent_family == "undecidable":
+            unfired_ids.append(criterion.id)
+            continue
+        if criterion.antecedent_family == "unconditional":
+            continue
         if is_turn_unsatisfiable_fallback_degraded(criterion):
             continue
         if is_contingent_missing_antecedent_degraded(criterion):
             # The degrade value is itself the source determination that the antecedent never fired,
             # so only affirmative evidence that a real blocker fired can keep the criterion in play.
-            if not (_contingent_antecedent_blocker_shaped(criterion) and _has_real_blocker_evidence(snapshot)):
+            if not (
+                _contingent_antecedent_blocker_shaped(criterion)
+                and _has_real_legacy_criterion_antecedent_evidence(criterion, snapshot)
+            ):
                 unfired_ids.append(criterion.id)
             continue
         path = criterion.contingent_antecedent_output_path
@@ -551,9 +762,9 @@ def structural_unfired_contingent_criterion_ids(
                 values.append(value)
             values.extend(_find_structured_field_values(value, field_names))
         if _is_blocker_contingent_criterion(criterion):
-            if _has_real_blocker_evidence(snapshot):
+            if _has_real_legacy_criterion_antecedent_evidence(criterion, snapshot):
                 continue
-            if _has_structural_no_blocker_evidence(snapshot):
+            if _has_structural_no_blocker_evidence(criterion, snapshot):
                 unfired_ids.append(criterion.id)
                 continue
         if not values:
@@ -580,27 +791,57 @@ def _contingent_antecedent_blocker_shaped(criterion: CompletionCriterion) -> boo
     return path is not None and _output_path_field(path) in _BLOCKER_PATH_FIELDS
 
 
-def _blocker_family_values(snapshot: RunEvidenceSnapshot) -> list[Any]:
+def _legacy_criterion_antecedent_values(
+    criterion: CompletionCriterion,
+    snapshot: RunEvidenceSnapshot,
+) -> list[Any]:
+    path = criterion.contingent_antecedent_output_path or criterion.output_path
+    if path is None:
+        return []
+    field_names = set(_field_aliases_for_output_path(path))
+    if _output_path_field(path) in _BLOCKER_PATH_FIELDS:
+        field_names.update(_BLOCKER_PATH_FIELDS)
+        field_names.update(f"{field}_output" for field in _BLOCKER_PATH_FIELDS)
     values: list[Any] = []
     for key, value in snapshot.block_outputs.items():
-        if key in _BLOCKER_FIELDS:
+        if key in field_names:
             values.append(value)
-        values.extend(_find_structured_field_values(value, _BLOCKER_FIELDS))
+        values.extend(_find_structured_field_values(value, field_names))
     return values
 
 
-def _has_real_blocker_evidence(snapshot: RunEvidenceSnapshot) -> bool:
-    return any(_is_real_blocker_evidence(value) for value in _blocker_family_values(snapshot))
+def _blocker_criterion_may_structurally_abstain(
+    criterion: CompletionCriterion,
+    snapshot: RunEvidenceSnapshot,
+) -> bool:
+    if criterion.request_slot_id is None:
+        return not snapshot.registered_output_values
+    evidence = snapshot.registered_blocker_evidence_by_request_slot_id.get(criterion.request_slot_id, ())
+    if len(evidence) == 1:
+        return _is_structural_no_blocker_marker(evidence[0].value)
+    if evidence:
+        return False
+    # Registered values with no accepted association fail closed: they may contain the fired
+    # blocker whose consequent would otherwise be waived. Another slot's association cannot
+    # license this criterion to abstain.
+    return not snapshot.registered_output_values
+
+
+def _has_real_legacy_criterion_antecedent_evidence(
+    criterion: CompletionCriterion,
+    snapshot: RunEvidenceSnapshot,
+) -> bool:
+    return any(_is_real_blocker_evidence(value) for value in _legacy_criterion_antecedent_values(criterion, snapshot))
 
 
 def _is_real_blocker_evidence(value: Any) -> bool:
     return _is_meaningful_contingent_antecedent_value(value) and not _is_structural_no_blocker_marker(value)
 
 
-def _has_structural_no_blocker_evidence(snapshot: RunEvidenceSnapshot) -> bool:
+def _has_structural_no_blocker_evidence(criterion: CompletionCriterion, snapshot: RunEvidenceSnapshot) -> bool:
     """A registered blocker-family key is an explicit negative record whatever its value shape
-    (None/""/false/"none"); only an absent key is an absent record, which ``_blocker_family_values`` guarantees."""
-    for value in _blocker_family_values(snapshot):
+    (None/""/false/"none"); only an absent key is an absent record."""
+    for value in _legacy_criterion_antecedent_values(criterion, snapshot):
         if _is_structural_no_blocker_marker(value):
             return True
     return False
@@ -630,10 +871,87 @@ def _is_structural_no_blocker_marker(value: Any) -> bool:
 
 
 def _evidence_source_from_ref(
-    block_output_sources: Mapping[str, EvidenceSourceKind], evidence_ref: str | None
+    evidence_catalog: Mapping[str, RenderedEvidenceRecord], evidence_ref: str | None
 ) -> EvidenceSourceKind | None:
     label = _evidence_ref_record_label(evidence_ref)
-    return block_output_sources.get(label) if label else None
+    record = evidence_catalog.get(label) if label else None
+    return record.source if record else None
+
+
+def _evidence_ref_path(evidence_ref: str | None) -> tuple[str, tuple[str, ...]] | None:
+    label = _evidence_ref_record_label(evidence_ref)
+    if label is None or evidence_ref is None:
+        return None
+    ref = evidence_ref.strip().removeprefix("block_outputs:")
+    _label, separator, raw_path = ref.partition(".")
+    path = tuple(segment.strip() for segment in raw_path.split(".") if segment.strip()) if separator else ()
+    return label, path
+
+
+def _record_path_resolves(value: Any, path: tuple[str, ...]) -> bool:
+    if not path:
+        return True
+    segment, *remaining = path
+    match = re.fullmatch(r"([^\[\]]+)?(?:\[(\d+)\])?", segment)
+    if match is None or (match.group(1) is None and match.group(2) is None):
+        return False
+    normalized_segment, raw_index = match.groups()
+    if normalized_segment is None:
+        if not isinstance(value, list) or raw_index is None:
+            return False
+        index = int(raw_index)
+        return index < len(value) and _record_path_resolves(value[index], tuple(remaining))
+    if isinstance(value, Mapping):
+        if normalized_segment not in value:
+            return False
+        resolved_value = value[normalized_segment]
+        if raw_index is not None:
+            if not isinstance(resolved_value, list):
+                return False
+            index = int(raw_index)
+            if index >= len(resolved_value):
+                return False
+            resolved_value = resolved_value[index]
+        return _record_path_resolves(resolved_value, tuple(remaining))
+    if isinstance(value, list):
+        return any(_record_path_resolves(item, path) for item in value)
+    return False
+
+
+def _satisfying_evidence_is_admissible(
+    criterion: CompletionCriterion,
+    evidence_ref: str | None,
+    evidence_catalog: Mapping[str, RenderedEvidenceRecord],
+    registered_output_evidence_by_request_slot_id: Mapping[str, tuple[RegisteredBlockerEvidence, ...]],
+) -> bool:
+    ref_path = _evidence_ref_path(evidence_ref)
+    if ref_path is None:
+        return False
+    label, path = ref_path
+    record = evidence_catalog.get(label)
+    if record is None or not _record_path_resolves(record.value, path):
+        return False
+    if criterion.requested_output_evidence_source == "independent_run_evidence" and (
+        record.source not in _INDEPENDENT_REQUESTED_OUTPUT_CORROBORATOR_SOURCES
+    ):
+        return False
+    if not is_neutral_reported_boolean_criterion(criterion):
+        return True
+    output_key = criterion.classification_output_key
+    request_slot_id = criterion.request_slot_id
+    if output_key is None or request_slot_id is None:
+        return False
+    associated_records = registered_output_evidence_by_request_slot_id.get(request_slot_id, ())
+    if len(associated_records) != 1:
+        return False
+    associated_record = associated_records[0]
+    return (
+        record.source == "independent_page_evidence"
+        and label != associated_record.registered_output_key
+        and associated_record.registered_output_key in evidence_catalog
+        and associated_record.output_path == f"output.{output_key}"
+        and isinstance(associated_record.value, bool)
+    )
 
 
 def _coerce_result(
@@ -644,7 +962,9 @@ def _coerce_result(
     contingent_on_by_criterion_id: dict[str, str] | None = None,
     contingent_antecedent_output_path_by_criterion_id: dict[str, str] | None = None,
     structural_unfired_criterion_ids: Iterable[str] = (),
-    block_output_sources: Mapping[str, EvidenceSourceKind] | None = None,
+    criteria_by_id: Mapping[str, CompletionCriterion] | None = None,
+    evidence_catalog: Mapping[str, RenderedEvidenceRecord] | None = None,
+    registered_output_evidence_by_request_slot_id: Mapping[str, tuple[RegisteredBlockerEvidence, ...]] | None = None,
 ) -> CompletionVerificationResult:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
@@ -676,6 +996,18 @@ def _coerce_result(
         else:
             state = "unknown"
         evidence_ref = _clean_optional_text(item.get("evidence_ref"), max_chars=_EVIDENCE_REF_MAX_CHARS)
+        criterion = (criteria_by_id or {}).get(criterion_id)
+        if state == "satisfied":
+            admission_criterion = criterion or CompletionCriterion(id=criterion_id, outcome="")
+            if not _satisfying_evidence_is_admissible(
+                admission_criterion,
+                evidence_ref,
+                evidence_catalog or {},
+                registered_output_evidence_by_request_slot_id or {},
+            ):
+                state = "unsatisfied"
+                reason_code = "no_evidence"
+                evidence_ref = None
         missing_evidence = None
         if state != "satisfied":
             missing_evidence = _clean_optional_text(
@@ -687,7 +1019,7 @@ def _coerce_result(
             reason_code=reason_code,
             evidence_ref=evidence_ref,
             missing_evidence=missing_evidence,
-            evidence_source=_evidence_source_from_ref(block_output_sources or {}, evidence_ref),
+            evidence_source=_evidence_source_from_ref(evidence_catalog or {}, evidence_ref),
         )
 
     verdicts = [by_id.get(criterion_id, _missing_verdict(criterion_id)) for criterion_id in criterion_ids]
@@ -933,14 +1265,20 @@ def grade_present_value_criteria(
             continue
         # Every named literal must appear in a SINGLE block output: a partial match
         # (e.g. a date present while the named total is not) is not the named outcome.
-        match_label = next(
-            (
-                label
-                for label, haystack in haystacks
-                if all(_present_verbatim(literal, haystack) for literal in literals)
-            ),
-            None,
-        )
+        matching_labels = [
+            label for label, haystack in haystacks if all(_present_verbatim(literal, haystack) for literal in literals)
+        ]
+        if is_neutral_reported_boolean_criterion(criterion):
+            match_label = next(
+                (
+                    label
+                    for label in matching_labels
+                    if snapshot.block_output_sources.get(label) == "independent_page_evidence"
+                ),
+                None,
+            )
+        else:
+            match_label = matching_labels[0] if matching_labels else None
         if match_label is not None:
             verdicts.append(
                 CriterionVerdict(
@@ -1266,7 +1604,9 @@ def grade_terminal_goal_record_criteria(
     eligible_criteria = [
         criterion
         for criterion in criteria
-        if criterion.kind == "terminal_action" and criterion.terminal_action_family in _TERMINAL_RECORD_FAMILY_ARTIFACTS
+        if criterion.kind == "terminal_action"
+        and criterion.terminal_action_verification_mode == "family_record_v1"
+        and criterion.terminal_action_family in _TERMINAL_RECORD_FAMILY_ARTIFACTS
     ]
     if not eligible_criteria:
         return []
@@ -2028,6 +2368,103 @@ def _is_reperception_contradiction(verdict: CriterionVerdict) -> bool:
     )
 
 
+def plain_outcome_no_evidence_abstention_decision(
+    result: CompletionVerificationResult,
+    verdict_by_id: Mapping[str, CriterionVerdict] | None = None,
+) -> PlainOutcomeNoEvidenceAbstentionDecision | None:
+    if result.status != "evaluated" or not result.criterion_ids:
+        return None
+    verdict_by_id = verdict_by_id or {verdict.criterion_id: verdict for verdict in result.verdicts}
+    active_ids = set(result.criterion_ids)
+    has_observed_reach_state = any(
+        _is_satisfied_observed_end_state_verdict(verdict)
+        for criterion_id, verdict in verdict_by_id.items()
+        if criterion_id in active_ids
+    )
+    if any(
+        verdict.state == "unsatisfied"
+        and verdict.reason_code == "evidence_contradicts"
+        and not result.is_structural_contingent_abstention(verdict)
+        and not (has_observed_reach_state and _is_reperception_contradiction(verdict))
+        for criterion_id, verdict in verdict_by_id.items()
+        if criterion_id in active_ids
+    ):
+        return None
+
+    confirming_ids: list[str] = []
+    confirming_sources: list[AuthoritativeDeliverableSource] = []
+    for criterion_id in result.criterion_ids:
+        verdict = verdict_by_id.get(criterion_id)
+        if (
+            verdict is None
+            or not verdict.satisfied
+            or verdict.reason_code != "evidence_confirms"
+            or result.criterion_level_by_id.get(criterion_id) != "run"
+        ):
+            continue
+        source: AuthoritativeDeliverableSource | None = None
+        if (
+            criterion_id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+            and verdict.evidence_source == "registered_download"
+            and criterion_id in result.criterion_requested_output_mint_source_by_id
+        ):
+            source = "registered_download"
+        elif criterion_id in result.criterion_output_path_by_id:
+            if verdict.evidence_source == "independent_page_evidence":
+                source = "independent_page_evidence"
+            elif verdict.evidence_source == "registered_artifact_content":
+                source = "registered_artifact_content"
+        if source is not None:
+            confirming_ids.append(criterion_id)
+            confirming_sources.append(source)
+    if not confirming_ids:
+        return None
+
+    degraded_ids = degraded_lane_criterion_ids(result)
+    floor_rekeyed_ids = set(result.floor_rekeyed_criterion_ids)
+    confirmed_ids = set(confirming_ids)
+    abstained_ids = tuple(
+        criterion_id
+        for criterion_id in result.criterion_ids
+        if criterion_id != REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+        and criterion_id not in degraded_ids
+        and criterion_id not in floor_rekeyed_ids
+        and criterion_id not in result.criterion_output_path_by_id
+        and criterion_id not in result.criterion_deliverable_kind_by_id
+        and result.deliverable_confirmation_criterion_id_by_id.get(criterion_id) in confirmed_ids
+        and result.criterion_level_by_id.get(criterion_id) == "run"
+        and result.criterion_kind_by_id.get(criterion_id) == "outcome"
+        and (verdict := verdict_by_id.get(criterion_id)) is not None
+        and verdict.state == "unsatisfied"
+        and verdict.reason_code == "no_evidence"
+    )
+    if not abstained_ids:
+        return None
+    return PlainOutcomeNoEvidenceAbstentionDecision(
+        criterion_ids=abstained_ids,
+        confirming_deliverable_criterion_ids=tuple(confirming_ids),
+        confirming_deliverable_sources=tuple(confirming_sources),
+    )
+
+
+def effective_unmet_verdicts(
+    result: CompletionVerificationResult,
+    *,
+    plain_outcome_decision: PlainOutcomeNoEvidenceAbstentionDecision | None = None,
+) -> list[CriterionVerdict]:
+    decision = plain_outcome_decision or plain_outcome_no_evidence_abstention_decision(result)
+    abstained_ids = set(decision.criterion_ids) if decision else set()
+    active_ids = set(result.criterion_ids)
+    return [
+        verdict
+        for verdict in result.verdicts
+        if verdict.criterion_id in active_ids
+        and not verdict.satisfied
+        and not result.is_structural_contingent_abstention(verdict)
+        and verdict.criterion_id not in abstained_ids
+    ]
+
+
 def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
 
@@ -2235,6 +2672,12 @@ def combine_verification_results(
     floor_rekeyed_path_by_id: dict[str, str] = {}
     floor_rekeyed_backed_by_id: dict[str, bool] = {}
     contingent_degraded_ids: list[str] = []
+    criterion_level_by_id: dict[str, CriterionLevel] = {}
+    criterion_kind_by_id: dict[str, CriterionKind] = {}
+    criterion_output_path_by_id: dict[str, str] = {}
+    criterion_deliverable_kind_by_id: dict[str, Literal["registered_download"]] = {}
+    criterion_requested_output_mint_source_by_id: dict[str, RequestedOutputPathMintSource] = {}
+    deliverable_confirmation_criterion_id_by_id: dict[str, str] = {}
     if run_result is not None:
         contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
         contingent_on_by_id.update(run_result.contingent_on_by_criterion_id)
@@ -2249,6 +2692,12 @@ def combine_verification_results(
         contingent_degraded_ids = list(
             dict.fromkeys([*contingent_degraded_ids, *run_result.contingent_degraded_criterion_ids])
         )
+        criterion_level_by_id.update(run_result.criterion_level_by_id)
+        criterion_kind_by_id.update(run_result.criterion_kind_by_id)
+        criterion_output_path_by_id.update(run_result.criterion_output_path_by_id)
+        criterion_deliverable_kind_by_id.update(run_result.criterion_deliverable_kind_by_id)
+        criterion_requested_output_mint_source_by_id.update(run_result.criterion_requested_output_mint_source_by_id)
+        deliverable_confirmation_criterion_id_by_id.update(run_result.deliverable_confirmation_criterion_id_by_id)
     if run_result is not None and run_result.status != "evaluated":
         return CompletionVerificationResult(
             status=run_result.status,
@@ -2264,6 +2713,12 @@ def combine_verification_results(
             floor_rekeyed_backed_by_criterion_id=floor_rekeyed_backed_by_id,
             contingent_degraded_criterion_ids=contingent_degraded_ids,
             requested_output_criteria_count=requested_output_criteria_count,
+            criterion_level_by_id=criterion_level_by_id,
+            criterion_kind_by_id=criterion_kind_by_id,
+            criterion_output_path_by_id=criterion_output_path_by_id,
+            criterion_deliverable_kind_by_id=criterion_deliverable_kind_by_id,
+            criterion_requested_output_mint_source_by_id=criterion_requested_output_mint_source_by_id,
+            deliverable_confirmation_criterion_id_by_id=deliverable_confirmation_criterion_id_by_id,
         )
     if run_result is not None:
         run_result = replace(
@@ -2297,6 +2752,12 @@ def combine_verification_results(
         floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
         contingent_degraded_criterion_ids=contingent_degraded_ids,
         requested_output_criteria_count=requested_output_criteria_count,
+        criterion_level_by_id=criterion_level_by_id,
+        criterion_kind_by_id=criterion_kind_by_id,
+        criterion_output_path_by_id=criterion_output_path_by_id,
+        criterion_deliverable_kind_by_id=criterion_deliverable_kind_by_id,
+        criterion_requested_output_mint_source_by_id=criterion_requested_output_mint_source_by_id,
+        deliverable_confirmation_criterion_id_by_id=deliverable_confirmation_criterion_id_by_id,
     )
 
 
@@ -2315,6 +2776,8 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
     if not degraded:
         return False
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    decision = plain_outcome_no_evidence_abstention_decision(result, verdict_by_id)
+    plain_outcome_abstained_ids = set(decision.criterion_ids) if decision else set()
     blocking: set[str] = set()
     for criterion_id in result.criterion_ids:
         verdict = verdict_by_id.get(criterion_id)
@@ -2325,6 +2788,8 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
         if verdict is not None and _is_incomplete_validation_classification_abstention(verdict):
             continue
         if verdict is not None and result.is_structural_contingent_abstention(verdict):
+            continue
+        if criterion_id in plain_outcome_abstained_ids:
             continue
         blocking.add(criterion_id)
     if not blocking:
@@ -2379,6 +2844,8 @@ def degraded_contract_delivered_unverified_terminal_state(
     if not degraded:
         return None
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    decision = plain_outcome_no_evidence_abstention_decision(result, verdict_by_id)
+    plain_outcome_abstained_ids = set(decision.criterion_ids) if decision else set()
     observed: list[CriterionVerdict] = []
     blocking: set[str] = set()
     for criterion_id in result.criterion_ids:
@@ -2389,6 +2856,8 @@ def degraded_contract_delivered_unverified_terminal_state(
         if verdict is not None and verdict.satisfied:
             continue
         if verdict is not None and result.is_structural_contingent_abstention(verdict):
+            continue
+        if criterion_id in plain_outcome_abstained_ids:
             continue
         blocking.add(criterion_id)
     if not observed or not blocking or not blocking <= degraded:
@@ -2456,24 +2925,105 @@ def floor_rekeyed_deliverable_credit(
     )
 
 
+def gradeable_completion_criteria(criteria: Iterable[CompletionCriterion]) -> list[CompletionCriterion]:
+    return [
+        criterion
+        for criterion in criteria
+        if criterion.mint_degrade != "undecidable_judgment"
+        and not (
+            is_judgment_finalization_candidate(criterion) and criterion.mint_disposition in {"pending", "degraded"}
+        )
+        and not (
+            criterion.requested_output_corroborator
+            and criterion.requested_output_evidence_source == "independent_run_evidence"
+        )
+    ]
+
+
+def carry_criterion_metadata(
+    result: CompletionVerificationResult,
+    criteria: Iterable[CompletionCriterion],
+) -> CompletionVerificationResult:
+    active_ids = set(result.criterion_ids)
+    active_criteria = [criterion for criterion in criteria if criterion.id in active_ids]
+    level_by_id = dict(result.criterion_level_by_id)
+    level_by_id.update({criterion.id: criterion.level for criterion in active_criteria})
+    kind_by_id = dict(result.criterion_kind_by_id)
+    kind_by_id.update({criterion.id: criterion.kind for criterion in active_criteria})
+    output_path_by_id = dict(result.criterion_output_path_by_id)
+    output_path_by_id.update(
+        {criterion.id: criterion.output_path for criterion in active_criteria if criterion.output_path is not None}
+    )
+    deliverable_kind_by_id = dict(result.criterion_deliverable_kind_by_id)
+    deliverable_kind_by_id.update(
+        {
+            criterion.id: criterion.deliverable_kind
+            for criterion in active_criteria
+            if criterion.deliverable_kind is not None
+        }
+    )
+    requested_output_mint_source_by_id = dict(result.criterion_requested_output_mint_source_by_id)
+    requested_output_mint_source_by_id.update(
+        {
+            criterion.id: criterion.requested_output_path_mint_source
+            for criterion in active_criteria
+            if criterion.requested_output_path_mint_source is not None
+        }
+    )
+    deliverable_confirmation_by_id = dict(result.deliverable_confirmation_criterion_id_by_id)
+    deliverable_confirmation_by_id.update(
+        {
+            criterion.id: criterion.deliverable_confirmation_criterion_id
+            for criterion in active_criteria
+            if criterion.deliverable_confirmation_criterion_id is not None
+        }
+    )
+    return replace(
+        result,
+        criterion_level_by_id=level_by_id,
+        criterion_kind_by_id=kind_by_id,
+        criterion_output_path_by_id=output_path_by_id,
+        criterion_deliverable_kind_by_id=deliverable_kind_by_id,
+        criterion_requested_output_mint_source_by_id=requested_output_mint_source_by_id,
+        deliverable_confirmation_criterion_id_by_id=deliverable_confirmation_by_id,
+    )
+
+
 def carry_degraded_criterion_ids(
     result: CompletionVerificationResult,
     criteria: Iterable[CompletionCriterion],
 ) -> CompletionVerificationResult:
     criteria = list(criteria)
-    degraded = [criterion.id for criterion in criteria if is_turn_unsatisfiable_fallback_degraded(criterion)]
+    degraded = [
+        criterion.id
+        for criterion in criteria
+        if criterion.mint_degrade is not None and not is_contingent_missing_antecedent_degraded(criterion)
+    ]
     contingent_degraded = [
         criterion.id for criterion in criteria if is_contingent_missing_antecedent_degraded(criterion)
+    ]
+    antecedent_family_by_id = {
+        criterion.id: criterion.antecedent_family for criterion in criteria if criterion.antecedent_family is not None
+    }
+    family_contingent_ids = [
+        criterion.id for criterion in criteria if criterion.antecedent_family in {"blocker", "undecidable"}
     ]
     if (
         not degraded
         and not contingent_degraded
+        and not antecedent_family_by_id
         and not result.degraded_criterion_ids
         and not result.contingent_degraded_criterion_ids
+        and not result.antecedent_family_by_criterion_id
     ):
         return result
     return replace(
         result,
+        contingent_criterion_ids=list(dict.fromkeys([*result.contingent_criterion_ids, *family_contingent_ids])),
+        antecedent_family_by_criterion_id={
+            **result.antecedent_family_by_criterion_id,
+            **antecedent_family_by_id,
+        },
         degraded_criterion_ids=list(dict.fromkeys([*result.degraded_criterion_ids, *degraded])),
         contingent_degraded_criterion_ids=list(
             dict.fromkeys([*result.contingent_degraded_criterion_ids, *contingent_degraded])
@@ -2631,12 +3181,18 @@ async def evaluate_completion_criteria(
             structural_unfired_criterion_ids=structural_unfired_ids,
         )
 
-    return _coerce_result(
+    result = _coerce_result(
         raw,
         criterion_ids,
         contingent_criterion_ids=contingent_ids,
         contingent_on_by_criterion_id=contingent_on_by_id,
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
         structural_unfired_criterion_ids=structural_unfired_ids,
-        block_output_sources=snapshot.block_output_sources,
+        criteria_by_id={criterion.id: criterion for criterion in criteria},
+        evidence_catalog=snapshot.rendered_evidence_catalog(),
+        registered_output_evidence_by_request_slot_id=snapshot.registered_output_evidence_by_request_slot_id,
+    )
+    return replace(
+        result,
+        registered_blocker_evidence_by_request_slot_id=dict(snapshot.registered_blocker_evidence_by_request_slot_id),
     )

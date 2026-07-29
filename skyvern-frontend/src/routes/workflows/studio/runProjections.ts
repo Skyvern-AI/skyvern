@@ -12,7 +12,7 @@ import {
 } from "@/routes/workflows/types/workflowRunTypes";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
 import { isRecord } from "@/util/utils";
-import { normalizeUtcTimestamp } from "@/util/timeFormat";
+import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
 
 export type RunOutcome = "idle" | "running" | "failed" | "success";
 
@@ -38,6 +38,30 @@ export function formatElapsed(
     return `${sec}s`;
   }
   return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+}
+
+// The elapsed value's hover tooltip: the full created/queued/started/finished
+// breakdown, one per line, omitting timestamps the run doesn't have yet.
+export function formatRunTimesTooltip(
+  workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
+): string {
+  const finalized = statusIsFinalized(workflowRun);
+  return [
+    workflowRun.created_at
+      ? `Created ${basicLocalTimeFormat(workflowRun.created_at)}`
+      : null,
+    workflowRun.queued_at
+      ? `Queued ${basicLocalTimeFormat(workflowRun.queued_at)}`
+      : null,
+    workflowRun.started_at
+      ? `Started ${basicLocalTimeFormat(workflowRun.started_at)}`
+      : null,
+    finalized && workflowRun.finished_at
+      ? `Finished ${basicLocalTimeFormat(workflowRun.finished_at)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function runOutcomeFromStatus(
@@ -75,10 +99,21 @@ type RunOutputSignals = Pick<
   | "webhook_failure_reason"
 >;
 
-// The pane-header indicator and RunView's Outputs tab both key off this; keep
-// them routed through here so they can't drift. The extracted_information cast
-// below is unsound on purpose — a string value must stay truthy via
-// Object.values, matching what RunOutputsSection actually renders.
+// Every outputs key but the always-appended extracted_information is a block's
+// returned value. Shared by the has-outputs gate and RunOutputsSection so they
+// can't disagree on what counts as a code-block output.
+export function outputFieldEntries(outputs: unknown): Array<[string, unknown]> {
+  if (!isRecord(outputs)) {
+    return [];
+  }
+  return Object.entries(outputs).filter(
+    ([key]) => key !== "extracted_information",
+  );
+}
+
+// RunView's Outputs tab keys off this. The extracted_information cast below is
+// unsound on purpose — a string value must stay truthy via Object.values,
+// matching what RunOutputsSection renders.
 export function runHasOutputs(
   workflowRun: RunOutputSignals | null | undefined,
 ): boolean {
@@ -95,6 +130,10 @@ export function runHasOutputs(
   const hasExtracted =
     extractedInformation != null &&
     Object.values(extractedInformation).some((value) => value !== null);
+  // Unlike the always-appended extracted_information, a block-output key exists
+  // only because a block emitted it — so its presence counts even when the value
+  // is null (the normal shape for a code-only workflow with no extraction).
+  const hasBlockOutputs = outputFieldEntries(outputs).length > 0;
   // A raw-count check, not RunView's deduped file list — dedup only ever
   // shrinks a non-empty input, never zeroes it out, so truthiness matches.
   const hasDownloads =
@@ -107,6 +146,7 @@ export function runHasOutputs(
   return (
     hasErrors ||
     hasExtracted ||
+    hasBlockOutputs ||
     hasDownloads ||
     hasObserverOutput ||
     hasWebhookFailure

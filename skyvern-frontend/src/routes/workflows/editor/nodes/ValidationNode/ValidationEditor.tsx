@@ -77,9 +77,11 @@ function ValidationEditorBody({
     <div data-testid="validation-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex justify-between">
-          <Label className="text-xs text-slate-300">Complete if...</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            Complete if...
+          </Label>
           {isFirstWorkflowBlock ? (
-            <div className="flex justify-end text-xs text-slate-400">
+            <div className="flex justify-end text-xs text-muted-foreground">
               Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
@@ -93,7 +95,9 @@ function ValidationEditorBody({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">Terminate if...</Label>
+        <Label className="text-xs text-tertiary-foreground">
+          Terminate if...
+        </Label>
         <WorkflowBlockInputTextarea
           aiImprove={AI_IMPROVE_CONFIGS.validation.terminateCriterion}
           nodeId={blockId}
@@ -125,7 +129,7 @@ function ValidationEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip

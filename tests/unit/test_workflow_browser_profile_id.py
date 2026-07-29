@@ -243,6 +243,7 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
     )
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
             return_value=[schedule_with_backend, schedule_without_backend]
         )
@@ -306,13 +307,22 @@ def _make_workflow_update_service(
 
 def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        browser_profile_id=None,
+        browser_seed_source=None,
+        proxy_location=None,
+    )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
     service.get_workflow_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     service.create_workflow_run_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    # These tests assert the request-level browser_profile_id copy, not seed resolution.
+    service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
     organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
     return service, organization, workflow_run
@@ -326,17 +336,21 @@ def _make_workflow_stub(
         workflow_id="wf_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        title="test",
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_profile_id=browser_profile_id,
+        browser_profile_key=None,
         persist_browser_session=False,
+        pin_saved_session_ip=False,
         max_elapsed_time_minutes=max_elapsed_time_minutes,
         run_with="agent",
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
 
 
@@ -357,6 +371,7 @@ async def test_setup_workflow_run_falls_back_to_workflow_browser_profile_id() ->
     assert request.browser_profile_id is None
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -379,6 +394,7 @@ async def test_setup_workflow_run_run_level_value_takes_precedence() -> None:
     request = WorkflowRequestBody(data={}, browser_profile_id="bp_run_specific")
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -401,6 +417,7 @@ async def test_setup_workflow_run_no_default_no_request_stays_none() -> None:
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -424,6 +441,7 @@ async def test_setup_workflow_run_session_present_skips_workflow_default() -> No
     assert request.browser_profile_id is None
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 
@@ -446,6 +464,7 @@ async def test_setup_workflow_run_prefers_request_max_elapsed_time_over_workflow
     request = WorkflowRequestBody(data={}, max_elapsed_time_minutes=10)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
 

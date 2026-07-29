@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import Exists, and_, exists, func, select, text, update
+from sqlalchemy import Exists, and_, exists, func, or_, select, text, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +39,11 @@ MAX_SYSTEM_TAGS_PER_WORKFLOW = RUN_METADATA_MAX_KEYS
 MAX_SYSTEM_TAGS_PER_RUN = RUN_METADATA_MAX_KEYS
 SYSTEM_TAG_CALLER_ID = "system"
 
+# Cap on distinct values surfaced per grouped key in get_run_tag_suggestions, so a
+# single high-cardinality key (one distinct value per run) can't fill the whole limit
+# and starve keys that sort after it. Standalone labels (key is None) stay uncapped.
+SUGGESTIONS_VALUES_PER_KEY = 3
+
 
 class TagCountLimitExceeded(ValueError):
     """Raised when an apply would push a workflow over MAX_TAGS_PER_WORKFLOW."""
@@ -49,6 +54,10 @@ class TagValueRenameCollision(ValueError):
     already exists active org-wide. v1 rejects rather than merging."""
 
 
+class TagValueAlreadyExists(ValueError):
+    """Raised when registering a ``(key, value)`` that is already registered active."""
+
+
 class RunTagWorkflowRunMismatch(ValueError):
     """Raised when a run-tag write targets a workflow run outside the supplied org."""
 
@@ -57,6 +66,7 @@ class RunTagWorkflowRunMismatch(ValueError):
 # BusinessLogicError (WARN), not UnexpectedError (ERROR).
 register_passthrough_exception(TagCountLimitExceeded)
 register_passthrough_exception(TagValueRenameCollision)
+register_passthrough_exception(TagValueAlreadyExists)
 register_passthrough_exception(RunTagWorkflowRunMismatch)
 
 
@@ -792,6 +802,46 @@ class TagsRepository(BaseRepository):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @db_operation("get_run_tag_suggestions")
+    async def get_run_tag_suggestions(
+        self,
+        organization_id: str,
+        limit: int = 1000,
+        key_prefix: str | None = None,
+    ) -> list[tuple[str | None, str | None]]:
+        """Distinct (key, value) pairs from active run-tag SET events for the org,
+        including reserved ``skyvern.*`` system keys (the registry-backed
+        ``list_tag_keys``/``list_tag_values`` never see these, so this is their only
+        surfacing path for pickers). Each grouped key contributes at most
+        ``SUGGESTIONS_VALUES_PER_KEY`` values so no single high-cardinality key can
+        consume the whole ``limit`` and starve keys that sort after it. When
+        ``key_prefix`` is provided, filtering happens before ranking and limiting."""
+        async with self.Session() as session:
+            distinct_pairs_stmt = (
+                select(WorkflowRunTagEventModel.key, WorkflowRunTagEventModel.value)
+                .where(WorkflowRunTagEventModel.organization_id == organization_id)
+                .where(WorkflowRunTagEventModel.superseded_at.is_(None))
+                .where(WorkflowRunTagEventModel.event_type == TagEventType.SET.value)
+            )
+            if key_prefix is not None:
+                distinct_pairs_stmt = distinct_pairs_stmt.where(WorkflowRunTagEventModel.key.startswith(key_prefix))
+            distinct_pairs = distinct_pairs_stmt.distinct().subquery()
+            ranked = select(
+                distinct_pairs.c.key,
+                distinct_pairs.c.value,
+                func.row_number()
+                .over(partition_by=distinct_pairs.c.key, order_by=distinct_pairs.c.value.asc())
+                .label("rn"),
+            ).subquery()
+            stmt = (
+                select(ranked.c.key, ranked.c.value)
+                .where(or_(ranked.c.key.is_(None), ranked.c.rn <= SUGGESTIONS_VALUES_PER_KEY))
+                .order_by(ranked.c.key.asc(), ranked.c.value.asc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return [(key, value) for key, value in result]
+
     @db_operation("recolor_tag_value")
     async def recolor_tag_value(
         self,
@@ -801,7 +851,10 @@ class TagsRepository(BaseRepository):
         color: str,
     ) -> TagValueModel | None:
         """Recolor an existing (key, value) registry row. Returns None when the pair
-        is not registered for the org (caller should 404)."""
+        is not registered for the org (caller should 404). Reserved ``skyvern.*``
+        keys are system-managed and always rejected (no system recolor path exists)."""
+        if is_reserved_tag_key(key):
+            raise ValueError("reserved skyvern.* tag values are system-managed and cannot be recolored")
         async with self.Session() as session:
             stmt = (
                 select(TagValueModel)
@@ -817,6 +870,73 @@ class TagsRepository(BaseRepository):
             await session.commit()
             await session.refresh(row)
             return row
+
+    @db_operation("register_tag_value")
+    async def register_tag_value(
+        self,
+        organization_id: str,
+        key: str,
+        value: str,
+        color: str | None = None,
+    ) -> TagValueModel:
+        """Register a grouped label ``(key, value)`` before any workflow uses it
+        (the settings-surface create path; applying tags registers implicitly).
+        Also registers the key row so the group shows up in pickers. Writes no
+        tag events — the label attaches to nothing yet. Raises
+        ``TagValueAlreadyExists`` when the pair is already registered active;
+        reserved ``skyvern.*`` keys are always rejected (system-managed)."""
+        if is_reserved_tag_key(key):
+            raise ValueError("reserved skyvern.* tag values are system-managed and cannot be created manually")
+        async with self.Session() as session:
+            existing = (
+                await session.execute(
+                    select(TagValueModel).where(
+                        and_(
+                            TagValueModel.organization_id == organization_id,
+                            TagValueModel.key == key,
+                            TagValueModel.value == value,
+                            TagValueModel.deleted_at.is_(None),
+                        )
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                raise TagValueAlreadyExists(f"tag value '{key}:{value}' already exists")
+
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+            insert = sqlite.insert if dialect_name == "sqlite" else postgresql.insert
+            # ON CONFLICT DO NOTHING keeps a concurrent create/apply race benign;
+            # the read-back below returns whichever row won.
+            await session.execute(
+                insert(TagValueModel.__table__)
+                .values(organization_id=organization_id, key=key, value=value, color=color or random_tag_color())
+                .on_conflict_do_nothing(
+                    index_elements=["organization_id", "key", "value"],
+                    index_where=text("deleted_at IS NULL"),
+                )
+            )
+            await session.execute(
+                insert(TagKeyModel.__table__)
+                .values(organization_id=organization_id, key=key)
+                .on_conflict_do_nothing(
+                    index_elements=["organization_id", "key"],
+                    index_where=text("deleted_at IS NULL"),
+                )
+            )
+            await session.commit()
+
+            return (
+                await session.execute(
+                    select(TagValueModel).where(
+                        and_(
+                            TagValueModel.organization_id == organization_id,
+                            TagValueModel.key == key,
+                            TagValueModel.value == value,
+                            TagValueModel.deleted_at.is_(None),
+                        )
+                    )
+                )
+            ).scalar_one()
 
     @db_operation("get_tag_key")
     async def get_tag_key(self, organization_id: str, key: str) -> TagKeyModel | None:
@@ -1128,7 +1248,12 @@ class TagsRepository(BaseRepository):
         iterates in Python. Fine for realistic key fan-out (a key on at most a
         few hundred workflows) and a one-off admin action; if a key ever spans
         thousands of workflows, switch to a bulk UPDATE (supersede) + batched
-        INSERT for the DELETE events to avoid the ORM round-trip."""
+        INSERT for the DELETE events to avoid the ORM round-trip.
+
+        Reserved ``skyvern.*`` keys are rejected unless the write carries system
+        provenance, so no user-provenance DELETE can land in the system-tag event log."""
+        if is_reserved_tag_key(key) and context.source != TagSource.SYSTEM:
+            raise ValueError("reserved skyvern.* tag keys can only be modified with system provenance")
         now = datetime.now(timezone.utc)
         async with self.Session() as session:
             key_row = (
@@ -1210,7 +1335,12 @@ class TagsRepository(BaseRepository):
 
         DELETE events don't match the SET-only partial UNIQUE, so superseding the SET
         and inserting the DELETE in one transaction needs no flush ordering (same as
-        ``delete_tag_key``). The same accepted delete-vs-SET race applies."""
+        ``delete_tag_key``). The same accepted delete-vs-SET race applies.
+
+        Reserved ``skyvern.*`` keys are rejected unless the write carries system
+        provenance, so no user-provenance DELETE can land in the system-tag event log."""
+        if is_reserved_tag_key(key) and context.source != TagSource.SYSTEM:
+            raise ValueError("reserved skyvern.* tag values can only be modified with system provenance")
         now = datetime.now(timezone.utc)
         async with self.Session() as session:
             value_row = (
@@ -1310,7 +1440,12 @@ class TagsRepository(BaseRepository):
         coexist with the rename — surfacing as a transient IntegrityError on the partial
         UNIQUE (the caller's one retry covers it) or two active SETs that the next apply
         reconciles. Serializing would need dialect-specific row/advisory locking,
-        disproportionate for a rare manual admin action."""
+        disproportionate for a rare manual admin action.
+
+        Reserved ``skyvern.*`` keys are rejected unless the write carries system
+        provenance, so no user-provenance SET can land in the system-tag event log."""
+        if is_reserved_tag_key(key) and context.source != TagSource.SYSTEM:
+            raise ValueError("reserved skyvern.* tag values can only be modified with system provenance")
         now = datetime.now(timezone.utc)
         async with self.Session() as session:
             old_row = (

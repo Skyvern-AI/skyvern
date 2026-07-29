@@ -44,12 +44,18 @@ def register_passthrough_exception(exc_type: type[Exception]) -> None:
         _PASSTHROUGH_EXCEPTIONS = (*_PASSTHROUGH_EXCEPTIONS, exc_type)
 
 
-def db_operation(operation_name: str, log_errors: bool = True) -> Callable[[Callable[P, R]], Callable[P, R]]:
+def db_operation(
+    operation_name: str,
+    log_errors: bool = True,
+    expected_errors: tuple[type[Exception], ...] = (),
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator that wraps an async function with standardized DB error handling.
 
     - Pass-through exceptions (NotFoundError, ScheduleLimitExceededError, etc.):
       logged at WARNING level then re-raised — visible to monitoring but not
       treated as infrastructure errors.
+    - expected_errors: logged at DEBUG then re-raised, for conditions the caller
+      already handles as a normal outcome.
     - SQLAlchemyError: logged with LOG.error() then re-raised
     - Exception: logged with LOG.error() then re-raised
 
@@ -57,6 +63,11 @@ def db_operation(operation_name: str, log_errors: bool = True) -> Callable[[Call
         operation_name: Human-readable name used in log messages for context.
         log_errors: Whether to log errors before re-raising. Set to False when
             stacked under @read_retry() to avoid duplicate log entries.
+        expected_errors: Exception types this operation's callers treat as an
+            expected, handled outcome rather than a failure. Declaring one keeps
+            the wrapper from asserting an error level the caller contradicts.
+            Empty by default, so every operation is loud unless it opts in — keep
+            a declared set no wider than the caller's own ``except``.
 
     Usage:
         @db_operation("get_task")
@@ -76,6 +87,16 @@ def db_operation(operation_name: str, log_errors: bool = True) -> Callable[[Call
             except _PASSTHROUGH_EXCEPTIONS:
                 if log_errors:
                     LOG.warning("BusinessLogicError", operation=operation_name, exc_info=True)
+                raise
+            # Must precede the SQLAlchemyError branch: a declared type is usually a subclass of it.
+            except expected_errors as exc:
+                if log_errors:
+                    LOG.debug(
+                        "ExpectedError",
+                        operation=operation_name,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
                 raise
             except SQLAlchemyError:
                 if log_errors:

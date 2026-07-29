@@ -24,9 +24,11 @@ from skyvern.forge.sdk.api.real_gcp import RealAsyncGcsStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
+    SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
@@ -153,11 +155,17 @@ class GcsStorage(BaseStorage):
         return await self.async_client.download_file(artifact.uri)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        share_urls = await self.async_client.create_signed_urls([artifact.uri])
+        share_urls = await self.get_share_links([artifact])
         return share_urls[0] if share_urls else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return await self.async_client.create_signed_urls([artifact.uri for artifact in artifacts])
+        return await presign_with_sensitive_cap(
+            artifacts,
+            presign=self.async_client.create_signed_urls,
+            presign_sensitive=lambda uris: self.async_client.create_signed_urls(
+                uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
+            ),
+        )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         storage_class = await self._get_storage_class_for_org(artifact.organization_id)
@@ -173,7 +181,7 @@ class GcsStorage(BaseStorage):
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=storage_class, tags=tags)
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"gs://{settings.GCS_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         storage_class = await self._get_storage_class_for_org(organization_id)
@@ -188,6 +196,7 @@ class GcsStorage(BaseStorage):
             tags=tags,
         )
         await self.async_client.upload_file_from_path(to_path, from_path, storage_class=storage_class, tags=tags)
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"gs://{settings.GCS_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
@@ -261,9 +270,15 @@ class GcsStorage(BaseStorage):
             storage_class=storage_class,
             tags=tags,
         )
-        await self.async_client.upload_file_from_path(
-            profile_uri, zip_file_path, storage_class=storage_class, tags=tags
-        )
+        try:
+            await self.async_client.upload_file_from_path(
+                profile_uri, zip_file_path, storage_class=storage_class, tags=tags
+            )
+        finally:
+            # make_archive writes temp_zip_file.name + ".zip", a separate file the NamedTemporaryFile
+            # cleanup never removes; drop it so successful profile banks don't leak zips into TEMP_PATH.
+            if os.path.exists(zip_file_path):
+                os.remove(zip_file_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from GCS."""
@@ -278,12 +293,29 @@ class GcsStorage(BaseStorage):
         temp_zip_file_path = temp_zip_file.name
 
         temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
+        try:
+            unzip_files(temp_zip_file_path, temp_dir)
+        finally:
+            # The downloaded archive is a delete=False temp file; remove it so cookie-bearing zips
+            # don't accumulate in TEMP_PATH on every profile retrieve (e.g. each cookie-only bank).
+            temp_zip_file.close()
+            os.unlink(temp_zip_file_path)
         return temp_dir
 
-    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
-        """Delete a browser profile from GCS."""
+    async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
+        """Non-destructive existence check via object metadata — avoids downloading the whole archive."""
+        profile_uri = (
+            f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        # Not-found returns None (-> False); transient/authz errors propagate so the has-content
+        # fail-safe treats a flaky read as existing content instead of reseeding a run to fresh and
+        # overwriting its saved archive.
+        return await self.async_client.get_object_info(profile_uri) is not None
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
+        """Delete a browser profile from GCS. hard_delete does a terminal object delete (full erasure while
+        the bucket has no object versioning/soft-delete). It does NOT purge old generations — if versioning
+        is enabled, expire noncurrent generations via a GCS lifecycle rule. Delete failures propagate."""
         profile_uri = (
             f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )

@@ -119,6 +119,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=data.credential.totp_identifier,
                 card_last4=None,
                 card_brand=None,
+                tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
             )
@@ -134,6 +135,7 @@ class CredentialVaultService(ABC):
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
+                tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
             )
@@ -150,6 +152,7 @@ class CredentialVaultService(ABC):
                 card_brand=None,
                 totp_identifier=None,
                 secret_label=data.credential.secret_label,
+                tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
             )
@@ -182,6 +185,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=data.credential.totp_identifier,
                 card_last4=None,
                 card_brand=None,
+                tested_url=data.tested_url,
                 **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
@@ -196,6 +200,7 @@ class CredentialVaultService(ABC):
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
+                tested_url=data.tested_url,
                 **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.SECRET:
@@ -211,6 +216,7 @@ class CredentialVaultService(ABC):
                 card_brand=None,
                 totp_identifier=None,
                 secret_label=data.credential.secret_label,
+                tested_url=data.tested_url,
                 **proxy_kwargs,
             )
         else:

@@ -20,8 +20,9 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
 
-// A code block's recorded actions, fetched once from the run timeline after
-// a run_outcome frame arrives (block_progress carries no action detail).
+// A block's recorded actions, fetched from the run timeline while the test run
+// is live (polled from the first frame that carries the run id) and again at
+// adjudication. block_progress carries no action detail, only the run id.
 export interface RecordedActionSummary {
   actionId: string;
   label: string;
@@ -87,6 +88,32 @@ export type BlockOutcome =
   | "not_demonstrated"
   | "not_evaluated";
 
+export interface TerminalEnvelopeFacts {
+  runVerdict: BlockOutcome | null;
+  runDisplayReason: string | null;
+}
+
+// Envelope dicts are backend model_dump output, so keys stay snake_case.
+// The backend anchors run_verdict from final outcomes only, so "evaluating"
+// is not a wire value here and parses to null like any unknown.
+export function parseTerminalEnvelope(
+  raw: unknown,
+): TerminalEnvelopeFacts | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const v = obj.run_verdict;
+  return {
+    runVerdict:
+      v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
+        ? v
+        : null,
+    runDisplayReason:
+      typeof obj.run_display_reason === "string"
+        ? obj.run_display_reason
+        : null,
+  };
+}
+
 export interface BlockState {
   workflowRunBlockId: string;
   label: string;
@@ -104,8 +131,8 @@ export interface BlockState {
   // ``done · 0:14``-style elapsed pill in the card.
   startedAt: string | null;
   endedAt: string | null;
-  // Recorded actions fetched post-run for progressive reveal. Undefined
-  // until the one-shot fetch resolves; set at most once (idempotent).
+  // Recorded actions for progressive reveal. Undefined until the first fetch
+  // resolves; grows by actionId as live polls return more (idempotent merge).
   recordedActions?: RecordedActionSummary[];
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
@@ -127,6 +154,9 @@ export interface ActivityEntry {
   success?: boolean;
   // Stable per-event id used as React key.
   id: string;
+  // Consecutive same-tool retries folded into this row by
+  // condenseActivityEntries. Unset outside that transform.
+  attempts?: number;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -150,6 +180,10 @@ export interface TurnNarrativeState {
   // Outcome-evidence verdict authorizing tested-success claims (ADR 0005).
   // Null means unknown (legacy/grafted rows) — distinct from false.
   verifiedSuccess: boolean | null;
+  // Run-outcome facts from the backend-finalized terminal envelope carried
+  // in the narrative payload. Authoritative once runVerdict is set; null on
+  // rows persisted before the envelope existed.
+  terminalEnvelope: TerminalEnvelopeFacts | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -200,6 +234,15 @@ export interface TurnNarrativeState {
     displayReason: string | null;
     activitySeqAtVerdict: number;
   } | null;
+  // Terminal-mode credential ask, from the credentialPrompt narrative signal.
+  // reason is kept as a raw string — the card tolerates unknown tokens.
+  credentialPrompt: { reason: string } | null;
+  // Resolved pause outcome, from the credentialPause narrative signal.
+  // "declined" means the pause engaged but never sent a frame, so no card.
+  credentialPause: {
+    outcome: "connected" | "skipped" | "timeout" | "declined";
+    credentialId: string | null;
+  } | null;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -210,6 +253,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   proposalDisposition: null,
   responseKind: null,
   verifiedSuccess: null,
+  terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -227,6 +271,8 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   authoringCount: 0,
   activitySeq: 0,
   lastRunOutcome: null,
+  credentialPrompt: null,
+  credentialPause: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -254,6 +300,34 @@ export function parseResponseKind(value: unknown): TurnResponseKind | null {
     value === "recover"
     ? value
     : null;
+}
+
+export function parseCredentialPrompt(
+  value: unknown,
+): TurnNarrativeState["credentialPrompt"] {
+  if (!value || typeof value !== "object") return null;
+  const reason = (value as Record<string, unknown>).reason;
+  return typeof reason === "string" && reason.length > 0 ? { reason } : null;
+}
+
+export function parseCredentialPause(
+  value: unknown,
+): TurnNarrativeState["credentialPause"] {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const outcome = o.outcome;
+  if (
+    outcome !== "connected" &&
+    outcome !== "skipped" &&
+    outcome !== "timeout" &&
+    outcome !== "declined"
+  ) {
+    return null;
+  }
+  return {
+    outcome,
+    credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+  };
 }
 
 // Tool calls that write the workflow definition. update_workflow only
@@ -291,6 +365,8 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   navigate_browser: "Opening page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
+  discover_workflow_entrypoint: "Finding the entry page",
+  inspect_page_for_composition: "Inspecting the page",
 };
 
 export function toolActivityDisplayLabel(toolName?: string | null): string {
@@ -345,6 +421,129 @@ function buildActivityFromNarration(
   };
 }
 
+// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention —
+// also used by copilotPhases.ts's hasPendingToolCall.
+export function toolCallIdOf(entry: ActivityEntry): string | undefined {
+  return entry.kind === "tool_call" || entry.kind === "tool_result"
+    ? entry.id.slice(3)
+    : undefined;
+}
+
+// Folds each tool_call/tool_result pair into one row (pending while
+// unresolved, replaced by its result once it lands) so a single tool
+// invocation never renders as two chatter lines, then folds a run of
+// same-tool retries into the last attempt's row with an attempt count —
+// only the terminal outcome of a retry chain ever shows red, intermediate
+// failed attempts stay quiet.
+//
+// Chronology, not just row count: a call is only replaced IN PLACE when
+// nothing else streamed while it was pending. If a narration arrived first
+// (the narrator can emit mid-flight progress on a slow call), replacing in
+// place would render the result ahead of a narration that genuinely came
+// earlier — so the stale pending row is dropped instead and the result
+// lands at its own later, true position.
+//
+// The retry fold below deliberately ignores narration rows entirely for
+// adjacency (tracks the last TOOL row, not literal array adjacency).
+// Array position alone can't reliably tell "narration mid-flight during
+// this attempt" from "narration genuinely between two attempts" once a
+// retry's own narration is involved — a mid-flight narration during
+// attempt 2 lands in the exact same ordered position as one that arrived
+// between attempt 1 and attempt 2. Since there's no per-entry signal to
+// disambiguate the two, narration never breaks a retry fold, full stop.
+// Folding itself follows the same drop-and-reinsert rule as pairing above:
+// the earlier attempt's row is removed rather than overwritten in place,
+// so a narration that streamed before the later attempt's result still
+// reads as arriving before it, not after.
+//
+// Known tradeoff: toolName is the only correlation signal available here
+// (no argument/target identity on the wire), so two independent same-tool
+// calls where only the first fails will also fold into one falsely-labeled
+// "retry" row. Accepted for this content-classification pass.
+//
+// A tool without a dedicated backend summary falls back to a bare "OK"
+// (summarize_tool_result in output_utils.py). That used to sit right below
+// its own "<tool name> · calling…" row, so the tool name was still visible
+// above it; condensing removes that row, leaving an unlabeled "OK" with no
+// context. Substitute the humanized tool name only for that exact literal
+// — a real backend summary always passes through untouched.
+const UNMAPPED_TOOL_RESULT_FALLBACK = "OK";
+
+function withHumanizedFallback(entry: ActivityEntry): ActivityEntry {
+  if (
+    entry.kind !== "tool_result" ||
+    entry.text !== UNMAPPED_TOOL_RESULT_FALLBACK
+  ) {
+    return entry;
+  }
+  return {
+    ...entry,
+    text: entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName),
+  };
+}
+
+export function condenseActivityEntries(
+  entries: ActivityEntry[],
+): ActivityEntry[] {
+  const callIndexById = new Map<string, number>();
+  const paired: (ActivityEntry | null)[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "tool_call") {
+      const id = toolCallIdOf(entry);
+      const idx = paired.push(entry) - 1;
+      if (id !== undefined) callIndexById.set(id, idx);
+      continue;
+    }
+    if (entry.kind === "tool_result") {
+      const id = toolCallIdOf(entry);
+      const idx = id !== undefined ? callIndexById.get(id) : undefined;
+      if (idx !== undefined) {
+        callIndexById.delete(id!);
+        if (idx === paired.length - 1) {
+          paired[idx] = entry;
+        } else {
+          paired[idx] = null;
+          paired.push(entry);
+        }
+      } else {
+        // Its tool_call was evicted past the activity cap — keep the
+        // result visible rather than silently dropping it.
+        paired.push(entry);
+      }
+      continue;
+    }
+    paired.push(entry);
+  }
+  const ordered = paired.filter((e): e is ActivityEntry => e !== null);
+
+  const condensed: (ActivityEntry | null)[] = [];
+  let lastToolIdx = -1;
+  for (const entry of ordered) {
+    const prevTool = lastToolIdx >= 0 ? condensed[lastToolIdx] : undefined;
+    if (
+      prevTool &&
+      entry.toolName !== undefined &&
+      prevTool.toolName === entry.toolName &&
+      prevTool.success === false
+    ) {
+      condensed[lastToolIdx] = null;
+      lastToolIdx =
+        condensed.push({
+          ...entry,
+          attempts: (prevTool.attempts ?? 1) + 1,
+        }) - 1;
+      continue;
+    }
+    const idx = condensed.push(entry) - 1;
+    if (entry.toolName !== undefined) {
+      lastToolIdx = idx;
+    }
+  }
+  return condensed
+    .filter((e): e is ActivityEntry => e !== null)
+    .map(withHumanizedFallback);
+}
+
 function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   const next = [...arr, entry];
   return next.length > cap ? next.slice(next.length - cap) : next;
@@ -355,6 +554,39 @@ function appendActivity(
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  // A run tool's result must rejoin its call's bucket. The run flips the active
+  // block between the call and the result, so routing the result to the live
+  // active block would split the call/result pair across buckets and it could
+  // never fold (mirrors the backend NarratorState._activity_bucket_label fix).
+  if (
+    entry.kind === "tool_result" &&
+    entry.toolName !== undefined &&
+    RUN_TOOLS.has(entry.toolName)
+  ) {
+    const callId = `tc-${toolCallIdOf(entry) ?? ""}`;
+    if (designActivity.some((e) => e.id === callId)) {
+      return {
+        blocks,
+        designActivity: appendCapped(
+          designActivity,
+          entry,
+          MAX_DESIGN_ACTIVITY_ENTRIES,
+        ),
+      };
+    }
+    const callBlockIdx = blocks.findIndex((b) =>
+      b.activity.some((e) => e.id === callId),
+    );
+    if (callBlockIdx !== -1) {
+      const nextBlocks = blocks.slice();
+      const callBlock = nextBlocks[callBlockIdx]!;
+      nextBlocks[callBlockIdx] = {
+        ...callBlock,
+        activity: appendCapped(callBlock.activity, entry, MAX_ACTIVITY_ENTRIES),
+      };
+      return { blocks: nextBlocks, designActivity };
+    }
+  }
   const activeIdx = blocks.findIndex((b) => b.state === "running");
   if (activeIdx === -1) {
     return {
@@ -407,6 +639,21 @@ export function isBlockOk(
     block.outcome === "demonstrated" ||
     block.outcome === "not_evaluated"
   );
+}
+
+// Labels that occur exactly once in the given set — the only labels safe to
+// key recorded actions on when the run-block id is missing (the terminal
+// narrative_payload drops workflowRunBlockId). Loop iterations reuse a label,
+// so an ambiguous label falls back to today's drop rather than mis-attributing.
+function uniqueLabelSet(labels: Array<string | undefined>): Set<string> {
+  const counts = new Map<string, number>();
+  for (const label of labels) {
+    if (!label) continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const unique = new Set<string>();
+  for (const [label, n] of counts) if (n === 1) unique.add(label);
+  return unique;
 }
 
 export function applyNarrativeEvent(
@@ -551,25 +798,41 @@ export function applyNarrativeEvent(
     }
 
     case "client_block_actions": {
-      // Idempotent merge: a block's recordedActions is set at most once, so
-      // a duplicate fetch response (or a re-dispatched event) is a no-op.
-      // Stagger each matched block's reveal start past the running total of
-      // its predecessors' own schedules, so a multi-block run replays in
-      // execution order instead of all at once.
+      // Idempotent grow-merge: live polling re-fetches the same run repeatedly
+      // and returns a growing action set. First sighting seeds the reveal
+      // anchor (recordedActionsAt), staggered past preceding blocks' schedules
+      // so a multi-block run replays in execution order. Later fetches append
+      // only actions we haven't seen (keyed by actionId) and keep the anchor
+      // fixed, so already-revealed rows never restart or duplicate.
+      // ponytail: an existing action's fields (duration/summary) are frozen at
+      // first sighting; if code-block streaming (null-then-backfill) makes that
+      // visibly wrong, re-merge matched actionIds instead of skipping them.
       let carry = 0;
       let changed = false;
+      // Match by run-block id only. A terminal frame restores each block's real
+      // id from the live blocks (see the `response` case), so a post-terminal
+      // fetch still matches by id — and a different run's ids never collide with
+      // this turn's, keeping late fetches from cross-contaminating prior turns.
       const blocks = prev.blocks.map((b) => {
-        if (b.recordedActions !== undefined) return b;
         const match = event.blocks.find(
           (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
         );
         if (!match || match.actions.length === 0) return b;
+        const existing = b.recordedActions;
+        if (existing === undefined) {
+          changed = true;
+          const recordedActionsAt = event.receivedAtMs + carry;
+          const offsets = buildRevealOffsets(
+            match.actions.map((a) => a.durationMs),
+          );
+          carry += offsets[offsets.length - 1] ?? 0;
+          return { ...b, recordedActions: match.actions, recordedActionsAt };
+        }
+        const known = new Set(existing.map((a) => a.actionId));
+        const additions = match.actions.filter((a) => !known.has(a.actionId));
+        if (additions.length === 0) return b;
         changed = true;
-        const recordedActionsAt = event.receivedAtMs + carry;
-        const durations = match.actions.map((a) => a.durationMs);
-        const offsets = buildRevealOffsets(durations);
-        carry += offsets[offsets.length - 1] ?? 0;
-        return { ...b, recordedActions: match.actions, recordedActionsAt };
+        return { ...b, recordedActions: [...existing, ...additions] };
       });
       return changed ? { ...prev, blocks } : prev;
     }
@@ -662,24 +925,44 @@ export function applyNarrativeEvent(
     case "response": {
       const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
       if (hydrated) {
-        // The backend payload never carries recordedActions/recordedActionsAt
-        // (client-only replay data); carry them over from the prior live
-        // blocks so a fetch that resolved before this terminal frame
-        // survives hydration instead of being silently dropped.
-        const recordedById = new Map(
+        // The BE narrative_payload drops workflowRunBlockId and the client-only
+        // recordedActions. Re-associate each hydrated block with the live block
+        // of the same label to restore its real run-block id (and carry any
+        // recordedActions). Restoring the real id keeps this frozen turn keyed
+        // by id, so a later test run that reuses a label matches by id and can't
+        // graft its actions onto this turn. Unique labels only — loop iterations
+        // reuse a label and can't be told apart without the id.
+        const liveById = new Map(
           prev.blocks
-            .filter((b) => b.recordedActions !== undefined)
+            .filter((b) => b.workflowRunBlockId !== "")
             .map((b) => [b.workflowRunBlockId, b] as const),
         );
+        const uniqueLiveLabels = uniqueLabelSet(
+          prev.blocks.map((b) => b.label),
+        );
+        const uniqueHydratedLabels = uniqueLabelSet(
+          hydrated.blocks.map((b) => b.label),
+        );
+        const liveByLabel = new Map(
+          prev.blocks
+            .filter((b) => uniqueLiveLabels.has(b.label))
+            .map((b) => [b.label, b] as const),
+        );
         const blocks = hydrated.blocks.map((b) => {
-          const carried = recordedById.get(b.workflowRunBlockId);
-          return carried
-            ? {
-                ...b,
-                recordedActions: carried.recordedActions,
-                recordedActionsAt: carried.recordedActionsAt,
-              }
-            : b;
+          const live =
+            (b.workflowRunBlockId !== ""
+              ? liveById.get(b.workflowRunBlockId)
+              : undefined) ??
+            (b.workflowRunBlockId === "" && uniqueHydratedLabels.has(b.label)
+              ? liveByLabel.get(b.label)
+              : undefined);
+          if (!live) return b;
+          return {
+            ...b,
+            workflowRunBlockId: live.workflowRunBlockId,
+            recordedActions: live.recordedActions,
+            recordedActionsAt: live.recordedActionsAt,
+          };
         });
         return {
           ...hydrated,
@@ -923,6 +1206,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.verifiedSuccess === "boolean"
         ? payload.verifiedSuccess
         : null,
+    terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
     draft,
@@ -944,6 +1228,8 @@ export function hydrateNarrativeFromPayload(
         : null,
     endedAt:
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
+    credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
+    credentialPause: parseCredentialPause(payload.credentialPause),
   };
 }
 
@@ -1006,7 +1292,7 @@ export function formatElapsed(
 export interface TurnSummary {
   headline: string;
   stats: string[];
-  accent: "ok" | "fail" | "qa";
+  accent: "ok" | "fail" | "qa" | "warn";
   glyph: string;
   isFail: boolean;
   isQA: boolean;
@@ -1045,6 +1331,49 @@ interface AdjudicatedParts {
   glyph: string;
 }
 
+export interface NotConfirmedOutcome {
+  verdict: "not_demonstrated";
+  displayReason: string | null;
+}
+
+export function notConfirmedOutcome(
+  turn: Pick<
+    TurnNarrativeState,
+    "terminalEnvelope" | "lastRunOutcome" | "blocks"
+  >,
+): NotConfirmedOutcome | null {
+  // The backend-finalized envelope is authoritative once it carries a run
+  // verdict; the pointer/block inference below only covers rows persisted
+  // before the envelope existed (or envelopes from run-less turns).
+  const envelope = turn.terminalEnvelope;
+  if (envelope !== null && envelope.runVerdict !== null) {
+    return envelope.runVerdict === "not_demonstrated"
+      ? {
+          verdict: "not_demonstrated",
+          displayReason: envelope.runDisplayReason,
+        }
+      : null;
+  }
+  if (turn.lastRunOutcome !== null) {
+    return turn.lastRunOutcome.verdict === "not_demonstrated"
+      ? {
+          verdict: "not_demonstrated",
+          displayReason: turn.lastRunOutcome.displayReason,
+        }
+      : null;
+  }
+  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
+    const block = turn.blocks[i]!;
+    if (block.outcome === "not_demonstrated") {
+      return {
+        verdict: "not_demonstrated",
+        displayReason: block.outcomeReason ?? null,
+      };
+    }
+  }
+  return null;
+}
+
 // Headline parts from the typed terminal adjudication. Returns null when the
 // turn predates the typed signal; a build kind without a verdict also falls
 // back to the legacy inference chain so genuinely-tested historical turns
@@ -1070,15 +1399,20 @@ function adjudicatedSummaryParts(
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (turn.responseKind !== "build") {
+    if (turn.responseKind === "refuse") {
+      return { headline: "Declined", accent: "qa", glyph: "✦" };
+    }
+    if (turn.responseKind === "diagnose") {
+      return { headline: "Answered", accent: "qa", glyph: "✦" };
+    }
+    if (
+      turn.responseType !== "ASK_QUESTION" &&
+      notConfirmedOutcome(turn)?.verdict === "not_demonstrated"
+    ) {
+      return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
+    }
     return {
-      headline:
-        turn.responseKind === "refuse"
-          ? "Declined"
-          : turn.responseKind === "diagnose"
-            ? "Answered"
-            : uxV1
-              ? "Needs your input"
-              : "Question",
+      headline: uxV1 ? "Needs your input" : "Question",
       accent: "qa",
       glyph: "✦",
     };
@@ -1089,6 +1423,13 @@ function adjudicatedSummaryParts(
   }
   if (flags.needsTestedProposalReview) {
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
+  }
+  if (turn.responseType === "ASK_QUESTION") {
+    return {
+      headline: uxV1 ? "Needs your input" : "Question",
+      accent: "qa",
+      glyph: "✦",
+    };
   }
   if (!turn.verifiedSuccess) {
     if (flags.hasCleanCompletedBuild) {

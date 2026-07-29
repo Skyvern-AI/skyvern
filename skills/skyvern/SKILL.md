@@ -20,7 +20,7 @@ Skyvern uses AI to navigate and interact with websites. Every command below is a
 | Throwaway autonomous trial | "try this once", "see if this works" | `skyvern browser run-task` | Higher | One-off autonomous agent for exploration. Do not use for recurring or multi-page production automations. |
 | Multi-page or reusable automation | "navigate a multi-page wizard", "set this up", "automate this weekly" | `skyvern workflow create` + `run` | N LLM + screenshots | Build a workflow with one block per step. Each block gets visual reasoning, verification, and reusable run history. |
 
-**MCP note:** if you are using the Skyvern MCP instead of the CLI, prefer `observe + execute` for same-page multi-step UI work. The CLI does not expose that pair directly.
+**MCP note:** if you are using the Skyvern MCP instead of the CLI, prefer `observe + execute` for same-page multi-step UI work on stdio; refs persist across calls until the next observe, navigation, or page/document context change. On hosted stateless HTTP, prefer `selector` or `intent` params; prior-call refs do not resolve, and one execute batch can use refs only when predictable before the call, never adaptively from an inline observe. The CLI does not expose that pair directly.
 
 ## Step 2: Apply These Decision Rules
 
@@ -90,7 +90,7 @@ skyvern browser act --prompt "Close the cookie banner, then click Sign In"
 ```
 
 **Warning:** act has NO screenshots in its LLM reasoning. It uses an economy accessibility tree.
-Fine for well-labeled elements. For visually complex targets, use MCP observe+click or hybrid mode.
+Fine for well-labeled elements. For visually complex targets, use MCP observe+execute on stdio (on hosted stateless HTTP prefer selector/intent) or hybrid mode.
 
 ### Same-page multi-step
 

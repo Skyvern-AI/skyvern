@@ -13,7 +13,10 @@ import {
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
+function useWorkflowRunWithWorkflowQuery(options?: {
+  workflowRunId?: string;
+  enabled?: boolean;
+}) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
   const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
@@ -55,7 +58,7 @@ function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
       }
       return statusIsRunningOrQueued(query.state.data);
     },
-    enabled: !!workflowRunId,
+    enabled: (options?.enabled ?? true) && !!workflowRunId,
   });
 }
 

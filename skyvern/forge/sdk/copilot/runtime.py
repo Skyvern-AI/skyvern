@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
@@ -45,22 +44,26 @@ from skyvern.webeye.browser_state import BrowserState
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
+    from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingSnapshot
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
+        MetadataRejectLadderState,
         RecordedBuildTestOutcome,
         RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
     )
+    from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
     from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -77,16 +80,6 @@ CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
-AuthorTimeGateAblationPayloadValue: TypeAlias = (
-    str
-    | int
-    | float
-    | bool
-    | None
-    | Sequence["AuthorTimeGateAblationPayloadValue"]
-    | dict[str, "AuthorTimeGateAblationPayloadValue"]
-)
-AuthorTimeGateAblationPayload: TypeAlias = dict[str, AuthorTimeGateAblationPayloadValue]
 SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
@@ -166,14 +159,38 @@ class RegisteredArtifactEvidence:
     workflow_run_id: str
 
 
-@dataclass(frozen=True)
-class AuthorTimeGateAblationEvent:
-    gate_id: str
-    reason_code: str
-    fingerprint: str
-    log_only: bool
-    blocked_tool: str | None = None
-    payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
+class ScoutedEquivalentInput(TypedDict):
+    input_key: str
+    parameter_value: str
+    transform: str
+
+
+class ScoutedInputCorrespondence(TypedDict):
+    input_key: str
+    matched_literal: str
+    parameter_value: str
+    surface: str
+    transform: str
+    position: int
+    equivalent_inputs: NotRequired[list[ScoutedEquivalentInput]]
+
+
+class ScoutedDynamicRowPeriodMatch(TypedDict):
+    period: str
+    selected_row_match_count: int
+    row_match_count: int
+
+
+class ScoutedDynamicRowEvidence(TypedDict):
+    source_url: str
+    target_selector: str
+    row_selector: str
+    row_text: str
+    row_selector_count: int
+    row_text_match_count: int
+    period_matches: list[ScoutedDynamicRowPeriodMatch]
+    selected_index: int
+    evidence_fingerprint: str
 
 
 class ScoutedInteraction(TypedDict):
@@ -181,6 +198,10 @@ class ScoutedInteraction(TypedDict):
     selector: NotRequired[str]
     source_url: NotRequired[str]
     value: NotRequired[str]
+    # Grounded value-containment witnesses computed at the update_workflow confluence; drive
+    # generator-owned templated locators. Empty/absent => literal replay.
+    input_correspondences: NotRequired[list[ScoutedInputCorrespondence]]
+    dynamic_row_evidence: NotRequired[ScoutedDynamicRowEvidence]
     typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
@@ -195,10 +216,37 @@ class ScoutedInteraction(TypedDict):
     control_value_satisfied: NotRequired[bool]
     trajectory_index: NotRequired[int]
     carried: NotRequired[bool]
+    # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
+    # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
+    ambiguous: NotRequired[bool]
     # Credential fills carry references and metadata only — never secret values.
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
     credential_name: NotRequired[str]
+    # Element identity fingerprint for credential-fill resolution: captured at fill time, attributes
+    # only (never values). Enables unambiguous identification of the scouted credential element
+    # across equivalent selectors (e.g., #pass vs input[type="password"]).
+    element_fingerprint_id: NotRequired[str]
+    element_fingerprint_name: NotRequired[str]
+    element_fingerprint_type: NotRequired[str]
+    element_fingerprint_placeholder: NotRequired[str]
+    element_fingerprint_label: NotRequired[str]
+    element_fingerprint_test_id: NotRequired[str]
+    element_fingerprint_tag: NotRequired[str]
+    element_fingerprint_probed: NotRequired[str]
+    # Stamped when exploration met a challenge here; read back by composition_challenge_carrier
+    # so synthesis emits solve_captcha(page) at this boundary.
+    challenge_state: NotRequired[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class PostRunPagePathInteractionWindow:
+    structural_key: str
+    workflow_run_id: str
+    trajectory_anchor: int
+    admitted_attempts: int = 0
+    observation_generation: int = 0
+    observed_successful_interactions: int = 0
 
 
 @dataclass
@@ -213,6 +261,7 @@ class AgentContext:
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
+    turn_intent: TurnIntent | None = None
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -273,6 +322,7 @@ class AgentContext:
     repeated_failure_nudge_emitted_at_streak: int = 0
     code_authoring_guardrail_reject_count: int = 0
     last_code_authoring_reject_was_credential_priority: bool = False
+    last_output_policy_reject_reason_codes: frozenset[str] | None = None
     # Climbs on each click that made no verified forward progress (failed/timed-out
     # click or a hollow post-click observe); resets on verified progress.
     consecutive_no_progress_interaction_count: int = 0
@@ -314,10 +364,12 @@ class AgentContext:
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
+    metadata_reject_ladder_state: MetadataRejectLadderState | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
+    authoring_parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None
     consecutive_non_converging_repair_count: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
@@ -344,6 +396,7 @@ class AgentContext:
     # only normalizes and carries the metadata; sufficiency checks live elsewhere.
     code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
     raw_code_artifact_metadata: object | None = None
+    submitted_code_artifact_metadata_snapshot: Any = None
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
@@ -358,6 +411,8 @@ class AgentContext:
     post_run_page_observation_url: str | None = None
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
+    post_run_page_observation_generation: int = 0
+    post_run_page_path_interaction_window: PostRunPagePathInteractionWindow | None = None
     post_run_current_page_inspection_workflow_run_id: str | None = None
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
@@ -372,6 +427,9 @@ class AgentContext:
     # preserves repeats and ordering so code_block_synthesis can emit a faithful
     # linear Playwright trajectory.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    # Solve attempts already spent per challenge. A challenge that never passes is precisely the
+    # one re-observed on every later capture, so cost otherwise grows with how stuck the turn is.
+    challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
@@ -379,15 +437,12 @@ class AgentContext:
     # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
     persisted_draft_browser_calls: list[tuple[str, str]] | None = None
     scouted_spine_checkpoint_fired: bool = False
+    scouted_spine_previous_omission_digest: str | None = None
+    scouted_spine_repeated_identical_missing_steps: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
-    output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
-    output_contract_deferral_count_by_signature: dict[str, int] = field(default_factory=dict)
     runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Progress-gated reset ledger: the last rejected draft's structural fingerprint and
-    # whether an imposition landed since, so a genuinely-changed re-attempt resets the
-    # steering-reject streak instead of counting cosmetic churn toward the cap.
-    output_contract_last_reject_fingerprint_by_signature: dict[str, str] = field(default_factory=dict)
+    # Whether an imposition landed for this contract since the last attempt.
     output_contract_imposed_since_last_reject_by_signature: dict[str, bool] = field(default_factory=dict)
     # Structural fingerprint captured when a structure directive was armed; a re-entry whose
     # fingerprint still matches means the directive went unconsumed (cosmetic churn), which
@@ -438,16 +493,25 @@ class AgentContext:
     # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
     pending_goal_complete_landing: bool = False
     synthesized_goal_complete_landed: bool = False
-    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
-    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    # Imposition answered this persist attempt on a goal-complete trajectory; owned-carrier metadata
+    # scaffolding keys off it (workflow_update._scaffold_metadata_from_owned_carrier_produced_output).
     spine_imposition_owned_attempt: bool = False
+    # Synthesized block computed by this persist attempt's imposition pass; the pre-persist spine gate
+    # reuses it so both seams grade one synthesis. Reset at each imposition entry.
+    imposition_synthesized_block: SynthesizedCodeBlock | None = None
+    # Label of the code block the imposition attempt owns this call (carrier), including on no-op early
+    # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
+    spine_imposition_carrier_label: str | None = None
     synthesized_block_reopened_after_failed_run: bool = False
-    synthesized_block_reopened_for_output_coverage: bool = False
     synthesized_block_reopened_for_credential_scout: bool = False
+    # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
+    # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
+    synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
     scouted_output_covered_paths: set[str] = field(default_factory=set)
+    # Ids of active terminal_action completion criteria the scout has structurally reached past the
+    # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.
+    scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
     scout_observation_contract: ScoutObservationContract | None = None
-    uncovered_output_rescout_context_key: str | None = None
-    uncovered_output_rescout_steer_key: str | None = None
     credential_scout_rescout_context_key: str | None = None
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
@@ -456,9 +520,6 @@ class AgentContext:
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None
     last_scout_observation_has_password_control: bool = False
-    # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
-    # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
-    download_scout_required_rejections: int = 0
     # Required parameter keys the build-test resolution seam could not bind from a user param,
     # a non-empty default, or a scout value. Reset per run; read when composing the run outcome.
     unbound_required_parameter_keys: list[str] = field(default_factory=list)
@@ -471,6 +532,19 @@ class AgentContext:
     # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
     # settle re-perception on whether that selector still resolves to a live element.
     pending_scout_click_selector: str | None = None
+    # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
+    # interaction only when the post-action resolved selector matches the probed one.
+    pending_scout_ambiguous: tuple[str, bool] | None = None
+    # (selector, role, accessible_name) captured pre-dispatch for an ambiguous selector only when the
+    # get_by_role(role, name, exact=True) re-anchor resolves to exactly one live element on the source
+    # page; a non-unique or nameless ambiguous selector leaves this None so synthesis drops the interaction.
+    pending_scout_reanchor: tuple[str, str, str] | None = None
+    # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
+    # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
+    pending_scout_dynamic_row: ScoutedDynamicRowEvidence | None = None
+    # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
+    # directly instead of silently accepting a dynamically attached dependency.
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.
@@ -487,11 +561,6 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
-    # Latest edited-schema-incompatibility terminal outcome, set when an edited
-    # extraction_schema declares fields that map to no output the block produces.
-    # Surfaced into the persisted TurnOutcome so a later turn can report it.
-    latest_schema_incompatibility: SchemaIncompatibility | None = None
-    author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
     # Single-owner turn-precedence contract. One mechanism owns a turn's steering
     # at a time; a contradicting weaker claim is recorded here and yields.
     turn_ownership: TurnOwnership | None = None
@@ -499,42 +568,6 @@ class AgentContext:
     # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
     # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
     blocker_signal_claimant: TurnClaimant | None = None
-
-
-def copilot_author_time_gate_log_only_enabled() -> bool:
-    return not settings.is_cloud_environment() and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
-
-
-def record_author_time_gate_ablation_event(
-    ctx: AgentContext,
-    *,
-    gate_id: str,
-    reason_code: str,
-    fingerprint: str,
-    blocked_tool: str | None = None,
-    payload: AuthorTimeGateAblationPayload | None = None,
-) -> bool:
-    if not copilot_author_time_gate_log_only_enabled():
-        return False
-    event = AuthorTimeGateAblationEvent(
-        gate_id=gate_id,
-        reason_code=reason_code,
-        fingerprint=fingerprint,
-        blocked_tool=blocked_tool,
-        payload=dict(payload or {}),
-        log_only=True,
-    )
-    ctx.author_time_gate_ablation_events.append(event)
-    LOG.info(
-        "copilot_author_time_gate_ablation_event",
-        gate_id=event.gate_id,
-        reason_code=event.reason_code,
-        fingerprint=event.fingerprint,
-        blocked_tool=event.blocked_tool,
-        log_only=event.log_only,
-        payload=event.payload,
-    )
-    return True
 
 
 def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:
@@ -606,6 +639,33 @@ async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, Brow
     return session_id, browser_state, page
 
 
+async def resolve_browser_state_for_context(
+    ctx: AgentContext,
+    *,
+    session_id: str | None = None,
+) -> BrowserState | None:
+    resolved_session_id = session_id if session_id is not None else ctx.browser_session_id
+    if not resolved_session_id:
+        return None
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
+        try:
+            _resolved_session_id, browser_state, _ = await _resolve_self_heal_browser_state(ctx)
+            if _resolved_session_id != resolved_session_id:
+                LOG.info(
+                    "Resolved self-heal browser session id differs from requested",
+                    requested_session_id=resolved_session_id,
+                    resolved_session_id=_resolved_session_id,
+                    organization_id=ctx.organization_id,
+                )
+            return browser_state
+        except HealAdoptionFailed:
+            return None
+    return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+        session_id=resolved_session_id,
+        organization_id=ctx.organization_id,
+    )
+
+
 @asynccontextmanager
 async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
@@ -642,10 +702,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         ctx.browser_session_id = browser_session_id
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
     else:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
         if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
             # Keep the session id out of the raised message -- it can propagate
             # to LLM- or user-visible output -- but log it for operators.
@@ -684,6 +741,12 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             # new SkyvernBrowser's pages[-1] fallback.
             state._active_page = working_page
         register_copilot_session(browser_session_id, state)
+        if is_self_heal_session_id(browser_session_id):
+            LOG.info(
+                "registered self-heal browser session",
+                session_id=browser_session_id,
+                organization_id=ctx.organization_id,
+            )
         try:
             async with scoped_session(state):
                 yield
@@ -695,6 +758,8 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             else:
                 ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
             unregister_copilot_session(browser_session_id)
+            if is_self_heal_session_id(browser_session_id):
+                LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:
         reset_api_key_override(override_token)
 

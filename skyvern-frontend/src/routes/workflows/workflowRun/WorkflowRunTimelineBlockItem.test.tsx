@@ -5,7 +5,13 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status } from "@/api/types";
@@ -69,6 +75,12 @@ function buildBlockItem(
 
 const noop = () => {};
 
+function expectNoPillChrome(element: HTMLElement) {
+  expect(element.className).not.toMatch(
+    /\b(?:rounded|border(?:-\S+)?|bg-\S+|p[xy]-\S+)\b/,
+  );
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -94,7 +106,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(rowButton.getAttribute("aria-pressed")).toBe("true");
   });
 
-  it("renders a fixed row anatomy with order, type, descriptor, and action count", () => {
+  it("renders a fixed row anatomy without a redundant block type label", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_active",
       block_type: "conditional",
@@ -106,7 +118,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -118,7 +130,10 @@ describe("WorkflowRunTimelineBlockItem", () => {
     );
 
     expect(screen.getByText("#5")).toBeDefined();
-    expect(screen.getByText("Condition")).toBeDefined();
+    expect(within(container).queryByText("Condition")).toBeNull();
+    expect(
+      within(container).getByRole("button", { name: /Conditional/ }),
+    ).toBeDefined();
     expect(screen.getByText("block_5")).toBeDefined();
     expect(
       screen.getByText(
@@ -175,7 +190,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -189,7 +204,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       /Extract the calendar event date from the page/,
     );
     const secondAction = screen.getByText(/Click the account menu/);
-    expect(screen.getByText("Extract Data")).toBeDefined();
+    const actionType = within(container).getByText("Extract Data");
+    expect(actionType.className).toContain("sr-only");
     expect(screen.queryByText("100%")).toBeNull();
     expect(
       firstAction.compareDocumentPosition(secondAction) &
@@ -385,7 +401,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -405,6 +421,15 @@ describe("WorkflowRunTimelineBlockItem", () => {
       gotoRow.compareDocumentPosition(clickRow) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+    expect(within(container).getByText("Goto URL").className).toContain(
+      "sr-only",
+    );
+    expect(within(container).getByText("Click").className).toContain("sr-only");
+    expect(
+      within(container).getByRole("button", {
+        name: /Goto URL.*page\.goto https:\/\/example\.com/,
+      }),
+    ).toBeDefined();
   });
 
   it("labels a recorded page.evaluate action as Execute JS instead of a blank badge", () => {
@@ -492,7 +517,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -502,7 +527,9 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(screen.getByText("Error")).toBeDefined();
+    const errorType = within(container).getByText("Error");
+    expect(errorType.className).toContain("text-rose-700");
+    expectNoPillChrome(errorType);
     expect(screen.queryByText("Screenshot")).toBeNull();
     expect(screen.getByText(/ValueError: boom · line 7/)).toBeDefined();
   });
@@ -656,7 +683,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       },
     ];
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -670,7 +697,9 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText(/Open the homepage/)).toBeDefined();
     expect(screen.getByText(/Click the top post/)).toBeDefined();
     expect(screen.getByText("Goto")).toBeDefined();
-    expect(screen.getByText("Click")).toBeDefined();
+    const clickType = within(container).getByText("Click");
+    expect(clickType.className).toContain("text-muted-foreground");
+    expectNoPillChrome(clickType);
     expect(screen.getByText("L1")).toBeDefined();
     expect(screen.getByText("L3-5")).toBeDefined();
   });
@@ -790,7 +819,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -800,8 +829,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    // Both the type badge and the row name read "Code" when nothing else exists.
-    expect(screen.getAllByText("Code").length).toBe(2);
+    expect(within(container).getAllByText("Code").length).toBe(1);
   });
 
   it("selects the block when a code step row is clicked", () => {
@@ -876,7 +904,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       },
     ];
 
-    render(
+    const { container } = render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -892,14 +920,17 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(didntRun.length).toBe(2);
     expect(screen.getByText(/Read the result/)).toBeDefined();
     expect(screen.getByText(/Summarize the page/)).toBeDefined();
+    const skippedType = within(container).getByText("Extract Data");
+    expect(skippedType.className).toContain("text-muted-foreground");
+    expectNoPillChrome(skippedType);
     // The executed goto step (line 1) reads its plain-English step copy in its
     // fired action row, not as a didn't-run row.
     expect(screen.getByText(/Open the homepage · line 1/)).toBeDefined();
     // The step at the failure line (3) executed no fired action and is not after
     // the failure, so it surfaces nowhere.
     expect(screen.queryByText(/Submit the form/)).toBeNull();
-    // Neutral slate tone — never the rose error tone.
-    expect(didntRun[0]!.className).toMatch(/text-slate-400/);
+    // Neutral muted tone — never the rose error tone.
+    expect(didntRun[0]!.className).toMatch(/text-muted-foreground/);
     expect(didntRun[0]!.className).not.toMatch(/rose/);
   });
 
@@ -1145,7 +1176,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       screen.getByText(/Extract the product details · line 12/),
     ).toBeDefined();
     expect(screen.queryByText(/page\.extract/)).toBeNull();
-    // The readable action type stays as the chip.
+    // The readable action type stays as plain text.
     expect(screen.getByText("Extract Data")).toBeDefined();
   });
 

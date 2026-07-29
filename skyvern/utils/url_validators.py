@@ -1,8 +1,10 @@
 import ipaddress
 import socket
 from http import HTTPStatus
+from typing import Any
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
+import httpx
 from pydantic import HttpUrl, ValidationError
 
 from skyvern.config import settings
@@ -13,6 +15,22 @@ MAX_SAFE_REDIRECTS = 10
 
 _BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
 _BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
+_BLOCKED_IP_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "::1/128",
+        "fc00::/7",
+    )
+)
+_BLOCKED_METADATA_IPS = frozenset(
+    ipaddress.ip_address(ip) for ip in ("169.254.169.254", "100.100.100.200", "fd00:ec2::254")
+)
 
 
 def strip_query_params(url: str) -> str:
@@ -85,6 +103,10 @@ def _normalize_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddres
 
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     ip = _normalize_ip(ip)
+    if ip in _BLOCKED_METADATA_IPS:
+        return True
+    if any(ip.version == network.version and ip in network for network in _BLOCKED_IP_NETWORKS):
+        return True
     return bool(
         ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved or ip.is_multicast or ip.is_unspecified
     )
@@ -144,24 +166,10 @@ def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
         return False
 
     try:
-        infos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
-    except OSError:
+        resolve_fetch_host_ips(normalized)
+    except BlockedHost:
         return True
-
-    resolved_any = False
-    for info in infos:
-        sockaddr = info[4]
-        ip_str = sockaddr[0] if sockaddr else None
-        if not ip_str:
-            continue
-        try:
-            resolved_ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        resolved_any = True
-        if _is_blocked_ip(resolved_ip):
-            return True
-    return not resolved_any
+    return False
 
 
 def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
@@ -190,7 +198,7 @@ def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
 
     try:
         infos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
-    except OSError:
+    except (OSError, UnicodeError):
         raise BlockedHost(host=host)
 
     resolved_ips: list[str] = []
@@ -224,7 +232,7 @@ def validate_url(url: str) -> str | None:
     if not v.host:
         return None
     host = v.host
-    blocked = is_blocked_host(host)
+    blocked = is_blocked_host(host, resolve_dns=False)
     if blocked:
         raise BlockedHost(host=host)
     return str(v)
@@ -252,6 +260,43 @@ def validate_redirect_url_with_resolved_ips(url: str, location: str) -> tuple[st
 
 def validate_redirect_url(url: str, location: str) -> str:
     return validate_redirect_url_with_resolved_ips(url, location)[0]
+
+
+class _PinnedIPTransport(httpx.AsyncHTTPTransport):
+    """Connect only to already-validated IPs, keeping SNI, Host, and cert verification on the hostname.
+
+    httpx resolves again at connect time, so a rebinding host can answer with a private
+    address after validation passed. Addresses are tried in resolution order so a host
+    whose first address is unreachable still behaves like an unpinned client.
+    """
+
+    def __init__(self, resolved_ips: tuple[str, ...], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._resolved_ips = resolved_ips
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original_url = request.url
+        request.extensions = {**request.extensions, "sni_hostname": original_url.host}
+        last_index = len(self._resolved_ips) - 1
+        for index, ip in enumerate(self._resolved_ips):
+            request.url = original_url.copy_with(host=ip)
+            try:
+                return await super().handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if index == last_index:
+                    raise
+        raise httpx.ConnectError(f"No validated address for {original_url.host} could be reached")
+
+
+def pinned_ip_client(resolved_ips: tuple[str, ...] | None, **kwargs: Any) -> httpx.AsyncClient:
+    """Client pinned to the IPs a caller already validated, so DNS cannot be re-answered at connect time.
+
+    Pass the IPs from `validate_fetch_url_with_resolved_ips`. Without them this is a plain
+    client with no rebinding protection.
+    """
+    if not resolved_ips:
+        return httpx.AsyncClient(**kwargs)
+    return httpx.AsyncClient(transport=_PinnedIPTransport(resolved_ips), **kwargs)
 
 
 def encode_url(url: str) -> str:

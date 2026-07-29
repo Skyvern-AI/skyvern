@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES as GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -26,7 +29,6 @@ from skyvern.forge.sdk.copilot.output_contracts import (
 )
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.runtime import output_contract_ladder_unresolved
-from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_REASON_CODE
 from skyvern.forge.sdk.copilot.turn_ownership import (
     TURN_HALT_RETIRED_LOG_EVENT,
     TurnClaimant,
@@ -45,7 +47,6 @@ LOG = structlog.get_logger()
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.runtime import AgentContext
 
-REPAIR_CEILING_REASON_CODE = "repair_ceiling_reached"
 ADVISORY_DISPATCH_STALLED_REASON_CODE = "advisory_dispatch_stalled"
 
 
@@ -53,8 +54,6 @@ class TurnHaltKind(StrEnum):
     LOOP_DETECTED = "loop_detected"
     ACTIVE_TERMINAL_CHALLENGE = "active_terminal_challenge"
     PROBABLE_SITE_BLOCK = "probable_site_block"
-    REPAIR_CEILING_REACHED = "repair_ceiling_reached"
-    SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
     OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
     DELIVERED_UNVERIFIED = "delivered_unverified"
 
@@ -73,6 +72,7 @@ _LOOP_TERMINAL_REASON_CODES = frozenset(
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
         "loop_detected_no_forward_progress_interaction",
+        DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
@@ -86,7 +86,6 @@ _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     }
 )
 _PROBABLE_SITE_BLOCK_REASON_CODES = frozenset({"probable_site_block_stop"})
-_SCHEMA_INCOMPATIBILITY_REASON_CODES = frozenset({SCHEMA_INCOMPATIBILITY_REASON_CODE})
 _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -102,17 +101,11 @@ _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
     {
         TurnHaltKind.LOOP_DETECTED,
         TurnHaltKind.PROBABLE_SITE_BLOCK,
-        TurnHaltKind.REPAIR_CEILING_REACHED,
-        TurnHaltKind.SCHEMA_INCOMPATIBILITY,
         TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE,
     }
 )
 _INVOLUNTARY_BLOCKER_REASON_CODES = (
-    _LOOP_TERMINAL_REASON_CODES
-    | _PROBABLE_SITE_BLOCK_REASON_CODES
-    | _SCHEMA_INCOMPATIBILITY_REASON_CODES
-    | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
-    | frozenset({REPAIR_CEILING_REASON_CODE})
+    _LOOP_TERMINAL_REASON_CODES | _PROBABLE_SITE_BLOCK_REASON_CODES | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
 )
 _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
 _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_SOURCES = frozenset({"run_execution"})
@@ -142,8 +135,6 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
     if reason in _PROBABLE_SITE_BLOCK_REASON_CODES:
         return TurnHaltKind.PROBABLE_SITE_BLOCK
-    if reason in _SCHEMA_INCOMPATIBILITY_REASON_CODES:
-        return TurnHaltKind.SCHEMA_INCOMPATIBILITY
     if reason in _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES:
         return TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
     return None
@@ -293,30 +284,6 @@ def stash_turn_halt_from_blocker_signal(ctx: Any, signal: object, *, source: str
     ctx.turn_halt = halt
     if blocker_signal_is_genuinely_terminal(halt.blocker_signal):
         claim_turn(ctx, TurnClaimant.GENUINELY_TERMINAL, renders_final_reply=True)
-    LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
-    return halt
-
-
-def stash_repair_ceiling_turn_halt(
-    ctx: Any,
-    signal: CopilotToolBlockerSignal,
-    *,
-    consecutive_identical_repair_count: int,
-) -> TurnHalt | None:
-    existing = getattr(ctx, "turn_halt", None)
-    if isinstance(existing, TurnHalt):
-        return existing
-    halt = TurnHalt(
-        kind=TurnHaltKind.REPAIR_CEILING_REACHED,
-        blocker_signal=signal,
-        draft_state={"preserves_workflow_draft": signal.preserves_workflow_draft},
-        extra={
-            "source": "enforcement",
-            "consecutive_identical_repair_count": consecutive_identical_repair_count,
-        },
-    )
-    ctx.turn_halt = halt
-    claim_turn(ctx, TurnClaimant.GENUINELY_TERMINAL, renders_final_reply=True)
     LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
     return halt
 

@@ -23,6 +23,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
@@ -34,6 +35,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEvent,
     OutputBlock,
+    ProcessedBlock,
     RecordingDraftStep,
 )
 
@@ -609,10 +611,33 @@ class Processor:
         self,
         compressed_chunks: list[str],
         draft_steps: list[RecordingDraftStep] | None = None,
-    ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
+        code_first: bool = False,
+    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
+        if code_first:
+            # Code-first always re-derives selector-bearing actions from raw events;
+            # draft steps carry no locators and act only as an edit overlay.
+            events = self.compressed_chunks_to_events(compressed_chunks)
+            actions = self.events_to_actions(events)
+            code_first_result = actions_to_code_first_blocks(actions, draft_steps)
+            if code_first_result is not None:
+                code_blocks, code_parameters = code_first_result
+                LOG.info(
+                    "record_browser.process_recording_code_first",
+                    recording_code_block_count=len(code_blocks),
+                    recording_code_parameter_count=len(code_parameters),
+                    recording_action_count=len(actions),
+                    **self.identity,
+                )
+                return list(code_blocks), code_parameters
+            LOG.warning(
+                "record_browser.code_first_fallback_to_legacy",
+                recording_action_count=len(actions),
+                **self.identity,
+            )
+
         # `is not None` (not truthiness): an empty list means the user deleted every
         # live-interpreted step, which must not fall back to re-processing raw events.
         if draft_steps is not None:
@@ -647,7 +672,8 @@ class BrowserSessionRecordingService:
         workflow_permanent_id: str,
         compressed_chunks: list[str],
         draft_steps: list[RecordingDraftStep] | None = None,
-    ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
+        code_first: bool = False,
+    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process compressed browser session recording events into workflow definition blocks.
         """
@@ -657,7 +683,7 @@ class BrowserSessionRecordingService:
             workflow_permanent_id,
         )
 
-        return await processor.process(compressed_chunks, draft_steps=draft_steps)
+        return await processor.process(compressed_chunks, draft_steps=draft_steps, code_first=code_first)
 
 
 async def smoke() -> None:

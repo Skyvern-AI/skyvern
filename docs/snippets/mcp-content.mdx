@@ -4,14 +4,14 @@ The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Code
 
 The MCP server exposes 75+ tools across many categories. Here are the key ones:
 
-| Category | Key tools | What they do |
-|----------|-----------|--------------|
-| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect` | Open, manage, and reuse browser sessions, including connecting to a local browser via CDP |
-| **Browser actions** | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait` | Control the browser with natural language, CSS/XPath selectors, or both (hybrid mode) |
-| **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured JSON from pages, capture screenshots, run JavaScript |
-| **Validation** | `skyvern_validate` | Assert page conditions in natural language (returns true/false with reasoning) |
-| **Credentials & login** | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
-| **Agents** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types |
+| Category                       | Key tools                                                                                                                                                                             | What they do                                                                                                           |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Browser session management** | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect`                   | Open, manage, and reuse browser sessions, including connecting to a local browser via CDP                              |
+| **Browser actions**            | `skyvern_act`, `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_wait`                   | Control the browser with natural language, CSS/XPath selectors, or both (hybrid mode)                                  |
+| **Data extraction**            | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate`                                                                                                                           | Pull structured JSON from pages, capture screenshots, run JavaScript                                                   |
+| **Validation**                 | `skyvern_validate`                                                                                                                                                                    | Assert page conditions in natural language (returns true/false with reasoning)                                         |
+| **Credentials & login**        | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete`                                                                                     | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
+| **Agents**                     | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types                                                      |
 
 Additional tools cover tab management, iframe switching, drag-and-drop, file upload, clipboard access, network/console inspection, HAR recording, web storage, auth state persistence, folder management, and cached script management.
 
@@ -21,12 +21,12 @@ Your AI assistant decides which tools to call based on your instructions. For ex
 
 You have three ways to connect a client to Skyvern:
 
-| | OAuth (sign in with browser) | API key | Local mode |
-|---|---|---|---|
-| **Best for** | Claude Code, Codex CLI, Cursor, ChatGPT, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern |
-| **Install required** | None | None | Python 3.11+ and `pip install "skyvern[server]"` |
-| **Credential** | Browser sign-in with your Skyvern account | API key from [app.skyvern.com](https://app.skyvern.com) | API key from your self-hosted instance |
-| **Where it runs** | Directly against Skyvern Cloud over HTTPS | Directly against Skyvern Cloud over HTTPS | Local Python process talking to your Skyvern server |
+|                      | OAuth (sign in with browser)                                                      | API key                                                                                                    | Local mode                                          |
+| -------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| **Best for**         | Claude Code, Codex CLI, Cursor, ChatGPT, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern                                |
+| **Install required** | None                                                                              | None                                                                                                       | Python 3.11+ and `pip install "skyvern[server]"`    |
+| **Credential**       | Browser sign-in with your Skyvern account                                         | API key from [app.skyvern.com](https://app.skyvern.com)                                                    | API key from your self-hosted instance              |
+| **Where it runs**    | Directly against Skyvern Cloud over HTTPS                                         | Directly against Skyvern Cloud over HTTPS                                                                  | Local Python process talking to your Skyvern server |
 
 If your client appears in the OAuth section below, start there. Otherwise use the API-key setup.
 
@@ -72,6 +72,7 @@ codex mcp add skyvern --url https://api.skyvern.com/mcp/ --oauth-resource https:
 ```
 
 Skyvern Cloud accepts both forms, so the flag is only needed on older self-hosted deployments.
+
 </Note>
 
 </Tab>
@@ -160,15 +161,19 @@ On Linux, add this manual bridge to `~/.config/Claude/claude_desktop_config.json
     "Skyvern": {
       "command": "npx",
       "args": [
+        "-y",
         "mcp-remote",
         "https://api.skyvern.com/mcp/",
         "--header",
-        "x-api-key:YOUR_SKYVERN_API_KEY"
-      ]
+        "x-api-key:${SKYVERN_API_KEY}"
+      ],
+      "env": { "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY" }
     }
   }
 }
 ```
+
+Put your API key in the `env` block so it is not exposed on the process command line.
 
 Use this Linux path when the one-click bundle is not available on your platform. It uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio and requires Node.js >= 20.
 
@@ -214,7 +219,10 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 <Tab title="Codex CLI">
 
 <Tip>
-Most Codex users should use the OAuth flow above (`codex mcp add skyvern --url https://api.skyvern.com/mcp/`). Use this manual TOML path only when you cannot complete a browser callback, for example on a headless server or in a CI runner.
+  Most Codex users should use the OAuth flow above (`codex mcp add skyvern --url
+  https://api.skyvern.com/mcp/`). Use this manual TOML path only when you cannot
+  complete a browser callback, for example on a headless server or in a CI
+  runner.
 </Tip>
 
 Add to `~/.codex/config.toml`:
@@ -293,7 +301,9 @@ Or add manually to `~/.openclaw/openclaw.json` (OpenClaw accepts JSON5, but plai
 ```
 
 <Tip>
-OpenClaw accepts JSON5 syntax in `openclaw.json`. `skyvern setup openclaw` can read that format, but when it rewrites the file it normalizes the config back to standard JSON, so comments and JSON5-only formatting are not preserved.
+  OpenClaw accepts JSON5 syntax in `openclaw.json`. `skyvern setup openclaw` can
+  read that format, but when it rewrites the file it normalizes the config back
+  to standard JSON, so comments and JSON5-only formatting are not preserved.
 </Tip>
 
 Verify the config:
@@ -323,7 +333,10 @@ skyvern setup mcporter
 After setup, restart your MCP client. Skyvern should appear as an MCP server and is ready for browser tasks.
 
 <Tip>
-Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, use Docker Compose or a source checkout, then run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
+  Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern
+  setup`. For the local self-hosted path, use Docker Compose or a source
+  checkout, then run `skyvern quickstart` or `skyvern init` and choose Claude
+  Code during the MCP step.
 </Tip>
 
 ## Switch an existing MCP config
@@ -358,7 +371,7 @@ If a config file exists but does not already contain a Skyvern entry, run `skyve
 Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a local Python process on your machine that connects to your local Skyvern server.
 
 <Tip title="Supported Python Versions" icon="fa-brands fa-python">
-Local mode requires Python 3.11, 3.12, or 3.13.
+  Local mode requires Python 3.11, 3.12, or 3.13.
 </Tip>
 
 ```bash
@@ -459,24 +472,27 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 </Tabs>
 
 <Tip>
-From Docker Compose or a source checkout, `skyvern init` and `skyvern quickstart` can write the local MCP config for you. In a project directory, choosing Claude Code defaults to project-local `.mcp.json` and installs `.claude/skills/qa`.
+  From Docker Compose or a source checkout, `skyvern init` and `skyvern
+  quickstart` can write the local MCP config for you. In a project directory,
+  choosing Claude Code defaults to project-local `.mcp.json` and installs
+  `.claude/skills/qa`.
 </Tip>
 
 <Accordion title="Config file locations by client">
 
-| Client | Format | Path |
-|--------|--------|------|
-| **Claude Desktop** (macOS) | JSON | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| **Claude Desktop** (Linux) | JSON | `~/.config/Claude/claude_desktop_config.json` |
-| **Claude Code** (project) | JSON | `.mcp.json` in project root |
-| **Claude Code** (global) | JSON | `~/.claude.json` |
-| **Codex** (global) | TOML | `~/.codex/config.toml` |
-| **Codex** (project) | TOML | `.codex/config.toml` in trusted project |
-| **Cursor** | JSON | `~/.cursor/mcp.json` |
-| **Windsurf** | JSON | `~/.codeium/windsurf/mcp_config.json` |
-| **Hermes** (global) | YAML | `~/.hermes/config.yaml` |
-| **Hermes** (per-profile) | YAML | `~/.hermes/profiles/<name>/config.yaml` |
-| **OpenClaw** | JSON5 | `~/.openclaw/openclaw.json` |
+| Client                     | Format | Path                                                              |
+| -------------------------- | ------ | ----------------------------------------------------------------- |
+| **Claude Desktop** (macOS) | JSON   | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Claude Desktop** (Linux) | JSON   | `~/.config/Claude/claude_desktop_config.json`                     |
+| **Claude Code** (project)  | JSON   | `.mcp.json` in project root                                       |
+| **Claude Code** (global)   | JSON   | `~/.claude.json`                                                  |
+| **Codex** (global)         | TOML   | `~/.codex/config.toml`                                            |
+| **Codex** (project)        | TOML   | `.codex/config.toml` in trusted project                           |
+| **Cursor**                 | JSON   | `~/.cursor/mcp.json`                                              |
+| **Windsurf**               | JSON   | `~/.codeium/windsurf/mcp_config.json`                             |
+| **Hermes** (global)        | YAML   | `~/.hermes/config.yaml`                                           |
+| **Hermes** (per-profile)   | YAML   | `~/.hermes/profiles/<name>/config.yaml`                           |
+| **OpenClaw**               | JSON5  | `~/.openclaw/openclaw.json`                                       |
 
 </Accordion>
 
@@ -484,20 +500,29 @@ From Docker Compose or a source checkout, `skyvern init` and `skyvern quickstart
 
 **Claude Desktop** looking up the top Hacker News posts:
 
-<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
-  <source src="https://github.com/user-attachments/assets/0c10dd96-c6ff-4b99-ad99-f34a5afd04fe" type="video/mp4" />
+<video style={{ aspectRatio: "16 / 9", width: "100%" }} controls>
+  <source
+    src="https://github.com/user-attachments/assets/0c10dd96-c6ff-4b99-ad99-f34a5afd04fe"
+    type="video/mp4"
+  />
 </video>
 
 **Cursor** finding programming jobs:
 
-<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
-  <source src="https://github.com/user-attachments/assets/084c89c9-6229-4bac-adc9-6ad69b41327d" type="video/mp4" />
+<video style={{ aspectRatio: "16 / 9", width: "100%" }} controls>
+  <source
+    src="https://github.com/user-attachments/assets/084c89c9-6229-4bac-adc9-6ad69b41327d"
+    type="video/mp4"
+  />
 </video>
 
 **Windsurf** searching Form 5500 and downloading files:
 
-<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
-  <source src="https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7" type="video/mp4" />
+<video style={{ aspectRatio: "16 / 9", width: "100%" }} controls>
+  <source
+    src="https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7"
+    type="video/mp4"
+  />
 </video>
 
 ## Connect to your local browser
@@ -517,11 +542,14 @@ This launches Chrome with your existing cookies and logins, and creates an ngrok
 The `--use-local-profile` flag clones auth-relevant data from your default Chrome profile (cookies, saved passwords, local storage) so the browser starts pre-authenticated. Your original profile is never modified.
 
 <Tip>
-This is especially powerful during development: make a code change, then ask your AI assistant to navigate to `localhost:3000` and verify it works. Fix code and validate in the same prompt.
+  This is especially powerful during development: make a code change, then ask
+  your AI assistant to navigate to `localhost:3000` and verify it works. Fix
+  code and validate in the same prompt.
 </Tip>
 
 <Warning>
-Always use `--api-key` when exposing your browser via tunnel. Without it, anyone with the ngrok URL has full browser control.
+  Always use `--api-key` when exposing your browser via tunnel. Without it,
+  anyone with the ngrok URL has full browser control.
 </Warning>
 
 <Accordion title="Claude Desktop bundle updates">
@@ -549,7 +577,9 @@ Then make a frontend change and type `/qa` in Claude Code. It will:
 For localhost testing, start your local Skyvern backend and frontend. You do not need `skyvern browser serve --tunnel` for this path.
 
 <Tip>
-The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and `skyvern_act` for natural-language interactions. Tests are generated fresh from each diff, so there are no test files to maintain.
+  The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each)
+  and `skyvern_act` for natural-language interactions. Tests are generated fresh
+  from each diff, so there are no test files to maintain.
 </Tip>
 
 ## Privacy and data handling
@@ -566,6 +596,7 @@ Only connect accounts, credentials, and websites that you are authorized to auto
 Double-check that your API key is correct. You can find or regenerate it at [Settings](https://app.skyvern.com). Make sure there are no extra spaces or newlines when pasting the key.
 
 If you recently regenerated your API key, run `skyvern mcp switch` if you installed the CLI, or update the MCP config manually, then restart your AI client.
+
 </Accordion>
 
 <Accordion title="Browser sign-in does not complete">
@@ -574,16 +605,22 @@ If the browser opens but the MCP client remains unauthenticated, confirm you can
 If you previously connected with `x-api-key` and are switching to OAuth, remove the stale MCP entry first (`claude mcp remove skyvern`, or delete the entry in `~/.cursor/mcp.json`) and re-add it without the `headers` field. A static header prevents the client from starting OAuth.
 
 If the sign-in page shows an authorization failure, start the flow again from your MCP client instead of reloading the browser page.
+
 </Accordion>
 
 <Accordion title="OAuth session expires">
-OAuth sessions use the access-token lifetime described in the OAuth setup section above. When authentication expires, re-run the MCP client's authentication flow. To stop using Skyvern from a client before then, clear that client's saved Skyvern authentication or remove the Skyvern MCP server entry.
+  OAuth sessions use the access-token lifetime described in the OAuth setup
+  section above. When authentication expires, re-run the MCP client's
+  authentication flow. To stop using Skyvern from a client before then, clear
+  that client's saved Skyvern authentication or remove the Skyvern MCP server
+  entry.
 </Accordion>
 
 <Accordion title="Tools not responding or timing out">
 Skyvern browser sessions take a few seconds to start. If a tool call times out, try again. The first call in a new session is slower than subsequent ones.
 
 If timeouts persist, check that your Skyvern account is active and has available credits at [app.skyvern.com](https://app.skyvern.com).
+
 </Accordion>
 
 <Accordion title="Python version errors (local mode only)">
@@ -599,6 +636,7 @@ You can also use `pipx` to install in an isolated environment:
 ```bash
 pipx install skyvern
 ```
+
 </Accordion>
 
 <Accordion title="Connection refused (local mode)">
@@ -611,6 +649,7 @@ skyvern run server
 Confirm the server is reachable at `http://localhost:8000`. If you changed the port, update `SKYVERN_BASE_URL` in your MCP config to match.
 
 You do not need Skyvern Cloud or browser tunneling for this path. Claude Code talks to the local MCP process over stdio, and that process talks to your local Skyvern server.
+
 </Accordion>
 
 <Accordion title="MCP client doesn't detect Skyvern">
@@ -623,4 +662,5 @@ which python3
 Use the full absolute path (e.g., `/usr/bin/python3` or `/Users/you/.pyenv/shims/python3`), not just `python3`. Restart your MCP client after editing the config file.
 
 If you used the wizard, re-run `skyvern init` or `skyvern setup claude-code --local` from the same Python environment to regenerate the config with the correct interpreter path.
+
 </Accordion>

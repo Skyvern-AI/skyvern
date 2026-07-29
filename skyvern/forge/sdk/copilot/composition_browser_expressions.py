@@ -18,11 +18,10 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_PAGE_OBSTRUCTIONS,
     _MAX_RESULT_CONTAINERS,
     _MAX_RESULT_SAMPLE_ROWS,
+    _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
     _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
-    _MODAL_DISMISS_HINTS,
-    _MODAL_DISMISS_SYMBOLS,
     _MODAL_IDENTITY_PATTERNS,
     _MODAL_ROLE_VALUES,
     _RESULT_CONTAINER_HINTS,
@@ -45,61 +44,123 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
 )
 
 
+_JS_TEXT_HELPER = "const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
+
+_JS_IS_EDITABLE_HELPER = (
+    "const isEditable = (node) => {"
+    "  const tag = (node.tagName || '').toLowerCase();"
+    "  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;"
+    "  return node.isContentEditable === true;"
+    "};"
+)
+
+_JS_IMPLICIT_ROLE_HELPER = (
+    "const implicitRole = (node) => {"
+    "  const tag = (node.tagName || '').toLowerCase();"
+    "  const type = (node.getAttribute('type') || '').toLowerCase();"
+    "  if (tag === 'a' && node.hasAttribute('href')) return 'link';"
+    "  if (tag === 'button') return 'button';"
+    "  if (tag === 'select') return 'combobox';"
+    "  if (tag === 'textarea') return 'textbox';"
+    "  if (tag === 'input') {"
+    "    if (['button', 'submit', 'reset'].includes(type)) return 'button';"
+    "    if (type === 'checkbox') return 'checkbox';"
+    "    if (type === 'radio') return 'radio';"
+    "    if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
+    "  }"
+    "  if (/^h[1-6]$/.test(tag)) return 'heading';"
+    "  return '';"
+    "};"
+)
+
+# ARIA roles whose accessible name is computed from the element's own text content (ARIA name-from-content).
+# Editable roles (textbox/combobox/searchbox/spinbutton/listbox) are deliberately absent so a typed-into
+# control never leaks its value as an accessible name.
+_JS_NAME_FROM_CONTENT_ROLES = (
+    "const nameFromContentRoles = new Set(["
+    "'button', 'link', 'checkbox', 'radio', 'heading', 'tab', 'menuitem', "
+    "'menuitemcheckbox', 'menuitemradio', 'option', 'switch', 'treeitem', "
+    "'cell', 'gridcell', 'columnheader', 'rowheader', 'row', 'tooltip'"
+    "]);"
+)
+
+_JS_ACCESSIBLE_NAME_HELPER = (
+    "const accessibleName = (node, role) => {"
+    "  const aria = text(node.getAttribute('aria-label'));"
+    "  if (aria) return aria;"
+    "  const labelledby = node.getAttribute('aria-labelledby');"
+    "  if (labelledby) {"
+    "    const parts = labelledby.split(/\\s+/).map((id) => {"
+    "      const ref = document.getElementById(id);"
+    "      return ref ? text(ref.textContent) : '';"
+    "    }).filter(Boolean);"
+    "    if (parts.length) return text(parts.join(' '));"
+    "  }"
+    "  const id = node.getAttribute('id');"
+    "  if (id) {"
+    "    let lab = null;"
+    "    try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
+    "    if (lab) { const t = text(lab.textContent); if (t) return t; }"
+    "  }"
+    "  const parentLabel = node.closest ? node.closest('label') : null;"
+    "  if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
+    "  const title = text(node.getAttribute('title'));"
+    "  if (title) return title;"
+    "  const placeholder = text(node.getAttribute('placeholder'));"
+    "  if (placeholder) return placeholder;"
+    "  if (role && nameFromContentRoles.has(role) && !isEditable(node)) {"
+    "    const content = text(node.textContent);"
+    "    if (content) return content;"
+    "  }"
+    "  return '';"
+    "};"
+)
+
+
 # Given a CSS selector, return the element's ARIA role and accessible name so the code-block
-# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The
-# name is read only from true label sources, never the element's own textContent/value.
+# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The name
+# follows the ARIA algorithm: label sources first, then name-from-content for content-named roles only.
 def scout_accessible_role_name_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return (
         "(() => {"
         f"  const el = document.querySelector({sel});"
         "  if (!el) return null;"
-        "  const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
-        "  const implicitRole = (node) => {"
-        "    const tag = (node.tagName || '').toLowerCase();"
-        "    const type = (node.getAttribute('type') || '').toLowerCase();"
-        "    if (tag === 'a' && node.hasAttribute('href')) return 'link';"
-        "    if (tag === 'button') return 'button';"
-        "    if (tag === 'select') return 'combobox';"
-        "    if (tag === 'textarea') return 'textbox';"
-        "    if (tag === 'input') {"
-        "      if (['button', 'submit', 'reset'].includes(type)) return 'button';"
-        "      if (type === 'checkbox') return 'checkbox';"
-        "      if (type === 'radio') return 'radio';"
-        "      if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
-        "    }"
-        "    if (/^h[1-6]$/.test(tag)) return 'heading';"
-        "    return '';"
-        "  };"
-        "  const accessibleName = (node) => {"
-        "    const aria = text(node.getAttribute('aria-label'));"
-        "    if (aria) return aria;"
-        "    const labelledby = node.getAttribute('aria-labelledby');"
-        "    if (labelledby) {"
-        "      const parts = labelledby.split(/\\s+/).map((id) => {"
-        "        const ref = document.getElementById(id);"
-        "        return ref ? text(ref.textContent) : '';"
-        "      }).filter(Boolean);"
-        "      if (parts.length) return text(parts.join(' '));"
-        "    }"
-        "    const id = node.getAttribute('id');"
-        "    if (id) {"
-        "      let lab = null;"
-        "      try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
-        "      if (lab) { const t = text(lab.textContent); if (t) return t; }"
-        "    }"
-        "    const parentLabel = node.closest ? node.closest('label') : null;"
-        "    if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
-        # textContent/value are never name sources: for a typed-into textbox/contenteditable
-        # they would leak the raw typed value as accessible_name.
-        "    const title = text(node.getAttribute('title'));"
-        "    if (title) return title;"
-        "    const placeholder = text(node.getAttribute('placeholder'));"
-        "    if (placeholder) return placeholder;"
-        "    return '';"
-        "  };"
+        f"  {_JS_TEXT_HELPER}"
+        f"  {_JS_IS_EDITABLE_HELPER}"
+        f"  {_JS_IMPLICIT_ROLE_HELPER}"
+        f"  {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"  {_JS_ACCESSIBLE_NAME_HELPER}"
         "  const role = text(el.getAttribute('role')) || implicitRole(el);"
-        "  return { role: role, accessible_name: accessibleName(el) };"
+        "  return { role: role, accessible_name: accessibleName(el, role) };"
+        "})()"
+    )
+
+
+# Count elements whose computed ARIA role and accessible name exactly match, so a scout-ambiguous
+# selector's get_by_role(role, name, exact=True) re-anchor is only trusted when it resolves uniquely.
+def role_name_match_count_expression(role: str, name: str) -> str:
+    target_role = json.dumps(role)
+    target_name = json.dumps(name)
+    return (
+        "(() => {"
+        "  try {"
+        f"    {_JS_TEXT_HELPER}"
+        f"    {_JS_IS_EDITABLE_HELPER}"
+        f"    {_JS_IMPLICIT_ROLE_HELPER}"
+        f"    {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"    {_JS_ACCESSIBLE_NAME_HELPER}"
+        f"    const targetRole = {target_role};"
+        f"    const targetName = {target_name};"
+        "    let count = 0;"
+        "    const nodes = document.querySelectorAll('*');"
+        "    for (const el of nodes) {"
+        "      const role = text(el.getAttribute('role')) || implicitRole(el);"
+        "      if (role !== targetRole) continue;"
+        "      if (accessibleName(el, role) === targetName) { count++; if (count > 1) break; }"
+        "    }"
+        "    return count;"
+        "  } catch (e) { return -1; }"
         "})()"
     )
 
@@ -109,6 +170,113 @@ def scout_accessible_role_name_expression(css_selector: str) -> str:
 def selector_match_count_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
+
+
+# Submit controls belonging to the form that contains a just-filled field. A login page often
+# offers a federated button that is larger and earlier in the DOM than the form's own submit, so
+# naming the filled form's submits keeps "how do I submit what I just filled" from being a guess.
+def enclosing_form_submit_controls_expression(css_selector: str) -> str:
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        "  try {"
+        f"    const el = document.querySelector({sel});"
+        "    const form = el && el.closest ? el.closest('form') : null;"
+        "    if (!form) return [];"
+        "    const uniq = (s) => { try { return s && document.querySelectorAll(s).length === 1; } catch (e) { return false; } };"
+        "    const esc = (v) => String(v).split('\\\\').join('\\\\\\\\').split('\"').join('\\\\\"');"
+        "    const out = [];"
+        "    for (const c of form.querySelectorAll('button, input[type=submit]')) {"
+        "      if (out.length >= 5) break;"
+        "      const aria = c.getAttribute('aria-label') || '';"
+        "      const label = (String(c.textContent || '').replace(/\\s+/g, ' ').trim()"
+        "        || aria || c.getAttribute('title') || c.getAttribute('value') || '').slice(0, 80);"
+        "      const tag = (c.tagName || '').toLowerCase();"
+        "      const id = c.getAttribute('id');"
+        "      let s = '';"
+        "      if (id && uniq('#' + id)) s = '#' + id;"
+        "      else if (aria && uniq(tag + '[aria-label=\"' + esc(aria) + '\"]')) s = tag + '[aria-label=\"' + esc(aria) + '\"]';"
+        "      out.push({ label: label, selector: s });"
+        "    }"
+        "    return out;"
+        "  } catch (e) { return []; }"
+        "})()"
+    )
+
+
+def scout_dynamic_row_evidence_expression(selector: str) -> str:
+    """Capture a bounded, source-page row identity for an exact positional click target.
+
+    Period capture intentionally recognizes English ``Month D, YYYY`` labels only. Keep this browser
+    parser in lockstep with ``_ROW_PERIOD_DATE_RE`` when adding formats; do not add site-specific cases.
+    """
+    sel = json.dumps(selector)
+    return (
+        "(() => {"
+        f"  const targetSelector = {sel};"
+        "  const text = (value) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, 500);"
+        "  const months = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, "
+        "july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };"
+        "  const daysInMonth = (year, month) => month === 2 ? "
+        "(year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28) : "
+        "([4, 6, 9, 11].includes(month) ? 30 : 31);"
+        "  const periods = (value) => {"
+        "    const found = [];"
+        "    const pattern = /\\b(January|February|March|April|May|June|July|August|September|October|November|December)\\s+(0?[1-9]|[12][0-9]|3[01]),\\s+([0-9]{4})\\b/gi;"
+        "    for (const match of String(value || '').matchAll(pattern)) {"
+        "      const month = months[match[1].toLowerCase()];"
+        "      const day = Number(match[2]); const year = Number(match[3]);"
+        "      if (year >= 1 && day <= daysInMonth(year, month)) "
+        "found.push(match[3] + '-' + String(month).padStart(2, '0'));"
+        "    }"
+        "    return found;"
+        "  };"
+        "  const escapeCss = (value) => window.CSS && CSS.escape ? CSS.escape(value) : "
+        "String(value).replace(/[^A-Za-z0-9_-]/g, (ch) => '\\\\' + ch);"
+        "  let target = null;"
+        "  let indexed = null;"
+        "  try {"
+        "    if (/^\\s*(xpath=|\\(?\\/)/.test(targetSelector)) {"
+        "      const xpath = targetSelector.replace(/^\\s*xpath=/, '');"
+        "      const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
+        "      target = result ? result.singleNodeValue : null;"
+        "    } else {"
+        "      indexed = targetSelector.match(/^(.*)\\s*>>\\s*nth=(\\d+)\\s*$/);"
+        "      if (indexed) target = document.querySelectorAll(indexed[1].trim())[Number(indexed[2])] || null;"
+        "      else target = document.querySelector(targetSelector);"
+        "    }"
+        "  } catch (e) { return null; }"
+        "  if (!target || !target.tagName) return null;"
+        "  const tag = target.tagName.toLowerCase();"
+        "  const id = target.getAttribute('id') || '';"
+        "  const classes = Array.from(target.classList || []).map(String).filter(Boolean);"
+        "  let rowSelector = indexed ? indexed[1].trim() : '';"
+        "  if (!rowSelector && id) rowSelector = '#' + escapeCss(id);"
+        "  else if (!rowSelector && classes.length) "
+        "rowSelector = tag + classes.map((name) => '.' + escapeCss(name)).join('');"
+        "  else if (!rowSelector) rowSelector = tag;"
+        "  let rows = [];"
+        "  try { rows = Array.from(document.querySelectorAll(rowSelector)); } catch (e) { return null; }"
+        "  if (rows.length < 2 || rows.length > 100) return null;"
+        "  const selectedIndex = rows.indexOf(target);"
+        "  if (selectedIndex < 0) return null;"
+        "  const rowText = text(target.textContent);"
+        "  if (!rowText) return null;"
+        "  const rowTextMatchCount = rows.reduce((count, row) => count + (text(row.textContent) === rowText ? 1 : 0), 0);"
+        "  const rowPeriods = rows.map((row) => periods(text(row.textContent)));"
+        "  const selectedPeriods = rowPeriods[selectedIndex];"
+        "  const uniqueSelectedPeriods = Array.from(new Set(selectedPeriods)).sort();"
+        "  if (uniqueSelectedPeriods.length > 20) return null;"
+        "  const periodMatches = uniqueSelectedPeriods.map((period) => ({"
+        "    period,"
+        "    selected_row_match_count: selectedPeriods.filter((candidate) => candidate === period).length,"
+        "    row_match_count: rowPeriods.filter((candidates) => candidates.includes(period)).length"
+        "  }));"
+        "  return { target_selector: targetSelector, row_selector: rowSelector, row_text: rowText, "
+        "row_selector_count: rows.length, row_text_match_count: rowTextMatchCount, period_matches: periodMatches, "
+        "selected_index: selectedIndex };"
+        "})()"
+    )
 
 
 # Read only the readonly/disabled control-state booleans for a CSS or XPath selector; never reads the
@@ -194,14 +362,13 @@ _STRUCTURED_CONST_HEADER = (
     f"const ANTI_BOT_PATTERNS={json.dumps(list(_ANTI_BOT_PATTERNS))};"
     f"const MODAL_IDENTITY_PATTERNS={json.dumps(sorted(_MODAL_IDENTITY_PATTERNS))};"
     f"const MODAL_ROLE_VALUES={json.dumps(sorted(_MODAL_ROLE_VALUES))};"
-    f"const MODAL_DISMISS_HINTS={json.dumps(sorted(_MODAL_DISMISS_HINTS))};"
-    f"const MODAL_DISMISS_SYMBOLS={json.dumps(sorted(_MODAL_DISMISS_SYMBOLS))};"
     f"const RESULT_CONTAINER_HINTS={json.dumps(sorted(_RESULT_CONTAINER_HINTS))};"
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
     f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
     f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
+    f"const MAX_REVEAL_KEY_VALUE_RELATIONS={int(_MAX_REVEAL_KEY_VALUE_RELATIONS)};"
     f"const MAX_TABLE_HEADERS={int(_MAX_TABLE_HEADERS)};"
     f"const MAX_RESULT_SAMPLE_ROWS={int(_MAX_RESULT_SAMPLE_ROWS)};"
     f"const MAX_SELECT_OPTIONS={int(_MAX_SELECT_OPTIONS)};"
@@ -226,18 +393,79 @@ const classesFor = (el) => Array.from((el && el.classList) || []).map((c) => Str
 const cssAttr = (v) => String(v).split('\\').join('\\\\').split('"').join('\\"');
 const simpleIdent = (v) => { if (!v) return false; if (!/[A-Za-z_-]/.test(v[0])) return false; for (let i = 1; i < v.length; i++) { if (!/[A-Za-z0-9_-]/.test(v[i])) return false; } return true; };
 const classSelector = (classes) => { const parts = []; for (const c of classes.slice(0, 3)) { parts.push(simpleIdent(c) ? '.' + c : '[class~="' + cssAttr(c) + '"]'); } return parts.join(''); };
+const resolvesUniquely = (sel, el) => {
+  if (!sel) return false;
+  try { const m = document.querySelectorAll(sel); return m.length === 1 && m[0] === el; } catch (e) { return false; }
+};
+const structuralPath = (el) => {
+  const parts = [];
+  let node = el;
+  while (node && node.nodeType === 1 && parts.length < 8) {
+    const tag = (node.tagName || '').toLowerCase();
+    if (!tag || tag === 'html') break;
+    const parent = node.parentElement;
+    if (!parent) { parts.unshift(tag); break; }
+    let idx = 1;
+    for (let i = 0; i < parent.children.length; i++) {
+      const sib = parent.children[i];
+      if (sib === node) break;
+      if (sib.tagName === node.tagName) idx++;
+    }
+    parts.unshift(tag + ':nth-of-type(' + idx + ')');
+    const pid = attr(parent, 'id');
+    if (pid && simpleIdent(pid)) { parts.unshift('#' + pid); break; }
+    node = parent;
+  }
+  return parts.join(' > ');
+};
+// The selector is a contract: the model clicks it and authors it into generated blocks, so an
+// ambiguous or unresolvable guess costs a failed run rather than a retry. Every candidate is
+// verified to match this exact node and nothing else before it is handed out.
 const selectorFor = (el) => {
   const tag = (el.tagName || '*').toLowerCase();
-  const id = attr(el, 'id'); if (id) return '#' + id;
+  const candidates = [];
+  const id = attr(el, 'id');
+  if (id) candidates.push(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]');
   const name = attr(el, 'name'); const value = attr(el, 'value');
-  if (name && value) return tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]';
+  if (name && value) candidates.push(tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]');
   const classes = classesFor(el); const cs = classSelector(classes);
-  if (cs && value) return tag + cs + '[value="' + cssAttr(value) + '"]';
-  if (name) return tag + '[name="' + cssAttr(name) + '"]';
+  if (cs && value) candidates.push(tag + cs + '[value="' + cssAttr(value) + '"]');
+  if (name) candidates.push(tag + '[name="' + cssAttr(name) + '"]');
   const href = attr(el, 'href');
-  if (tag === 'a' && href) return 'a[href="' + cssAttr(href) + '"]';
-  if (cs) return tag + cs;
-  return tag;
+  if (tag === 'a' && href) candidates.push('a[href="' + cssAttr(href) + '"]');
+  if (cs) candidates.push(tag + cs);
+  const type = attr(el, 'type');
+  if (cs && type) candidates.push(tag + cs + '[type="' + cssAttr(type) + '"]');
+  for (let i = 0; i < candidates.length; i++) {
+    if (resolvesUniquely(candidates[i], el)) return candidates[i];
+  }
+  const path = structuralPath(el);
+  if (resolvesUniquely(path, el)) return path;
+  return candidates.length ? candidates[0] : tag;
+};
+// A submit control with no text still has an identity in title/aria-label/alt (an icon-only
+// "Sign in with Google" is the common shape). Reporting it as an empty string offers the model an
+// anonymous control alongside the named one it actually wants.
+const controlLabel = (el) => {
+  const own = nodeText(el) || attr(el, 'value');
+  if (own) return own;
+  const img = el.querySelector && el.querySelector('img[alt], [aria-label]');
+  return (
+    attr(el, 'aria-label') ||
+    attr(el, 'title') ||
+    (img ? attr(img, 'alt') || attr(img, 'aria-label') : '') ||
+    ''
+  );
+};
+// A filled value lives on the DOM property, not the attribute, and a password's value must never
+// be reported at all. Without a non-secret filled signal the page looks unfilled after a credential
+// fill, and the agent concludes the fill failed and hunts for another way to sign in.
+const isFilled = (el) => {
+  try {
+    return typeof el.value === 'string' && el.value.length > 0;
+  } catch (e) {
+    return false;
+  }
 };
 const FIELD_TAGS = new Set(['input', 'select', 'textarea', 'button']);
 const adjacentText = (field) => {
@@ -322,17 +550,12 @@ const modalDismissControls = (node) => {
     if (out.length >= MAX_MODAL_DISMISS_CONTROLS) break;
     const selector = selectorFor(c);
     if (seen.has(selector)) continue;
-    const text = nodeText(c) || attr(c, 'value');
-    const ariaLabel = attr(c, 'aria-label');
-    const title = attr(c, 'title');
-    const explicit = [text.trim().toLowerCase(), ariaLabel.trim().toLowerCase(), title.trim().toLowerCase()];
-    const identity = (text + ' ' + ariaLabel + ' ' + title + ' ' + modalIdentity(c)).toLowerCase();
-    const hasDataDismiss = c.hasAttribute && c.hasAttribute('data-dismiss');
-    const hasSymbol = MODAL_DISMISS_SYMBOLS.some((s) => explicit.includes(s));
-    const hasText = MODAL_DISMISS_HINTS.some((h) => identity.includes(h));
-    if (!(hasDataDismiss || hasSymbol || hasText)) continue;
+    // Every control the dialog offers is reported. A keyword list cannot name every way a dialog
+    // closes ("No, keep ...", an icon-only glyph), and filtering on one leaves the agent looking at
+    // a modal it has no way to clear.
+    const text = controlLabel(c);
     seen.add(selector);
-    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: ariaLabel, title: title, selector: selector, type: attr(c, 'type') });
+    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, type: attr(c, 'type') });
   }
   return out;
 };
@@ -347,14 +570,17 @@ for (const form of document.querySelectorAll('form')) {
   const submitControls = [];
   for (const node of form.querySelectorAll('input,select,textarea,button')) {
     const tag = (node.tagName || '').toLowerCase();
-    const fieldType = lower(attr(node, 'type') || tag || 'text');
+    const declaredType = lower(attr(node, 'type'));
+    const fieldType = tag === 'button'
+      ? (['button', 'reset', 'submit'].includes(declaredType) ? declaredType : 'submit')
+      : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push({ text: nodeText(node) || attr(node, 'value'), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
+      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node) });
+    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node) });
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }
@@ -385,6 +611,12 @@ const clickableSelector = (el) => {
   return '';
 };
 const clickableText = (el) => nodeText(el) || attr(el, 'aria-label') || attr(el, 'value') || attr(el, 'title');
+const elementVisible = (node) => {
+  if (!node || !node.getBoundingClientRect) return false;
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
+};
 const usedClickableSelectors = new Set();
 for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.selector) usedClickableSelectors.add(sc.selector);
 for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
@@ -394,6 +626,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
   const tag = (el.tagName || '').toLowerCase();
   if (SKIP_TAGS.has(tag)) continue;
+  if (!elementVisible(el)) continue;
   if (el.closest && el.closest('form')) continue;
   const text = clickableText(el);
   const selector = clickableSelector(el);
@@ -413,12 +646,6 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
 const resultContainers = [];
 let resultContainersTruncated = false;
 const selectorMatchCount = (selector) => { if (!selector) return 0; try { return document.querySelectorAll(selector).length; } catch (e) { return 0; } };
-const elementVisible = (node) => {
-  if (!node || !node.getBoundingClientRect) return false;
-  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
-  const rect = node.getBoundingClientRect();
-  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
-};
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
   return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
@@ -488,17 +715,70 @@ for (const node of all) {
   keyValueRelations.push({ key_text: keyText, value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
 }
 
+const revealHintTokens = (node) => (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const matchesResultHintToken = (node) => revealHintTokens(node).some((t) => RESULT_CONTAINER_HINTS.includes(t));
+const revealHeadingTags = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+let revealRelationCount = 0;
+let revealRelationsTruncated = false;
+for (const node of all) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  if (!matchesResultHintToken(node)) continue;
+  const children = Array.from(node.children || []);
+  if (children.length < 3 || children.length > 6) continue;
+  if (children.some((c) => c.children && c.children.length > 0)) continue;
+  const heading = children[0];
+  if (!revealHeadingTags.has((heading.tagName || '').toLowerCase()) || !elementVisible(heading)) continue;
+  const keyText = nodeText(heading);
+  if (!keyText || keyText.length > 120) continue;
+  const selector = selectorFor(node);
+  const matches = selectorMatchCount(selector);
+  if (!matches) continue;
+  let position = -1;
+  try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
+  if (position < 0) continue;
+  const valueLeaves = [];
+  for (let i = 1; i < children.length; i++) {
+    const leaf = children[i];
+    if (!elementVisible(leaf)) continue;
+    const valueText = nodeText(leaf);
+    if (!valueText || keyText === valueText) continue;
+    valueLeaves.push({ index: i, valueText: valueText });
+  }
+  const revealKeyText = valueLeaves.length === 1 ? keyText : '';
+  let capped = false;
+  for (const leaf of valueLeaves) {
+    if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
+    keyValueRelations.push({ key_text: revealKeyText, value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    revealRelationCount++;
+  }
+  if (capped) break;
+}
+
 const challengeControls = [];
 const seenChallenge = new Set();
+const challengeIdentity = (node) => {
+  const tag = (node.tagName || '').toLowerCase();
+  return [tag, attr(node, 'id'), attr(node, 'name'), classesFor(node).join(' '), attr(node, 'src'), attr(node, 'type'), attr(node, 'data-sitekey'), attr(node, 'data-callback'), attr(node, 'data-expired-callback'), attr(node, 'data-error-callback'), attr(node, 'aria-label'), attr(node, 'title')].join(' ').toLowerCase();
+};
+const insideChallengeCarrier = (node) => {
+  for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    const identity = challengeIdentity(ancestor);
+    if (ANTI_BOT_PATTERNS.some((p) => identity.includes(p))) return true;
+  }
+  return false;
+};
 for (const node of all) {
   if (challengeControls.length >= MAX_CHALLENGE_CONTROLS) break;
+  if (!elementVisible(node)) continue;
   const tag = (node.tagName || '').toLowerCase();
-  const identity = [tag, attr(node, 'id'), attr(node, 'name'), '', attr(node, 'src'), attr(node, 'type'), attr(node, 'data-sitekey'), attr(node, 'data-callback'), attr(node, 'data-expired-callback'), attr(node, 'data-error-callback'), attr(node, 'aria-label'), attr(node, 'title')].join(' ').toLowerCase();
-  if (!ANTI_BOT_PATTERNS.some((p) => identity.includes(p))) continue;
+  const identity = challengeIdentity(node);
+  const interactiveDescendant = ['a', 'button', 'input', 'select', 'textarea'].includes(tag) && insideChallengeCarrier(node);
+  if (!ANTI_BOT_PATTERNS.some((p) => identity.includes(p)) && !interactiveDescendant) continue;
   const selector = selectorFor(node);
   if (seenChallenge.has(selector)) continue;
   seenChallenge.add(selector);
-  const entry = { tag: tag, id: attr(node, 'id'), name: attr(node, 'name'), class: classesFor(node), type: attr(node, 'type'), selector: selector, text: nodeText(node) || attr(node, 'aria-label') };
+  const entry = { tag: tag, id: attr(node, 'id'), name: attr(node, 'name'), class: classesFor(node), type: attr(node, 'type'), selector: selector, text: nodeText(node) || attr(node, 'value') || attr(node, 'aria-label'), checked: !!node.checked, disabled: controlDisabled(node) };
   for (const k of ['src', 'title', 'data-sitekey', 'data-callback', 'data-expired-callback', 'data-error-callback']) {
     const v = attr(node, k);
     if (v) entry[k.split('-').join('_')] = v;
@@ -570,6 +850,7 @@ return JSON.stringify({
   result_containers_truncated: resultContainersTruncated,
   key_value_relations: keyValueRelations,
   key_value_relations_truncated: keyValueRelationsTruncated,
+  reveal_relations_truncated: revealRelationsTruncated,
   clickable_controls: clickableControls,
   challenge_controls: challengeControls,
   modal_overlays: modalOverlays,

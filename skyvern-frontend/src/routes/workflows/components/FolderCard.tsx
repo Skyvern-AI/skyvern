@@ -37,7 +37,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
       >
         <div className="flex items-start gap-3">
           <div className="mt-0.5">
-            <FolderIcon className="h-5 w-5 text-blue-400" />
+            <FolderIcon className="h-5 w-5 text-blue-700 dark:text-blue-400" />
           </div>
           <div className="flex min-w-0 flex-1 flex-col gap-1">
             <div className="flex items-start justify-between gap-2">
@@ -56,7 +56,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
                     <TooltipTrigger asChild>
                       <button
                         onClick={() => setIsEditDialogOpen(true)}
-                        className="rounded p-1.5 text-slate-400 transition-colors hover:bg-slate-500/20 hover:text-slate-300"
+                        className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-slate-500/20 hover:text-tertiary-foreground"
                         aria-label="Edit folder"
                       >
                         <Pencil1Icon className="h-4 w-4" />
@@ -71,7 +71,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
                 />
               </div>
             </div>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
+            <p className="text-xs text-muted-foreground dark:text-slate-400">
               {folder.workflow_count}{" "}
               {folder.workflow_count === 1 ? "agent" : "agents"}
             </p>

@@ -72,6 +72,15 @@ class PersistentBrowserSession(BaseModel):
     runnable_id: str | None = None
     browser_address: str | None = None
     ip_address: str | None = None
+    # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address
+    # remains the client-facing proxy URL. These must never reach a client or a log —
+    # BrowserSessionResponse.from_browser_session is the allowlist that enforces the former.
+    upstream_cdp_url: str | None = None
+    browser_vendor: str | None = None
+    # The upstream provider's own id for this browser. Server-side only, under the same allowlist
+    # as the two fields above. It is the sole handle for terminating a session out of band, so the
+    # orphan reaper reads it off the row after the process that created the session is gone.
+    browser_id: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
     proxy_location: ProxyLocationInput = None
@@ -83,6 +92,7 @@ class PersistentBrowserSession(BaseModel):
     compute_cost: Decimal | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    last_activity_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

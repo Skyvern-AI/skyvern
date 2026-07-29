@@ -19,8 +19,12 @@ import {
 vi.mock("../tagging/TagChipList", () => ({
   TagChipList: () => <span data-testid="tag-chip-list" />,
 }));
-vi.mock("../WorkflowRowContextMenu", () => ({
-  WorkflowRowContextMenu: ({ children }: { children: ReactNode }) => children,
+vi.mock("../WorkflowRowActions", () => ({
+  WorkflowRowActions: ({
+    children,
+  }: {
+    children: (kebab: ReactNode) => ReactNode;
+  }) => children(null),
 }));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => false,
@@ -43,6 +47,7 @@ const contextValue: WorkflowsListContextValue = {
   selectedCount: 0,
   foldersMap: new Map(),
   workflowTagsMap: { wpid_1: [{ key: "env", value: "prod" }] },
+  workflowReliabilityMap: {},
   tagDescriptions: new Map(),
   tagColors: new Map(),
   tagKeys: [],

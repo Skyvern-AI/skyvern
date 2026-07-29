@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
     ConditionalBlock,
@@ -83,6 +84,7 @@ def _workflow_run(ai_fallback: bool | None = None) -> MagicMock:
     workflow_run.status = WorkflowRunStatus.running
     workflow_run.run_with = None
     workflow_run.ai_fallback = ai_fallback
+    workflow_run.start_fresh_browser = False
     return workflow_run
 
 
@@ -366,16 +368,58 @@ async def test_login_block_with_saved_profile_rewrites_goal_and_persists_profile
     page.url = "https://example.com/home"
     browser_state = AsyncMock()
     browser_state.get_working_page = AsyncMock(return_value=page)
+    # No browser open yet: the credential profile loads into a fresh browser (the seed path this test
+    # covers). A pre-existing browser would instead degrade to fresh (see the cached-browser guard).
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: None)
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", AsyncMock(return_value=browser_state))
     execute_safe = AsyncMock(return_value=_completed_result(block))
     monkeypatch.setattr(LoginBlock, "execute_safe", execute_safe)
 
     await _run_single_block(service, block)
 
-    update_run.assert_awaited_once_with(workflow_run_id="wr_test", browser_profile_id="bp_123")
+    update_run.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        browser_profile_id="bp_123",
+        browser_seed_source=BrowserSeedSource.credential,
+    )
     assert block.navigation_goal is not None
     assert block.navigation_goal.startswith("A saved browser session has been loaded.")
     assert "Original goal: log in" in block.navigation_goal
+    execute_safe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_login_block_does_not_clobber_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = WorkflowService()
+    block = _login_block("login", "https://example.com/home")
+    monkeypatch.setattr(WorkflowService, "_apply_login_block_credential_proxy_pin", AsyncMock())
+    monkeypatch.setattr(
+        WorkflowService, "_resolve_login_block_browser_profile_id", AsyncMock(return_value="bp_credential")
+    )
+    decision = AsyncMock(
+        return_value=DebugSessionProfileDecision(attach_browser_session_id=None, incompatible_reason=None)
+    )
+    monkeypatch.setattr(WorkflowService, "_evaluate_debug_session_profile_decision", decision)
+    update_run = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update_run)
+    get_or_create = AsyncMock()
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
+    execute_safe = AsyncMock(return_value=_completed_result(block))
+    monkeypatch.setattr(LoginBlock, "execute_safe", execute_safe)
+
+    workflow_run = _workflow_run()
+    workflow_run.browser_seed_source = BrowserSeedSource.override
+
+    await _run_single_block(service, block, workflow_run=workflow_run)
+
+    # An explicit per-run override must survive the login block: no re-stamp, no credential boot, no
+    # goal rewrite — just a normal login into the overridden profile.
+    update_run.assert_not_awaited()
+    decision.assert_not_awaited()
+    get_or_create.assert_not_awaited()
+    assert block.navigation_goal == "log in"
     execute_safe.assert_awaited_once()
 
 

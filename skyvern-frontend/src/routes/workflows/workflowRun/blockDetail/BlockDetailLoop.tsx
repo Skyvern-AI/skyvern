@@ -1,6 +1,6 @@
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { stringifyTimelineValue } from "./formatValue";
-import { BlockDetailFailure, CodeBlock, Section } from "./shared";
+import { CodeBlock, Section } from "./shared";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -29,7 +29,6 @@ function BlockDetailLoop({ block, iterationIndex = null }: Props) {
 
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
-      <BlockDetailFailure block={block} />
       {showIterationOnly && (
         <Section title={`Iteration ${(highlightIndex ?? 0) + 1} value`}>
           <CodeBlock>{stringifyTimelineValue(highlightedValue)}</CodeBlock>
@@ -44,9 +43,9 @@ function BlockDetailLoop({ block, iterationIndex = null }: Props) {
                 return (
                   <div
                     key={index}
-                    className="flex min-w-0 gap-2 text-xs text-slate-300"
+                    className="flex min-w-0 gap-2 text-xs text-tertiary-foreground"
                   >
-                    <span className="shrink-0 self-start py-2 text-slate-500">
+                    <span className="shrink-0 self-start py-2 text-muted-foreground dark:text-slate-500">
                       [{index}]
                     </span>
                     <CodeBlock className="min-w-0 flex-1">{full}</CodeBlock>
@@ -55,7 +54,9 @@ function BlockDetailLoop({ block, iterationIndex = null }: Props) {
               })}
             </div>
           ) : (
-            <div className="text-xs text-slate-500">No values.</div>
+            <div className="text-xs text-muted-foreground dark:text-slate-500">
+              No values.
+            </div>
           )}
         </Section>
       )}
@@ -67,7 +68,7 @@ function BlockDetailLoop({ block, iterationIndex = null }: Props) {
               : "Current iteration"
           }
         >
-          <span className="text-sm text-slate-200">
+          <span className="text-sm text-foreground dark:text-slate-200">
             {displayedIteration + 1}
             {isForLoop && loopValues.length > 0
               ? ` of ${loopValues.length}`

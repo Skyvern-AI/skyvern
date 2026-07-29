@@ -9,6 +9,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     ShapeExpectation,
     ValueCardinality,
     ValueShape,
+    _exact_path,
     _key_value_shape_bindings,
     _table_shape_bindings,
     array_parent_path,
@@ -208,6 +209,76 @@ def test_only_exact_configured_aliases_bind_observed_labels() -> None:
     fuzzy["evidence"]["key_value_relations"][0]["key_text"] = "Approximate record value"
 
     assert _derive(packet=fuzzy) is None
+
+
+def _reveal_relation(key_text: str, *, value_child_index: int, value_text: str = "Amount due: $3,927.75") -> dict:
+    return {
+        "key_text": key_text,
+        "value_text": value_text,
+        "container_selector": "#result",
+        "container_match_count": 1,
+        "container_position": 0,
+        "value_child_index": value_child_index,
+        "direct_child_count": 4,
+        "visible": True,
+        "value_visible": True,
+    }
+
+
+def _packet_with_reveal(*relations: dict) -> dict[str, object]:
+    packet = _flow_packet()
+    packet["evidence"]["key_value_relations"].extend(relations)
+    return packet
+
+
+def test_exact_path_rejects_empty_label_and_binds_configured_label() -> None:
+    assert _exact_path("", LABELS_BY_PATH) is None
+    assert _exact_path("Overall State", LABELS_BY_PATH) == "output.overall_state"
+
+
+def test_multi_value_reveal_container_is_binder_inert_and_preserves_plan() -> None:
+    base = _derive()
+    with_reveal = _derive(
+        packet=_packet_with_reveal(
+            _reveal_relation("", value_child_index=1),
+            _reveal_relation("", value_child_index=2, value_text="Billing period: Mar 1 - Mar 31, 2026"),
+        )
+    )
+
+    assert base is not None
+    assert with_reveal is not None
+    assert with_reveal.identity == base.identity
+    assert {binding.output_path for binding in with_reveal.live_reads} == {
+        binding.output_path for binding in base.live_reads
+    }
+
+
+def test_single_value_reveal_heading_absent_from_labels_does_not_poison_plan() -> None:
+    base = _derive()
+    with_reveal = _derive(packet=_packet_with_reveal(_reveal_relation("March 2026 statement", value_child_index=1)))
+
+    assert base is not None
+    assert with_reveal is not None
+    assert with_reveal.identity == base.identity
+
+
+def test_single_value_reveal_heading_colliding_with_bound_label_yields_bounded_none() -> None:
+    assert _derive(packet=_packet_with_reveal(_reveal_relation("Overall State", value_child_index=1))) is None
+
+
+def test_reveal_truncation_signal_voids_plan_without_pass_one_flag() -> None:
+    base = _derive()
+    warned = _packet_with_reveal(
+        _reveal_relation("", value_child_index=1),
+        _reveal_relation("", value_child_index=2, value_text="Billing period: Mar 1 - Mar 31, 2026"),
+    )
+    warned_evidence = warned["evidence"]
+    assert isinstance(warned_evidence, dict)
+    warned_evidence["inspection_warnings"] = ["reveal_relations_truncated"]
+
+    assert base is not None
+    assert warned_evidence["key_value_relations_truncated"] is False
+    assert _derive(packet=warned) is None
 
 
 def test_table_identity_coordinate_and_shape_ambiguity_fail_closed() -> None:

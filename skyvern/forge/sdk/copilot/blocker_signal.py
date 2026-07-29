@@ -227,6 +227,7 @@ class TerminalEvidence:
 @dataclass(frozen=True)
 class LoopBlockerEvidence(TerminalEvidence):
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+    output_policy_reject_reason_codes: frozenset[str] | None = None
 
 
 class _LoopEvidenceCtx(Protocol):
@@ -239,6 +240,7 @@ class _LoopEvidenceCtx(Protocol):
     staged_workflow_yaml: str | None
     has_staged_proposal: bool
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None
+    last_output_policy_reject_reason_codes: frozenset[str] | None
 
 
 class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
@@ -258,6 +260,7 @@ class _TerminalEvidenceResetCtx(Protocol):
     last_run_blocks_block_labels: list[str]
     last_run_outcome: RecordedRunOutcome | None
     last_run_outcome_block_labels: list[str]
+    terminal_envelope_run_outcomes: list[RecordedRunOutcome]
     last_outcome_gate_reason: str | None
     last_outcome_gate_workflow_run_id: str | None
     last_test_anti_bot: str | None
@@ -294,6 +297,7 @@ def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> 
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None
     ctx.last_run_outcome_block_labels = []
+    ctx.terminal_envelope_run_outcomes = []
     ctx.last_outcome_gate_reason = None
     ctx.last_outcome_gate_workflow_run_id = None
     ctx.last_test_anti_bot = None
@@ -308,6 +312,7 @@ def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence
     evidence = terminal_evidence_from_ctx(ctx)
     # Older context snapshots may not carry fields added after the snapshot was created.
     result_steer = getattr(ctx, "latest_evaluate_result_composition_steer", None)
+    reject_reason_codes = getattr(ctx, "last_output_policy_reject_reason_codes", None)
     return LoopBlockerEvidence(
         outcome_gate_reason=evidence.outcome_gate_reason,
         outcome_gate_workflow_run_id=evidence.outcome_gate_workflow_run_id,
@@ -316,6 +321,7 @@ def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence
         anti_bot_blocked=evidence.anti_bot_blocked,
         has_draft=evidence.has_draft,
         latest_evaluate_result_composition_steer=result_steer,
+        output_policy_reject_reason_codes=reject_reason_codes if isinstance(reject_reason_codes, frozenset) else None,
     )
 
 
@@ -342,11 +348,13 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
-UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
-RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
+DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE = "loop_detected_discovery_exhausted_no_entry_url"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
-    {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
+    {
+        OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+    }
 )
 
 # A held blocker whose reason code is in this set must win both the rendered reply and the typed
@@ -359,11 +367,10 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         "tool_error_post_budget_challenge_blocker",
         "tool_error_challenge_gated_submit_disabled",
         "probable_site_block_stop",
-        SCHEMA_INCOMPATIBILITY_REASON_CODE,
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
         "advisory_dispatch_stalled",
-        "repair_ceiling_reached",
+        DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
     }
 )
 
@@ -391,18 +398,6 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code == "tool_error_post_budget_challenge_blocker"
         and existing.internal_reason_code in _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES
-    ):
-        return True
-    if (
-        incoming.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
-        and existing.blocker_kind == "tool_error"
-        and not existing.renders_final_reply
-    ):
-        return True
-    if (
-        existing.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
-        and not existing.renders_final_reply
-        and incoming.renders_final_reply
     ):
         return True
     if (
@@ -490,6 +485,14 @@ _LOOP_CREDENTIAL_TEMPLATE = (
 CREDENTIAL_SCOUT_VERIFY_REPLY = (
     "I need to verify the saved-credential login in the browser before I can save or run this code."
 )
+# Mirrors OutputPolicyReason.RAW_SECRET_LEAK.value; kept local because output_policy imports this
+# module, so importing back would be circular.
+RAW_SECRET_LEAK_REASON_CODE = "raw_secret_leak"
+RAW_SECRET_EMBED_REFUSAL_REPLY = (
+    "I couldn't save this because the login code kept embedding the credential's secret value directly "
+    "instead of referencing your saved credential. Your draft is preserved — tell me to reference the "
+    "saved credential and I'll try again."
+)
 _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     "loop_detected_repeated_failed_step": (
         "I retried without making progress.",
@@ -502,10 +505,6 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
     "loop_detected_generic": (
         "I couldn't keep going on this turn.",
         "Tell me what to change and I'll try again.",
-    ),
-    "repair_ceiling_reached": (
-        "I couldn't get past the same problem after several attempts.",
-        "Tell me what to change and I'll try a different approach.",
     ),
     "code_authoring_guardrail_churn": (
         "I kept rewriting the generated code, but the safety checks rejected each version.",
@@ -645,6 +644,9 @@ def compose_loop_blocker_user_facing_reason(
     if internal_reason_code == "loop_detected_credential_or_parameter_misconfig":
         return _LOOP_CREDENTIAL_TEMPLATE, draft_tier
     if internal_reason_code == "credential_priority_authoring_churn":
+        reject_reason_codes = evidence.output_policy_reject_reason_codes if evidence is not None else None
+        if reject_reason_codes == frozenset({RAW_SECRET_LEAK_REASON_CODE}):
+            return RAW_SECRET_EMBED_REFUSAL_REPLY, draft_tier
         return CREDENTIAL_SCOUT_VERIFY_REPLY, draft_tier
     framing, ask = _LOOP_BRANCH_COPY.get(internal_reason_code or "", _LOOP_BRANCH_COPY["loop_detected_generic"])
     result_steer = evidence.latest_evaluate_result_composition_steer if evidence is not None else None

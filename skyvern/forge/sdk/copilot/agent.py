@@ -6,13 +6,18 @@ Uses the OpenAI Agents SDK with LiteLLM for multi-provider LLM support.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
+import math
+import os
 import re
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -28,10 +33,12 @@ if TYPE_CHECKING:
 import structlog
 import yaml
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.copilot import llm_config
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -44,7 +51,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase, initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import (
+    BuildPhase,
+    anchor_recovers_entrypoint,
+    extract_in_turn_entry_url,
+    initial_build_phase,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -81,21 +93,34 @@ from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CodeAuthoringRepairContext,
     CopilotContext,
+    DeliveredUnverifiedPublicOutputs,
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
     NarrativeOutcomeAdjudication,
+    ProposalDisposition,
     ResponseType,
     StructuredContext,
     TurnNarrativePayload,
+    adopt_model_authored_context,
+    coerce_ask_subject,
     finalize_discovery_counter_in_global_llm_context,
+    parsed_ask_refs,
+    record_approved_credentials_in_global_llm_context,
+    record_signin_email_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.credential_literal_rebind import (
+    rebind_scouted_credential_literals,
+    scouted_credential_targets,
+)
+from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
     SCOUTED_SPINE_TURN_HALT_USER_REASON,
+    _get_scouted_spine_missing_steps_for_halt,
     artifact_health_blocked,
     log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
@@ -131,6 +156,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyVerdict,
     actuation_obligation_key,
     build_output_policy_diagnostics,
+    demote_author_time_steer_reasons,
     derive_output_kind,
     evaluate_actuation_obligation,
     evaluate_output_policy,
@@ -163,13 +189,20 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
-from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
+from skyvern.forge.sdk.copilot.runtime import (
+    _browser_context_is_attachable,
+)
+from skyvern.forge.sdk.copilot.secret_redaction import SECRET_KEYWORD_ASSIGNMENT_PATTERN
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
+from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, reason_in_reply_shadow
+from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
+from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_churn
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -193,6 +226,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     classify_turn_intent,
     turn_intent_defers_authoring_live_fill,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
     derive_response_kind,
@@ -205,7 +239,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
-from skyvern.forge.sdk.trace import apply_context_attrs
+from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -271,7 +305,7 @@ def _copilot_turn_span(
     turn_id: str | None = None,
 ) -> Iterator[Any]:
     tracer = otel_trace.get_tracer("skyvern")
-    with tracer.start_as_current_span(_COPILOT_TURN_SPAN_NAME) as span:
+    with traced_span(tracer, _COPILOT_TURN_SPAN_NAME) as span:
         span.set_attribute("skyvern.span.role", "wrapper")
         span.set_attribute("copilot.turn_index", _derive_turn_index(chat_history, turn_index))
         if turn_id is not None:
@@ -520,19 +554,8 @@ def _store_request_policy_on_context(
         chat_history_text=policy_inputs.chat_history_text,
         previous_user_message=policy_inputs.previous_user_message,
     )
-    turn_intent = build_turn_intent(
-        user_message=policy_inputs.user_message,
-        workflow_yaml=policy_inputs.workflow_yaml,
-        chat_history=policy_inputs.chat_history_messages,
-        global_llm_context=policy_inputs.global_llm_context,
-        request_policy=policy,
-        workflow_id=policy_inputs.workflow_id,
-        workflow_permanent_id=policy_inputs.workflow_permanent_id,
-        workflow_run_id=policy_inputs.workflow_run_id,
-        browser_session_id=policy_inputs.browser_session_id,
-        classifier_result=turn_intent_classifier_result,
-        fix_origin=policy_inputs.fix_origin,
-    )
+    ctx.turn_intent_classifier_result = turn_intent_classifier_result
+    _derive_turn_intent_on_context(ctx, policy, policy_inputs)
     _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
     ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
@@ -542,7 +565,32 @@ def _store_request_policy_on_context(
         chat_history_text=policy_chat_history_text,
         global_llm_context=policy_inputs.global_llm_context,
     )
-    ctx.turn_intent = turn_intent
+
+
+def _derive_turn_intent_on_context(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    """Snapshot ``policy``'s authority into ``ctx.turn_intent``.
+
+    build_turn_intent hard-clears may_update_workflow/may_run_blocks for a CLARIFY
+    policy, so any code that later un-blocks the policy must re-derive here or the
+    turn keeps clarify-shaped authority.
+    """
+    ctx.turn_intent = build_turn_intent(
+        user_message=policy_inputs.user_message,
+        workflow_yaml=policy_inputs.workflow_yaml,
+        chat_history=policy_inputs.chat_history_messages,
+        global_llm_context=policy_inputs.global_llm_context,
+        request_policy=policy,
+        workflow_id=policy_inputs.workflow_id,
+        workflow_permanent_id=policy_inputs.workflow_permanent_id,
+        workflow_run_id=policy_inputs.workflow_run_id,
+        browser_session_id=policy_inputs.browser_session_id,
+        classifier_result=ctx.turn_intent_classifier_result,
+        fix_origin=policy_inputs.fix_origin,
+    )
 
 
 def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
@@ -563,6 +611,26 @@ def _turn_context_log_fields(packet: TurnContextPacket | None) -> dict[str, Any]
 
 def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, str]:
     return {key: str(value) for key, value in _turn_context_log_fields(packet).items()}
+
+
+def _transcript_anchor_disabled() -> bool:
+    """Test-isolation knob: COPILOT_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
+    return os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
+    """The earliest-user-turn anchor, or "" when it cannot be trusted this turn.
+
+    Blanked when the retained window is at capacity: a full window may have
+    dropped older turns, so earliest_user_turn would be a middle-history turn
+    rather than the original request.
+    """
+    # Deferred: routes.workflow_copilot imports this module (circular at import time).
+    from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
+
+    if not isinstance(packet, TurnContextPacket) or chat_history_len >= CHAT_HISTORY_CONTEXT_MESSAGES:
+        return ""
+    return packet.transcript_context.earliest_user_turn
 
 
 def _store_turn_context_packet_on_context(
@@ -844,6 +912,13 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "list the exact key in the code block's parameter_keys, reference the exact key as a bare Python "
             "variable in code, do not hardcode the eval value, and rerun via update_and_run_blocks."
         )
+    if repair_context.parameter_binding_directive is not None:
+        lines.append("parameter_binding_pairs:")
+        for candidate in repair_context.parameter_binding_directive.candidates:
+            key = _clean_authoring_repair_prompt_atom(candidate.declared_key, max_chars=80)
+            selector = _clean_authoring_repair_prompt_atom(candidate.field_selector, max_chars=160)
+            if key and selector:
+                lines.append(f"- {key} -> {selector}")
     if repair_context.reason_code == "synthesized_parameter_binding_ambiguous":
         binding_action_lines = _render_unresolved_name_binding_actions(
             repair_context.unresolved_names, available_parameter_keys
@@ -926,6 +1001,38 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
                 lines.append(f"- {'; '.join(fields)}")
     if outcome.workflow_run_id:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    page_path_failure = outcome.page_path_failure
+    if page_path_failure is not None and page_path_failure.is_page_path:
+        lines.extend(
+            [
+                "POST-RUN PAGE-PATH CONTINUATION:",
+                f"kind: {_clean_authoring_repair_prompt_atom(page_path_failure.kind)}",
+            ]
+        )
+        for target in page_path_failure.continuation_targets:
+            selector = _clean_authoring_repair_prompt_atom(target.selector)
+            lines.append(f"- allowed click: selector={selector}")
+            if page_path_failure.enter_allowed and target.kind in {"form_submit", "challenge"}:
+                lines.append(f"- allowed Enter: selector={selector}")
+        lines.append(
+            "Continue from the current page with one exact listed click or Enter action. "
+            "Do not navigate away or re-author the workflow before attempting that bounded continuation."
+        )
+    elif (
+        page_path_failure is None
+        and outcome.phase == "persisted_block_run"
+        and outcome.reason_code == "outcome_not_demonstrated"
+        and outcome.workflow_run_id
+    ):
+        lines.extend(
+            [
+                "POST-RUN PAGE-PATH CONTRACT UNBOUND:",
+                'Before any click or key press, call inspect_page_for_composition with target_url="current_page". '
+                "Do not use evaluate as a substitute. If the fresh same-run observation is page-path-shaped, it "
+                "will emit the exact allowed click or Enter selector; use only that selector without navigating or "
+                "re-authoring first. Otherwise the existing blocker remains in force.",
+            ]
+        )
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
     if outcome.observed_page_value_excerpt:
@@ -1142,7 +1249,10 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "workflow and skip the browser run with a credential setup message. "
             + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run blocks, "
             + "and tell the user to store the redacted secret as a saved credential before testing. "
-            + "If `resolved_credentials` are present, use those `credential_id` values."
+            + "If `resolved_credentials` are present, use those `credential_id` values. "
+            + "If `resolved_signin_email` is present, that address signs in: bind it to the workflow as a "
+            + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
+            + "under a different address, and do not ask for a saved password credential for that login."
         )
         return (
             prompt
@@ -1150,6 +1260,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
             + _synthesized_block_offer_prompt(ctx)
+            + todo_list_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )
 
@@ -1691,11 +1802,88 @@ def _should_use_built_unverified_completed_reply(
     )
 
 
+def _terminal_envelope_run_outcomes(ctx: CopilotContext) -> list[RecordedRunOutcome]:
+    raw = ctx.terminal_envelope_run_outcomes
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        outcomes = [outcome for outcome in raw if isinstance(outcome, RecordedRunOutcome)]
+        if outcomes:
+            return outcomes
+    recorded = ctx.last_run_outcome
+    return [recorded] if isinstance(recorded, RecordedRunOutcome) else []
+
+
+def _terminal_halt_fields(ctx: CopilotContext) -> tuple[str | None, str | None]:
+    halt = getattr(ctx, "turn_halt", None)
+    if not isinstance(halt, TurnHalt):
+        return None, None
+    blocker_reason: str | None = None
+    signal = halt.blocker_signal
+    if isinstance(signal, CopilotToolBlockerSignal):
+        blocker_reason = signal.user_facing_reason
+    return blocker_reason, halt.kind.value
+
+
+def _attempted_summary(narrative_summary: object, narrative_payload: object) -> str | None:
+    if isinstance(narrative_summary, str) and narrative_summary.strip():
+        return narrative_summary.strip()
+    if isinstance(narrative_payload, Mapping):
+        payload_summary = narrative_payload.get("narrativeSummary")
+        if isinstance(payload_summary, str) and payload_summary.strip():
+            return payload_summary.strip()
+    return None
+
+
+def _assemble_terminal_envelope_safe(
+    *,
+    response_type: str,
+    verified: bool,
+    workflow_applied: bool,
+    proposal_disposition: str | None,
+    run_outcomes: Sequence[RecordedRunOutcome],
+    blocker_reason: str | None,
+    halt_kind: str | None,
+    attempted: str | None,
+    workflow_mutated: bool,
+    turn_outcome_response_kind: str | None,
+    final_message: str,
+) -> dict[str, Any] | None:
+    try:
+        envelope = assemble_terminal_envelope(
+            response_type=response_type,
+            verified=verified,
+            workflow_applied=workflow_applied,
+            proposal_disposition=proposal_disposition,
+            run_outcomes=run_outcomes,
+            blocker_reason=blocker_reason,
+            halt_kind=halt_kind,
+            attempted=attempted,
+            workflow_mutated=workflow_mutated,
+            turn_outcome_response_kind=turn_outcome_response_kind,
+        )
+    except Exception:
+        LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
+        return None
+    if envelope is None:
+        return None
+    reason_in_reply = reason_in_reply_shadow(envelope.run_display_reason, final_message)
+    payload = envelope.model_dump(mode="json")
+    LOG.info(
+        "copilot_terminal_envelope",
+        **payload,
+        response_type=response_type,
+        envelope_response_kind=envelope.response_kind,
+        reason_in_reply=reason_in_reply,
+        finalized=False,
+    )
+    return payload
+
+
 def _make_agent_result(
     ctx: CopilotContext | None,
     *,
     global_llm_context: str | None = None,
     turn_outcome: TurnOutcome | None = None,
+    _delivered_unverified_snapshot: _DeliveredUnverifiedSnapshot | None = None,
     **kwargs: Any,
 ) -> AgentResult:
     """Sole ``AgentResult`` constructor in this module.
@@ -1706,16 +1894,25 @@ def _make_agent_result(
     normal translate-result, missing-SDK fallback, unexpected-error fallback).
     """
     final_context = (
-        finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+        record_signin_email_in_global_llm_context(
+            ctx,
+            record_approved_credentials_in_global_llm_context(
+                ctx, finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+            ),
+        )
         if ctx is not None
         else global_llm_context
     )
+    kwargs.pop("delivered_unverified_observed_outputs", None)
     narrative_payload = kwargs.get("narrative_payload")
     if ctx is not None and narrative_payload is None:
         raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     response_type = kwargs.get("response_type", "REPLY")
     proposal_disposition = kwargs.get("proposal_disposition")
     if isinstance(narrative_payload, dict):
+        payload_base = {
+            key: value for key, value in narrative_payload.items() if key != "deliveredUnverifiedObservedOutputs"
+        }
         payload_updates: dict[str, Any] = {}
         if "responseType" not in narrative_payload:
             payload_updates["responseType"] = response_type
@@ -1741,13 +1938,37 @@ def _make_agent_result(
             adjudication = _build_outcome_adjudication_payload(ctx)
             if adjudication is not None:
                 payload_updates["outcomeAdjudication"] = adjudication
-        if payload_updates:
-            kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
+        if (
+            ctx is not None
+            and ctx.delivered_unverified_terminal is True
+            and isinstance(_delivered_unverified_snapshot, _DeliveredUnverifiedSnapshot)
+            and _delivered_unverified_snapshot
+        ):
+            payload_updates["deliveredUnverifiedObservedOutputs"] = _delivered_unverified_snapshot
+        if payload_updates or len(payload_base) != len(narrative_payload):
+            kwargs["narrative_payload"] = {**payload_base, **payload_updates}
+    terminal_envelope: dict[str, Any] | None = None
+    if ctx is not None:
+        blocker_reason, halt_kind = _terminal_halt_fields(ctx)
+        turn_outcome_response_kind = turn_outcome.response_kind.value if turn_outcome is not None else None
+        response_type_value = response_type if isinstance(response_type, str) else "REPLY"
+        terminal_envelope = _assemble_terminal_envelope_safe(
+            response_type=response_type_value,
+            verified=bool(verified_goal_claim_authorized(ctx)),
+            workflow_applied=False,
+            proposal_disposition=proposal_disposition if isinstance(proposal_disposition, str) else None,
+            run_outcomes=_terminal_envelope_run_outcomes(ctx),
+            blocker_reason=blocker_reason,
+            halt_kind=halt_kind,
+            attempted=_attempted_summary(kwargs.get("narrative_summary"), kwargs.get("narrative_payload")),
+            workflow_mutated=bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None,
+            turn_outcome_response_kind=turn_outcome_response_kind,
+            final_message=str(kwargs.get("user_response") or ""),
+        )
+    kwargs["terminal_envelope"] = terminal_envelope
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
     if ctx is not None and result.turn_outcome is not None:
         result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
-    if ctx is not None and not result.apply_without_review:
-        result.apply_without_review = _should_apply_code_only_success_without_review(ctx, result.proposal_disposition)
     if ctx is not None and result.completion_criteria_turn_state is None:
         result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     if ctx is not None and result.code_artifact_metadata is None:
@@ -1760,19 +1981,6 @@ def _make_agent_result(
         elif isinstance(ctx_metadata, dict) and ctx_metadata:
             result.code_artifact_metadata = ctx_metadata
     return result
-
-
-def _should_apply_code_only_success_without_review(ctx: CopilotContext, disposition: object) -> bool:
-    return (
-        disposition == "auto_applicable"
-        and verified_goal_claim_authorized(ctx)
-        and ctx.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-        and ctx.last_test_ok is True
-        and ctx.last_full_workflow_test_ok is True
-        and not ctx.last_test_suspicious_success
-        and ctx.has_staged_proposal
-        and ctx.staged_workflow is not None
-    )
 
 
 def _build_outcome_adjudication_payload(ctx: CopilotContext) -> NarrativeOutcomeAdjudication | None:
@@ -1900,6 +2108,8 @@ def _build_exit_result(
     global_llm_context: str | None,
     cancelled: bool = False,
     terminal_reason: str | None = None,
+    proposal_disposition: ProposalDisposition = "auto_applicable",
+    _delivered_unverified_snapshot: _DeliveredUnverifiedSnapshot | None = None,
 ) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
@@ -1953,6 +2163,7 @@ def _build_exit_result(
         ctx,
         _make_agent_result(
             ctx,
+            _delivered_unverified_snapshot=_delivered_unverified_snapshot,
             user_response=final_text,
             updated_workflow=verified_workflow,
             global_llm_context=global_llm_context,
@@ -1963,6 +2174,7 @@ def _build_exit_result(
             staged_workflow=ctx.staged_workflow,
             canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
             total_tokens=ctx.total_tokens_used,
+            proposal_disposition=proposal_disposition,
             cancelled=cancelled,
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
@@ -1985,6 +2197,7 @@ async def _build_goal_satisfied_exit_result(
     terminal_reason: str = "verified_goal_satisfied",
     exit_site: str = "verified_goal_satisfied",
     flush_goal_satisfied: bool = True,
+    name_missing_spine_steps: bool = False,
 ) -> AgentResult:
     # Bypass one extra LLM turn after a full workflow test already satisfies
     # the diagnosis contract.
@@ -2008,6 +2221,10 @@ async def _build_goal_satisfied_exit_result(
         user_response = (
             "I reached the requested outcome, but the workflow has not been tested end-to-end. "
             "Review the draft before using it."
+        )
+    if name_missing_spine_steps and log_scouted_spine_unresolved_at_turn_halt(ctx):
+        user_response = _with_scouted_spine_missing_steps(
+            ctx, user_response, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
         )
     final_text, outcome = apply_repeated_reply_guard(
         final_text=user_response,
@@ -2097,10 +2314,36 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
         terminal_reason=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
         exit_site=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
         flush_goal_satisfied=False,
+        name_missing_spine_steps=True,
     )
 
 
-_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED})
+_SCOUTED_SPINE_MISSING_STEPS_PREFIX = "This draft is still missing steps you demonstrated:"
+
+
+def _with_scouted_spine_missing_steps(
+    ctx: CopilotContext,
+    user_response: str,
+    missing_steps: str | None,
+    *,
+    held_signal_unrelated: bool = False,
+) -> str:
+    """Name the demonstrated-but-missing steps on any give-up offer that carries a staged proposal, and
+    anchor them in the held blocker signal so the blocker-override finalizer cannot re-render them away.
+    When the held signal is an unrelated blocker that owns the turn (output policy, timeout, credential),
+    the steps are surfaced in the reply only; its reason and claimant stay intact so the turn's single
+    owner keeps rendering its own reply. Idempotent so a pre-finalizer append plus the finalizer re-render
+    never doubles the note."""
+    if not missing_steps or not ctx.has_staged_proposal:
+        return user_response
+    if _SCOUTED_SPINE_MISSING_STEPS_PREFIX in user_response:
+        return user_response
+    reframed = f"{user_response}\n\n{_SCOUTED_SPINE_MISSING_STEPS_PREFIX} {missing_steps}"
+    if not held_signal_unrelated and isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
+        ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": reframed})
+        ctx.blocker_signal_claimant = None
+    return reframed
 
 
 def _build_turn_halt_exit_result(
@@ -2109,24 +2352,24 @@ def _build_turn_halt_exit_result(
     halt: TurnHalt,
 ) -> AgentResult:
     under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
+    missing_steps = _get_scouted_spine_missing_steps_for_halt(ctx) if under_build_open else None
     if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
-        reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
         return _build_wip_exit_result(
             ctx,
             global_llm_context,
-            default_reply=reply,
-            unvalidated_reply=reply,
-            tested_reply=reply,
+            default_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
+            unvalidated_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
+            tested_reply=_BUILT_UNVERIFIED_COMPLETED_REPLY,
             terminal_reason=f"turn_halt:{halt.kind.value}",
+            missing_spine_steps=missing_steps,
         )
     signal = halt.blocker_signal
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
         signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
-    if under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS:
+    scouted_spine_owns = under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS
+    if scouted_spine_owns:
         user_response = SCOUTED_SPINE_TURN_HALT_USER_REASON
-        # The blocker-override finalizer re-renders from the held signal, so the
-        # reframed reason must live there, not just in the local reply.
         if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
             ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
             ctx.blocker_signal_claimant = None
@@ -2134,6 +2377,9 @@ def _build_turn_halt_exit_result(
         user_response = signal.user_facing_reason
     else:
         user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
+    user_response = _with_scouted_spine_missing_steps(
+        ctx, user_response, missing_steps, held_signal_unrelated=not scouted_spine_owns
+    )
     return _build_exit_result(
         ctx,
         user_response,
@@ -2239,6 +2485,360 @@ _VERIFIED_CLASSIFICATION_GATE_KEYS = (
 )
 _VERIFIED_CLASSIFICATION_GATE_PHRASES = ("Sign in or register to continue",)
 _VERIFIED_TERMINAL_VALUE_MAX_CHARS = 180
+_DELIVERED_UNVERIFIED_SUMMARY_MAX_CHARS = 720
+_DELIVERED_UNVERIFIED_OMISSION_KEY = "$skyvernOmitted"
+_DELIVERED_UNVERIFIED_METADATA_KEY = "$skyvernOutput"
+_DELIVERED_UNVERIFIED_MAX_DEPTH = 16
+_DELIVERED_UNVERIFIED_MAX_NODES = 64
+_DELIVERED_UNVERIFIED_MAX_STRING_CHARS = 512
+_DELIVERED_UNVERIFIED_MAX_SERIALIZED_BYTES = 65_536
+_DELIVERED_UNVERIFIED_SERIALIZED_METADATA_RESERVE_BYTES = 2_048
+_DELIVERED_UNVERIFIED_MAX_IMAGE_ENCODED_BYTES = 65_536
+_DELIVERED_UNVERIFIED_MAX_IMAGE_DECODED_BYTES = 49_152
+_DELIVERED_UNVERIFIED_MAX_IMAGE_PIXELS = 1_000_000
+_REDACTED_INTERNAL_OUTPUT = "[REDACTED_INTERNAL]"
+_UNSUPPORTED_DELIVERED_OUTPUT = object()
+_INVALID_DELIVERED_IMAGE = object()
+_PNG_START = b"\x89PNG\r\n\x1a\n"
+_PNG_END = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
+_JPEG_START = b"\xff\xd8"
+_JPEG_END = b"\xff\xd9"
+_CAMEL_CASE_ACRONYM_BOUNDARY_RE = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_CASE_KEY_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_DELIMITED_KEY_BOUNDARY_RE = re.compile(r"[-\s]+")
+
+
+def _delivered_unverified_image_payload(value: str) -> tuple[bool, str]:
+    lowered = value[:32].lower()
+    for prefix in ("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/jpg;base64,"):
+        if lowered.startswith(prefix):
+            return True, value[len(prefix) :]
+    if lowered.startswith("data:image/"):
+        return True, ""
+    try:
+        decoded_prefix = base64.b64decode(value[:16], validate=True)
+    except (binascii.Error, ValueError):
+        return False, value
+    return decoded_prefix.startswith((_PNG_START, _JPEG_START)), value
+
+
+def _delivered_unverified_decoded_size(encoded: str) -> int | None:
+    if not encoded or len(encoded) % 4 != 0:
+        return None
+    padding = len(encoded) - len(encoded.rstrip("="))
+    if padding > 2:
+        return None
+    return (len(encoded) // 4) * 3 - padding
+
+
+def _canonical_delivered_unverified_image(value: str) -> tuple[bool, str | None]:
+    image_input, encoded = _delivered_unverified_image_payload(value)
+    if not image_input:
+        return False, None
+    encoded_size = len(encoded.encode("ascii", errors="ignore"))
+    decoded_size = _delivered_unverified_decoded_size(encoded)
+    if (
+        encoded_size != len(encoded)
+        or encoded_size > _DELIVERED_UNVERIFIED_MAX_IMAGE_ENCODED_BYTES
+        or decoded_size is None
+        or decoded_size > _DELIVERED_UNVERIFIED_MAX_IMAGE_DECODED_BYTES
+    ):
+        return True, None
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return True, None
+    if len(decoded) > _DELIVERED_UNVERIFIED_MAX_IMAGE_DECODED_BYTES:
+        return True, None
+    if not decoded.startswith((_PNG_START, _JPEG_START)):
+        return True, None
+    try:
+        with Image.open(BytesIO(decoded)) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _DELIVERED_UNVERIFIED_MAX_IMAGE_PIXELS:
+                return True, None
+            if image.format == "PNG":
+                if not decoded.endswith(_PNG_END):
+                    return True, None
+                canonical_image = image.convert("RGBA")
+            elif image.format == "JPEG":
+                if not decoded.endswith(_JPEG_END):
+                    return True, None
+                canonical_image = image.convert("RGB")
+            else:
+                return True, None
+            image.load()
+            pixels_only = Image.frombytes(canonical_image.mode, canonical_image.size, canonical_image.tobytes())
+            canonical_bytes = BytesIO()
+            pixels_only.save(canonical_bytes, format=image.format)
+    except (binascii.Error, Image.DecompressionBombError, OSError, SyntaxError, UnidentifiedImageError, ValueError):
+        return True, None
+    return True, base64.b64encode(canonical_bytes.getvalue()).decode()
+
+
+def _sanitize_delivered_unverified_scalar(ctx: CopilotContext, value: Any) -> Any:
+    if value is None or isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _UNSUPPORTED_DELIVERED_OUTPUT
+    if isinstance(value, str):
+        image_input, canonical_image = _canonical_delivered_unverified_image(value)
+        if image_input:
+            return canonical_image if canonical_image is not None else _INVALID_DELIVERED_IMAGE
+        registered_scrubbed = scrub_secrets_from_text(ctx, value)
+        redacted = redact_sensitive_fields(redact_raw_secrets_for_prompt(registered_scrubbed))
+        return _REDACTED_INTERNAL_OUTPUT if contains_internal_machinery_leak(redacted) else redacted
+    return _UNSUPPORTED_DELIVERED_OUTPUT
+
+
+def _delivered_unverified_sensitive_key(key: str) -> bool:
+    original = key.strip()
+    normalized = _CAMEL_CASE_ACRONYM_BOUNDARY_RE.sub("_", original)
+    normalized = _CAMEL_CASE_KEY_BOUNDARY_RE.sub("_", normalized)
+    normalized = _DELIMITED_KEY_BOUNDARY_RE.sub("_", normalized).lower()
+    for candidate in dict.fromkeys((original, normalized)):
+        if SECRET_KEYWORD_ASSIGNMENT_PATTERN.fullmatch(candidate) or SECRET_KEYWORD_ASSIGNMENT_PATTERN.fullmatch(
+            f"{candidate}=value"
+        ):
+            return True
+        redacted = redact_sensitive_fields({candidate: None})
+        if isinstance(redacted, dict) and redacted.get(candidate) == "****":
+            return True
+    return False
+
+
+def _disambiguate_captured_output_key(key: str) -> str:
+    if key in {_DELIVERED_UNVERIFIED_OMISSION_KEY, _DELIVERED_UNVERIFIED_METADATA_KEY}:
+        return f"{key} [captured]"
+    return key
+
+
+def _unique_sanitized_output_key(target: dict[str, Any], key: str) -> str:
+    if key not in target:
+        return key
+    collision_index = 2
+    while f"{key} [{collision_index}]" in target:
+        collision_index += 1
+    return f"{key} [{collision_index}]"
+
+
+def _delivered_unverified_omission(reason: str) -> dict[str, dict[str, str | int]]:
+    return {_DELIVERED_UNVERIFIED_OMISSION_KEY: {"reason": reason, "count": 1}}
+
+
+@dataclass
+class _DeliveredUnverifiedAdmissionBudget:
+    nodes: int = 0
+    depth_omitted: int = 0
+    node_omitted: int = 0
+    string_omitted: int = 0
+    serialized_bytes_omitted: int = 0
+    non_finite_omitted: int = 0
+    cycle_omitted: int = 0
+    unsupported_omitted: int = 0
+    image_omitted: int = 0
+
+    def omission_counts(self) -> dict[str, int]:
+        counts = {
+            "depth": self.depth_omitted,
+            "node": self.node_omitted,
+            "string": self.string_omitted,
+            "serializedBytes": self.serialized_bytes_omitted,
+            "nonFinite": self.non_finite_omitted,
+            "cycle": self.cycle_omitted,
+            "unsupported": self.unsupported_omitted,
+            "image": self.image_omitted,
+        }
+        return {reason: count for reason, count in counts.items() if count}
+
+
+def _bounded_delivered_unverified_scalar(
+    ctx: CopilotContext,
+    value: Any,
+    budget: _DeliveredUnverifiedAdmissionBudget,
+) -> Any:
+    scalar = _sanitize_delivered_unverified_scalar(ctx, value)
+    if scalar is _INVALID_DELIVERED_IMAGE:
+        budget.image_omitted += 1
+        return _delivered_unverified_omission("invalid image")
+    return scalar
+
+
+def _delivered_unverified_admission_priority(value: Any) -> int:
+    """Admit bounded scalar outcomes before containers and long prose."""
+    if value is None or isinstance(value, bool | int):
+        return 0
+    if isinstance(value, float):
+        return 0 if math.isfinite(value) else 3
+    if isinstance(value, str):
+        return 0 if len(value) <= _VERIFIED_TERMINAL_VALUE_MAX_CHARS else 2
+    if isinstance(value, dict | list):
+        return 1
+    return 3
+
+
+def _delivered_unverified_fits_serialized_budget(root: dict[str, Any] | list[Any]) -> bool:
+    # Count the conservative ASCII-escaped wire form so alternate JSON
+    # serializers cannot expand admitted Unicode beyond the public cap.
+    serialized_size = len(json.dumps(root, separators=(",", ":")).encode())
+    return serialized_size <= (
+        _DELIVERED_UNVERIFIED_MAX_SERIALIZED_BYTES - _DELIVERED_UNVERIFIED_SERIALIZED_METADATA_RESERVE_BYTES
+    )
+
+
+def _admit_delivered_unverified_mapping_value(
+    root: dict[str, Any] | list[Any],
+    target: dict[str, Any],
+    key: str,
+    value: Any,
+    budget: _DeliveredUnverifiedAdmissionBudget,
+) -> bool:
+    target[key] = value
+    if _delivered_unverified_fits_serialized_budget(root):
+        return True
+    del target[key]
+    budget.serialized_bytes_omitted += 1
+    return False
+
+
+def _admit_delivered_unverified_list_value(
+    root: dict[str, Any] | list[Any],
+    target: list[Any],
+    value: Any,
+    budget: _DeliveredUnverifiedAdmissionBudget,
+) -> bool:
+    target.append(value)
+    if _delivered_unverified_fits_serialized_budget(root):
+        return True
+    target.pop()
+    budget.serialized_bytes_omitted += 1
+    return False
+
+
+def _sanitize_delivered_unverified_value(ctx: CopilotContext, value: Any) -> Any:
+    budget = _DeliveredUnverifiedAdmissionBudget()
+    scalar = _bounded_delivered_unverified_scalar(ctx, value, budget)
+    if scalar is not _UNSUPPORTED_DELIVERED_OUTPUT:
+        return scalar
+    if not isinstance(value, dict | list):
+        return _UNSUPPORTED_DELIVERED_OUTPUT
+
+    root: dict[str, Any] | list[Any] = {} if isinstance(value, dict) else []
+    pending: list[tuple[dict[Any, Any] | list[Any], dict[str, Any] | list[Any], frozenset[int], int]] = [
+        (value, root, frozenset({id(value)}), 0)
+    ]
+    while pending:
+        source, target, ancestors, depth = pending.pop(0)
+        if isinstance(source, dict) and isinstance(target, dict):
+            ordered_items = sorted(source.items(), key=lambda entry: _delivered_unverified_admission_priority(entry[1]))
+            for index, (key, item) in enumerate(ordered_items):
+                if budget.nodes >= _DELIVERED_UNVERIFIED_MAX_NODES:
+                    budget.node_omitted += len(source) - index
+                    break
+                budget.nodes += 1
+                if not isinstance(key, str):
+                    budget.unsupported_omitted += 1
+                    continue
+                if len(key) > _DELIVERED_UNVERIFIED_MAX_STRING_CHARS:
+                    budget.string_omitted += 1
+                    continue
+                source_key_sensitive = _delivered_unverified_sensitive_key(key)
+                sanitized_key = _bounded_delivered_unverified_scalar(ctx, key, budget)
+                if not isinstance(sanitized_key, str) or sanitized_key == _REDACTED_INTERNAL_OUTPUT:
+                    budget.unsupported_omitted += 1
+                    continue
+                sanitized_key = _disambiguate_captured_output_key(sanitized_key)
+                sanitized_key = _unique_sanitized_output_key(target, sanitized_key)
+                if source_key_sensitive or _delivered_unverified_sensitive_key(sanitized_key):
+                    _admit_delivered_unverified_mapping_value(root, target, sanitized_key, "****", budget)
+                    continue
+                sanitized_item = _bounded_delivered_unverified_scalar(ctx, item, budget)
+                if sanitized_item is not _UNSUPPORTED_DELIVERED_OUTPUT:
+                    _admit_delivered_unverified_mapping_value(root, target, sanitized_key, sanitized_item, budget)
+                    continue
+                if isinstance(item, float) and not math.isfinite(item):
+                    budget.non_finite_omitted += 1
+                    _admit_delivered_unverified_mapping_value(
+                        root, target, sanitized_key, _delivered_unverified_omission("non-finite number"), budget
+                    )
+                elif isinstance(item, dict | list) and id(item) in ancestors:
+                    budget.cycle_omitted += 1
+                    _admit_delivered_unverified_mapping_value(
+                        root, target, sanitized_key, _delivered_unverified_omission("cycle"), budget
+                    )
+                elif isinstance(item, dict | list):
+                    if depth >= _DELIVERED_UNVERIFIED_MAX_DEPTH:
+                        budget.depth_omitted += 1
+                        _admit_delivered_unverified_mapping_value(
+                            root, target, sanitized_key, _delivered_unverified_omission("depth budget"), budget
+                        )
+                        continue
+                    child: dict[str, Any] | list[Any] = {} if isinstance(item, dict) else []
+                    if _admit_delivered_unverified_mapping_value(root, target, sanitized_key, child, budget):
+                        pending.append((item, child, ancestors | {id(item)}, depth + 1))
+                else:
+                    budget.unsupported_omitted += 1
+                    _admit_delivered_unverified_mapping_value(
+                        root, target, sanitized_key, _delivered_unverified_omission("unsupported value"), budget
+                    )
+        elif isinstance(source, list) and isinstance(target, list):
+            for index, item in enumerate(source):
+                if budget.nodes >= _DELIVERED_UNVERIFIED_MAX_NODES:
+                    budget.node_omitted += len(source) - index
+                    break
+                budget.nodes += 1
+                sanitized_item = _bounded_delivered_unverified_scalar(ctx, item, budget)
+                if sanitized_item is not _UNSUPPORTED_DELIVERED_OUTPUT:
+                    _admit_delivered_unverified_list_value(root, target, sanitized_item, budget)
+                    continue
+                if isinstance(item, float) and not math.isfinite(item):
+                    budget.non_finite_omitted += 1
+                    _admit_delivered_unverified_list_value(
+                        root, target, _delivered_unverified_omission("non-finite number"), budget
+                    )
+                elif isinstance(item, dict | list) and id(item) in ancestors:
+                    budget.cycle_omitted += 1
+                    _admit_delivered_unverified_list_value(
+                        root, target, _delivered_unverified_omission("cycle"), budget
+                    )
+                elif isinstance(item, dict | list):
+                    if depth >= _DELIVERED_UNVERIFIED_MAX_DEPTH:
+                        budget.depth_omitted += 1
+                        _admit_delivered_unverified_list_value(
+                            root, target, _delivered_unverified_omission("depth budget"), budget
+                        )
+                        continue
+                    child = {} if isinstance(item, dict) else []
+                    if _admit_delivered_unverified_list_value(root, target, child, budget):
+                        pending.append((item, child, ancestors | {id(item)}, depth + 1))
+                else:
+                    budget.unsupported_omitted += 1
+                    _admit_delivered_unverified_list_value(
+                        root, target, _delivered_unverified_omission("unsupported value"), budget
+                    )
+    if isinstance(root, dict):
+        root = {_DELIVERED_UNVERIFIED_METADATA_KEY: {"omitted": budget.omission_counts()}, **root}
+    return root
+
+
+class _DeliveredUnverifiedSnapshot(dict[str, Any]):
+    """Sanitized, admission-bounded output shared by terminal prose and payload."""
+
+
+def _delivered_unverified_observed_outputs(ctx: CopilotContext) -> _DeliveredUnverifiedSnapshot:
+    observed_outputs = ctx.delivered_unverified_observed_outputs
+    producer_halt = ctx.turn_halt
+    producer_admitted = (
+        producer_halt is not None
+        and producer_halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED
+        and ctx.delivered_unverified_terminal is True
+    )
+    if not isinstance(observed_outputs, DeliveredUnverifiedPublicOutputs) and not producer_admitted:
+        return _DeliveredUnverifiedSnapshot()
+    if not observed_outputs:
+        return _DeliveredUnverifiedSnapshot()
+    sanitized = _sanitize_delivered_unverified_value(ctx, observed_outputs)
+    return _DeliveredUnverifiedSnapshot(sanitized) if isinstance(sanitized, dict) else _DeliveredUnverifiedSnapshot()
 
 
 def _terminal_summary_scalar(value: Any) -> str | None:
@@ -2256,26 +2856,99 @@ def _terminal_summary_scalar(value: Any) -> str | None:
     return cleaned
 
 
-def _delivered_unverified_reply(ctx: CopilotContext) -> str | None:
-    if getattr(ctx, "delivered_unverified_terminal", False) is not True:
-        return None
-    parts: list[str] = []
-    observed_outputs = getattr(ctx, "delivered_unverified_observed_outputs", {})
-    if not isinstance(observed_outputs, dict):
-        observed_outputs = {}
+def _terminal_output_root_path(key: str) -> str:
+    if key.strip() == key and key and not any(char in key for char in ('"', "[", "]", "\r", "\n", "\t")):
+        return key
+    return f"$[{json.dumps(key, ensure_ascii=False)}]"
+
+
+def _terminal_output_child_path(path: str, segment: str | int) -> str:
+    if isinstance(segment, int):
+        return f"{path}[{segment}]"
+    return f"{path}[{json.dumps(segment, ensure_ascii=False)}]"
+
+
+def _flatten_terminal_output(value: Any, path: str) -> list[tuple[int, str, str]]:
+    entries: list[tuple[int, str, str]] = []
+    pending: list[tuple[Any, str]] = [(value, path)]
+    while pending:
+        current, current_path = pending.pop()
+        if isinstance(current, dict):
+            if not current:
+                entries.append((3, current_path, "{}"))
+                continue
+            children = [
+                (item, _terminal_output_child_path(current_path, key))
+                for key, item in current.items()
+                if isinstance(key, str)
+            ]
+            pending.extend(reversed(children))
+            continue
+        if isinstance(current, list):
+            if not current:
+                entries.append((3, current_path, "[]"))
+                continue
+            pending.extend(
+                (item, _terminal_output_child_path(current_path, index))
+                for index, item in reversed(list(enumerate(current)))
+            )
+            continue
+        rendered: str | None
+        if isinstance(current, str) and not current.strip():
+            rendered = '""'
+        else:
+            rendered = "null" if current is None else _terminal_summary_scalar(current)
+        if rendered is None:
+            continue
+        if current is None or isinstance(current, bool | int | float):
+            rank = 0
+        elif isinstance(current, str) and len(" ".join(current.strip().split())) <= _VERIFIED_TERMINAL_VALUE_MAX_CHARS:
+            rank = 1
+        else:
+            rank = 2
+        entries.append((rank, current_path, rendered))
+    return entries
+
+
+def _delivered_unverified_summary(observed_outputs: dict[str, Any]) -> str | None:
+    entries: list[tuple[int, str, str]] = []
     for key, value in observed_outputs.items():
-        rendered = _terminal_summary_scalar(value)
-        if rendered is None and isinstance(value, list | dict):
-            try:
-                rendered = redact_raw_secrets_for_prompt(json.dumps(value, sort_keys=True))
-            except TypeError:
-                rendered = None
-        if isinstance(key, str) and key.strip() and rendered and not contains_internal_machinery_leak(rendered):
-            parts.append(f"{key}: {rendered[:_VERIFIED_TERMINAL_VALUE_MAX_CHARS]}")
-    if parts:
+        if key == _DELIVERED_UNVERIFIED_METADATA_KEY:
+            continue
+        entries.extend(_flatten_terminal_output(value, _terminal_output_root_path(key)))
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    if not entries:
+        return None
+
+    parts: list[str] = []
+    for index, (_, path, rendered) in enumerate(entries):
+        part = f"{path}: {rendered}"
+        candidate_parts = [*parts, part]
+        remaining = len(entries) - index - 1
+        suffix = f"; {remaining} more fields available in structured output" if remaining else ""
+        if len("; ".join(candidate_parts)) + len(suffix) <= _DELIVERED_UNVERIFIED_SUMMARY_MAX_CHARS:
+            parts.append(part)
+        else:
+            break
+
+    omitted = len(entries) - len(parts)
+    if omitted:
+        suffix = f"{omitted} more field{'s' if omitted != 1 else ''} available in structured output"
+        return f"{'; '.join(parts)}; {suffix}" if parts else suffix
+    return "; ".join(parts)
+
+
+def _delivered_unverified_reply(
+    ctx: CopilotContext,
+    observed_outputs: _DeliveredUnverifiedSnapshot,
+) -> str | None:
+    if ctx.delivered_unverified_terminal is not True:
+        return None
+    summary = _delivered_unverified_summary(observed_outputs)
+    if summary:
         return (
             "I built and ran the workflow. The latest run returned "
-            f"{'; '.join(parts[:4])}. That value was not independently verified, so review the draft before using it."
+            f"{summary}. That value was not independently verified, so review the draft before using it."
         )
     return (
         "I built and ran the workflow, and the latest run returned the requested output. "
@@ -2542,6 +3215,9 @@ def _finalize_result_with_blocker_override(
             return preserved
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
+    rendered_reply = _with_scouted_spine_missing_steps(
+        ctx, rendered_reply, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
+    )
 
     rendered_kind = (
         CopilotOutputKind.CLARIFICATION_REQUEST
@@ -2908,14 +3584,22 @@ def _build_wip_exit_result(
     tested_reply: str,
     cancelled: bool = False,
     terminal_reason: str | None = None,
+    missing_spine_steps: str | None = None,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
+    if missing_spine_steps is None:
+        missing_spine_steps = _get_scouted_spine_missing_steps_for_halt(ctx)
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
     )
     effective_terminal = terminal_reason or ("cancel" if cancelled else None)
+    delivered_unverified_snapshot = (
+        _delivered_unverified_observed_outputs(ctx)
+        if ctx.delivered_unverified_terminal is True
+        else _DeliveredUnverifiedSnapshot()
+    )
 
     def _guard(text: str) -> tuple[str, TurnOutcome]:
         if contains_internal_machinery_leak(text):
@@ -2924,6 +3608,7 @@ def _build_wip_exit_result(
                 terminal_reason=effective_terminal,
             )
             text = _observed_facts_halt_reply(ctx)
+        text = _with_scouted_spine_missing_steps(ctx, text, missing_spine_steps, held_signal_unrelated=True)
         return apply_repeated_reply_guard(
             final_text=text,
             attempted_kind=ResponseKind.CLARIFY,
@@ -2939,6 +3624,7 @@ def _build_wip_exit_result(
             ctx,
             _make_agent_result(
                 ctx,
+                _delivered_unverified_snapshot=delivered_unverified_snapshot,
                 user_response=final_text,
                 updated_workflow=verified_workflow,
                 global_llm_context=global_llm_context,
@@ -2971,6 +3657,7 @@ def _build_wip_exit_result(
         and ctx.last_good_workflow_yaml
         and ctx.last_workflow is not ctx.last_good_workflow
         and not ctx.last_test_suspicious_success
+        and ctx.delivered_unverified_terminal is not True
     ):
         reply = _last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply
         final_text, outcome = _guard(reply)
@@ -2978,6 +3665,7 @@ def _build_wip_exit_result(
             ctx,
             _make_agent_result(
                 ctx,
+                _delivered_unverified_snapshot=delivered_unverified_snapshot,
                 user_response=final_text,
                 updated_workflow=ctx.last_good_workflow,
                 global_llm_context=global_llm_context,
@@ -3010,7 +3698,7 @@ def _build_wip_exit_result(
     ):
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
-        delivered_reply = _delivered_unverified_reply(ctx)
+        delivered_reply = _delivered_unverified_reply(ctx, delivered_unverified_snapshot)
         if delivered_reply is not None:
             reply = delivered_reply
             unvalidated = True
@@ -3028,6 +3716,7 @@ def _build_wip_exit_result(
             ctx,
             _make_agent_result(
                 ctx,
+                _delivered_unverified_snapshot=delivered_unverified_snapshot,
                 user_response=final_text,
                 updated_workflow=ctx.last_workflow,
                 global_llm_context=global_llm_context,
@@ -3052,12 +3741,17 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_workflow",
         )
+    fallback_reply = recorded_failure_reply or default_reply
+    if ctx.delivered_unverified_terminal is True:
+        fallback_reply = _delivered_unverified_reply(ctx, delivered_unverified_snapshot) or fallback_reply
     return _build_exit_result(
         ctx,
-        recorded_failure_reply or default_reply,
+        fallback_reply,
         global_llm_context,
         cancelled=cancelled,
         terminal_reason=effective_terminal,
+        proposal_disposition="review_untested" if ctx.delivered_unverified_terminal is True else "auto_applicable",
+        _delivered_unverified_snapshot=delivered_unverified_snapshot,
     )
 
 
@@ -3198,6 +3892,65 @@ async def _resolve_wrapped_exception_exit_result(
     return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
 
 
+def _inline_replace_workflow_credential_verdict(
+    ctx: CopilotContext, action_data: dict[str, Any], resp_type: str, user_response: str
+) -> tuple[str, OutputPolicyVerdict, OutputPolicyVerdict]:
+    """Rebind scouted credential literals into ``action_data['workflow_yaml']`` and evaluate the inline
+    REPLACE_WORKFLOW output policy, recording churn when the author-time verdict rejects. Returns the
+    effective YAML plus the raw and author-time verdicts."""
+    workflow_yaml = action_data.get("workflow_yaml", "")
+    inline_rebind = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
+    if inline_rebind.changed:
+        workflow_yaml = inline_rebind.workflow_yaml
+        action_data["workflow_yaml"] = workflow_yaml
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW rebound scouted credential literals",
+            credential_literals_rebound=bool(inline_rebind.rebound),
+            authored_credential_fills=[list(pair) for pair in inline_rebind.authored],
+        )
+    for skip in inline_rebind.skips:
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW credential authoring skipped",
+            stage=skip.stage,
+            selector=skip.selector,
+            targets_present=len(scouted_credential_targets(ctx.scout_trajectory)),
+        )
+    raw_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type=resp_type,
+        user_response=str(user_response),
+        workflow_yaml=workflow_yaml,
+        tool_arguments=action_data,
+        has_workflow_proposal=True,
+        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+    )
+    # This surface persists a draft, so it is graded like the update_workflow tool body rather than
+    # like a final reply: only what a later test-run cannot undo refuses here, and every other reason
+    # steers the next authoring attempt.
+    author_time_verdict = OutputPolicyVerdict(
+        allowed=raw_verdict.allowed,
+        output_kind=raw_verdict.output_kind,
+        reason_codes=list(raw_verdict.reason_codes),
+    )
+    steered_reasons = demote_author_time_steer_reasons(author_time_verdict)
+    if steered_reasons:
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW output policy reasons demoted to steering",
+            steered_reason_codes=[reason.value for reason in steered_reasons],
+        )
+    if inline_rebind.residual_selectors and author_time_verdict.allowed:
+        # This path bypasses the update_workflow guardrail, and the output-policy scan does not catch a bare
+        # `page.fill(sel, ...)`, so an inline secret the rebind could not neutralize would slip through here.
+        LOG.info(
+            "copilot inline REPLACE_WORKFLOW credential residual raw fill fail-closed",
+            residual_raw_credential_fill_selectors=list(inline_rebind.residual_selectors),
+        )
+        author_time_verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
+    if not author_time_verdict.allowed:
+        _record_output_policy_guardrail_churn(ctx, "replace_workflow_inline", workflow_yaml, author_time_verdict)
+    return workflow_yaml, raw_verdict, author_time_verdict
+
+
 async def _translate_to_agent_result(
     result: RunResultStreaming,
     ctx: CopilotContext,
@@ -3218,6 +3971,12 @@ async def _translate_to_agent_result(
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
+    if resp_type == "ASK_QUESTION":
+        LOG.info(
+            "copilot_ask_subject",
+            subject=coerce_ask_subject(action_data.get("ask_subject")),
+            refs=parsed_ask_refs(action_data.get("refs")),
+        )
     normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
     resp_type = normalized_scaffolding.response_type
     user_response = normalized_scaffolding.user_response or "Done."
@@ -3250,6 +4009,13 @@ async def _translate_to_agent_result(
 
     turn_intent = ctx.turn_intent if isinstance(ctx.turn_intent, TurnIntent) else None
     may_update_workflow = turn_intent is None or turn_intent.authority.may_update_workflow
+    if resp_type == "REPLACE_WORKFLOW" and ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        LOG.warning("copilot suppressed inline REPLACE_WORKFLOW on runtime self-heal turn")
+        user_response = _with_inline_reject_note(
+            user_response,
+            "Runtime self-heal cannot update workflow definitions; retrying in read-only recovery mode.",
+        )
+        resp_type = "REPLY"
     if resp_type == "REPLACE_WORKFLOW" and turn_intent is not None and not turn_intent.authority.may_update_workflow:
         # A no-mutation turn (e.g. DIAGNOSE) must not stage a draft even via an inline REPLACE_WORKFLOW, which
         # bypasses the may_update_workflow=False authority enforced on the update_workflow tool. Downgrade to a
@@ -3268,16 +4034,9 @@ async def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
-            inline_raw_verdict = evaluate_output_policy(
-                request_policy=ctx.request_policy,
-                response_type=resp_type,
-                user_response=str(user_response),
-                workflow_yaml=workflow_yaml,
-                tool_arguments=action_data,
-                has_workflow_proposal=True,
-                output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+            workflow_yaml, inline_raw_verdict, inline_policy_verdict = _inline_replace_workflow_credential_verdict(
+                ctx, action_data, resp_type, str(user_response)
             )
-            inline_policy_verdict = hard_block_output_policy_verdict(inline_raw_verdict)
             if not inline_policy_verdict.allowed:
                 inline_diagnostics = build_output_policy_diagnostics(
                     raw_verdict=inline_raw_verdict,
@@ -3298,23 +4057,24 @@ async def _translate_to_agent_result(
             # The final-output policy pass still runs below; leave last_workflow
             # / last_workflow_yaml unchanged until this candidate survives the
             # inline checks.
+            from skyvern.forge.sdk.copilot.author_time_block import (
+                BANNED_BLOCKS_BLOCK_ID,
+                CODE_SAFETY_BLOCK_ID,
+                AuthorTimeBlock,
+            )
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
+                _code_block_safety_errors,
                 _detect_new_banned_blocks,
                 _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
                 _stale_block_metadata_message,
-                _timing_only_challenge_wait_reject_message,
                 composition_page_evidence_error,
                 workflow_target_url,
             )
             from skyvern.forge.sdk.copilot.tools.banned_blocks import _copilot_banned_block_types
+            from skyvern.forge.sdk.copilot.tools.workflow_update import _human_facing_code_safety_errors
 
-            wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
-            if wait_block_error:
-                user_response = _with_inline_reject_note(user_response, wait_block_error)
-                ctx.last_test_ok = None
-                workflow_yaml = ""
             banned_items = _detect_new_banned_blocks(
                 workflow_yaml,
                 ctx.last_workflow_yaml,
@@ -3322,23 +4082,43 @@ async def _translate_to_agent_result(
             )
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
-                user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items, ctx))
+                inline_banned_blocks_block = AuthorTimeBlock(
+                    block_id=BANNED_BLOCKS_BLOCK_ID,
+                    error=_banned_block_reject_message(banned_items, ctx),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_banned_blocks_block.error)
                 workflow_yaml = ""
+            # This surface persists a draft without the update_workflow tool, so it needs the same
+            # code-safety block: unsafe in-page code on a page holding a filled credential is the
+            # one thing a later test-run cannot undo. Constructed as an AuthorTimeBlock rather than
+            # discarded on a bare error string, so this refusal is bound by the same three-identity
+            # check as the tool seam and a new inline gate cannot join it silently.
+            inline_code_safety_errors = _human_facing_code_safety_errors(
+                _code_block_safety_errors(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
+            )
+            if inline_code_safety_errors:
+                inline_code_safety_block = AuthorTimeBlock(
+                    block_id=CODE_SAFETY_BLOCK_ID,
+                    error="\n".join(str(error) for error in inline_code_safety_errors),
+                )
+                user_response = _with_inline_reject_note(user_response, inline_code_safety_block.error)
+                workflow_yaml = ""
+            # Stale metadata and missing page evidence are both authoring quality, not disclosure: a
+            # later test-run is what settles whether the draft works. They surface as a finding and
+            # clear the test credit, so the draft survives but cannot be reported as verified.
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
                 user_response = _with_inline_reject_note(user_response, _stale_block_metadata_message(stale_metadata))
                 ctx.last_test_ok = None
-                workflow_yaml = ""
             composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
             if composition_evidence_error:
                 LOG.info(
-                    "copilot inline composition page evidence rejected workflow",
+                    "copilot inline composition page evidence finding",
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     target_url=workflow_target_url(workflow_yaml),
                 )
                 user_response = _with_inline_reject_note(user_response, composition_evidence_error)
                 ctx.last_test_ok = None
-                workflow_yaml = ""
         if workflow_yaml:
             # Inline REPLACE_WORKFLOW bypasses the update_workflow tool, so apply the same default here.
             workflow_yaml = default_data_write_continue_on_failure(
@@ -3351,6 +4131,7 @@ async def _translate_to_agent_result(
                     organization_id=organization_id,
                     workflow_yaml=workflow_yaml,
                     settings_fallback_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml,
+                    credential_scrub_values=registered_scrub_values(ctx),
                 )
                 last_workflow_yaml = workflow_yaml
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
@@ -3469,15 +4250,7 @@ async def _translate_to_agent_result(
         last_workflow = None
         last_workflow_yaml = None
 
-    llm_context_raw = action_data.get("global_llm_context")
-    structured = StructuredContext.from_json_str(global_llm_context)
-    if isinstance(llm_context_raw, dict):
-        try:
-            structured = StructuredContext.model_validate(llm_context_raw)
-        except Exception:
-            pass
-    elif isinstance(llm_context_raw, str):
-        structured = StructuredContext.from_json_str(llm_context_raw)
+    structured = adopt_model_authored_context(global_llm_context, action_data.get("global_llm_context"))
     structured.merge_turn_summary(ctx.tool_activity)
     enriched_context = structured.to_json_str()
     workflow_attempted = ctx.has_genuine_workflow_attempt()
@@ -3825,6 +4598,88 @@ def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None
     return fallback_key
 
 
+async def _run_agent_loop_with_surface(
+    *,
+    ctx: Any,
+    stream: EventSourceStream,
+    chat_id: str,
+    user_message: str,
+    system_prompt: Callable[[object, object], str] | str,
+    model_name: str,
+    run_config: Any,
+    llm_key: str,
+    copilot_config: CopilotConfig,
+    native_tools: list[Any],
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+    output_guardrails: list[Any],
+    allow_untested_retry: bool = False,
+) -> Any:
+    from agents import Agent
+    from agents.mcp import MCPServerManager
+
+    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
+    from skyvern.forge.sdk.copilot.enforcement import run_with_enforcement
+    from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+    from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
+
+    mcp_server = SkyvernOverlayMCPServer(
+        transport=skyvern_mcp,
+        overlays=overlays,
+        alias_map=alias_map,
+        allowlist=frozenset(alias_map.values()),
+        context_provider=lambda: ctx,
+    )
+    ctx.discovery_mcp_server = mcp_server
+    agent = Agent(
+        name="workflow-copilot",
+        instructions=system_prompt,
+        tools=native_tools,
+        mcp_servers=[mcp_server],
+        model=model_name,
+        output_guardrails=output_guardrails,
+    )
+    session = create_copilot_session(chat_id)
+    model_token = _copilot_model_name.set(model_name)
+    try:
+        async with MCPServerManager([mcp_server]) as manager:
+            agent.mcp_servers = list(manager.active_servers)
+            attempts = 2 if allow_untested_retry else 1
+            for attempt in range(attempts):
+                try:
+                    result = await run_with_enforcement(
+                        agent=agent,
+                        initial_input=user_message,
+                        ctx=ctx,
+                        stream=stream,
+                        max_turns=copilot_config.max_turns,
+                        hooks=CopilotRunHooks(ctx),
+                        run_config=run_config,
+                        session=session,
+                        copilot_config=copilot_config,
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        attempt + 1 < attempts
+                        and getattr(ctx, "last_workflow", None) is None
+                        and isinstance(exc, LiteLLMNotFoundError)
+                    ):
+                        LOG.warning("Retrying untested draft agent loop after model lookup failure")
+                        continue
+                    raise
+        LOG.info(
+            "Copilot agent model attempt succeeded",
+            workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+            llm_key=llm_key,
+        )
+        return result
+    finally:
+        _copilot_model_name.reset(model_token)
+        session.close()
+
+
 def _build_request_policy_clarification_result(
     policy: RequestPolicy,
     prior_global_llm_context: str | None,
@@ -4131,6 +4986,49 @@ def _build_copilot_output_guardrails(
     ]
 
 
+def _build_self_heal_output_guardrails(
+    OutputGuardrailCls: Any,
+    GuardrailFunctionOutputCls: Any,
+) -> list[Any]:
+    # Self-heal final output is machine-consumed, not user-facing chat text.
+    # Chat output policy requires CopilotContext and fails closed in headless runs; self-heal only trips on mutate/ask-human.
+    def self_heal_output_guardrail(_context: Any, _agent: Any, agent_output: Any) -> Any:
+        try:
+            final_text = extract_final_text(agent_output)
+        except Exception:
+            final_text = _agent_output_to_text(agent_output)
+
+        action_data = parse_final_response(final_text)
+        response_type = str(action_data.get("type") or "REPLY").strip().upper()
+        if response_type not in COPILOT_RESPONSE_TYPES:
+            response_type = "REPLY"
+
+        raw_upper = final_text.upper()
+        replace_marker_present = "REPLACE_WORKFLOW" in raw_upper
+        user_response = action_data.get("user_response")
+        parse_failed = response_type == "REPLY" and (
+            str(user_response or "") == final_text or str(user_response or "") == "Done."
+        )
+        tripwire_triggered = response_type in {"REPLACE_WORKFLOW", "ASK_QUESTION"} or (
+            parse_failed and replace_marker_present
+        )
+
+        trace_data = {
+            "response_type": response_type,
+            "tripwire_triggered": tripwire_triggered,
+            "origin": "runtime_self_heal",
+        }
+        LOG.info("self-heal output guardrail verdict", **trace_data)
+        return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=tripwire_triggered)
+
+    return [
+        OutputGuardrailCls(
+            guardrail_function=self_heal_output_guardrail,
+            name="self_heal_output_guardrail",
+        )
+    ]
+
+
 def _output_policy_verdict_from_guardrail_exception(exc: BaseException) -> OutputPolicyVerdict:
     guardrail_result = getattr(exc, "guardrail_result", None)
     guardrail_output = getattr(guardrail_result, "output", None)
@@ -4244,6 +5142,9 @@ def _build_output_policy_blocked_result(
                 composed_from_recorded_evidence = True
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+    user_response = _with_scouted_spine_missing_steps(
+        ctx, user_response, _get_scouted_spine_missing_steps_for_halt(ctx), held_signal_unrelated=True
+    )
     has_non_actuation_hard_block = any(
         reason
         not in {
@@ -4431,7 +5332,7 @@ async def run_copilot_agent(
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     exc_info=True,
                 )
-                turn_span.record_exception(exc)
+                record_span_exception(turn_span, exc, set_error_status=False)
                 ctx = CopilotContext(
                     organization_id=organization_id,
                     workflow_id=chat_request.workflow_id,
@@ -4513,7 +5414,6 @@ async def _run_copilot_turn_impl(
             MaxTurnsExceeded,
             OutputGuardrailTripwireTriggered,
         )
-        from agents.mcp import MCPServerManager
         from agents.run_context import RunContextWrapper
     except ModuleNotFoundError as e:
         if e.name == "agents":
@@ -4640,12 +5540,18 @@ async def _run_copilot_turn_impl(
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
-        return _build_request_policy_clarification_result(
-            request_policy,
-            prior_global_llm_context=global_llm_context,
-            prior_workflow_yaml=chat_request.workflow_yaml,
-            ctx=ctx,
-        )
+        preflight_resolution = None
+        if request_policy.clarification_reason == "login_credentials_unresolved":
+            preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
+            if preflight_resolution is not None:
+                _derive_turn_intent_on_context(ctx, request_policy, policy_inputs)
+        if preflight_resolution is None:
+            return _build_request_policy_clarification_result(
+                request_policy,
+                prior_global_llm_context=global_llm_context,
+                prior_workflow_yaml=chat_request.workflow_yaml,
+                ctx=ctx,
+            )
     if request_policy is None:
         raise CopilotRequestPolicyMissingError()
 
@@ -4665,12 +5571,38 @@ async def _run_copilot_turn_impl(
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
     ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
+    persisted_entrypoint_url = prior_structured_context.entrypoint_url
+    # Blanking the anchor disables both its consumers below; the env knob exists so an
+    # E2E can prove the persisted slot alone carries recovery. Never set in production.
+    transcript_anchor = (
+        ""
+        if persisted_entrypoint_url or _transcript_anchor_disabled()
+        else _transcript_anchor_for_turn(ctx.turn_context_packet, len(chat_history))
+    )
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
         agent_user_message or "",
         chat_request.workflow_yaml or "",
+        transcript_anchor,
+        persisted_entrypoint_url=persisted_entrypoint_url,
     )
+    in_turn_entrypoint = extract_in_turn_entry_url(
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
+    )
+    anchor_entrypoint = anchor_recovers_entrypoint(
+        ctx.turn_intent,
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
+        transcript_anchor,
+    )
+    if in_turn_entrypoint is not None:
+        ctx.resolved_discovery_entrypoint_url = in_turn_entrypoint
+    elif ctx.resolved_discovery_entrypoint_url is None:
+        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint or persisted_entrypoint_url
     LOG.info(
         "copilot.build_phase_initial",
         build_phase=ctx.build_phase.value,
@@ -4690,7 +5622,6 @@ async def _run_copilot_turn_impl(
             ctx=ctx,
         )
 
-    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotBuiltUnverified,
         CopilotGoalSatisfied,
@@ -4698,12 +5629,8 @@ async def _run_copilot_turn_impl(
         CopilotTotalTimeoutError,
         CopilotUnrecoverableToolError,
         gate_decision_trace_fields,
-        run_with_enforcement,
     )
-    from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-    from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
     from skyvern.forge.sdk.copilot.tools import (
         NATIVE_TOOLS,
         _build_skyvern_mcp_overlays,
@@ -4806,62 +5733,22 @@ async def _run_copilot_turn_impl(
         attempt_run_config: Any,
         attempt_llm_key: str,
     ) -> RunResultStreaming:
-        mcp_server = SkyvernOverlayMCPServer(
-            transport=skyvern_mcp,
-            overlays=overlays,
+        return await _run_agent_loop_with_surface(
+            ctx=ctx,
+            stream=stream,
+            chat_id=chat_id,
+            user_message=user_message,
+            system_prompt=system_prompt,
+            model_name=attempt_model_name,
+            run_config=attempt_run_config,
+            llm_key=attempt_llm_key,
+            copilot_config=copilot_config,
+            native_tools=native_tools,
             alias_map=alias_map,
-            allowlist=frozenset(alias_map.values()),
-            context_provider=lambda: ctx,
-        )
-        # The discovery walker reaches the connected FastMCP client through
-        # ctx, without exposing private overlay state.
-        ctx.discovery_mcp_server = mcp_server
-        agent = Agent(
-            name="workflow-copilot",
-            instructions=system_prompt,
-            tools=native_tools,
-            mcp_servers=[mcp_server],
-            model=attempt_model_name,
+            overlays=overlays,
             output_guardrails=output_guardrails,
+            allow_untested_retry=ctx.allow_untested_workflow_draft,
         )
-        session = create_copilot_session(chat_id)
-        model_token = _copilot_model_name.set(attempt_model_name)
-        try:
-            async with MCPServerManager([mcp_server]) as manager:
-                agent.mcp_servers = list(manager.active_servers)
-                attempts = 2 if ctx.allow_untested_workflow_draft else 1
-                for attempt in range(attempts):
-                    try:
-                        result = await run_with_enforcement(
-                            agent=agent,
-                            initial_input=user_message,
-                            ctx=ctx,
-                            stream=stream,
-                            max_turns=copilot_config.max_turns,
-                            hooks=CopilotRunHooks(ctx),
-                            run_config=attempt_run_config,
-                            session=session,
-                            copilot_config=copilot_config,
-                        )
-                        break
-                    except Exception as exc:
-                        if (
-                            attempt + 1 < attempts
-                            and ctx.last_workflow is None
-                            and isinstance(exc, LiteLLMNotFoundError)
-                        ):
-                            LOG.warning("Retrying untested draft agent loop after model lookup failure")
-                            continue
-                        raise
-            LOG.info(
-                "Copilot agent model attempt succeeded",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                llm_key=attempt_llm_key,
-            )
-            return result
-        finally:
-            _copilot_model_name.reset(model_token)
-            session.close()
 
     try:
         with trace_context:

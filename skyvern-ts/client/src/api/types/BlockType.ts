@@ -28,5 +28,8 @@ export const BlockType = {
     WorkflowTrigger: "workflow_trigger",
     GoogleSheetsRead: "google_sheets_read",
     GoogleSheetsWrite: "google_sheets_write",
+    PdfFill: "pdf_fill",
+    SplitPdf: "split_pdf",
+    EmailInbox: "email_inbox",
 } as const;
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];

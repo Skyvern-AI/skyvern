@@ -20,7 +20,7 @@ function HumanInteractionBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Instructions</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               Instructions for the human interaction
             </h2>
           </div>
@@ -47,7 +47,7 @@ function HumanInteractionBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Timeout</h1>
-            <h2 className="text-base text-slate-400">In seconds</h2>
+            <h2 className="text-base text-muted-foreground">In seconds</h2>
           </div>
           <Input value={timeoutSeconds.toString()} readOnly />
         </div>

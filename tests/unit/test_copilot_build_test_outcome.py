@@ -3,12 +3,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    MetadataRejectLadderInput,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
     _binding_frontier_facet,
+    adjudicate_metadata_reject_ladder,
+    arm_recorded_outcome_grounding_requirement,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
+    clear_recorded_outcome_grounding_requirement,
     latest_recorded_build_test_outcome_repeated,
+    maybe_satisfy_recorded_outcome_grounding_requirement,
     observed_value_extraction_scaffold_lines,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
@@ -23,6 +28,49 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, LoadedResultCompositionTarget
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+
+def _metadata_reject_ladder_input(*, structural_key: str = "reject-key") -> MetadataRejectLadderInput:
+    return MetadataRejectLadderInput(
+        reject_family="missing_code_artifact_metadata",
+        structural_key=structural_key,
+        gate_id="code_artifact_metadata",
+        missing_fields_by_label={
+            "extract_record": ["declared_goal", "claimed_outcomes", "evidence_refs_or_observation_refs"]
+        },
+    )
+
+
+def test_metadata_reject_ladder_reaches_exact_field_terminal_on_third_same_key() -> None:
+    reject = _metadata_reject_ladder_input()
+
+    first = adjudicate_metadata_reject_ladder(None, reject)
+    second = adjudicate_metadata_reject_ladder(first.state, reject)
+    third = adjudicate_metadata_reject_ladder(second.state, reject)
+
+    assert first.action == "rung_1"
+    assert first.rung == 1
+    assert second.action == "rung_2"
+    assert second.rung == 2
+    assert second.missing_fields_by_label == reject.missing_fields_by_label
+    assert third.action == "terminal"
+    assert third.rung is None
+    assert third.gate_id == "code_artifact_metadata"
+    assert third.missing_fields_by_label == reject.missing_fields_by_label
+    assert third.state.streak_count == 3
+
+
+def test_metadata_reject_ladder_changed_structural_key_starts_new_streak() -> None:
+    first = adjudicate_metadata_reject_ladder(None, _metadata_reject_ladder_input())
+    second = adjudicate_metadata_reject_ladder(
+        first.state,
+        _metadata_reject_ladder_input(structural_key="changed-key"),
+    )
+
+    assert second.action == "rung_1"
+    assert second.rung == 1
+    assert second.state.structural_key == "changed-key"
+    assert second.state.streak_count == 1
 
 
 def test_structural_key_changes_when_page_or_result_structure_changes() -> None:
@@ -234,6 +282,37 @@ def test_hollow_outcome_carries_observed_value_excerpt_off_the_structural_key() 
     assert "100245" in confirmation.observed_page_value_excerpt
     assert confirmation.structural_key == other.structural_key
     assert "WTR-1842-DEMO" not in str(confirmation.structural_key_payload)
+
+
+def test_hollow_outcome_reason_code_unchanged_with_value_carrying_relation() -> None:
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#view-statement",
+        current_url="https://portal.example.com/statement",
+        source_url="https://portal.example.com/statement",
+        page_evidence={
+            "page_title": "Statement",
+            "forms": [],
+            "key_value_relations": [
+                {
+                    "key_text": "March 2026 statement",
+                    "value_text": "Amount due: $3,927.75",
+                    "container_selector": "#result",
+                    "value_child_index": 1,
+                    "direct_child_count": 3,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "key_value_relations_truncated": False,
+        },
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+
+    assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+    assert outcome.is_authoritative is True
+    assert "$3,927.75" not in str(outcome.structural_key_payload)
 
 
 def test_hollow_outcome_value_excerpt_falls_back_to_legacy_text_keys() -> None:
@@ -814,8 +893,89 @@ def test_not_evaluated_recorded_outcome_is_not_authoritative_repair_failure() ->
 
     assert outcome is not None
     assert outcome.verdict == "not_authoritative"
-    assert outcome.reason_code == "failed_run"
+    assert outcome.reason_code == "run_completed_unevaluated"
     assert outcome.is_authoritative is False
+
+
+def test_completed_run_with_registered_outputs_is_not_classified_as_failed_run() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_completed",
+            "overall_status": "completed",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+            "registered_output_parameter_values": [
+                {"output_parameter_id": "op_1", "value": {"output": {"top_entry": "First listed entry"}}}
+            ],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_completed"),
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code != "failed_run"
+    assert outcome.reason_code == "run_completed_unevaluated"
+
+
+def test_failed_run_classification_preserved_for_not_ok_run() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_not_ok",
+            "overall_status": "failed",
+            "failure_type": "block_failure",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.reason_code == "runtime_block_failure"
+    assert outcome.verdict == "repairable_failure"
+
+
+def test_failed_run_classification_preserved_for_failed_block() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_failed_block",
+            "overall_status": "completed",
+            "failure_type": "block_failure",
+            "blocks": [{"label": "collect_top_entry", "status": "failed", "failure_reason": "selector not found"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.reason_code == "runtime_block_failure"
+
+
+def test_judge_evaluated_non_satisfaction_keeps_failure_classification() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_judged",
+            "overall_status": "completed",
+            "blocks": [{"label": "collect_top_entry", "status": "completed"}],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_judged",
+        ),
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "outcome_not_demonstrated"
 
 
 def test_outcome_not_demonstrated_does_not_mark_presence_only_abstention_as_missing_output() -> None:
@@ -1241,3 +1401,114 @@ def test_persisted_run_prose_only_failure_is_not_authoritative() -> None:
 
     assert outcome is None or outcome.is_authoritative is False
     assert outcome is None or outcome.structural_key is None
+    (adjudicate_metadata_reject_ladder,)
+
+
+def _grounding_outcome(*, workflow_run_id: str | None = "wr_grounded") -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+        workflow_run_id=workflow_run_id,
+        block_labels=["search_records"],
+        structural_failure_identity="runtime:timeout_waiting_for_selector:failed",
+        page_evidence_refs=["origin_present"],
+    )
+
+
+def _grounding_ctx(outcome: RecordedBuildTestOutcome | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_grounding_requirement=None,
+        recorded_outcome_binding_constraint=None,
+        composition_page_evidence=None,
+        scout_observation_contract=None,
+        last_run_blocks_workflow_run_id=None,
+        observed_browser_urls=[],
+    )
+
+
+def test_grounding_arms_on_an_authoritative_non_progress_outcome() -> None:
+    outcome = _grounding_outcome()
+    ctx = _grounding_ctx(outcome)
+
+    requirement = arm_recorded_outcome_grounding_requirement(ctx)
+
+    assert requirement is not None
+    assert requirement.structural_key == outcome.structural_key
+    assert requirement.workflow_run_id == "wr_grounded"
+    assert requirement.satisfied is False
+    assert ctx.recorded_outcome_grounding_requirement is requirement
+
+
+def test_grounding_does_not_arm_on_progress_or_without_an_authoritative_outcome() -> None:
+    progressed = _grounding_outcome().model_copy(update={"verdict": "progress_observed"})
+    assert arm_recorded_outcome_grounding_requirement(_grounding_ctx(progressed)) is None
+
+    assert arm_recorded_outcome_grounding_requirement(_grounding_ctx(None)) is None
+
+    unauthoritative = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+    )
+    assert unauthoritative.is_authoritative is False
+    assert arm_recorded_outcome_grounding_requirement(_grounding_ctx(unauthoritative)) is None
+
+
+def test_grounding_arm_is_idempotent_for_the_same_outcome_and_run() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+
+    first = arm_recorded_outcome_grounding_requirement(ctx)
+    second = arm_recorded_outcome_grounding_requirement(ctx)
+
+    assert first is not None
+    assert second is first
+
+
+def test_grounding_is_satisfied_only_by_inspected_evidence_from_the_same_run() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    ctx.composition_page_evidence = {
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.com/results",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_other",
+    }
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+    assert ctx.recorded_outcome_grounding_requirement.satisfied is False
+
+    ctx.composition_page_evidence = {**ctx.composition_page_evidence, "workflow_run_id": "wr_grounded"}
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+
+    satisfied = ctx.recorded_outcome_grounding_requirement
+    assert satisfied.satisfied is True
+    assert satisfied.payload is not None
+    assert satisfied.payload.source_url == "https://example.com/results"
+    assert satisfied.payload.repeated_structural_key == satisfied.structural_key
+
+
+def test_grounding_is_not_satisfied_by_evidence_from_another_tool() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = {
+        "source_tool": "evaluate",
+        "current_url": "https://example.com/results",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_grounded",
+    }
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+
+def test_clearing_the_grounding_requirement_also_drops_the_binding_constraint() -> None:
+    ctx = _grounding_ctx(_grounding_outcome())
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.recorded_outcome_binding_constraint = object()
+
+    clear_recorded_outcome_grounding_requirement(ctx)
+
+    assert ctx.recorded_outcome_grounding_requirement is None
+    assert ctx.recorded_outcome_binding_constraint is None

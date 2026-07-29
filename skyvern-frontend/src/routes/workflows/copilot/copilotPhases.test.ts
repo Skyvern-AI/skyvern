@@ -12,6 +12,7 @@ import {
   BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
+  toolActivityDisplayLabel,
 } from "./narrativeState";
 
 const entry = (
@@ -66,6 +67,21 @@ describe("AUTHORING_TOOLS / RUN_TOOLS", () => {
   });
 });
 
+describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
+  it("labels discover_workflow_entrypoint and inspect_page_for_composition", () => {
+    expect(toolActivityDisplayLabel("discover_workflow_entrypoint")).toBe(
+      "Finding the entry page",
+    );
+    expect(toolActivityDisplayLabel("inspect_page_for_composition")).toBe(
+      "Inspecting the page",
+    );
+  });
+
+  it("still falls back to Working for unmapped tools", () => {
+    expect(toolActivityDisplayLabel("some_unmapped_tool")).toBe("Working");
+  });
+});
+
 describe("derivePhases — bucket split keeps update_workflow in Draft (Codex catch)", () => {
   it("an update_workflow tool_call on a draft-only turn lands in the Draft bucket, not Test", () => {
     const t = turn({
@@ -99,6 +115,84 @@ describe("derivePhases — bucket split", () => {
     expect(phase(rows, "explore").entries.map((e) => e.id)).toEqual(["1", "2"]);
     expect(phase(rows, "test").entries.map((e) => e.id)).toEqual(["3"]);
     expect(phase(rows, "draft").entries.map((e) => e.id)).toEqual(["4"]);
+  });
+});
+
+describe("derivePhases — condenses each phase's entries (SKY-11971)", () => {
+  it("folds a failed-then-retried tool_call/tool_result pair in the explore bucket into one row", () => {
+    const t = turn({
+      designActivity: [
+        entry({
+          id: "tc-1",
+          kind: "tool_call",
+          toolName: "evaluate",
+        }),
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: false,
+        }),
+        entry({
+          id: "tc-2",
+          kind: "tool_call",
+          toolName: "evaluate",
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: true,
+        }),
+      ],
+    });
+    const rows = derivePhases(t);
+    const exploreEntries = phase(rows, "explore").entries;
+    expect(exploreEntries).toHaveLength(1);
+    expect(exploreEntries[0]).toMatchObject({
+      id: "tr-2",
+      success: true,
+      attempts: 2,
+    });
+  });
+
+  it("REGRESSION PIN: the explore 'N steps' stub matches the condensed row count, not the raw event count (Claude catch)", () => {
+    const t = turn({
+      terminal: "response",
+      designActivity: [
+        entry({ id: "tc-1", kind: "tool_call", toolName: "evaluate" }),
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: false,
+        }),
+        entry({ id: "tc-2", kind: "tool_call", toolName: "evaluate" }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: true,
+        }),
+      ],
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "explore").entries).toHaveLength(1);
+    expect(phase(rows, "explore").stub).toBe("1 step");
+  });
+
+  it("leaves the earlier bucket-routing test's un-paired hand-rolled ids unaffected", () => {
+    // Regression pin: short test ids ("1"/"2"/"3"/"4") don't collide with
+    // the tc-/tr- correlation convention, so condensing is a no-op there.
+    const t = turn({
+      designActivity: [
+        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
+        entry({ id: "2", kind: "tool_call", toolName: "update_workflow" }),
+      ],
+      designEnded: true,
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "draft").entries.map((e) => e.id)).toEqual(["2"]);
   });
 });
 
@@ -517,5 +611,34 @@ describe("derivePhases — redraft re-activation (SKY-11970 pin)", () => {
     const rows = derivePhases(t);
     expect(phase(rows, "test").status).toBe("active");
     expect(phase(rows, "draft").status).not.toBe("active");
+  });
+});
+
+describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)", () => {
+  const notConfirmedTurn = (runToolNames: string[]): TurnNarrativeState =>
+    turn({
+      terminal: "response",
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [block({ state: "completed", outcome: "not_demonstrated" })],
+      designActivity: runToolNames.map((toolName, i) =>
+        entry({ id: `r${i}`, kind: "tool_call", toolName }),
+      ),
+    });
+
+  it("surfaces the run count on a multi-run redraft loop (else 6 runs read as 1)", () => {
+    const rows = derivePhases(
+      notConfirmedTurn([
+        "update_and_run_blocks",
+        "update_and_run_blocks",
+        "run_blocks_and_collect_debug",
+      ]),
+    );
+    expect(phase(rows, "test").stub).toBe("3 runs · not confirmed");
+  });
+
+  it("omits the count for a single run, keeping today's look", () => {
+    const rows = derivePhases(notConfirmedTurn(["update_and_run_blocks"]));
+    expect(phase(rows, "test").stub).toBe("· not confirmed");
   });
 });

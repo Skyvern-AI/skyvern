@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { ArtifactVideo } from "@/components/ArtifactVideo";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { getRecordingURL } from "./artifactUtils";
@@ -42,7 +43,14 @@ function TaskRecording() {
   }
 
   if (recordingData?.url) {
-    return <video width={800} height={450} src={recordingData.url} controls />;
+    return (
+      <ArtifactVideo
+        width={800}
+        height={450}
+        src={recordingData.url}
+        controls
+      />
+    );
   }
 
   if (recordingData?.archived) {

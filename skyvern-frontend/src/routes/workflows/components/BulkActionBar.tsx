@@ -112,10 +112,11 @@ function BulkActionBar({
         succeeded,
         total: count,
         results,
-        successTitle: (n) => `Cloned ${n} agent${n !== 1 ? "s" : ""}.`,
-        failureTitle: (n) => `Failed to clone ${n} agent${n !== 1 ? "s" : ""}.`,
+        successTitle: (n) => `Duplicated ${n} agent${n !== 1 ? "s" : ""}.`,
+        failureTitle: (n) =>
+          `Failed to duplicate ${n} agent${n !== 1 ? "s" : ""}.`,
         partialTitle: (successCount, failedCount) =>
-          `Cloned ${successCount} agent${successCount !== 1 ? "s" : ""}. ${failedCount} failed.`,
+          `Duplicated ${successCount} agent${successCount !== 1 ? "s" : ""}. ${failedCount} failed.`,
       });
       if (succeeded === count) {
         onClearSelection();
@@ -314,7 +315,7 @@ function BulkActionBar({
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => void handleBulkClone()}>
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone {count}
+            Duplicate ({count})
           </DropdownMenuItem>
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>

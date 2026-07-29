@@ -49,7 +49,7 @@ function SplitPdfEditorBody({
     <div data-testid="split-pdf-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File URL</Label>
+          <Label className="text-xs text-tertiary-foreground">File URL</Label>
           <HelpTooltip content={helpTooltips["split_pdf"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
@@ -62,7 +62,7 @@ function SplitPdfEditorBody({
 
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Prompt</Label>
+          <Label className="text-xs text-tertiary-foreground">Prompt</Label>
           <HelpTooltip content={helpTooltips["split_pdf"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
@@ -107,7 +107,9 @@ function SplitPdfEditorBody({
               />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">LLM Key</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    LLM Key
+                  </Label>
                   <HelpTooltip content={helpTooltips["split_pdf"]["llmKey"]} />
                 </div>
                 <WorkflowBlockInput

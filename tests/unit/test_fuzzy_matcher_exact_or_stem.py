@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
+from skyvern.core.script_generations.fuzzy_matcher import (
+    match_option_exact_or_stem,
+    match_option_exact_or_stem_with_tier,
+)
 
 
 @pytest.mark.parametrize(
@@ -33,3 +36,9 @@ def test_returns_index_on_exact_or_clean_stem(candidate: str, options: list[str]
 )
 def test_returns_none_when_not_safely_resolvable(candidate: str, options: list[str]) -> None:
     assert match_option_exact_or_stem(candidate, options) is None
+
+
+def test_match_option_exact_or_stem_with_tier() -> None:
+    assert match_option_exact_or_stem_with_tier("Alpha", ["Other", "alpha"]) == (1, "exact")
+    assert match_option_exact_or_stem_with_tier("Years", ["Year", "Month"]) == (0, "stem")
+    assert match_option_exact_or_stem_with_tier("County", ["County", "county"]) == (None, None)

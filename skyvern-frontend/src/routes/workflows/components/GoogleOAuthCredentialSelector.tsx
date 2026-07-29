@@ -56,6 +56,15 @@ function GoogleOAuthCredentialSelector({
 
   const hasCredentials = credentials.length > 0;
   const isKnownCredential = credentials.some((c) => c.id === value);
+  // The saved id may point at a connection that still exists but is expired
+  // ("needs reconnect"). Re-auth-in-place keeps the same id, so the block keeps
+  // working once the account is reconnected — no need to repoint.
+  const savedCredentialNeedsReconnect =
+    !!value &&
+    !isKnownCredential &&
+    allCredentials.some(
+      (c) => c.id === value && !isGoogleOAuthCredentialActive(c),
+    );
   const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
   const needsAutoFill = !value;
 
@@ -113,15 +122,28 @@ function GoogleOAuthCredentialSelector({
           <button
             type="button"
             onClick={handleUseAccountPicker}
-            className="text-xs text-slate-400 underline hover:text-slate-300"
+            className="text-xs text-muted-foreground underline hover:text-tertiary-foreground"
           >
             Use account picker
           </button>
         </>
       ) : (
         <>
-          {value && hasCredentials && !isKnownCredential ? (
-            <p className="rounded-md border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-[0.7rem] text-amber-200">
+          {savedCredentialNeedsReconnect ? (
+            <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
+              Saved Google account needs to be reconnected. Reconnect it on the{" "}
+              <a
+                href="/integrations"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+              >
+                Integrations
+              </a>{" "}
+              page to keep this block working.
+            </p>
+          ) : value && hasCredentials && !isKnownCredential ? (
+            <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
               Saved Google account is no longer connected. Pick another below.
             </p>
           ) : null}
@@ -137,7 +159,7 @@ function GoogleOAuthCredentialSelector({
                     <p className="text-sm font-medium">
                       <SelectItemText>{cred.credential_name}</SelectItemText>
                     </p>
-                    <p className="text-xs text-slate-400">{cred.id}</p>
+                    <p className="text-xs text-muted-foreground">{cred.id}</p>
                   </div>
                 </CustomSelectItem>
               ))}

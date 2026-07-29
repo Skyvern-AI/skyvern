@@ -499,8 +499,16 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
 
     if tool_name == "update_workflow":
         return f"Workflow updated ({data.get('block_count', '?')} blocks)"
-    if tool_name == "update_and_run_blocks" and data.get("skipped_run"):
-        return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
+    if tool_name == "update_and_run_blocks":
+        if not isinstance(raw_data, dict):
+            return "OK"
+        if data.get("skipped_run"):
+            return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
+        # Non-skip result is run-blocks-shaped (overall_status, no block_count).
+        status = data.get("overall_status") or data.get("status")
+        if status:
+            return f"Updated the workflow and ran it: {status}"
+        return "Updated the workflow and ran it"
     if tool_name == "list_credentials":
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "get_block_schema":
@@ -548,6 +556,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
         return f"Selected '{data.get('value', '?')}'"
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
+    if tool_name == "discover_workflow_entrypoint":
+        candidate_url = data.get("candidate_url")
+        if isinstance(candidate_url, str) and candidate_url:
+            return f"Found the entry page: {candidate_url[:80]}"
+        return "No entry page found"
+    if tool_name == "inspect_page_for_composition":
+        raw_forms = data.get("forms")
+        forms = raw_forms if isinstance(raw_forms, list) else []
+        field_count = sum(len(f.get("fields") or []) for f in forms if isinstance(f, dict))
+        if field_count:
+            return f"Inspected the page ({field_count} form field(s))"
+        return "Inspected the page"
     return "OK"
 
 

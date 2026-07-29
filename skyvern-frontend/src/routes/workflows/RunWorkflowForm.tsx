@@ -15,6 +15,7 @@ import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import {
   Accordion,
   AccordionContent,
@@ -50,6 +51,8 @@ import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isActivationRun } from "@/util/onboarding/rolloutGating";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
@@ -59,6 +62,7 @@ import { parseHeaderJson } from "@/util/secretHeaders";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import {
+  CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
   WorkflowBlock,
@@ -67,6 +71,13 @@ import {
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
+import { BrowserProfileControl } from "./components/BrowserProfileControl";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { RotatingCredentialField } from "./components/RotatingCredentialField";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
@@ -74,7 +85,10 @@ import {
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
-import { getLoginCredentialInputs } from "./runWorkflowCredentials";
+import {
+  getLoginCredentialInputs,
+  getRotatingCredentialIds,
+} from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
 import { visitWorkflowBlocks } from "./workflowBlockUtils";
 
@@ -206,6 +220,7 @@ type RunWorkflowRequestBody = {
   webhook_callback_url?: string | null;
   browser_session_id: string | null;
   browser_profile_id?: string | null;
+  start_fresh_browser?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   cdp_connect_headers?: Record<string, string> | null;
@@ -214,15 +229,34 @@ type RunWorkflowRequestBody = {
   ai_fallback?: boolean;
 };
 
-function getRunWorkflowRequestBody(
+// Start-fresh and a picked override are mutually exclusive, but a per-input
+// agent's seeded override is inert (submit nulls it), so it must not count —
+// otherwise a per-input rerun leaves Start-fresh permanently disabled.
+// eslint-disable-next-line react-refresh/only-export-components
+export function isOverrideProfilePicked(
+  browserProfileId: string | null | undefined,
+  browserProfileKey?: string | null,
+  browserMemoryEnabled?: boolean,
+): boolean {
+  if (browserMemoryEnabled && browserProfileKey?.trim()) {
+    return false;
+  }
+  return Boolean((browserProfileId ?? "").toString().trim());
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function getRunWorkflowRequestBody(
   values: RunWorkflowFormType,
   workflowParameters: Array<WorkflowParameter>,
+  browserProfileKey?: string | null,
+  browserMemoryEnabled?: boolean,
 ): RunWorkflowRequestBody {
   const {
     webhookCallbackUrl,
     proxyLocation,
     browserSessionId,
     browserProfileId,
+    startFreshBrowser,
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
@@ -240,16 +274,32 @@ function getRunWorkflowRequestBody(
 
   const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
   const bpi = browserProfileId?.trim() === "" ? null : browserProfileId;
+  // A live session is the browser for the run and the backend rejects fresh +
+  // session together, so an attached session wins and suppresses the fresh flag.
+  const startFresh = Boolean(startFreshBrowser) && !bsi;
+  // A per-input agent resolves its profile from browser_profile_key server-side;
+  // a run-level override ranks above that key and bypasses it, so drop it too.
+  // Browser-memory only — flag-off keeps the legacy payload byte-identical.
+  const perInputAgent =
+    Boolean(browserMemoryEnabled) && Boolean(browserProfileKey?.trim());
 
   const body: RunWorkflowRequestBody = {
     data,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
-    browser_profile_id: bpi,
+    // Backend ranks an explicit profile override above start_fresh_browser, so a
+    // fresh run must drop the (possibly settings-derived) override to take effect.
+    browser_profile_id: startFresh || perInputAgent ? null : bpi,
     browser_address: cdpAddress,
     run_with: runWith,
     ai_fallback: aiFallback ?? true,
   };
+
+  // start_fresh_browser is a browser-memory-only field; flag-off must not add it
+  // to the request, keeping the legacy wire shape byte-identical.
+  if (browserMemoryEnabled) {
+    body.start_fresh_browser = startFresh;
+  }
 
   if (maxScreenshotScrolls) {
     body.max_screenshot_scrolls = maxScreenshotScrolls;
@@ -354,11 +404,53 @@ function getLoginCredentialDisplayText(
   };
 }
 
-type RunWorkflowFormType = Record<string, unknown> & {
+function FallbackCredentialList({
+  fallbackCredentialIds,
+  fallbackTrigger,
+  credentialNamesById,
+}: {
+  fallbackCredentialIds: Array<string>;
+  fallbackTrigger: CredentialFallbackTrigger | null;
+  credentialNamesById: Map<string, string>;
+}) {
+  if (fallbackCredentialIds.length === 0) {
+    return null;
+  }
+
+  const triggerText =
+    fallbackTrigger === "any_failure"
+      ? "for any reason"
+      : "on credential failures";
+
+  return (
+    <div className="space-y-2">
+      <ol className="space-y-1">
+        {fallbackCredentialIds.map((credentialId, index) => (
+          <li
+            key={credentialId}
+            className="flex min-w-0 items-center gap-2 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200"
+          >
+            <span className="shrink-0 text-slate-400">{index + 1}.</span>
+            <span className="truncate">
+              {credentialNamesById.get(credentialId) ?? credentialId}
+            </span>
+          </li>
+        ))}
+      </ol>
+      <p className="text-xs text-slate-400">
+        If the run fails {triggerText}, Skyvern retries it automatically with
+        the next fallback.
+      </p>
+    </div>
+  );
+}
+
+export type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
   browserProfileId: string | null;
+  startFreshBrowser?: boolean;
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
@@ -415,7 +507,10 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
   const onboarding = useOnboardingStateOptional();
+  const credentialFallbackRetryEnabled =
+    useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
   const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
   const onboardingLoading = onboarding != null && onboarding.isLoading;
   // Gate on the rollout arm so a 0% rollout / rollback restores the
   // pre-onboarding login-block alert instead of the credential prompt.
@@ -440,6 +535,7 @@ function RunWorkflowForm({
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
       browserProfileId: initialSettings.browserProfileId ?? null,
+      startFreshBrowser: false,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -454,6 +550,13 @@ function RunWorkflowForm({
   });
 
   const formErrors = form.formState.errors;
+  // start_fresh and a picked profile override are contradictory (the backend
+  // rejects the pair), so keep them mutually exclusive in the form.
+  const overrideProfilePicked = isOverrideProfilePicked(
+    form.watch("browserProfileId"),
+    workflow?.browser_profile_key,
+    browserMemoryEnabled,
+  );
   const hasBlockingParameterError = workflowParameters.some(
     (param) =>
       blockingParameterTypes.has(param.workflow_parameter_type) &&
@@ -463,7 +566,12 @@ function RunWorkflowForm({
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
       const client = await getClient(credentialGetter);
-      const body = getRunWorkflowRequestBody(values, workflowParameters);
+      const body = getRunWorkflowRequestBody(
+        values,
+        workflowParameters,
+        workflow?.browser_profile_key,
+        browserMemoryEnabled,
+      );
       return client.post<
         RunWorkflowRequestBody,
         { data: { workflow_run_id: string } }
@@ -482,11 +590,10 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       if (studioEnabled) {
-        // A full-run start lands on the bare ?wr= deep link; the learned run
-        // layout (or factory copilot,browser,overview) restores via the fallback.
-        navigate(
-          `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
-        );
+        // A full-run start lands on the bare /runs/{wr} deep link; the learned
+        // run layout (or factory copilot,browser,overview) restores via the
+        // fallback.
+        navigate(`/runs/${response.data.workflow_run_id}`);
       } else {
         navigate(
           env.useNewRunsUrl
@@ -560,6 +667,7 @@ function RunWorkflowForm({
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
       browserProfileId: initialSettings.browserProfileId ?? null,
+      startFreshBrowser: false,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -598,6 +706,7 @@ function RunWorkflowForm({
       proxyLocation,
       browserSessionId,
       browserProfileId,
+      startFreshBrowser,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpConnectHeaders,
@@ -617,6 +726,7 @@ function RunWorkflowForm({
       proxyLocation,
       browserSessionId,
       browserProfileId,
+      startFreshBrowser,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpConnectHeaders,
@@ -632,6 +742,7 @@ function RunWorkflowForm({
       "proxyLocation",
       "browserSessionId",
       "browserProfileId",
+      "startFreshBrowser",
       "maxScreenshotScrolls",
       "extraHttpHeaders",
       "cdpConnectHeaders",
@@ -674,7 +785,7 @@ function RunWorkflowForm({
             <h1 className="text-3xl">
               Inputs{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
-            <h2 className="text-lg text-slate-400">
+            <h2 className="text-lg text-muted-foreground">
               Fill the placeholder values that you have linked throughout your
               agent.
             </h2>
@@ -686,6 +797,8 @@ function RunWorkflowForm({
                 const body = getRunWorkflowRequestBody(
                   values,
                   workflowParameters,
+                  workflow?.browser_profile_key,
+                  browserMemoryEnabled,
                 );
                 const transformedBody = transformToWorkflowRunRequest(
                   body,
@@ -764,11 +877,25 @@ function RunWorkflowForm({
             <header>
               <h1 className="text-lg">Login credentials</h1>
             </header>
-            {loginCredentialInputs.map(({ parameter, loginBlockLabels }) => {
+            {loginCredentialInputs.map((input) => {
+              const {
+                parameter,
+                loginBlockLabels,
+                fallbackCredentialIds,
+                fallbackTrigger,
+              } = input;
               const { title, description } = getLoginCredentialDisplayText(
                 parameter,
                 loginBlockLabels,
               );
+              // Only surface fallbacks (and the "retries automatically" promise) for orgs in the
+              // rollout; the backend retry gate is keyed on the same flag.
+              const hasFallbacks =
+                credentialFallbackRetryEnabled &&
+                fallbackCredentialIds.length > 0;
+              const displayedFallbackCredentialIds = hasFallbacks
+                ? fallbackCredentialIds
+                : [];
 
               if (
                 parameter.parameter_type === WorkflowParameterTypes.Workflow
@@ -792,15 +919,15 @@ function RunWorkflowForm({
                     render={({ field }) => (
                       <FormItem>
                         <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
+                          <FormLabel className="!text-foreground">
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
                                 {title}
-                                <span className="text-sm text-slate-400">
+                                <span className="text-sm text-muted-foreground">
                                   credential
                                 </span>
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 {description}
                               </h2>
                             </div>
@@ -829,6 +956,47 @@ function RunWorkflowForm({
                 );
               }
 
+              const credentialIds = getRotatingCredentialIds(parameter);
+
+              if (credentialIds.length <= 1) {
+                const primaryCredentialId =
+                  credentialIds[0] ?? parameter.credential_id;
+                return (
+                  <div key={parameter.key} className="flex gap-16">
+                    <div className="w-72 shrink-0 text-slate-50">
+                      <div className="flex items-center gap-2 text-lg">
+                        {title}
+                        <span className="text-sm text-slate-400">
+                          credential
+                        </span>
+                      </div>
+                      <h2 className="text-sm text-slate-400">{description}</h2>
+                    </div>
+                    <div className="w-full space-y-2">
+                      <div className="flex min-w-0 items-center gap-2 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200">
+                        <span className="min-w-0 truncate">
+                          {credentialNamesById.get(primaryCredentialId) ??
+                            primaryCredentialId}
+                        </span>
+                        {hasFallbacks && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-xs font-normal"
+                          >
+                            Primary
+                          </Badge>
+                        )}
+                      </div>
+                      <FallbackCredentialList
+                        fallbackCredentialIds={displayedFallbackCredentialIds}
+                        fallbackTrigger={fallbackTrigger}
+                        credentialNamesById={credentialNamesById}
+                      />
+                    </div>
+                  </div>
+                );
+              }
+
               return (
                 <FormField
                   key={parameter.key}
@@ -845,6 +1013,14 @@ function RunWorkflowForm({
                       credentialNamesById={credentialNamesById}
                       title={title}
                       description={description}
+                      showPrimaryBadge={hasFallbacks}
+                      fallbackContent={
+                        <FallbackCredentialList
+                          fallbackCredentialIds={displayedFallbackCredentialIds}
+                          fallbackTrigger={fallbackTrigger}
+                          credentialNamesById={credentialNamesById}
+                        />
+                      }
                     />
                   )}
                 />
@@ -928,17 +1104,17 @@ function RunWorkflowForm({
                     return (
                       <FormItem>
                         <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
+                          <FormLabel className="!text-foreground">
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
                                 {parameter.key}
-                                <span className="text-sm text-slate-400">
+                                <span className="text-sm text-muted-foreground">
                                   {getLabelForWorkflowParameterType(
                                     parameter.workflow_parameter_type,
                                   )}
                                 </span>
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 {parameter.description}
                               </h2>
                             </div>
@@ -1019,7 +1195,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Webhook Callback URL
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           The URL of a webhook endpoint to send the details of
                           the agent result.
                         </h2>
@@ -1079,7 +1255,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Proxy Location
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           Route Skyvern through one of our available proxies.
                         </h2>
                       </div>
@@ -1129,7 +1305,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Run With
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           {descriptions[field.value] ?? descriptions.agent}
                         </h2>
                       </div>
@@ -1170,7 +1346,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           AI Fallback (cached scripts)
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           If the run fails when running with code, keep this on
                           to have AI attempt to fix the issue and regenerate the
                           code.
@@ -1216,7 +1392,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Session ID
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Use a persistent browser session to maintain
                                   state and enable browser interaction.
                                 </h2>
@@ -1253,7 +1429,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Profile
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Load a saved browser profile to reuse cookies,
                                   storage, and signed-in state for this run.
                                 </h2>
@@ -1261,10 +1437,42 @@ function RunWorkflowForm({
                             </FormLabel>
                             <div className="w-full space-y-2">
                               <FormControl>
-                                <BrowserProfileSelector
-                                  value={field.value}
-                                  onChange={field.onChange}
-                                />
+                                {browserMemoryEnabled ? (
+                                  workflow?.browser_profile_key ? (
+                                    // F8: a per-input agent has no single profile to
+                                    // override — show the state read-only, not a picker.
+                                    <div className="rounded-md border border-input px-3 py-2 text-sm text-muted-foreground">
+                                      This agent keeps one profile per input
+                                      value — a one-run override doesn’t apply
+                                      here.
+                                    </div>
+                                  ) : (
+                                    <BrowserProfileControl
+                                      mode="dropdown"
+                                      profileId={field.value}
+                                      onProfileChange={(id) => {
+                                        field.onChange(id);
+                                        // Picking an override and starting fresh are
+                                        // mutually exclusive; a real pick clears fresh.
+                                        if (id) {
+                                          form.setValue(
+                                            "startFreshBrowser",
+                                            false,
+                                          );
+                                        }
+                                      }}
+                                      codeValue=""
+                                      onCodeChange={() => {}}
+                                      codeMode="none"
+                                      restingCaption="Resolved from agent settings"
+                                    />
+                                  )
+                                ) : (
+                                  <BrowserProfileSelector
+                                    value={field.value}
+                                    onChange={field.onChange}
+                                  />
+                                )}
                               </FormControl>
                               <FormMessage />
                             </div>
@@ -1273,6 +1481,46 @@ function RunWorkflowForm({
                       );
                     }}
                   />
+                  {browserMemoryEnabled && (
+                    <FormField
+                      control={form.control}
+                      name="startFreshBrowser"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormControl>
+                            {overrideProfilePicked ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <label className="flex w-fit cursor-not-allowed items-center gap-2 text-sm opacity-50">
+                                    <Checkbox checked={false} disabled />
+                                    Start fresh for this run
+                                  </label>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  This run starts from the picked profile —
+                                  clear it to start fresh.
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
+                                <Checkbox
+                                  checked={Boolean(field.value)}
+                                  onCheckedChange={(v) =>
+                                    field.onChange(v === true)
+                                  }
+                                />
+                                Start fresh for this run
+                              </label>
+                            )}
+                          </FormControl>
+                          <p className="ml-6 text-xs text-muted-foreground">
+                            Ignores saved profiles this run — nothing is read or
+                            written.
+                          </p>
+                        </FormItem>
+                      )}
+                    />
+                  )}
                   <FormField
                     key="cdpAddress"
                     control={form.control}
@@ -1286,7 +1534,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Address
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   The address of the Browser server to use for
                                   the agent run.
                                 </h2>
@@ -1324,7 +1572,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Extra HTTP Headers
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Specify some self defined HTTP requests
                                   headers in Dict format
                                 </h2>
@@ -1358,7 +1606,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   CDP Connect Headers
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Headers attached only to the CDP WebSocket
                                   handshake when connecting to a remote browser
                                   (e.g. auth for the CDP endpoint). Not
@@ -1394,7 +1642,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Max Screenshot Scrolls
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                                 </h2>
                               </div>

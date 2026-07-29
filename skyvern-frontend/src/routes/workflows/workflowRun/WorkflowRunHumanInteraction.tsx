@@ -26,15 +26,25 @@ interface Props {
 export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
-  const isPaused =
-    workflowRun && workflowRun.status === WorkflowRunStatus.Paused;
+  // The studio run view carries the run id in a query param, not a route
+  // param, so resolve the run from the block itself rather than the URL.
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: workflowRunBlock.workflow_run_id,
+  });
+  // Actionable only when the resolved run IS this block's run (keepPreviousData can
+  // briefly return the prior run while switching), the run is paused, and this block
+  // is still running — else a stale/historical prompt would resolve the wrong pause
+  // (the continue/cancel mutations target the resolved run).
+  const isAwaitingInteraction =
+    workflowRun?.workflow_run_id === workflowRunBlock.workflow_run_id &&
+    workflowRun?.status === WorkflowRunStatus.Paused &&
+    workflowRunBlock.status === WorkflowRunStatus.Running;
+
+  const positiveLabel = workflowRunBlock.positive_descriptor || "Approve";
+  const negativeLabel = workflowRunBlock.negative_descriptor || "Reject";
 
   const buttonLayout =
-    (workflowRunBlock.positive_descriptor?.length ?? 0) < 8 &&
-    (workflowRunBlock.negative_descriptor?.length ?? 0) < 8
-      ? "inline"
-      : "stacked";
+    positiveLabel.length < 8 && negativeLabel.length < 8 ? "inline" : "stacked";
 
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [choice, setChoice] = useState<"approve" | "reject" | null>(null);
@@ -58,8 +68,8 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
 
       toast({
         variant: "success",
-        title: `${workflowRunBlock.positive_descriptor}`,
-        description: `Successfully chose: ${workflowRunBlock.positive_descriptor}`,
+        title: positiveLabel,
+        description: `Successfully chose: ${positiveLabel}`,
       });
     },
     onError: (error) => {
@@ -90,8 +100,8 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
 
       toast({
         variant: "success",
-        title: `${workflowRunBlock.negative_descriptor}`,
-        description: `Successfully chose: ${workflowRunBlock.negative_descriptor}`,
+        title: negativeLabel,
+        description: `Successfully chose: ${negativeLabel}`,
       });
     },
     onError: (error) => {
@@ -103,7 +113,7 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
     },
   });
 
-  if (!isPaused) {
+  if (!isAwaitingInteraction) {
     return null;
   }
 
@@ -113,11 +123,13 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {choice === "approve"
-                ? workflowRunBlock.positive_descriptor
-                : workflowRunBlock.negative_descriptor}
+              {choice === "approve" ? positiveLabel : negativeLabel}
             </DialogTitle>
-            <DialogDescription>Are you sure?</DialogDescription>
+            <DialogDescription>
+              {choice === "approve"
+                ? "The agent will continue running from where it paused."
+                : "The agent run will be stopped and can't be resumed."}
+            </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <DialogClose asChild>
@@ -139,7 +151,10 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
         </DialogContent>
       </Dialog>
 
-      <div className="text-sm">{workflowRunBlock.instructions}</div>
+      <div className="text-sm">
+        {workflowRunBlock.instructions ||
+          "The agent is paused and waiting for your review."}
+      </div>
       <div
         className={cn("flex gap-2", {
           "justify-between": buttonLayout === "inline",
@@ -153,7 +168,7 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
             setIsDialogOpen(true);
           }}
         >
-          <div>{workflowRunBlock.negative_descriptor}</div>
+          <div>{negativeLabel}</div>
         </Button>
         <Button
           variant="default"
@@ -162,7 +177,7 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
             setIsDialogOpen(true);
           }}
         >
-          <div>{workflowRunBlock.positive_descriptor}</div>
+          <div>{positiveLabel}</div>
         </Button>
       </div>
     </div>

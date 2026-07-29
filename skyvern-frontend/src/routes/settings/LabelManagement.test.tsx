@@ -25,12 +25,18 @@ Element.prototype.hasPointerCapture = () => false;
 Element.prototype.releasePointerCapture = () => {};
 
 const getMock = vi.fn();
+const postMock = vi.fn();
 const patchMock = vi.fn();
 const deleteMock = vi.fn();
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: () =>
-    Promise.resolve({ get: getMock, patch: patchMock, delete: deleteMock }),
+    Promise.resolve({
+      get: getMock,
+      post: postMock,
+      patch: patchMock,
+      delete: deleteMock,
+    }),
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
@@ -44,6 +50,7 @@ const tagValues: Array<TagValue> = [
 
 beforeEach(() => {
   getMock.mockResolvedValue({ data: tagValues });
+  postMock.mockResolvedValue({ data: {} });
   patchMock.mockResolvedValue({ data: {} });
   deleteMock.mockResolvedValue({ data: {} });
 });
@@ -75,9 +82,9 @@ describe("LabelManagement", () => {
 
     expect(await screen.findByRole("heading", { name: "env" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "team" })).toBeTruthy();
-    expect(screen.getByText("3 workflows")).toBeTruthy();
-    expect(screen.getByText("1 workflow")).toBeTruthy();
-    expect(screen.getByText("0 workflows")).toBeTruthy();
+    expect(screen.getByText("3 agents")).toBeTruthy();
+    expect(screen.getByText("1 agent")).toBeTruthy();
+    expect(screen.getByText("0 agents")).toBeTruthy();
   });
 
   it("shows an empty state when no labels are registered", async () => {
@@ -94,7 +101,7 @@ describe("LabelManagement", () => {
 
     expect(screen.getByText(/Delete label/)).toBeTruthy();
     expect(
-      screen.getByText(/removes it from 3 workflows and from the/),
+      screen.getByText(/removes it from 3 agents and from the/),
     ).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
@@ -153,5 +160,139 @@ describe("LabelManagement", () => {
         color: "red",
       });
     });
+  });
+
+  it("hides reserved skyvern.* rows from the label list entirely", async () => {
+    getMock.mockResolvedValue({
+      data: [
+        ...tagValues,
+        {
+          key: "skyvern.platform",
+          value: "web",
+          color: "blue",
+          workflow_count: 2,
+        },
+      ],
+    });
+    renderSurface();
+
+    expect(await screen.findByRole("heading", { name: "env" })).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "skyvern.platform" }),
+    ).toBeNull();
+    expect(screen.queryByText(/skyvern\.platform/)).toBeNull();
+    // Non-reserved rows are unaffected.
+    expect(screen.getByLabelText("Rename prod")).toBeTruthy();
+  });
+
+  it("shows the empty state when only reserved labels exist", async () => {
+    getMock.mockResolvedValue({
+      data: [
+        {
+          key: "skyvern.platform",
+          value: "web",
+          color: "blue",
+          workflow_count: 2,
+        },
+      ],
+    });
+    renderSurface();
+
+    expect(await screen.findByText(/No labels yet/)).toBeTruthy();
+  });
+
+  it("renders rows with value-only chips, without the group prefix", async () => {
+    renderSurface();
+
+    await screen.findByRole("heading", { name: "env" });
+    // The group name lives only in the section heading (h3), never in the chips.
+    expect(screen.queryByText("env", { selector: "span" })).toBeNull();
+    expect(screen.getByText("prod")).toBeTruthy();
+  });
+
+  it("filters rows by label value as you type", async () => {
+    renderSurface();
+
+    await screen.findByRole("heading", { name: "env" });
+    fireEvent.change(screen.getByLabelText("Search labels"), {
+      target: { value: "grow" },
+    });
+
+    expect(screen.queryByRole("heading", { name: "env" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "team" })).toBeTruthy();
+    expect(screen.getByText("growth")).toBeTruthy();
+  });
+
+  it("keeps a whole group visible when the query matches its name", async () => {
+    renderSurface();
+
+    await screen.findByRole("heading", { name: "env" });
+    fireEvent.change(screen.getByLabelText("Search labels"), {
+      target: { value: "env" },
+    });
+
+    expect(screen.getByText("prod")).toBeTruthy();
+    expect(screen.getByText("staging")).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "team" })).toBeNull();
+  });
+
+  it("shows a no-match state for an unmatched query", async () => {
+    renderSurface();
+
+    await screen.findByRole("heading", { name: "env" });
+    fireEvent.change(screen.getByLabelText("Search labels"), {
+      target: { value: "zzz" },
+    });
+
+    expect(screen.getByText(/No labels match/)).toBeTruthy();
+  });
+
+  it("creates a label from the New label dialog", async () => {
+    postMock.mockResolvedValue({
+      data: { key: "region", value: "emea", color: "teal", workflow_count: 0 },
+    });
+    renderSurface();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New label" }));
+    fireEvent.change(screen.getByLabelText("Group"), {
+      target: { value: "region" },
+    });
+    fireEvent.change(screen.getByLabelText("Label"), {
+      target: { value: "emea" },
+    });
+    fireEvent.click(screen.getByLabelText("teal"));
+    fireEvent.click(screen.getByRole("button", { name: "Create label" }));
+
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith("/tag-values", {
+        key: "region",
+        value: "emea",
+        color: "teal",
+      });
+    });
+  });
+
+  it("rejects a reserved group inline in the create dialog", async () => {
+    renderSurface();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New label" }));
+    fireEvent.change(screen.getByLabelText("Group"), {
+      target: { value: "skyvern.platform" },
+    });
+    fireEvent.change(screen.getByLabelText("Label"), {
+      target: { value: "web" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create label" }));
+
+    expect(await screen.findByText(/reserved/)).toBeTruthy();
+    expect(postMock).not.toHaveBeenCalled();
+  });
+
+  it("offers a New label CTA in the empty state", async () => {
+    getMock.mockResolvedValue({ data: [] });
+    renderSurface();
+
+    expect(await screen.findByText(/No labels yet/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "New label" })).toBeTruthy();
   });
 });

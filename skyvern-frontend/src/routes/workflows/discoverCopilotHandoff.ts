@@ -103,6 +103,24 @@ export function useDiscoverCopilotPromptRecovery({
   };
 }
 
+// In the studio shell the Copilot's visibility is the copilot pane, not the
+// non-embedded `isCopilotOpen` state. A Discover → Studio handoff lands with the
+// prompt seeded but only the default editor+browser panes open, so the pane must
+// be opened explicitly to surface the handed-off prompt. Off in the legacy
+// (non-embedded) editor, which already opens Copilot from the seed, and a no-op
+// when the pane is already open (e.g. a shared ?panes=copilot link).
+export function shouldOpenCopilotPaneForHandoff(params: {
+  embedded: boolean;
+  hasInitialCopilotMessage: boolean;
+  copilotPaneOpen: boolean;
+}): boolean {
+  return (
+    params.embedded &&
+    params.hasInitialCopilotMessage &&
+    !params.copilotPaneOpen
+  );
+}
+
 // Drops `via=discover` from a location.search string once the seed prompt it
 // pointed at has been consumed, so a later remount of the editor (e.g. via
 // browser back/forward) can't make useViaEntryPointCapture re-fire

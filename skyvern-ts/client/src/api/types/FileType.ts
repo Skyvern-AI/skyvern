@@ -7,5 +7,6 @@ export const FileType = {
     Pdf: "pdf",
     Image: "image",
     Docx: "docx",
+    Zip: "zip",
 } as const;
 export type FileType = (typeof FileType)[keyof typeof FileType];

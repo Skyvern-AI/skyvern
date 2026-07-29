@@ -106,7 +106,7 @@ function FolderTreeNode({
                   isExpanded && "rotate-90",
                 )}
               />
-              <FolderIcon className="h-4 w-4 shrink-0 text-blue-400" />
+              <FolderIcon className="h-4 w-4 shrink-0 text-blue-700 dark:text-blue-400" />
               <span className="truncate font-medium" title={folder.title}>
                 {folder.title}
               </span>
@@ -130,7 +130,7 @@ function FolderTreeNode({
                       type="button"
                       onClick={() => onCreateAgentInFolder(folder.folder_id)}
                       disabled={isCreatingAgent}
-                      className="rounded p-1.5 text-slate-400 transition-colors hover:bg-slate-500/20 hover:text-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-slate-500/20 hover:text-tertiary-foreground disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label="New agent in folder"
                     >
                       <PlusIcon className="h-4 w-4" />
@@ -145,7 +145,7 @@ function FolderTreeNode({
                     <button
                       type="button"
                       onClick={() => setIsEditDialogOpen(true)}
-                      className="rounded p-1.5 text-slate-400 transition-colors hover:bg-slate-500/20 hover:text-slate-300"
+                      className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-slate-500/20 hover:text-tertiary-foreground"
                       aria-label="Edit folder"
                     >
                       <Pencil1Icon className="h-4 w-4" />

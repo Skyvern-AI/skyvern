@@ -10,13 +10,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.copilot.context import (
+    ApprovedCredential,
     FillCarry,
     LoadedResultTargetContext,
     ObservedPage,
     StructuredContext,
     _fill_carry_from_scout_trajectory,
     _merge_observed_acted_pages,
+    adopt_model_authored_context,
     finalize_discovery_counter_in_global_llm_context,
+    record_approved_credentials_in_global_llm_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
@@ -545,6 +548,71 @@ def test_finalize_handles_invalid_json_inbound() -> None:
     assert sc.discovery_calls_made == 1
 
 
+_ENTRYPOINT_A = "http://localhost:8955/analytics_console/pathfold/?date_from=-7d"
+_ENTRYPOINT_B = "http://localhost:8955/analytics_console/other/"
+
+
+def test_structured_context_entrypoint_url_round_trips() -> None:
+    sc = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A)
+    parsed = StructuredContext.from_json_str(sc.to_json_str())
+    assert parsed.entrypoint_url == _ENTRYPOINT_A
+
+
+def test_structured_context_legacy_json_without_entrypoint_url_deserializes_to_none() -> None:
+    legacy = StructuredContext(user_goal="g").to_json_str()
+    assert '"entrypoint_url"' in legacy
+    stripped = json.loads(legacy)
+    del stripped["entrypoint_url"]
+    parsed = StructuredContext.from_json_str(json.dumps(stripped))
+    assert parsed.entrypoint_url is None
+
+
+def test_finalize_persists_resolved_entrypoint_url_on_entrypoint_only_turn() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_A,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, None)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_cancel_arm_persists_entrypoint_never_none() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_A,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, None)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_keeps_persisted_entrypoint_when_turn_resolves_nothing() -> None:
+    inbound = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A).to_json_str()
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=None,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_in_turn_entrypoint_overwrites_persisted_slot() -> None:
+    inbound = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A).to_json_str()
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_B,
+    )
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_B
+
+
 def test_finalize_treats_none_ctx_as_passthrough_in_factory() -> None:
     """The factory in agent.py passes ctx=None for very-early errors (before
     CopilotContext is constructed). The finalizer itself isn't called in that
@@ -662,3 +730,88 @@ class TestCopilotContext:
         assert ctx.last_failure_signature is None
         assert ctx.repeated_failure_streak_count == 0
         assert ctx.repeated_failure_nudge_emitted_at_streak == 0
+
+
+def _policy_ctx(resolved: list[SimpleNamespace], credential_input_kind: str = "credential_name") -> SimpleNamespace:
+    return SimpleNamespace(
+        request_policy=SimpleNamespace(resolved_credentials=resolved, credential_input_kind=credential_input_kind)
+    )
+
+
+def test_record_approved_credentials_persists_resolved_ids() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    records = StructuredContext.from_json_str(raw).approved_credentials
+    assert records == [ApprovedCredential(credential_id="cred_portal")]
+
+
+def test_record_approved_credentials_is_idempotent_across_turns() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    first = record_approved_credentials_in_global_llm_context(ctx, None)
+    second = record_approved_credentials_in_global_llm_context(ctx, first)
+
+    ids = [record.credential_id for record in StructuredContext.from_json_str(second).approved_credentials]
+    assert ids == ["cred_portal"]
+
+
+def test_record_approved_credentials_caps_at_twenty() -> None:
+    prior = StructuredContext(
+        approved_credentials=[ApprovedCredential(credential_id=f"cred_{i}") for i in range(20)]
+    ).to_json_str()
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_new", name="")])
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, prior)
+
+    records = StructuredContext.from_json_str(raw).approved_credentials
+    assert len(records) == 20
+    assert records[-1].credential_id == "cred_new"
+    assert "cred_0" not in {record.credential_id for record in records}
+
+
+def test_record_approved_credentials_survive_prompt_sanitization() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    recorded = record_approved_credentials_in_global_llm_context(ctx, None)
+    sanitized = sanitize_global_llm_context_for_prompt(recorded)
+
+    ids = [record.credential_id for record in StructuredContext.from_json_str(sanitized).approved_credentials]
+    assert ids == ["cred_portal"]
+
+
+def test_record_approved_credentials_no_ops_without_resolved() -> None:
+    assert record_approved_credentials_in_global_llm_context(_policy_ctx([]), None) is None
+    assert record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=None), "prior") == "prior"
+
+
+def test_model_authored_context_cannot_introduce_approved_credentials() -> None:
+    # Org membership is not evidence the user named a credential: an entry the model
+    # supplies must not survive into the recorded set, or the next turn would promote
+    # it into resolved_credentials and clear the unapproved-credential gate.
+    trusted = StructuredContext(approved_credentials=[ApprovedCredential(credential_id="cred_named")]).to_json_str()
+    model_authored = {
+        "user_goal": "log in",
+        "approved_credentials": [{"credential_id": "cred_never_named"}],
+    }
+
+    adopted = adopt_model_authored_context(trusted, model_authored)
+
+    assert [r.credential_id for r in adopted.approved_credentials] == ["cred_named"]
+    assert adopted.user_goal == "log in"
+
+
+def test_model_authored_context_cannot_drop_a_server_recorded_approval() -> None:
+    trusted = StructuredContext(approved_credentials=[ApprovedCredential(credential_id="cred_named")]).to_json_str()
+
+    adopted = adopt_model_authored_context(trusted, {"user_goal": "x", "approved_credentials": []})
+
+    assert [r.credential_id for r in adopted.approved_credentials] == ["cred_named"]
+
+
+def test_model_authored_free_text_context_is_preserved_without_approvals() -> None:
+    adopted = adopt_model_authored_context(None, "just some prose the model emitted")
+
+    assert adopted.user_goal == "just some prose the model emitted"
+    assert adopted.approved_credentials == []

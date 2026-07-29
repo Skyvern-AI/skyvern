@@ -14,6 +14,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_prof
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -510,6 +511,14 @@ class FileStorageType(StrEnum):
     SFTP = "sftp"
 
 
+class FileDownloadTarget(StrEnum):
+    WEBSITE = "website"
+    S3 = "s3"
+    AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
+
+
 class FileUploadDestination(BaseModel):
     """Customer-storage destination for a single file upload.
 
@@ -609,6 +618,8 @@ class CredentialParameterYAML(ParameterYAML):
     credential_id: str
     credential_ids: list[str] | None = None
     selection_strategy: str | None = None
+    fallback_credential_ids: list[str] | None = None
+    fallback_trigger: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -833,8 +844,14 @@ class CodeBlockYAML(BlockYAML):
 
     code: str
     parameter_keys: list[str] | None = None
-    prompt: str | None = None
-    steps: list[CodeBlockStepYAML] | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Plain-language goal of this code block, shown as the block's Goal in the editor",
+    )
+    steps: list[CodeBlockStepYAML] | None = Field(
+        default=None,
+        description="Plain-language step outline mapped to code line ranges; derived from the code when omitted",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1061,6 +1078,7 @@ class LoginBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
     skip_saved_profile: bool = False
 
 
@@ -1086,6 +1104,27 @@ class HumanInteractionBlockYAML(BlockYAML):
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
+    download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_blob_container_name: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    path: str | None = None
+    prompt: str | None = None
+    continue_on_empty: bool = False
     navigation_goal: str
     url: str | None = None
     title: str = ""
@@ -1403,7 +1442,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
-    max_screenshot_scrolls: int | None = None
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None

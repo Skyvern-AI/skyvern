@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, unquote, urlparse
 
 import aiohttp
+import filetype
 import structlog
 from multidict import CIMultiDictProxy
 from yarl import URL
@@ -576,6 +577,26 @@ def sanitize_filename(filename: str) -> str:
     return "".join(c for c in filename if c.isalnum() or c in ["-", "_", ".", "%", " "])
 
 
+def guess_extension_from_file(file_path: str | Path) -> str:
+    """Infer a file's extension (with leading dot) from its magic bytes, or "" if unreadable/unknown."""
+    try:
+        kind = filetype.guess(str(file_path))
+    except OSError:
+        return ""
+    return f".{kind.extension}" if kind else ""
+
+
+def recover_download_extension(file_path: str | Path, download_suffix: str | None = None) -> str:
+    """Extension to append to a downloaded file that has none, sniffed from its content.
+
+    Returns "" when ``download_suffix`` already carries its own extension, so the final
+    ``download_suffix + extension`` name is not doubled (e.g. invoice.pdf + .pdf).
+    """
+    if download_suffix and Path(download_suffix).suffix:
+        return ""
+    return guess_extension_from_file(file_path)
+
+
 def rename_file(file_path: str, new_file_name: str) -> str:
     try:
         new_file_name = sanitize_filename(new_file_name)
@@ -614,6 +635,17 @@ def make_temp_directory(
     temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)
     return tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=temp_dir)
+
+
+def is_temp_working_dir(path: str) -> bool:
+    """A working copy under the Skyvern temp root — a fresh temp dir or a storage extraction (S3/GCS/
+    Azure) — is safe to delete. LocalStorage.retrieve_browser_profile returns the LIVE profile dir
+    (outside TEMP_PATH); deleting that erases saved state. Fail closed on any doubt — leaking a temp
+    dir beats destroying live state."""
+    try:
+        return Path(path).resolve().is_relative_to(Path(settings.TEMP_PATH).resolve())
+    except Exception:
+        return False
 
 
 def create_named_temporary_file(delete: bool = True, file_name: str | None = None) -> tempfile._TemporaryFileWrapper:

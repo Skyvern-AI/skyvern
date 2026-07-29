@@ -81,7 +81,7 @@ function MicroDropdown({ selections, selected, onChange }: Props) {
           {isOpen && (
             <div
               className={cn(
-                "absolute right-0 z-10 rounded-md bg-background text-xs text-slate-400",
+                "absolute right-0 z-10 rounded-md bg-background text-xs text-muted-foreground",
                 "duration-200 animate-in fade-in-0 zoom-in-95",
                 openUpwards
                   ? "bottom-full mb-2 slide-in-from-bottom-2"
@@ -94,7 +94,7 @@ function MicroDropdown({ selections, selected, onChange }: Props) {
                   <div
                     key={s}
                     className={cn(
-                      "flex cursor-pointer items-center gap-1 rounded-md p-1 hover:bg-slate-800",
+                      "flex cursor-pointer items-center gap-1 rounded-md p-1 hover:bg-muted",
                       "animate-in fade-in-0 slide-in-from-left-2",
                       {
                         "pointer-events-none cursor-default opacity-50":

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -29,7 +30,7 @@ class WorkflowCopilotCompletionCriteriaSet(BaseModel):
     workflow_copilot_chat_id: str
     goal_epoch: int
     status: str
-    criteria: list[dict]
+    criteria: list[dict[str, Any]]
     source_turn_id: str | None = None
     source_goal_text: str | None = None
     consecutive_all_no_evidence: int = 0
@@ -40,6 +41,19 @@ class WorkflowCopilotCompletionCriteriaSet(BaseModel):
     supersede_reason: str | None = None
     created_at: datetime
     modified_at: datetime
+
+
+CriteriaSetNonAdoptableReason = Literal["unknown_shape", "undecodable_v1_criteria"]
+
+
+@dataclass(frozen=True)
+class NonAdoptableCriteriaSet:
+    """A persisted criteria-set row whose shape cannot be decoded into the current
+    model; callers must treat the row as absent/superseded, never as an empty contract."""
+
+    reason: CriteriaSetNonAdoptableReason
+    completion_criteria_set_id: str
+    goal_epoch: int
 
 
 class WorkflowCopilotChatSender(StrEnum):
@@ -268,6 +282,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         None,
         description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
     )
+    terminal_envelope: dict[str, Any] | None = Field(
+        None,
+        description="Shadow-only terminal outcome envelope for end-of-turn typed-state validation.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):
@@ -350,6 +368,11 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.BLOCK_PROGRESS, description="Message type"
     )
     workflow_run_block_id: str = Field(..., description="Stable per-block id; used as the row key in the activity pane")
+    workflow_run_id: str | None = Field(
+        None,
+        description="Dispatched run id for this block; lets the FE fetch recorded actions live during execution. "
+        "Optional for backward compatibility with clients that only read the run id from run_outcome.",
+    )
     block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
     block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
     status: str = Field(
@@ -434,6 +457,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "workflow_credential_inputs_unbound",
         "missing_credential_run_failure",
         "credential_deferred_draft",
+        "login_credentials_unresolved",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")

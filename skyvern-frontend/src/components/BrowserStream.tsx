@@ -34,6 +34,7 @@ import { useSettingsStore } from "@/store/SettingsStore";
 import { wssBaseUrl, newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { formatRecordingClock } from "@/util/recordingClock";
+import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
 import {
   StreamStatusPanel,
@@ -42,6 +43,8 @@ import {
 import { handleVncClipboardPasteShortcut } from "@/components/browserStreamClipboard";
 
 import "./browser-stream.css";
+
+installNoVncGestureCrashGuard();
 
 const MESSAGE_RECONNECT_DELAY_MS = 1000;
 const MESSAGE_MAX_RECONNECT_ATTEMPTS = 20;

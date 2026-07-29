@@ -8,11 +8,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ProxyLocation } from "@/api/types";
 import { getInitialValues } from "./utils";
 import { isMaskedHeaders } from "@/util/secretHeaders";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
   const { workflowPermanentId } = useParams();
   const location = useLocation();
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
 
   const { data: workflow, isFetching } = useQuery<WorkflowApiResponse>({
     queryKey: ["workflow", workflowPermanentId],
@@ -64,7 +66,7 @@ function WorkflowRunParameters() {
       <div className="space-y-8">
         <header className="space-y-5">
           <h1 className="text-3xl">Inputs</h1>
-          <h2 className="text-lg text-slate-400">
+          <h2 className="text-lg text-muted-foreground">
             Fill the placeholder values that you have linked throughout your
             agent.
           </h2>
@@ -91,8 +93,12 @@ function WorkflowRunParameters() {
           maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
         extraHttpHeaders:
           extraHttpHeaders ?? workflow.extra_http_headers ?? null,
-        browserProfileId:
-          browserProfileId ?? workflow.browser_profile_id ?? null,
+        // Under browser memory the run form's control is a one-run override that
+        // rests on Auto (the workflow's own profile is resolved server-side), so
+        // only carry an explicit per-run/rerun override — not the inherited default.
+        browserProfileId: browserMemoryEnabled
+          ? browserProfileId
+          : (browserProfileId ?? workflow.browser_profile_id ?? null),
         cdpConnectHeaders: cdpConnectHeaders ?? storedCdpConnectHeaders,
         cdpAddress: null,
         runWith,

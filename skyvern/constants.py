@@ -16,6 +16,10 @@ INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
+# Independent budget for disabling the download interceptor during close(). Kept well below
+# BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly
+# and can never consume the budget the paid-provider cleanup phase needs.
+BROWSER_INTERCEPTOR_DISABLE_TIMEOUT = 30  # 30 seconds
 BROWSER_DOWNLOAD_MAX_WAIT_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_TIMEOUT = 600  # 10 minute
@@ -40,10 +44,14 @@ SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
 AUTO_COMPLETION_POTENTIAL_VALUES_COUNT = 3
 DROPDOWN_MENU_MAX_DISTANCE = 100
 BROWSER_DOWNLOADING_SUFFIX = ".crdownload"
-MAX_UPLOAD_FILE_COUNT = 50
-AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT = 50
+MAX_UPLOAD_FILE_COUNT = 300
+AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT = 300
 CUSTOMER_STORAGE_UPLOAD_MAX_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB per file (FileUploadBlock)
 DEFAULT_MAX_SCREENSHOT_SCROLLS = 3
+# Sanity ceiling for a user-supplied scroll count. Bounds the value well below the
+# INTEGER column limit (a larger value overflowed workflow_runs on insert) while
+# staying far above any real screenshot need.
+MAX_SCREENSHOT_SCROLLS = 1000
 
 # Default navigation_goal for LoginBlocks. Instructs the LLM how to find the login
 # page, fill credentials, and handle multi-step flows / 2FA.

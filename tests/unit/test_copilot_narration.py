@@ -1150,6 +1150,43 @@ async def test_poll_tick_emits_block_progress_for_each_new_transition() -> None:
 
 
 @pytest.mark.asyncio
+async def test_poll_tick_stamps_workflow_run_id_on_block_progress() -> None:
+    """The run id threaded from the watchdog rides every block_progress frame so the
+    FE can fetch recorded actions live during execution; it defaults to None for
+    callers/paths that don't pass one (backward-compatible with run_outcome-only clients)."""
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotBlockProgressUpdate
+
+    async def fetch() -> list[_StubBlock]:
+        return [_StubBlock("b0", "running", label="step_navigate", block_type="navigation")]
+
+    async def run_once(run_id: str | None) -> WorkflowCopilotBlockProgressUpdate:
+        state = NarratorState()
+        stream = _StubStream()
+        await narrator_poll_tick(
+            state,
+            current_block_ts=_ts(2.0),
+            prior_block_ts=_ts(1.0),
+            last_block_fetch_monotonic=0.0,
+            seen_block_states={},
+            fetch_block_statuses=fetch,
+            stream=stream,  # type: ignore[arg-type]
+            workflow_run_id=run_id,
+        )
+        if state.in_flight_task is not None:
+            state.in_flight_task.cancel()
+            try:
+                await state.in_flight_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        payloads = [p for p in stream.sent if isinstance(p, WorkflowCopilotBlockProgressUpdate)]
+        assert len(payloads) == 1
+        return payloads[0]
+
+    assert (await run_once("wr_live_123")).workflow_run_id == "wr_live_123"
+    assert (await run_once(None)).workflow_run_id is None
+
+
+@pytest.mark.asyncio
 async def test_poll_tick_does_not_emit_block_progress_for_unchanged_blocks() -> None:
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotBlockProgressUpdate
 

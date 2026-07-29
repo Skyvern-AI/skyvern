@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
 from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
@@ -47,6 +50,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
@@ -72,6 +76,99 @@ from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+
+def _floor_rekeyed_association_is_coherent(item: Mapping[str, object]) -> bool:
+    marker_present = "requested_output_floor_rekeyed" in item
+    path_present = "floor_rekeyed_from_path" in item
+    if not marker_present and not path_present:
+        return True
+    return (
+        marker_present
+        and path_present
+        and item["requested_output_floor_rekeyed"] is True
+        and isinstance(item["floor_rekeyed_from_path"], str)
+    )
+
+
+def _decode_completion_criteria_set(
+    row: WorkflowCopilotCompletionCriteriaSetModel,
+) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet:
+    """A current or v1 row adopts only when every recorded criterion decodes without loss."""
+    raw_criteria = row.criteria
+    try:
+        if isinstance(raw_criteria, list):
+            current = WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+            inner = current.criteria
+            is_v1_envelope = False
+        elif (
+            isinstance(raw_criteria, dict)
+            and raw_criteria.get("contract_version") == 1
+            and isinstance(raw_criteria.get("criteria"), list)
+        ):
+            inner = raw_criteria["criteria"]
+            current = None
+            is_v1_envelope = True
+        else:
+            inner = None
+            current = None
+            is_v1_envelope = False
+
+        decoded = criteria_from_json(inner)
+        if inner is not None and (
+            (is_v1_envelope and not inner)
+            or len(decoded) != len(inner)
+            or any(
+                not _floor_rekeyed_association_is_coherent(item)
+                or any(
+                    field in item and item[field] != canonical_value
+                    for field, canonical_value in criterion_authority_projection(
+                        criterion,
+                        stored_item=item,
+                    ).items()
+                )
+                or ("antecedent_family" in item and item["antecedent_family"] is None)
+                for item, criterion in zip(inner, decoded)
+            )
+        ):
+            return NonAdoptableCriteriaSet(
+                reason="undecodable_v1_criteria",
+                completion_criteria_set_id=row.completion_criteria_set_id,
+                goal_epoch=row.goal_epoch,
+            )
+        if current is not None:
+            return current
+        if is_v1_envelope:
+            return WorkflowCopilotCompletionCriteriaSet(
+                completion_criteria_set_id=row.completion_criteria_set_id,
+                organization_id=row.organization_id,
+                workflow_copilot_chat_id=row.workflow_copilot_chat_id,
+                goal_epoch=row.goal_epoch,
+                status=row.status,
+                criteria=inner,
+                source_turn_id=row.source_turn_id,
+                source_goal_text=row.source_goal_text,
+                consecutive_all_no_evidence=row.consecutive_all_no_evidence,
+                tripwire_fired=row.tripwire_fired,
+                last_fully_satisfied_workflow_yaml=row.last_fully_satisfied_workflow_yaml,
+                superseded_by_set_id=row.superseded_by_set_id,
+                superseded_at=row.superseded_at,
+                supersede_reason=row.supersede_reason,
+                created_at=row.created_at,
+                modified_at=row.modified_at,
+            )
+    except Exception:
+        LOG.warning(
+            "copilot completion criteria set decode raised; treating row as unknown shape",
+            completion_criteria_set_id=row.completion_criteria_set_id,
+            goal_epoch=row.goal_epoch,
+            exc_info=True,
+        )
+    return NonAdoptableCriteriaSet(
+        reason="unknown_shape",
+        completion_criteria_set_id=row.completion_criteria_set_id,
+        goal_epoch=row.goal_epoch,
+    )
 
 
 class WorkflowParametersRepository(BaseRepository):
@@ -229,6 +326,8 @@ class WorkflowParametersRepository(BaseRepository):
                 credential_id=parameter.credential_id,
                 credential_ids=parameter.credential_ids,
                 selection_strategy=parameter.selection_strategy,
+                fallback_credential_ids=parameter.fallback_credential_ids,
+                fallback_trigger=parameter.fallback_trigger,
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):
@@ -698,19 +797,22 @@ class WorkflowParametersRepository(BaseRepository):
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-    ) -> WorkflowCopilotCompletionCriteriaSet | None:
+    ) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet | None:
         async with self.Session() as session:
             query = (
                 select(WorkflowCopilotCompletionCriteriaSetModel)
                 .filter(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
                 .filter(WorkflowCopilotCompletionCriteriaSetModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                .order_by(WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc())
+                .order_by(
+                    WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc(),
+                    WorkflowCopilotCompletionCriteriaSetModel.created_at.desc(),
+                )
                 .limit(1)
             )
             row = (await session.scalars(query)).first()
             if not row:
                 return None
-            return WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+            return _decode_completion_criteria_set(row)
 
     @db_operation("create_workflow_copilot_completion_criteria_set")
     async def create_workflow_copilot_completion_criteria_set(
@@ -718,7 +820,7 @@ class WorkflowParametersRepository(BaseRepository):
         organization_id: str,
         workflow_copilot_chat_id: str,
         goal_epoch: int,
-        criteria: list[dict],
+        criteria: list[dict[str, Any]],
         source_turn_id: str | None = None,
         source_goal_text: str | None = None,
         consecutive_all_no_evidence: int = 0,
@@ -804,6 +906,7 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("get_task_generation_by_prompt_hash")
     async def get_task_generation_by_prompt_hash(
         self,
+        organization_id: str,
         user_prompt_hash: str,
         query_window_hours: int = settings.PROMPT_CACHE_WINDOW_HOURS,
     ) -> TaskGeneration | None:
@@ -811,9 +914,11 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             query = (
                 select(TaskGenerationModel)
-                .filter_by(user_prompt_hash=user_prompt_hash)
+                .filter_by(organization_id=organization_id, user_prompt_hash=user_prompt_hash)
                 .filter(TaskGenerationModel.llm.is_not(None))
                 .filter(TaskGenerationModel.created_at > before_time)
+                .order_by(TaskGenerationModel.created_at.desc())
+                .limit(1)
             )
             task_generation = (await session.scalars(query)).first()
             if not task_generation:
@@ -851,6 +956,53 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_action)
             return hydrate_action(new_action)
+
+    @traced(name="skyvern.db.upsert_recorded_action")
+    @db_operation("upsert_recorded_action")
+    async def upsert_recorded_action(self, action: Action) -> None:
+        # Idempotent on action_id: a code block's streamed write (mid-execution, screenshot not yet
+        # uploaded) and its end-of-block batch converge on the same row, so the batch backfills the
+        # screenshot instead of inserting a duplicate. Isolated from create_action to leave the agent
+        # write path untouched.
+        action_log_payload = redact_action_for_log(action)
+        values = {
+            "action_id": action.action_id,
+            "action_type": action.action_type,
+            "source_action_id": action.source_action_id,
+            "organization_id": action.organization_id,
+            "workflow_run_id": action.workflow_run_id,
+            "task_id": action.task_id,
+            "step_id": action.step_id,
+            "step_order": action.step_order,
+            "action_order": action.action_order,
+            "status": action.status,
+            "reasoning": action.reasoning,
+            "intention": action.intention,
+            "response": action_log_payload.get("response"),
+            "element_id": action.element_id,
+            "skyvern_element_hash": action.skyvern_element_hash,
+            "skyvern_element_data": action.skyvern_element_data,
+            "screenshot_artifact_id": action.screenshot_artifact_id,
+            "action_json": action.model_dump(),
+            "confidence_float": action.confidence_float,
+            "created_by": action.created_by,
+        }
+        if action.created_at is not None:
+            values["created_at"] = action.created_at
+        if action.modified_at is not None:
+            values["modified_at"] = action.modified_at
+        async with self.Session() as session:
+            stmt = pg_insert(ActionModel).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["action_id"],
+                set_={
+                    "screenshot_artifact_id": stmt.excluded.screenshot_artifact_id,
+                    "action_json": stmt.excluded.action_json,
+                    "modified_at": stmt.excluded.modified_at,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
 
     @db_operation("update_action_reasoning")
     async def update_action_reasoning(
@@ -892,4 +1044,7 @@ class WorkflowParametersRepository(BaseRepository):
             )
 
             actions = (await session.scalars(query)).all()
-            return [Action.model_validate(action) for action in actions]
+            # hydrate_action, not Action.model_validate: the base model has no action_json merge, so
+            # validating the row directly drops every subclass field a cached action was recorded
+            # with. Matches every other retrieval site.
+            return [hydrate_action(action) for action in actions]

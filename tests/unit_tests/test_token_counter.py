@@ -1,6 +1,6 @@
 """Tests for token counter utility."""
 
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import approx_count_tokens, count_tokens
 
 
 class TestCountTokens:
@@ -106,3 +106,31 @@ def hello():
         char_count = len(text)
         assert result > char_count / 10  # Very loose lower bound
         assert result < char_count  # Token count should be less than char count
+
+
+class TestApproxCountTokens:
+    """Tests for approx_count_tokens function (character-based heuristic)."""
+
+    def test_empty_string(self):
+        assert approx_count_tokens("") == 0
+
+    def test_ceil_division_by_four(self):
+        assert approx_count_tokens("a") == 1
+        assert approx_count_tokens("abcd") == 1
+        assert approx_count_tokens("abcde") == 2
+
+    def test_returns_integer(self):
+        assert isinstance(approx_count_tokens("test"), int)
+
+    def test_no_tiktoken_encode(self, monkeypatch):
+        """The heuristic must not invoke tiktoken encoding regardless of load state."""
+
+        def _boom() -> None:
+            raise AssertionError("approx_count_tokens must not load the encoding")
+
+        monkeypatch.setattr("skyvern.utils.token_counter._get_encoding", _boom)
+        assert approx_count_tokens("word " * 1000) == 1250
+
+    def test_gate_threshold_behavior(self):
+        """Large HTML should exceed the 100k-token gate via the cheap estimate."""
+        assert approx_count_tokens("x" * 500_000) == 125_000

@@ -67,7 +67,7 @@ function FieldLabel({
 }) {
   return (
     <div className="flex gap-2">
-      <Label className="text-xs text-slate-300">{label}</Label>
+      <Label className="text-xs text-tertiary-foreground">{label}</Label>
       <HelpTooltip content={helpTooltips["email_inbox"]?.[field] ?? fallback} />
     </div>
   );
@@ -125,7 +125,7 @@ function EmailInboxEditorBody({
   return (
     <div data-testid="email-inbox-block-form" className="space-y-4">
       <div className="space-y-3">
-        <div className="text-xs font-medium uppercase tracking-wider text-slate-400">
+        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Connection
         </div>
 

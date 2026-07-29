@@ -1,4 +1,5 @@
 import {
+  CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
   WorkflowParameter,
@@ -10,6 +11,8 @@ import { visitWorkflowBlocks } from "./workflowBlockUtils";
 export type LoginCredentialInput = {
   parameter: WorkflowParameter | CredentialParameter;
   loginBlockLabels: Array<string>;
+  fallbackCredentialIds: Array<string>;
+  fallbackTrigger: CredentialFallbackTrigger | null;
 };
 
 function isCredentialIdWorkflowParameter(
@@ -39,7 +42,18 @@ export function getRotatingCredentialIds(
   );
 }
 
-function isRotatingCredentialParameter(
+export function getFallbackCredentialIds(
+  parameter: CredentialParameter,
+): Array<string> {
+  return (parameter.fallback_credential_ids ?? []).filter(
+    (credentialId, index, allCredentialIds): credentialId is string =>
+      typeof credentialId === "string" &&
+      credentialId.length > 0 &&
+      allCredentialIds.indexOf(credentialId) === index,
+  );
+}
+
+function isConfigurableCredentialParameter(
   parameter: unknown,
 ): parameter is CredentialParameter {
   if (parameter === null || typeof parameter !== "object") {
@@ -47,10 +61,17 @@ function isRotatingCredentialParameter(
   }
 
   const maybeParameter = parameter as Partial<CredentialParameter>;
+  if (
+    maybeParameter.parameter_type !== WorkflowParameterTypes.Credential ||
+    typeof maybeParameter.key !== "string"
+  ) {
+    return false;
+  }
+
+  const credentialParameter = maybeParameter as CredentialParameter;
   return (
-    maybeParameter.parameter_type === WorkflowParameterTypes.Credential &&
-    typeof maybeParameter.key === "string" &&
-    getRotatingCredentialIds(maybeParameter as CredentialParameter).length > 1
+    getRotatingCredentialIds(credentialParameter).length > 1 ||
+    getFallbackCredentialIds(credentialParameter).length > 0
   );
 }
 
@@ -68,7 +89,7 @@ function collectLoginCredentialLabels(
       for (const parameter of block.parameters ?? []) {
         if (
           !isCredentialIdWorkflowParameter(parameter) &&
-          !isRotatingCredentialParameter(parameter)
+          !isConfigurableCredentialParameter(parameter)
         ) {
           continue;
         }
@@ -102,7 +123,7 @@ export function getLoginCredentialInputs({
     [
       ...workflowParameters.filter(isCredentialIdWorkflowParameter),
       ...workflow.workflow_definition.parameters.filter(
-        isRotatingCredentialParameter,
+        isConfigurableCredentialParameter,
       ),
     ].map((parameter) => [parameter.key, parameter]),
   );
@@ -123,10 +144,22 @@ export function getLoginCredentialInputs({
       return [];
     }
 
+    const fallbackCredentialIds =
+      parameter.parameter_type === WorkflowParameterTypes.Credential
+        ? getFallbackCredentialIds(parameter)
+        : [];
+    const fallbackTrigger =
+      fallbackCredentialIds.length > 0 &&
+      parameter.parameter_type === WorkflowParameterTypes.Credential
+        ? (parameter.fallback_trigger ?? "credential_failures")
+        : null;
+
     return [
       {
         parameter,
         loginBlockLabels: Array.from(labels),
+        fallbackCredentialIds,
+        fallbackTrigger,
       },
     ];
   });

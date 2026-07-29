@@ -93,6 +93,16 @@ class _FailingUpdateCredentialRepository(_FakeCredentialRepository):
         raise RuntimeError("database unavailable")
 
 
+class _CapturingCreateCredentialRepository(_FakeCredentialRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_kwargs: dict[str, object] | None = None
+
+    async def create_credential(self, **kwargs: object) -> Credential:
+        self.create_kwargs = kwargs
+        return await super().create_credential(**kwargs)
+
+
 def _password_request(name: str = "Login", password: str = "secret-password") -> CreateCredentialRequest:
     return CreateCredentialRequest(
         name=name,
@@ -240,3 +250,18 @@ def test_skyvern_credential_vault_key_file_creation_is_single_winner(tmp_path, m
     assert len(set(returned_keys)) == 1
     assert returned_keys[0] == stored_key
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_skyvern_credential_vault_create_threads_tested_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    repository = _CapturingCreateCredentialRepository()
+    monkeypatch.setattr(app.DATABASE, "credentials", repository)
+
+    request = _password_request()
+    request = request.model_copy(update={"tested_url": "https://example.com/login"})
+    await SkyvernCredentialVaultService().create_credential("org_test", request)
+
+    assert repository.create_kwargs is not None
+    assert repository.create_kwargs["tested_url"] == "https://example.com/login"

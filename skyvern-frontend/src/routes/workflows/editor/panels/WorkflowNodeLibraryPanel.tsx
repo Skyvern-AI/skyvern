@@ -440,7 +440,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                   }}
                 >
                   <div className="flex min-w-0 gap-2">
-                    <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+                    <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
                       {item.icon}
                     </div>
                     <div className="flex min-w-0 flex-col gap-1">
@@ -456,7 +456,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                 </div>
               ))
             ) : (
-              <div className="p-4 text-center text-sm text-slate-400">
+              <div className="p-4 text-center text-sm text-muted-foreground">
                 No results found
               </div>
             )}

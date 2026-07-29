@@ -10,7 +10,7 @@ function WaitBlockParameters({ waitSec }: Props) {
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Wait Duration</h1>
-          <h2 className="text-base text-slate-400">
+          <h2 className="text-base text-muted-foreground">
             Seconds to wait before proceeding
           </h2>
         </div>

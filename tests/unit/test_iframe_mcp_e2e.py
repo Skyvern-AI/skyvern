@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -19,7 +20,14 @@ from playwright.async_api import async_playwright
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState, get_current_session, set_current_session
-from skyvern.cli.mcp_tools.browser import skyvern_frame_list, skyvern_frame_main, skyvern_frame_switch
+from skyvern.cli.mcp_tools.browser import (
+    skyvern_execute,
+    skyvern_frame_list,
+    skyvern_frame_main,
+    skyvern_frame_switch,
+    skyvern_observe,
+)
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 
 
 def _has_playwright_browser() -> bool:
@@ -46,11 +54,17 @@ MAIN_HTML = """\
 <body>
   <h1 id="main-heading">Main Page</h1>
   <input id="main-input" type="text" value="" />
+  <button id="parent-action" type="button">Parent action</button>
   <iframe id="pay-frame" name="payment" srcdoc='
     <!DOCTYPE html>
     <html><body>
       <h2 id="frame-heading">Payment</h2>
       <input id="card" type="text" value="" placeholder="Card" />
+      <button id="frame-action" type="button"
+        onclick="document.getElementById(`frame-status`).textContent = `clicked`">
+        Frame action
+      </button>
+      <div id="frame-status">idle</div>
     </body></html>
   '></iframe>
 </body>
@@ -76,63 +90,8 @@ class _FakeBrowser:
         self._browser_context = _FakeBrowserContext(page)
 
     async def get_working_page(self) -> Any:
-        # Return a lightweight wrapper that has the frame methods
-        return _WrappedPage(self._page)
-
-
-class _WrappedPage:
-    """Thin wrapper around Playwright Page to add frame_switch/main/list."""
-
-    def __init__(self, page: Any) -> None:
-        self.page = page
-        self._working_frame = None
-
-    @property
-    def _locator_scope(self) -> Any:
-        if self._working_frame is not None:
-            return self._working_frame
-        return self.page
-
-    async def frame_switch(
-        self, *, selector: str | None = None, name: str | None = None, index: int | None = None
-    ) -> dict[str, Any]:
-        params = sum(p is not None for p in (selector, name, index))
-        if params != 1:
-            raise ValueError("Exactly one of selector, name, or index is required.")
-
-        frame = None
-        if selector is not None:
-            element = await self.page.query_selector(selector)
-            if element is None:
-                raise ValueError(f"Selector '{selector}' did not match any element.")
-            frame = await element.content_frame()
-            if frame is None:
-                raise ValueError(f"Selector '{selector}' did not resolve to an iframe.")
-        elif name is not None:
-            frame = self.page.frame(name=name)
-            if frame is None:
-                raise ValueError(f"No frame found with name '{name}'.")
-        elif index is not None:
-            frames = self.page.frames
-            if index < 0 or index >= len(frames):
-                raise ValueError(f"Frame index {index} out of range.")
-            frame = frames[index]
-
-        self._working_frame = frame
-        return {"name": frame.name if frame else None, "url": frame.url if frame else None}
-
-    def frame_main(self) -> dict[str, str]:
-        self._working_frame = None
-        return {"status": "switched_to_main_frame"}
-
-    async def frame_list(self) -> list[dict[str, Any]]:
-        return [
-            {"index": i, "name": f.name, "url": f.url, "is_main": f == self.page.main_frame}
-            for i, f in enumerate(self.page.frames)
-        ]
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.page, name)
+        # The real page wrapper, so frame routing (_locator_scope) matches production.
+        return SkyvernBrowserPage(MagicMock(), self._page)
 
 
 @pytest_asyncio.fixture
@@ -228,3 +187,55 @@ async def test_mcp_frame_switch_persists_across_calls(mcp_session: SessionState)
     frame = state._working_frame
     heading = await frame.locator("#frame-heading").text_content()
     assert heading == "Payment"
+
+
+@pytest.mark.asyncio
+async def test_mcp_observe_execute_ref_in_working_frame(mcp_session: SessionState) -> None:
+    await skyvern_frame_switch(selector="#pay-frame")
+
+    observe_result = await skyvern_observe()
+
+    assert observe_result["ok"] is True
+    names = {element["name"] for element in observe_result["data"]["elements"]}
+    assert "Frame action" in names
+    assert "Parent action" not in names
+    frame = mcp_session._working_frame
+    assert frame is not None
+    assert observe_result["data"]["url"] == frame.url
+    ref = next(element["ref"] for element in observe_result["data"]["elements"] if element["name"] == "Frame action")
+
+    execute_result = await skyvern_execute(steps=[{"tool": "click", "params": {"ref": ref}}])
+
+    assert execute_result["ok"] is True
+    assert await frame.locator("#frame-status").text_content() == "clicked"
+
+
+@pytest.mark.asyncio
+async def test_mcp_frame_main_invalidates_iframe_observe_ref(mcp_session: SessionState) -> None:
+    await skyvern_frame_switch(selector="#pay-frame")
+    observe_result = await skyvern_observe()
+    ref = next(element["ref"] for element in observe_result["data"]["elements"] if element["name"] == "Frame action")
+    frame = mcp_session._working_frame
+    assert frame is not None
+
+    await skyvern_frame_main()
+    execute_result = await skyvern_execute(steps=[{"tool": "click", "params": {"ref": ref}}])
+
+    assert execute_result["ok"] is False
+    assert "Unknown ref" in execute_result["data"]["results"][0]["error"]
+    assert await frame.locator("#frame-status").text_content() == "idle"
+
+
+@pytest.mark.asyncio
+async def test_iframe_navigation_invalidates_observed_ref(mcp_session: SessionState) -> None:
+    await skyvern_frame_switch(selector="#pay-frame")
+    observe_result = await skyvern_observe()
+    ref = next(element["ref"] for element in observe_result["data"]["elements"] if element["name"] == "Frame action")
+    frame = mcp_session._working_frame
+    assert frame is not None
+
+    await frame.goto("data:text/html,<button id='replacement'>Replacement action</button>")
+    execute_result = await skyvern_execute(steps=[{"tool": "click", "params": {"ref": ref}}])
+
+    assert execute_result["ok"] is False
+    assert "Unknown ref" in execute_result["data"]["results"][0]["error"]

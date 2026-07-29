@@ -1,11 +1,13 @@
+import socket
 from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.config import settings
+from skyvern.exceptions import BlockedHost
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
@@ -199,8 +201,11 @@ async def test_custom_llm_routes_register_update_and_delete_config(
 
 @pytest.mark.asyncio
 async def test_update_custom_llm_preserves_masked_api_key(
+    monkeypatch: pytest.MonkeyPatch,
     fake_organizations: FakeOrganizationsRepository,
 ) -> None:
+    validate_api_base = AsyncMock()
+    monkeypatch.setattr(routes, "_validate_custom_llm_api_base", validate_api_base)
     org = _org()
     create_response = await routes.create_custom_llm(
         CustomLLMCreateRequest(
@@ -234,6 +239,7 @@ async def test_update_custom_llm_preserves_masked_api_key(
     registered_config = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
     assert registered_config.litellm_params
     assert registered_config.litellm_params["api_key"] == "sk-or"
+    assert validate_api_base.await_count == 2
 
     deregister_custom_llm_config(custom_llm_id)
 
@@ -396,6 +402,72 @@ def test_cloud_custom_llm_api_base_blocks_local_targets(monkeypatch: pytest.Monk
         )
 
 
+@pytest.mark.asyncio
+async def test_cloud_custom_llm_create_blocks_private_dns_answer_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    monkeypatch.setattr(SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", False, raising=False)
+    resolver = MagicMock(return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("172.16.0.42", 443))])
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
+
+    request = CustomLLMCreateRequest(
+        config=CustomLLMConfig(
+            display_name="Cloud endpoint",
+            provider="openai_compatible",
+            model_name="example-model",
+            api_base="https://llm.example.test/v1",
+            api_key="test-key",
+        )
+    )
+    resolver.assert_not_called()
+
+    with pytest.raises(BlockedHost):
+        await routes.create_custom_llm(request, _org())
+
+    assert fake_organizations.tokens == []
+
+
+def test_stored_custom_llm_validation_allows_legacy_api_base_without_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", False, raising=False)
+    resolver = MagicMock(side_effect=AssertionError("stored custom LLM reads must not resolve DNS"))
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
+
+    CustomLLMConfig.model_validate_json(
+        '{"display_name":"Stored endpoint","provider":"openrouter","model_name":"example/model",'
+        '"api_base":"https://gateway.example.test/v1","api_key":"test-key"}'
+    )
+
+    resolver.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "api_base", "error"),
+    [
+        ("openai_compatible", "http://llm.example.test/v1", "Cloud api_base must use HTTPS on port 443"),
+        ("openai_compatible", "https://llm.example.test:8443/v1", "Cloud api_base must use HTTPS on port 443"),
+        ("openrouter", "https://gateway.example.test/v1", "OpenRouter api_base must use openrouter.ai"),
+    ],
+)
+async def test_cloud_custom_llm_api_base_restrictions_apply_only_at_write_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    api_base: str,
+    error: str,
+) -> None:
+    monkeypatch.setattr(SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", False, raising=False)
+    config = CustomLLMConfig(
+        display_name="Cloud endpoint",
+        provider=provider,  # type: ignore[arg-type]
+        model_name="example/model",
+        api_base=api_base,
+        api_key="test-key",
+    )
+    with pytest.raises(routes.HTTPException, match=error):
+        await routes._validate_custom_llm_api_base(config)
+
+
 def test_custom_llm_api_base_allows_local_targets_for_self_hosted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", True, raising=False)
 
@@ -413,6 +485,10 @@ async def test_task_v2_metadata_uses_selected_custom_llm(
     monkeypatch: pytest.MonkeyPatch,
     fake_organizations: FakeOrganizationsRepository,
 ) -> None:
+    monkeypatch.setattr(
+        "skyvern.utils.url_validators.socket.getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))],
+    )
     org = _org()
     custom_llm_id = "oat_custom_metadata"
     register_custom_llm_config(

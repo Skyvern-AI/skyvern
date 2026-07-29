@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
 from pathlib import Path
+from typing import cast
 
 import structlog
 from playwright._impl._errors import TargetClosedError
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserType,
     is_final_status,
 )
+from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _release_cdp_port
@@ -408,7 +410,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             launch_proxy_location = session.proxy_location if session.proxy_location is not None else proxy_location
             extra_http_headers = app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(session.proxy_session_id)
 
-            browser_state = await RealBrowserManager._create_browser_state(
+            browser_state = await cast(RealBrowserManager, app.BROWSER_MANAGER)._create_browser_state(
                 proxy_location=launch_proxy_location,
                 url=url,
                 organization_id=organization_id,
@@ -512,8 +514,23 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """Release a specific browser session."""
         await self.database.browser_sessions.release_persistent_browser_session(session_id, organization_id)
 
-    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
-        """Close a specific browser session."""
+    async def _release_local_browser_session(
+        self, organization_id: str, browser_session_id: str, *, export_profile: bool | None = None
+    ) -> bool:
+        """Tear down and drop this process's in-memory BrowserState for a session WITHOUT completing
+        the shared DB row. Returns True iff a locally-held state was released.
+
+        Shared by close_session (which completes the DB row afterward) and reconcile_local_sessions,
+        whose row is already terminal in the DB — so this path must never close the row itself
+        (that would be a redundant write on a completed row, or a NotFoundError on a deleted one).
+
+        export_profile controls whether the profile is persisted at teardown:
+        - None (close_session): re-read the row to honor a live opt-in toggle; fail OPEN on a
+          missing/errored re-read so a transient blip never drops an opted-in / reuse profile.
+        - bool (reconcile): the caller already resolved the opt-in from its own fresh, authoritative
+          read of a terminal row, so honor it directly with no re-read — a soft-delete or error
+          between the two reads can't flip the verdict into a fail-open export. True exports; False
+          skips the snapshot/upload entirely."""
         browser_session = self._browser_sessions.get(browser_session_id)
         if browser_session and browser_session.organization_id != organization_id:
             LOG.warning(
@@ -522,27 +539,29 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 cached_organization_id=browser_session.organization_id,
                 session_id=browser_session_id,
             )
-            browser_session = None
-        if browser_session:
-            LOG.info(
-                "Closing browser session",
-                organization_id=organization_id,
-                session_id=browser_session_id,
+            return False
+        if not browser_session:
+            return False
+
+        LOG.info(
+            "Closing browser session",
+            organization_id=organization_id,
+            session_id=browser_session_id,
+        )
+        # Export session profile before closing (so it can be used to create browser profiles)
+        browser_artifacts = browser_session.browser_state.browser_artifacts
+        if export_profile is not False and browser_artifacts and browser_artifacts.browser_session_dir:
+            # Export-eligible paths snapshot session cookies before store_browser_profile copies
+            # the dir; the later close() persist runs after this export, too late to land in the
+            # archive. export_profile=False intentionally skips both the cookie snapshot and the
+            # profile upload.
+            await persist_session_cookies(
+                browser_session.browser_state.browser_context, browser_artifacts.browser_session_dir
             )
-            # Export session profile before closing (so it can be used to create browser profiles)
-            browser_artifacts = browser_session.browser_state.browser_artifacts
-            if browser_artifacts and browser_artifacts.browser_session_dir:
-                # Snapshot session cookies before store_browser_profile copies the dir; the later
-                # close() persist runs after this export, too late to land in the archive. The
-                # snapshot stays unconditional even when the export is skipped so the sidecar is
-                # ready if the session opted in.
-                await persist_session_cookies(
-                    browser_session.browser_state.browser_context, browser_artifacts.browser_session_dir
-                )
-                # Re-read the persisted row so an update-while-alive opt-in toggle is honored.
-                # Isolated and fail-open: a lookup error must neither block the close cleanup below
-                # nor drop an opted-in / profile-reuse session's profile, so skip only on a confirmed
-                # opted-out row.
+            if export_profile is None:
+                # close_session: re-read the row to honor an update-while-alive opt-in toggle. Fail
+                # open on a missing/errored re-read so a transient blip never drops an opted-in /
+                # profile-reuse session's profile.
                 should_export = True
                 try:
                     persisted_session = await self.database.browser_sessions.get_persistent_browser_session(
@@ -556,74 +575,84 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                         organization_id=organization_id,
                         exc_info=True,
                     )
-                if should_export:
-                    try:
-                        await app.STORAGE.store_browser_profile(
-                            organization_id=organization_id,
-                            profile_id=browser_session_id,
-                            directory=browser_artifacts.browser_session_dir,
-                        )
-                        LOG.info(
-                            "Exported browser session profile",
-                            browser_session_id=browser_session_id,
-                            organization_id=organization_id,
-                        )
-                    except Exception:
-                        LOG.exception(
-                            "Failed to export browser session profile",
-                            browser_session_id=browser_session_id,
-                            organization_id=organization_id,
-                        )
-                else:
+            else:
+                # reconcile already resolved the opt-in from its own fresh, authoritative read of a
+                # terminal row; honor it directly with no re-read, so a soft-delete or transient error
+                # between the two reads can never flip the verdict into a fail-open export.
+                should_export = export_profile
+            if should_export:
+                try:
+                    await app.STORAGE.store_browser_profile(
+                        organization_id=organization_id,
+                        profile_id=browser_session_id,
+                        directory=browser_artifacts.browser_session_dir,
+                    )
                     LOG.info(
-                        "Skipping browser profile export; session did not opt into profile generation",
+                        "Exported browser session profile",
                         browser_session_id=browser_session_id,
                         organization_id=organization_id,
                     )
-
-            try:
-                await browser_session.browser_state.close()
-            except TargetClosedError:
+                except Exception:
+                    LOG.exception(
+                        "Failed to export browser session profile",
+                        browser_session_id=browser_session_id,
+                        organization_id=organization_id,
+                    )
+            else:
                 LOG.info(
-                    "Browser context already closed",
+                    "Skipping browser profile export; session did not opt into profile generation",
+                    browser_session_id=browser_session_id,
                     organization_id=organization_id,
-                    session_id=browser_session_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Error while closing browser session",
-                    organization_id=organization_id,
-                    session_id=browser_session_id,
-                    exc_info=True,
                 )
 
-            if browser_artifacts and browser_artifacts.video_artifacts:
-                for video_artifact in browser_artifacts.video_artifacts:
-                    if video_artifact.video_path:
-                        try:
-                            video_path = Path(video_artifact.video_path)
-                            if video_path.exists():
-                                date = video_path.parent.name
-                                await app.STORAGE.sync_browser_session_file(
-                                    organization_id=organization_id,
-                                    browser_session_id=browser_session_id,
-                                    artifact_type="videos",
-                                    local_file_path=str(video_path),
-                                    remote_path=video_path.name,
-                                    date=date,
-                                )
-                        except Exception:
-                            LOG.exception(
-                                "Failed to sync video recording",
-                                browser_session_id=browser_session_id,
+        try:
+            await browser_session.browser_state.close()
+        except TargetClosedError:
+            LOG.info(
+                "Browser context already closed",
+                organization_id=organization_id,
+                session_id=browser_session_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Error while closing browser session",
+                organization_id=organization_id,
+                session_id=browser_session_id,
+                exc_info=True,
+            )
+
+        if browser_artifacts and browser_artifacts.video_artifacts:
+            for video_artifact in browser_artifacts.video_artifacts:
+                if video_artifact.video_path:
+                    try:
+                        video_path = Path(video_artifact.video_path)
+                        if video_path.exists():
+                            date = video_path.parent.name
+                            await app.STORAGE.sync_browser_session_file(
                                 organization_id=organization_id,
-                                video_path=video_artifact.video_path,
+                                browser_session_id=browser_session_id,
+                                artifact_type="videos",
+                                local_file_path=str(video_path),
+                                remote_path=video_path.name,
+                                date=date,
                             )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to sync video recording",
+                            browser_session_id=browser_session_id,
+                            organization_id=organization_id,
+                            video_path=video_artifact.video_path,
+                        )
 
-            self._browser_sessions.pop(browser_session_id, None)
-            if browser_session.cdp_port is not None:
-                _release_cdp_port(browser_session.cdp_port)
-        else:
+        self._browser_sessions.pop(browser_session_id, None)
+        if browser_session.cdp_port is not None:
+            _release_cdp_port(browser_session.cdp_port)
+        return True
+
+    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
+        """Close a specific browser session."""
+        released = await self._release_local_browser_session(organization_id, browser_session_id)
+        if not released:
             LOG.info(
                 "Browser session not found in memory, marking as deleted in database",
                 organization_id=organization_id,
@@ -686,6 +715,37 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 await self.reap_expired_sessions()
             except Exception:
                 LOG.exception("Browser session reaper pass failed")
+            try:
+                await self.reconcile_local_sessions()
+            except Exception:
+                LOG.exception("Browser session reconcile pass failed")
+
+    async def _owning_run_is_active(self, runnable_id: str, runnable_type: str | None, organization_id: str) -> bool:
+        """Whether the run occupying a session is still live, so the reaper must leave teardown to it.
+
+        A run that dies before release_browser_session leaves runnable_id set forever; treating a
+        terminal or missing owner as inactive lets the normal timeout+grace gate reclaim the session
+        instead of skipping it forever. Owners we can't authoritatively resolve — an unrecognized
+        runnable type or a lookup failure — are treated as active, so a reap never races a run we
+        can't prove is gone."""
+        if runnable_type != RunType.workflow_run:
+            return True
+        try:
+            workflow_run = await self.database.workflow_runs.get_workflow_run(
+                workflow_run_id=runnable_id,
+                organization_id=organization_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Could not resolve owning run for persistent browser session; leaving it protected",
+                runnable_id=runnable_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return True
+        if workflow_run is None:
+            return False
+        return not workflow_run.status.is_final()
 
     async def reap_expired_sessions(self) -> None:
         """Close the sessions this process holds whose timeout (plus grace) has elapsed via
@@ -698,8 +758,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             # Only reap browsers this process holds; completing another process's row would hide its leak.
             if db_session.persistent_browser_session_id not in self._browser_sessions:
                 continue
-            # Leave sessions occupied by a running task/workflow to that run's own teardown.
-            if db_session.runnable_id is not None:
+            # Leave sessions occupied by a still-live run to that run's own teardown. A run that died
+            # before releasing occupancy leaves runnable_id set forever, so resolve the owner and let
+            # an expired session with a terminal/missing owner fall through to the expiry gate below.
+            if db_session.runnable_id is not None and await self._owning_run_is_active(
+                db_session.runnable_id, db_session.runnable_type, db_session.organization_id
+            ):
                 continue
             # Leave sessions an active copilot turn is driving (no runnable_id and not renewed).
             if db_session.persistent_browser_session_id in copilot_session_ids:
@@ -727,6 +791,82 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                     "Failed to reap expired persistent browser session",
                     session_id=db_session.persistent_browser_session_id,
                     organization_id=db_session.organization_id,
+                )
+
+    async def reconcile_local_sessions(self) -> None:
+        """Release BrowserStates this process holds whose authoritative shared row is already
+        completed/closed (or gone).
+
+        reap_expired_sessions only scans uncompleted rows, so once another replica (or a
+        renewal-failure/close-all/shutdown close) completes the shared persistent_browser_sessions
+        row, this process's cached BrowserState + Playwright driver are never revisited and leak.
+        This pass is bounded to the sessions THIS process holds — no global scan — and fails safe:
+        a lookup error, a still-active/renewable row, a row a run still occupies, or an active
+        copilot turn all leave the local state for a later pass rather than risk closing a live
+        session. The DB row is authoritative for the closed/gone verdict, but the release is
+        local-only: the row is already terminal, so completing it again is either redundant or an
+        error."""
+        copilot_session_ids = active_copilot_session_ids()
+        for session_id, cached in list(self._browser_sessions.items()):
+            if session_id in copilot_session_ids:
+                continue
+            organization_id = cached.organization_id
+            if organization_id is None:
+                # Without a known org we can't do the authoritative org-scoped lookup; fail safe.
+                continue
+            try:
+                db_session = await self.database.browser_sessions.get_persistent_browser_session(
+                    session_id, organization_id
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to reconcile worker-local browser session against its shared row; "
+                    "leaving it for a later pass",
+                    session_id=session_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+                continue
+            # A run still occupies this row (runnable_id set): leave teardown to that run's own
+            # cleanup — never yank a browser out from under a live task/workflow. But close only sets
+            # completed_at/status without clearing runnable_id, and a completed row is invisible to
+            # reap_expired_sessions, so resolve the owner the same way the reaper does and skip only a
+            # still-live/unknown owner; a terminal/missing owner falls through to reclaim below.
+            if (
+                db_session is not None
+                and db_session.runnable_id is not None
+                and await self._owning_run_is_active(
+                    db_session.runnable_id, db_session.runnable_type, db_session.organization_id
+                )
+            ):
+                continue
+            # Reclaim only on an authoritative terminal verdict: a completed/final row, or a missing
+            # row (soft-deleted / gone — get_persistent_browser_session returns None, never on error).
+            # A present, non-final, uncompleted row is still active/renewable; leave it to ordinary
+            # expiration in reap_expired_sessions.
+            if db_session is not None and db_session.completed_at is None and not is_final_status(db_session.status):
+                continue
+            LOG.info(
+                "Reclaiming worker-local browser session whose shared row is completed or gone",
+                session_id=session_id,
+                organization_id=organization_id,
+                row_present=db_session is not None,
+            )
+            try:
+                # Resolve the profile opt-in from THIS authoritative read and pass the verdict, so the
+                # release never re-reads: a missing/deleted row (db_session is None) can't confirm the
+                # opt-in -> no export; an opted-out present row -> no export; an opted-in present row
+                # -> export. This never persists an unknown/opted-out session's data and closes the
+                # soft-delete race between reconcile's read and a second in-release read.
+                should_export_profile = db_session is not None and db_session.should_export_profile()
+                await self._release_local_browser_session(
+                    organization_id, session_id, export_profile=should_export_profile
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to reclaim worker-local browser session",
+                    session_id=session_id,
+                    organization_id=organization_id,
                 )
 
     @classmethod

@@ -308,9 +308,15 @@ class TestUpdateArtifactDataScopeFallback:
             patch(f"{_MANAGER_PATH}.STORAGE.store_artifact", AsyncMock()),
         ):
             await manager.update_artifact_data(artifact_id="a_recording", organization_id="o_1", data=b"video")
-            await asyncio.gather(*manager.upload_aiotasks_map["wrb_1"])
 
-        assert list(manager.upload_aiotasks_map.keys()) == ["wrb_1"]
+            # Observe the keying while the upload is still pending: completed tasks
+            # self-discard from the map (SKY-12524).
+            assert list(manager.upload_aiotasks_map.keys()) == ["wrb_1"]
+
+            await asyncio.gather(*list(manager.upload_aiotasks_map["wrb_1"]))
+            await asyncio.sleep(0)
+
+        assert "wrb_1" not in manager.upload_aiotasks_map
 
     @pytest.mark.asyncio
     async def test_prefers_task_id_when_present(self) -> None:
@@ -321,10 +327,14 @@ class TestUpdateArtifactDataScopeFallback:
             patch(f"{_MANAGER_PATH}.STORAGE.store_artifact", AsyncMock()),
         ):
             await manager.update_artifact_data(artifact_id="a_recording", organization_id="o_1", data=b"video")
-            await asyncio.gather(*manager.upload_aiotasks_map["tsk_1"])
 
-        assert "tsk_1" in manager.upload_aiotasks_map
-        assert "wrb_1" not in manager.upload_aiotasks_map
+            assert "tsk_1" in manager.upload_aiotasks_map
+            assert "wrb_1" not in manager.upload_aiotasks_map
+
+            await asyncio.gather(*list(manager.upload_aiotasks_map["tsk_1"]))
+            await asyncio.sleep(0)
+
+        assert "tsk_1" not in manager.upload_aiotasks_map
 
     @pytest.mark.asyncio
     async def test_raises_when_no_scope_id_available(self) -> None:

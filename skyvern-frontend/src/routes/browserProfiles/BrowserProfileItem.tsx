@@ -16,7 +16,13 @@ import {
 } from "@/components/ui/tooltip";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 
+import {
+  BROWSER_PROFILE_ROLE_BADGE,
+  BROWSER_PROFILE_ROLE_TOOLTIP,
+  getBrowserProfileRole,
+} from "./browserProfileRole";
 import { DeleteBrowserProfileButton } from "./DeleteBrowserProfileButton";
+import { RefreshBrowserProfileButton } from "./RefreshBrowserProfileButton";
 import { RenameBrowserProfileDialog } from "./RenameBrowserProfileDialog";
 
 type Props = {
@@ -36,6 +42,11 @@ function BrowserProfileItem({
 }: Props) {
   const navigate = useNavigate();
   const [renameOpen, setRenameOpen] = useState(false);
+  const role = getBrowserProfileRole(profile);
+  const badgeTooltip =
+    role === "credential" && profile.linked_credential_name
+      ? `${BROWSER_PROFILE_ROLE_TOOLTIP.credential} Linked to ${profile.linked_credential_name}.`
+      : BROWSER_PROFILE_ROLE_TOOLTIP[role];
 
   const handleRowClick = (event: React.MouseEvent<HTMLTableRowElement>) => {
     if (event.ctrlKey || event.metaKey) {
@@ -74,15 +85,21 @@ function BrowserProfileItem({
             <span className="truncate" title={profile.name}>
               {profile.name}
             </span>
-            {profile.is_managed ? (
-              <Badge
-                variant="secondary"
-                className="shrink-0"
-                title="Auto-saved from a Save & Reuse Session workflow. Recreated automatically on the next run."
-              >
-                Auto-managed
-              </Badge>
-            ) : null}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    tabIndex={0}
+                    className="shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <Badge variant="secondary">
+                      {BROWSER_PROFILE_ROLE_BADGE[role]}
+                    </Badge>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{badgeTooltip}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
           <div
             className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground"
@@ -119,6 +136,7 @@ function BrowserProfileItem({
       </TableCell>
       <TableCell onClick={stopRowClick}>
         <div className="flex justify-end gap-2">
+          <RefreshBrowserProfileButton profile={profile} />
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>

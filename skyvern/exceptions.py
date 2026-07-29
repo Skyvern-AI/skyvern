@@ -1,4 +1,5 @@
 import re
+from collections.abc import Sequence
 from http import HTTPStatus
 from importlib.util import find_spec
 from typing import NoReturn
@@ -54,6 +55,10 @@ class SkyvernException(Exception):
         # name carries sensitive info (e.g. a remote-browser vendor identity) override this
         # so the concrete name stays in logs/monitoring but never reaches end users.
         return type(self).__name__
+
+
+class SkyvernPageAnalysisTimeout(SkyvernException):
+    pass
 
 
 class SkyvernExtraNotInstalled(ImportError):
@@ -136,13 +141,22 @@ def _is_browser_connection_error(message: str) -> bool:
 
 
 # A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
-# ws/wss endpoint URL, which can carry the remote-browser vendor host, a session-bearing
-# path/query, or credentials embedded as user:pass@host. Redact it before it reaches a user.
-_CDP_WS_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+# endpoint URL, which can carry the remote-browser vendor host, a session-bearing path/query,
+# or credentials embedded as user:pass@host. The devtools socket is always ws/wss, so a ws/wss
+# URL in a browser error is unambiguously a CDP endpoint and safe to redact anywhere. The
+# /json/version discovery endpoint is http/https and carries the same host/token, but so does an
+# ordinary navigation/target/proxy URL — an http(s) URL is only known to be a CDP endpoint in a
+# CDP-connection context, so http(s) redaction is scoped to that context (see redact_cdp_endpoint_urls).
+_WS_ENDPOINT_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+_CDP_ENDPOINT_URL_RE = re.compile(r"(?:wss?|https?)://\S+", re.IGNORECASE)
 
 
-def _redact_cdp_endpoint_urls(message: str) -> str:
-    return _CDP_WS_URL_RE.sub("[remote browser endpoint]", message)
+def redact_ws_endpoint_urls(message: str) -> str:
+    return _WS_ENDPOINT_URL_RE.sub("[remote browser endpoint]", message)
+
+
+def redact_cdp_endpoint_urls(message: str) -> str:
+    return _CDP_ENDPOINT_URL_RE.sub("[remote browser endpoint]", message)
 
 
 def get_user_facing_exception_message(exception: Exception) -> str:
@@ -162,6 +176,21 @@ def get_user_facing_exception_message(exception: Exception) -> str:
 class DisabledBlockExecutionError(SkyvernHTTPException):
     def __init__(self, message: str | None = None):
         super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
+
+
+class BrowserActionPolicyNotEnforceable(SkyvernHTTPException):
+    """A workflow version was enrolled in a browser action policy the runtime cannot uphold.
+
+    `reasons` are stable codes describing the configuration only — never workflow content, origins
+    or identifiers — because they are rendered to callers and stamped on failed runs.
+    """
+
+    def __init__(self, reasons: Sequence[str]):
+        self.reasons = tuple(reasons)
+        super().__init__(
+            f"Workflow cannot run under a browser action policy: {', '.join(self.reasons)}",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 class RateLimitExceeded(SkyvernHTTPException):
@@ -196,6 +225,12 @@ class CardNumberInputMismatch(SkyvernException):
             "Card number input read-back mismatch: "
             f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
         )
+
+
+class SecretInputMismatch(SkyvernException):
+    def __init__(self) -> None:
+        # No secret material in the message: not the value, its length, or its character classes.
+        super().__init__("Secret input read-back mismatch after atomic re-entry.")
 
 
 class ConditionalBranchEvaluationError(SkyvernException):
@@ -506,7 +541,14 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
-        raw_message = _redact_cdp_endpoint_urls(str(exception).strip())
+        # BrowserFactory.create_browser_context wraps every creator/setup failure, so an http(s) URL
+        # here is only known to be a CDP discovery endpoint (rather than an ordinary proxy/public-IP
+        # probe URL the user needs) when the error carries a CDP-connection signal. Default to ws/wss
+        # redaction and escalate to http(s)+ws(s) redaction only for connect_over_cdp/WebSocket errors.
+        raw = str(exception).strip()
+        raw_message = (
+            redact_cdp_endpoint_urls(raw) if _is_browser_connection_error(raw) else redact_ws_endpoint_urls(raw)
+        )
         raw_lower = raw_message.lower()
 
         # Browser launch environment errors: worker cannot initialize the
@@ -588,6 +630,10 @@ class StepNotFound(SkyvernHTTPException):
 class FailedToTakeScreenshot(SkyvernException):
     def __init__(self, error_message: str) -> None:
         super().__init__(f"Failed to take screenshot. Error message: {error_message}")
+
+
+class ScreenshotTargetClosed(FailedToTakeScreenshot):
+    pass
 
 
 class EmptyScrapePage(SkyvernException):
@@ -1003,6 +1049,9 @@ class NoAvailableOptionFoundForCustomSelection(SkyvernException):
         self.observed_options_count = observed_count
         self.observed_options_excerpt = observed_excerpt
         self.reason = reason
+        # Set True when an earlier level of a cascading select already committed a click before this
+        # miss, so the widget is partially mutated and the miss must not be reported as a clean skip.
+        self.widget_mutated = False
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
@@ -1084,6 +1133,15 @@ class InvalidWorkflowParameter(SkyvernHTTPException):
         super().__init__(
             message,
             status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+class ActionExecutionTimeout(SkyvernException):
+    def __init__(self, action_type: str, timeout_seconds: float):
+        super().__init__(
+            f"Action execution timed out after {timeout_seconds:.0f} seconds and was aborted"
+            f" (action_type={action_type}). The browser action did not complete in time —"
+            " the page or browser may have become unresponsive."
         )
 
 
@@ -1232,6 +1290,27 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         super().__init__(
             f"Browser session {browser_session_id} does not exist or is not live.",
             status_code=HTTPStatus.NOT_FOUND,
+        )
+
+
+class MissingOrganizationForBrowserSession(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Cannot acquire browser session {browser_session_id} without an organization identity.")
+
+
+class MissingBrowserStateForBrowserSession(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} has no reusable browser state (cold or evicted); "
+            "cannot acquire it for the script."
+        )
+
+
+class BrowserSessionSwitchNotAllowed(SkyvernException):
+    def __init__(self, script_id: str | None, bound_session_id: str | None, requested_session_id: str) -> None:
+        super().__init__(
+            f"Script {script_id} already bound a browser (session {bound_session_id}); cannot switch to "
+            f"browser session {requested_session_id} mid-run."
         )
 
 

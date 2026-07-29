@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     ProposalDisposition,
     TurnNarrativePayload,
+    adopt_model_authored_context,
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
@@ -57,6 +58,12 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import is_defer_authoring_durable_fill_criterion
+from skyvern.forge.sdk.copilot.terminal_envelope import (
+    TerminalOutcomeEnvelope,
+    finalize_applied_state,
+    reason_in_reply_shadow,
+    render_terminal_message,
+)
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CopilotComposerMode,
     build_minimal_turn_outcome,
@@ -71,6 +78,7 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    NonAdoptableCriteriaSet,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
     WorkflowCopilotCancelRequest,
@@ -99,11 +107,13 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
+WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS = 3_000_000
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
     "audio/mpeg",
@@ -193,7 +203,6 @@ def _reason_category_for_copilot_code_mode_opt_out(
 ) -> str:
     if (
         prior_turn_outcome.copilot_last_code_build_failed
-        or prior_turn_outcome.copilot_repair_ceiling_hit
         or prior_turn_outcome.terminal_reason == COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
     ):
         return "failure"
@@ -226,7 +235,6 @@ def _capture_copilot_code_mode_opt_out(
                 "to_mode": to_mode,
                 "reason_category": _reason_category_for_copilot_code_mode_opt_out(prior_turn_outcome),
                 "last_code_build_failed": prior_turn_outcome.copilot_last_code_build_failed,
-                "repair_ceiling_hit": prior_turn_outcome.copilot_repair_ceiling_hit,
                 "pending_capability": prior_turn_outcome.copilot_pending_capability,
                 "org_id": organization_id,
                 "workflow_permanent_id": workflow_permanent_id,
@@ -393,10 +401,15 @@ def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
 
 
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """Only auto-applicable proposals may honor ``auto_accept=True``."""
+    """Only auto-applicable proposals may honor ``auto_accept=True``.
+
+    Auto-apply requires the chat's explicit ``auto_accept`` opt-in — a verified
+    build never commits on the user's behalf; it lands as a pending proposal for
+    the review gate.
+    """
     if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
         return False
-    return auto_accept is True or getattr(agent_result, "apply_without_review", False) is True
+    return auto_accept is True
 
 
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
@@ -458,14 +471,87 @@ def _with_terminal_narrative_metadata(
     *,
     cancelled: bool,
     proposal_disposition: ProposalDisposition,
+    terminal_envelope: dict[str, Any] | None = None,
 ) -> TurnNarrativePayload | None:
     if narrative_payload is None:
         return None
-    return {
+    payload: TurnNarrativePayload = {
         **narrative_payload,
         "cancelled": cancelled,
         "proposalDisposition": proposal_disposition,
     }
+    if terminal_envelope is not None:
+        payload["terminalEnvelope"] = terminal_envelope
+    return payload
+
+
+def _agent_terminal_envelope(agent_result: AgentResult | None) -> dict[str, Any] | None:
+    if agent_result is None:
+        return None
+    try:
+        payload = agent_result.terminal_envelope
+    except AttributeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _finalized_terminal_envelope(
+    agent_result: AgentResult | None,
+    *,
+    workflow_applied: bool,
+    final_message: str,
+    response_type: str,
+) -> tuple[TerminalOutcomeEnvelope, dict[str, Any]] | None:
+    payload = _agent_terminal_envelope(agent_result)
+    if payload is None:
+        return None
+    # workflow_applied mirrors the legacy auto-accept SSE field, which reads
+    # true on no-proposal turns because AgentResult defaults its disposition
+    # to auto_applicable. The envelope must only claim applied when a
+    # proposal actually existed to commit.
+    proposal_present = getattr(agent_result, "updated_workflow", None) is not None or bool(
+        getattr(agent_result, "has_staged_proposal", False)
+    )
+    try:
+        finalized = finalize_applied_state(
+            TerminalOutcomeEnvelope.model_validate(payload),
+            applied=workflow_applied and proposal_present,
+            proposal_present=proposal_present,
+        )
+        payload = finalized.model_dump(mode="json")
+    except Exception:
+        LOG.warning("copilot terminal envelope finalization failed", exc_info=True)
+        return None
+    reason_in_reply = reason_in_reply_shadow(
+        payload.get("run_display_reason") if isinstance(payload.get("run_display_reason"), str) else None,
+        final_message,
+    )
+    LOG.info(
+        "copilot_terminal_envelope",
+        **payload,
+        response_type=response_type,
+        envelope_response_kind=payload.get("response_kind"),
+        reason_in_reply=reason_in_reply,
+        finalized=True,
+    )
+    return finalized, payload
+
+
+def _with_rendered_terminal_text(
+    narrative_payload: TurnNarrativePayload | None,
+    *,
+    rendered_message: str,
+) -> TurnNarrativePayload | None:
+    if narrative_payload is None:
+        return None
+    payload: TurnNarrativePayload = narrative_payload.copy()
+    if isinstance(payload.get("terminalMessage"), str):
+        payload["terminalMessage"] = rendered_message
+    # The FE renders narrativeSummary ahead of terminalMessage, so a distinct
+    # concise summary must not survive a replaced reply with stale prose.
+    if payload.get("narrativeSummary") is not None:
+        payload["narrativeSummary"] = rendered_message
+    return payload
 
 
 def _build_recoverable_route_agent_result(
@@ -523,16 +609,33 @@ async def _load_completion_criteria_snapshot(chat: Any) -> StoredCriteriaSnapsho
         return None
     if latest is None:
         return StoredCriteriaSnapshot()
+    if isinstance(latest, NonAdoptableCriteriaSet):
+        LOG.warning(
+            "copilot completion criteria set not adoptable; disabling active set for this turn",
+            reason=latest.reason,
+            completion_criteria_set_id=latest.completion_criteria_set_id,
+            goal_epoch=latest.goal_epoch,
+        )
+        return StoredCriteriaSnapshot(active=None, next_epoch=latest.goal_epoch + 1)
     active = None
     if latest.status == CRITERIA_SET_STATUS_ACTIVE:
-        active = StoredCriteriaSet(
-            set_id=latest.completion_criteria_set_id,
-            goal_epoch=latest.goal_epoch,
-            criteria=criteria_from_json(latest.criteria),
-            consecutive_all_no_evidence=latest.consecutive_all_no_evidence,
-            tripwire_fired=latest.tripwire_fired,
-            last_fully_satisfied_workflow_yaml=latest.last_fully_satisfied_workflow_yaml,
-        )
+        try:
+            active = StoredCriteriaSet(
+                set_id=latest.completion_criteria_set_id,
+                goal_epoch=latest.goal_epoch,
+                criteria=criteria_from_json(latest.criteria),
+                consecutive_all_no_evidence=latest.consecutive_all_no_evidence,
+                tripwire_fired=latest.tripwire_fired,
+                last_fully_satisfied_workflow_yaml=latest.last_fully_satisfied_workflow_yaml,
+            )
+        except Exception:
+            LOG.warning(
+                "copilot completion criteria decode failed; disabling active set for this turn",
+                completion_criteria_set_id=latest.completion_criteria_set_id,
+                goal_epoch=latest.goal_epoch,
+                exc_info=True,
+            )
+            return StoredCriteriaSnapshot(active=None, next_epoch=latest.goal_epoch + 1)
     return StoredCriteriaSnapshot(active=active, next_epoch=latest.goal_epoch + 1)
 
 
@@ -626,18 +729,13 @@ async def _persist_proposed_workflow_state(
         (restored and not keep_pending_proposal)
         or agent_result.clear_proposed_workflow
         or _should_commit_staged_workflow(chat.auto_accept, agent_result)
-        or (
-            getattr(agent_result, "apply_without_review", False) is True
-            and auto_accept_effective
-            and not _output_policy_blocked_final_response(agent_result)
-        )
     ):
         # Null any persisted proposed_workflow the assistant just invalidated
         # so a reload does not resurrect a stale Accept/Reject card. Runs
         # under both auto_accept values — a stale proposal can survive an
         # auto-accept toggle. The staged-commit clause always wins over
-        # keep_pending_proposal: this turn's own auto-commit already
-        # overwrote canonical, so an earlier bypassed proposal is now stale
+        # keep_pending_proposal: this turn's own auto-accept commit already
+        # overwrote canonical, so an earlier pending proposal is now stale
         # regardless of the client's preservation request.
         await _clear_proposed_workflow(chat)
     elif (
@@ -669,18 +767,21 @@ async def _persist_cancel_turn(
     audio_artifact_id: str | None = None,
     turn_id: str | None = None,
     keep_pending_proposal: bool = False,
+    prior_global_llm_context: str | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
     Pass the agent's ``AgentResult`` for cancels during the agent run so
     rollback uses the same ``workflow_was_persisted`` source of truth as
-    the success path; pass ``None`` for pre-agent cancels.
+    the success path; pass ``None`` for pre-agent cancels. A pre-agent cancel
+    carries ``prior_global_llm_context`` forward so durable state survives.
     """
     turn_outcome: TurnOutcome | None
+    workflow_applied = False
     if agent_result is None:
         user_response = "Cancelled by user."
         updated_workflow = None
-        updated_global_llm_context = None
+        updated_global_llm_context = prior_global_llm_context
         total_tokens = None
         response_type = "REPLY"
         output_policy_diagnostics = None
@@ -688,6 +789,7 @@ async def _persist_cancel_turn(
         response_turn_id = turn_id
         narrative_summary = None
         narrative_payload = None
+        terminal_envelope = None
         if chat.proposed_workflow is not None and not keep_pending_proposal:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
@@ -730,12 +832,32 @@ async def _persist_cancel_turn(
         response_turn_id = turn_id or agent_result.turn_id
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
+        workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
+        terminal_envelope_result = _finalized_terminal_envelope(
+            agent_result,
+            workflow_applied=workflow_applied,
+            final_message=user_response,
+            response_type=response_type,
+        )
+        if terminal_envelope_result is None:
+            terminal_envelope = None
+        else:
+            terminal_envelope_model, terminal_envelope = terminal_envelope_result
+            # Cancelled turns keep the agent text (render_terminal_message
+            # passes them through), so only the flag marker is stamped here.
+            # Shielded like the persistence writes above: a cancel landing on
+            # this await must not skip the chat-row persistence that follows.
+            if await asyncio.shield(app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)):
+                terminal_envelope = terminal_envelope_model.model_copy(
+                    update={"rendered_from_envelope": True}
+                ).model_dump(mode="json")
 
     proposal_disposition = _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
         cancelled=True,
         proposal_disposition=proposal_disposition,
+        terminal_envelope=terminal_envelope,
     )
 
     await asyncio.shield(
@@ -770,11 +892,13 @@ async def _persist_cancel_turn(
                     total_tokens=total_tokens,
                     response_type=response_type,
                     proposal_disposition=proposal_disposition,
+                    workflow_applied=workflow_applied,
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
                     turn_id=response_turn_id,
                     narrative_summary=narrative_summary,
                     narrative_payload=narrative_payload,
+                    terminal_envelope=terminal_envelope,
                 )
             )
         )
@@ -851,10 +975,56 @@ async def _finalise_normal_turn(
     await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
+    terminal_envelope_result = _finalized_terminal_envelope(
+        agent_result,
+        workflow_applied=workflow_applied,
+        final_message=user_response,
+        response_type=agent_result.response_type,
+    )
+    narrative_payload = agent_result.narrative_payload
+    narrative_summary = agent_result.narrative_summary
+    if terminal_envelope_result is None:
+        terminal_envelope = None
+    else:
+        terminal_envelope_model, terminal_envelope = terminal_envelope_result
+        should_render_terminal_from_envelope = await app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(
+            organization_id
+        )
+        replaced = False
+        if should_render_terminal_from_envelope:
+            # rendered_from_envelope means "flag on, envelope is display
+            # authority" for the FE — not that this turn's text was replaced.
+            terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
+            user_response, replaced = render_terminal_message(
+                terminal_envelope_model,
+                user_response,
+                cancelled=False,
+            )
+            terminal_envelope = terminal_envelope_model.model_dump(mode="json")
+            if replaced:
+                narrative_payload = _with_rendered_terminal_text(
+                    agent_result.narrative_payload,
+                    rendered_message=user_response,
+                )
+                # The frame-level summary is preferred by the FE over the
+                # message on hydration, so it must carry the rendered text too.
+                narrative_summary = user_response
+        # The envelope's own log fields are stamped pre-render, so this is the
+        # only signal that witnesses the render decision in prod.
+        LOG.info(
+            "copilot_terminal_render_decision",
+            flag_enabled=should_render_terminal_from_envelope,
+            replaced=replaced,
+            run_verdict=terminal_envelope_model.run_verdict,
+            next_state=terminal_envelope_model.next_state,
+            response_kind=terminal_envelope_model.response_kind,
+            reason_present=bool(terminal_envelope_model.run_display_reason),
+        )
     narrative_payload = _with_terminal_narrative_metadata(
-        agent_result.narrative_payload,
+        narrative_payload,
         cancelled=False,
         proposal_disposition=proposal_disposition,
+        terminal_envelope=terminal_envelope,
     )
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -888,8 +1058,9 @@ async def _finalise_normal_turn(
             workflow_applied=workflow_applied,
             output_policy_diagnostics=agent_result.output_policy_diagnostics,
             turn_id=agent_result.turn_id,
-            narrative_summary=agent_result.narrative_summary,
+            narrative_summary=narrative_summary,
             narrative_payload=narrative_payload,
+            terminal_envelope=terminal_envelope,
         )
     )
 
@@ -985,6 +1156,21 @@ async def _get_debug_artifact(organization_id: str, workflow_run_id: str) -> Art
     return artifacts[0] if isinstance(artifacts, list) and artifacts else None
 
 
+async def _get_debug_html(organization_id: str, workflow_run_id: str) -> str | None:
+    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
+    if not artifact:
+        return None
+    artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+    if not artifact_bytes:
+        return None
+    # The extreme-size cap can drop middle-tree evidence; move to structure-aware
+    # selection if that trade-off causes copilot regressions.
+    return truncate_page_html_for_summary(
+        artifact_bytes.decode("utf-8"),
+        max_chars=WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS,
+    )
+
+
 async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None) -> RunInfo | None:
     if not workflow_run_id:
         return None
@@ -997,12 +1183,7 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
 
     block = blocks[0]
 
-    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
-    if artifact:
-        artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-        html = artifact_bytes.decode("utf-8") if artifact_bytes else None
-    else:
-        html = None
+    html = await _get_debug_html(organization_id, workflow_run_id)
 
     return RunInfo(
         block_label=block.label,
@@ -1044,11 +1225,7 @@ async def _get_new_copilot_block_infos(
             )
         )
 
-    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
-    html: str | None = None
-    if artifact:
-        artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-        html = artifact_bytes.decode("utf-8") if artifact_bytes else None
+    html = await _get_debug_html(organization_id, workflow_run_id)
 
     return block_infos, html
 
@@ -1176,9 +1353,11 @@ async def copilot_call_llm(
         action_type=action_type,
     )
 
-    global_llm_context = action_data.get("global_llm_context")
-    if global_llm_context is not None:
-        global_llm_context = sanitize_global_llm_context_for_prompt(str(global_llm_context))
+    model_authored_context = action_data.get("global_llm_context")
+    if model_authored_context is not None:
+        global_llm_context = sanitize_global_llm_context_for_prompt(
+            adopt_model_authored_context(global_llm_context, model_authored_context).to_json_str()
+        )
 
     if action_type == "REPLACE_WORKFLOW":
         llm_workflow_yaml = default_data_write_continue_on_failure(
@@ -1895,6 +2074,7 @@ async def _new_copilot_chat_post(
                         audio_artifact_id=chat_request.audio_artifact_id,
                         turn_id=turn_id,
                         keep_pending_proposal=chat_request.keep_pending_proposal,
+                        prior_global_llm_context=global_llm_context,
                     )
                 )
                 terminal_frame_emitted = True

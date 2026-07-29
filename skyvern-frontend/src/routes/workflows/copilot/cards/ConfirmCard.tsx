@@ -37,7 +37,7 @@ export function ConfirmCard({ onConfirm, onChangeInstead }: ConfirmCardProps) {
       <button
         type="button"
         onClick={onChangeInstead}
-        className="rounded-md px-3 py-1.5 text-xs text-slate-400 hover:bg-slate-elevation4 hover:text-slate-200"
+        className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
       >
         Tell it what to change instead
       </button>

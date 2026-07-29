@@ -7,7 +7,7 @@ import copy
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -19,22 +19,21 @@ from agents.run import Runner
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    RAW_SECRET_LEAK_REASON_CODE,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-    UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
     compose_loop_blocker_user_facing_reason,
     loop_blocker_evidence_from_ctx,
     stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD, DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    PostRunPagePathFailure,
     RecordedBuildTestOutcome,
-    author_time_reject_missing_output_paths,
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_authoring_repair_context,
-    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -89,10 +88,14 @@ from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
     normalize_block_authoring_policy,
 )
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.context import (
+    AskSubject,
+    CodeAuthoringRepairContext,
+    coerce_ask_subject,
+    parsed_ask_refs,
+)
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
-    DiagnosisRepairContract,
     RepairLoopState,
     RepairNextAction,
 )
@@ -117,6 +120,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     CompletionCriterion,
     RequestPolicy,
+    floor_rekeyed_requested_output_paths,
     request_policy_has_present_completion_contract,
     requested_output_path_for_field,
     schema_output_path_aliases_from_criteria,
@@ -137,8 +141,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    AuthorTimeGateAblationPayload,
-    record_author_time_gate_ablation_event,
+    PostRunPagePathInteractionWindow,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
@@ -150,7 +153,6 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
-    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
@@ -159,6 +161,9 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_and_stash_blocker_signal,
     claim_turn,
+    claim_would_succeed,
+    claimant_outranks,
+    current_turn_owner,
     emit_blocker_signal_payload,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
@@ -249,8 +254,20 @@ _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
 # for either or an update_workflow re-author silently spends the one-shot rescout.
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
+_POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
+_LOGIN_SUBMIT_NAME_PATTERN = re.compile(
+    r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
+    re.I,
+)
+_LOGIN_SUBMIT_SELECTOR_PATTERN = re.compile(
+    r"^(?:(?:log in|login|sign in|authenticate)(?: submit| button| btn)?|"
+    r"(?:submit|button|btn) (?:log in|login|sign in|authenticate))$",
+    re.I,
+)
 # Evidence sources confirmable only after a run — excluded from the pre-run scout-coverage gate.
-_PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset({"registered_output_parameter", "registered_artifact_content"})
+_PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
+    {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
+)
 # OpenAI detail=high cost per resized image. If we support other providers,
 # pull from model config — this value will silently over/undercount otherwise.
 # See screenshot_utils.resize_screenshot_b64 for the dimension contract this
@@ -395,39 +412,6 @@ def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
     return state if isinstance(state, RepairLoopState) else None
 
 
-def _needs_repair_ceiling_halt(ctx: Any) -> bool:
-    state = _repair_loop_state(ctx)
-    return state is not None and state.ceiling_reached is True and run_backed_repair_evidence_exists(ctx)
-
-
-def repair_ceiling_stop_signal(
-    ctx: Any,
-    contract: DiagnosisRepairContract | None,
-    config: CopilotConfig | None = None,
-) -> CopilotToolBlockerSignal:
-    state = contract.repair_loop_state if isinstance(contract, DiagnosisRepairContract) else None
-    count = state.consecutive_identical_repair_count if state is not None else 0
-    evidence = loop_blocker_evidence_from_ctx(ctx)
-    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
-        "repair_ceiling_reached", evidence, blocked_tool="update_and_run_blocks"
-    )
-    agent_steering = (
-        f"This repair has made no verified progress across {count} attempts; "
-        "stop retrying and report the recorded blocker from the preserved draft."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=evidence.has_draft,
-        renders_final_reply=True,
-        internal_reason_code="repair_ceiling_reached",
-        blocked_tool="update_and_run_blocks",
-    )
-
-
 def code_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
     count = _get_int(ctx, "code_authoring_guardrail_reject_count")
     evidence = loop_blocker_evidence_from_ctx(ctx)
@@ -457,10 +441,18 @@ def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBloc
     user_facing, _tiers = compose_loop_blocker_user_facing_reason(
         "credential_priority_authoring_churn", evidence, blocked_tool="update_workflow"
     )
-    agent_steering = (
-        f"The credential-scout gate has rejected the generated code {count} times without an accepted save; "
-        "stop rewriting it and report the recorded blocker from the preserved draft."
-    )
+    # Older context snapshots may not carry fields added after the snapshot was created.
+    reject_reason_codes = getattr(ctx, "last_output_policy_reject_reason_codes", None)
+    if reject_reason_codes == frozenset({RAW_SECRET_LEAK_REASON_CODE}):
+        agent_steering = (
+            "The generated login code embedded the credential's secret value and was refused; "
+            "stop rewriting it and report the recorded blocker from the preserved draft."
+        )
+    else:
+        agent_steering = (
+            f"The credential-scout gate has rejected the generated code {count} times without an accepted save; "
+            "stop rewriting it and report the recorded blocker from the preserved draft."
+        )
     return CopilotToolBlockerSignal(
         blocker_kind="loop_detected",
         agent_steering_text=agent_steering,
@@ -525,6 +517,19 @@ SCOUTED_SPINE_TURN_HALT_USER_REASON = (
 )
 
 
+def _get_scouted_spine_missing_steps_for_halt(ctx: AgentContext) -> str | None:
+    """Missing-steps text for any give-up offer, covering every open obligation family
+    (uncovered rungs, unforgiven drops, unrecorded indices, truncation), not uncovered rungs alone."""
+    try:
+        findings = _scouted_spine_open_obligation(ctx)
+    except Exception:
+        LOG.warning("copilot_scouted_spine_halt_missing_steps_failed", exc_info=True)
+        return None
+    if not findings:
+        return None
+    return _scouted_spine_missing_text(findings)
+
+
 def log_scouted_spine_unresolved_at_turn_halt(ctx: AgentContext) -> bool:
     """Log-only and never raises: a failed obligation read must not block rendering the halt reply."""
     try:
@@ -581,17 +586,45 @@ def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
     return nudge
 
 
+def _code_authoring_reject_count_resets(repeated_outcome: bool | None, frontier_unchanged: bool) -> bool:
+    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
+    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
+    return repeated_outcome is False and not frontier_unchanged
+
+
+def code_authoring_churn_stop_would_claim(ctx: AgentContext, *, frontier_unchanged: bool = False) -> bool:
+    """Read-only predicate: would recording one more plain (non-credential) guardrail reject reach
+    the churn ceiling AND win the turn? Mirrors _record_code_authoring_guardrail_reject's threshold,
+    terminal-defer, and claim precedence without mutating ctx."""
+    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
+    base = (
+        0
+        if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged)
+        else ctx.code_authoring_guardrail_reject_count
+    )
+    if base + 1 < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
+        return False
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return False
+    return claim_would_succeed(ctx, TurnClaimant.CODE_AUTHORING_CHURN)
+
+
 def _record_code_authoring_guardrail_reject(
-    ctx: AgentContext, *, defer_churn_stop: bool = False, frontier_unchanged: bool = False
+    ctx: AgentContext,
+    *,
+    defer_churn_stop: bool = False,
+    frontier_unchanged: bool = False,
+    output_policy_reason_codes: frozenset[str] | None = None,
 ) -> None:
     # Callers record the current build-test outcome first so repeat detection compares that key to history.
     repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
-    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
-    if repeated_outcome is False and not frontier_unchanged:
+    if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged):
         ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
+    # Any non-output-policy reject clears the cause, so the credential-priority terminal never
+    # attributes a scout-gate stop to a stale raw-secret-leak streak.
+    ctx.last_output_policy_reject_reason_codes = output_policy_reason_codes
     LOG.info(
         "copilot code-authoring guardrail reject recorded",
         reject_count=ctx.code_authoring_guardrail_reject_count,
@@ -894,12 +927,13 @@ def _completion_verification_only_structural_abstentions(ctx: CopilotContext) ->
 
 
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
-    if outcome_fully_verified(ctx):
-        return True
-    # The judge verdict is authoritative: once it has evaluated, an unconfirmed
-    # criterion means the outcome is unmet regardless of run status. The block-count
-    # heuristic (which counts method verbs in the request) governs only when there
-    # is no evaluated verdict.
+    return outcome_fully_verified(ctx)
+
+
+def built_complete_without_evaluated_outcome(ctx: CopilotContext) -> bool:
+    """A run that looks built and repair-inert but carries no evaluated verdict.
+    It ends the turn like ``built_unverified_repair_inert_context`` does, but must
+    never authorize a verified-satisfaction claim."""
     if _outcome_criteria_evaluated(ctx):
         return False
     if not (
@@ -941,6 +975,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
         "gate_built_unverified_repair_inert": built_unverified_repair_inert_context(ctx),
+        "gate_built_complete_without_evaluated_outcome": built_complete_without_evaluated_outcome(ctx),
         "gate_claim_authorized": verified_goal_claim_authorized(ctx),
         "gate_last_test_ok": ctx.last_test_ok is True,
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
@@ -1102,7 +1137,7 @@ def _turn_intent_can_update_and_run_without_user_input(turn_intent: Any) -> bool
     return bool(turn_intent.authority.may_run_blocks)
 
 
-def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
+def _present_completion_contract_ask_admission_base(ctx: CopilotContext) -> bool:
     request_policy = ctx.request_policy
     if not isinstance(request_policy, RequestPolicy):
         return False
@@ -1112,17 +1147,35 @@ def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
         return False
     if request_policy.clarification_reason not in (None, "none"):
         return False
-    if not _turn_intent_can_author_without_user_input(ctx.turn_intent):
+    return _turn_intent_can_author_without_user_input(ctx.turn_intent)
+
+
+def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
+    if not _present_completion_contract_ask_admission_base(ctx):
         return False
-    if ctx.has_genuine_workflow_attempt():
-        return False
-    return True
+    return not ctx.has_genuine_workflow_attempt()
 
 
 def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str, Any]) -> str | None:
     if parsed.get("type") != "ASK_QUESTION":
         return None
-    if not recycle_admits_present_completion_contract_ask(ctx):
+    ask_subject = coerce_ask_subject(parsed.get("ask_subject"))
+    if ask_subject is not None:
+        # A schema ask the contract already answers is redundant whether or not the turn has
+        # built anything yet, so it resolves on the base admission without the attempt check.
+        if _present_completion_contract_ask_admission_base(ctx):
+            auto_answer = _typed_ask_subject_auto_answer(ctx, ask_subject, parsed)
+            if auto_answer is not None:
+                return auto_answer
+    retry_admitted = recycle_admits_present_completion_contract_ask(ctx)
+    if ask_subject is not None:
+        LOG.info(
+            "copilot_ask_subject_passed_through",
+            subject=ask_subject,
+            outcome="build_first_retry" if retry_admitted else "reached_user",
+            **ctx.genuine_attempt_parity_fields(),
+        )
+    if not retry_admitted:
         return None
     LOG.info(
         "copilot.present_completion_contract_ask_retry",
@@ -1131,6 +1184,35 @@ def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str
         **ctx.genuine_attempt_parity_fields(),
     )
     return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+
+
+def _typed_ask_subject_auto_answer(ctx: CopilotContext, ask_subject: AskSubject, parsed: dict[str, Any]) -> str | None:
+    if ask_subject != "output_schema":
+        return None
+    refs = parsed_ask_refs(parsed.get("refs"))
+    if not refs:
+        return None
+    # Reads the raw policy criteria rather than the turn-active set the other requested-output
+    # consumers use: floor-rekey annotations are baked in at request-policy build time, and what
+    # the model may cite as refs is rendered from this same set in `prompt_summary`.
+    policy = ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return None
+    criteria = policy.graded_completion_criteria()
+    requested = requested_output_paths(criteria) | floor_rekeyed_requested_output_paths(criteria)
+    if not requested or not set(refs) <= requested:
+        return None
+    resolved = sorted(set(refs))
+    LOG.info(
+        "copilot_ask_subject_auto_answered",
+        subject=ask_subject,
+        resolved_refs=resolved,
+    )
+    return (
+        "The outputs you asked to confirm are already pinned by this request's completion contract. "
+        f"Requested output paths: {', '.join(resolved)}. Author and test the workflow to produce them, "
+        "choosing a reasonable representation for each, instead of asking the user to re-confirm."
+    )
 
 
 def _nudge(config: CopilotConfig | None, key: str) -> str:
@@ -1212,6 +1294,11 @@ def _pre_discovery_url_question_nudge(
     if getattr(ctx, "build_phase", None) not in DISCOVERY_PERMITTED_PHASES:
         return None
     if _get_int(ctx, "discovery_calls_this_turn") != 0:
+        return None
+    if (
+        getattr(ctx, "turn_halt", None) is not None
+        or _get_int(ctx, "discovery_failure_streak_this_turn") >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD
+    ):
         return None
     request_policy = getattr(ctx, "request_policy", None)
     clarification_reason = getattr(request_policy, "clarification_reason", "none")
@@ -1535,21 +1622,8 @@ def _check_enforcement(
 
     if verified_goal_satisfied_context(ctx):
         raise CopilotGoalSatisfied()
-    if built_unverified_repair_inert_context(ctx):
+    if built_unverified_repair_inert_context(ctx) or built_complete_without_evaluated_outcome(ctx):
         raise CopilotBuiltUnverified()
-
-    if _needs_repair_ceiling_halt(ctx):
-        contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-        state = _repair_loop_state(ctx)
-        # Backstop: detection-time latch normally raises this above; catches a run-backed increment that bypassed it.
-        signal = repair_ceiling_stop_signal(ctx, contract, config)
-        stash_blocker_signal(ctx, signal)
-        stash_repair_ceiling_turn_halt(
-            ctx,
-            signal,
-            consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
-        )
-        raise_if_turn_halt(ctx, verified=verified)
 
     # A pending credential pause pre-empts every hygiene nudge below, not just
     # the failed-test one: a credential-blocked update_and_run_blocks call
@@ -1915,7 +1989,7 @@ _AGGRESSIVE_PRUNE_TAIL = 7
 
 def aggressive_prune(items: list[Any]) -> list[Any]:
     """Emergency prune: drop ALL screenshots, keep original message + last ~3
-    tool call/output pairs + latest nudge."""
+    tool call/output pairs + latest nudge, prioritizing pair-valid history."""
     if not items:
         return items
 
@@ -1927,7 +2001,31 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         if len(tail) >= _AGGRESSIVE_PRUNE_TAIL:
             break
     tail.reverse()
-    return [items[0]] + tail
+    opening = items[0]
+    opening_call_id = _item_field(opening, "call_id")
+    seen_call_ids: set[str] = (
+        {opening_call_id}
+        if _item_field(opening, "type") == "function_call" and isinstance(opening_call_id, str)
+        else set()
+    )
+    retained_tail: list[Any] = []
+    orphaned_output_dropped = False
+    for item in tail:
+        item_type = _item_field(item, "type")
+        call_id = _item_field(item, "call_id")
+        if item_type == "function_call_output" and call_id not in seen_call_ids:
+            orphaned_output_dropped = True
+            continue
+        retained_tail.append(item)
+        if item_type == "function_call" and isinstance(call_id, str):
+            seen_call_ids.add(call_id)
+
+    LOG.info(
+        "copilot_aggressive_prune_pair_validity",
+        retained_tail=[_item_field(item, "type") for item in retained_tail],
+        orphaned_output_dropped=orphaned_output_dropped,
+    )
+    return [opening, *retained_tail]
 
 
 def _is_context_window_error(exc: BaseException) -> bool:
@@ -2187,6 +2285,16 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     trajectory_len = len(trajectory)
     previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
     trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    known_terminal_actions = _known_non_method_mandated_terminal_actions(ctx)
+    business_goal_complete = (
+        _trajectory_reaches_post_credential_commit(ctx) if known_terminal_actions else trajectory_goal_complete
+    )
+    if (
+        (known_terminal_actions or _active_floor_rekeyed_runtime_outputs(ctx))
+        and _last_scout_credential_fill_index(trajectory) is not None
+        and not business_goal_complete
+    ):
+        return None
     if (
         getattr(ctx, "synthesized_block_offered", False)
         and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
@@ -2224,7 +2332,11 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     if reopened_after_failed_run:
         ctx.synthesized_block_reopened_after_failed_run = True
     goal = getattr(ctx, "block_goal_main_goal", "") or getattr(ctx, "user_message", "") or ""
-    return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory, goal=goal)}
+    offer_text = render_synthesized_offer_text(synthesized, trajectory, goal=goal)
+    missing_steps = _get_scouted_spine_missing_steps_for_halt(ctx)
+    if missing_steps:
+        offer_text += f"\n\n**Note:** This draft is missing these demonstrated steps: {missing_steps}"
+    return {"role": "user", "content": offer_text}
 
 
 def _completion_verification_unsatisfied(ctx: Any) -> bool:
@@ -2271,8 +2383,6 @@ def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
 
 
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
-    if ctx.synthesized_block_reopened_for_output_coverage:
-        return True
     if ctx.synthesized_block_reopened_for_credential_scout:
         return True
     if synthesized_goal_completion_landing_pending(ctx):
@@ -2310,26 +2420,68 @@ def _canonical_output_path(path: str) -> str:
 
 
 def _active_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
-    turn_state = ctx.completion_criteria_turn_state
+    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     if turn_state is None or turn_state.decision is None:
         return ()
     return turn_state.decision.criteria
 
 
+def _coverage_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    criteria = list(_active_completion_criteria(ctx))
+    policy = getattr(ctx, "request_policy", None)
+    if isinstance(policy, RequestPolicy):
+        known = {(criterion.id, criterion.output_path) for criterion in criteria}
+        criteria.extend(
+            criterion for criterion in policy.completion_criteria if (criterion.id, criterion.output_path) not in known
+        )
+    return tuple(criteria)
+
+
 def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
     """Completion criteria whose requested output is observable before a run. A criterion whose
-    evidence lives in a registered output parameter or artifact content is only confirmable
-    post-run, so gating the scout window on it would demand an unsatisfiable pre-run observation.
-    The persist scaffold still demands those paths at author time — that gate is SKY-11591's."""
+    evidence comes from an independent run, registered output parameter, or artifact content is
+    only confirmable post-run, so gating the scout window on it would demand an unsatisfiable
+    pre-run observation. The persist scaffold still demands those paths at author time — that gate
+    is SKY-11591's."""
     return tuple(
         criterion
-        for criterion in _active_completion_criteria(ctx)
+        for criterion in _coverage_completion_criteria(ctx)
         if criterion.requested_output_evidence_source not in _PRE_RUN_UNGATED_EVIDENCE_SOURCES
     )
 
 
+def _floor_rekeyed_requested_output_paths(ctx: AgentContext) -> set[str]:
+    return floor_rekeyed_requested_output_paths(_pre_run_gated_completion_criteria(ctx))
+
+
+def pre_run_gated_outputs_without_path(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    """Pre-run-gated runtime-output criteria carrying neither an ``output_path`` nor rekey
+    provenance, so nothing identifies them and they would drop from the gate unseen."""
+    return tuple(
+        criterion
+        for criterion in _pre_run_gated_completion_criteria(ctx)
+        if criterion.kind == "outcome"
+        and criterion.level != "definition"
+        and not criterion.method_mandated
+        and criterion.requested_output_evidence_source == "runtime_output"
+        and not criterion.output_path
+        and not (criterion.requested_output_floor_rekeyed and criterion.floor_rekeyed_from_path)
+    )
+
+
 def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
-    paths = set(requested_output_paths(_pre_run_gated_completion_criteria(ctx)))
+    pre_run_gated_paths = set(requested_output_paths(_pre_run_gated_completion_criteria(ctx)))
+    unregisterable = pre_run_gated_outputs_without_path(ctx)
+    if unregisterable:
+        LOG.warning(
+            "copilot_pre_run_gated_output_criterion_without_path",
+            count=len(unregisterable),
+            criterion_ids=[criterion.id for criterion in unregisterable],
+            outcomes=[criterion.outcome[:80] for criterion in unregisterable],
+            floor_rekeyed=[criterion.requested_output_floor_rekeyed for criterion in unregisterable],
+            floor_rekeyed_from_path=[criterion.floor_rekeyed_from_path for criterion in unregisterable],
+        )
+    paths = set(pre_run_gated_paths) | _floor_rekeyed_requested_output_paths(ctx)
     repair_context = ctx.last_code_authoring_repair_context
     if repair_context is not None:
         paths.update(
@@ -2337,6 +2489,19 @@ def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
             for raw in repair_context.required_goal_value_paths
             if isinstance(raw, str) and raw
         )
+    coverage_criteria = _coverage_completion_criteria(ctx)
+    independent_run_evidence_paths = {
+        _canonical_output_path(criterion.output_path)
+        for criterion in coverage_criteria
+        if criterion.requested_output_evidence_source == "independent_run_evidence" and criterion.output_path
+    }
+    non_independent_evidence_paths = {
+        _canonical_output_path(criterion.output_path)
+        for criterion in coverage_criteria
+        if criterion.requested_output_evidence_source != "independent_run_evidence" and criterion.output_path
+    }
+    independent_only_paths = independent_run_evidence_paths - non_independent_evidence_paths
+    paths.difference_update(independent_only_paths)
     return paths
 
 
@@ -2350,6 +2515,18 @@ def _requested_output_coverage_tokens(ctx: AgentContext) -> dict[str, frozenset[
         tokens_by_path.setdefault(path, set()).update(
             token for token in leaf_tokens if token not in _COVERAGE_GENERIC_TOKENS
         )
+    # A rekeyed path is an opaque digest whose leaf would never match the page and would false-match
+    # on "request"/"slot", so coverage keys on the outcome text instead.
+    for criterion in _pre_run_gated_completion_criteria(ctx):
+        if not (criterion.requested_output_floor_rekeyed and criterion.floor_rekeyed_from_path):
+            continue
+        outcome_tokens = {
+            token
+            for token in COVERAGE_TOKEN_RE.findall((criterion.outcome or "").lower())
+            if token not in _COVERAGE_GENERIC_TOKENS
+        }
+        if outcome_tokens:
+            tokens_by_path[criterion.floor_rekeyed_from_path] = outcome_tokens
     return {
         path: frozenset(token for token in tokens if not token.isdigit()) for path, tokens in tokens_by_path.items()
     }
@@ -2391,13 +2568,24 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
+def _effective_requested_output_path(criterion: CompletionCriterion) -> str | None:
+    """The path a requested output is known by, falling back to the identity a slot rekey preserved."""
+    if criterion.output_path:
+        return criterion.output_path
+    if criterion.requested_output_floor_rekeyed and criterion.floor_rekeyed_from_path:
+        return criterion.floor_rekeyed_from_path
+    return None
+
+
 def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, ...]]:
     requested_paths = _requested_output_paths_for_ctx(ctx)
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
-        if criterion.output_path in requested_paths and criterion.outcome.strip():
-            labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+        outcome = criterion.outcome.strip()
+        path = _effective_requested_output_path(criterion)
+        if path in requested_paths and outcome:
+            labels_by_path.setdefault(path, ())
+            labels_by_path[path] += (outcome,)
     return labels_by_path
 
 
@@ -2423,9 +2611,12 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
         return None
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
-        if criterion.output_path in requested_paths and criterion.outcome.strip():
-            labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+        outcome = criterion.outcome.strip()
+        path = _effective_requested_output_path(criterion)
+        if path in requested_paths and outcome:
+            labels_by_path.setdefault(path, ())
+            labels_by_path[path] += (outcome,)
+    # A path with no label is an underivable field; withholding the plan keeps a clarification legitimate.
     if set(labels_by_path) != requested_paths:
         return None
     return derive_requested_output_extraction_plan(
@@ -2553,6 +2744,20 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
     return bool(getattr(ctx, "last_scout_observation_has_password_control", False))
 
 
+def _first_stable_login_submit_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
+    for index, interaction in enumerate(interactions[credential_index + 1 :], start=credential_index + 1):
+        tool_name = str(interaction.get("tool_name") or "").strip()
+        if tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter":
+            return index
+        if tool_name != "click":
+            continue
+        accessible_name = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("accessible_name") or "").lower()).strip()
+        selector = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("selector") or "").lower()).strip()
+        if _LOGIN_SUBMIT_NAME_PATTERN.fullmatch(accessible_name) or _LOGIN_SUBMIT_SELECTOR_PATTERN.fullmatch(selector):
+            return index
+    return None
+
+
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
     """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
     credentials (username/password fills) must have every required field filled plus a post-fill
@@ -2574,18 +2779,103 @@ def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bo
     # requires_submit is always True here: the predicate is deliberately stricter than the persist
     # gate, which demands a submit only when the block's code itself performs one.
     gap = credential_scout_gap(interactions, requirements, requires_submit=True)
+    if gap.missing_submit and _active_non_method_mandated_terminal_actions(ctx):
+        credential_index = _last_scout_credential_fill_index(interactions)
+        if (
+            credential_index is not None
+            and _first_stable_login_submit_index(interactions, credential_index) is not None
+        ):
+            return bool(gap.missing_fields)
     return bool(gap.missing_fields) or gap.missing_submit
 
 
+def _active_non_method_mandated_terminal_actions(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    return tuple(
+        criterion
+        for criterion in _active_completion_criteria(ctx)
+        if criterion.kind == "terminal_action" and not criterion.method_mandated
+    )
+
+
+def _known_non_method_mandated_terminal_actions(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    return tuple(
+        criterion
+        for criterion in _coverage_completion_criteria(ctx)
+        if criterion.kind == "terminal_action" and not criterion.method_mandated
+    )
+
+
+def _active_floor_rekeyed_runtime_outputs(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    """Runtime outputs whose exact paths were moved to producer-floor custody.
+
+    They no longer participate in requested-output extraction planning, but they still prove the
+    workflow has a business goal beyond authentication. A credential-only trajectory must not use
+    the generic fill/commit heuristic to offer a completed block while these outputs are pending.
+    """
+    return tuple(
+        criterion
+        for criterion in _active_completion_criteria(ctx)
+        if criterion.level == "run"
+        and criterion.requested_output_floor_rekeyed
+        and bool(criterion.floor_rekeyed_from_path)
+        and criterion.requested_output_evidence_source == "runtime_output"
+    )
+
+
+def _trajectory_has_noncredential_business_fill(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    return trajectory_has_browser_fill_interaction(
+        [
+            interaction
+            for interaction in trajectory
+            if str(interaction.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME
+        ]
+    )
+
+
 def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
-    """The scout trajectory covers a durable entry followed by a commit, or a reached download target with a selector.
-    Monotone in what the scout captured, so it cannot flip as the requested-output extraction plan materializes."""
+    """The scout trajectory covers an opening click followed by a commit, a durable entry followed by a commit,
+    or a reached download target with a selector. Monotone in what the scout captured."""
     trajectory = ctx.scout_trajectory
     if not trajectory:
         return False
-    download = ctx.reached_download_target
-    if download is not None and download.selector:
+    if _active_floor_rekeyed_runtime_outputs(ctx) and not _trajectory_has_noncredential_business_fill(trajectory):
+        return False
+    if _active_non_method_mandated_terminal_actions(ctx) or (
+        _active_floor_rekeyed_runtime_outputs(ctx) and _last_scout_credential_fill_index(trajectory) is not None
+    ):
+        return _trajectory_reaches_post_credential_commit(ctx)
+    return _trajectory_reaches_generic_goal(ctx, trajectory, include_download=True)
+
+
+def _trajectory_reaches_generic_goal(
+    ctx: AgentContext,
+    trajectory: list[Any],
+    *,
+    include_download: bool,
+    allow_intermediate_interactions: bool = False,
+) -> bool:
+    """Apply the established download, open-to-commit, and durable-entry reach shapes to one trajectory slice."""
+    download = getattr(ctx, "reached_download_target", None)
+    if include_download and download is not None and download.selector:
         return True
+    opening_trajectory_index: int | None = None
+    ordered_pair_candidates = trajectory if allow_intermediate_interactions or len(trajectory) == 2 else []
+    for interaction in ordered_pair_candidates:
+        if not isinstance(interaction, dict):
+            continue
+        trajectory_index = interaction.get("trajectory_index")
+        if not isinstance(trajectory_index, int):
+            continue
+        if (
+            opening_trajectory_index is not None
+            and trajectory_index > opening_trajectory_index
+            and str(interaction.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+            and not is_generic_entry_opener_click(interaction)
+            and not _is_result_surface_navigation_click(interaction)
+        ):
+            return True
+        if opening_trajectory_index is None and str(interaction.get("tool_name") or "") == "click":
+            opening_trajectory_index = trajectory_index
     last_entry_index: int | None = None
     for index, item in enumerate(trajectory):
         if isinstance(item, dict) and is_durable_fallback_entry_target(item):
@@ -2596,8 +2886,28 @@ def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
         isinstance(item, dict)
         and str(item.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
         and not is_generic_entry_opener_click(item)
+        and not _is_result_surface_navigation_click(item)
         for item in trajectory[last_entry_index + 1 :]
     )
+
+
+def _is_result_surface_navigation_click(interaction: Mapping[str, Any]) -> bool:
+    """A results/list navigation click is not evidence that a business mutation committed."""
+    if str(interaction.get("tool_name") or "") != "click":
+        return False
+    target = " ".join(
+        (
+            str(interaction.get("selector") or ""),
+            str(interaction.get("accessible_name") or ""),
+        )
+    ).lower()
+    if any(token in target for token in ("submit", "confirm", "save", "place-order", "place_order")):
+        return False
+    selector = str(interaction.get("selector") or "").strip().lower()
+    role = str(interaction.get("role") or "").strip().lower()
+    if role == "link" or selector.startswith(("a[", "a.", "a#")):
+        return True
+    return any(token in target for token in ("table", "results", "history", "listing"))
 
 
 def _request_expects_unreached_download(ctx: AgentContext) -> bool:
@@ -2610,12 +2920,87 @@ def _request_expects_unreached_download(ctx: AgentContext) -> bool:
     return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
 
 
+def _last_scout_credential_fill_index(trajectory: list[Any]) -> int | None:
+    # Boundary past the ENTIRE credential flow, including a runtime-only OTP/MFA fill. Keying only on
+    # username/password let an MFA step (fill totp -> verify-click) form a durable entry->commit past
+    # the boundary and falsely release the terminal-action gate on a login-only trajectory.
+    last_index: int | None = None
+    for index, item in enumerate(trajectory):
+        if isinstance(item, dict) and str(item.get("tool_name") or "").strip() == CREDENTIAL_FILL_TOOL_NAME:
+            last_index = index
+    return last_index
+
+
+def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
+    """Apply the ordinary reach shapes only to the business spine after the credential submit."""
+    trajectory = ctx.scout_trajectory
+    if not trajectory:
+        return False
+    interactions = [item for item in trajectory if isinstance(item, dict)]
+    credential_index = _last_scout_credential_fill_index(interactions)
+    if credential_index is None:
+        return _trajectory_reaches_generic_goal(
+            ctx,
+            interactions,
+            include_download=False,
+            allow_intermediate_interactions=True,
+        )
+    credential_submit_index = _first_stable_login_submit_index(interactions, credential_index)
+    latest_fill_source_url = str(interactions[credential_index].get("source_url") or "").strip()
+    if credential_submit_index is None and latest_fill_source_url:
+        credential_submit_index = first_matched_post_fill_submit_index(
+            interactions,
+            credential_index,
+            {latest_fill_source_url},
+        )
+    if credential_submit_index is None:
+        return False
+    return _trajectory_reaches_generic_goal(
+        ctx,
+        interactions[credential_submit_index + 1 :],
+        include_download=False,
+        allow_intermediate_interactions=True,
+    )
+
+
+def reached_terminal_action_criterion_ids(ctx: AgentContext) -> set[str]:
+    """Active, non-method-mandated terminal_action criterion ids the scout has structurally reached: empty
+    until the post-credential trajectory shows an ordered open->commit pair or durable entry->commit. The
+    method_mandated synthetic durable-fill criterion is excluded so a login-only turn never self-releases."""
+    if not _trajectory_reaches_post_credential_commit(ctx):
+        return set()
+    return {criterion.id for criterion in _active_non_method_mandated_terminal_actions(ctx)}
+
+
+def record_reached_terminal_action_observation(ctx: AgentContext) -> None:
+    reached = reached_terminal_action_criterion_ids(ctx)
+    if not reached:
+        return
+    newly_observed = reached - ctx.scout_observed_terminal_criterion_ids
+    if not newly_observed:
+        return
+    ctx.scout_observed_terminal_criterion_ids.update(newly_observed)
+    LOG.info("copilot_reached_terminal_action_observed", criterion_ids=sorted(newly_observed))
+
+
+def _request_expects_unreached_terminal_action(ctx: AgentContext) -> bool:
+    # A terminal_action criterion is reached only once the scout observes its downstream page, which no
+    # pre-run page scalar evidences; a goal-reaching login prefix would otherwise read goal-complete before
+    # the scout crosses into the business spine and land the latch on a login-only trajectory.
+    for criterion in _active_non_method_mandated_terminal_actions(ctx):
+        if criterion.id not in ctx.scout_observed_terminal_criterion_ids:
+            return True
+    return False
+
+
 def synthesized_trajectory_is_goal_complete(ctx: AgentContext) -> bool:
     """A goal-reaching trajectory with no requested-output path left uncovered; an empty requested-output set falls
     through to the reach shape byte-identically, so an entry ``synthesize_code_block`` would drop never counts."""
     if uncovered_requested_output_paths(ctx):
         return False
     if _request_expects_unreached_download(ctx):
+        return False
+    if _request_expects_unreached_terminal_action(ctx):
         return False
     scalar_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
     if scalar_paths:
@@ -2685,10 +3070,14 @@ def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
 def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
     if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
         return False
-    if uncovered_requested_output_paths(ctx):
-        return False
-    if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
-        return False
+    if _active_non_method_mandated_terminal_actions(ctx) or _active_floor_rekeyed_runtime_outputs(ctx):
+        if not synthesized_trajectory_is_goal_complete(ctx):
+            return False
+    else:
+        if uncovered_requested_output_paths(ctx):
+            return False
+        if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
+            return False
     if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
         return False
     if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
@@ -2752,22 +3141,6 @@ def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> s
     return "allow"
 
 
-def _uncovered_output_reject_rescout_key(canonical_paths: set[str], structural_failure_identity: str) -> str:
-    return f"{structural_failure_identity}|{','.join(sorted(canonical_paths))}"
-
-
-def _active_uncovered_output_reject_paths(ctx: AgentContext) -> set[str]:
-    canonical = {
-        _canonical_output_path(path)
-        for path in author_time_reject_missing_output_paths(ctx.latest_recorded_build_test_outcome)
-    }
-    return canonical & uncovered_requested_output_paths(ctx) if canonical else set()
-
-
-def _uncovered_output_reject_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
-    return tool_name == "evaluate" and bool(_active_uncovered_output_reject_paths(ctx))
-
-
 def _actuation_obligation_live_fill_delivery_required(ctx: CopilotContext) -> bool:
     turn_intent = getattr(ctx, "turn_intent", None)
     if (
@@ -2801,6 +3174,25 @@ def _actuation_obligation_admits_required_fill_tool(ctx: CopilotContext, tool_na
     return tool_name == _actuation_obligation_required_fill_tool(ctx)
 
 
+def _actuation_obligation_admits_login_completion_tool(
+    ctx: CopilotContext, tool_name: str, arguments: Mapping[str, Any] | None
+) -> bool:
+    if tool_name not in _SYNTHESIZED_BLOCK_COMMIT_TOOLS:
+        return False
+    # Only Enter commits a login form, matching what _first_stable_login_submit_index credits as a
+    # submit; every other keystroke stays gated. Absent arguments fail closed — the signature
+    # defaults them to None, so a caller that omits them must not admit arbitrary keystrokes.
+    if tool_name == "press_key" and (
+        not isinstance(arguments, Mapping) or str(arguments.get("key") or "").strip() != "Enter"
+    ):
+        return False
+    if not _actuation_obligation_live_fill_delivery_required(ctx):
+        return False
+    if _last_scout_credential_fill_index(ctx.scout_trajectory) is None:
+        return False
+    return not _trajectory_reaches_post_credential_commit(ctx)
+
+
 def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
     """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
     (structural identity + credential binding) digest. A repeat identical reject returns False and
@@ -2814,74 +3206,6 @@ def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool
 
 def _credential_scout_reopen_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
     return tool_name == "evaluate" and bool(ctx.synthesized_block_reopened_for_credential_scout)
-
-
-def consume_uncovered_output_reopen_event(ctx: CopilotContext) -> bool:
-    """Arm a one-shot scout-window reopen for the first author-time reject citing an uncovered
-    requested-output path. Returns True only on that first reject per structural identity; a
-    repeat identical reject falls through so it counts normally toward the repair ceiling."""
-    active = _active_uncovered_output_reject_paths(ctx)
-    if not active:
-        return False
-    latest = ctx.latest_recorded_build_test_outcome
-    if latest is None:
-        return False
-    key = _uncovered_output_reject_rescout_key(active, latest.structural_failure_identity)
-    if ctx.uncovered_output_rescout_context_key == key:
-        return False
-    ctx.uncovered_output_rescout_context_key = key
-    ctx.synthesized_block_reopened_for_output_coverage = True
-    return True
-
-
-def uncovered_output_reject_scout_steer_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    if tool_name not in _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS:
-        return None
-    if not ctx.synthesized_block_reopened_for_output_coverage:
-        return None
-    active = _active_uncovered_output_reject_paths(ctx)
-    if not active:
-        return None
-    latest = ctx.latest_recorded_build_test_outcome
-    if latest is None:
-        return None
-    key = _uncovered_output_reject_rescout_key(active, latest.structural_failure_identity)
-    if ctx.uncovered_output_rescout_steer_key == key:
-        return None
-    payload: AuthorTimeGateAblationPayload = {
-        "uncovered_output_paths": sorted(active),
-        "structural_failure_identity": latest.structural_failure_identity,
-    }
-    if record_author_time_gate_ablation_event(
-        ctx,
-        gate_id="uncovered_output_rescout_steer",
-        reason_code=UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
-        fingerprint=key,
-        blocked_tool=tool_name,
-        payload=payload,
-    ):
-        return None
-    # Commit-after-claim: a yielded steer must not burn the one-shot rescout key.
-    if claim_turn(ctx, TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER) is ClaimOutcome.YIELDED:
-        return None
-    ctx.uncovered_output_rescout_steer_key = key
-    named_paths = ", ".join(sorted(active))
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "The authored workflow still leaves these requested output paths unobserved: "
-            f"{named_paths}. Do NOT re-author yet. Call evaluate to scout the page where those values "
-            "appear until they are observed, then author a block that returns them."
-        ),
-        user_facing_reason="I need to view the page with the requested details before saving the workflow.",
-        recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({"evaluate"}),
-        preserves_workflow_draft=True,
-        renders_final_reply=False,
-        internal_reason_code=UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
-        blocked_tool=tool_name,
-        extra={"uncovered_output_paths": sorted(active)},
-    )
 
 
 def _should_block_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: str) -> bool:
@@ -2901,9 +3225,142 @@ def _should_block_tool_after_unresolved_recorded_outcome(ctx: Any, tool_name: st
     return _completion_verification_unsatisfied(ctx)
 
 
-def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
+def _post_run_page_path_tool_allowed(
+    condition: PostRunPagePathFailure,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> bool:
+    if not condition.is_page_path or not isinstance(arguments, Mapping):
+        return False
+    selectors = {target.selector for target in condition.continuation_targets}
+    if tool_name == "click":
+        selector = arguments.get("selector")
+        return isinstance(selector, str) and selector in selectors
+    if tool_name != "press_key" or arguments.get("key") != "Enter" or not condition.enter_allowed:
+        return False
+    selector = arguments.get("selector")
+    enter_selectors = {
+        target.selector for target in condition.continuation_targets if target.kind in {"form_submit", "challenge"}
+    }
+    return isinstance(selector, str) and selector in enter_selectors
+
+
+def _latest_scout_trajectory_index(ctx: CopilotContext) -> int:
+    return max(
+        (
+            trajectory_index
+            for interaction in ctx.scout_trajectory
+            if isinstance((trajectory_index := interaction.get("trajectory_index")), int)
+        ),
+        default=-1,
+    )
+
+
+def _post_run_page_path_successful_interactions(
+    ctx: CopilotContext,
+    window: PostRunPagePathInteractionWindow,
+) -> int:
+    return sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if isinstance((trajectory_index := interaction.get("trajectory_index")), int)
+        and trajectory_index > window.trajectory_anchor
+        and str(interaction.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+    )
+
+
+def _post_run_page_path_admission_state(
+    ctx: CopilotContext,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> tuple[PostRunPagePathInteractionWindow, str, str, int, int] | None:
+    if not _should_block_tool_after_unresolved_recorded_outcome(ctx, tool_name):
+        return None
+    latest = ctx.latest_recorded_build_test_outcome
+    if latest is None:
+        return None
+    condition = latest.page_path_failure
+    if condition is None or not _post_run_page_path_tool_allowed(condition, tool_name, arguments):
+        return None
+    structural_key = latest.structural_key
+    workflow_run_id = latest.workflow_run_id
+    if not structural_key or not workflow_run_id:
+        return None
+    if (
+        ctx.post_run_page_observation_after_failed_test is not True
+        or ctx.post_run_page_observation_tool not in _POST_RUN_PAGE_OBSERVATION_TOOLS
+        or ctx.post_run_page_observation_workflow_run_id != workflow_run_id
+        or ctx.post_run_page_observation_url != condition.current_url
+        or condition.workflow_run_id != workflow_run_id
+        or ctx.last_run_blocks_workflow_run_id != workflow_run_id
+    ):
+        return None
+    window = ctx.post_run_page_path_interaction_window
+    if window is None or (window.structural_key, window.workflow_run_id) != (structural_key, workflow_run_id):
+        window = PostRunPagePathInteractionWindow(
+            structural_key=structural_key,
+            workflow_run_id=workflow_run_id,
+            trajectory_anchor=_latest_scout_trajectory_index(ctx),
+        )
+    successful_interactions = _post_run_page_path_successful_interactions(ctx, window)
+    observation_generation = ctx.post_run_page_observation_generation
+    if window.admitted_attempts >= _POST_RUN_PAGE_PATH_INTERACTION_BUDGET or (
+        successful_interactions > window.observed_successful_interactions
+        and observation_generation <= window.observation_generation
+    ):
+        return None
+    owner = current_turn_owner(ctx)
+    if (
+        owner is not None
+        and owner.claimant is not TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION
+        and not claimant_outranks(TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION, owner.claimant)
+    ):
+        return None
+    return window, structural_key, workflow_run_id, successful_interactions, observation_generation
+
+
+def post_run_page_path_interaction_allowed(
+    ctx: CopilotContext,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> bool:
+    return _post_run_page_path_admission_state(ctx, tool_name, arguments) is not None
+
+
+def try_admit_post_run_page_path_interaction(
+    ctx: CopilotContext,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+) -> bool:
+    state = _post_run_page_path_admission_state(ctx, tool_name, arguments)
+    if state is None:
+        return False
+    window, structural_key, workflow_run_id, successful_interactions, observation_generation = state
+    if claim_turn(ctx, TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION) is ClaimOutcome.YIELDED:
+        return False
+    ctx.post_run_page_path_interaction_window = replace(
+        window,
+        admitted_attempts=window.admitted_attempts + 1,
+        observation_generation=observation_generation,
+        observed_successful_interactions=successful_interactions,
+    )
+    LOG.info(
+        "copilot post-run page-path interaction admitted",
+        tool_name=tool_name,
+        selector=arguments.get("selector") if isinstance(arguments, Mapping) else None,
+        structural_key=structural_key,
+        workflow_run_id=workflow_run_id,
+        admitted_attempts=window.admitted_attempts + 1,
+        observation_generation=observation_generation,
+    )
+    return True
+
+
+def synthesized_block_persistence_signal(
+    ctx: Any, tool_name: str, arguments: Mapping[str, Any] | None = None
+) -> CopilotToolBlockerSignal | None:
     if _should_block_tool_after_unresolved_recorded_outcome(ctx, tool_name):
-        return CopilotToolBlockerSignal(
+        signal = CopilotToolBlockerSignal(
             blocker_kind="tool_error",
             agent_steering_text=(
                 "The last recorded test outcome is authoritative and still has unsatisfied completion criteria. "
@@ -2919,18 +3376,22 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
             blocked_tool=tool_name,
             extra={"recorded_outcome_reason_code": "outcome_not_demonstrated"},
         )
+        if try_admit_post_run_page_path_interaction(ctx, tool_name, arguments):
+            return None
+        return signal
     if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
         return None
     ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
     if ambiguous_selector_rescout_state == "allow":
-        return None
-    if _uncovered_output_reject_admits_evaluate(ctx, tool_name):
         return None
     if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN)
         return None
     if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
         claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)
+        return None
+    if _actuation_obligation_admits_login_completion_tool(ctx, tool_name, arguments):
+        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION)
         return None
     if (
         ambiguous_selector_rescout_state != "block"

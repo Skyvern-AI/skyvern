@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
+    WorkflowDefinitionYamlBlocksItem_Code,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
@@ -85,6 +86,12 @@ class ActionTarget(BaseModel):
     sky_id: str | None = None
     tag_name: str | None = None
     texts: list[str] = []
+    # Durable-locator fields captured at event time for code-first synthesis.
+    # sky_id is runtime-assigned and never usable as a replay selector.
+    selector: str | None = None
+    role: str | None = None
+    accessible_name: str | None = None
+    input_type: str | None = None
 
 
 class Mouse(BaseModel):
@@ -103,6 +110,10 @@ OutputBlock = t.Union[
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Wait,
 ]
+
+# What process_recording can return: legacy interpretable blocks, plus code blocks
+# when code-first mode is enabled. The live interpreter only ever sees OutputBlock.
+ProcessedBlock = t.Union[OutputBlock, WorkflowDefinitionYamlBlocksItem_Code]
 
 
 class RecordingDraftStep(BaseModel):
@@ -180,6 +191,10 @@ class EventTarget(BaseModel):
     tagName: str | None = None
     text: list[str] = []
     value: str | int | None = None
+    selector: str | None = None
+    role: str | None = None
+    accessibleName: str | None = None
+    inputType: str | None = None
 
 
 class MousePosition(BaseModel):

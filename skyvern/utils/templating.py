@@ -1,6 +1,7 @@
 import re
 
-from jinja2 import Environment, StrictUndefined, UndefinedError, meta
+from jinja2 import StrictUndefined, UndefinedError, meta
+from jinja2.sandbox import SandboxedEnvironment
 
 
 class Constants:
@@ -30,8 +31,10 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
 
 
 def get_missing_variables(template_source: str, template_data: dict) -> set[str]:
-    # quick check - catch top-level undefineds
-    env = Environment(undefined=StrictUndefined)
+    # quick check - catch top-level undefineds. Sandboxed so that rendering
+    # untrusted source below cannot reach attribute-access SSTI gadgets
+    # (e.g. {{ ''.__class__.__mro__ }}) — SandboxedEnvironment raises SecurityError.
+    env = SandboxedEnvironment(undefined=StrictUndefined)
     ast = env.parse(template_source)
     undeclared_vars = meta.find_undeclared_variables(ast)
     missing_vars = undeclared_vars - set(template_data.keys())

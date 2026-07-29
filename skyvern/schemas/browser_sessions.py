@@ -3,15 +3,12 @@ from pydantic import BaseModel, Field, field_validator
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
 from skyvern.services.browser_recording.types import RecordingDraftStep
 from skyvern.utils.url_validators import validate_url
-
-MIN_TIMEOUT = 5
-MAX_TIMEOUT = 60 * 24  # 24 hours
-DEFAULT_TIMEOUT = 60
 
 
 class CreateBrowserSessionRequest(BaseModel):
@@ -105,6 +102,10 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
     draft_steps: list[RecordingDraftStep] | None = Field(
         default=None,
         description="Optional live interpretation drafts to commit instead of reprocessing the compressed recording.",
+    )
+    code_first: bool = Field(
+        default=False,
+        description="When true, synthesize deterministic code blocks from the recording instead of agent blocks.",
     )
 
 

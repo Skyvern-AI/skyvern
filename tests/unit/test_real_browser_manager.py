@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -31,6 +33,38 @@ def make_workflow_run(
     wfr.extra_http_headers = None
     wfr.browser_address = None
     return wfr
+
+
+class _StopBeforeBrowserContext(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_task_first_creation_gives_engine_flag_the_pinned_workflow_id() -> None:
+    """A workflow-owned task that creates the browser first pins under workflow_run_id but keeps it
+    out of browser-context creation (download-dir scoping). The engine-flag context must still carry
+    that workflow_run_id — so both the flag distinct_id and its workflow_run_id property match the
+    pinned run — while the browser context keeps the raw (None) workflow_run_id."""
+    manager = RealBrowserManager()
+    seen: dict[str, object] = {}
+
+    async def capture(*, run_key: str | None, context: object) -> object:
+        seen["run_key"] = run_key
+        seen["context"] = context
+        raise _StopBeforeBrowserContext
+
+    with patch.object(manager, "get_or_resolve_engine_selection", side_effect=capture):
+        with pytest.raises(_StopBeforeBrowserContext):
+            await manager._create_browser_state(
+                task_id="tsk_1",
+                workflow_run_id=None,  # kept out of browser-context creation (download-dir scoping)
+                engine_run_key="wr_1",
+                engine_workflow_run_id="wr_1",
+            )
+
+    assert seen["run_key"] == "wr_1"
+    assert seen["context"].workflow_run_id == "wr_1"  # engine flag sees the pinned workflow run
+    assert seen["context"].task_id == "tsk_1"
 
 
 @pytest.mark.asyncio
@@ -117,9 +151,10 @@ async def test_non_pbs_workflow_run_cache_hit_on_second_call() -> None:
 
 @pytest.mark.asyncio
 async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
-    """Non-PBS child runs must still inherit the parent's browser when no browser_session_id."""
+    """Non-PBS child runs must still inherit a healthy parent browser when no browser_session_id."""
     manager = RealBrowserManager()
     parent_state = MagicMock()
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
     manager.pages["wfr_parent"] = parent_state
 
     workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
@@ -134,6 +169,46 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
     # Both entries should be synced
     assert manager.pages["wfr_child"] is parent_state
     assert manager.pages["wfr_parent"] is parent_state
+
+
+@pytest.mark.asyncio
+async def test_child_run_does_not_adopt_stale_sibling_browser_without_page() -> None:
+    """A parent_workflow_run_id entry is shared by every child run of the same parent.
+
+    When independent child runs are dispatched to one long-lived worker (e.g. a
+    sequential fan-out), a later child can find an earlier, already-completed
+    sibling's torn-down browser under the parent key. It must NOT be adopted:
+    its page is gone, so the first browser block would raise
+    ``MissingBrowserStatePage`` ("Browser state page is missing"). The manager
+    must instead evict the stale entry and create a fresh browser for the run.
+    """
+    manager = RealBrowserManager()
+    # Sibling C1 completed and left a torn-down browser under the shared parent key.
+    stale_state = MagicMock()
+    stale_state.get_working_page = AsyncMock(return_value=None)
+    manager.pages["wfr_parent"] = stale_state
+
+    workflow_run = make_workflow_run("wfr_child_2", parent_workflow_run_id="wfr_parent")
+
+    fresh_state = MagicMock()
+    fresh_state.get_or_create_page = AsyncMock()
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as mock_create:
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id=None,
+        )
+
+    # A brand-new browser must be created, not the stale sibling state.
+    mock_create.assert_awaited_once()
+    assert result is fresh_state
+    assert result is not stale_state
+    # The fresh browser gets a page (the parent early-return path skips this).
+    fresh_state.get_or_create_page.assert_awaited_once()
+    # The stale entry must be replaced by the fresh browser, not left dangling.
+    assert manager.pages["wfr_child_2"] is fresh_state
+    assert manager.pages["wfr_parent"] is fresh_state
 
 
 def make_task(
@@ -525,8 +600,10 @@ async def test_popup_video_listener_registers_pre_existing_pages() -> None:
     browser_context.pages = [initial_page]
     set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
 
-    # Let the ensure_future tasks run
-    await asyncio.sleep(0)
+    # Let the ensure_future tasks run to completion (registration spans multiple loop turns)
+    async with asyncio.timeout(1):
+        while not artifacts.video_artifacts:
+            await asyncio.sleep(0)
 
     paths = [va.video_path for va in artifacts.video_artifacts]
     assert paths == ["/tmp/videos/initial.webm"]
@@ -684,6 +761,7 @@ async def test_non_pbs_workflow_run_does_not_rebind() -> None:
     """The own-browser (no browser_session_id) path must run zero new download-rebind code (SKY-11083 regression guard)."""
     manager = RealBrowserManager()
     parent_state = MagicMock()
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
     manager.pages["wfr_parent"] = parent_state
 
     workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
@@ -987,3 +1065,74 @@ async def test_pbs_recovery_falls_through_to_get_or_create_page_when_fresh_state
     assert create_call.kwargs.get("url") == "https://example.com"
     # We never re-attempted navigate_to_url on the fresh state (no page to use).
     fresh.navigate_to_url.assert_not_awaited()
+
+
+class _EngineUnderTestError(Exception):
+    pass
+
+
+class _EngineUnderTestTimeout(_EngineUnderTestError):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_stamps_resolved_engine_selection() -> None:
+    """The exact BrowserEngineSelection resolved at the manager's ownership boundary
+    (get_or_resolve_engine_selection) must be the identical object pinned on the constructed
+    RealBrowserState, so a run's recovery/classification code binds to THIS run's engine identity
+    rather than a rebuilt or dropped selection."""
+    manager = RealBrowserManager()
+    fake_pw = MagicMock()
+    selection = BrowserEngineSelection(
+        name="engine-under-test",
+        start_driver=AsyncMock(return_value=fake_pw),
+        error_type=_EngineUnderTestError,
+        timeout_error_type=_EngineUnderTestTimeout,
+        metadata=BrowserEngineMetadata(name="engine-under-test", version="0.0.0"),
+        selection_reason="test",
+    )
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ) as create_browser_context,
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_engine_stamp")
+
+    assert state.engine_selection is selection
+    assert state.pw is fake_pw
+    selection.start_driver.assert_awaited_once()
+    assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+
+
+@pytest.mark.asyncio
+async def test_repair_forwards_pinned_engine_selection() -> None:
+    selection = BrowserEngineSelection(
+        name="engine-under-test",
+        start_driver=AsyncMock(),
+        error_type=_EngineUnderTestError,
+        timeout_error_type=_EngineUnderTestTimeout,
+        metadata=BrowserEngineMetadata(name="engine-under-test", version="0.0.0"),
+        selection_reason="test",
+    )
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=None,
+        engine_selection=selection,
+    )
+    context = MagicMock()
+    context.pages = []
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            AsyncMock(return_value=(context, BrowserArtifacts(), None)),
+        ) as create_browser_context,
+        patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+    ):
+        await state.check_and_fix_state()
+
+    assert create_browser_context.await_args.kwargs["engine_selection"] is selection

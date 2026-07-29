@@ -23,5 +23,17 @@ export interface FileUploadBlock {
     azure_blob_container_name?: string;
     google_credential_id?: string;
     google_drive_folder_id?: string;
+    sftp_host?: string;
+    sftp_port?: number;
+    sftp_username?: string;
+    sftp_password?: string;
+    sftp_private_key?: string;
+    sftp_private_key_passphrase?: string;
+    sftp_remote_path?: string;
+    sftp_host_key?: string;
+    /** Optional natural-language control over which downloaded files are uploaded; empty means upload all. */
+    prompt?: string;
     path?: string;
+    /** When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload. */
+    continue_on_empty?: boolean;
 }

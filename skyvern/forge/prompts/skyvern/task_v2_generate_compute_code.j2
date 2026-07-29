@@ -1,0 +1,46 @@
+You are given structured data that earlier steps already gathered from the web, and a goal that requires computing a deliverable from that data (for example: rank items, total a column, pick the minimum or maximum, filter, count, or aggregate). Write a short Python snippet that computes the answer.
+
+The overall user goal:
+{{ user_goal }}
+
+What this compute step must produce:
+{{ plan }}
+
+A variable named `gathered_data` is ALREADY defined in your scope. Do NOT redefine it and do NOT re-type the data into your code. It is a list of records; each record has the keys "type" (the kind of step), "task" (what that step did), and "extracted_data" (the structured data that step captured). Here is its current content so you can see the exact field names and shapes to read from:
+
+{{ gathered_data }}
+
+Write Python that reads from `gathered_data` and computes the deliverable for the goal.
+
+STRICT sandbox rules — code that violates ANY of them is rejected and you will be asked to rewrite it:
+- NO `import` statements of any kind. The data you need is already in `gathered_data`.
+- NO dunder access: do not use any name or attribute that starts with `__` (e.g. `__class__`, `__globals__`).
+- NO file, network, OS, subprocess, or environment access.
+- This is a DATA-ONLY step. Do NOT reference `page`, the browser, `await`, `asyncio`, `sleep`, `otp`, `re`/regex, `eval`, `exec`, or `compile`. Your code must be fully synchronous and operate only on `gathered_data`.
+- Do NOT use `while` loops or `.format`/`.format_map`. Iterate with bounded `for`/comprehensions over the data, and build strings with f-strings or concatenation.
+- The final line of your code MUST be the unconditional `return {"output": <deliverable>}` — not inside an `if`, loop, or helper function. Handle empty/missing data by computing a default value first, then returning it on that final line.
+{% raw %}- Do NOT use Jinja template syntax (`{{ ... }}`, `{% ... %}`) anywhere in your code, and avoid f-strings with doubled braces.{% endraw %}
+- The ONLY names available to you are:
+  - builtins: `len`, `range`, `str`, `int`, `float`, `dict`, `list`, `tuple`, `set`, `bool`, `isinstance`, `enumerate`, `any`, `all`, `max`, `min`, `sum`, `sorted`, `print`
+  - `json` (only `json.dumps` and `json.loads`)
+  - the variable `gathered_data`
+  - plus Python syntax: `lambda`, list/dict/set comprehensions, f-strings, slicing, and arithmetic/comparison/boolean operators.
+- `round`, `abs`, `map`, `filter`, `zip`, `reversed`, and `__import__` are NOT available — do not use them. For an average, use `sum(values) / len(values)`. For a sorted-descending list, use `sorted(items, key=..., reverse=True)`.
+- Your snippet MUST end with an explicit `return {"output": <deliverable>}` statement, where `<deliverable>` is the computed answer (a value, list, or dict). The explicit `return` is required — without it the result is discarded.
+
+Keep the code minimal and defensive: tolerate missing keys with `.get(...)` and skip records whose `extracted_data` does not contain what you need.
+{% if safety_error %}
+
+Your PREVIOUS attempt was rejected by the safety check:
+ERROR: {{ safety_error }}
+PREVIOUS CODE:
+{{ prior_attempt }}
+
+Rewrite the snippet so it obeys every rule above. Return only safe code.
+{% endif %}
+
+Respond in this exact JSON format:
+{
+  "thoughts": "<brief reasoning: which records in gathered_data you read, and how you compute the deliverable>",
+  "code": "<the Python snippet; it MUST end with return {\"output\": <deliverable>}>"
+}

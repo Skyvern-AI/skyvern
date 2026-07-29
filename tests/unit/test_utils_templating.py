@@ -1,6 +1,7 @@
 import re
 
 import pytest
+from jinja2.exceptions import SecurityError
 
 from skyvern.utils.templating import Constants, get_missing_variables
 
@@ -46,3 +47,16 @@ def test_get_missing_variables(template, data, expected):
 def test_regex_missing_variable_pattern(template, expected):
     matches = set(re.findall(Constants.MissingVariablePattern, template))
     assert matches == expected
+
+
+@pytest.mark.parametrize(
+    "gadget",
+    [
+        "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+        "{{ [].__class__.__base__ }}",
+        "{% for cls in ().__class__.__bases__ %}{{ cls }}{% endfor %}",
+    ],
+)
+def test_get_missing_variables_never_renders_gadgets_unsandboxed(gadget):
+    with pytest.raises(SecurityError):
+        get_missing_variables(gadget, {})

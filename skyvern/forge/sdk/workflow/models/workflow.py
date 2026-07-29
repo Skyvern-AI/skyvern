@@ -2,10 +2,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
-from typing_extensions import deprecated
+from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator, model_validator
+from typing_extensions import Self, deprecated
 
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -17,6 +17,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, 
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -35,7 +36,8 @@ class WorkflowRequestBody(BaseModel):
     totp_identifier: str | None = None
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
-    max_screenshot_scrolls: int | None = None
+    start_fresh_browser: bool = False
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
@@ -60,6 +62,35 @@ class WorkflowRequestBody(BaseModel):
     @classmethod
     def validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_session(self) -> Self:
+        # Covers the legacy /workflows/{id}/run endpoint, which parses this body directly. Upstream
+        # request models reject the combo too, so no internal construction ever sets both.
+        if self.start_fresh_browser and self.browser_session_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_session_id — "
+                "a live session is the browser for the run."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_profile(self) -> Self:
+        if self.start_fresh_browser and self.browser_profile_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_profile_id — "
+                "pick one: a fresh browser or a specific profile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_address(self) -> Self:
+        if self.start_fresh_browser and self.browser_address:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_address — "
+                "connecting to an existing remote browser reuses its session state."
+            )
+        return self
 
 
 @deprecated("Use WorkflowRunResponse instead")
@@ -228,6 +259,9 @@ class WorkflowRun(BaseModel):
     organization_id: str
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
+    browser_seed_source: BrowserSeedSource | None = None
+    browser_sink_profile_id: str | None = None
+    start_fresh_browser: bool | None = None
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
@@ -239,6 +273,8 @@ class WorkflowRun(BaseModel):
     totp_identifier: str | None = None
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
+    retried_from_workflow_run_id: str | None = None
+    fallback_attempt: int | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
@@ -275,6 +311,10 @@ class WorkflowRun(BaseModel):
     finished_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
+
+    @property
+    def is_debug_session(self) -> bool:
+        return self.debug_session_id is not None
 
 
 def is_adaptive_caching_from_effective_state(
@@ -346,6 +386,8 @@ class WorkflowRunResponseBase(BaseModel):
     status: WorkflowRunStatus
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
+    retried_from_workflow_run_id: str | None = None
+    retried_by_workflow_run_id: str | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
@@ -381,6 +423,8 @@ class WorkflowRunResponseBase(BaseModel):
     workflow_title: str | None = None
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
+    browser_seed_source: BrowserSeedSource | None = None
+    browser_sink_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     run_with: str = "agent"

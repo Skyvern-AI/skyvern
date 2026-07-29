@@ -67,7 +67,7 @@ function HumanInteractionEditorBody({
       <div className="space-y-2">
         <div className="flex justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               Instructions For Human
             </Label>
             <HelpTooltip content={instructionsTooltip} />
@@ -82,7 +82,9 @@ function HumanInteractionEditorBody({
         />
       </div>
       <div className="space-between flex items-center gap-2">
-        <Label className="text-xs text-slate-300">Timeout (minutes)</Label>
+        <Label className="text-xs text-tertiary-foreground">
+          Timeout (minutes)
+        </Label>
         <HelpTooltip content={timeoutTooltip} />
         <Input
           className="ml-auto w-16 text-right"
@@ -97,19 +99,19 @@ function HumanInteractionEditorBody({
           }}
         />
       </div>
-      <div className="workflow-editor-tip flex items-center justify-center gap-2 rounded-md bg-slate-800 p-2">
-        <span className="workflow-editor-tip-icon rounded bg-slate-700 p-1 text-lg">
+      <div className="workflow-editor-tip flex items-center justify-center gap-2 rounded-md bg-muted p-2">
+        <span className="workflow-editor-tip-icon rounded bg-muted p-1 text-lg dark:bg-slate-700">
           💡
         </span>
-        <div className="space-y-1 text-xs text-slate-400">
+        <div className="space-y-1 text-xs text-muted-foreground">
           The agent will pause and send an email notification to the recipients.
           The agent continues or terminates based on the user's response.
         </div>
       </div>
-      <div className="space-y-4 rounded-md bg-slate-800 p-4">
+      <div className="space-y-4 rounded-md bg-muted p-4">
         <h2>Email Settings</h2>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Recipients</Label>
+          <Label className="text-xs text-tertiary-foreground">Recipients</Label>
           <WorkflowBlockInput
             nodeId={blockId}
             onChange={(next) => update({ recipients: next })}
@@ -119,7 +121,7 @@ function HumanInteractionEditorBody({
           />
         </div>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Subject</Label>
+          <Label className="text-xs text-tertiary-foreground">Subject</Label>
           <WorkflowBlockInput
             nodeId={blockId}
             onChange={(next) => update({ subject: next })}
@@ -129,7 +131,7 @@ function HumanInteractionEditorBody({
           />
         </div>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Body</Label>
+          <Label className="text-xs text-tertiary-foreground">Body</Label>
           <WorkflowBlockInputTextarea
             aiImprove={AI_IMPROVE_CONFIGS.humanInteraction.body}
             nodeId={blockId}
@@ -151,7 +153,7 @@ function HumanInteractionEditorBody({
               <div className="flex gap-4">
                 <div className="flex-1 space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Negative Button Label
                     </Label>
                     <HelpTooltip content={negativeDescriptorTooltip} />
@@ -166,7 +168,7 @@ function HumanInteractionEditorBody({
                 </div>
                 <div className="flex-1 space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Positive Button Label
                     </Label>
                     <HelpTooltip content={positiveDescriptorTooltip} />

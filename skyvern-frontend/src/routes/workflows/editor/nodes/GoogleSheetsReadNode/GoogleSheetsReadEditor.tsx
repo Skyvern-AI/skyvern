@@ -87,13 +87,15 @@ function GoogleSheetsReadEditorBody({
   return (
     <div data-testid="google-sheets-read-block-form" className="space-y-4">
       <div className="space-y-3">
-        <div className="text-xs font-medium uppercase tracking-wider text-slate-400">
+        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Connection
         </div>
 
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Google Account</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Google Account
+            </Label>
             <HelpTooltip
               content={
                 helpTooltips["google_sheets_read"]?.["credentialId"] ??
@@ -111,7 +113,9 @@ function GoogleSheetsReadEditorBody({
 
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Spreadsheet</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Spreadsheet
+            </Label>
             <HelpTooltip
               content={
                 helpTooltips["google_sheets_read"]?.["spreadsheetUrl"] ??
@@ -159,7 +163,9 @@ function GoogleSheetsReadEditorBody({
             <div className="space-y-3">
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Sheet Name</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Sheet Name
+                  </Label>
                   <HelpTooltip
                     content={
                       helpTooltips["google_sheets_read"]?.["sheetName"] ??
@@ -183,7 +189,9 @@ function GoogleSheetsReadEditorBody({
 
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Range</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Range
+                  </Label>
                   <HelpTooltip
                     content={
                       helpTooltips["google_sheets_read"]?.["range"] ??
@@ -202,7 +210,7 @@ function GoogleSheetsReadEditorBody({
 
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Has Header Row
                   </Label>
                   <HelpTooltip

@@ -687,6 +687,50 @@ async def wrapper({default_args}):
 
         return filtered_user_function
 
+    def test_inline_exec_emits_audit_event_with_hash_not_code(self) -> None:
+        """The inline exec path emits codeblock.inline_exec_entered with a code hash, never the code."""
+        import hashlib
+        from unittest.mock import MagicMock
+
+        from structlog.testing import capture_logs
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="audit_output",
+            description="test output",
+            output_parameter_id="op_audit",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        secret_marker = "s3cr3t_business_logic_token"
+        code = f"x = {secret_marker!r}\nreturn {{'x': x}}"
+        block = CodeBlock(label="audit_block", code=code, output_parameter=output_parameter)
+
+        with capture_logs() as logs:
+            block.generate_async_user_function(
+                block.code,
+                MagicMock(),
+                workflow_run_id="wr-audit",
+                organization_id="org-audit",
+                workflow_run_block_id="wrb-audit",
+            )
+
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_entered"]
+        assert len(events) == 1
+        entry = events[0]
+        assert entry["code_sha256"] == hashlib.sha256(code.encode("utf-8")).hexdigest()
+        assert entry["code_len"] == len(code)
+        assert entry["in_process"] is True
+        assert isinstance(entry["pid"], int) and entry["pid"] > 0
+        assert entry["hostname"]
+        assert entry["organization_id"] == "org-audit"
+        assert entry["workflow_run_id"] == "wr-audit"
+        assert entry["workflow_run_block_id"] == "wrb-audit"
+        # SECURITY: the raw user code must never appear in the audit payload.
+        assert secret_marker not in json.dumps(entry, default=str)
+
     @pytest.mark.asyncio
     async def test_safe_code_runs_successfully(self) -> None:
         """Legitimate code should execute and return results."""
@@ -1411,6 +1455,124 @@ class TestCodeBlockOtpBuiltinDelegates:
         result = await otp_builtin(cred)
         assert result == "999111"
         assert called["bound"] is True
+
+
+class TestCodeBlockOtpForIdentifier:
+    """A bare address resolves an OTP with no credential in play, and keeps its code/link form."""
+
+    @staticmethod
+    def _patch_poll(monkeypatch: pytest.MonkeyPatch, wrc, polled):
+        from skyvern.forge.sdk.workflow.models import block as block_module
+
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        captured: dict[str, object] = {}
+
+        async def fake_poll(**kwargs: object):
+            captured.update(kwargs)
+            return polled
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_resolves_without_any_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import MagicMock
+
+        from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp_for_identifier
+        from skyvern.services.otp_service import OTPValue
+
+        wrc = WorkflowRunContext(
+            workflow_title="t",
+            workflow_id="w",
+            workflow_permanent_id="wpid",
+            workflow_run_id=_WORKFLOW_RUN_ID,
+            aws_client=MagicMock(),
+        )
+        assert wrc.values == {}
+        assert wrc.credential_totp_identifiers == {}
+
+        captured = self._patch_poll(monkeypatch, wrc, OTPValue(value="778899"))
+
+        result = await _resolve_code_block_otp_for_identifier(
+            "signin@example.com", _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120
+        )
+
+        assert result == "778899"
+        assert captured["totp_identifier"] == "signin@example.com"
+        assert captured["organization_id"] == _ORG_ID
+        # Same run-start anchoring as the credential-bound path.
+        assert captured["created_after"] == _FakeWorkflowRun().started_at
+        # Same secret registration as the credential-bound path.
+        assert "778899" in wrc.secrets.values()
+
+    @pytest.mark.asyncio
+    async def test_magic_link_is_flagged_as_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp_for_identifier
+        from skyvern.services.otp_service import OTPValue
+
+        wrc = _build_wrc_with_identifier()
+        self._patch_poll(monkeypatch, wrc, OTPValue(value="https://example.com/magic?t=abc"))
+
+        result = await _resolve_code_block_otp_for_identifier(
+            "signin@example.com", _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120
+        )
+
+        assert result.is_link is True
+        assert result == "https://example.com/magic?t=abc"
+
+    @pytest.mark.asyncio
+    async def test_code_is_not_flagged_as_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp_for_identifier
+        from skyvern.services.otp_service import OTPValue
+
+        wrc = _build_wrc_with_identifier()
+        self._patch_poll(monkeypatch, wrc, OTPValue(value="445566"))
+
+        result = await _resolve_code_block_otp_for_identifier(
+            "signin@example.com", _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120
+        )
+
+        assert result.is_link is False
+        # Usable directly as the value to type, without unwrapping.
+        assert result == "445566"
+        assert result.strip() == "445566"
+
+    @pytest.mark.asyncio
+    async def test_builtin_routes_a_string_to_the_identifier_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.workflow.models.block import CodeBlock as _CB
+        from skyvern.services.otp_service import OTPValue
+
+        wrc = _build_wrc_with_identifier()
+        captured = self._patch_poll(monkeypatch, wrc, OTPValue(value="112233"))
+
+        otp_builtin = _CB.build_safe_vars()["otp"]
+        result = await otp_builtin("typed@example.com", organization_id=_ORG_ID, workflow_run_id=_WORKFLOW_RUN_ID)
+
+        assert result == "112233"
+        assert captured["totp_identifier"] == "typed@example.com"
+
+    @pytest.mark.asyncio
+    async def test_credential_path_still_returns_a_plain_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """otp(credential) is unchanged: a bare str, with no code/link attribute grafted on."""
+        from skyvern.forge.sdk.workflow.models.block import OTPResult, _resolve_code_block_otp
+        from skyvern.services.otp_service import OTPValue
+
+        wrc = _build_wrc_with_identifier()
+        self._patch_poll(monkeypatch, wrc, OTPValue(value="https://example.com/magic?t=xyz"))
+
+        code = await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+
+        assert type(code) is str
+        assert not isinstance(code, OTPResult)
+        assert code == "https://example.com/magic?t=xyz"
 
 
 class TestCodeBlockOtpNoLeak:

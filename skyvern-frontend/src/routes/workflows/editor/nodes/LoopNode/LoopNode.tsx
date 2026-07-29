@@ -8,6 +8,7 @@ import {
   type Node,
 } from "@xyflow/react";
 import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -37,7 +38,8 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     throw new Error("Node not found"); // not possible
   }
   const { editable, label } = data;
-  const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
+  const { blockLabel: urlBlockLabel } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -162,7 +164,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
             {
               "pointer-events-none": thisBlockIsPlaying,
-              "bg-slate-950 outline outline-2 outline-slate-300":
+              "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
             data.comparisonColor,
@@ -200,7 +202,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
         className="opacity-0"
       />
       <div
-        className="rounded-xl border-2 border-dashed border-slate-600 p-2"
+        className="rounded-xl border-2 border-dashed border-border p-2 dark:border-slate-600"
         style={{
           width: loopNodeWidth,
           height: childrenHeightExtent,
@@ -214,7 +216,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               open ? "shadow-md" : "shadow-sm",
               {
                 "pointer-events-none": thisBlockIsPlaying,
-                "bg-slate-950 outline outline-2 outline-slate-300":
+                "bg-background outline outline-2 outline-ring":
                   thisBlockIsTargetted,
               },
               data.comparisonColor,

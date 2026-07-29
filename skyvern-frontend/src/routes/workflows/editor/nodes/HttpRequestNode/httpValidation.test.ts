@@ -114,10 +114,71 @@ describe("validateUrl", () => {
     expect(result.valid).toBe(true);
   });
 
+  test("template-only URL is valid", () => {
+    const result = validateUrl("{{login_complete_url}}");
+    expect(result.valid).toBe(true);
+  });
+
+  test("template-only URL with inner spaces is valid", () => {
+    const result = validateUrl("{{ login_complete_url }}");
+    expect(result.valid).toBe(true);
+  });
+
+  test("template URL with a path is valid", () => {
+    const result = validateUrl("{{base_url}}/api/callback");
+    expect(result.valid).toBe(true);
+  });
+
+  test("https URL with a template host is valid", () => {
+    const result = validateUrl("https://{{host}}/path");
+    expect(result.valid).toBe(true);
+  });
+
+  test("template control expression URL is valid", () => {
+    const result = validateUrl("{% if use_prod %}https://a.com{% endif %}");
+    expect(result.valid).toBe(true);
+  });
+
   test("non-http protocol is invalid", () => {
     const result = validateUrl("ftp://example.com");
     expect(result.valid).toBe(false);
     expect(result.message).toBe("URL must use HTTP or HTTPS protocol");
+  });
+
+  test("non-http protocol with a template host is invalid", () => {
+    const result = validateUrl("ftp://{{host}}");
+    expect(result.valid).toBe(false);
+    expect(result.message).toBe("URL must use HTTP or HTTPS protocol");
+  });
+
+  test("javascript scheme with a template payload is invalid", () => {
+    const result = validateUrl("javascript:{{payload}}");
+    expect(result.valid).toBe(false);
+    expect(result.message).toBe("URL must use HTTP or HTTPS protocol");
+  });
+
+  test("space-spliced javascript scheme with a template payload is invalid", () => {
+    const result = validateUrl("java script:{{payload}}");
+    expect(result.valid).toBe(false);
+    expect(result.message).toBe("URL must use HTTP or HTTPS protocol");
+  });
+
+  test("tab-spliced javascript scheme with a template payload is invalid", () => {
+    const result = validateUrl("java\tscript:{{payload}}");
+    expect(result.valid).toBe(false);
+    expect(result.message).toBe("URL must use HTTP or HTTPS protocol");
+  });
+
+  test("mailto scheme with a template address is invalid", () => {
+    const result = validateUrl("mailto:{{address}}");
+    expect(result.valid).toBe(false);
+    expect(result.message).toBe("URL must use HTTP or HTTPS protocol");
+  });
+
+  test("scheme-relative URL with a template host is invalid", () => {
+    const result = validateUrl("//{{host}}/evil.js");
+    expect(result.valid).toBe(false);
+    expect(result.message).toBe("Invalid URL format");
   });
 
   test("malformed URL is invalid", () => {

@@ -8,6 +8,7 @@ This service is responsible for:
 
 import asyncio
 import shutil
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,8 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 
 LOG = structlog.get_logger()
 
@@ -113,6 +116,107 @@ def cleanup_temp_directory() -> int:
         LOG.exception("Error cleaning temp directory", temp_path=str(temp_path))
 
     return removed_count
+
+
+def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
+    """
+    Remove stale per-run disk artifacts left behind on crash paths: per-day browser
+    console-log dirs under LOG_PATH and per-run download dirs under DOWNLOAD_PATH.
+
+    TEMP_PATH is intentionally excluded. Its dominant leak (the CDP-connect profile copy)
+    is fixed at the source, and mtime is not a safe liveness signal for what remains there:
+    reused generated-script caches (TEMP_PATH/<script_id>) are overwritten in place without
+    bumping the dir mtime, and browser-session profile dirs are written only at open/close —
+    both read as stale while actively in use. LOG_PATH/DOWNLOAD_PATH are single-tenant and
+    keyed per run, so an aged top-level entry there is genuinely finished.
+
+    DOWNLOAD_PATH is swept only when the active storage backend uploads run downloads
+    elsewhere (S3/Azure/GCS), leaving the local copy as scratch. On the local backend
+    LocalStorage.save_downloaded_files is a no-op and get_downloaded_files serves the files
+    in place via file:// URIs, so DOWNLOAD_PATH/<run_id> is the run's permanent artifact
+    record — sweeping it would silently delete user data — and it is left untouched.
+
+    Returns:
+        Number of entries removed.
+    """
+    if max_age_hours is None:
+        max_age_hours = settings.TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS
+    if max_age_hours <= 0:
+        return 0
+
+    cutoff = time.time() - max_age_hours * 3600
+    removed_count = 0
+    bases = [settings.LOG_PATH]
+    if not isinstance(StorageFactory.get_storage(), LocalStorage):
+        bases.append(settings.DOWNLOAD_PATH)
+    for base in bases:
+        base_path = Path(base)
+        if not base_path.is_dir():
+            continue
+        try:
+            entries = list(base_path.iterdir())
+        except OSError:
+            LOG.warning("Failed to list directory for temp-artifact sweep", base=str(base_path), exc_info=True)
+            continue
+        for entry in entries:
+            try:
+                # Accepted TOCTOU: a late write between this mtime check and rmtree is tolerated;
+                # the age gate + hourly cadence mean a swept entry's run finished long ago.
+                if entry.lstat().st_mtime >= cutoff:
+                    continue
+                # is_symlink guard keeps rmtree from following a symlink out of the swept base.
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed_count += 1
+            except FileNotFoundError:
+                continue
+            except Exception:
+                LOG.warning("Failed to sweep stale temp entry", entry=str(entry), exc_info=True)
+
+    if removed_count:
+        LOG.info("Swept stale temp artifacts", removed_count=removed_count, max_age_hours=max_age_hours)
+    return removed_count
+
+
+async def _temp_artifact_sweep_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(sweep_stale_temp_artifacts)
+        except Exception:
+            LOG.exception("Temp-artifact sweep failed")
+        await asyncio.sleep(3600)
+
+
+_temp_sweep_task: asyncio.Task | None = None
+
+
+def start_temp_artifact_sweep() -> asyncio.Task | None:
+    """Start the hourly stale temp-artifact sweep (idempotent; disabled by a non-positive age gate)."""
+    global _temp_sweep_task
+
+    if settings.TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS <= 0:
+        LOG.info("Temp-artifact sweep disabled", max_age_hours=settings.TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS)
+        return None
+    if _temp_sweep_task is not None and not _temp_sweep_task.done():
+        return _temp_sweep_task
+
+    _temp_sweep_task = asyncio.create_task(_temp_artifact_sweep_loop())
+    LOG.info("Started temp-artifact sweep", max_age_hours=settings.TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS)
+    return _temp_sweep_task
+
+
+async def stop_temp_artifact_sweep() -> None:
+    global _temp_sweep_task
+
+    if _temp_sweep_task is not None and not _temp_sweep_task.done():
+        _temp_sweep_task.cancel()
+        try:
+            await _temp_sweep_task
+        except asyncio.CancelledError:
+            pass
+    _temp_sweep_task = None
 
 
 def get_stale_browser_processes(max_age_minutes: int = 60) -> list[psutil.Process]:

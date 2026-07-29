@@ -1,9 +1,11 @@
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Union
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import jwt
 
@@ -61,6 +63,40 @@ def generate_skyvern_signature(
 
 MAX_WEBHOOK_PAYLOAD_LOG_SIZE = 8000  # ~8KB – keeps Datadog log entries manageable
 
+# Any absolute http(s) URL token, up to the next whitespace/quote/angle bracket
+# (a JSON string can't contain a raw " or \), so an embedded URL is matched too,
+# not only a whole-value URL. Case-insensitive to catch uppercase schemes.
+_URL_TOKEN_RE = re.compile(r"https?://[^\s\"\\<>]+", re.IGNORECASE)
+# Query-param names whose presence marks a URL as credentialed: Skyvern HMAC
+# signing (sig), and storage presigns (S3 X-Amz-Signature/Credential/Security-Token,
+# GCS X-Goog-Signature, Azure SAS sig). Any match strips the whole query.
+_URL_SIGNATURE_PARAMS = frozenset(
+    {"sig", "x-amz-signature", "x-amz-credential", "x-amz-security-token", "x-goog-signature"}
+)
+
+
+def _strip_credentialed_url_query(match: "re.Match[str]") -> str:
+    url = match.group(0)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        # Fail closed: an unparseable URL keeps only its pre-query/fragment prefix.
+        return re.split(r"[?#]", url, maxsplit=1)[0]
+    query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    if not query_keys & _URL_SIGNATURE_PARAMS:
+        return url
+    netloc = parsed.netloc.rsplit("@", 1)[-1]  # drop any basic-auth userinfo
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def redact_credentialed_urls(text: str) -> str:
+    """Strip signing/presign query params from any credentialed URL in a string.
+
+    Covers Skyvern signed content URLs and S3/Azure/GCS presigns, including URLs embedded in a
+    larger value; non-credentialed URLs and surrounding text are untouched. For log-only copies.
+    """
+    return _URL_TOKEN_RE.sub(_strip_credentialed_url_query, text)
+
 
 @dataclass
 class WebhookSignature:
@@ -68,7 +104,7 @@ class WebhookSignature:
     signature: str
     signed_payload: str
     headers: dict[str, str]
-    # Truncated version of signed_payload safe for logging
+    # URL-credential-redacted, truncated copy of the payload — safe for logging.
     payload_for_log: str
 
 
@@ -76,12 +112,16 @@ def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSi
     payload_str = _normalize_json_dumps(payload)
     signature = generate_skyvern_signature(payload=payload_str, api_key=api_key)
     timestamp = str(int(datetime.utcnow().timestamp()))
-    if len(payload_str) > MAX_WEBHOOK_PAYLOAD_LOG_SIZE:
+    # Redact signed/presigned URL params before truncating so the log copy never
+    # carries replayable credentials. signed_payload stays raw so delivery and the
+    # HMAC signature above are unaffected.
+    log_payload = redact_credentialed_urls(payload_str)
+    if len(log_payload) > MAX_WEBHOOK_PAYLOAD_LOG_SIZE:
         payload_for_log = (
-            payload_str[:MAX_WEBHOOK_PAYLOAD_LOG_SIZE] + f"... (truncated, original size: {len(payload_str)})"
+            log_payload[:MAX_WEBHOOK_PAYLOAD_LOG_SIZE] + f"... (truncated, original size: {len(payload_str)})"
         )
     else:
-        payload_for_log = payload_str
+        payload_for_log = log_payload
     return WebhookSignature(
         timestamp=timestamp,
         signature=signature,

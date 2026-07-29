@@ -7,10 +7,12 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 import httpx
 import structlog
 
+from skyvern.exceptions import InvalidUrl
 from skyvern.forge import app
 
 LOG = structlog.get_logger()
@@ -48,6 +50,13 @@ class PreparedWorkflowWebhook:
 
 def is_retryable_status(status_code: int) -> bool:
     return status_code in NON_5XX_RETRYABLE_STATUS_CODES or 500 <= status_code < 600
+
+
+def describe_delivery_error(exc: Exception) -> str:
+    # httpx timeout exceptions stringify to "", which made both persisted
+    # failure reasons and retry logs unactionable (SKY-13149).
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -88,6 +97,13 @@ async def deliver_webhook_with_retries(
     max_attempts: int = WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     base_delay_seconds: float = WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
 ) -> httpx.Response:
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        # Reject scheme-less/host-less targets before the outbound call so the
+        # failure is classified as invalid input rather than a raw
+        # httpx.UnsupportedProtocol from the transport.
+        raise InvalidUrl(url)
+
     last_response: httpx.Response | None = None
     last_exc: Exception | None = None
 
@@ -130,7 +146,7 @@ async def deliver_webhook_with_retries(
                 attempt=attempt + 1,
                 max_attempts=max_attempts,
                 status_code=status_code,
-                error=str(last_exc) if last_exc is not None else None,
+                error=describe_delivery_error(last_exc) if last_exc is not None else None,
                 sleep_seconds=delay,
                 retry_after_present=last_response is not None and "Retry-After" in last_response.headers,
             )

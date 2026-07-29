@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -238,3 +239,36 @@ async def test_find_tool_exception(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result["ok"] is False
     assert "Locator error" in result["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        'He said "hi"',
+        "it's here",
+        r"path\with\backslashes",
+        r"tab\there and newline\nthere",
+        "mixed \"quotes\" and 'apostrophes'",
+        "unicode — em dash ✓",
+        "trailing backslash\\",
+    ],
+)
+@pytest.mark.asyncio
+async def test_find_sdk_equivalent_survives_hostile_values(monkeypatch: pytest.MonkeyPatch, hostile: str) -> None:
+    """sdk_equivalent stays parseable Python meaning the original value, whatever the caller sends.
+
+    do_find builds FindResult.selector in a different function from the sdk_equivalent sink, so
+    the static guard in test_mcp_sdk_equivalent_guard.py cannot see this path. Round-tripping the
+    argument catches the quiet half of the bug: `\\b` emitted into hand-written quotes parses fine
+    but means BACKSPACE.
+    """
+    page = _make_mock_page()
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, page, ctx)
+
+    result = await mcp_browser.skyvern_find(by="text", value=hostile)
+
+    snippet = result["data"]["sdk_equivalent"]
+    call = ast.parse(snippet, mode="eval").body
+    assert isinstance(call, ast.Call), f"sdk_equivalent is not a call: {snippet!r}"
+    assert ast.literal_eval(call.args[0]) == hostile, f"value did not survive the round trip: {snippet!r}"

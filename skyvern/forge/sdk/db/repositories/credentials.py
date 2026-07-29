@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import cast
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -17,7 +18,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, should_generate_proxy_session_id
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
 _UNSET = object()
 
@@ -39,6 +40,7 @@ class CredentialRepository(BaseRepository):
         card_brand: str | None,
         totp_identifier: str | None = None,
         secret_label: str | None = None,
+        tested_url: str | None = None,
         proxy_location: ProxyLocationInput = None,
         proxy_session_id: str | None = None,
     ) -> Credential:
@@ -60,6 +62,7 @@ class CredentialRepository(BaseRepository):
                 card_last4=card_last4,
                 card_brand=card_brand,
                 secret_label=secret_label,
+                tested_url=tested_url,
                 proxy_location=serialized_proxy_location,
                 proxy_session_id=proxy_session_id,
             )
@@ -70,6 +73,51 @@ class CredentialRepository(BaseRepository):
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
+
+    @db_operation("get_credentials_by_browser_profile_id")
+    async def get_credentials_by_browser_profile_id(
+        self, browser_profile_id: str, organization_id: str
+    ) -> list[Credential]:
+        async with self.Session() as session:
+            credentials = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(browser_profile_id=browser_profile_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                )
+            ).all()
+            return [Credential.model_validate(c) for c in credentials]
+
+    @db_operation("link_browser_profile_if_unset")
+    async def link_browser_profile_if_unset(
+        self, credential_id: str, organization_id: str, browser_profile_id: str
+    ) -> str | None:
+        """Atomically link a browser profile only if the credential has none yet. Returns the WINNING
+        profile id — the one just set if we won the race, or the existing one if a concurrent first
+        login already linked a different profile. None means the credential is gone. Lets the auto-create
+        path drop its orphan and adopt the winner instead of clobbering it (last-writer-wins)."""
+        async with self.Session() as session:
+            result = await session.execute(
+                update(CredentialModel)
+                .where(CredentialModel.credential_id == credential_id)
+                .where(CredentialModel.organization_id == organization_id)
+                .where(CredentialModel.deleted_at.is_(None))
+                .where(CredentialModel.browser_profile_id.is_(None))
+                .values(browser_profile_id=browser_profile_id)
+            )
+            await session.commit()
+            if result.rowcount == 1:
+                return browser_profile_id
+            credential = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(credential_id=credential_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                )
+            ).first()
+            return credential.browser_profile_id if credential else None
 
     @db_operation("get_credential")
     async def get_credential(self, credential_id: str, organization_id: str) -> Credential | None:
@@ -150,7 +198,8 @@ class CredentialRepository(BaseRepository):
         credential_id: str,
         organization_id: str,
         name: str | None = None,
-        browser_profile_id: str | None = None,
+        browser_profile_id: str | None | object = _UNSET,
+        pin_saved_session_ip: bool | None = None,
         tested_url: str | None = None,
         user_context: str | None = None,
         save_browser_session_intent: bool | None = None,
@@ -171,8 +220,12 @@ class CredentialRepository(BaseRepository):
                 raise NotFoundError(f"Credential {credential_id} not found")
             if name is not None:
                 credential.name = name
-            if browser_profile_id is not None:
-                credential.browser_profile_id = browser_profile_id
+            # Sentinel-gated so an explicit None unlinks (user picks Auto after attaching a profile),
+            # while an omitted value (_UNSET) leaves the link untouched.
+            if browser_profile_id is not _UNSET:
+                credential.browser_profile_id = cast("str | None", browser_profile_id)
+            if pin_saved_session_ip is not None:
+                credential.pin_saved_session_ip = pin_saved_session_ip
             if tested_url is not None:
                 credential.tested_url = tested_url
             if user_context is not None:
@@ -187,6 +240,12 @@ class CredentialRepository(BaseRepository):
                 unset=_UNSET,
                 rotate_proxy_session_id=rotate_proxy_session_id,
             )
+            # The IP pin holds a stable IP via a sticky proxy session. When the pin is turned on but no
+            # proxy session is provisioned (pin set without a residential-ISP proxy), mint one now so
+            # pin=true is not a silent no-op when a run is later seeded from this credential's profile.
+            if pin_saved_session_ip and not credential.proxy_session_id:
+                credential.proxy_location = serialize_proxy_location(ProxyLocation.RESIDENTIAL_ISP)
+                credential.proxy_session_id = generate_proxy_session_id(credential_id)
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
@@ -205,6 +264,7 @@ class CredentialRepository(BaseRepository):
         card_last4: str | None = None,
         card_brand: str | None = None,
         secret_label: str | None = None,
+        tested_url: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         proxy_session_id: str | None | object = _UNSET,
         rotate_proxy_session_id: bool = False,
@@ -230,6 +290,8 @@ class CredentialRepository(BaseRepository):
             credential.card_last4 = card_last4
             credential.card_brand = card_brand
             credential.secret_label = secret_label
+            if tested_url is not None:
+                credential.tested_url = tested_url
             apply_proxy_pin_to_model(
                 credential,
                 entity_id=credential_id,

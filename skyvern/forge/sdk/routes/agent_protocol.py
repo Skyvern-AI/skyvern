@@ -3,10 +3,11 @@ import json
 import random
 import time
 import unicodedata
+from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import structlog
 import yaml
@@ -43,11 +44,12 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
     parse_keyring,
     verify_artifact_signature,
 )
@@ -58,6 +60,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
+    TagValueAlreadyExists,
     TagValueRenameCollision,
     TagValueRenameResult,
 )
@@ -158,6 +161,7 @@ from skyvern.schemas.tags import (
     RunTagsBatchRequest,
     RunTagsBatchResponse,
     RunTagsResponse,
+    RunTagSuggestionsResponse,
     TagApplyRequest,
     TagHistoryItem,
     TagHistoryResponse,
@@ -168,6 +172,7 @@ from skyvern.schemas.tags import (
     TagResponse,
     TagsResponse,
     TagValue,
+    TagValueCreate,
     TagValueDelete,
     TagValueDeleteResponse,
     TagValueRename,
@@ -299,6 +304,19 @@ async def run_task(
     )
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
+        # The V1 / CUA task engines build a legacy TaskRequest that carries no browser-memory controls,
+        # so these run-level fields would silently no-op. Reject them explicitly rather than accept-and-
+        # ignore; skyvern_v2 honors both via initialize_task_v2. V1/CUA parity is deferred (SKY-12644).
+        if run_request.browser_profile_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="browser_profile_id is not supported for the skyvern_v1 or CUA task engines; use engine=skyvern_v2.",
+            )
+        if run_request.start_fresh_browser:
+            raise HTTPException(
+                status_code=400,
+                detail="start_fresh_browser is not supported for the skyvern_v1 or CUA task engines; use engine=skyvern_v2.",
+            )
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
         url = run_request.url
@@ -387,6 +405,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
@@ -412,6 +431,8 @@ async def run_task(
                 extra_http_headers=run_request.extra_http_headers,
                 cdp_connect_headers=run_request.cdp_connect_headers,
                 browser_session_id=run_request.browser_session_id,
+                browser_profile_id=run_request.browser_profile_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
             )
@@ -462,6 +483,8 @@ async def run_task(
                 proxy_location=task_v2.proxy_location,
                 max_steps=run_request.max_steps,
                 browser_session_id=run_request.browser_session_id,
+                browser_profile_id=run_request.browser_profile_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
@@ -481,6 +504,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
         browser_profile_id=workflow_run_request.browser_profile_id,
+        start_fresh_browser=workflow_run_request.start_fresh_browser,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         max_elapsed_time_minutes=workflow_run_request.max_elapsed_time_minutes,
         extra_http_headers=workflow_run_request.extra_http_headers,
@@ -597,6 +621,7 @@ async def run_workflow(
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -1738,7 +1763,7 @@ async def require_workflow_tagging(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "apply_workflow_tags"},
     description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
     summary="Apply agent tags",
@@ -1794,7 +1819,7 @@ async def apply_workflow_tags(
     "/workflows/{workflow_permanent_id}/tags/{key}",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_workflow_tag"},
     description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
     summary="Delete agent tag",
     responses={
@@ -1840,7 +1865,7 @@ async def delete_workflow_tag(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_workflow_tags"},
     description="Get the current tag state for a workflow.",
     summary="Get agent tags",
     responses={
@@ -1887,7 +1912,7 @@ async def _build_tags_response(workflow_permanent_id: str, organization_id: str)
     "/workflows/{workflow_permanent_id}/tags/history",
     response_model=TagHistoryResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_workflow_tag_history"},
     description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
     summary="Get agent tag history",
     responses={
@@ -1934,7 +1959,7 @@ async def get_workflow_tag_history(
     "/runs/{workflow_run_id}/tags",
     response_model=RunTagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "apply_run_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "apply_run_tags"},
     description="Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
     summary="Apply run tags",
@@ -1986,7 +2011,7 @@ async def apply_run_tags(
     "/runs/{workflow_run_id}/tags/{key}",
     response_model=RunTagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_run_tag"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_run_tag"},
     description="Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.",
     summary="Delete run tag",
     responses={
@@ -2027,7 +2052,7 @@ async def delete_run_tag(
     "/runs/{workflow_run_id}/tags",
     response_model=RunTagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_run_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tags"},
     description="Get the current tag state for a workflow run.",
     summary="Get run tags",
     responses={
@@ -2071,7 +2096,7 @@ async def _build_run_tags_response(workflow_run_id: str, organization_id: str) -
     "/runs/{workflow_run_id}/tags/history",
     response_model=RunTagHistoryResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_run_tag_history"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tag_history"},
     description="Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.",
     summary="Get run tag history",
     responses={
@@ -2113,7 +2138,7 @@ async def get_run_tag_history(
     "/tag-keys",
     response_model=list[TagKey],
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_tag_keys"},
     description="List all tag keys registered for the organization with their descriptions.",
     summary="List tag keys",
     responses={200: {"description": "Successfully retrieved tag keys"}},
@@ -2135,7 +2160,7 @@ async def list_tag_keys(
     "/tag-keys/{key}",
     response_model=TagKey,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_tag_key"},
     description="Update the description for a tag key.",
     summary="Update tag key",
     responses={
@@ -2172,7 +2197,7 @@ async def update_tag_key(
     "/tag-keys/{key}",
     response_model=TagKeyDeleteResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_tag_key"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_tag_key"},
     description="Delete a tag key from the organization registry and remove that tag from every workflow that "
     "currently has it (cascade). Returns how many workflows the tag was removed from.",
     summary="Delete tag key",
@@ -2212,7 +2237,7 @@ async def delete_tag_key(
     "/tag-values",
     response_model=list[TagValue],
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "list_tag_values"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_tag_values"},
     description="List the palette color and current workflow usage count for each grouped tag (key, value) "
     "for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number "
     "of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
@@ -2239,13 +2264,48 @@ async def list_tag_values(
     ]
 
 
+@legacy_base_router.post("/tag-values", response_model=TagValue, tags=["agent"], include_in_schema=False)
+@legacy_base_router.post("/tag-values/", response_model=TagValue, include_in_schema=False)
+@base_router.post(
+    "/tag-values",
+    response_model=TagValue,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "create_tag_value"},
+    description="Register a grouped tag (key, value) with a palette color before any workflow uses it. "
+    "The label shows a zero workflow count until applied to a workflow.",
+    summary="Create tag value",
+    responses={
+        200: {"description": "Successfully registered tag value"},
+        409: {"description": "Tag value already exists"},
+        422: {"description": "Invalid key, value, or color"},
+    },
+)
+@base_router.post("/tag-values/", response_model=TagValue, include_in_schema=False)
+async def create_tag_value(
+    data: TagValueCreate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValue:
+    analytics.capture("skyvern-oss-tag-value-create")
+    try:
+        row = await app.DATABASE.tags.register_tag_value(
+            organization_id=current_org.organization_id,
+            key=data.key,
+            value=data.value,
+            color=data.color,
+        )
+    except TagValueAlreadyExists as e:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=0)
+
+
 @legacy_base_router.patch("/tag-values/{key}", response_model=TagValue, tags=["agent"], include_in_schema=False)
 @legacy_base_router.patch("/tag-values/{key}/", response_model=TagValue, include_in_schema=False)
 @base_router.patch(
     "/tag-values/{key}",
     response_model=TagValue,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "update_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_tag_value"},
     description="Recolor a grouped tag (key, value). The value is supplied in the body so values "
     "containing '/' stay addressable. The new color must be a palette name.",
     summary="Update tag value color",
@@ -2287,7 +2347,7 @@ async def update_tag_value(
     "/tag-values/{key}/rename",
     response_model=TagValueRenameResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "rename_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "rename_tag_value"},
     description="Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow "
     "carrying the old label; the new label inherits the old color. Both values ride in the body so values "
     "containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
@@ -2338,7 +2398,7 @@ async def rename_tag_value(
     "/tag-values/{key}",
     response_model=TagValueDeleteResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_tag_value"},
     description="Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it "
     "(cascade). The value rides in the body so values containing '/' stay addressable. Returns how many "
     "workflows the label was removed from.",
@@ -2616,6 +2676,44 @@ async def batch_get_run_tags_post(
         )
     tag_map = await _resolve_active_batch_run_ids(run_ids, current_org.organization_id)
     return _build_run_batch_response(run_ids, tag_map)
+
+
+@legacy_base_router.get(
+    "/run-tag-suggestions", response_model=RunTagSuggestionsResponse, tags=["agent"], include_in_schema=False
+)
+@legacy_base_router.get("/run-tag-suggestions/", response_model=RunTagSuggestionsResponse, include_in_schema=False)
+@base_router.get(
+    "/run-tag-suggestions",
+    response_model=RunTagSuggestionsResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tag_suggestions"},
+    description="List distinct (key, value) pairs ever set on a run for the organization, sourced from the "
+    "run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys "
+    "(which are never registered) so pickers can offer them alongside user-defined tags.",
+    summary="List run tag suggestions",
+    responses={200: {"description": "Successfully retrieved run tag suggestions"}},
+)
+@base_router.get("/run-tag-suggestions/", response_model=RunTagSuggestionsResponse, include_in_schema=False)
+async def get_run_tag_suggestions(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagSuggestionsResponse:
+    organization_id = current_org.organization_id
+    pairs = await app.DATABASE.tags.get_run_tag_suggestions(organization_id=organization_id)
+    keys: list[str] = []
+    values_by_key: dict[str, list[str]] = {}
+    labels: list[str] = []
+    for key, value in pairs:
+        if value is None:
+            continue
+        if key is None:
+            labels.append(value)
+            continue
+        if key not in values_by_key:
+            keys.append(key)
+            values_by_key[key] = []
+        values_by_key[key].append(value)
+    return RunTagSuggestionsResponse(keys=keys, values_by_key=values_by_key, labels=labels)
 
 
 @legacy_base_router.post(
@@ -2994,6 +3092,47 @@ async def get_artifact_content(
         media_type=media_type,
         headers=headers,
     )
+
+
+@base_router.get(
+    "/artifacts/{artifact_id}/signed-url",
+    tags=["Artifacts"],
+    response_model=ArtifactSignedUrl,
+    description="Mint a fresh short-lived URL for the artifact's content, for use at the point of consumption.",
+    summary="Mint a short-lived artifact content URL",
+    responses={
+        200: {"description": "Freshly minted content URL"},
+        404: {"description": "Artifact not found or content unavailable"},
+    },
+    # Kept out of the public OpenAPI schema until the Fern SDK deliberately adopts it.
+    include_in_schema=False,
+)
+@base_router.get("/artifacts/{artifact_id}/signed-url/", response_model=ArtifactSignedUrl, include_in_schema=False)
+async def get_artifact_signed_url(
+    artifact_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ArtifactSignedUrl:
+    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
+        artifact_id=artifact_id,
+        organization_id=current_org.organization_id,
+    )
+    if not artifact:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    signed_url = await app.ARTIFACT_MANAGER.resolve_share_url(
+        artifact,
+        expiry_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    )
+    if not signed_url:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
+    expiry_values = parse_qs(urlparse(signed_url).query).get("expiry")
+    expires_at = int(expiry_values[0]) if expiry_values else None
+    return ArtifactSignedUrl(artifact_id=artifact_id, signed_url=signed_url, expires_at=expires_at)
 
 
 @base_router.get(
@@ -3463,30 +3602,6 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
 
 
-def _workflow_request_body_from_existing_run(
-    workflow_run: WorkflowRun,
-    parameters: dict[str, Any] | None = None,
-    run_metadata: dict[str, str] | None = None,
-) -> WorkflowRequestBody:
-    return WorkflowRequestBody(
-        data=parameters,
-        proxy_location=workflow_run.proxy_location,
-        webhook_callback_url=workflow_run.webhook_callback_url,
-        totp_verification_url=workflow_run.totp_verification_url,
-        totp_identifier=workflow_run.totp_identifier,
-        browser_session_id=workflow_run.browser_session_id,
-        browser_profile_id=workflow_run.browser_profile_id,
-        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_run, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_run.extra_http_headers,
-        cdp_connect_headers=workflow_run.cdp_connect_headers,
-        browser_address=workflow_run.browser_address,
-        run_with=workflow_run.run_with,
-        ai_fallback=workflow_run.ai_fallback,
-        run_metadata=run_metadata,
-    )
-
-
 def _workflow_run_request_from_workflow_request(
     *,
     workflow_id: str,
@@ -3503,6 +3618,7 @@ def _workflow_run_request_from_workflow_request(
         totp_identifier=workflow_request.totp_identifier,
         browser_session_id=workflow_request.browser_session_id,
         browser_profile_id=workflow_request.browser_profile_id,
+        start_fresh_browser=workflow_request.start_fresh_browser,
         max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
         max_elapsed_time_minutes=getattr(workflow_request, "max_elapsed_time_minutes", None),
         extra_http_headers=workflow_request.extra_http_headers,
@@ -3617,7 +3733,7 @@ async def retry_workflow_run(
             organization_id=current_org.organization_id,
             exc_info=True,
         )
-    legacy_workflow_request = _workflow_request_body_from_existing_run(
+    legacy_workflow_request = workflow_service.workflow_request_body_from_existing_run(
         workflow_run=original_workflow_run,
         parameters=original_workflow_run_parameters,
         run_metadata=original_run_metadata,
@@ -3672,6 +3788,7 @@ async def retry_workflow_run(
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -3856,6 +3973,76 @@ async def get_runs(
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
+_MAX_TAG_FILTER_TERMS = 20
+
+
+def _parse_tag_filter_terms(tags: list[str] | None) -> list[tuple[str | None, str | None]]:
+    """Parse a repeated/comma-separated ``tags`` query param into (key, value) filter terms.
+
+    Shared by ``get_runs_v2``, ``get_workflow_runs_by_id``, and ``get_workflows``. Each term is a
+    label (``production`` -> ``(None, "production")``), a group wildcard (``env:*`` -> ``("env", None)``),
+    or an exact group:label (``env:prod`` -> ``("env", "prod")``); malformed terms raise a 400.
+
+    Terms are deduplicated, then capped at ``_MAX_TAG_FILTER_TERMS`` (400 beyond it): the
+    ``Query(max_length=20)`` on callers only bounds repeated params, not the comma-split
+    expansion, and each distinct term becomes its own AND'd subquery.
+    """
+    # A lone empty value (?tags= with nothing else) is a no-op for backward
+    # compat; any blank segment alongside real ones — comma (env:prod,) or
+    # repeated (tags=env:prod&tags=) — is malformed, so both encodings 400 alike.
+    tag_groups = tags or []
+    if tag_groups == [""]:
+        tag_groups = []
+    # Split on the FIRST colon: no colon -> value-only (None, value); value `*` ->
+    # group-only (key, None); else exact (key, value), whose value may contain colons.
+    invalid_term_detail = "expected 'label', 'key:*', or 'key:value'"
+    parsed_tags: list[tuple[str | None, str | None]] = []
+    for raw_group in tag_groups:
+        for raw_term in raw_group.split(","):
+            term = raw_term.strip()
+            if not term:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid tag filter; empty term.",
+                )
+            tag_key, sep, tag_value = term.partition(":")
+            if not sep:
+                parsed_tags.append((None, term))
+                continue
+            tag_key, tag_value = tag_key.strip(), tag_value.strip()
+            if not tag_key:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
+                )
+            if tag_value == "*":
+                parsed_tags.append((tag_key, None))
+            elif not tag_value:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
+                )
+            else:
+                parsed_tags.append((tag_key, tag_value))
+    deduped_tags = list(dict.fromkeys(parsed_tags))
+    if len(deduped_tags) > _MAX_TAG_FILTER_TERMS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"Too many tag filter terms; at most {_MAX_TAG_FILTER_TERMS} distinct terms are allowed.",
+        )
+    return deduped_tags
+
+
+async def _parse_and_gate_tag_filter_terms(
+    tags: list[str] | None,
+    current_org: Organization,
+) -> list[tuple[str | None, str | None]]:
+    parsed_tags = _parse_tag_filter_terms(tags)
+    if parsed_tags:
+        await require_workflow_tagging(current_org)
+    return parsed_tags
+
+
 # NOTE: v2 returns TaskRunListItem from the unified task_runs table,
 # replacing the v1 response type (list[WorkflowRun | Task]) which
 # merged two separate queries. The v1 endpoint is preserved for
@@ -3886,13 +4073,37 @@ async def get_runs_v2(
         examples=["login_url", "wr_abc123"],
     ),
     run_type: Annotated[list[RunType] | None, Query()] = None,
+    workflow_permanent_id: Annotated[
+        list[str] | None,
+        Query(
+            max_length=50,
+            description="Filter to runs of these workflows (agents). Repeat the param to include multiple.",
+        ),
+    ] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by run tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
+                "Matches current tag values only."
+            ),
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
+        ),
+    ] = None,
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
-    if search_key and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
+    if (search_key or workflow_permanent_id) and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=f"Search pagination is limited to the first {MAX_SEARCH_FETCH_LIMIT} matches. Use a narrower search.",
         )
+
+    run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
     rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
         current_org.organization_id,
@@ -3901,6 +4112,8 @@ async def get_runs_v2(
         status=[s.value for s in status] if status else None,
         search_key=search_key,
         run_type=[r.value for r in run_type] if run_type else None,
+        workflow_permanent_ids=workflow_permanent_id,
+        run_tags=run_tags or None,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
     return ORJSONResponse([item.model_dump(mode="json") for item in items])
@@ -4246,6 +4459,7 @@ async def _get_workflow_runs_by_id(
     exclude_child_runs: bool,
     created_at_start: datetime | None = None,
     created_at_end: datetime | None = None,
+    run_tags: Sequence[tuple[str | None, str | None]] | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -4259,6 +4473,7 @@ async def _get_workflow_runs_by_id(
         exclude_child_runs=exclude_child_runs,
         created_at_start=created_at_start,
         created_at_end=created_at_end,
+        run_tags=run_tags,
     )
 
 
@@ -4311,14 +4526,31 @@ async def get_workflow_runs_by_id(
         datetime | None,
         Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by run tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
+                "Matches current tag values only."
+            ),
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     List runs for a specific workflow permanent id.
 
     The public API excludes child workflow runs so workflow histories only show top-level runs.
-    All filters (**status**, **search_key**, **error_code**) are combined with AND logic.
+    All filters (**status**, **search_key**, **error_code**, **tags**) are combined with AND logic.
     """
+    run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
+
     return await _get_workflow_runs_by_id(
         workflow_id=workflow_id,
         organization_id=current_org.organization_id,
@@ -4330,6 +4562,7 @@ async def get_workflow_runs_by_id(
         created_at_start=created_at_start,
         created_at_end=created_at_end,
         exclude_child_runs=True,
+        run_tags=run_tags or None,
     )
 
 
@@ -4382,13 +4615,31 @@ async def get_workflow_runs_by_id_legacy(
         datetime | None,
         Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by run tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
+                "Matches current tag values only."
+            ),
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     List runs for a specific workflow permanent id using legacy endpoint behavior.
 
-    Legacy callers keep seeing child workflow runs to avoid changing existing API behavior.
+    Legacy callers keep seeing child workflow runs to avoid changing existing API behavior,
+    including when a ``tags`` filter is active (child runs matching the filter stay visible).
     """
+    run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
+
     return await _get_workflow_runs_by_id(
         workflow_id=workflow_id,
         organization_id=current_org.organization_id,
@@ -4400,6 +4651,7 @@ async def get_workflow_runs_by_id_legacy(
         created_at_start=created_at_start,
         created_at_end=created_at_end,
         exclude_child_runs=False,
+        run_tags=run_tags or None,
     )
 
 
@@ -4619,49 +4871,7 @@ async def get_workflows(
     # Default to published and draft if no status filter provided
     effective_statuses = status if status else [WorkflowStatus.published, WorkflowStatus.draft]
 
-    # A lone empty value (?tags= with nothing else) is a no-op for backward
-    # compat; any blank segment alongside real ones — comma (env:prod,) or
-    # repeated (tags=env:prod&tags=) — is malformed, so both encodings 400 alike.
-    tag_groups = tags or []
-    if tag_groups == [""]:
-        tag_groups = []
-    # Split on the FIRST colon: no colon -> value-only (None, value); value `*` ->
-    # group-only (key, None); else exact (key, value), whose value may contain colons.
-    invalid_term_detail = "expected 'label', 'key:*', or 'key:value'"
-    workflow_tags: list[tuple[str | None, str | None]] = []
-    for raw_group in tag_groups:
-        for raw_term in raw_group.split(","):
-            term = raw_term.strip()
-            if not term:
-                raise HTTPException(
-                    status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid tag filter; empty term.",
-                )
-            tag_key, sep, tag_value = term.partition(":")
-            if not sep:
-                workflow_tags.append((None, term))
-                continue
-            tag_key, tag_value = tag_key.strip(), tag_value.strip()
-            if not tag_key:
-                raise HTTPException(
-                    status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
-                )
-            if tag_value == "*":
-                workflow_tags.append((tag_key, None))
-            elif not tag_value:
-                raise HTTPException(
-                    status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
-                )
-            else:
-                workflow_tags.append((tag_key, tag_value))
-
-    if workflow_tags and not await app.AGENT_FUNCTION.is_workflow_tagging_enabled(current_org.organization_id):
-        raise HTTPException(
-            status_code=http_status.HTTP_403_FORBIDDEN,
-            detail="Workflow tagging is not enabled for this organization.",
-        )
+    workflow_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
     if template and workflow_tags:
         # Templates are global; tags are org-scoped, so the two can't combine.

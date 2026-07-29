@@ -4,10 +4,11 @@ import inspect
 
 import pytest
 
+import skyvern.cli.mcp_tools._common as mcp_common
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.cli.mcp_tools.inspection import skyvern_get_html
-from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT
+from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT, EXTRACT_DATA_CONTENT
 from skyvern.cli.mcp_tools.session import skyvern_browser_session_create, skyvern_browser_session_list
 from skyvern.cli.mcp_tools.workflow import (
     skyvern_workflow_create,
@@ -39,6 +40,19 @@ def test_mcp_instructions_guide_text_prompt_defaults() -> None:
     assert "skyvern_observe" in mcp.instructions
 
 
+def test_workflow_create_guides_code_only_policy() -> None:
+    assert mcp_common.CODE_ONLY_SCHEMA_GUIDANCE in (skyvern_workflow_create.__doc__ or "")
+
+
+def test_mcp_instructions_guide_code_only_policy() -> None:
+    assert mcp_common.CODE_ONLY_SCHEMA_GUIDANCE in mcp.instructions
+
+
+def test_workflow_prompts_guide_code_only_policy_at_each_authoring_surface() -> None:
+    assert BUILD_WORKFLOW_CONTENT.count(mcp_common.CODE_ONLY_SCHEMA_GUIDANCE) == 2
+    assert EXTRACT_DATA_CONTENT.count(mcp_common.CODE_ONLY_SCHEMA_GUIDANCE) == 1
+
+
 @pytest.mark.asyncio
 async def test_expected_prompts_registered() -> None:
     prompts = await mcp.list_prompts()
@@ -57,6 +71,26 @@ async def test_text_prompt_block_schema_example_omits_raw_llm_key() -> None:
     assert "model" not in result["data"]["example"]
 
 
+@pytest.mark.asyncio
+async def test_code_block_schema_advertises_goal_prompt() -> None:
+    """The MCP contract must steer clients to put each code block's plain-language goal in `prompt`
+    (rendered as the block's Goal), so MCP input reaches the Goal field (SKY-12954)."""
+    result = await skyvern_block_schema(block_type="code")
+
+    assert result["ok"] is True
+    example = result["data"]["example"]
+    assert example["block_type"] == "code"
+    assert example["prompt"]
+    properties = result["data"]["schema"]["properties"]
+    assert "goal" in properties["prompt"]["description"].lower()
+    assert properties["steps"]["description"]
+
+
+def test_workflow_create_guides_code_block_goal_prompt() -> None:
+    assert "plain-language goal" in (skyvern_workflow_create.__doc__ or "")
+    assert "plain-language goal" in (skyvern_workflow_update.__doc__ or "")
+
+
 # --- Tool-routing hints in tool descriptions (mechanism (c): wrong-tool / missing-arg calls) ---
 # These guard the cross-references that steer an MCP client to the right tool. Tool names are stable
 # API identifiers, so asserting they appear in the routing docstrings is a contract check, not prose.
@@ -66,6 +100,8 @@ def test_workflow_get_routes_search_and_browse_to_workflow_list() -> None:
     """get fetches ONE workflow by known id; search/browse/paginate belong on workflow_list (SKY-12087/89/90/91)."""
     doc = skyvern_workflow_get.__doc__ or ""
     assert "skyvern_workflow_list" in doc
+    assert "skyvern workflow get --id <wpid> --definition-file wf.json" in doc
+    assert "skyvern workflow update --id <wpid> --definition @wf.json" in doc
     params = inspect.signature(skyvern_workflow_get).parameters
     assert params["workflow_id"].default is inspect.Parameter.empty
 
@@ -82,6 +118,8 @@ def test_workflow_update_keeps_serialized_definition() -> None:
     """update takes the whole workflow serialized into `definition`; flat fields are rejected (SKY-12072)."""
     doc = skyvern_workflow_update.__doc__ or ""
     assert "definition" in doc
+    assert "skyvern workflow get --id <wpid> --definition-file wf.json" in doc
+    assert "skyvern workflow update --id <wpid> --definition @wf.json" in doc
     params = inspect.signature(skyvern_workflow_update).parameters
     assert params["definition"].default is inspect.Parameter.empty
 

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
     TagCountLimitExceeded,
     TagsRepository,
+    TagValueAlreadyExists,
     TagValueRenameCollision,
 )
 from skyvern.forge.sdk.workflow.models.tags import (
@@ -1372,4 +1373,147 @@ async def test_delete_tag_value_then_reapply_reregisters(repo: TagsRepository) -
         "wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), colors={"env": "green"}
     )
     assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "prod"}
+    assert [(v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("prod", "green")]
+
+
+def _system_ctx() -> TagWriteContext:
+    return TagWriteContext(
+        caller_id="system:test",
+        source=TagSource.SYSTEM,
+        caller_type=CallerType.SYSTEM,
+    )
+
+
+async def _seed_system_run_tag(repo: TagsRepository) -> None:
+    await _seed_workflow_run(repo, WRID)
+    await repo.apply_system_run_tag_changes(
+        workflow_run_id=WRID,
+        organization_id=ORG_ID,
+        sets={"skyvern.platform": "web"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_recolor_tag_value_rejects_reserved_key(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    with pytest.raises(ValueError, match="reserved"):
+        await repo.recolor_tag_value(ORG_ID, "skyvern.platform", "web", "pink")
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_rejects_reserved_key_with_user_provenance(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    with pytest.raises(ValueError, match="reserved"):
+        await repo.delete_tag_value(ORG_ID, "skyvern.platform", "web", _ctx())
+
+    # The system tag is untouched and no user-provenance event leaked into the log.
+    assert await repo.get_active_grouped_tags_for_run(WRID, ORG_ID) == {"skyvern.platform": "web"}
+    assert all(row.source == TagSource.SYSTEM.value for row in await _all_run_events(repo))
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_rejects_reserved_key_with_user_provenance(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    with pytest.raises(ValueError, match="reserved"):
+        await repo.rename_tag_value(ORG_ID, "skyvern.platform", "web", "browser", _ctx())
+
+    assert await repo.get_active_grouped_tags_for_run(WRID, ORG_ID) == {"skyvern.platform": "web"}
+    assert all(row.source == TagSource.SYSTEM.value for row in await _all_run_events(repo))
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_value_allows_reserved_key_with_system_provenance(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    removed = await repo.delete_tag_value(ORG_ID, "skyvern.platform", "web", _system_ctx())
+
+    assert removed is not None
+    assert removed.removed_from_run_count == 1
+    assert await repo.get_active_grouped_tags_for_run(WRID, ORG_ID) == {}
+
+
+@pytest.mark.asyncio
+async def test_rename_tag_value_allows_reserved_key_with_system_provenance(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    result = await repo.rename_tag_value(ORG_ID, "skyvern.platform", "web", "browser", _system_ctx())
+
+    assert result is not None
+    assert await repo.get_active_grouped_tags_for_run(WRID, ORG_ID) == {"skyvern.platform": "browser"}
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_rejects_reserved_key_with_user_provenance(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    with pytest.raises(ValueError, match="reserved"):
+        await repo.delete_tag_key(ORG_ID, "skyvern.platform", _ctx())
+
+    assert await repo.get_active_grouped_tags_for_run(WRID, ORG_ID) == {"skyvern.platform": "web"}
+    assert all(row.source == TagSource.SYSTEM.value for row in await _all_run_events(repo))
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_allows_reserved_key_with_system_provenance(repo: TagsRepository) -> None:
+    await _seed_system_run_tag(repo)
+
+    removed = await repo.delete_tag_key(ORG_ID, "skyvern.platform", _system_ctx())
+
+    assert removed is not None
+    assert removed.removed_from_run_count == 1
+    assert await repo.get_active_grouped_tags_for_run(WRID, ORG_ID) == {}
+
+
+@pytest.mark.asyncio
+async def test_register_tag_value_registers_color_row_and_key(repo: TagsRepository) -> None:
+    row = await repo.register_tag_value(ORG_ID, "env", "prod", "blue")
+
+    assert row is not None
+    assert (row.key, row.value, row.color) == ("env", "prod", "blue")
+    assert [(v.key, v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("env", "prod", "blue")]
+    # The group participates in the key registry (pickers/descriptions) too.
+    assert await _registered_keys(repo) == ["env"]
+
+
+@pytest.mark.asyncio
+async def test_register_tag_value_assigns_random_color_when_none(repo: TagsRepository) -> None:
+    row = await repo.register_tag_value(ORG_ID, "env", "prod", None)
+
+    assert row is not None
+    assert row.color in TAG_COLOR_PALETTE
+
+
+@pytest.mark.asyncio
+async def test_register_tag_value_writes_no_tag_events(repo: TagsRepository) -> None:
+    await repo.register_tag_value(ORG_ID, "env", "prod", "blue")
+
+    assert await _all_events(repo) == []
+    assert await _all_run_events(repo) == []
+
+
+@pytest.mark.asyncio
+async def test_register_tag_value_conflicts_when_already_registered(repo: TagsRepository) -> None:
+    await repo.register_tag_value(ORG_ID, "env", "prod", "blue")
+
+    with pytest.raises(TagValueAlreadyExists):
+        await repo.register_tag_value(ORG_ID, "env", "prod", "red")
+
+
+@pytest.mark.asyncio
+async def test_register_tag_value_rejects_reserved_key(repo: TagsRepository) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        await repo.register_tag_value(ORG_ID, "skyvern.platform", "web", "blue")
+
+
+@pytest.mark.asyncio
+async def test_register_tag_value_reuses_soft_deleted_pair(repo: TagsRepository) -> None:
+    await repo.register_tag_value(ORG_ID, "env", "prod", "blue")
+    await repo.delete_tag_value(ORG_ID, "env", "prod", _ctx())
+
+    row = await repo.register_tag_value(ORG_ID, "env", "prod", "green")
+
+    assert row is not None
     assert [(v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("prod", "green")]

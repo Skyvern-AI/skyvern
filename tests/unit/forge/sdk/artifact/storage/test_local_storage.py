@@ -1,3 +1,6 @@
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 from freezegun import freeze_time
 
@@ -105,3 +108,17 @@ class TestLocalStorageBuildURIs:
             uri
             == f"file://{local_storage.artifact_path}/{settings.ENV}/{TEST_ORGANIZATION_ID}/ai_suggestions/{TEST_AI_SUGGESTION_ID}/2025-06-09T12:00:00_artifact123_screenshot_llm.png"
         )
+
+
+@pytest.mark.asyncio
+async def test_delete_browser_profile_hard_delete_raises_on_failure(
+    local_storage: LocalStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path))
+    (tmp_path / TEST_ORGANIZATION_ID / "profiles" / "bp_1").mkdir(parents=True)
+    with patch("skyvern.forge.sdk.artifact.storage.local.shutil.rmtree", side_effect=OSError("disk")):
+        # hard_delete surfaces the failure so the caller reports reap_failed, not a false erasure.
+        with pytest.raises(OSError):
+            await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=True)
+        # default delete stays best-effort (swallowed).
+        await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=False)

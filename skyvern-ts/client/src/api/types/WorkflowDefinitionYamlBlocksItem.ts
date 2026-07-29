@@ -7,6 +7,7 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Code
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Conditional
     | Skyvern.WorkflowDefinitionYamlBlocksItem.DownloadToS3
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.EmailInbox
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Extraction
     | Skyvern.WorkflowDefinitionYamlBlocksItem.FileDownload
     | Skyvern.WorkflowDefinitionYamlBlocksItem.FileUpload
@@ -19,9 +20,11 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.HumanInteraction
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Login
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Navigation
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.PdfFill
     | Skyvern.WorkflowDefinitionYamlBlocksItem.PdfParser
     | Skyvern.WorkflowDefinitionYamlBlocksItem.PrintPage
     | Skyvern.WorkflowDefinitionYamlBlocksItem.SendEmail
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.SplitPdf
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Task
     | Skyvern.WorkflowDefinitionYamlBlocksItem.TaskV2
     | Skyvern.WorkflowDefinitionYamlBlocksItem.TextPrompt
@@ -46,6 +49,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3BlockYaml {
         block_type: "download_to_s3";
+    }
+
+    export interface EmailInbox extends Skyvern.EmailInboxBlockYaml {
+        block_type: "email_inbox";
     }
 
     export interface Extraction extends Skyvern.ExtractionBlockYaml {
@@ -96,6 +103,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
         block_type: "navigation";
     }
 
+    export interface PdfFill extends Skyvern.PdfFillBlockYaml {
+        block_type: "pdf_fill";
+    }
+
     export interface PdfParser extends Skyvern.PdfParserBlockYaml {
         block_type: "pdf_parser";
     }
@@ -106,6 +117,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface SendEmail extends Skyvern.SendEmailBlockYaml {
         block_type: "send_email";
+    }
+
+    export interface SplitPdf extends Skyvern.SplitPdfBlockYaml {
+        block_type: "split_pdf";
     }
 
     export interface Task extends Skyvern.TaskBlockYaml {

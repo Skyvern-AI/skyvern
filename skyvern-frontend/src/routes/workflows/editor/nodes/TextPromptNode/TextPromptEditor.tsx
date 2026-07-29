@@ -48,7 +48,7 @@ function TextPromptEditorBody({
     <div data-testid="text-prompt-block-form" className="space-y-4 p-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Prompt</Label>
+          <Label className="text-xs text-tertiary-foreground">Prompt</Label>
           <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea

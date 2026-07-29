@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -9,21 +10,29 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     FailedToTakeScreenshot,
     NoElementFound,
     ScrapingFailed,
     ScrapingFailedBlankPage,
+    ScreenshotTargetClosed,
+    SkyvernPageAnalysisTimeout,
     UnknownElementTreeFormat,
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
+from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.experimentation.transient_ui_capture import (
+    decide_transient_ui_suppression,
+    emit_transient_ui_popup_telemetry,
+    transient_ui_capture_arm,
+)
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import (
@@ -34,15 +43,22 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapeExcludeFunc,
     json_to_html,
 )
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
+
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
 
 
-async def build_scraping_failed_reason(browser_state: BrowserState, requested_url: str) -> str:
+async def build_scraping_failed_reason(
+    browser_state: BrowserState, requested_url: str, *, timed_out: bool = False
+) -> str:
     """Build the user-facing ScrapingFailed reason with the requested URL plus the landed URL when they differ.
 
     Query strings are stripped because OAuth/SSO URLs commonly carry secrets in query params.
+    ``timed_out`` keeps the word "timeout" in the reason so failure_classifier routes page-analysis
+    timeouts to PAGE_LOAD_TIMEOUT instead of lumping them into DATA_EXTRACTION_FAILURE.
     """
     safe_requested = strip_query_params(requested_url)
     safe_landed: str | None = None
@@ -55,13 +71,40 @@ async def build_scraping_failed_reason(browser_state: BrowserState, requested_ur
     except Exception:
         LOG.debug("Could not resolve landed URL for ScrapingFailed reason", exc_info=True)
 
-    base = (
-        "Skyvern failed to load the website. "
-        "The page may have navigated unexpectedly or become unresponsive during analysis."
-    )
+    if timed_out:
+        base = (
+            "Skyvern hit a page-analysis timeout while loading the website. "
+            "The page took too long to load or become responsive during analysis."
+        )
+    else:
+        base = (
+            "Skyvern failed to load the website. "
+            "The page may have navigated unexpectedly or become unresponsive during analysis."
+        )
     if safe_landed and safe_landed != safe_requested and safe_landed not in {"about:blank", ""}:
         return f"{base} Requested URL: {safe_requested}. Current URL: {safe_landed}."
     return f"{base} URL: {safe_requested}."
+
+
+def _is_page_analysis_timeout(engine_selection: "BrowserEngineSelection | None", error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout attributable to THIS run's selected browser engine.
+
+    The Skyvern-owned analyzer deadline (``SkyvernPageAnalysisTimeout``) is always a page-analysis
+    timeout; otherwise the driver-native decision routes through the per-run engine selection so a run
+    pinned to a non-Playwright engine recognizes its native timeout while a foreign driver's timeout is
+    rejected. Falls back to the stock Playwright timeout identity when no engine is pinned (callers or
+    states built outside the per-run engine seam).
+    """
+    if isinstance(error, SkyvernPageAnalysisTimeout):
+        return True
+    if engine_selection is not None:
+        return engine_selection.is_engine_timeout_error(error)
+    return isinstance(error, TimeoutError)
+
+
+def _scrape_timed_out(browser_state: BrowserState, error: BaseException) -> bool:
+    """Whether ``error`` is a page-analysis timeout from THIS run's selected browser engine."""
+    return _is_page_analysis_timeout(browser_state.engine_selection, error)
 
 
 RESERVED_ATTRIBUTES = {
@@ -125,19 +168,6 @@ BASE64_INCLUDE_ATTRIBUTES = {
     "srcset",
     "icon",
 }
-
-
-def load_js_script() -> str:
-    # TODO: Handle file location better. This is a hacky way to find the file location.
-    path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
-    try:
-        # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
-        # This will allow our code to be type safe.
-        with open(path) as f:
-            return f.read()
-    except FileNotFoundError as e:
-        LOG.exception("Failed to load the JS script", path=path)
-        raise e
 
 
 JS_FUNCTION_DEFS = load_js_script()
@@ -204,6 +234,7 @@ async def scrape_website(
     support_empty_page: bool = False,
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
+    allow_transient_ui_suppression: bool = False,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -240,12 +271,19 @@ async def scrape_website(
             support_empty_page=support_empty_page,
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
+            allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
     except ScrapingFailedBlankPage:
         raise
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > max_retries:
+            if isinstance(e, ScreenshotTargetClosed):
+                # Expected teardown/site-initiated close, and this log is duplicative either way: a
+                # caller with strategies left treats it as retryable, and one out of attempts logs
+                # its own terminal record.
+                LOG.warning("Scraping stopped because the browser target closed", url=url)
+                raise e
             LOG.error(
                 "Scraping failed after max retries, aborting.",
                 max_retries=max_retries,
@@ -256,7 +294,11 @@ async def scrape_website(
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
-                raise ScrapingFailed(reason=await build_scraping_failed_reason(browser_state, url)) from e
+                raise ScrapingFailed(
+                    reason=await build_scraping_failed_reason(
+                        browser_state, url, timed_out=_scrape_timed_out(browser_state, e)
+                    )
+                ) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
         await asyncio.sleep(0.5)
         return await scrape_website(
@@ -271,6 +313,7 @@ async def scrape_website(
             max_screenshot_number=max_screenshot_number,
             scroll=scroll,
             must_included_tags=must_included_tags,
+            allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
 
 
@@ -398,6 +441,7 @@ async def scrape_web_unsafe(
     support_empty_page: bool = False,
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
+    allow_transient_ui_suppression: bool = False,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -439,13 +483,15 @@ async def scrape_web_unsafe(
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-    elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
+    elements, element_tree, destinations = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
     empty_page_retry = False
     if not elements and not support_empty_page:
         LOG.warning("No elements found on the page, wait and retry")
         await empty_page_retry_wait()
         empty_page_retry = True
-        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
+        elements, element_tree, destinations = await get_interactable_element_tree(
+            page, scrape_exclude, must_included_tags
+        )
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
@@ -455,9 +501,26 @@ async def scrape_web_unsafe(
         element_tree_trimmed_html_str = "".join(
             json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
         )
-        token_count = count_tokens(element_tree_trimmed_html_str)
+        token_count = approx_count_tokens(element_tree_trimmed_html_str)
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
+
+        # Shadow-detect an open transient popup only on the agent-step scrape (opt-in via
+        # allow_transient_ui_suppression); goal-verification / extraction / error-detection scrapes
+        # keep legacy scrolling. Only the treatment arm suppresses the scroll so the popup survives
+        # into the just-built tree's next action, and only up to a bounded number of consecutive
+        # captures so a stale expanded trigger cannot pin the run at one viewport.
+        popup_trigger: dict | None = None
+        transient_ui_ctx = skyvern_context.current()
+        arm = transient_ui_capture_arm(transient_ui_ctx)
+        suppress_scroll = False
+        suppression_capped = False
+        if allow_transient_ui_suppression and scroll and arm != "off":
+            popup_trigger = await skyvern_frame.get_open_aria_popup_trigger()
+            decision = decide_transient_ui_suppression(transient_ui_ctx, arm, detected=popup_trigger is not None)
+            suppress_scroll = decision.suppress
+            suppression_capped = decision.capped
+        effective_scroll = scroll and not suppress_scroll
 
         # get current x, y position of the page
         x: int | None = None
@@ -469,7 +532,7 @@ async def scrape_web_unsafe(
             LOG.warning("Failed to get current x, y position of the page", exc_info=True)
 
         _tracer = otel_trace.get_tracer("skyvern")
-        with _tracer.start_as_current_span("skyvern.browser.scrape_screenshot") as _ss_span:
+        with traced_span(_tracer, "skyvern.browser.scrape_screenshot") as _ss_span:
             apply_context_attrs(_ss_span)
             # Hardcoded since this is an inline span, not a @traced method.
             # Update if scrape_web_unsafe is renamed.
@@ -478,26 +541,31 @@ async def scrape_web_unsafe(
             _ss_span.set_attribute("max_screenshot_number", max_screenshot_number)
             _ss_span.set_attribute("draw_boxes", draw_boxes)
             _ss_span.set_attribute("scroll", scroll)
+            _ss_span.set_attribute("effective_scroll", effective_scroll)
+            if arm != "off":
+                _ss_span.set_attribute("transient_ui_arm", arm)
+            if popup_trigger is not None:
+                _ss_span.set_attribute("transient_ui_detected", True)
+                emit_transient_ui_popup_telemetry(_ss_span, popup_trigger)
+                if suppress_scroll:
+                    _ss_span.set_attribute("transient_ui_scroll_suppressed", True)
+                if suppression_capped:
+                    _ss_span.set_attribute("transient_ui_suppression_capped", True)
             _scrape_ctx = skyvern_context.current()
             if _scrape_ctx:
                 if _scrape_ctx.scrape_trigger:
                     _ss_span.set_attribute("scrape_trigger", _scrape_ctx.scrape_trigger)
                 if _scrape_ctx.scrape_screenshots_consumed is not None:
                     _ss_span.set_attribute("screenshots_consumed", _scrape_ctx.scrape_screenshots_consumed)
-            try:
-                screenshots = await SkyvernFrame.take_split_screenshots(
-                    page=page,
-                    url=url,
-                    draw_boxes=draw_boxes,
-                    max_number=max_screenshot_number,
-                    scroll=scroll,
-                )
-                _ss_span.set_attribute("screenshot_count", len(screenshots))
-                _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
-            except Exception as e:
-                _ss_span.record_exception(e)
-                _ss_span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
-                raise
+            screenshots = await SkyvernFrame.take_split_screenshots(
+                page=page,
+                url=url,
+                draw_boxes=draw_boxes,
+                max_number=max_screenshot_number,
+                scroll=effective_scroll,
+            )
+            _ss_span.set_attribute("screenshot_count", len(screenshots))
+            _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
 
         # scroll back to the original x, y position of the page
         if x is not None and y is not None:
@@ -540,6 +608,10 @@ async def scrape_web_unsafe(
         screenshots=screenshots,
         id_to_frame_dict=id_to_frame_dict,
         empty_page_retry=empty_page_retry,
+    )
+
+    advance_observation_epoch(
+        page, main_frame_url=page.main_frame.url, element_hashes=id_to_element_hash, destinations=destinations
     )
 
     return ScrapedPage(
@@ -594,7 +666,14 @@ async def filter_frames(
             filtered_frames.append(frame)
             continue
 
-        decision = await scrape_exclude(frame.page, frame)
+        try:
+            frame_page = frame.page
+        except AssertionError:
+            # Playwright's Frame.page asserts self._page; a frame can detach between
+            # the is_detached() check above and here, leaving _page unset.
+            continue
+
+        decision = await scrape_exclude(frame_page, frame)
         if decision.placeholder is not None and decision.placeholder not in placeholder_nodes:
             placeholder_nodes.append(decision.placeholder)
         if decision.exclude:
@@ -609,6 +688,7 @@ async def add_frame_interactable_elements(
     frame_index: int,
     elements: list[dict],
     element_tree: list[dict],
+    destinations: dict[str, dict],
     must_included_tags: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -639,9 +719,10 @@ async def add_frame_interactable_elements(
         skyvern_frame = await SkyvernFrame.create_instance(frame)
         await _wait_for_scrape_ready(skyvern_frame)
 
-        frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
+        frame_elements, frame_element_tree, frame_destinations = await skyvern_frame.build_tree_from_body(
             frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags
         )
+        destinations.update(frame_destinations)
 
         for element in elements:
             if element["id"] == skyvern_id:
@@ -659,15 +740,16 @@ async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     must_included_tags: list[str] | None = None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict[str, dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
-    :return: Tuple containing the element tree and a map of element IDs to elements.
+    :return: Tuple of the interactable elements, the element tree, and the per-element
+        destination-facts sidecar stripped out of them at the SkyvernFrame boundary.
     """
     # main page index is 0
     skyvern_page = await SkyvernFrame.create_instance(page)
-    elements, element_tree = await skyvern_page.build_tree_from_body(
+    elements, element_tree, destinations = await skyvern_page.build_tree_from_body(
         frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
     )
 
@@ -691,6 +773,7 @@ async def get_interactable_element_tree(
             frame_index,
             elements,
             element_tree,
+            destinations,
             must_included_tags,
         )
 
@@ -699,17 +782,24 @@ async def get_interactable_element_tree(
     # element tree only — never ``elements`` — so they can never become a click target.
     element_tree.extend(placeholder_nodes)
 
-    return elements, element_tree
+    return elements, element_tree, destinations
 
 
 class IncrementalScrapePage(ElementTreeBuilder):
-    def __init__(self, skyvern_frame: SkyvernFrame) -> None:
+    def __init__(
+        self,
+        skyvern_frame: SkyvernFrame,
+        engine_selection: "BrowserEngineSelection | None" = None,
+    ) -> None:
         self.id_to_element_dict: dict[str, dict] = dict()
         self.id_to_css_dict: dict[str, str] = dict()
         self.elements: list[dict] = list()
         self.element_tree: list[dict] = list()
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
+        # The logical run's pinned engine, so the wait-until-finished retry recognizes THIS engine's
+        # native analysis timeout; None (default) preserves the stock Playwright timeout identity.
+        self.engine_selection = engine_selection
         self.last_used_element_tree_html: str | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
@@ -732,7 +822,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
             incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
                 wait_until_finished=True
             )
-        except TimeoutError:
+        except Exception as e:
+            if not _is_page_analysis_timeout(self.engine_selection, e):
+                raise
             LOG.warning(
                 "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
             )

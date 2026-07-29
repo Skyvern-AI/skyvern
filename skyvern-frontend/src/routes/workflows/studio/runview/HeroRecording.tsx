@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { ArtifactVideo } from "@/components/ArtifactVideo";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 type HeroRecordingProps = {
@@ -38,7 +39,7 @@ function RecordingPlayer({
   }
 
   return (
-    <video
+    <ArtifactVideo
       src={url}
       controls
       preload="metadata"

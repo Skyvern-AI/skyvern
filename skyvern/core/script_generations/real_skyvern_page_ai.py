@@ -35,6 +35,7 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ClickAction,
+    HoverAction,
     InputTextAction,
     SelectOptionAction,
     UploadFileAction,
@@ -42,6 +43,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.handler import (
     get_actual_value_of_parameter_if_secret,
     handle_click_action,
+    handle_hover_action,
     handle_input_text_action,
     handle_select_option_action,
     handle_upload_file_action,
@@ -70,7 +72,10 @@ async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
         locator = page.locator(selector)
         element_id = await locator.get_attribute("unique_id", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
     except Exception:
-        LOG.exception("Failed to get element id by selector", selector=selector)
+        # A selector miss is an expected, handled fallback: callers treat a None return as
+        # a signal to take the heavier AI single-action path (and record a fallback episode),
+        # so warn without a stack trace rather than logging an error on every stale selector.
+        LOG.warning("Failed to get element id by selector", selector=selector)
         return None
     return element_id
 
@@ -363,6 +368,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         workflow_run_id=workflow_run_id,
                         totp_identifier=totp_identifier,
                         totp_verification_url=totp_url,
+                        expected_otp_type=OTPType.TOTP,
                     )
                 if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
                     verification_code = otp_value.value
@@ -1658,6 +1664,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
         elif action_type == "SELECT_OPTION":
             template = "single-select-action"
             llm_handler = app.SELECT_AGENT_LLM_API_HANDLER
+        elif action_type == "HOVER":
+            template = "single-hover-action"
+            llm_handler = app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
         else:
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
@@ -1723,6 +1732,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "SELECT_OPTION" and isinstance(action, SelectOptionAction):
                 result = await handle_select_option_action(action, self.page, self.scraped_page, task, step)
+            elif action_type == "HOVER" and isinstance(action, HoverAction):
+                result = await handle_hover_action(action, self.page, self.scraped_page, task, step)
             else:
                 LOG.warning(
                     "ai_act: action type mismatch",

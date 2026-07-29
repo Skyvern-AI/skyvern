@@ -4,7 +4,7 @@ import {
   Cross2Icon,
   ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,8 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { isRecord } from "@/util/utils";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { cn, isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
@@ -27,11 +28,17 @@ import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
   formatElapsed,
+  formatRunTimesTooltip,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
 import { toReadableSearch } from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
+import { collectBlockPrompts } from "./blockPrompts";
+import {
+  failureDetailIsLong,
+  formatFailureReason,
+} from "./failureReasonFormat";
 import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
@@ -42,6 +49,7 @@ import {
 } from "./RunOutputsSection";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunSummaryStrip } from "./RunSummaryStrip";
+import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -76,12 +84,17 @@ export function RunView({
   onFix,
   onRetry,
 }: RunViewProps) {
+  const { runId: pathRunId } = useParams();
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
   // isLoading here, not isPending like RunTab: this query is enabled only once a run
   // id exists, so a disabled query means "no run" → fall through to the empty CTA.
-  const { data: workflowRun, isLoading } =
-    useWorkflowRunWithWorkflowQuery(queryOptions);
-  const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
+  const {
+    data: workflowRun,
+    isLoading,
+    isPlaceholderData: runIsPlaceholder,
+  } = useWorkflowRunWithWorkflowQuery(queryOptions);
+  const { data: timeline, isPlaceholderData: timelineIsPlaceholder } =
+    useWorkflowRunTimelineQuery(queryOptions);
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
@@ -95,6 +108,7 @@ export function RunView({
   const view = useRunPaneViewStore((s) => s.view);
   const resetPaneView = useRunPaneViewStore((s) => s.reset);
   const [failureDismissed, setFailureDismissed] = useState(false);
+  const [failureDetailExpanded, setFailureDetailExpanded] = useState(false);
   const [outputSummary, setOutputSummary] = useState<string | null>(null);
 
   // A pinned frame belongs to one run; drop it when the run changes, then re-seed
@@ -104,6 +118,7 @@ export function RunView({
     setOutputSummary(null);
     resetPaneView();
     setFailureDismissed(false);
+    setFailureDetailExpanded(false);
     const active = searchParamsRef.current.get("active");
     if (active) {
       pinFrame(active);
@@ -151,6 +166,11 @@ export function RunView({
     if (!workflowRunId) {
       return;
     }
+    // Under the short /runs/{wr} URL the run is already named by the path, so
+    // pinning ?wr= would only duplicate it; the pane reads the run from either.
+    if (pathRunId === workflowRunId) {
+      return;
+    }
     if (new URLSearchParams(window.location.search).get("wr")) {
       return;
     }
@@ -162,7 +182,7 @@ export function RunView({
     }
     next.set("wr", workflowRunId);
     navigate({ search: toReadableSearch(next) }, { replace: true });
-  }, [runPaneOpen, workflowRunId, navigate]);
+  }, [runPaneOpen, workflowRunId, pathRunId, navigate]);
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
@@ -183,6 +203,13 @@ export function RunView({
     if (!workflowRun || !timeline) {
       return;
     }
+    // On a run switch, keepPreviousData briefly serves the PREVIOUS run's
+    // (finalized) run + timeline. Deciding auto-pin on it would lock THIS run's
+    // one-shot to the old run's last frame and never re-decide; wait for the
+    // new run's real payload.
+    if (runIsPlaceholder || timelineIsPlaceholder) {
+      return;
+    }
     if (!statusIsFinalized(workflowRun)) {
       // Still running: leave the one-shot open so the terminal transition of
       // a watched run lands the same last-item pin as a cold open.
@@ -194,7 +221,11 @@ export function RunView({
     const params = new URLSearchParams(
       window.location.search || searchParamsRef.current.toString(),
     );
-    if (params.get("wr") !== workflowRunId || params.get("active")) {
+    // The short /runs/{wr} URL names the run in the path rather than ?wr=, so a
+    // matching path id is the focused deep link too (parity with ?wr= cold open).
+    const isFocusedDeepLink =
+      params.get("wr") === workflowRunId || pathRunId === workflowRunId;
+    if (!isFocusedDeepLink || params.get("active")) {
       return;
     }
     if (params.has("bl")) {
@@ -214,7 +245,16 @@ export function RunView({
     if (last) {
       pinFrame(last.id);
     }
-  }, [workflowRunId, workflowRun, timeline, frames, pinFrame]);
+  }, [
+    workflowRunId,
+    workflowRun,
+    timeline,
+    frames,
+    pinFrame,
+    pathRunId,
+    runIsPlaceholder,
+    timelineIsPlaceholder,
+  ]);
 
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
@@ -285,6 +325,9 @@ export function RunView({
   const runInputs = useMemo(() => {
     const definitionParameters =
       workflowRun?.workflow?.workflow_definition?.parameters;
+    const blockPrompts = collectBlockPrompts(
+      workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+    );
     const runParameters =
       (workflowRun?.parameters as Record<string, unknown> | undefined) ?? {};
     const parameters = getOrderedRunParameters(
@@ -302,12 +345,22 @@ export function RunView({
       });
     };
     pushMeta("Webhook URL", workflowRun?.webhook_callback_url);
+    // Task 2.0 runs store TOTP config on task_v2, not the top-level run.
+    pushMeta(
+      "TOTP URL",
+      workflowRun?.totp_verification_url ??
+        workflowRun?.task_v2?.totp_verification_url,
+    );
+    pushMeta(
+      "TOTP identifier",
+      workflowRun?.totp_identifier ?? workflowRun?.task_v2?.totp_identifier,
+    );
     pushMeta("Proxy", workflowRun?.proxy_location);
     pushMeta("Extra HTTP headers", workflowRun?.extra_http_headers);
     pushMeta("Browser session", workflowRun?.browser_session_id);
     pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
-    return { parameters, meta };
+    return { parameters, blockPrompts, meta };
   }, [workflowRun]);
 
   // Task 2.0 runs carry their output (and any webhook failure) on task_v2,
@@ -319,7 +372,9 @@ export function RunView({
     null;
 
   const hasInputs =
-    runInputs.parameters.length > 0 || runInputs.meta.length > 0;
+    runInputs.parameters.length > 0 ||
+    runInputs.blockPrompts.length > 0 ||
+    runInputs.meta.length > 0;
   const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
@@ -330,6 +385,13 @@ export function RunView({
     workflowRun.started_at ?? workflowRun.created_at ?? null,
     finalized ? (workflowRun.finished_at ?? null) : null,
   );
+  const elapsedTitle = formatRunTimesTooltip(workflowRun);
+  const failureReason = formatFailureReason(
+    workflowRun.failure_reason ?? "The run failed.",
+  );
+  const failureDetailLong = failureReason.detail
+    ? failureDetailIsLong(failureReason.detail)
+    : false;
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col">
@@ -337,7 +399,6 @@ export function RunView({
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
         />
-
         {provisioning ? (
           <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-slate-elevation2 px-3 py-1.5 text-xs text-muted-foreground">
             <ClockIcon className="h-3.5 w-3.5 shrink-0" />
@@ -345,23 +406,46 @@ export function RunView({
           </div>
         ) : null}
 
-        {failed && !failureDismissed ? (
+        {failed && !failureDismissed && view === "timeline" ? (
           <div className="shrink-0 rounded-lg border border-destructive/40 bg-slate-elevation1 p-4">
-            <div className="flex items-start gap-2 text-sm font-semibold text-foreground">
+            <div className="flex items-start gap-2">
               <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
-              <span className="min-w-0 flex-1">
-                {workflowRun.failure_reason ?? "The run failed."}
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold text-foreground">
+                  {failureReason.headline}
+                </div>
+                {failureReason.detail ? (
+                  <>
+                    <p
+                      className={cn(
+                        "mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted-foreground",
+                        !failureDetailExpanded && "line-clamp-3",
+                      )}
+                    >
+                      {failureReason.detail}
+                    </p>
+                    {failureDetailLong ? (
+                      <button
+                        type="button"
+                        onClick={() => setFailureDetailExpanded((v) => !v)}
+                        className="mt-1 text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      >
+                        {failureDetailExpanded ? "Show less" : "Show more"}
+                      </button>
+                    ) : null}
+                  </>
+                ) : null}
                 {matchFailureTips(workflowRun.failure_reason ?? null).map(
                   (tip) => (
                     <span
                       key={tip}
-                      className="mt-1.5 block text-xs font-normal italic text-muted-foreground"
+                      className="mt-1.5 block text-xs italic text-muted-foreground"
                     >
                       {tip}
                     </span>
                   ),
                 )}
-              </span>
+              </div>
               <button
                 type="button"
                 onClick={() => setFailureDismissed(true)}
@@ -381,7 +465,7 @@ export function RunView({
                 ) : null}
                 {onRetry ? (
                   <Button size="sm" variant="secondary" onClick={onRetry}>
-                    Retry as-is
+                    Retry
                   </Button>
                 ) : null}
               </div>
@@ -391,7 +475,7 @@ export function RunView({
 
         {view === "timeline" ? (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <RunSummaryStrip workflowRun={workflowRun} elapsed={elapsed} />
+            <RunSummaryStrip workflowRun={workflowRun} />
             <ResizableTimelineSplit
               className="flex-1"
               top={
@@ -399,6 +483,9 @@ export function RunView({
                   <WorkflowRunTimeline
                     workflowRunId={workflowRunId}
                     hideLiveBadge
+                    enableSearch
+                    elapsed={elapsed}
+                    elapsedTitle={elapsedTitle}
                     activeItem={activeItem}
                     activeIteration={activeIteration}
                     onActionItemSelected={(item) => {
@@ -406,6 +493,19 @@ export function RunView({
                     }}
                     onBlockItemSelected={(block) => {
                       pinFrame(block.workflow_run_block_id);
+                      const handle =
+                        useWorkflowBlockSearchStore.getState().handle;
+                      if (!handle) {
+                        return;
+                      }
+                      const nodeId = resolveTimelineBlockJumpNodeId({
+                        editorOpen: studioPanes.includes("editor"),
+                        targets: handle.getTargets(),
+                        label: block.label,
+                      });
+                      if (nodeId) {
+                        handle.focusBlock(nodeId);
+                      }
                     }}
                     onThoughtItemSelected={(thought) => {
                       pinFrame(thought.thought_id);
@@ -439,6 +539,7 @@ export function RunView({
             {hasInputs ? (
               <RunInputsSection
                 parameters={runInputs.parameters}
+                blockPrompts={runInputs.blockPrompts}
                 meta={runInputs.meta}
               />
             ) : (
@@ -453,6 +554,7 @@ export function RunView({
               <RunOutputsSection
                 workflowRunId={workflowRun.workflow_run_id}
                 workflowTitle={workflowRun.workflow?.title}
+                outputs={workflowRun.outputs}
                 extractedInformation={extractedInformation}
                 files={downloadedFiles}
                 errors={runErrors}

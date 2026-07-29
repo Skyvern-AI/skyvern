@@ -31,7 +31,34 @@ from urllib.parse import urlencode
 
 from pydantic import BaseModel, model_validator
 
+from skyvern.forge.sdk.artifact.models import ArtifactType
+
 ARTIFACT_URL_EXPIRY_SECONDS = 12 * 60 * 60  # 12 hours — global default when no per-org override.
+
+# TTL for URLs minted at the point of use via GET /artifacts/{id}/signed-url.
+# Short on purpose: the consumer asks for a fresh URL right before dereferencing
+# it, so the window only needs to cover one fetch (or one video-buffering burst).
+ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS = 5 * 60
+
+# Screenshots and recordings capture whatever the browser rendered — page content,
+# filled form values, logged-in views — so their capability URLs get a tighter
+# window than downloads, which API consumers routinely fetch on their own
+# schedule. 1 hour is the floor `ARTIFACT_URL_EXPIRY_SECONDS_MIN` already
+# guarantees webhook consumers; first-party viewers survive it by re-minting via
+# GET /v1/artifacts/{id}/signed-url.
+SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS = 60 * 60
+
+SENSITIVE_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
+    {
+        ArtifactType.RECORDING,
+        ArtifactType.SESSION_REPLAY,
+        ArtifactType.SCREENSHOT,
+        ArtifactType.SCREENSHOT_LLM,
+        ArtifactType.SCREENSHOT_ACTION,
+        ArtifactType.SCREENSHOT_FINAL,
+        ArtifactType.SCREENSHOT_PROXY,
+    }
+)
 
 # Bounds for the per-org override. 1 hour minimum keeps URLs useful for webhook
 # consumers that retry across short outages; 7 days maximum follows the AWS S3
@@ -58,6 +85,22 @@ def effective_artifact_url_expiry_seconds(per_org_value: int | None) -> int:
         ARTIFACT_URL_EXPIRY_SECONDS_MIN,
         min(ARTIFACT_URL_EXPIRY_SECONDS_MAX, per_org_value),
     )
+
+
+def artifact_url_expiry_seconds_for_type(
+    artifact_type: ArtifactType | None,
+    expiry_seconds: int | None,
+) -> int | None:
+    """Cap a sensitive artifact's URL TTL; pass every other type through unchanged.
+
+    Never lengthens: a caller already asking for a shorter window (the
+    on-demand mint endpoint) keeps it.
+    """
+    if artifact_type not in SENSITIVE_ARTIFACT_TYPES:
+        return expiry_seconds
+    if expiry_seconds is None:
+        return SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+    return min(expiry_seconds, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS)
 
 
 class HmacKeyEntry(BaseModel):
@@ -127,9 +170,8 @@ def sign_artifact_url(
 
     The signature is URL-safe base64 (no padding), 43 characters for SHA-256.
 
-    ``artifact_name`` and ``artifact_type`` are appended as informational query
-    params for client use only — they are not part of the canonical string or
-    signature.
+    ``artifact_name`` and ``artifact_type`` are accepted for call-site
+    compatibility but intentionally omitted from the capability URL.
     """
     kid = keyring.current_kid
     secret_bytes = keyring.get_secret_bytes(kid)
@@ -141,12 +183,7 @@ def sign_artifact_url(
     path = _ARTIFACT_CONTENT_PATH_TEMPLATE.format(artifact_id=artifact_id)
     canonical = _canonical_string("GET", path, expiry, kid)
     sig = _hmac_b64(secret_bytes, canonical)
-    sig_params: dict[str, str | int] = {"expiry": expiry, "kid": kid, "sig": sig}
-    if artifact_name is not None:
-        sig_params["artifact_name"] = artifact_name
-    if artifact_type is not None:
-        sig_params["artifact_type"] = artifact_type
-    params = urlencode(sig_params)
+    params = urlencode({"expiry": expiry, "kid": kid, "sig": sig})
     return f"{base_url.rstrip('/')}{path}?{params}"
 
 

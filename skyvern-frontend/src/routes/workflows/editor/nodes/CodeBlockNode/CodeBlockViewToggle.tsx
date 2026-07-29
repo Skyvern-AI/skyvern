@@ -13,13 +13,13 @@ const segmentClass = (active: boolean) =>
   cn(
     "flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors",
     active
-      ? "bg-slate-elevation3 text-slate-100"
-      : "text-slate-400 hover:text-slate-200",
+      ? "bg-slate-elevation3 text-foreground"
+      : "text-muted-foreground hover:text-foreground dark:hover:text-slate-200",
   );
 
 function CodeBlockViewToggle({ value, onChange }: Props) {
   return (
-    <div className="nodrag nopan flex items-center gap-0.5 rounded-md border border-slate-700 bg-slate-elevation1 p-0.5">
+    <div className="nodrag nopan flex items-center gap-0.5 rounded-md border border-border bg-slate-elevation1 p-0.5">
       <button
         type="button"
         aria-pressed={value === "plain"}

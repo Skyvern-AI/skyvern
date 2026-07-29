@@ -1,4 +1,4 @@
-import { Pencil1Icon } from "@radix-ui/react-icons";
+import { PencilSolidIcon } from "@/components/icons/PencilSolidIcon";
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { cn } from "@/util/utils";
 import type { CredentialFolder } from "./types/credentialFolderTypes";
@@ -70,7 +70,7 @@ function CredentialFolderCard({
                         className="rounded p-1.5 text-slate-400 transition-colors hover:bg-slate-500/20 hover:text-slate-300"
                         aria-label="Edit folder"
                       >
-                        <Pencil1Icon className="h-4 w-4" />
+                        <PencilSolidIcon className="h-4 w-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent>Edit Folder</TooltipContent>

@@ -11,9 +11,8 @@ import itertools
 import json
 from types import SimpleNamespace
 
-import pytest
+from structlog.testing import capture_logs
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot import enforcement
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -33,19 +32,15 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     classify_output_contract_bail_family,
     resolve_output_contract_actuation,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-from skyvern.forge.sdk.copilot.result_evidence import loaded_result_composition_evidence_from_page
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    RequestPolicy,
+)
 from skyvern.forge.sdk.copilot.runtime import (
     output_contract_ladder_unresolved,
-    record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as wu
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind, turn_halt_from_blocker_signal
-from skyvern.forge.sdk.copilot.turn_ownership import (
-    TurnClaimant,
-    claim_and_stash_blocker_signal,
-    current_turn_owner,
-)
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _ALL_SPLIT_BLOCKERS = [
@@ -57,11 +52,6 @@ _ALL_SPLIT_BLOCKERS = [
     "insufficient_durable_stages",
     "target_block_not_resolved_in_parsed",
 ]
-
-
-@pytest.fixture(autouse=True)
-def _disable_author_time_gate_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", False)
 
 
 def test_resolver_is_total_over_the_evidence_family_matrix() -> None:
@@ -471,51 +461,11 @@ def test_option_a_falls_through_on_two_mapping_locals() -> None:
 def _counter_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         turn_id="turn_example",
+        request_policy=None,
         output_contract_reject_count_by_signature={},
         output_contract_last_reject_fingerprint_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
     )
-
-
-def test_counter_resets_on_structural_fingerprint_delta() -> None:
-    ctx = _counter_ctx()
-    required = {"output.confirmation_number"}
-    first = wu._record_output_contract_family_reject(
-        ctx, required, reject_family="metadata_reject", authored_structural_fingerprint="fp_a"
-    )
-    second = wu._record_output_contract_family_reject(
-        ctx, required, reject_family="metadata_reject", authored_structural_fingerprint="fp_a"
-    )
-    assert (first, second) == (1, 2)
-    changed = wu._record_output_contract_family_reject(
-        ctx, required, reject_family="metadata_reject", authored_structural_fingerprint="fp_b"
-    )
-    assert changed == 1
-
-
-def test_counter_holds_streak_on_cosmetic_churn() -> None:
-    ctx = _counter_ctx()
-    required = {"output.confirmation_number"}
-    for expected in (1, 2, 3):
-        count = wu._record_output_contract_family_reject(
-            ctx, required, reject_family="metadata_reject", authored_structural_fingerprint="fp_same"
-        )
-        assert count == expected
-
-
-def test_counter_resets_after_imposition_marker() -> None:
-    ctx = _counter_ctx()
-    required = {"output.confirmation_number"}
-    wu._record_output_contract_family_reject(
-        ctx, required, reject_family="metadata_reject", authored_structural_fingerprint="fp_same"
-    )
-    signature = next(iter(ctx.output_contract_reject_count_by_signature))
-    ctx.output_contract_imposed_since_last_reject_by_signature[signature] = True
-    count = wu._record_output_contract_family_reject(
-        ctx, required, reject_family="metadata_reject", authored_structural_fingerprint="fp_same"
-    )
-    assert count == 1
-    assert ctx.output_contract_imposed_since_last_reject_by_signature[signature] is False
 
 
 _STATIC_RETURN_BLOCKERS = ["static_return_envelope_unavailable"]
@@ -527,10 +477,12 @@ def _advisory_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         turn_ownership=None,
         blocker_signal_claimant=None,
+        request_policy=None,
         gate_precedence_conflict_events=[],
         output_contract_reject_count_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
         output_contract_armed_directive_fingerprint_by_signature={},
+        output_contract_last_reject_fingerprint_by_signature={},
         output_contract_output_owner_directive_candidates_by_signature={},
         output_contract_actuation_by_signature={},
         output_contract_actuation_count_by_signature={},
@@ -541,7 +493,8 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_run_output_observed_by_signature={},
         output_contract_run_bound_required_path_by_signature={},
         output_contract_bail_actuated_this_call=False,
-        author_time_gate_ablation_events=[],
+        submitted_code_artifact_metadata_snapshot=None,
+        rejected_code_artifact_metadata_captures=[],
         latest_recorded_build_test_outcome=None,
         recorded_build_test_outcome_history=[],
         scouted_output_covered_paths=set(),
@@ -579,172 +532,6 @@ def _actuate(ctx: SimpleNamespace, signature: str) -> OutputContractActuationKin
     return actuation.kind
 
 
-def test_author_time_gate_log_only_requires_local_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = _advisory_ctx()
-    monkeypatch.setattr(settings, "ENV", "prod")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    assert (
-        record_author_time_gate_ablation_event(
-            ctx,
-            gate_id="metadata_run_preflight_reject",
-            reason_code="metadata_contract_required_before_run",
-            fingerprint="sig",
-            blocked_tool="update_and_run_blocks",
-        )
-        is False
-    )
-    assert ctx.author_time_gate_ablation_events == []
-
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", False)
-    assert (
-        record_author_time_gate_ablation_event(
-            ctx,
-            gate_id="metadata_run_preflight_reject",
-            reason_code="metadata_contract_required_before_run",
-            fingerprint="sig",
-            blocked_tool="update_and_run_blocks",
-        )
-        is False
-    )
-    assert ctx.author_time_gate_ablation_events == []
-
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    assert (
-        record_author_time_gate_ablation_event(
-            ctx,
-            gate_id="metadata_run_preflight_reject",
-            reason_code="metadata_contract_required_before_run",
-            fingerprint="sig",
-            blocked_tool="update_and_run_blocks",
-        )
-        is True
-    )
-    assert ctx.author_time_gate_ablation_events[-1].log_only is True
-
-
-def test_log_only_output_contract_actuation_records_without_granting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    signature = "sig_log_only"
-    ctx = _arm_static_return_advisory_ctx(signature)
-
-    assert _actuate(ctx, signature) == OutputContractActuationKind.ADVISORY_RUN
-
-    assert ctx.output_contract_actuation_by_signature == {}
-    assert ctx.output_contract_actuation_count_by_signature == {}
-    assert ctx.output_contract_declick_attempted_by_signature == {}
-    event = ctx.author_time_gate_ablation_events[-1]
-    assert event.gate_id == "output_contract_actuation"
-    assert event.reason_code == "advisory_run"
-    assert event.blocked_tool == "update_workflow"
-    assert event.fingerprint == _FINGERPRINT
-    assert event.log_only is True
-
-
-def test_log_only_terminal_stash_does_not_duplicate_output_contract_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    signature = "sig_terminal_log_only"
-    ctx = _advisory_ctx()
-    ctx.turn_halt = None
-    _mark_consumed_empty_run(ctx, signature, page_extraction=True)
-
-    actuation = wu._actuate_output_contract_bail(
-        ctx,
-        blockers=list(_STATIC_RETURN_BLOCKERS),
-        target_code=_PAGE_READ_CODE,
-        required_paths={"output.confirmation_number"},
-        signature=signature,
-        current_fingerprint=_FINGERPRINT,
-    )
-    assert actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL
-    wu._stash_output_source_unobservable_terminal(
-        ctx,
-        reason_code=actuation.reason_code,
-        required_paths={"output.confirmation_number"},
-        block_label="collect_confirmation",
-        signature=signature,
-        blockers=list(_STATIC_RETURN_BLOCKERS),
-    )
-
-    assert len(ctx.author_time_gate_ablation_events) == 1
-    assert ctx.author_time_gate_ablation_events[0].fingerprint == _FINGERPRINT
-    assert ctx.turn_halt is None
-
-
-def test_log_only_metadata_preflight_records_without_rejecting_or_consuming(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    signature = "sig_metadata"
-    ctx = _advisory_ctx()
-    ctx.output_contract_actuation_by_signature[signature] = OutputContractAdvisoryState.GRANTED
-    evaluation = SimpleNamespace(
-        has_deficiencies=True,
-        canonical_signature=signature,
-        can_attempt_run=False,
-        payload={"reason_code": "output_contract_required"},
-        reason_code="output_contract_required",
-        block_label="collect_confirmation",
-        required_paths={"output.confirmation_number"},
-        missing_metadata_paths=["output.confirmation_number"],
-        missing_schema_paths=[],
-        missing_return_paths=[],
-        shape_violations=[],
-    )
-    monkeypatch.setattr(wu, "_impose_output_contract_envelope_after_steering", lambda *args: (args[1], args[2], False))
-    monkeypatch.setattr(wu, "_scaffold_metadata_contract_for_update", lambda *args: (args[2], False))
-    monkeypatch.setattr(wu, "_evaluate_output_contract_for_code_block", lambda *args, **kwargs: evaluation)
-
-    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
-
-    assert result is None
-    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
-    assert ctx.output_contract_reject_count_by_signature == {}
-    event = ctx.author_time_gate_ablation_events[-1]
-    assert event.gate_id == "metadata_run_preflight_reject"
-    assert event.reason_code == "output_contract_required"
-    assert event.blocked_tool == "update_and_run_blocks"
-    assert event.fingerprint == wu._output_contract_structural_fingerprint("workflow: yaml", signature)
-    assert event.log_only is True
-
-
-def test_log_only_metadata_preflight_skips_run_attemptable_without_advisory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    ctx = _advisory_ctx()
-    evaluation = SimpleNamespace(
-        has_deficiencies=True,
-        canonical_signature="sig_run_attemptable",
-        can_attempt_run=True,
-        payload={"reason_code": "output_contract_required"},
-        reason_code="output_contract_required",
-        block_label="collect_confirmation",
-        required_paths={"output.confirmation_number"},
-        missing_metadata_paths=["output.confirmation_number"],
-        missing_schema_paths=[],
-        missing_return_paths=[],
-        shape_violations=[],
-    )
-    monkeypatch.setattr(wu, "_impose_output_contract_envelope_after_steering", lambda *args: (args[1], args[2], False))
-    monkeypatch.setattr(wu, "_scaffold_metadata_contract_for_update", lambda *args: (args[2], False))
-    monkeypatch.setattr(wu, "_evaluate_output_contract_for_code_block", lambda *args, **kwargs: evaluation)
-
-    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
-
-    assert result is None
-    assert ctx.author_time_gate_ablation_events == []
-    assert ctx.output_contract_reject_count_by_signature == {}
-
-
 def _genuine_terminal_signal() -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
@@ -756,122 +543,6 @@ def _genuine_terminal_signal() -> CopilotToolBlockerSignal:
         internal_reason_code="probable_site_block_stop",
         blocked_tool="update_workflow",
     )
-
-
-def test_metadata_preflight_yields_to_live_ladder_and_records_conflict() -> None:
-    ctx = make_copilot_ctx()
-    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
-
-    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is True
-    assert any(
-        event.owner == "output_contract_actuation" and event.yielded == "metadata_run_preflight_reject"
-        for event in ctx.gate_precedence_conflict_events
-    )
-
-
-def test_metadata_preflight_does_not_yield_without_a_live_grant() -> None:
-    ctx = make_copilot_ctx()
-
-    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
-    assert ctx.gate_precedence_conflict_events == []
-
-
-def test_metadata_preflight_does_not_yield_during_ordinary_reject_without_a_grant() -> None:
-    ctx = make_copilot_ctx()
-    ctx.output_contract_actuation_count_by_signature["sig_landed"] = 1
-    assert output_contract_ladder_unresolved(ctx) is True
-
-    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
-
-
-def test_metadata_preflight_does_not_yield_to_a_genuine_terminal_owner() -> None:
-    ctx = make_copilot_ctx()
-    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
-    terminal = _genuine_terminal_signal()
-    claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal)
-    ctx.turn_halt = turn_halt_from_blocker_signal(terminal, source="test")
-    assert current_turn_owner(ctx).claimant is TurnClaimant.GENUINELY_TERMINAL
-
-    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
-
-
-def test_metadata_preflight_reject_returns_none_at_call_site_while_ladder_owns(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = make_copilot_ctx()
-    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
-    monkeypatch.setattr(
-        wu,
-        "_recorded_outcome_convergence_reject",
-        lambda *args, **kwargs: wu._ConvergenceReject("sig_target", "frontier_unchanged", False),
-    )
-    monkeypatch.setattr(wu, "_workflow_yaml_code_blocks_by_label", lambda *args: {})
-    monkeypatch.setattr(wu, "_record_author_time_reject_outcome", lambda *args, **kwargs: None)
-    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda *args, **kwargs: None)
-
-    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
-
-    assert result is None
-    assert any(event.yielded == "metadata_run_preflight_reject" for event in ctx.gate_precedence_conflict_events)
-
-
-def test_metadata_preflight_reject_still_rejects_without_a_live_ladder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = make_copilot_ctx()
-    monkeypatch.setattr(
-        wu,
-        "_recorded_outcome_convergence_reject",
-        lambda *args, **kwargs: wu._ConvergenceReject("sig_target", "frontier_unchanged", False),
-    )
-    monkeypatch.setattr(wu, "_workflow_yaml_code_blocks_by_label", lambda *args: {})
-    monkeypatch.setattr(wu, "_record_author_time_reject_outcome", lambda *args, **kwargs: None)
-    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda *args, **kwargs: None)
-
-    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
-
-    assert result is not None
-    assert result["ok"] is False
-
-
-def test_credential_scout_submit_gate_still_blocks_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-    ctx = SimpleNamespace(
-        block_authoring_policy=wu.BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        workflow_yaml="",
-        scout_trajectory=[
-            {
-                "tool_name": "fill_credential_field",
-                "credential_id": "cred_safe",
-                "credential_field": "password",
-                "source_url": "https://login.example.test/login",
-            }
-        ],
-    )
-    workflow_yaml = """
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_safe
-  blocks:
-    - block_type: code
-      label: login
-      parameter_keys:
-        - login_credentials
-      code: |
-        await page.locator("#password").fill(login_credentials.password)
-        await page.get_by_role("button", name="Submit").click()
-"""
-
-    errors = wu._credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
-
-    assert len(errors) == 1
-    assert "a later submit action on the same page" in errors[0]
 
 
 def test_advisory_grant_survives_double_preflight_pass() -> None:
@@ -911,6 +582,33 @@ def test_advisory_grant_is_not_consumed_without_workflow_run_id() -> None:
 
     assert consumed == []
     assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
+
+
+def test_reject_shaped_run_result_suppresses_missing_run_id_warning() -> None:
+    signature = "sig_reject_shape"
+    ctx = _arm_static_return_advisory_ctx(signature)
+    reject = {"ok": False, "error": "refused", "data": {"reason_code": "value_bearing_output_required"}}
+
+    with capture_logs() as logs:
+        consumed = wu.consume_output_contract_advisory_grant_for_run_result(ctx, reject)
+
+    assert consumed == []
+    assert not [
+        log for log in logs if log["event"] == "copilot_output_contract_advisory_run_result_missing_workflow_run_id"
+    ]
+
+
+def test_non_reject_run_result_missing_run_id_still_warns() -> None:
+    signature = "sig_missing_run_id"
+    ctx = _arm_static_return_advisory_ctx(signature)
+
+    with capture_logs() as logs:
+        consumed = wu.consume_output_contract_advisory_grant_for_run_result(ctx, {"ok": True, "data": {"note": "x"}})
+
+    assert consumed == []
+    assert [
+        log for log in logs if log["event"] == "copilot_output_contract_advisory_run_result_missing_workflow_run_id"
+    ]
 
 
 def test_advisory_grant_arms_pending_run_output_evidence() -> None:
@@ -1060,6 +758,65 @@ def test_click_only_declick_flag_clears_when_source_becomes_observable() -> None
     assert signature not in ctx.output_contract_declick_attempted_by_signature
 
 
+def test_steer_only_downgrades_advisory_run_and_grants_nothing() -> None:
+    signature = "sig_steer_advisory"
+    baseline_ctx = _advisory_ctx()
+    baseline_ctx.output_contract_reject_count_by_signature[signature] = 1
+    baseline_ctx.output_contract_armed_directive_fingerprint_by_signature[signature] = _FINGERPRINT
+    baseline = wu._actuate_output_contract_bail(
+        baseline_ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_PAGE_READ_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint=_FINGERPRINT,
+    )
+    assert baseline.kind == OutputContractActuationKind.ADVISORY_RUN
+
+    ctx = _advisory_ctx()
+    ctx.output_contract_reject_count_by_signature[signature] = 1
+    ctx.output_contract_armed_directive_fingerprint_by_signature[signature] = _FINGERPRINT
+    steered = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_PAGE_READ_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint=_FINGERPRINT,
+        steer_only=True,
+    )
+    assert steered.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert ctx.output_contract_actuation_by_signature == {}
+    assert ctx.output_contract_actuation_count_by_signature == {}
+
+
+def test_steer_only_never_terminals_click_only_and_skips_declick() -> None:
+    signature = "sig_steer_click_only"
+    ctx = _advisory_ctx()
+    first = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_CLICK_ONLY_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint="fp_0",
+        steer_only=True,
+    )
+    assert first.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert signature not in ctx.output_contract_declick_attempted_by_signature
+    second = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=list(_STRUCTURAL_BLOCKERS),
+        target_code=_CLICK_ONLY_CODE,
+        required_paths={"output.confirmation_number"},
+        signature=signature,
+        current_fingerprint="fp_1",
+        steer_only=True,
+    )
+    assert second.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    assert second.reason_code != OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
+
+
 def test_observed_required_values_exact_and_lineage_match() -> None:
     ctx = SimpleNamespace(scouted_output_covered_paths={"output.order.id"}, composition_page_evidence=None)
     assert wu._observed_required_output_values(ctx, {"output.order.id"}) is True
@@ -1125,6 +882,7 @@ def _ladder_ctx() -> SimpleNamespace:
     ctx = _advisory_ctx()
     ctx.turn_halt = None
     ctx.output_contract_bail_actuated_this_call = False
+    ctx.metadata_reject_ladder_state = None
     return ctx
 
 
@@ -1183,120 +941,6 @@ def test_ladder_resolved_once_advisory_consumed() -> None:
 
 def test_ladder_resolved_when_no_output_contract_activity() -> None:
     assert output_contract_ladder_unresolved(_ladder_ctx()) is False
-
-
-def test_reject_seam_adjudication_grants_advisory_within_caps_when_imposition_early_outs() -> None:
-    ctx = _ladder_ctx()
-    signature = "sig_early_out"
-    evaluation = _make_evaluation(signature, block_label="collect")
-    for _ in range(wu._MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN + 1):
-        ctx.output_contract_bail_actuated_this_call = False
-        wu._adjudicate_output_contract_ladder_after_reject(
-            ctx, evaluation, workflow_yaml=_PAGE_READ_YAML, current_fingerprint="fp_early_out"
-        )
-    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
-    assert ctx.turn_halt is None
-
-
-def test_same_fresh_signature_emits_one_reject_before_typed_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = _ladder_ctx()
-    signature = "sig_first_contact_example"
-    evaluation = _make_evaluation(signature, block_label="collect")
-    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: None)
-
-    first = wu._record_output_contract_reject(
-        ctx,
-        evaluation,
-        summary="First typed deficiency.",
-        authored_structural_fingerprint="fp_first_contact",
-        workflow_yaml=_PAGE_READ_YAML,
-    )
-    first_outcome = ctx.latest_recorded_build_test_outcome
-    ctx.output_contract_bail_actuated_this_call = False
-    second = wu._record_output_contract_reject(
-        ctx,
-        evaluation,
-        summary="Same typed deficiency.",
-        authored_structural_fingerprint="fp_first_contact",
-        workflow_yaml=_PAGE_READ_YAML,
-    )
-
-    assert first["output_contract_actuation"] == OutputContractActuationKind.STRUCTURE_DIRECTIVE.value
-    assert first_outcome is not None
-    assert first_outcome.phase == "author_time_reject"
-    assert second["output_contract_actuation"] == OutputContractActuationKind.ADVISORY_RUN.value
-    assert ctx.latest_recorded_build_test_outcome is None
-    assert [entry["phase"] for entry in ctx.recorded_build_test_outcome_history] == ["author_time_reject"]
-    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
-
-
-def test_reject_seam_metadata_required_reaches_advisory_before_no_source_terminal() -> None:
-    ctx = _ladder_ctx()
-    signature = "sig_metadata_required"
-    ctx.output_contract_declick_attempted_by_signature[signature] = True
-    for _ in range(wu._MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN):
-        wu._record_output_contract_actuation_progress(ctx, signature)
-    workflow_yaml = (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "    - block_type: code\n"
-        "      label: collect\n"
-        "      code: \"page.click('#submit')\"\n"
-    )
-
-    wu._adjudicate_output_contract_ladder_after_reject(
-        ctx, _make_evaluation(signature, block_label="collect"), workflow_yaml=workflow_yaml, current_fingerprint="fp"
-    )
-
-    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
-    assert ctx.turn_halt is None
-
-
-def test_reject_seam_adjudication_skips_when_imposition_already_actuated_this_call() -> None:
-    ctx = _ladder_ctx()
-    ctx.output_contract_bail_actuated_this_call = True
-    signature = "sig_already_actuated"
-    wu._adjudicate_output_contract_ladder_after_reject(
-        ctx, _make_evaluation(signature, block_label="collect"), workflow_yaml=_PAGE_READ_YAML, current_fingerprint="fp"
-    )
-    assert signature not in ctx.output_contract_actuation_count_by_signature
-    assert signature not in ctx.output_contract_actuation_by_signature
-
-
-def test_reject_seam_adjudication_skips_owner_ambiguity_without_owner_block() -> None:
-    ctx = _ladder_ctx()
-    signature = "sig_owner_ambiguous"
-    wu._adjudicate_output_contract_ladder_after_reject(
-        ctx, _make_evaluation(signature, block_label=""), workflow_yaml="", current_fingerprint="fp"
-    )
-    assert signature not in ctx.output_contract_actuation_count_by_signature
-    assert signature not in ctx.output_contract_actuation_by_signature
-
-
-def test_reject_seam_adjudication_stashes_terminal_after_declick_cycle(monkeypatch: object) -> None:
-    ctx = _ladder_ctx()
-    signature = "sig_no_source"
-    ctx.output_contract_declick_attempted_by_signature[signature] = True
-    stashed: list[str] = []
-
-    def capture(_ctx: object, *, reason_code: str, **_kwargs: object) -> None:
-        stashed.append(reason_code)
-
-    monkeypatch.setattr(wu, "_stash_output_source_unobservable_terminal", capture)  # type: ignore[attr-defined]
-    workflow_yaml = (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "    - block_type: code\n"
-        "      label: collect\n"
-        "      code: \"page.click('#toggle-service')\"\n"
-    )
-    wu._adjudicate_output_contract_ladder_after_reject(
-        ctx,
-        _make_evaluation(signature, block_label="collect", shape_violations=list(_STRUCTURAL_BLOCKERS)),
-        workflow_yaml=workflow_yaml,
-        current_fingerprint="fp_no_source",
-    )
-    assert stashed == [OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE]
 
 
 def test_observed_but_unbound_run_without_page_extraction_is_not_exhaustion() -> None:
@@ -1507,55 +1151,6 @@ def test_advisory_grant_downgraded_to_directive_when_run_authority_forbids_dispa
     assert signature not in ctx.output_contract_actuation_by_signature
 
 
-def test_loaded_result_carrier_is_selector_bound_and_claimed_by_one_contract_signature(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _advisory_ctx()
-    events: list[dict[str, object]] = []
-
-    def capture_event(_ctx: object, **kwargs: object) -> bool:
-        events.append(kwargs)
-        return False
-
-    monkeypatch.setattr(wu, "record_author_time_gate_ablation_event", capture_event)
-    ctx.latest_evaluate_result_composition_steer = loaded_result_composition_evidence_from_page(
-        {"result_containers": [{"selector": "#results", "row_count": 1, "sample_rows": ["Example customer record"]}]},
-        source_tool="evaluate",
-        source_url="https://example.com/results",
-    )
-
-    first = wu._actuate_output_contract_bail(
-        ctx,
-        blockers=["static_return_envelope_unavailable"],
-        target_code='await page.locator("#results").click()',
-        required_paths={"output.record_id"},
-        signature="sig-a",
-        current_fingerprint="fp-a",
-    )
-
-    assert ctx.latest_evaluate_result_composition_signature == "sig-a"
-
-    ctx.output_contract_bail_actuated_this_call = False
-    second = wu._actuate_output_contract_bail(
-        ctx,
-        blockers=["static_return_envelope_unavailable"],
-        target_code='await page.locator("#results").click()',
-        required_paths={"output.other_id"},
-        signature="sig-b",
-        current_fingerprint="fp-b",
-    )
-
-    assert ctx.latest_evaluate_result_composition_signature == "sig-a"
-    assert first.kind is not OutputContractActuationKind.BLOCKED_TERMINAL
-    assert second.kind is OutputContractActuationKind.STRUCTURE_DIRECTIVE
-    first_payload = events[0]["payload"]
-    second_payload = events[1]["payload"]
-    assert isinstance(first_payload, dict)
-    assert isinstance(second_payload, dict)
-    assert first_payload["loaded_result_source_producible"] is True
-    assert second_payload["loaded_result_source_producible"] is False
-
-
 def _antecedent_ctx(*criteria: CompletionCriterion) -> CopilotContext:
     ctx = make_copilot_ctx()
     ctx.block_authoring_policy = wu.BlockAuthoringPolicy.CODE_ONLY_BROWSER
@@ -1604,6 +1199,25 @@ def test_contingent_antecedent_alone_forms_declaration_only_contract() -> None:
     assert contract.observation_paths == set()
     assert contract.declaration_paths == {"output.blocker"}
     assert contract.union == {"output.blocker"}
+
+
+def test_blocker_family_path_is_declaration_only_for_authoring() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_blocker",
+            outcome="A blocker is reported when the site blocks submission.",
+            output_path="output.blocker",
+            antecedent_family="blocker",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.observation_paths == set()
+    assert contract.declaration_paths == {"output.blocker"}
+    assert contract.union == {"output.blocker"}
+    assert contract.liveness is wu._OutputContractLiveness.ABSENT
+    assert wu._value_bearing_directive_paths(contract) == {"output"}
 
 
 def test_antecedent_overlapping_requested_output_stays_observation() -> None:
@@ -1893,7 +1507,100 @@ def test_mint_degraded_output_path_leaves_observation_lane() -> None:
     )
 
     assert wu._requested_output_child_paths(ctx) == set()
+    contract = wu._output_contract_required_paths_source(ctx)
+    assert contract.union == set()
+    assert contract.degraded_request_slots == ()
+
+
+def test_face_c_degraded_mint_preserves_satisfiable_value_bearing_authoring_path() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_degraded",
+            outcome="Whether the requested action is available is returned.",
+            output_path="output.action_is_available",
+            contingent_on="the action is unavailable",
+            contingent_antecedent_output_path="output.blocker",
+            mint_degrade="undecidable_judgment",
+            mint_disposition="degraded",
+            pinability="unpinnable",
+        ),
+        CompletionCriterion(
+            id="c_visible_label",
+            outcome="The visible action label is returned.",
+            output_path="output.visible_action_label",
+            pinability="shapeless_valid",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+    skeleton = wu._return_skeleton_for_required_paths(contract.union, contract.declaration_paths)
+
+    assert contract.observation_paths == {"output.visible_action_label"}
+    assert contract.declaration_paths == set()
+    assert contract.union != {"output.blocker"}
+    assert skeleton == 'return {"output": {"visible_action_label": visible_action_label}}'
+    assert "None" not in skeleton
+
+
+def test_classifier_minted_download_path_excluded_from_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+            requested_output_path_mint_source="classifier_default",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
     assert wu._output_contract_required_paths_source(ctx).union == set()
+
+
+def test_classifier_declared_download_path_excluded_from_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+            requested_output_path_mint_source="classifier_declared",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).union == set()
+
+
+def test_non_minted_registered_download_path_still_requires_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == {"output.downloaded_files"}
+
+
+def test_independent_validation_classification_is_post_run_only() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c1",
+            outcome="The run classifies whether the path is login-only.",
+            kind="validation_classification",
+            classification_output_key="login_only",
+            expected_classification=True,
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).observation_paths == set()
 
 
 def test_runtime_repair_contract_carries_declaration_lane_with_stable_signature() -> None:
@@ -2036,3 +1743,157 @@ def test_observation_production_is_not_click_only_spine() -> None:
     code = 'await page.click("#submit")\nreturn {"output": {"record_id": "x"}}'
 
     assert wu._output_contract_click_only_spine(code, {"output.blocker"}) is False
+
+
+_METADATA_REQUIRED = {"output.confirmation_number"}
+
+
+def test_contract_satisfying_candidate_admits_run_no_reject() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    workflow_yaml = _declaration_waiver_yaml(
+        'record_id = await page.inner_text("#record")\nreturn {"output": {"record_id": record_id}}'
+    )
+    metadata = [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output.record_id"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+        )
+    ]
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is False
+    assert evaluation.missing_return_paths == []
+    assert evaluation.missing_metadata_paths == []
+
+
+def test_deficient_candidate_still_rejected_by_gate() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")\nreturn record_id')
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, [], enforce_value_bearing_liveness=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is True
+    assert "output.record_id" in evaluation.missing_return_paths
+    assert "output.record_id" in evaluation.missing_metadata_paths
+
+
+# ---------------------------------------------------------------------------
+# SKY-12907: impose-or-credit at the convergence ceiling.
+# ---------------------------------------------------------------------------
+
+
+def _record_criterion_ctx() -> CopilotContext:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    ctx.turn_id = "turn_ceiling_record"
+    return ctx
+
+
+def _record_contract_metadata() -> list[dict[str, object]]:
+    return [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output.record_id"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+        )
+    ]
+
+
+_UNCERTAIN_ROOT_ENVELOPE_CODE = 'envelope = {"output": {"blocker": None}}\nenvelope.update(status)\nreturn envelope'
+
+
+def _declaration_only_root_contract() -> tuple[CopilotContext, str, list[dict[str, object]]]:
+    ctx = _antecedent_ctx(_blocker_contingent_criterion())
+    ctx.turn_id = "turn_ceiling_root"
+    workflow_yaml = _declaration_waiver_yaml(_UNCERTAIN_ROOT_ENVELOPE_CODE)
+    metadata = [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            declaration_paths={"output.blocker"},
+        )
+    ]
+    return ctx, workflow_yaml, metadata
+
+
+def test_credit_flag_admits_uncertain_root_envelope_and_keeps_absent_rejected() -> None:
+    ctx, workflow_yaml, metadata = _declaration_only_root_contract()
+
+    strict = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+    assert strict is not None
+    assert wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in strict.shape_violations
+
+    credited = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True, credit_convergence_ceiling=True
+    )
+    assert credited is not None
+    assert credited.has_deficiencies is False
+
+    # A provably output-less envelope stays rejected even with crediting on.
+    absent_yaml = _declaration_waiver_yaml('return {"status": "done"}')
+    absent = wu._evaluate_output_contract_for_code_block(
+        ctx, absent_yaml, metadata, enforce_value_bearing_liveness=True, credit_convergence_ceiling=True
+    )
+    assert absent is not None
+    assert wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in absent.shape_violations
+
+
+def _steering_exhausted_evidence(**overrides: object) -> OutputContractActuationEvidence:
+    base = dict(
+        imposed_available=False,
+        click_only_spine=False,
+        observed_required_values=False,
+        prior_actuation=True,
+        prior_directive_unconsumed=True,
+        steering_exhausted=True,
+    )
+    base.update(overrides)
+    return OutputContractActuationEvidence(**base)  # type: ignore[arg-type]
+
+
+def _arm_steering_exhausted(ctx: object, signature: str, workflow_yaml: str) -> None:
+    """Steering is exhausted once a directive is armed and the draft's canonical structural
+    fingerprint is unchanged across it — the typed replacement for a reject-count ceiling."""
+    ctx.output_contract_actuation_count_by_signature[signature] = 1
+    ctx.output_contract_last_reject_fingerprint_by_signature[signature] = wu._output_contract_structural_fingerprint(
+        workflow_yaml, signature
+    )
+
+
+# ---------------------------------------------------------------------------
+# The code-authoring guardrail give-up consults the ceiling actuation.
+# ---------------------------------------------------------------------------
+
+
+def _guardrail_impose_ctx() -> tuple[CopilotContext, str, list[dict[str, object]]]:
+    ctx = _record_criterion_ctx()
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")')
+    metadata = _record_contract_metadata()
+    ctx.scouted_output_covered_paths = {"output.record_id"}
+    ctx.code_authoring_guardrail_reject_count = enforcement.MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    return ctx, workflow_yaml, metadata

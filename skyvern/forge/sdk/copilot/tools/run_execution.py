@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -34,7 +33,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
     registered_output_payload_binds_output_path,
-    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
@@ -75,8 +73,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    consume_uncovered_output_reopen_event,
-    repair_ceiling_stop_signal,
     reset_no_progress_interaction_count,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -129,7 +125,6 @@ from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     stash_delivered_unverified_turn_halt,
-    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.typed_value_policy import should_reject_type_text_value
@@ -1063,10 +1058,22 @@ def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) 
             block["extracted_data"] = {key: value}
 
 
+def _registered_output_identity_workflow(
+    *,
+    dispatch_to_worker: bool,
+    dispatch_workflow: Workflow | None,
+    runtime_workflow: Workflow,
+) -> Workflow | None:
+    if dispatch_to_worker:
+        return dispatch_workflow
+    return runtime_workflow
+
+
 async def _attach_registered_output_parameter_values(
     *,
     workflow_run_id: str,
     workflow: Workflow | None,
+    output_identity_workflow: Workflow | None = None,
     data: dict[str, Any],
     persisted_output_parameters: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -1086,7 +1093,8 @@ async def _attach_registered_output_parameter_values(
     if not registered_rows:
         return {}
 
-    index_by_id, index_by_key = _workflow_output_parameter_indexes(workflow)
+    exact_output_identity = output_identity_workflow is not None
+    index_by_id, index_by_key = _workflow_output_parameter_indexes(output_identity_workflow or workflow)
     persisted_key_by_id = {
         output_parameter_id: key
         for parameter in persisted_output_parameters or []
@@ -1100,8 +1108,15 @@ async def _attach_registered_output_parameter_values(
         if not isinstance(output_parameter_id, str) or not output_parameter_id:
             continue
         block_info = dict(index_by_id.get(output_parameter_id, {}))
+        if exact_output_identity and not block_info:
+            LOG.info(
+                "Skipped registered output with no exact run-definition identity",
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=output_parameter_id,
+            )
+            continue
         output_parameter_key = block_info.get("output_parameter_key")
-        if not isinstance(output_parameter_key, str) or not output_parameter_key:
+        if not exact_output_identity and (not isinstance(output_parameter_key, str) or not output_parameter_key):
             output_parameter_key = persisted_key_by_id.get(output_parameter_id)
             if isinstance(output_parameter_key, str):
                 block_info["output_parameter_key"] = output_parameter_key
@@ -1272,7 +1287,9 @@ async def _capture_and_store_post_run_page(
     evidence: dict[str, Any] | None = None
     try:
         evidence, _ = await asyncio.wait_for(
-            _capture_composition_evidence(ctx, inspected_url=current_url, current_url=current_url),
+            _capture_composition_evidence(
+                ctx, inspected_url=current_url, current_url=current_url, solve_challenges=False
+            ),
             timeout=_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS,
         )
     except Exception:
@@ -1842,6 +1859,7 @@ async def _run_blocks_and_collect_debug(
                     block_state_map=ctx.block_state_map,
                     block_started_at_map=ctx.block_started_at_map,
                     block_ended_at_map=ctx.block_ended_at_map,
+                    workflow_run_id=workflow_run.workflow_run_id,
                 )
                 prior_block_ts = tick_result.prior_block_ts
                 last_block_fetch_monotonic = tick_result.last_block_fetch_monotonic
@@ -2202,12 +2220,16 @@ async def _run_blocks_and_collect_debug(
     if not run_ok and run and getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
 
+    output_identity_workflow = _registered_output_identity_workflow(
+        dispatch_to_worker=dispatch_to_worker,
+        dispatch_workflow=dispatch_workflow,
+        runtime_workflow=runtime_workflow,
+    )
+
     registered_outputs_by_label = await _attach_registered_output_parameter_values(
         workflow_run_id=workflow_run.workflow_run_id,
-        # Dispatched runs: the worker wrote outputs keyed by the persisted dispatch version's
-        # regenerated output-parameter ids, so map against that version (not runtime_workflow,
-        # which is intentionally left with the source ids). Inline runs map against runtime_workflow.
-        workflow=dispatch_workflow if dispatch_workflow is not None else runtime_workflow,
+        workflow=runtime_workflow,
+        output_identity_workflow=output_identity_workflow,
         data=result_data,
         persisted_output_parameters=all_output_params,
     )
@@ -2707,7 +2729,9 @@ def _record_run_blocks_result(
     )
     copilot_ctx.completion_verification_result = completion_verification
     if prior_committed_outcome is None or _verification_fully_satisfied(completion_verification):
-        record_completion_verification(copilot_ctx, completion_verification)
+        record_completion_verification(
+            copilot_ctx, completion_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+        )
         _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
@@ -2843,7 +2867,9 @@ def _record_run_blocks_result(
         if blocked_verification is not completion_verification:
             completion_verification = blocked_verification
             copilot_ctx.completion_verification_result = blocked_verification
-            record_completion_verification(copilot_ctx, blocked_verification)
+            record_completion_verification(
+                copilot_ctx, blocked_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+            )
             _record_adjudication_on_turn_state(copilot_ctx, blocked_verification)
         _mark_page_inspected(copilot_ctx)
         result["ok"] = False
@@ -3339,7 +3365,12 @@ def _mark_stored_post_run_failure_page(copilot_ctx: Any) -> None:
     if not post_run_inspection_cleanly_matches(evidence, run_id):
         return
     url = evidence.get("current_url") or evidence.get("inspected_url") or ""
-    _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=url)
+    _mark_post_run_page_observed(
+        copilot_ctx,
+        source_tool="inspect_page_for_composition",
+        url=url,
+        page_evidence=evidence,
+    )
     page_title = evidence.get("page_title")
     if isinstance(page_title, str) and page_title:
         _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
@@ -3433,23 +3464,13 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
     if progressed:
         reset_no_progress_interaction_count(copilot_ctx)
 
-    if not progressed and consume_uncovered_output_reopen_event(copilot_ctx):
-        contract.repair_loop_state = RepairLoopState(
-            streak_token=copilot_ctx.last_repair_non_convergence_signature,
-            consecutive_identical_repair_count=copilot_ctx.consecutive_non_converging_repair_count,
-            ceiling_reached=False,
-        )
-        return
-
     signature = _repair_non_convergence_signature(copilot_ctx, contract)
     if signature is None or progressed:
         copilot_ctx.consecutive_non_converging_repair_count = 0
-        copilot_ctx.last_repair_non_convergence_signature = None
         clear_recorded_outcome_grounding_requirement(copilot_ctx)
         contract.repair_loop_state = RepairLoopState(
             streak_token=None,
             consecutive_identical_repair_count=0,
-            ceiling_reached=False,
         )
         return
     prior_count = copilot_ctx.consecutive_non_converging_repair_count
@@ -3465,21 +3486,12 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
         ):
             clear_recorded_outcome_grounding_requirement(copilot_ctx)
     copilot_ctx.consecutive_non_converging_repair_count = count
-    copilot_ctx.last_repair_non_convergence_signature = signature
     contract.repair_loop_state = RepairLoopState(
         streak_token=signature,
         consecutive_identical_repair_count=count,
-        ceiling_reached=count >= settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL,
     )
     if _should_arm_recorded_outcome_grounding(copilot_ctx):
         arm_recorded_outcome_grounding_requirement(copilot_ctx)
-    if contract.repair_loop_state.ceiling_reached and run_backed_repair_evidence_exists(copilot_ctx):
-        signal = repair_ceiling_stop_signal(copilot_ctx, contract)
-        contract.repair_decision = contract.repair_decision.model_copy(
-            update={"next_action": RepairNextAction.STOP, "target_blocks": []}
-        )
-        stash_blocker_signal(copilot_ctx, signal)
-        stash_repair_ceiling_turn_halt(copilot_ctx, signal, consecutive_identical_repair_count=count)
 
 
 def _record_diagnosis_repair_contract(

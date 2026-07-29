@@ -1,4 +1,5 @@
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { Status } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
@@ -13,7 +14,7 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
  * waiting on human input (2FA, verification).
  */
 export function useExecutingBlockRun(): boolean {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const [searchParams] = useSearchParams();
   const isBlockRun = searchParams.has("bl");
   const urlRunId = searchParams.get("wr");

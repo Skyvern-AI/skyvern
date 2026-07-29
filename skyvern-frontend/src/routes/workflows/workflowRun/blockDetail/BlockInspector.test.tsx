@@ -150,3 +150,37 @@ describe("BlockInspector Inputs tab", () => {
     expect(screen.getByText("Fill out the form")).toBeDefined();
   });
 });
+
+describe("BlockInspector failure scoping", () => {
+  it("shows the failure reason on Summary and not on the other sub-panels", () => {
+    const block = buildBlock({
+      failure_reason: "Element not found",
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(screen.getByText("Failure")).toBeDefined();
+    expect(screen.getByText("Element not found")).toBeDefined();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Inputs" }));
+    expect(screen.queryByText("Element not found")).toBeNull();
+  });
+
+  it("opens on Summary for a failed block even when output exists", () => {
+    const block = buildBlock({
+      failure_reason: "Element not found",
+      output: { result: "partial" },
+    });
+    render(<BlockInspector block={block} />);
+
+    // Default tab is Summary (not Outputs), so the failure is visible on load.
+    expect(screen.getByText("Element not found")).toBeDefined();
+  });
+
+  it("surfaces the block failure on Summary when an action is selected", () => {
+    const block = buildBlock({ failure_reason: "Login rejected" });
+    const action = buildAction({ action_type: ActionTypes.Click });
+    render(<BlockInspector block={block} action={action} />);
+
+    expect(screen.getByText("Login rejected")).toBeDefined();
+  });
+});

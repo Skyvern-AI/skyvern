@@ -60,7 +60,7 @@ export function ParametersDialogBase({
             <div className="flex flex-wrap items-center gap-2">
               <div className="break-all font-mono text-sm">{item.key}</div>
               {item.description ? (
-                <div className="text-xs text-slate-400">
+                <div className="text-xs text-muted-foreground">
                   — {item.description}
                 </div>
               ) : null}
@@ -102,7 +102,7 @@ export function ParametersDialogBase({
           <DialogTitle>{title}</DialogTitle>
         </DialogHeader>
         {items.length === 0 ? (
-          <div className="text-sm text-slate-400">No inputs.</div>
+          <div className="text-sm text-muted-foreground">No inputs.</div>
         ) : (
           <div className="space-y-3">
             <Label className="text-xs">{sectionLabel}</Label>

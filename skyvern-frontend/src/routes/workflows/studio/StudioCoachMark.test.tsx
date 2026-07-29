@@ -63,4 +63,9 @@ describe("StudioCoachMark", () => {
     renderAt("/workflows/wpid_1/studio?wr=wr_1");
     expect(screen.queryByRole("note")).toBeNull();
   });
+
+  test("stays out of the way under the short run URL path", () => {
+    renderAt("/runs/wr_1");
+    expect(screen.queryByRole("note")).toBeNull();
+  });
 });

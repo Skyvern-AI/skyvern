@@ -4,7 +4,10 @@ These tests exercise the in-memory accumulation helpers and the ZIP-building
 utility without touching S3 or the database.
 """
 
+import asyncio
+import gc
 import io
+import weakref
 import zipfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -701,3 +704,183 @@ class TestFlushStepArchive:
         # The fallback should find nothing to flush — no extra uploads
         mock_storage.store_artifact.assert_not_awaited()
         mock_database.artifacts.bulk_create_artifacts.assert_not_awaited()
+
+
+class TestWaitForUploadAiotasksCleanup:
+    """wait_for_upload_aiotasks must release its upload_aiotasks_map entry on every exit path.
+
+    upload_aiotasks_map is the sole strong reference to the fire-and-forget upload Tasks. An
+    orphaned entry pins a completed-with-exception Task, whose traceback pins the store_artifact
+    coroutine frame and its artifact byte payload. Cleanup must therefore run on success, timeout,
+    caller cancellation, and non-timeout gather exceptions — not only the first two.
+    """
+
+    @pytest.mark.asyncio
+    async def test_success_removes_map_entry(self) -> None:
+        manager = ArtifactManager()
+
+        async def quick() -> None:
+            return None
+
+        task = asyncio.create_task(quick())
+        manager.upload_aiotasks_map["k"].append(task)
+
+        await manager.wait_for_upload_aiotasks(["k"])
+
+        assert task.done()
+        assert "k" not in manager.upload_aiotasks_map
+
+    @pytest.mark.asyncio
+    async def test_timeout_removes_map_entry_and_swallows_timeout(self) -> None:
+        manager = ArtifactManager()
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(hang())
+        manager.upload_aiotasks_map["k"].append(task)
+
+        real_timeout = asyncio.timeout
+        # Fire the 30s guard fast without altering the production semantics under test.
+        with patch(
+            "skyvern.forge.sdk.artifact.manager.asyncio.timeout",
+            lambda _seconds: real_timeout(0.05),
+        ):
+            # Established behavior: the timeout is logged and swallowed, not re-raised.
+            await manager.wait_for_upload_aiotasks(["k"])
+
+        assert "k" not in manager.upload_aiotasks_map
+        assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_removes_map_entry_and_reraises(self) -> None:
+        manager = ArtifactManager()
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(hang())
+        manager.upload_aiotasks_map["k"].append(task)
+
+        wait_task = asyncio.create_task(manager.wait_for_upload_aiotasks(["k"]))
+        await asyncio.sleep(0.01)  # let wait_task suspend inside the gather await
+        wait_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+
+        assert "k" not in manager.upload_aiotasks_map
+        assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_gather_exception_removes_map_entry_and_reraises(self) -> None:
+        manager = ArtifactManager()
+
+        async def raise_soon() -> None:
+            await asyncio.sleep(0)
+            raise ValueError("upload boom")
+
+        task = asyncio.create_task(raise_soon())
+        manager.upload_aiotasks_map["k"].append(task)
+
+        with pytest.raises(ValueError, match="upload boom"):
+            await manager.wait_for_upload_aiotasks(["k"])
+
+        assert "k" not in manager.upload_aiotasks_map
+
+    @pytest.mark.asyncio
+    async def test_failed_completed_task_released_on_cancellation(self) -> None:
+        manager = ArtifactManager()
+
+        async def fail_now() -> None:
+            raise ValueError("pins byte payload via traceback")
+
+        failed = asyncio.create_task(fail_now())
+        await asyncio.sleep(0)  # let it complete with an exception
+        assert failed.done() and failed.exception() is not None  # retrieve → no "never retrieved" warning
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        hanging = asyncio.create_task(hang())
+        manager.upload_aiotasks_map["k"].extend([failed, hanging])
+        ref = weakref.ref(failed)
+
+        wait_task = asyncio.create_task(manager.wait_for_upload_aiotasks(["k"]))
+        await asyncio.sleep(0.01)
+        wait_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+
+        assert "k" not in manager.upload_aiotasks_map
+        assert all(failed is not t for lst in manager.upload_aiotasks_map.values() for t in lst)
+
+        del failed
+        gc.collect()
+        assert ref() is None  # traceback + byte payload no longer reachable through the map
+
+        await asyncio.gather(hanging, return_exceptions=True)  # settle the gather-cancelled task
+
+    @pytest.mark.asyncio
+    async def test_absent_key_is_safe(self) -> None:
+        manager = ArtifactManager()
+
+        await manager.wait_for_upload_aiotasks(["never-added"])
+
+        assert "never-added" not in manager.upload_aiotasks_map
+
+    @pytest.mark.asyncio
+    async def test_duplicate_wait_same_key_is_idempotent(self) -> None:
+        manager = ArtifactManager()
+
+        async def quick() -> None:
+            return None
+
+        manager.upload_aiotasks_map["k"].append(asyncio.create_task(quick()))
+
+        await manager.wait_for_upload_aiotasks(["k"])
+        assert "k" not in manager.upload_aiotasks_map
+
+        await manager.wait_for_upload_aiotasks(["k"])  # second wait on the now-absent key is a no-op
+        assert "k" not in manager.upload_aiotasks_map
+
+    @pytest.mark.asyncio
+    async def test_concurrent_wait_same_key_is_safe(self) -> None:
+        manager = ArtifactManager()
+
+        async def settle() -> None:
+            await asyncio.sleep(0)
+
+        manager.upload_aiotasks_map["k"].append(asyncio.create_task(settle()))
+
+        results = await asyncio.gather(
+            manager.wait_for_upload_aiotasks(["k"]),
+            manager.wait_for_upload_aiotasks(["k"]),
+            return_exceptions=True,
+        )
+
+        assert results == [None, None]  # neither concurrent waiter raised KeyError
+        assert "k" not in manager.upload_aiotasks_map
+
+    @pytest.mark.asyncio
+    async def test_tasks_appended_during_wait_are_dropped_from_map(self) -> None:
+        # Documented decision: a task appended to the same key *during* the wait is cleared with
+        # the rest of the entry and is NOT awaited by the in-flight call. This preserves the
+        # pre-existing whole-entry cleanup semantics rather than draining late arrivals.
+        manager = ArtifactManager()
+        appended_holder: list[asyncio.Task[None]] = []
+
+        async def gate() -> None:
+            late = asyncio.create_task(asyncio.sleep(3600))
+            appended_holder.append(late)
+            manager.upload_aiotasks_map["k"].append(late)
+
+        manager.upload_aiotasks_map["k"].append(asyncio.create_task(gate()))
+
+        await manager.wait_for_upload_aiotasks(["k"])
+
+        assert "k" not in manager.upload_aiotasks_map
+        late = appended_holder[0]
+        assert not late.done()  # the late arrival was not awaited to completion by this call
+        late.cancel()
+        await asyncio.gather(late, return_exceptions=True)  # settle the cancelled task

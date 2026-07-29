@@ -5,8 +5,10 @@ import { python } from "@codemirror/lang-python";
 import { html } from "@codemirror/lang-html";
 import { yaml } from "@codemirror/lang-yaml";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
+import { tokyoNightDay } from "@uiw/codemirror-theme-tokyo-night-day";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
+import { useThemeAsDarkOrLight } from "@/components/useThemeAsDarkOrLight";
 import { useDebouncedCallback } from "use-debounce";
 
 import {
@@ -33,6 +35,9 @@ function getLanguageExtension(
 type Props = {
   value: string;
   onChange?: (value: string) => void;
+  // Invoked once with the CodeMirror view when it is created (e.g. to drive
+  // the search panel from a toolbar button).
+  onEditorView?: (view: EditorView) => void;
   language?: "python" | "json" | "html" | "yaml";
   lineWrap?: boolean;
   readOnly?: boolean;
@@ -67,6 +72,7 @@ const VIEWPORT_PREMOUNT_MARGIN = "200px";
 function CodeEditorImpl({
   value,
   onChange,
+  onEditorView,
   minHeight,
   maxHeight,
   language,
@@ -85,6 +91,7 @@ function CodeEditorImpl({
   // the editor and the oversized-document guard never read `.length` of
   // undefined.
   const safeValue = value ?? "";
+  const themeMode = useThemeAsDarkOrLight();
   const viewRef = useRef<EditorView | null>(null);
   const [internalValue, setInternalValue] = useState(safeValue);
   const latestValueRef = useRef(safeValue);
@@ -138,6 +145,11 @@ function CodeEditorImpl({
     latestOnChangeRef.current = onChange;
   }, [onChange]);
 
+  const latestOnEditorViewRef = useRef(onEditorView);
+  useEffect(() => {
+    latestOnEditorViewRef.current = onEditorView;
+  }, [onEditorView]);
+
   const debouncedOnChange = useDebouncedCallback((newValue: string) => {
     latestOnChangeRef.current?.(newValue);
   }, 300);
@@ -158,6 +170,7 @@ function CodeEditorImpl({
 
   const handleCreateEditor = useCallback((view: EditorView) => {
     viewRef.current = view;
+    latestOnEditorViewRef.current?.(view);
   }, []);
 
   const handleEditorUpdate = useCallback((viewUpdate: ViewUpdate) => {
@@ -277,7 +290,7 @@ function CodeEditorImpl({
       value={internalValue}
       onChange={handleChange}
       extensions={extensions}
-      theme={tokyoNightStorm}
+      theme={themeMode === "dark" ? tokyoNightStorm : tokyoNightDay}
       minHeight={minHeight}
       maxHeight={maxHeight}
       readOnly={readOnly}

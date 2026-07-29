@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
@@ -113,6 +117,44 @@ class FakePage:
 
     async def scroll(self, **kwargs):  # noqa: ANN003, ANN201
         return None
+
+
+@asynccontextmanager
+async def _recorded_action_db() -> AsyncIterator[AgentDB]:
+    db = AgentDB("sqlite+aiosqlite:///:memory:")
+    async with db.engine.begin() as connection:
+        await connection.run_sync(ActionModel.__table__.create)
+    try:
+        yield db
+    finally:
+        await db.engine.dispose()
+
+
+async def _record_timed_action() -> Action:
+    recorder = _Recorder()
+
+    async def delayed_call() -> None:
+        await asyncio.sleep(0.01)
+
+    await recorder.record(ActionType.CLICK, "locator.click", "#go", delayed_call, (), {})
+    action = recorder.actions[0]
+    action.task_id = "tsk_timing"
+    action.step_id = "stp_timing"
+    action.step_order = 0
+    return action
+
+
+@pytest.mark.asyncio
+async def test_recorded_action_has_wall_clock_timestamps_and_duration() -> None:
+    action = await _record_timed_action()
+
+    assert action.created_at is not None
+    assert action.modified_at is not None
+    assert action.created_at < action.modified_at
+    assert action.created_at.tzinfo is None
+    assert action.modified_at.tzinfo is None
+    assert isinstance(action.output, dict)
+    assert "duration_ms" in action.output
 
 
 @pytest.mark.asyncio
@@ -418,12 +460,15 @@ def _patch_execute_environment(
         "create_artifact": AsyncMock(return_value="artifact_1"),
         "create_task_and_step": AsyncMock(return_value=(_FakeTask(), _FakeStep())),
         "create_action": AsyncMock(return_value=None),
+        "upsert_recorded_action": AsyncMock(return_value=None),
         "update_task": AsyncMock(return_value=None),
         "update_step": AsyncMock(return_value=None),
+        "billing_hook": AsyncMock(return_value=None),
     }
     monkeypatch.setattr(
         "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", validate_code_block
     )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "post_code_block_execution", mocks["billing_hook"], raising=False)
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *args, **kwargs: browser_state)
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: context)
@@ -433,13 +478,26 @@ def _patch_execute_environment(
     monkeypatch.setattr(app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", mocks["create_artifact"])
     monkeypatch.setattr(app.agent, "create_task_and_step_from_code_block", mocks["create_task_and_step"], raising=False)
     monkeypatch.setattr(app.DATABASE.workflow_params, "create_action", mocks["create_action"])
+    monkeypatch.setattr(
+        app.DATABASE.workflow_params, "upsert_recorded_action", mocks["upsert_recorded_action"], raising=False
+    )
     monkeypatch.setattr(app.DATABASE.tasks, "update_task", mocks["update_task"])
     monkeypatch.setattr(app.DATABASE.tasks, "update_step", mocks["update_step"])
     return mocks
 
 
+def _upsert_calls(mocks: dict[str, AsyncMock]) -> list[Action]:
+    """Every recorded-action write, in order — the streamed (mid-block) writes then the end-of-block batch."""
+    return [call.args[0] for call in mocks["upsert_recorded_action"].await_args_list]
+
+
 def _created_actions(mocks: dict[str, AsyncMock]) -> list[Action]:
-    return [call.args[0] for call in mocks["create_action"].await_args_list]
+    # Final persisted row per action: the streamed write and the end-of-block batch converge on action_id,
+    # so keep the last write (which carries the drained screenshot) and dedupe.
+    by_id: dict[str | None, Action] = {}
+    for action in _upsert_calls(mocks):
+        by_id[action.action_id] = action
+    return list(by_id.values())
 
 
 @pytest.mark.asyncio
@@ -487,6 +545,26 @@ async def test_create_task_and_step_from_code_block_maps_goal_to_task(monkeypatc
     assert create_task.await_args.kwargs["url"] == "https://example.com/login"
     assert update_task.await_args.kwargs["status"] == TaskStatus.running
     assert create_step.await_args.kwargs["order"] == 0
+
+
+@pytest.mark.asyncio
+async def test_create_task_and_step_from_code_block_maps_empty_goal_to_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt-less code block stores navigation_goal NULL, not "", so action-plan lookups stay consistent."""
+    create_task = AsyncMock(return_value=_FakeTask())
+    monkeypatch.setattr(app.DATABASE.tasks, "get_last_task_for_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.tasks, "create_task", create_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task", AsyncMock(return_value=_FakeTask()))
+    monkeypatch.setattr(app.DATABASE.tasks, "create_step", AsyncMock(return_value=_FakeStep()))
+
+    block = _make_code_block("x = 1", goal="")
+    await ForgeAgent().create_task_and_step_from_code_block(
+        code_block=block,
+        organization_id="o_test",
+        workflow_run_id="wr_test",
+        task_url="https://example.com/login",
+    )
+
+    assert create_task.await_args.kwargs["navigation_goal"] is None
 
 
 @pytest.mark.asyncio
@@ -593,11 +671,20 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
+    # The enabled-gate now lives at the chokepoint, ahead of the mocked floor.
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    # Force the floor path deterministically so this exercises execute()'s seat-finalization
+    # wiring regardless of ambient cap-cache / api-key state leaked by other tests in the suite.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
     monkeypatch.setattr(
         CodeBlock,
         "_attempt_self_heal",
-        AsyncMock(return_value=SimpleNamespace(success=True, output_parameter_value=None)),
+        AsyncMock(return_value=SimpleNamespace(success=True, output_parameter_value=None, failure_reason=None)),
     )
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
@@ -621,6 +708,7 @@ async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.Monke
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
     monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
@@ -632,8 +720,8 @@ async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_goalless_code_block_creates_no_task_or_actions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without a goal there is no task to hang actions on, so none are created or persisted."""
+async def test_goalless_code_block_creates_task_and_persists_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A goalless block still gets a container task so its page activity is visible and billable."""
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
@@ -642,13 +730,15 @@ async def test_goalless_code_block_creates_no_task_or_actions(monkeypatch: pytes
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
-    assert mocks["create_task_and_step"].await_count == 0
-    assert mocks["create_action"].await_count == 0
+    assert mocks["create_task_and_step"].await_count == 1
+    actions = _created_actions(mocks)
+    assert [a.action_type for a in actions] == [ActionType.CLICK]
+    assert all(a.task_id == "tsk_code" and a.step_id == "stp_code" for a in actions)
 
 
 @pytest.mark.asyncio
-async def test_goalless_code_block_skips_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No task means screenshots would have no action row to anchor to, so don't take orphan ones."""
+async def test_goalless_code_block_takes_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a container task now created for goalless blocks, screenshots anchor like goal blocks."""
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
@@ -657,7 +747,62 @@ async def test_goalless_code_block_skips_screenshots(monkeypatch: pytest.MonkeyP
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
-    assert mocks["create_artifact"].await_count == 0
+    assert mocks["create_artifact"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_code_block_success_invokes_billing_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful code block invokes post_code_block_execution with its container task + step, after persist."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    mocks["billing_hook"].assert_awaited_once()
+    task, step = mocks["billing_hook"].await_args.args
+    assert task.task_id == "tsk_code"
+    assert step.step_id == "stp_code"
+    # Billing counts persisted action rows, so the hook must fire after persist. Streaming + the
+    # end-of-block batch converge on one row per action via action_id — exactly one distinct action here.
+    assert len(_created_actions(mocks)) == 1
+    assert mocks["create_action"].await_count == 0  # recorder writes via the isolated upsert, not create_action
+
+
+@pytest.mark.asyncio
+async def test_code_block_failure_skips_billing_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed code block is not billed."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("element detached")
+
+    page = FakePage()
+    page.inner = ExplodingLocator()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    assert mocks["billing_hook"].await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_billing_hook_failure_does_not_fail_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Billing is best-effort at this seam: a hook error must never change the block outcome."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    mocks["billing_hook"].side_effect = RuntimeError("billing backend down")
+
+    block = _make_code_block("value = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
 
 
 @pytest.mark.asyncio
@@ -753,11 +898,136 @@ async def test_page_evaluate_action_captures_and_links_screenshot(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_actions_stream_before_block_end_and_converge_on_one_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each action is written mid-block (streamed) AND in the end-of-block batch, but both writes share the
+    action's stable id and upsert one row — no duplicate. This is the ticket's core idempotency guarantee."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    writes = _upsert_calls(mocks)
+    # one streamed write during execution + one end-of-block batch write for the single action
+    assert len(writes) == 2
+    assert writes[0].action_id is not None
+    assert writes[0].action_id == writes[1].action_id  # converge on one row, not a duplicate
+    assert len(_created_actions(mocks)) == 1  # deduped to exactly one persisted action
+    assert mocks["create_action"].await_count == 0  # shared agent write path left untouched
+
+
+@pytest.mark.asyncio
+async def test_streamed_write_precedes_screenshot_backfilled_by_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The streamed row is written before the deferred screenshot upload finishes (screenshot_artifact_id is
+    None); the end-of-block batch upserts the same id with the drained screenshot."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    writes = _upsert_calls(mocks)
+    assert writes[0].screenshot_artifact_id is None  # streamed: upload still deferred
+    assert writes[-1].screenshot_artifact_id == "artifact_1"  # batch: screenshot backfilled
+    assert writes[0].action_id == writes[-1].action_id
+
+
+@pytest.mark.asyncio
+async def test_reupsert_preserves_action_end_timestamp_and_backfills_screenshot() -> None:
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        stamped_end = action.modified_at
+        await db.workflow_params.upsert_recorded_action(action)
+
+        await asyncio.sleep(0.01)
+        action.screenshot_artifact_id = "artifact_timing"
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.modified_at == stamped_end
+    assert row.screenshot_artifact_id == "artifact_timing"
+
+
+@pytest.mark.asyncio
+async def test_recorded_action_timestamps_round_trip_through_hydration() -> None:
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+            hydrated = hydrate_action(row)
+
+    assert row.created_at == action.created_at
+    assert row.modified_at == action.modified_at
+    assert hydrated.created_at == action.created_at
+    assert hydrated.modified_at == action.modified_at
+
+
+@pytest.mark.asyncio
+async def test_unstamped_action_reupsert_keeps_bump_behavior() -> None:
+    async with _recorded_action_db() as db:
+        action = Action(
+            action_id="act_unstamped",
+            action_type=ActionType.CLICK,
+            status=ActionStatus.completed,
+            task_id="tsk_unstamped",
+            step_id="stp_unstamped",
+            step_order=0,
+            action_order=0,
+        )
+        assert action.created_at is None
+        assert action.modified_at is None
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            first = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+            first_modified = first.modified_at
+
+        await asyncio.sleep(0.01)
+        action.screenshot_artifact_id = "artifact_unstamped"
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.screenshot_artifact_id == "artifact_unstamped"
+    assert row.modified_at > first_modified
+    assert row.modified_at.tzinfo is None
+
+
+@pytest.mark.asyncio
+async def test_streamed_write_masks_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Secrets must be masked on the streamed path too, not only in the end-of-block batch."""
+    secret = "s3cr3t-token"
+    page = FakePage()
+    context = FakeWorkflowRunContext(secrets={"pw": secret})
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block(f"await page.locator('#{secret}').click()\nvalue = 'ok'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    writes = _upsert_calls(mocks)
+    assert writes, "expected at least the streamed write"
+    for action in writes:
+        dumped = json.dumps(action.model_dump(mode="json"))
+        assert secret not in dumped
+        assert "*****" in dumped  # control: the secret was present and got masked, not simply absent
+
+
+@pytest.mark.asyncio
 async def test_persist_failure_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
     page = FakePage()
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
-    mocks["create_action"].side_effect = RuntimeError("db unavailable")
+    mocks["upsert_recorded_action"].side_effect = RuntimeError("db unavailable")
 
     block = _make_code_block("await page.locator('#go').click()\nvalue = 'ok'", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
@@ -784,7 +1054,7 @@ async def test_create_task_failure_does_not_fail_the_block(monkeypatch: pytest.M
     assert result.status == BlockStatus.completed
     assert result.output_parameter_value is not None
     assert result.output_parameter_value["value"] == "ok"
-    assert mocks["create_action"].await_count == 0
+    assert mocks["upsert_recorded_action"].await_count == 0
     assert mocks["create_artifact"].await_count == 0
 
 
@@ -806,7 +1076,7 @@ async def test_link_block_failure_fails_task_and_disables_recording(monkeypatch:
 
     assert result.success is True
     assert result.status == BlockStatus.completed
-    assert mocks["create_action"].await_count == 0
+    assert mocks["upsert_recorded_action"].await_count == 0
     assert mocks["create_artifact"].await_count == 0
     assert [call.kwargs.get("status") for call in mocks["update_task"].await_args_list] == [TaskStatus.failed]
     assert [call.kwargs.get("status") for call in mocks["update_step"].await_args_list] == [StepStatus.failed]
@@ -839,6 +1109,9 @@ async def test_caught_page_failure_then_unrelated_raise_persists_synthetic_actio
     assert actions[-1].status == ActionStatus.failed
     assert isinstance(actions[-1].output, dict) and actions[-1].output["code_line"] == 5
     assert "later failure" in (actions[-1].response or "")
+    # The synthetic error row is built outside the recorder; it still needs a stable id or the upsert
+    # inserts a null primary key and the code-error row is lost.
+    assert all(a.action_id for a in _upsert_calls(mocks))
 
 
 @pytest.mark.asyncio

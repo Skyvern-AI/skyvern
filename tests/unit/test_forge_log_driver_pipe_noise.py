@@ -12,6 +12,30 @@ class TargetClosedError(Exception):
     """Stand-in for patchright's TargetClosedError (the filter matches by type name)."""
 
 
+class PlaywrightError(Exception):
+    """Stand-in for playwright/patchright's Error carrying the collected-object message."""
+
+
+_CHANNEL_COLLECTED_TEXT = "Channel.send: The object has been collected to prevent unbounded heap growth."
+
+
+def _orphaned_task_record_for(
+    exc: Exception, *, message: str = "Task exception was never retrieved", include_repr: bool = True
+) -> logging.LogRecord:
+    msg = message
+    if include_repr:
+        msg = f"{message}\ntask: <Task finished name='Task-1' coro=<foo() done> exception={exc!r}>"
+    return logging.LogRecord(
+        name="asyncio",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg=msg,
+        args=(),
+        exc_info=(type(exc), exc, None),
+    )
+
+
 def _orphaned_future_record(exc_text: str) -> logging.LogRecord:
     return _orphaned_future_record_for(Exception(exc_text))
 
@@ -103,6 +127,36 @@ def test_filter_keeps_target_closed_error_from_awaited_path() -> None:
     assert _DriverPipeNoiseFilter().filter(record) is True
 
 
+def test_filter_drops_collected_object_task_noise() -> None:
+    # The recurring Hetzner burst: an orphaned Playwright teardown coroutine raises
+    # "Channel.send: The object has been collected ..." and asyncio logs it as a
+    # "Task exception was never retrieved" record. Pre-existing benign teardown noise.
+    record = _orphaned_task_record_for(PlaywrightError(_CHANNEL_COLLECTED_TEXT))
+    assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_drops_collected_object_future_noise() -> None:
+    # Same collected-object teardown surfacing on the Future variant.
+    record = _orphaned_future_record_for(PlaywrightError(_CHANNEL_COLLECTED_TEXT))
+    assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_drops_collected_object_via_exc_info_when_message_lacks_repr() -> None:
+    record = _orphaned_task_record_for(PlaywrightError(_CHANNEL_COLLECTED_TEXT), include_repr=False)
+    assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_keeps_execution_context_destroyed_orphaned_task() -> None:
+    # A different asyncio teardown class must stay visible — narrow suppression only.
+    record = _orphaned_task_record_for(PlaywrightError("Execution context was destroyed"))
+    assert _DriverPipeNoiseFilter().filter(record) is True
+
+
+def test_filter_keeps_generic_orphaned_task() -> None:
+    record = _orphaned_task_record_for(RuntimeError("some genuinely different bug"))
+    assert _DriverPipeNoiseFilter().filter(record) is True
+
+
 def test_filter_keeps_other_orphaned_future_exceptions() -> None:
     record = _orphaned_future_record("some other unrelated failure")
     assert _DriverPipeNoiseFilter().filter(record) is True
@@ -164,10 +218,12 @@ def test_setup_logger_filter_suppresses_emitted_noise(_restore_asyncio_filters: 
     asyncio_logger.addHandler(handler)
     try:
         asyncio_logger.handle(_orphaned_future_record("Connection closed while reading from the driver"))
+        asyncio_logger.handle(_orphaned_task_record_for(PlaywrightError(_CHANNEL_COLLECTED_TEXT)))
         asyncio_logger.handle(_orphaned_future_record("a genuinely different error"))
     finally:
         asyncio_logger.removeHandler(handler)
 
     messages = [r.getMessage() for r in captured]
     assert not any("Connection closed while reading from the driver" in m for m in messages)
+    assert not any(_CHANNEL_COLLECTED_TEXT in m for m in messages)
     assert any("a genuinely different error" in m for m in messages)

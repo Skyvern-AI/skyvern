@@ -327,10 +327,10 @@ def test_mint_degrade_survives_json_round_trip() -> None:
     assert restored[0].mint_degrade == _DEGRADE
 
 
-def test_mint_degrade_is_identity_bearing_in_reconcile_key() -> None:
+def test_mint_degrade_is_not_identity_bearing_in_reconcile_key() -> None:
     base = CompletionCriterion(id="req", outcome="return the status", level="run", output_path="output.status")
     degraded = replace(base, mint_degrade=_DEGRADE)
-    assert _criterion_reconcile_key(base) != _criterion_reconcile_key(degraded)
+    assert _criterion_reconcile_key(base) == _criterion_reconcile_key(degraded)
 
 
 def test_producer_floor_excludes_degraded_from_rekey() -> None:

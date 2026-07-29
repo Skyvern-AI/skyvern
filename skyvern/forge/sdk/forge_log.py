@@ -4,6 +4,7 @@ import re
 import sys
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import structlog
 from structlog.typing import EventDict
@@ -31,25 +32,38 @@ _entrypoint: str = "unknown"
 _DRIVER_PIPE_CLOSED_ERROR = "Connection closed while reading from the driver"
 _TARGET_CLOSED_ERROR = "Target page, context or browser has been closed"
 _ORPHANED_FUTURE_MESSAGE = "Future exception was never retrieved"
+_ORPHANED_TASK_MESSAGE = "Task exception was never retrieved"
 _TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
+_CHANNEL_COLLECTED_ERROR = "The object has been collected to prevent unbounded heap growth"
 
 
 class _DriverPipeNoiseFilter(logging.Filter):
-    """Drop asyncio's orphaned-future noise from a torn-down Playwright driver/target.
+    """Drop asyncio's orphaned-task/future noise from a torn-down Playwright driver/target.
 
-    Benign teardown race: a fire-and-forget driver op left a future behind, then the
-    target closed before it resolved, so asyncio logs the un-retrieved exception at
-    ERROR. Two variants are suppressed: the driver-pipe close (matched by its
-    distinctive message) and patchright's TargetClosedError. The latter is matched by
-    exception *type*, not text — the same "...has been closed" message can also come
-    from a crashed/killed browser, so a type check keeps real failures visible.
+    All variants are the same benign artifact: a fire-and-forget driver coroutine left a
+    task/future behind, then the target/driver went away before it resolved, so asyncio's
+    __del__ logs the un-retrieved exception at ERROR. Suppressed cases:
+      - driver-pipe close (matched by its distinctive message);
+      - patchright's TargetClosedError, matched by exception *type* not text — the same
+        "...has been closed" message can also come from a crashed/killed browser, so a
+        type check keeps real failures visible (Future variant only, unchanged);
+      - Playwright's "Channel.send: The object has been collected ..." teardown, matched by
+        its distinctive message on either the Task or Future orphaned-artifact variant.
+        This is a recurring, high-volume, pre-existing teardown pattern; it is unrelated to
+        OTEL instrumentation (asyncio's __del__ emits it whether or not AsyncioInstrumentor
+        is loaded — the instrumentor only adds a trace_coroutine frame to the traceback).
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
+        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
+        is_orphaned = _ORPHANED_FUTURE_MESSAGE in message or _ORPHANED_TASK_MESSAGE in message
+        if is_orphaned and (
+            _CHANNEL_COLLECTED_ERROR in message or (exc is not None and _CHANNEL_COLLECTED_ERROR in str(exc))
+        ):
+            return False
         if _ORPHANED_FUTURE_MESSAGE not in message:
             return True
-        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
         if _DRIVER_PIPE_CLOSED_ERROR in message or (exc is not None and _DRIVER_PIPE_CLOSED_ERROR in str(exc)):
             return False
         if exc is not None:
@@ -155,6 +169,38 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def redact_registered_secrets(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Redact credential values the copilot filled during a turn from every string in the event dict.
+
+    Imported lazily: this module is imported far earlier in boot than the copilot package.
+    """
+    from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, all_registered_secret_values
+
+    secrets = all_registered_secret_values()
+    if not secrets:
+        return event_dict
+
+    def scrub(node: Any) -> Any:
+        # Nested values are folded into `msg` by add_kv_pairs_to_msg further down the chain, so a
+        # secret carried only inside a nested kwarg reaches the log line unless we recurse here.
+        if isinstance(node, str):
+            for secret in secrets:
+                if secret in node:
+                    node = node.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+            return node
+        if isinstance(node, dict):
+            return {key: scrub(item) for key, item in node.items()}
+        if isinstance(node, list):
+            return [scrub(item) for item in node]
+        if isinstance(node, tuple):
+            return tuple(scrub(item) for item in node)
+        return node
+
+    for key, value in list(event_dict.items()):
+        event_dict[key] = scrub(value)
+    return event_dict
+
+
 def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """Redact Bearer JWTs from any string value in the event dict.
 
@@ -167,6 +213,17 @@ def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: E
     return event_dict
 
 
+def _compact_action(action: Any) -> Any:
+    """The few fields a log line needs to correlate. Anything else belongs in the database."""
+    if isinstance(action, (str, int, float, bool, dict, list, type(None))):
+        return action
+    return {
+        "id": getattr(action, "action_id", None),
+        "type": str(getattr(action, "action_type", type(action).__name__)),
+        "element_id": getattr(action, "element_id", None),
+    }
+
+
 def compact_action_objects(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """Compact verbose Action / ActionResult kwargs to a few key fields.
 
@@ -174,15 +231,24 @@ def compact_action_objects(logger: logging.Logger, method_name: str, event_dict:
     Action dataclass dumps 25+ attributes including LLM-generated reasoning /
     intention / response strings. Full action data is persisted to the DB and
     queryable there; logs only need enough to correlate.
+
+    ``actions=`` is handled the same way for the same reason: a batch of ten renders ten full
+    reprs. It happens to keep a signed ``file_url`` out of that one shape, but this is a LOG VOLUME
+    control and NOT a redaction control — it inspects two fixed keys and nothing else, so no part of
+    it should be relied on to keep credentials out of logs. Credential redaction across the logging
+    stack is a separate concern with its own ticket.
     """
     action = event_dict.get("action")
     if action is not None and not isinstance(action, (str, int, float, bool, dict, list, type(None))):
         try:
-            event_dict["action"] = {
-                "id": getattr(action, "action_id", None),
-                "type": str(getattr(action, "action_type", type(action).__name__)),
-                "element_id": getattr(action, "element_id", None),
-            }
+            event_dict["action"] = _compact_action(action)
+        except Exception:
+            pass
+
+    actions = event_dict.get("actions")
+    if isinstance(actions, (list, tuple)) and actions:
+        try:
+            event_dict["actions"] = [_compact_action(item) for item in actions]
         except Exception:
             pass
 
@@ -428,6 +494,7 @@ def setup_logger() -> None:
     additional_processors = (
         [
             redact_bearer_tokens,
+            redact_registered_secrets,
             compact_action_objects,
             structlog.processors.EventRenamer("msg"),
             add_kv_pairs_to_msg,
@@ -444,6 +511,7 @@ def setup_logger() -> None:
         if settings.JSON_LOGGING
         else [
             redact_bearer_tokens,
+            redact_registered_secrets,
             compact_action_objects,
             structlog.processors.CallsiteParameterAdder(
                 {
@@ -481,6 +549,14 @@ def setup_logger() -> None:
                 structlog.stdlib.add_logger_name,
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
+                # Every record on this handler — native structlog AND foreign stdlib (temporal,
+                # asyncio, sqlalchemy, uvicorn) — is serialized here, so this is the one seam that
+                # covers both. `format_exc_info` in `foreign_pre_chain` has already rendered
+                # exc_info to a string by now, so a secret in the exception text is reachable.
+                # These stay duplicated in the structlog chain above on purpose: that pass also
+                # guards `context.log`, which is persisted to the per-run S3 log artifact.
+                redact_bearer_tokens,
+                redact_registered_secrets,
                 renderer,
             ],
         )
@@ -517,6 +593,13 @@ def setup_logger() -> None:
     logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
+
+    # The OTLP gRPC exporter logs a WARNING per retry and an ERROR per dropped batch when its
+    # endpoint is unreachable; raise its threshold via OTEL_EXPORTER_LOG_LEVEL (default WARNING) to
+    # drop that spam where the endpoint is intentionally unavailable, keeping it visible elsewhere.
+    logging.getLogger("opentelemetry.exporter.otlp.proto.grpc.exporter").setLevel(
+        LOGGING_LEVEL_MAP.get(settings.OTEL_EXPORTER_LOG_LEVEL.upper(), logging.WARNING)
+    )
 
     # Drop asyncio's orphaned-future noise from torn-down Playwright driver pipes (logged at
     # ERROR but non-actionable). setup_logger may run more than once (uvicorn reload), so keep

@@ -30,7 +30,7 @@ function IndentRails({ depth }: { depth: number }) {
           className="relative shrink-0 self-stretch"
           style={{ width: `${INDENT_PX}px` }}
         >
-          <div className="absolute inset-y-0 left-1/2 w-px bg-slate-700" />
+          <div className="absolute inset-y-0 left-1/2 w-px bg-border" />
         </div>
       ))}
     </>
@@ -89,21 +89,21 @@ function WorkflowRunTimelineUnexecutedBlockItem({
         >
           <div className="size-4 shrink-0" />
           <div className="flex min-w-0 flex-1 items-center gap-1.5">
-            <div className="size-2 shrink-0 rounded-full border border-dashed border-slate-500" />
+            <div className="size-2 shrink-0 rounded-full border border-dashed border-border dark:border-slate-500" />
             <span title={blockTypeTitle} className="shrink-0">
               <WorkflowBlockIcon
                 workflowBlockType={block.block_type}
-                className="size-3.5 text-slate-400"
+                className="size-3.5 text-muted-foreground"
               />
             </span>
-            <span className="inline-flex min-w-[6rem] max-w-[8rem] shrink-0 justify-center truncate rounded bg-slate-700/70 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+            <span className="inline-flex min-w-[6rem] max-w-[8rem] shrink-0 justify-center truncate rounded bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-tertiary-foreground dark:bg-slate-700/70">
               {typeLabel}
             </span>
-            <span className="min-w-0 max-w-[12rem] truncate text-slate-300">
+            <span className="min-w-0 max-w-[12rem] truncate text-tertiary-foreground">
               {block.label}
             </span>
             <span
-              className="ml-auto shrink-0 rounded bg-slate-800 px-1 text-[10px] uppercase tracking-wide text-slate-400"
+              className="ml-auto shrink-0 rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground"
               title={badge.title}
             >
               {badge.label}

@@ -146,6 +146,38 @@ class TestResolveCredentialFillValue:
         }
 
     @pytest.mark.asyncio
+    async def test_resolve_inventory_includes_totp_when_seed_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(
+            monkeypatch,
+            PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=_FAKE_TOTP_SEED),
+        )
+        ctx = _ctx()
+        _, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "username")
+        assert error is None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password", "totp"})
+        }
+
+    @pytest.mark.asyncio
+    async def test_resolve_inventory_excludes_totp_for_runtime_only_otp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(
+            monkeypatch,
+            PasswordCredential(
+                username=_FAKE_USERNAME,
+                password=_FAKE_PASSWORD,
+                totp=None,
+                totp_type=TotpType.EMAIL,
+                totp_identifier="ops@example.com",
+            ),
+        )
+        ctx = _ctx()
+        _, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "username")
+        assert error is None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+
+    @pytest.mark.asyncio
     async def test_resolve_inventory_excludes_empty_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password="", totp=None))
         ctx = _ctx()

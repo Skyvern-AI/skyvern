@@ -6,9 +6,15 @@ OSS-synced: only example.* / RFC-2606 placeholder targets and synthetic labels.
 from __future__ import annotations
 
 import ast
+import hashlib
+import inspect
 import json
+import re
 import textwrap
-from types import SimpleNamespace
+from collections.abc import Iterable
+from pathlib import Path
+from types import EllipsisType, SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -19,6 +25,11 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
+from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
+    AuthoringParameterBindingCandidate,
+    build_authoring_parameter_binding_directive,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
@@ -28,9 +39,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
-    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
-    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
@@ -76,6 +85,8 @@ from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    CriterionKind,
+    CriterionLevel,
     JudgmentTruthCondition,
     RequestedOutputEvidenceSource,
     RequestPolicy,
@@ -87,6 +98,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _detect_stale_block_metadata,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
@@ -100,11 +112,30 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     TurnHaltKind,
     TurnHaltVerdict,
     _kind_for_blocker_signal,
-    stash_repair_ceiling_turn_halt,
+    stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+
+
+def _typed_completion_criterion(
+    *,
+    id: str,
+    output_path: str,
+    level: CriterionLevel,
+    method_mandated: bool,
+    kind: CriterionKind,
+) -> CompletionCriterion:
+    return CompletionCriterion(
+        id=id,
+        outcome=f"The run returns {output_path}.",
+        output_path=output_path,
+        level=level,
+        method_mandated=method_mandated,
+        kind=kind,
+    )
 
 
 def _yaml(body: str) -> str:
@@ -410,6 +441,7 @@ def _draft_only_credential_ctx() -> CopilotContext:
         allow_update_workflow=True,
         allow_run_blocks=False,
         allow_missing_credentials_in_draft=True,
+        credential_draft_deferred_explicitly=True,
         resolved_credentials=[
             SimpleNamespace(
                 credential_id="cred_missing",
@@ -437,13 +469,93 @@ def _stub_successful_update(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_process_workflow_yaml)
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _fake_get_prior_workflow)
-    monkeypatch.setattr(workflow_update_module, "composition_page_evidence_error", lambda *_args, **_kwargs: None)
 
 
 def _single_code_block(parsed: dict[str, object]) -> dict[str, object]:
     blocks = [block for block in workflow_blocks(parsed) if str(block.get("block_type") or "").lower() == "code"]
     assert len(blocks) == 1
     return blocks[0]
+
+
+_UNREFERENCED_DEFINITION_YAML = _yaml(
+    """
+    title: Submit reusable service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+      - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+      - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+      - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+      blocks:
+      - block_type: code
+        label: submit_service_request
+        parameter_keys: []
+        code: |
+          await page.locator("#open").click()
+          await page.locator("#submit").click()
+    """
+)
+
+
+def _definition_contract_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome=(
+                    "The workflow uses business name, contact email, service address, and desired start date "
+                    "as reusable inputs."
+                ),
+                level="definition",
+                output_path="workflow.parameters",
+            )
+        ]
+    )
+    return ctx
+
+
+def _same_month_file_match_case() -> tuple[CopilotContext, str, dict[str, str]]:
+    ctx = _definition_contract_ctx()
+    _enable_imposition(ctx)
+    source_url = "https://example.com/statements"
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#statement-row",
+            "source_url": source_url,
+            "trajectory_index": 0,
+        }
+    ]
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/invoice_100245_2026-05.pdf"]',
+        affordance_text="Download invoice",
+        download_kind="attribute",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+    submitted = _yaml(
+        """
+        title: Download reusable invoice
+        workflow_definition:
+          parameters:
+          - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "stale-account"}
+          - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-06-01"}
+          - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-06-30"}
+          blocks:
+          - block_type: code
+            label: download_invoice
+            parameter_keys: []
+            code: |
+              await page.locator("#statement-row").click()
+        """
+    )
+    values = {
+        "account_number": "100245",
+        "download_start_date": "2026-05-01",
+        "download_end_date": "2026-05-31",
+    }
+    return ctx, submitted, values
 
 
 @pytest.mark.parametrize(
@@ -693,21 +805,27 @@ class TestCodeSafetySeam:
     def test_safe_code_passes(self) -> None:
         assert _code_block_safety_errors(_SAFE_CODE_YAML, None) == []
 
+    def test_unparseable_code_block_reports_one_syntax_error(self) -> None:
+        errors = _code_block_safety_errors(_code_yaml("text = await page.evaluate("), None)
+
+        assert len(errors) == 1
+        assert "is not valid Python" in errors[0]
+
     @pytest.mark.asyncio
     async def test_denied_page_api_attribute_is_repairable_preflight_error_without_duplicate_generic_message(
         self,
     ) -> None:
         result = await _update_workflow(
-            {"workflow_yaml": _code_yaml("text = await page.evaluate('() => document.body.innerText')")},
+            {"workflow_yaml": _code_yaml("state = await page.context.storage_state()")},
             _standard_ctx(),
         )
 
         assert result["ok"] is False
         joined = result["error"]
-        assert "AUTHOR_PAGE_EVALUATE" in joined
+        assert "AUTHOR_PAGE_CONTEXT" in joined
         assert "failed the generated-code preflight check" in joined
         assert joined.count("failed the sandbox safety check") == 0
-        assert joined.count("page.evaluate is not allowed") == 1
+        assert joined.count("page.context is not allowed") == 1
 
     def test_unresolved_sandbox_names_are_seam_errors(self) -> None:
         errors = _code_block_safety_errors(
@@ -1057,14 +1175,15 @@ class TestCodeSafetySeam:
         result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
 
         assert result["ok"] is False
-        assert "authoring_repair_context" not in result["data"]
+        # A block carrying no data omits the key entirely, which satisfies the same contract.
+        assert "authoring_repair_context" not in result.get("data", {})
         assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.parametrize(
         "workflow_yaml",
         [
             _code_yaml("import os\nprint(provider_query)"),
-            _code_yaml("await page.evaluate(provider_query)"),
+            _code_yaml("await page.request.get(provider_query)"),
         ],
     )
     @pytest.mark.asyncio
@@ -1076,29 +1195,6 @@ class TestCodeSafetySeam:
         assert result["ok"] is False
         assert "authoring_repair_context" not in result["data"]
         assert ctx.last_code_authoring_repair_context is None
-
-    @pytest.mark.asyncio
-    async def test_imposition_reject_carries_ambiguous_selector_repair_context(self) -> None:
-        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
-        private_url = "https://example.com/orders?session=secret-token#account"
-        for interaction in ctx.scout_trajectory:
-            interaction["source_url"] = private_url
-
-        result = await _update_workflow({"workflow_yaml": _resale_submitted_yaml("button:nth-of-type(2)")}, ctx)
-
-        assert result["ok"] is False
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "ambiguous_bare_selector"
-        assert repair_context["block_label"] == "order_status"
-        assert repair_context["selector"] == "button"
-        assert repair_context["source_url"] == "https://example.com"
-        assert "secret-token" not in str(repair_context)
-        assert repair_context["refiner_selector"] is None
-        assert repair_context["selector_alternatives"] == [
-            {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"}
-        ]
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
 
     def test_ambiguous_selector_repair_context_only_carries_valid_refiner(self) -> None:
         code_block = {"label": "order_status"}
@@ -1211,22 +1307,835 @@ class TestCodeSafetySeam:
         assert "button:nth-of-type" not in str(dumped)
         assert "other-page" not in str(dumped)
 
-    @pytest.mark.asyncio
-    async def test_imposition_reject_replaces_stale_repair_context(self) -> None:
-        ctx = _resale_ctx(refiner_selector="button:nth-of-type(2)")
-        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
 
-        result = await _update_workflow({"workflow_yaml": _resale_submitted_yaml("button:nth-of-type(2)")}, ctx)
-
-        assert result["ok"] is False
-        assert result["data"]["authoring_repair_context"]["reason_code"] == "ambiguous_bare_selector"
-        assert result["data"]["authoring_repair_context"]["selector_alternatives"] == [
-            {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"}
-        ]
-        assert ctx.last_code_authoring_repair_context != _stale_unresolved_repair_context()
+def _live_root_value_bearing_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.turn_id = "t-live-root-value-bearing-directive"
+    ctx.scout_trajectory = []
+    ctx.request_policy = RequestPolicy(
+        request_slot_failure_kind="invalid_anchor_correction",
+        completion_criteria=[
+            CompletionCriterion(
+                id="3362dc25307750ce8cfcc05e3459f621874ba48d0a4500fbdd67f95d84cace37",
+                outcome="A visible manual-service path is returned as a blocker.",
+                output_path="output.blocker",
+                contingent_on="the site exposes only a manual-service path",
+                contingent_antecedent_output_path="output.blocker",
+                antecedent_family="blocker",
+            ),
+            *[
+                CompletionCriterion(
+                    id=f"slot_{index}",
+                    outcome=f"The returned record includes slot {index}.",
+                    output_path="output",
+                    antecedent_family="undecidable",
+                    request_slot_id=f"slot_{index}",
+                    pinability="unpinnable",
+                    mint_disposition="degraded",
+                    mint_degrade="undecidable_judgment",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=path,
+                )
+                for index, path in enumerate(
+                    (
+                        "output.confirmation_number",
+                        "output.account_number",
+                        "output.selected_start_date",
+                        "output.deposit_amount",
+                        "output.next_owner",
+                    )
+                )
+            ],
+        ],
+    )
+    return ctx
 
 
 class TestCodeRepairProgressClassification:
+    def test_output_safety_clamp_byte_parity(self) -> None:
+        source = inspect.getsource(workflow_update_module._extraction_code_with_required_static_return)
+
+        assert hashlib.sha256(source.encode()).hexdigest() == (
+            "32d1a9443d6dae7e8f6367cbe52902d7aaeb270e78c0275a66648d6013f24f9d"
+        )
+
+    def test_recut_binding_is_inert_for_runtime_self_heal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        ctx.turn_origin = TurnOrigin.runtime_self_heal
+        ctx.authoring_parameter_binding_snapshot = Mock()
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_authoring_parameter_binding_resolution",
+            Mock(side_effect=AssertionError("runtime self-heal must not resolve authoring bindings")),
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            _UNREFERENCED_DEFINITION_YAML,
+            ctx,
+            runtime_parameters={"business_name": "Example Co"},
+        )
+
+        assert result.workflow_yaml == _UNREFERENCED_DEFINITION_YAML
+        assert result.violations == []
+        assert result.substitutions is None
+        assert ctx.authoring_parameter_binding_snapshot is None
+
+    def test_same_month_file_match_runtime_values_override_defaults_and_satisfy_definition(self) -> None:
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        source_url = "https://example.com/statements"
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": source_url,
+                "trajectory_index": 0,
+            }
+        ]
+        raw_selector = 'a[href="/files/invoice_100245_2026-05.pdf"]'
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector=raw_selector,
+            affordance_text="Download invoice",
+            download_kind="attribute",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        submitted = _yaml(
+            """
+            title: Download reusable invoice
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "stale-account"}
+              - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-06-01"}
+              - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-06-30"}
+              blocks:
+              - block_type: code
+                label: download_invoice
+                parameter_keys: []
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters={
+                "account_number": "100245",
+                "download_start_date": "2026-05-01",
+                "download_end_date": "2026-05-31",
+            },
+        )
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        code = str(block["code"])
+        assert set(block["parameter_keys"]) == {
+            "account_number",
+            "download_start_date",
+            "download_end_date",
+        }
+        assert code.count("_scout_download_target = page.locator(") == 1
+        assert "_scout_entry_target = _scout_download_target" in code
+        assert "await _scout_download_target.click()" in code
+        assert "100245" not in code
+        assert "2026-05" not in code
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, result.workflow_yaml) is None
+        assert ctx.authoring_parameter_binding_snapshot is None
+
+    def test_same_month_file_match_rebinds_literal_when_other_block_references_all_keys(self) -> None:
+        ctx, _, values = _same_month_file_match_case()
+        submitted = _yaml(
+            """
+            title: Download reusable invoice
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string, default_value: "100245"}
+              - {parameter_type: workflow, key: download_start_date, workflow_parameter_type: string, default_value: "2026-05-01"}
+              - {parameter_type: workflow, key: download_end_date, workflow_parameter_type: string, default_value: "2026-05-31"}
+              blocks:
+              - block_type: text_prompt
+                label: prepare_invoice_request
+                parameter_keys: [account_number, download_start_date, download_end_date]
+                prompt: "Inputs: {{ parameters.account_number }}, {{ parameters.download_start_date }}, {{ parameters.download_end_date }}"
+              - block_type: code
+                label: download_invoice
+                parameter_keys: []
+                code: |
+                  await page.locator("#statement-row").click()
+                  await page.locator('a[href="/files/invoice_100245_2026-05.pdf"]').click()
+            """
+        )
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, submitted) is None
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(
+                submitted,
+                ctx,
+                runtime_parameters=values,
+            )
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "100245" not in code
+        assert "2026-05" not in code
+        assert any(
+            log.get("event") == "copilot_spine_same_month_file_match_transform_applied"
+            and log.get("provenance_source") == "same_month_file_match"
+            for log in logs
+        )
+
+    def test_same_month_file_match_rejects_stale_pending_directive_before_persistence(self) -> None:
+        ctx, submitted, values = _same_month_file_match_case()
+        keys = tuple(values)
+        directive = build_authoring_parameter_binding_directive(
+            structural_key="stale-structural-key",
+            source_origin="https://example.com",
+            candidates=[AuthoringParameterBindingCandidate(declared_key="account_number", field_selector="#account")],
+        )
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="download_invoice",
+            reason_code="synthesized_parameter_binding_ambiguous",
+            unresolved_names=list(keys),
+            parameter_keys=list(keys),
+            parameter_binding_directive=directive,
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+
+        assert result.workflow_yaml == submitted
+        assert result.violations == [
+            "Unable to impose synthesized code block: stored parameter binding directive is stale."
+        ]
+        assert result.repair_context is ctx.last_code_authoring_repair_context
+
+    def test_same_month_file_match_persistence_provenance_rejects_missing_identity_hole(self) -> None:
+        ctx, submitted, values = _same_month_file_match_case()
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+        assert result.violations == []
+        synthesized = ctx.imposition_synthesized_block
+        assert synthesized is not None
+        provenance = next(
+            record
+            for record in synthesized.diagnostics.locator_provenance
+            if record.get("source") == code_block_synthesis_module.SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE
+        )
+        tampered = dict(provenance)
+        tampered["holes"] = [hole for hole in provenance["holes"] if hole["format_id"] != "identity"]
+
+        assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+        assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+    def test_same_month_file_match_rejects_ambiguous_fresh_directive_before_persistence(self) -> None:
+        ctx, submitted, values = _same_month_file_match_case()
+        source_url = "https://example.com/statements"
+        ctx.scout_trajectory.append(
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "source_url": source_url,
+                "trajectory_index": 1,
+            }
+        )
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": source_url,
+            "forms": [
+                {
+                    "fields": [{"selector": "#account", "value": values["account_number"]}],
+                    "submit_controls": [{"selector": "#submit"}],
+                }
+            ],
+        }
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            submitted,
+            ctx,
+            runtime_parameters=values,
+        )
+
+        assert result.workflow_yaml == submitted
+        assert result.violations == [
+            "Unable to impose synthesized code block: current-page parameter binding is ambiguous."
+        ]
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "synthesized_parameter_binding_ambiguous"
+        assert result.repair_context.parameter_binding_directive is not None
+        assert result.repair_context.parameter_binding_directive.source_origin == "https://example.com"
+
+    def test_selection_resolution_binds_witnessed_click_value(self) -> None:
+        ctx = SimpleNamespace(
+            scout_trajectory=[
+                {
+                    "tool_name": "click",
+                    "selector": '[data-account="100245"]',
+                    "source_url": "https://example.com/statements",
+                    "trajectory_index": 0,
+                }
+            ]
+        )
+        for interaction in ctx.scout_trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is not None
+        binding = resolution.snapshot.field_bindings[0]
+        assert binding.declared_key == "account_number"
+        assert binding.match_basis == "scouted_selection_value"
+
+    def test_selection_resolution_rejects_prose_echo_without_scouted_interaction(self) -> None:
+        ctx = SimpleNamespace(
+            scout_trajectory=[
+                {
+                    "tool_name": "click",
+                    "selector": "#unrelated-open-button",
+                    "source_url": "https://example.com/statements",
+                    "trajectory_index": 0,
+                }
+            ]
+        )
+        for interaction in ctx.scout_trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is None
+
+    def test_selection_resolution_short_value_below_witness_bar_does_not_bind(self) -> None:
+        ctx = SimpleNamespace(
+            scout_trajectory=[
+                {
+                    "tool_name": "select_option",
+                    "selector": "#plan",
+                    "value": "US",
+                    "source_url": "https://example.com/statements",
+                    "trajectory_index": 0,
+                }
+            ]
+        )
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["region"],
+            ephemeral_values={"region": "US"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is None
+
+    def test_selection_resolution_multiple_matches_yield_candidates_without_snapshot(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "click",
+                "selector": '[data-account="100245"]',
+                "source_url": "https://example.com/statements",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": '[data-ref="100245"]',
+                "source_url": "https://example.com/statements",
+                "trajectory_index": 1,
+            },
+        ]
+        for interaction in trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        ctx = SimpleNamespace(scout_trajectory=trajectory)
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is not None
+
+    def test_selection_resolution_cross_origin_click_is_not_admitted(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "click",
+                "selector": '[data-account="100245"]',
+                "source_url": "https://other.example.org/statements",
+                "trajectory_index": 0,
+            }
+        ]
+        for interaction in trajectory:
+            interaction["input_correspondences"] = code_block_synthesis_module.input_correspondences_for_interaction(
+                interaction, {"account_number": "100245"}
+            )
+        ctx = SimpleNamespace(scout_trajectory=trajectory)
+        resolution = workflow_update_module._selection_parameter_binding_resolution(
+            ctx,
+            target_keys=["account_number"],
+            ephemeral_values={"account_number": "100245"},
+            structural_key="definition-reject",
+            source_origin="https://example.com",
+        )
+        assert resolution.snapshot is None
+        assert resolution.directive is None
+
+    @pytest.mark.asyncio
+    async def test_synthesized_business_input_floor_allows_fully_bound_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="submit-request",
+                    outcome="the service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                    level="run",
+                )
+            ]
+        )
+        ctx.synthesized_block_offered = True
+        ctx.spine_imposition_owned_attempt = True
+        bound_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name, service_address]
+                code: |
+                  await page.locator("#business").fill(str(business_name))
+                  await page.locator("#address").fill(str(service_address))
+                  await page.locator("#submit").click()
+            """
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_maybe_impose_synthesized_code_block",
+            lambda *_args, **_kwargs: workflow_update_module._SynthesizedCodeImpositionResult(
+                workflow_yaml=bound_yaml,
+                substitutions={"submit_service_request": "synthesized"},
+            ),
+        )
+
+        result = await _update_workflow(
+            {"workflow_yaml": bound_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == bound_yaml
+
+    @pytest.mark.asyncio
+    async def test_bound_draft_run_blocks_dispatches_when_criteria_dark(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(allow_run_blocks=True)
+        bound_yaml = _yaml(
+            """
+            title: Download monthly statement
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: account_number, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: fetch_invoice_pdf
+                parameter_keys: [account_number]
+                code: |
+                  await page.locator("#account").fill(str(account_number))
+                  await page.locator("#current-statement-row").click()
+            """
+        )
+
+        persist_result = await _update_workflow(
+            {"workflow_yaml": bound_yaml},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert persist_result["ok"] is True
+
+        dispatched: list[object] = []
+
+        async def _run(_params: object, _ctx: object, **_kwargs: object) -> dict[str, object]:
+            dispatched.append(_params)
+            return {"ok": True, "run_status": "completed"}
+
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _run)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        await tools_module.run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug"),
+            json.dumps({"block_labels": ["fetch_invoice_pdf"]}),
+        )
+
+        assert dispatched != []
+
+    @pytest.mark.asyncio
+    async def test_public_update_and_run_consumes_existing_page_binding_before_definition_reject(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        source_url = "https://example.com/utility"
+        runtime_parameters = {
+            "business_name": "Example Co",
+            "contact_email": "ops@example.com",
+            "service_address": "1 Example Way",
+            "desired_start_date": "2026-08-01",
+        }
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#company",
+                "source_url": source_url,
+                "typed_length": 10,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#email",
+                "source_url": source_url,
+                "typed_length": 15,
+                "trajectory_index": 1,
+            },
+            {"tool_name": "click", "selector": "#submit", "source_url": source_url, "trajectory_index": 2},
+        ]
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": source_url,
+            "forms": [
+                {
+                    "fields": [
+                        {"selector": "#company", "value": runtime_parameters["business_name"]},
+                        {"selector": "#email", "value": runtime_parameters["contact_email"]},
+                        {"selector": "#address", "value": runtime_parameters["service_address"]},
+                        {"selector": "#date", "value": runtime_parameters["desired_start_date"]},
+                    ],
+                    "submit_controls": [{"selector": "#submit"}],
+                }
+            ],
+        }
+
+        async def _no_prior_definition(_ctx: CopilotContext) -> None:
+            return None
+
+        dispatched_candidates: list[str] = []
+
+        async def _run(_params: object, run_ctx: CopilotContext, **_kwargs: object) -> dict[str, object]:
+            dispatched_candidates.append(run_ctx.workflow_yaml or "")
+            return {"ok": False, "error": "stop after exact candidate"}
+
+        async def _verification(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *_args: (["submit_service_request"], {}, None))
+        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *_args: None)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _run)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", _verification)
+        monkeypatch.setattr(tools_module, "_tool_visible_result_after_completion_verification", lambda _c, r, _v: r)
+
+        with capture_logs() as logs:
+            result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+                json.dumps(
+                    {
+                        "workflow_yaml": _UNREFERENCED_DEFINITION_YAML,
+                        "block_labels": ["submit_service_request"],
+                        "parameters": runtime_parameters,
+                    }
+                ),
+            )
+
+        bound = next(log for log in logs if log["event"] == "copilot recorded outcome submit rung bound")
+        consumed = next(
+            log for log in logs if log["event"] == "copilot recorded outcome binding consumed by synthesizer"
+        )
+        assert consumed["binding_fingerprints"] == [bound["binding_fingerprint"]]
+        assert dispatched_candidates == [ctx.workflow_yaml]
+        assert json.loads(result)["error"] == "stop after exact candidate"
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        block = _single_code_block(parsed)
+        code = str(block["code"])
+        assert block["parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+        assert code.count('page.locator("#company").fill(str(business_name))') == 1
+        assert code.count('page.locator("#email").fill(str(contact_email))') == 1
+        assert code.count('page.locator("#address").fill(str(service_address))') == 1
+        assert code.count('page.locator("#date").fill(str(desired_start_date))') == 1
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, ctx.workflow_yaml) is None
+
+    @pytest.mark.asyncio
+    async def test_public_initial_preflight_preserves_code_safety_precedence_for_untagged_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[CompletionCriterion(id="run", outcome="The service request is submitted.")]
+        )
+        unsafe_yaml = _UNREFERENCED_DEFINITION_YAML.replace(
+            'await page.locator("#open").click()',
+            'import requests\n      await page.locator("#open").click()',
+        )
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": unsafe_yaml, "block_labels": ["submit_service_request"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed.get("data", {}).get("reason_code") != "definition_contract_unsatisfied"
+        assert "sandbox safety check" in parsed["error"]
+
+    def test_definition_preflight_drops_bindings_from_non_fallthrough_branch(self) -> None:
+        ctx = _definition_contract_ctx()
+        terminal_branch_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  if page.url.endswith("/done"):
+                      company = business_name
+                      if True:
+                          return {"already_done": True}
+                  else:
+                      company = "fixed"
+                  await page.locator("#company").fill(company)
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, terminal_branch_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    @pytest.mark.parametrize(
+        "terminal_test", ["if 1:\n    return {'already_done': True}", "while True:\n    return {'already_done': True}"]
+    )
+    def test_definition_preflight_drops_bindings_from_constant_terminal_control(self, terminal_test: str) -> None:
+        ctx = _definition_contract_ctx()
+        indented_terminal = textwrap.indent(terminal_test, "          ")
+        workflow_yaml = _yaml(
+            "title: Submit reusable service request\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: submit_service_request\n"
+            "    parameter_keys: [business_name]\n"
+            "    code: |\n"
+            "      if page.url.endswith('/done'):\n"
+            "          company = business_name\n"
+            f"{indented_terminal}\n"
+            "      else:\n"
+            "          company = 'fixed'\n"
+            "      await page.locator('#company').fill(company)\n"
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, workflow_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    def test_definition_preflight_ignores_break_in_unreachable_constant_branch(self) -> None:
+        ctx = _definition_contract_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  if page.url.endswith("/done"):
+                      company = business_name
+                      while True:
+                          if False:
+                              break
+                          return {"already_done": True}
+                  else:
+                      company = "fixed"
+                  await page.locator("#company").fill(company)
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, workflow_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    def test_definition_preflight_ignores_break_overridden_by_terminal_finally(self) -> None:
+        ctx = _definition_contract_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  if page.url.endswith("/done"):
+                      company = business_name
+                      while True:
+                          try:
+                              break
+                          finally:
+                              return {"already_done": True}
+                  else:
+                      company = "fixed"
+                  await page.locator("#company").fill(company)
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, workflow_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    @pytest.mark.parametrize(
+        ("code", "expected_unreferenced"),
+        [
+            (
+                "values = [business_name for business_name in ['fixed']]\n"
+                "await page.locator('#company').fill(values[0])",
+                ["business_name"],
+            ),
+            (
+                "async def fill_company():\n"
+                "    await page.locator('#company').fill(str(business_name))\n"
+                "await fill_company()",
+                [],
+            ),
+        ],
+    )
+    def test_definition_preflight_honors_python_scopes(self, code: str, expected_unreferenced: list[str]) -> None:
+        ctx = _definition_contract_ctx()
+        indented_code = textwrap.indent(code, "      ")
+        scoped_yaml = _yaml(
+            "title: Submit reusable service request\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: submit_service_request\n"
+            "    parameter_keys: [business_name]\n"
+            "    code: |\n"
+            f"{indented_code}\n"
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, scoped_yaml)
+
+        if expected_unreferenced:
+            assert result is not None
+            assert list(result.unreferenced_parameter_keys) == expected_unreferenced
+        else:
+            assert result is None
+
+    @pytest.mark.parametrize(
+        ("template", "is_consumed"),
+        [
+            ('{{ "business_name" }}', False),
+            ("{% if business_name %}/customer{% endif %}", True),
+        ],
+    )
+    def test_definition_preflight_uses_jinja_semantics(self, template: str, is_consumed: bool) -> None:
+        ctx = _definition_contract_ctx()
+        templated_yaml = _yaml(
+            f"""
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {{parameter_type: workflow, key: business_name, workflow_parameter_type: string}}
+              blocks:
+              - block_type: navigation
+                label: open_customer
+                url: {json.dumps(template)}
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, templated_yaml)
+
+        assert (result is None) is is_consumed
+
+    @pytest.mark.asyncio
+    async def test_definition_preflight_defers_to_repairable_syntax_error(self) -> None:
+        ctx = _definition_contract_ctx()
+        malformed_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  await page.locator("#company").fill(str(business_name)
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": malformed_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert "not valid Python" in result["error"]
+        assert result.get("data", {}).get("reason_code") != "definition_contract_unsatisfied"
+
     @pytest.mark.asyncio
     async def test_code_safety_seam_reject_carries_progress_surface_kind(self) -> None:
         ctx = _code_only_ctx()
@@ -1249,7 +2158,7 @@ class TestCodeRepairProgressClassification:
             "_code_block_safety_errors",
             lambda workflow_yaml, prior_yaml: [
                 "Code block `search_registry` failed the generated-code preflight check: "
-                "AUTHOR_PAGE_EVALUATE: page.evaluate is not allowed."
+                "AUTHOR_PAGE_REQUEST: page.request is not allowed."
             ],
         )
         ctx = _code_only_ctx()
@@ -1287,66 +2196,11 @@ class TestCodeRepairProgressClassification:
         payload = _code_safety_reject_payload(
             [
                 "Code block `search_registry` failed the generated-code preflight check: "
-                "AUTHOR_PAGE_EVALUATE: page.evaluate is not allowed."
+                "AUTHOR_PAGE_REQUEST: page.request is not allowed."
             ]
         )
 
         assert payload is None
-
-    @pytest.mark.asyncio
-    async def test_authoritative_recorded_outcome_rejects_unchanged_authored_candidate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.workflow_yaml = _code_yaml('await page.goto("https://example.com/old")')
-        signature = authored_structure_signature_from_workflow(_SAFE_CODE_YAML)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:typed-outcome",
-            authored_structure_signature=signature,
-        )
-
-        result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "left the frontier the last recorded test outcome named unchanged" in result["error"]
-        assert ctx.workflow_yaml == _code_yaml('await page.goto("https://example.com/old")')
-        assert ctx.has_staged_proposal is False
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "unchanged_after_recorded_outcome"
-        assert ctx.latest_recorded_build_test_outcome.structural_key is not None
-
-    @pytest.mark.asyncio
-    async def test_repeated_unchanged_authored_candidate_keeps_same_reject_key_and_backstop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        signature = authored_structure_signature_from_workflow(_SAFE_CODE_YAML)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:typed-outcome",
-            authored_structure_signature=signature,
-        )
-
-        first = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
-        first_key = ctx.latest_recorded_build_test_outcome.structural_key
-        first_count = ctx.code_authoring_guardrail_reject_count
-        second = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML}, ctx, allow_missing_credentials=True)
-
-        assert first["ok"] is False
-        assert second["ok"] is False
-        assert first_key is not None
-        assert ctx.latest_recorded_build_test_outcome.structural_key == first_key
-        assert first_count == 1
-        assert ctx.code_authoring_guardrail_reject_count == 2
 
     @pytest.mark.asyncio
     async def test_authoritative_recorded_outcome_allows_changed_authored_candidate(
@@ -1370,177 +2224,6 @@ class TestCodeRepairProgressClassification:
         assert result["ok"] is True
         assert ctx.workflow_yaml == changed_yaml
         assert ctx.has_staged_proposal is True
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_output_empty_changed_candidate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.completion_verification_result = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=["npi", "locations"],
-            verdicts=[
-                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
-                CriterionVerdict(criterion_id="locations", state="unsatisfied", reason_code="no_evidence"),
-            ],
-        )
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi", "locations"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi", "locations"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-        )
-        partial_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              parameters:
-              - parameter_type: workflow
-                workflow_parameter_type: string
-                key: address_city_county_or_zip_code
-              blocks:
-              - block_type: code
-                label: {label}
-                parameter_keys:
-                - address_city_county_or_zip_code
-                code: |
-                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
-                  await page.locator("#locInput").fill(str(address_city_county_or_zip_code))
-                  return {{}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not return any keyed output" in result["error"]
-        assert ctx.has_staged_proposal is False
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_explicit_empty_return_despite_assigned_goal_root(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.completion_verification_result = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=["npi"],
-            verdicts=[
-                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
-            ],
-        )
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  npi = await page.locator("#npi").inner_text(timeout=5000)
-                  return {{}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not return any keyed output" in result["error"]
-        assert ctx.has_staged_proposal is False
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.is_authoritative is True
-        assert outcome.block_labels == [label]
-        assert outcome.structural_failure_identity.startswith("author_time:")
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_known_empty_helper_without_missing_facts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.completion_verification_result = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=["npi"],
-            verdicts=[
-                CriterionVerdict(criterion_id="npi", state="unsatisfied", reason_code="no_evidence"),
-            ],
-        )
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  def build():
-                      return {{}}
-
-                  return build()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not return any keyed output" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.block_labels == [label]
-        assert outcome.missing_requested_output_facts == []
-        assert outcome.structural_failure_identity.startswith("author_time:")
 
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_implicit_keyed_output_candidate(
@@ -1592,61 +2275,6 @@ class TestCodeRepairProgressClassification:
         assert result["ok"] is True
         labels = [block.get("label") for block in workflow_blocks(parse_workflow_yaml(ctx.workflow_yaml))]
         assert labels == [label]
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_candidate_missing_requested_output_roots(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["address"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["address"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
-                {
-                    "output_path": "credentialing_status",
-                    "output_root": "credentialing_status",
-                    "value_status": "no_typed_value",
-                },
-                {"output_path": "locations", "output_root": "locations", "value_status": "empty_typed_value"},
-                {"output_path": "statuses", "output_root": "statuses", "value_status": "no_typed_value"},
-            ],
-        )
-        partial_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
-                  address = "North Carolina, USA"
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        assert ctx.has_staged_proposal is False
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
 
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_accepts_canonical_output_path_candidate_with_sibling(
@@ -1701,154 +2329,6 @@ class TestCodeRepairProgressClassification:
         assert ctx.code_artifact_metadata[label]["claimed_outcomes"][0]["extraction_schema"] == schema
         assert ctx.latest_recorded_build_test_outcome is not None
         assert ctx.latest_recorded_build_test_outcome.reason_code == "outcome_not_demonstrated"
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_flat_candidate_for_canonical_output_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "submit_form_and_extract_confirmation"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["confirmation_number"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["confirmation_number"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {
-                    "output_path": "output.confirmation_number",
-                    "output_root": "output",
-                    "value_status": "no_typed_value",
-                },
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Form submission
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"confirmation_number": "ABC-123"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "output.confirmation_number" in result["error"]
-        assert "satisfies the requested output contract" in result["error"]
-        assert "canonical required child paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.confirmation_number",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-        rendered = agent_module._recorded_build_test_outcome_prompt(ctx)
-        assert "output_path=output.confirmation_number" in rendered
-
-    def test_required_output_roots_ignore_nested_debug_output_root_without_declared_root(self) -> None:
-        label = "extract_provider_profile"
-        metadata = {label: {"block_label": label, "claimed_outcomes": [{"goal_value_paths": ["debug_output"]}]}}
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"debug_output": {{"npi": "1234567890"}}}}
-            """
-        )
-
-        assert workflow_update_module._candidate_missing_required_output_paths(
-            candidate_yaml,
-            metadata,
-            required_paths={"npi"},
-        ) == ["npi"]
-
-    def test_required_output_roots_ignore_same_label_undeclared_static_root(self) -> None:
-        label = "extract_provider_profile"
-        metadata = {label: {"block_label": label, "claimed_outcomes": [{"goal_value_paths": ["address"]}]}}
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"npi": "1234567890"}}
-            """
-        )
-
-        assert workflow_update_module._candidate_missing_required_output_paths(
-            candidate_yaml,
-            metadata,
-            required_paths={"npi"},
-        ) == ["npi"]
-
-    def test_required_output_roots_ignore_static_root_without_label_metadata(self) -> None:
-        label = "extract_provider_profile"
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"npi": "1234567890"}}
-            """
-        )
-
-        assert workflow_update_module._candidate_missing_required_output_paths(
-            candidate_yaml,
-            {},
-            required_paths={"npi"},
-        ) == ["npi"]
-
-    def test_required_output_roots_accept_same_label_declared_static_root(self) -> None:
-        label = "extract_provider_profile"
-        metadata = {label: {"block_label": label, "claimed_outcomes": [{"goal_value_paths": ["npi"]}]}}
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"npi": "1234567890"}}
-            """
-        )
-
-        assert (
-            workflow_update_module._candidate_missing_required_output_paths(
-                candidate_yaml,
-                metadata,
-                required_paths={"npi"},
-            )
-            == []
-        )
 
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_unprovable_dynamic_output_shape(
@@ -2109,18 +2589,6 @@ class TestCodeRepairProgressClassification:
             for fact in outcome.missing_requested_output_facts
         )
 
-    def test_local_dict_dynamic_key_preserves_literal_roots_while_abstaining(self) -> None:
-        produced = workflow_update_module._code_block_produced_output_roots(
-            """
-            key = "npi"
-            result = {"address": "North Carolina", key: "123"}
-            return result
-            """
-        )
-
-        assert produced.roots == {"address"}
-        assert produced.abstained is True
-
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_helper_dynamic_key_local_dict_to_abstain(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2175,535 +2643,6 @@ class TestCodeRepairProgressClassification:
             fact.get("reason_code") != "recorded_outcome_missing_output_coverage"
             for fact in outcome.missing_requested_output_facts
         )
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_unrelated_dynamic_output_shape(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["address"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["address"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  result = {{}}
-                  key = "address"
-                  result[key] = await page.locator("#address").inner_text(timeout=5000)
-                  return result
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "npi",
-                "output_root": "npi",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_when_unrelated_block_abstains(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        declared_label = "extract_provider_profile"
-        unrelated_label = "extract_unrelated_status"
-        ctx.code_artifact_metadata = {
-            declared_label: {
-                "block_label": declared_label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {declared_label}
-                code: |
-                  return {{"address": "North Carolina"}}
-              - block_type: code
-                label: {unrelated_label}
-                code: |
-                  result = {{}}
-                  key = "status"
-                  result[key] = await page.locator("#status").inner_text(timeout=5000)
-                  return result
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "npi",
-                "output_root": "npi",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_keeps_undeclared_missing_roots_with_dynamic_shape(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-                {"output_path": "status", "output_root": "status", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  result = {{}}
-                  key = "npi"
-                  result[key] = await page.locator("#npi").inner_text(timeout=5000)
-                  return result
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "status",
-                "output_root": "status",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_literal_output_missing_required_root(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"address": "North Carolina"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.block_labels == [label]
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "npi",
-                "output_root": "npi",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_empty_return_despite_assigned_root(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  npi = await page.locator("#npi").inner_text(timeout=5000)
-                  return {{}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not return any keyed output" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.block_labels == [label]
-        assert outcome.missing_requested_output_facts == []
-
-    @pytest.mark.parametrize("return_expression", ["None", "[]", '["not keyed"]'])
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_static_non_keyed_return_with_unrelated_output(
-        self, monkeypatch: pytest.MonkeyPatch, return_expression: str
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        declared_label = "extract_provider_profile"
-        unrelated_label = "extract_unrelated_status"
-        ctx.code_artifact_metadata = {
-            declared_label: {
-                "block_label": declared_label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {declared_label}
-                code: |
-                  return {return_expression}
-              - block_type: code
-                label: {unrelated_label}
-                code: |
-                  return {{"status": "active"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "npi",
-                "output_root": "npi",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_helper_known_empty_output(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["npi"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "npi", "output_root": "npi", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  def build():
-                      return {{}}
-
-                  return build()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not return any keyed output" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == []
-
-    @pytest.mark.asyncio
-    async def test_metadata_reject_persists_missing_roots_for_next_author_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
-                {
-                    "output_path": "credentialing_status",
-                    "output_root": "credentialing_status",
-                    "value_status": "no_typed_value",
-                },
-            ],
-        )
-        partial_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
-                  return {{"search_options": []}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": partial_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "address",
-                "output_root": "address",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "credentialing_status",
-                "output_root": "credentialing_status",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-        ]
-        rendered = agent_module._recorded_build_test_outcome_prompt(ctx)
-        assert "missing_requested_output_facts:" in rendered
-        assert "output_root=address" in rendered
-        assert "output_root=credentialing_status" in rendered
-        assert "value_status=no_typed_value" in rendered
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_broad_output_for_missing_child_paths(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_entry"
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["output"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.verified_block_outputs[label] = {
-            "output": {"npi": "1234567890", "address": "Example location", "statuses": ["active"]}
-        }
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "output.npi", "output_root": "output", "value_status": "no_typed_value"},
-                {"output_path": "output.address", "output_root": "output", "value_status": "no_typed_value"},
-                {"output_path": "output.statuses", "output_root": "output", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"output": {{"summary": "found"}}}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "requested output contract" in result["error"]
-        assert result["data"]["canonical_required_child_paths"] == [
-            "output.address",
-            "output.npi",
-            "output.statuses",
-        ]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.address",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.npi",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.statuses",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-        ]
 
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_exact_missing_array_child_paths(
@@ -2774,191 +2713,6 @@ class TestCodeRepairProgressClassification:
         labels = [block.get("label") for block in workflow_blocks(parse_workflow_yaml(ctx.workflow_yaml))]
         assert labels == [label]
 
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_extraction_schema_wrapper_mismatch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_entry"
-        child_paths = ["output.npi", "output.locations[].address", "output.statuses"]
-        claimed_schema = (
-            '{"type":"object","properties":{'
-            '"npi":{"type":"string"},'
-            '"locations":{"type":"array","items":{"type":"object","properties":{"address":{"type":"string"}}}},'
-            '"statuses":{"type":"array","items":{"type":"string"}}}}'
-        )
-        terminal_schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{'
-            '"npi":{"type":"string"},'
-            '"locations":{"type":"array","items":{"type":"object","properties":{"address":{"type":"string"}}}},'
-            '"statuses":{"type":"array","items":{"type":"string"}}}}}}'
-        )
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": child_paths, "extraction_schema": claimed_schema}],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": child_paths, "extraction_schema": terminal_schema}
-                ],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "output.npi", "output_root": "output", "value_status": "no_typed_value"},
-                {
-                    "output_path": "output.locations[].address",
-                    "output_root": "output",
-                    "value_status": "no_typed_value",
-                },
-                {"output_path": "output.statuses", "output_root": "output", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{
-                      "output": {{
-                          "npi": "1234567890",
-                          "locations": [{{"address": "Example location"}}],
-                          "statuses": ["active"],
-                      }}
-                  }}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "extraction_schema" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.locations[].address",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.npi",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.statuses",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-        ]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "metadata_reject"
-        assert repair_context["block_label"] == label
-        assert repair_context["runtime_failure_class"] == "recorded_outcome_missing_output_coverage"
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
-
-    @pytest.mark.asyncio
-    async def test_requested_output_contract_rejects_collapsed_candidate_before_recorded_outcome(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_entry"
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.npi",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-                SimpleNamespace(
-                    id="requested_locations",
-                    output_path="output.locations",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-                SimpleNamespace(
-                    id="requested_statuses",
-                    output_path="output.statuses",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-            ]
-        )
-        ctx.code_artifact_metadata = {
-            label: {
-                "block_label": label,
-                "claimed_outcomes": [{"goal_value_paths": ["output"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        candidate_yaml = _yaml(
-            f"""
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"output": {{"summary": "found"}}}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "requested output contract" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.locations",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.npi",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.statuses",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-        ]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "metadata_reject"
-        assert repair_context["block_label"] == label
-        assert repair_context["runtime_failure_class"] == "requested_output_contract_missing_output_coverage"
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
-
     def test_single_output_contract_evaluator_reports_all_deficiency_classes(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = [
@@ -2967,7 +2721,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -3033,56 +2787,6 @@ class TestCodeRepairProgressClassification:
         assert "description" not in json.dumps(schema)
         assert "example" not in json.dumps(schema)
 
-    @pytest.mark.asyncio
-    async def test_update_and_run_preflight_and_update_workflow_share_contract_signature(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-        repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id"],
-            required_extraction_schema_paths=["output.record_id"],
-            required_code_return_paths=["output.record_id"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-        update_ctx = _code_only_ctx()
-        update_ctx.turn_id = "shared-contract-turn"
-        update_ctx.last_code_authoring_repair_context = repair_context
-        run_ctx = _code_only_ctx()
-        run_ctx.turn_id = "shared-contract-turn"
-        run_ctx.last_code_authoring_repair_context = repair_context
-
-        update_result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml}, update_ctx, allow_missing_credentials=True
-        )
-        run_result = workflow_update_module._metadata_contract_run_preflight_reject(run_ctx, workflow_yaml, [])
-
-        assert run_result is not None
-        assert update_result["ok"] is False
-        assert run_result["ok"] is False
-        assert (
-            update_result["data"]["canonical_output_contract_signature"]
-            == (run_result["data"]["canonical_output_contract_signature"])
-        )
-        assert (
-            update_result["data"]["canonical_required_child_paths"]
-            == (run_result["data"]["canonical_required_child_paths"])
-        )
-        assert update_result["data"]["satisfying_templates"] == run_result["data"]["satisfying_templates"]
-
     def test_static_return_uncertainty_requires_typed_advisory_grant(self) -> None:
         ctx = _code_only_ctx()
         ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
@@ -3112,7 +2816,7 @@ class TestCodeRepairProgressClassification:
               - block_type: code
                 label: extract_entry_output
                 code: |
-                  return build_output()
+                  return {"output": build_output()}
             """
         )
 
@@ -3141,107 +2845,6 @@ class TestCodeRepairProgressClassification:
         assert granted_eval.payload["actuated_static_return_advisory"] is True
         assert granted_eval.can_attempt_run is True
 
-    def test_complete_metadata_without_code_return_is_run_preflight_advisory(self) -> None:
-        ctx = _code_only_ctx()
-        required_paths = {"output.account_number", "output.confirmation_number"}
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_account",
-                    output_path="output.account_number",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-                SimpleNamespace(
-                    id="requested_confirmation",
-                    output_path="output.confirmation_number",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-            ]
-        )
-        schema = workflow_update_module._schema_template_text_for_required_paths(required_paths)
-        metadata = [
-            {
-                "block_label": "submit_service_request",
-                "claimed_outcomes": [{"goal_value_paths": sorted(required_paths), "extraction_schema": schema}],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": sorted(required_paths), "extraction_schema": schema}
-                ],
-            }
-        ]
-        workflow_yaml = _yaml(
-            """
-            title: Service request
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: submit_service_request
-                code: |
-                  await page.get_by_role("button", name="Submit").click()
-            """
-        )
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
-            required_paths=required_paths,
-        )
-        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
-
-        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
-            ctx, workflow_yaml, metadata, allow_static_return_advisory=True
-        )
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
-
-        assert evaluation is not None
-        assert evaluation.can_attempt_run is True
-        assert evaluation.missing_return_paths == []
-        assert evaluation.payload["static_return_advisory_paths"] == sorted(required_paths)
-        assert evaluation.payload["actuated_static_return_advisory"] is True
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_save_only_update_rejects_static_return_gap_without_typed_grant(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id"],
-            required_extraction_schema_paths=["output.record_id"],
-            required_code_return_paths=["output.record_id"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return "not a structured output"
-            """
-        )
-        ctx.turn_id = "save-only-static-return-gap"
-        result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert result["ok"] is False
-        assert result["data"]["reason_code"] == "output_contract_required"
-        assert result["data"]["missing_code_return_paths"] == ["output.record_id"]
-        assert result["data"]["static_return_advisory_paths"] == []
-
     @pytest.mark.asyncio
     async def test_run_path_allows_typed_advisory_declared_output_return_shape_gap(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3269,13 +2872,7 @@ class TestCodeRepairProgressClassification:
             """
         )
         ctx.turn_id = "run-static-return-gap"
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
-            required_paths={"output.record_id"},
-        )
+        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths={"output.record_id"})
         workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
 
         result = await _update_workflow(
@@ -3372,7 +2969,6 @@ class TestCodeRepairProgressClassification:
 
         monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", fake_get_prior_workflow)
         monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", fake_process_workflow_yaml)
-        monkeypatch.setattr(workflow_update_module, "composition_page_evidence_error", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(
             workflow_update_module.app.WORKFLOW_SERVICE,
             "update_workflow_definition",
@@ -3456,7 +3052,6 @@ class TestCodeRepairProgressClassification:
 
         monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", fake_get_prior_workflow)
         monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", fake_process_workflow_yaml)
-        monkeypatch.setattr(workflow_update_module, "composition_page_evidence_error", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(
             workflow_update_module.app.WORKFLOW_SERVICE,
             "update_workflow_definition",
@@ -3479,87 +3074,21 @@ class TestCodeRepairProgressClassification:
         assert persisted["workflow_id"] == "w"
         assert persisted["workflow_definition"].blocks == [SimpleNamespace(label="validate_public_path")]
 
-    @pytest.mark.asyncio
-    async def test_output_contract_reject_budget_counts_same_signature_across_classes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.record_id",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-
-        result = None
-        for _ in range(4):
-            result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result is not None
-        assert result["ok"] is False
-        assert result["data"]["reason_code"] == "output_contract_required"
-        assert result["data"]["output_contract_reject_count"] == 4
-        assert result["data"]["canonical_required_child_paths"] == ["output.record_id"]
-
     def test_output_contract_signature_uses_stable_scope_and_required_path_identity(self) -> None:
         ctx = _code_only_ctx()
         ctx.turn_id = "contract-scope-a"
         first = workflow_update_module._output_contract_signature(
             ctx=ctx,
-            workflow_yaml=_yaml(
-                """
-                title: First draft title
-                workflow_definition:
-                  blocks: []
-                """
-            ),
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
             required_paths={"output.locations[].address", "output.statuses"},
         )
         second = workflow_update_module._output_contract_signature(
             ctx=ctx,
-            workflow_yaml=_yaml(
-                """
-                title: Changed draft title
-                workflow_definition:
-                  blocks: []
-                """
-            ),
-            source="runtime_output_repair",
-            reason_code="runtime_output_repair_required",
             required_paths={"output.statuses", "output.locations[].address"},
         )
         other_ctx = _code_only_ctx()
         other_ctx.turn_id = "contract-scope-b"
         other_scope = workflow_update_module._output_contract_signature(
             ctx=other_ctx,
-            workflow_yaml=_yaml(
-                """
-                title: Changed draft title
-                workflow_definition:
-                  blocks: []
-                """
-            ),
-            source="runtime_output_repair",
-            reason_code="runtime_output_repair_required",
             required_paths={"output.statuses", "output.locations[].address"},
         )
 
@@ -3573,62 +3102,6 @@ class TestCodeRepairProgressClassification:
             )
             == first
         )
-
-    def test_output_contract_family_counter_aggregates_reject_classes(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.turn_id = "contract-budget-scope"
-        required_paths = {"output.record_id"}
-        first = workflow_update_module._record_output_contract_family_reject(
-            ctx,
-            required_paths,
-            reject_family="metadata_reject",
-        )
-        second = workflow_update_module._record_output_contract_family_reject(
-            ctx,
-            required_paths,
-            reject_family="synthesized_parameter_binding_ambiguous",
-        )
-        third = workflow_update_module._record_output_contract_family_reject(
-            ctx,
-            required_paths,
-            reject_family="declared_output_return_shape",
-        )
-
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml="title: Any\nworkflow_definition:\n  blocks: []\n",
-            source="different",
-            reason_code="different",
-            required_paths=required_paths,
-        )
-        assert (first, second, third) == (1, 2, 3)
-        assert ctx.output_contract_reject_count_by_signature[signature] == 3
-
-    def test_output_contract_family_counter_is_scoped(self) -> None:
-        ctx = _code_only_ctx()
-        required_paths = {"output.status"}
-
-        ctx.turn_id = "first-build-goal"
-        first_scope_count = workflow_update_module._record_output_contract_family_reject(
-            ctx,
-            required_paths,
-            reject_family="metadata_reject",
-        )
-        ctx.turn_id = "second-build-goal"
-        second_scope_count = workflow_update_module._record_output_contract_family_reject(
-            ctx,
-            required_paths,
-            reject_family="metadata_reject",
-        )
-        ctx.turn_id = "first-build-goal"
-        first_scope_again = workflow_update_module._record_output_contract_family_reject(
-            ctx,
-            required_paths,
-            reject_family="output_contract_required",
-        )
-
-        assert (first_scope_count, second_scope_count, first_scope_again) == (1, 1, 2)
-        assert len(ctx.output_contract_reject_count_by_signature) == 2
 
     def test_output_contract_owner_pin_is_scoped(self) -> None:
         ctx = _code_only_ctx()
@@ -3672,94 +3145,6 @@ class TestCodeRepairProgressClassification:
             "first_goal_output"
         )
 
-    def test_metadata_contract_recorded_key_stable_across_reject_count_and_reason_drift(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.turn_id = "stable-contract-key"
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.record_id",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        workflow_yaml = _yaml(
-            """
-            title: First candidate title
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
-        assert evaluation is not None
-
-        workflow_update_module._record_output_contract_reject(
-            ctx,
-            evaluation,
-            summary="First reject wording.",
-        )
-        first_key = ctx.latest_recorded_build_test_outcome.structural_key
-        assert first_key is not None
-
-        evaluation.payload["reason_code"] = "declared_output_return_shape"
-        workflow_update_module._record_output_contract_reject(
-            ctx,
-            evaluation,
-            summary="Changed reject wording and reason site.",
-        )
-
-        assert ctx.latest_recorded_build_test_outcome.structural_key == first_key
-        assert latest_recorded_build_test_outcome_repeated(ctx) is True
-        assert ctx.latest_recorded_build_test_outcome.missing_requested_output_facts
-
-    def test_metadata_contract_recorded_key_keeps_distinct_scope_and_required_paths(self) -> None:
-        workflow_yaml = _yaml(
-            """
-            title: Shared shape
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-
-        def recorded_key(turn_id: str, output_path: str) -> str:
-            ctx = _code_only_ctx()
-            ctx.turn_id = turn_id
-            ctx.request_policy = RequestPolicy(
-                completion_criteria=[
-                    SimpleNamespace(
-                        id="requested_value",
-                        output_path=output_path,
-                        level="run",
-                        method_mandated=False,
-                        kind="outcome",
-                    )
-                ]
-            )
-            evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
-            assert evaluation is not None
-            workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="Rejected.")
-            key = ctx.latest_recorded_build_test_outcome.structural_key
-            assert key is not None
-            return key
-
-        first_scope_key = recorded_key("first-build-goal", "output.status")
-        second_scope_key = recorded_key("second-build-goal", "output.status")
-        other_path_key = recorded_key("first-build-goal", "output.npi")
-
-        assert first_scope_key != second_scope_key
-        assert first_scope_key != other_path_key
-
     @pytest.mark.asyncio
     async def test_output_contract_first_contact_imposes_keyed_return_envelope(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3768,14 +3153,14 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_flags",
                     output_path="output.flags",
                     level="run",
@@ -3813,282 +3198,10 @@ class TestCodeRepairProgressClassification:
             == {}
         )
 
-    @pytest.mark.asyncio
-    async def test_requested_output_contract_routes_ambiguous_output_target_to_typed_repair(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.npi",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        ctx.code_artifact_metadata = {
-            "lookup_entry": {
-                "block_label": "lookup_entry",
-                "claimed_outcomes": [{"goal_value_paths": ["output"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output"]}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        candidate_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: open_entry
-                code: |
-                  await page.goto("https://example.com/search")
-              - block_type: code
-                label: lookup_entry
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "requested output contract" in result["error"]
-        assert result["data"]["authoring_repair_context"]["reason_code"] == "output_owner_ambiguous"
-        assert ctx.last_code_authoring_repair_context is not None
-        assert ctx.last_code_authoring_repair_context.reason_code == "output_owner_ambiguous"
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.npi",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-        assert result["data"]["metadata_repair_contract"] is None
-        assert result["data"]["block_label"] == ""
-        assert result["data"]["shape_violations"] == ["missing_output_owner"]
-
-    @pytest.mark.asyncio
-    async def test_requested_output_contract_omits_repair_context_when_schema_target_is_ambiguous(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        child_paths = ["output.npi"]
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.npi",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        ctx.code_artifact_metadata = {
-            "lookup_entry": {
-                "block_label": "lookup_entry",
-                "claimed_outcomes": [
-                    {
-                        "goal_value_paths": child_paths,
-                        "extraction_schema": '{"type":"object","properties":{"npi":{"type":"string"}}}',
-                    }
-                ],
-                "terminal_verifier_expectations": [{"goal_value_paths": child_paths}],
-            }
-        }
-        ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
-        candidate_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: open_entry
-                code: |
-                  await page.goto("https://example.com/search")
-              - block_type: code
-                label: lookup_entry
-                code: |
-                  return {"output": {"npi": "1234567890"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "extraction_schema" in result["error"]
-        assert result["data"]["authoring_repair_context"]["block_label"] == "lookup_entry"
-        assert ctx.last_code_authoring_repair_context is not None
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.npi",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-        assert result["data"]["metadata_repair_contract"]["block_label"] == "lookup_entry"
-
-    def test_metadata_contract_run_preflight_blocks_missing_metadata_before_run(self) -> None:
+    def _run_preflight_metadata_reject_ctx(self) -> CopilotContext:
         ctx = _code_only_ctx()
         ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id", "output.flags"],
-            required_extraction_schema_paths=["output.record_id", "output.flags"],
-            required_code_return_paths=["output.record_id", "output.flags"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
-
-        assert result is not None
-        assert result["ok"] is False
-        assert result["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert result["data"]["output_contract_reason_code"] == "output_contract_required"
-        assert result["data"]["block_label"] == "extract_entry_output"
-        assert result["data"]["canonical_required_child_paths"] == ["output.flags", "output.record_id"]
-        assert result["data"]["missing_goal_value_paths"] == ["output.flags", "output.record_id"]
-        assert result["data"]["missing_extraction_schema_paths"] == ["output.flags", "output.record_id"]
-        assert result["data"]["missing_code_return_paths"] == ["output.flags", "output.record_id"]
-        assert result["data"]["metadata_contract_source"] == "requested_output_contract"
-        assert result["data"]["metadata_contract_reason_code"] == ("requested_output_contract_missing_output_coverage")
-        assert result["data"]["metadata_repair_contract"] == {
-            "block_label": "extract_entry_output",
-            "required_goal_value_paths": ["output.flags", "output.record_id"],
-            "required_extraction_schema_paths": ["output.flags", "output.record_id"],
-            "required_code_return_paths": ["output.flags", "output.record_id"],
-            "source": "requested_output_contract",
-            "reason_code": "requested_output_contract_missing_output_coverage",
-        }
-        assert result["data"]["authoring_repair_context"]["required_goal_value_paths"] == [
-            "output.flags",
-            "output.record_id",
-        ]
-        assert result["data"]["missing_requested_output_facts"] == [
-            {
-                "output_path": "output.flags",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.record_id",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-        ]
-        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", result)
-        assert sanitized["data"]["authoring_repair_context"]["metadata_contract_source"] == (
-            "requested_output_contract"
-        )
-        assert sanitized["data"]["metadata_repair_contract"] == result["data"]["metadata_repair_contract"]
-
-    def test_metadata_contract_run_preflight_preserves_run_backed_convergence_terminal(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_account",
-                    output_path="output.account_number",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Service request
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: submit_service_request
-                code: |
-                  await page.get_by_role("button", name="Submit").click()
-            """
-        )
-        metadata = [
-            {
-                "artifact_id": "code_artifact:submit_service_request",
-                "block_label": "submit_service_request",
-                "claimed_outcomes": [
-                    {
-                        "goal_value_paths": ["output.account_number"],
-                        "extraction_schema": (
-                            '{"type":"object","properties":{"output":{"type":"object","properties":'
-                            '{"account_number":{}}}}}'
-                        ),
-                    }
-                ],
-            }
-        ]
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            workflow_run_id="wr_recorded",
-            block_labels=["submit_service_request"],
-            structural_failure_identity="completion:typed-output",
-            authored_structure_signature="previous-authoring-signature",
-        )
-        ctx.recorded_persisted_block_run_workflow_run_id = "wr_recorded"
-        recorded_sig = authored_block_signatures_from_workflow(workflow_yaml, metadata)["submit_service_request"]
-        ctx.recorded_outcome_binding_constraint = RecordedOutcomeBindingConstraint(
-            repeated_structural_key=ctx.latest_recorded_build_test_outcome.structural_key or "",
-            phase="persisted_block_run",
-            reason_code="outcome_not_demonstrated",
-            frontier_facet="value_shape",
-            owning_block_labels=["submit_service_request"],
-            diagnostic_reason="empty_page",
-            workflow_run_id="wr_recorded",
-            recorded_block_signatures={"submit_service_request": recorded_sig},
-        )
-
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
-
-        assert result is not None
-        assert result["ok"] is False
-        assert "frontier" in result["error"]
-        assert ctx.turn_halt is not None
-        assert ctx.turn_halt.kind is TurnHaltKind.REPAIR_CEILING_REACHED
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "unchanged_after_recorded_outcome"
-        assert outcome.workflow_run_id is None
-
-    def test_metadata_contract_run_preflight_budget_remains_repair_before_run(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.turn_id = "preflight-no-run-contract"
-        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
+            block_label="validate_start",
             reason_code="metadata_reject",
             required_goal_value_paths=["output.record_id"],
             required_extraction_schema_paths=["output.record_id"],
@@ -4096,125 +3209,25 @@ class TestCodeRepairProgressClassification:
             metadata_contract_source="requested_output_contract",
             metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
         )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
+        return ctx
 
-        results = [
-            workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, []) for _ in range(4)
-        ]
-
-        assert results[0] is not None
-        assert results[0]["ok"] is False
-        assert results[0]["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert results[0]["data"]["output_contract_reason_code"] == "output_contract_required"
-        assert results[0]["data"]["output_contract_reject_count"] == 1
-        assert results[-1] is not None
-        assert results[-1]["data"]["output_contract_reject_count"] == 4
-        assert all(
-            result is None or result["data"]["reason_code"] != "output_contract_reject_budget_exhausted"
-            for result in results
-        )
-
-    def test_metadata_contract_run_preflight_accepts_complete_submitted_metadata(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id", "output.flags"],
-            required_extraction_schema_paths=["output.record_id", "output.flags"],
-            required_code_return_paths=["output.record_id", "output.flags"],
-            metadata_contract_source="recorded_outcome",
-            metadata_contract_reason_code="recorded_outcome_missing_output_coverage",
-        )
-        schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{'
-            '"record_id":{"type":"string"},'
-            '"flags":{"type":"array","items":{"type":"string"}}}}}}'
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"record_id": "ABC123", "flags": ["enabled"]}}
-            """
-        )
-        metadata = [
-            {
-                "block_label": "extract_entry_output",
-                "claimed_outcomes": [
-                    {"goal_value_paths": ["output.record_id", "output.flags"], "extraction_schema": schema}
-                ],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": ["output.record_id", "output.flags"], "extraction_schema": schema}
-                ],
-            }
-        ]
-
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
-
-        assert result is None
-
-    def test_metadata_contract_run_preflight_rejects_root_only_output(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
-            block_label="extract_entry_output",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.record_id"],
-            required_extraction_schema_paths=["output.record_id"],
-            required_code_return_paths=["output.record_id"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                code: |
-                  return {"output": {"summary": "found"}}
-            """
-        )
-        metadata = [
-            {
-                "block_label": "extract_entry_output",
-                "claimed_outcomes": [
-                    {
-                        "goal_value_paths": ["output"],
-                        "extraction_schema": '{"type":"object","properties":{"output":{"type":"object"}}}',
-                    }
-                ],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output"]}],
-            }
-        ]
-
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
-
-        assert result is not None
-        assert result["ok"] is False
-        assert result["data"]["missing_goal_value_paths"] == ["output.record_id"]
-        assert result["data"]["missing_extraction_schema_paths"] == ["output.record_id"]
-        assert result["data"]["missing_code_return_paths"] == ["output.record_id"]
+    _RUN_PREFLIGHT_CLICK_YAML = _yaml(
+        """
+        title: Provider lookup
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: validate_start
+            code: |
+              await page.locator("#start").click()
+        """
+    )
 
     def test_metadata_contract_scaffold_uses_recorded_paths_before_request_policy(self) -> None:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.requested_value",
                     level="run",
@@ -4317,39 +3330,6 @@ class TestCodeRepairProgressClassification:
         required_paths = workflow_update_module._output_contract_required_paths_source(ctx).union
 
         assert required_paths == set()
-
-    def test_independent_judgment_repair_context_is_not_rehydrated_as_code_return_path(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                CompletionCriterion(
-                    id="login_gate",
-                    outcome="the target path is blocked by a login gate",
-                    output_path="output.login_gate_blocks_target",
-                    expected_output_shape="goal_judgment_boolean",
-                    requested_output_evidence_source="independent_run_evidence",
-                    judgment_truth_condition=JudgmentTruthCondition(
-                        predicate="login_gate_blocks_target",
-                        polarity_when_holds=True,
-                    ),
-                )
-            ]
-        )
-        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
-            block_label="judge_login_gate_blocks_target",
-            reason_code="metadata_reject",
-            required_goal_value_paths=["output.login_gate_blocks_target"],
-            required_extraction_schema_paths=["output.login_gate_blocks_target"],
-            required_code_return_paths=["output.login_gate_blocks_target"],
-            metadata_contract_source="requested_output_contract",
-            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
-        )
-
-        required_paths = workflow_update_module._output_contract_required_paths_source(ctx).union
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, _SAFE_CODE_YAML, [])
-
-        assert required_paths == set()
-        assert result is None
 
     def test_mixed_repair_context_keeps_non_judgment_code_return_path(self) -> None:
         ctx = _code_only_ctx()
@@ -5211,7 +4191,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.requested_value",
                     level="run",
@@ -5639,14 +4619,14 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_flags",
                     output_path="output.flags",
                     level="run",
@@ -5694,7 +4674,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -5746,289 +4726,6 @@ class TestCodeRepairProgressClassification:
         assert labels == ["enter_filters", "choose_record", "extract_record"]
 
     @pytest.mark.asyncio
-    async def test_formation_prepared_p4_two_block_output_owner_ignores_generic_non_owner_label_reject(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_npi",
-                    output_path="output.npi",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: search_directory
-                prompt: Search the directory and extract provider result data.
-                code: |
-                  await page.locator("#npi").fill("1234567890")
-                  await page.locator("#search_by").click()
-              - block_type: code
-                label: extract_directory_result
-                prompt: Read the provider card and return the NPI.
-                code: |
-                  await page.locator("#coastalCard").wait_for(state="visible")
-                  return {"output": {"npi": "1234567890"}}
-            """
-        )
-        schema = '{"type":"object","properties":{"output":{"type":"object","properties":{"npi":{"type":"string"}}}}}'
-        metadata = [
-            {
-                "block_label": "extract_directory_result",
-                "claimed_outcomes": [{"goal_value_paths": ["output.npi"], "extraction_schema": schema}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output.npi"], "extraction_schema": schema}],
-            }
-        ]
-
-        save_only = await _update_workflow(
-            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert save_only["ok"] is False
-        assert "search_directory" in save_only["error"]
-
-        run_ctx = _code_only_ctx()
-        run_ctx.request_policy = ctx.request_policy
-        prepared_run = await _update_workflow(
-            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
-            run_ctx,
-            allow_missing_credentials=True,
-            allow_static_output_uncertainty=True,
-            formation_prepared=True,
-        )
-
-        assert prepared_run["ok"] is True
-        assert run_ctx.latest_recorded_build_test_outcome is None
-        assert workflow_update_module._artifact_declares_goal_values(
-            run_ctx.code_artifact_metadata["extract_directory_result"]
-        )
-        assert not workflow_update_module._artifact_declares_goal_values(
-            run_ctx.code_artifact_metadata["search_directory"]
-        )
-
-    @pytest.mark.asyncio
-    async def test_separated_spine_shape_rejects_collapsed_output_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = [
-            {"tool_name": "type_text", "selector": "#filter", "source_url": "https://example.com/records"},
-            {"tool_name": "click", "selector": "#choose", "source_url": "https://example.com/records"},
-        ]
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.record_id",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{"record_id":{"type":"string"}}}}}'
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              parameters:
-              - parameter_type: workflow
-                workflow_parameter_type: string
-                key: value
-              blocks:
-              - block_type: code
-                label: extract_record
-                parameter_keys:
-                - value
-                code: |
-                  _scout_entry_target = page.locator("#filter")
-                  try:
-                      await _scout_entry_target.wait_for(state="visible", timeout=1000)
-                  except Exception:
-                      await page.goto("https://example.com/records", wait_until="domcontentloaded")
-                      await _scout_entry_target.wait_for(state="visible")
-                  await page.locator("#filter").fill(str(value))
-                  await page.locator("#choose").click()
-                  await page.wait_for_load_state("domcontentloaded")
-                  return {"output": {"record_id": "ABC123"}}
-            """
-        )
-        metadata = [
-            {
-                "block_label": "extract_record",
-                "claimed_outcomes": [{"goal_value_paths": ["output.record_id"], "extraction_schema": schema}],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": ["output.record_id"], "extraction_schema": schema}
-                ],
-            }
-        ]
-
-        result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert result["ok"] is False
-        assert result["data"]["reason_code"] == "output_contract_required"
-        assert result["data"]["shape_violations"] == ["separated_spine_shape_required"]
-
-    @pytest.mark.asyncio
-    async def test_separated_spine_shape_rejects_collapsed_output_owner_with_sibling_block(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = [
-            {"tool_name": "type_text", "selector": "#filter", "source_url": "https://example.com/records"},
-            {"tool_name": "click", "selector": "#choose", "source_url": "https://example.com/records"},
-        ]
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.record_id",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{"record_id":{"type":"string"}}}}}'
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: prepare_session
-                code: |
-                  context["ready"] = True
-              - block_type: code
-                label: extract_record
-                code: |
-                  _scout_entry_target = page.locator("#filter")
-                  try:
-                      await _scout_entry_target.wait_for(state="visible", timeout=1000)
-                  except Exception:
-                      await page.goto("https://example.com/records", wait_until="domcontentloaded")
-                      await _scout_entry_target.wait_for(state="visible")
-                  await page.locator("#filter").fill(str(value))
-                  await page.locator("#choose").click()
-                  await page.wait_for_load_state("domcontentloaded")
-                  return {"output": {"record_id": "ABC123"}}
-            """
-        )
-        metadata = [
-            {
-                "block_label": "extract_record",
-                "claimed_outcomes": [{"goal_value_paths": ["output.record_id"], "extraction_schema": schema}],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": ["output.record_id"], "extraction_schema": schema}
-                ],
-            }
-        ]
-
-        result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert result["ok"] is False
-        assert result["data"]["reason_code"] == "output_contract_required"
-        assert result["data"]["shape_violations"] == ["separated_spine_shape_required"]
-        assert result["data"]["block_label"] == "extract_record"
-        assert result["data"]["output_owner_labels"] == ["extract_record"]
-
-    @pytest.mark.asyncio
-    async def test_separated_spine_shape_rejects_collapsed_output_owner_with_extra_browser_action(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = [
-            {"tool_name": "type_text", "selector": "#filter", "source_url": "https://example.com/records"},
-            {"tool_name": "click", "selector": "#choose", "source_url": "https://example.com/records"},
-        ]
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.record_id",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{"record_id":{"type":"string"}}}}}'
-        )
-        workflow_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              parameters:
-              - parameter_type: workflow
-                workflow_parameter_type: string
-                key: value
-              blocks:
-              - block_type: code
-                label: extract_record
-                parameter_keys:
-                - value
-                code: |
-                  _scout_entry_target = page.locator("#filter")
-                  try:
-                      await _scout_entry_target.wait_for(state="visible", timeout=1000)
-                  except Exception:
-                      await page.goto("https://example.com/records", wait_until="domcontentloaded")
-                      await _scout_entry_target.wait_for(state="visible")
-                  await page.locator("#filter").fill(str(value))
-                  await page.locator("#choose").click()
-                  await page.wait_for_load_state("domcontentloaded")
-                  await page.locator("#extra").click()
-                  return {"output": {"record_id": "ABC123"}}
-            """
-        )
-        metadata = [
-            {
-                "block_label": "extract_record",
-                "claimed_outcomes": [{"goal_value_paths": ["output.record_id"], "extraction_schema": schema}],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": ["output.record_id"], "extraction_schema": schema}
-                ],
-            }
-        ]
-
-        result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert result["ok"] is False
-        assert result["data"]["reason_code"] == "output_contract_required"
-        assert result["data"]["shape_violations"] == ["separated_spine_shape_required"]
-        assert result["data"]["block_label"] == "extract_record"
-
-    @pytest.mark.asyncio
     async def test_separated_spine_shape_ignores_one_block_without_multi_stage_spine(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -6037,7 +4734,7 @@ class TestCodeRepairProgressClassification:
         ctx.scout_trajectory = []
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -6094,7 +4791,7 @@ class TestCodeRepairProgressClassification:
         )
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id=f"requested_{index}",
                     output_path=path,
                     level="run",
@@ -6135,292 +4832,6 @@ class TestCodeRepairProgressClassification:
         assert result["ok"] is True
         labels = [block.get("label") for block in workflow_blocks(parse_workflow_yaml(ctx.workflow_yaml))]
         assert labels == [label]
-
-    @pytest.mark.asyncio
-    async def test_requested_output_contract_missing_metadata_records_child_path_facts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.npi",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-                SimpleNamespace(
-                    id="requested_statuses",
-                    output_path="output.statuses",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-            ]
-        )
-        candidate_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: output, key: lookup_result}
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                prompt: Extract structured fields from the entry.
-                code: |
-                  await page.goto("https://example.com/search")
-                  return {"output": {"summary": "found"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "Required requested output paths: output.npi, output.statuses" in result["error"]
-        expected_facts = [
-            {
-                "output_path": "output.npi",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-            {
-                "output_path": "output.statuses",
-                "output_root": "output",
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "value_status": "no_typed_value",
-            },
-        ]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == expected_facts
-        assert result["data"]["missing_requested_output_facts"] == expected_facts
-        assert result["data"]["metadata_repair_contract"] == {
-            "block_label": "extract_entry_output",
-            "required_goal_value_paths": ["output.npi", "output.statuses"],
-            "required_extraction_schema_paths": ["output.npi", "output.statuses"],
-            "required_code_return_paths": ["output.npi", "output.statuses"],
-            "source": "requested_output_contract",
-            "reason_code": "requested_output_contract_missing_output_coverage",
-        }
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "metadata_reject"
-        assert repair_context["block_label"] == "extract_entry_output"
-        assert repair_context["runtime_failure_class"] == "requested_output_contract_missing_output_coverage"
-        assert repair_context["required_goal_value_paths"] == ["output.npi", "output.statuses"]
-        assert repair_context["required_extraction_schema_paths"] == ["output.npi", "output.statuses"]
-        assert repair_context["required_code_return_paths"] == ["output.npi", "output.statuses"]
-        assert repair_context["metadata_contract_source"] == "requested_output_contract"
-        assert repair_context["metadata_contract_reason_code"] == ("requested_output_contract_missing_output_coverage")
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
-        sanitized = sanitize_tool_result_for_llm("update_workflow", result)
-        assert sanitized["data"]["authoring_repair_context"]["required_goal_value_paths"] == [
-            "output.npi",
-            "output.statuses",
-        ]
-        assert sanitized["data"]["authoring_repair_context"]["required_extraction_schema_paths"] == [
-            "output.npi",
-            "output.statuses",
-        ]
-        assert sanitized["data"]["authoring_repair_context"]["required_code_return_paths"] == [
-            "output.npi",
-            "output.statuses",
-        ]
-        assert sanitized["data"]["authoring_repair_context"]["metadata_contract_source"] == "requested_output_contract"
-        assert sanitized["data"]["metadata_repair_contract"] == result["data"]["metadata_repair_contract"]
-
-        schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{'
-            '"npi":{"type":"string"},'
-            '"statuses":{"type":"array","items":{"type":"string"}}}}}}'
-        )
-        corrected_metadata = {
-            "extract_entry_output": {
-                "block_label": "extract_entry_output",
-                "claimed_outcomes": [
-                    {"goal_value_paths": ["output.npi", "output.statuses"], "extraction_schema": schema}
-                ],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": ["output.npi", "output.statuses"], "extraction_schema": schema}
-                ],
-            }
-        }
-        corrected_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: output, key: lookup_result}
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                prompt: Extract structured fields from the entry.
-                code: |
-                  await page.goto("https://example.com/search")
-                  return {"output": {"npi": "1234567890", "statuses": ["active"]}}
-            """
-        )
-
-        corrected = await _update_workflow(
-            {"workflow_yaml": corrected_yaml, "code_artifact_metadata": corrected_metadata},
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert corrected["ok"] is True
-        accepted_yaml = parse_workflow_yaml(ctx.workflow_yaml)
-        accepted_block = _single_code_block(accepted_yaml)
-        assert accepted_block["label"] == "extract_entry_output"
-        assert (
-            accepted_block["code"].strip().endswith('return {"output": {"npi": "1234567890", "statuses": ["active"]}}')
-        )
-        assert accepted_block["extraction_schema"] == schema
-        stored_metadata = ctx.code_artifact_metadata["extract_entry_output"]
-        assert stored_metadata["block_label"] == corrected_metadata["extract_entry_output"]["block_label"]
-        assert stored_metadata["claimed_outcomes"][0]["goal_value_paths"] == ["output.npi", "output.statuses"]
-        assert stored_metadata["claimed_outcomes"][0]["extraction_schema"] == schema
-        assert stored_metadata["terminal_verifier_expectations"][0]["goal_value_paths"] == [
-            "output.npi",
-            "output.statuses",
-        ]
-        assert stored_metadata["terminal_verifier_expectations"][0]["extraction_schema"] == schema
-        assert ctx.workflow_verification_evidence.code_artifact_metadata == ctx.code_artifact_metadata
-
-    @pytest.mark.asyncio
-    async def test_recorded_outcome_missing_metadata_records_recorded_child_path_facts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_value",
-                    output_path="output.requested_only",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                ),
-            ]
-        )
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "output.recorded", "output_root": "output", "value_status": "no_typed_value"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            """
-            title: Entry lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: output, key: lookup_result}
-              blocks:
-              - block_type: code
-                label: extract_entry_output
-                prompt: Extract structured fields from the entry.
-                code: |
-                  await page.goto("https://example.com/search")
-                  return {"output": {"summary": "found"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "Required requested output paths: output.recorded" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "output.recorded",
-                "output_root": "output",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
-        assert result["data"]["missing_requested_output_facts"] == outcome.missing_requested_output_facts
-        assert result["data"]["metadata_repair_contract"] == {
-            "block_label": "extract_entry_output",
-            "required_goal_value_paths": ["output.recorded"],
-            "required_extraction_schema_paths": ["output.recorded"],
-            "required_code_return_paths": ["output.recorded"],
-            "source": "recorded_outcome",
-            "reason_code": "recorded_outcome_missing_output_coverage",
-        }
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "metadata_reject"
-        assert repair_context["block_label"] == "extract_entry_output"
-        assert repair_context["runtime_failure_class"] == "recorded_outcome_missing_output_coverage"
-        assert repair_context["required_goal_value_paths"] == ["output.recorded"]
-        assert repair_context["required_extraction_schema_paths"] == ["output.recorded"]
-        assert repair_context["required_code_return_paths"] == ["output.recorded"]
-        assert repair_context["metadata_contract_source"] == "recorded_outcome"
-        assert repair_context["metadata_contract_reason_code"] == "recorded_outcome_missing_output_coverage"
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_rejects_when_only_last_run_produced_required_roots(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "extract_top_hn_post"
-        ctx.verified_block_outputs[label] = {
-            "top_post": "Claude Sonnet 5",
-            "rank": 1,
-            "url": "https://news.ycombinator.com/item?id=1",
-        }
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "top_post", "output_root": "top_post", "value_status": "presence_only_evidence"},
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Hacker News lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  return {{"rank": 1, "url": "https://news.ycombinator.com/item?id=1"}}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not cover the missing requested output paths" in result["error"]
-        outcome = ctx.latest_recorded_build_test_outcome
-        assert outcome is not None
-        assert outcome.reason_code == "metadata_reject"
-        assert outcome.missing_requested_output_facts == [
-            {
-                "output_path": "top_post",
-                "output_root": "top_post",
-                "reason_code": "recorded_outcome_missing_output_coverage",
-                "value_status": "no_typed_value",
-            }
-        ]
 
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_static_return_for_required_root(
@@ -6464,52 +4875,6 @@ class TestCodeRepairProgressClassification:
 
         assert result["ok"] is True
         assert ctx.workflow_yaml == candidate_yaml
-
-    @pytest.mark.asyncio
-    async def test_authoritative_outcome_not_demonstrated_still_rejects_empty_last_run_roots(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        label = "lookup_provider_and_extract_credentials"
-        ctx.verified_block_outputs[label] = {
-            "address": "",
-            "credentialing_status": "",
-            "locations": [],
-            "statuses": [],
-        }
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="outcome_not_demonstrated",
-            structural_failure_identity="completion:unsatisfied-output",
-            authored_structure_signature="authored:previous-failed-candidate",
-            missing_requested_output_facts=[
-                {"output_path": "address", "output_root": "address", "value_status": "no_typed_value"},
-                {
-                    "output_path": "credentialing_status",
-                    "output_root": "credentialing_status",
-                    "value_status": "no_typed_value",
-                },
-            ],
-        )
-        candidate_yaml = _yaml(
-            f"""
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {label}
-                code: |
-                  await page.locator("#locInput").wait_for(state="visible", timeout=15000)
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": candidate_yaml}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "does not return any keyed output" in result["error"]
 
     @pytest.mark.asyncio
     async def test_authoritative_outcome_not_demonstrated_allows_candidate_covering_missing_output_roots(
@@ -6777,58 +5142,6 @@ class TestCodeRepairProgressClassification:
         assert ctx.workflow_yaml == candidate_yaml
 
     @pytest.mark.asyncio
-    async def test_captured_select_option_rejects_authored_text_click_plan_selection(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "select_option",
-                "selector": "#planSelect",
-                "source_url": "https://example.com/plans?session=private",
-                "value": "gold",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Plan lookup
-            workflow_definition:
-              parameters:
-              - parameter_type: workflow
-                workflow_parameter_type: string
-                key: plan
-              blocks:
-              - block_type: code
-                label: plan_selection
-                parameter_keys:
-                - plan
-                code: |
-                  main = page.locator("main")
-                  await main.get_by_text(str(plan), exact=True).first.click()
-                  return {"selected_plan": str(plan)}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
-
-        assert result["ok"] is False
-        assert "select-option interaction with a text click" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "select_option_interaction_mismatch"
-        assert repair_context["block_label"] == "plan_selection"
-        assert repair_context["selector"] == "#planSelect"
-        assert repair_context["source_url"] == "https://example.com"
-        assert "private" not in str(repair_context)
-        assert ctx.last_code_authoring_repair_context is not None
-        assert ctx.last_code_authoring_repair_context.reason_code == "select_option_interaction_mismatch"
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "code_safety_reject"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-        assert ctx.has_staged_proposal is False
-
-    @pytest.mark.asyncio
     async def test_captured_select_option_allows_authored_select_api(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
@@ -6912,77 +5225,6 @@ class TestCodeRepairProgressClassification:
         assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
-    async def test_runtime_hidden_option_failure_rejects_repeated_text_click_structure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "select_option",
-                "selector": "#planSelect",
-                "source_url": "https://example.com/plans",
-                "value": "gold",
-                "trajectory_index": 0,
-            }
-        ]
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="runtime_block_failure",
-            structural_failure_identity="runtime:hidden-option-click",
-            authored_structure_signature="authored:previous-hidden-option-click",
-        )
-
-        def submitted_yaml(return_value: str) -> str:
-            return _yaml(
-                f"""
-                title: Plan lookup
-                workflow_definition:
-                  parameters:
-                  - parameter_type: workflow
-                    workflow_parameter_type: string
-                    key: plan
-                  blocks:
-                  - block_type: code
-                    label: plan_selection
-                    parameter_keys:
-                    - plan
-                    code: |
-                      main = page.locator("main")
-                      await main.get_by_text(str(plan), exact=True).first.click()
-                      return {{"selected_plan": "{return_value}"}}
-                """
-            )
-
-        first = await _update_workflow({"workflow_yaml": submitted_yaml("first")}, ctx, allow_missing_credentials=True)
-        first_key = ctx.latest_recorded_build_test_outcome.structural_key
-        first_count = ctx.code_authoring_guardrail_reject_count
-        second = await _update_workflow(
-            {"workflow_yaml": submitted_yaml("second")}, ctx, allow_missing_credentials=True
-        )
-
-        assert first["ok"] is False
-        assert second["ok"] is False
-        assert first_key is not None
-        assert ctx.latest_recorded_build_test_outcome.structural_key == first_key
-        assert first_count == 1
-        assert ctx.code_authoring_guardrail_reject_count == 2
-        assert ctx.has_staged_proposal is False
-
-    @pytest.mark.asyncio
-    async def test_raw_conflict_marker_reject_carries_progress_surface_kind(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        result = await _update_workflow({"workflow_yaml": f"<<<<<<< HEAD\n{_SAFE_CODE_YAML}"}, ctx)
-        assert result["ok"] is False
-        assert result["data"]["surface_kind"] == "code_repair_progress"
-        assert result["data"]["progress_text"]
-
-    @pytest.mark.asyncio
     async def test_credential_scout_reject_is_not_classified_as_progress(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
@@ -7054,7 +5296,7 @@ def _spine_actuation_ctx() -> CopilotContext:
     ]
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            SimpleNamespace(
+            _typed_completion_criterion(
                 id="requested_value",
                 output_path="output.record_id",
                 level="run",
@@ -7240,28 +5482,6 @@ class TestSeparatedSpineViolationActuation:
         assert "spine_split_blockers:" in rendered
         assert "one browser-stage code block per scouted mutation stage" in rendered
 
-    def test_preflight_reject_persists_directive_repair_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
-        ctx = _spine_actuation_ctx()
-        workflow_yaml = _collapsed_spine_yaml(
-            "_setup = 1\n" + _SPINE_SYNTH_CODE + '\nreturn {"output": {"record_id": "X"}}'
-        )
-
-        prepared_yaml, prepared_metadata, _ = workflow_update_module._impose_output_contract_envelope_after_steering(
-            ctx, workflow_yaml, []
-        )
-        prepared_metadata, _ = workflow_update_module._scaffold_metadata_contract_for_update(
-            ctx, prepared_yaml, prepared_metadata
-        )
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, prepared_yaml, prepared_metadata)
-
-        assert result is not None
-        assert result["ok"] is False
-        assert ctx.last_code_authoring_repair_context is not None
-        assert (
-            ctx.last_code_authoring_repair_context.required_block_structure == "separated_browser_spine_plus_extraction"
-        )
-
     def test_cosmetic_churn_escalates_to_advisory_instead_of_rearming(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
         ctx = _spine_actuation_ctx()
@@ -7281,61 +5501,6 @@ class TestSeparatedSpineViolationActuation:
         assert list(ctx.output_contract_actuation_by_signature.values()) == [OutputContractAdvisoryState.GRANTED]
         assert ctx.turn_halt is None
         assert len(ctx.output_contract_spine_directive_blockers_by_attempt_key) == 1
-
-    def test_granted_advisory_arms_run_evidence_without_preflight_consume_when_run_attemptable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        ctx = _spine_actuation_ctx()
-        signature = "sig_preflight_dispatch"
-        ctx.output_contract_actuation_by_signature[signature] = OutputContractAdvisoryState.GRANTED
-        evaluation = workflow_update_module._OutputContractEvaluation(
-            block_label="extract_record",
-            artifact_id="art-1",
-            required_paths={"output.confirmation_number"},
-            observation_paths={"output.confirmation_number"},
-            declaration_paths=set(),
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
-            missing_metadata_paths=[],
-            missing_schema_paths=[],
-            missing_return_paths=[],
-            shape_violations=["separated_spine_shape_violation"],
-            canonical_signature=signature,
-            payload={
-                "reason_code": "requested_output_contract_missing_output_coverage",
-                "missing_requested_output_facts": [],
-            },
-            repair_context=None,
-            can_attempt_run=True,
-        )
-        monkeypatch.setattr(
-            workflow_update_module,
-            "_impose_output_contract_envelope_after_steering",
-            lambda ctx, wf, meta: (wf, meta, False),
-        )
-        monkeypatch.setattr(
-            workflow_update_module,
-            "_scaffold_metadata_contract_for_update",
-            lambda ctx, wf, meta: (meta, False),
-        )
-        monkeypatch.setattr(
-            workflow_update_module,
-            "_evaluate_output_contract_for_code_block",
-            lambda *a, **k: evaluation,
-        )
-
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, "title: x", [])
-
-        assert result is None
-        assert ctx.output_contract_pending_run_evidence.get(signature) == ["output.confirmation_number"]
-        assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
-
-        run_result = {
-            "data": {"blocks": [{"label": "extract_record", "extracted_data": {"confirmation_number": "R-9"}}]}
-        }
-        workflow_update_module.record_output_contract_run_output_evidence(ctx, run_result)
-        assert ctx.output_contract_run_output_observed_by_signature[signature] is True
-        assert ctx.output_contract_run_bound_required_path_by_signature[signature] is True
 
 
 def _dual_output_owner_yaml() -> str:
@@ -7403,23 +5568,6 @@ class TestAmbiguousOutputOwnerActuation:
 
         assert "output_owner_candidate_labels: extract_a, extract_b" in rendered
         assert "sole output owner" in rendered
-
-    def test_preflight_reject_persists_owner_ambiguity_repair_context(self) -> None:
-        ctx = _spine_actuation_ctx()
-        workflow_yaml = _dual_output_owner_yaml()
-
-        prepared_yaml, prepared_metadata, _ = workflow_update_module._impose_output_contract_envelope_after_steering(
-            ctx, workflow_yaml, []
-        )
-        prepared_metadata, _ = workflow_update_module._scaffold_metadata_contract_for_update(
-            ctx, prepared_yaml, prepared_metadata
-        )
-        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, prepared_yaml, prepared_metadata)
-
-        assert result is not None
-        assert result["ok"] is False
-        assert ctx.last_code_authoring_repair_context is not None
-        assert ctx.last_code_authoring_repair_context.reason_code == "output_owner_ambiguous"
 
     def test_owner_directive_emits_fingerprint_once_per_signature(self) -> None:
         ctx = _spine_actuation_ctx()
@@ -7505,57 +5653,6 @@ class TestSeparatedSpineImpositionRunEligibility:
 
         assert validation.violations == []
 
-    def test_split_imposed_yaml_clears_output_contract_run_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
-        ctx = _spine_actuation_ctx()
-        workflow_yaml = _collapsed_spine_yaml(
-            _SPINE_SYNTH_CODE
-            + '\nvalue = await page.locator("#result").inner_text()\nreturn {"output": {"record_id": value}}'
-        )
-
-        split_yaml, split_metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
-            ctx, workflow_yaml, []
-        )
-        assert applied is True
-
-        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
-            ctx, split_yaml, split_metadata, allow_static_return_advisory=True
-        )
-        assert evaluation is not None
-        assert workflow_update_module._SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE not in evaluation.shape_violations
-        assert evaluation.can_attempt_run or not evaluation.has_deficiencies
-
-        assert workflow_update_module._metadata_contract_run_preflight_reject(ctx, split_yaml, split_metadata) is None
-
-    def test_directive_satisfying_reauthor_passes_preflight(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
-        ctx = _spine_actuation_ctx()
-        collapsed_yaml = _collapsed_spine_yaml(
-            "_setup = 1\n" + _SPINE_SYNTH_CODE + '\nreturn {"output": {"record_id": "X"}}'
-        )
-
-        _yaml_out, _meta, armed = workflow_update_module._impose_output_contract_envelope_after_steering(
-            ctx, collapsed_yaml, []
-        )
-        assert armed is False
-        assert ctx.output_contract_spine_directive_blockers_by_attempt_key
-
-        schema = (
-            '{"type":"object","properties":{"output":{"type":"object","properties":{"record_id":{"type":"string"}}}}}'
-        )
-        reauthored_yaml = _already_split_spine_yaml(base="extract_record")
-        metadata = [
-            {
-                "block_label": "extract_record",
-                "claimed_outcomes": [{"goal_value_paths": ["output.record_id"], "extraction_schema": schema}],
-                "terminal_verifier_expectations": [
-                    {"goal_value_paths": ["output.record_id"], "extraction_schema": schema}
-                ],
-            }
-        ]
-
-        assert workflow_update_module._metadata_contract_run_preflight_reject(ctx, reauthored_yaml, metadata) is None
-
     def test_armed_attempt_key_survives_scaffold_metadata_owner_shift(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
         ctx = _spine_actuation_ctx()
@@ -7571,17 +5668,11 @@ class TestSeparatedSpineImpositionRunEligibility:
             ctx, workflow_yaml, []
         )
         contract = workflow_update_module._output_contract_required_paths_source(ctx)
-        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
+        required_paths = contract.union
         read_label, _owner_labels = workflow_update_module._target_output_contract_block_label(
             ctx, workflow_yaml, scaffolded_metadata, required_paths
         )
-        read_signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source=source,
-            reason_code=reason_code,
-            required_paths=required_paths,
-        )
+        read_signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=required_paths)
         read_key = workflow_update_module._output_contract_spine_directive_attempt_key(
             signature=read_signature, block_label=read_label, workflow_yaml=workflow_yaml
         )
@@ -7625,108 +5716,6 @@ def _budget_evaluation(ctx: CopilotContext) -> _OutputContractEvaluation:
     return evaluation
 
 
-class TestOutputContractBudgetRunGuard:
-    def _prime(self, monkeypatch: pytest.MonkeyPatch) -> tuple[CopilotContext, _OutputContractEvaluation]:
-        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
-        ctx = _spine_actuation_ctx()
-        signature = workflow_update_module._stable_output_contract_key("turn:t-spine", {"output.record_id"})
-        ctx.output_contract_reject_count_by_signature = {
-            signature: workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS - 1
-        }
-        evaluation = _budget_evaluation(ctx)
-        return ctx, evaluation
-
-    def test_budget_rewrite_deferred_without_run_evidence(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx, evaluation = self._prime(monkeypatch)
-
-        payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
-
-        assert payload["output_contract_reject_count"] >= workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS
-        assert payload["reason_code"] == "output_contract_required"
-
-    def test_budget_rewrite_deferred_for_author_time_reject_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx, evaluation = self._prime(monkeypatch)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="author_time_reject", verdict="authoring_rejected", reason_code="metadata_reject"
-        )
-
-        payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
-
-        assert payload["reason_code"] == "output_contract_required"
-
-    def test_budget_rewrite_fires_with_persisted_run_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx, evaluation = self._prime(monkeypatch)
-        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            verdict="repairable_failure",
-            reason_code="failed_run",
-            workflow_run_id="wr_1",
-            structural_failure_identity="runtime:failed",
-        )
-        ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
-
-        payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
-
-        assert payload["reason_code"] == "output_contract_reject_budget_exhausted"
-
-    def _prime_at_reject_count(
-        self, monkeypatch: pytest.MonkeyPatch, *, reject_count: int, deferral_count: int
-    ) -> tuple[CopilotContext, _OutputContractEvaluation]:
-        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
-        ctx = _spine_actuation_ctx()
-        signature = workflow_update_module._stable_output_contract_key("turn:t-spine", {"output.record_id"})
-        ctx.output_contract_reject_count_by_signature = {signature: reject_count}
-        ctx.output_contract_deferral_count_by_signature = {signature: deferral_count}
-        evaluation = _budget_evaluation(ctx)
-        return ctx, evaluation
-
-    def test_zero_run_reject_loop_terminalizes_at_deferral_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx, evaluation = self._prime_at_reject_count(
-            monkeypatch,
-            reject_count=workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS,
-            deferral_count=workflow_update_module._MAX_OUTPUT_CONTRACT_DEFERRALS - 1,
-        )
-
-        payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
-
-        assert payload["reason_code"] == "output_contract_reject_budget_exhausted"
-
-    def test_zero_run_reject_below_deferral_cap_still_defers(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ctx, evaluation = self._prime_at_reject_count(
-            monkeypatch,
-            reject_count=workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS,
-            deferral_count=0,
-        )
-
-        payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
-
-        assert payload["reason_code"] == "output_contract_required"
-
-    def test_deferral_cap_matches_max_rejects_plus_two(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
-        ctx = _spine_actuation_ctx()
-        signature = workflow_update_module._stable_output_contract_key("turn:t-spine", {"output.record_id"})
-        ctx.output_contract_reject_count_by_signature = {
-            signature: workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS - 1
-        }
-        ctx.output_contract_deferral_count_by_signature = {}
-
-        reasons: list[str] = []
-        for _ in range(6):
-            evaluation = _budget_evaluation(ctx)
-            payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
-            reasons.append(str(payload["reason_code"]))
-            if payload["reason_code"] == "output_contract_reject_budget_exhausted":
-                break
-
-        assert reasons[-1] == "output_contract_reject_budget_exhausted"
-        assert reasons[:-1] == ["output_contract_required"] * (len(reasons) - 1)
-        assert (
-            ctx.output_contract_reject_count_by_signature[signature]
-            == workflow_update_module._MAX_OUTPUT_CONTRACT_REJECTS + 2
-        )
-
-
 class TestCodeBlockParameterPersistSeam:
     def test_declared_credential_key_is_adopted_for_unresolved_name(self) -> None:
         workflow_yaml = _yaml(
@@ -7751,82 +5740,6 @@ class TestCodeBlockParameterPersistSeam:
         parsed = parse_workflow_yaml(adopted)
         blocks = workflow_blocks(parsed)
         assert blocks[0]["parameter_keys"] == ["portal_credentials"]
-
-    @pytest.mark.asyncio
-    async def test_undeclared_parameter_key_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.workflow_yaml = _SAFE_CODE_YAML
-        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
-        submitted = _directory_blocks_yaml(
-            """
-            - block_type: code
-              label: search_directory
-              parameter_keys: [address_or_postal_code]
-              code: |
-                await page.locator("#location").fill(str(address_or_postal_code))
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "search_directory" in result["error"]
-        assert "`address_or_postal_code`" in result["error"]
-        assert "workflow_definition.parameters" in result["error"]
-        assert ctx.workflow_yaml == _SAFE_CODE_YAML
-        assert "authoring_repair_context" not in result["data"]
-        assert ctx.last_code_authoring_repair_context is None
-
-    @pytest.mark.asyncio
-    async def test_nested_code_block_undeclared_parameter_key_rejects(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        submitted = _directory_blocks_yaml(
-            """
-            - block_type: loop
-              label: retry_search
-              loop_blocks:
-              - block_type: code
-                label: nested_directory_search
-                parameter_keys: [address_or_postal_code]
-                code: |
-                  await page.locator("#location").fill(str(address_or_postal_code))
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "nested_directory_search" in result["error"]
-        assert "`address_or_postal_code`" in result["error"]
-        assert ctx.workflow_yaml == ""
-
-    def test_deeply_nested_parameter_contract_returns_validation_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        block: dict[str, object] = {
-            "block_type": "code",
-            "label": "search_directory",
-            "parameter_keys": ["search_location"],
-            "code": "print(search_location)",
-        }
-        for index in range(1100):
-            block = {
-                "block_type": "loop",
-                "label": f"loop_{index}",
-                "loop_blocks": [block],
-            }
-        parsed = {
-            "workflow_definition": {
-                "parameters": [{"key": "search_location"}],
-                "blocks": [block],
-            }
-        }
-        monkeypatch.setattr(workflow_update_module, "parse_workflow_yaml", lambda _workflow_yaml: parsed)
-
-        assert (
-            workflow_update_module._code_block_parameter_contract_error("workflow_definition: {}")
-            == "Workflow YAML nesting is too deep to validate."
-        )
 
     def test_output_contract_graph_preserves_branch_isolation(self) -> None:
         workflow_yaml = _yaml(
@@ -7935,58 +5848,6 @@ class TestCodeBlockParameterPersistSeam:
         assert result["ok"] is True
         assert ctx.workflow_yaml == submitted
 
-    @pytest.mark.parametrize(
-        ("submitted", "label", "key"),
-        [
-            (
-                _directory_blocks_yaml(
-                    """
-                    - block_type: code
-                      label: summarize_registry
-                      parameter_keys: [search_registry_output]
-                      code: |
-                        print(search_registry_output)
-                    - block_type: code
-                      label: search_registry
-                      code: |
-                        return {"records": []}
-                    """
-                ),
-                "summarize_registry",
-                "search_registry_output",
-            ),
-            (
-                _directory_blocks_yaml(
-                    """
-                    - block_type: loop
-                      label: retry_search
-                      loop_blocks:
-                      - block_type: code
-                        label: nested_directory_search
-                        parameter_keys: [retry_search_output]
-                        code: |
-                          print(retry_search_output)
-                    """
-                ),
-                "nested_directory_search",
-                "retry_search_output",
-            ),
-        ],
-    )
-    @pytest.mark.asyncio
-    async def test_unavailable_output_parameter_key_rejects(
-        self, monkeypatch: pytest.MonkeyPatch, submitted: str, label: str, key: str
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert label in result["error"]
-        assert f"`{key}`" in result["error"]
-        assert ctx.workflow_yaml == ""
-
     @pytest.mark.parametrize("marker", ["<<<<<<< HEAD", "======="])
     @pytest.mark.asyncio
     async def test_raw_workflow_yaml_conflict_marker_rejects_before_persist(
@@ -8003,58 +5864,6 @@ class TestCodeBlockParameterPersistSeam:
         assert f"conflict marker `{marker}`" in result["error"]
         assert "line 1" in result["error"]
         assert ctx.workflow_yaml == _SAFE_CODE_YAML
-
-    @pytest.mark.asyncio
-    async def test_conflict_marker_inside_code_block_has_marker_specific_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: search_registry
-                code: |
-                  <<<<<<< HEAD
-                  await page.goto("https://example.com/search")
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Code block `search_registry` contains unresolved conflict marker `<<<<<<< HEAD`" in result["error"]
-        assert "not valid Python" not in result["error"]
-        assert ctx.workflow_yaml == ""
-
-    @pytest.mark.asyncio
-    async def test_registered_download_output_keys_are_not_parameter_keys(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        submitted = _yaml(
-            """
-            title: Statement download
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: download_statement
-                parameter_keys: [downloaded_files]
-                code: |
-                  print(downloaded_files)
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "download_statement" in result["error"]
-        assert "`downloaded_files`" in result["error"]
-        assert "execution layer injects registered download output keys" in result["error"]
 
 
 class TestCompiledAuthoringImposition:
@@ -8090,6 +5899,18 @@ class TestCompiledAuthoringImposition:
             }
         ]
         return ctx
+
+    @staticmethod
+    def _cafe_search_capture() -> dict[str, object]:
+        return {
+            "tool_name": "type_text",
+            "selector": "#café-search",
+            "source_url": "https://example.com/catalog",
+            "typed_length": 15,
+            "role": "textbox",
+            "accessible_name": "Catalog search",
+            "trajectory_index": 0,
+        }
 
     @pytest.mark.asyncio
     async def test_imposes_strict_scout_selector_and_lifts_singleton_literal(
@@ -8131,138 +5952,6 @@ class TestCompiledAuthoringImposition:
             ],
             "prior_source": "workflow_yaml",
         }
-
-    @pytest.mark.asyncio
-    async def test_imposition_appends_no_fill_skeleton_and_emits_no_skeleton_substitution(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        metadata = [_terminal_metadata("search_registry", "search the registry")]
-
-        result = await _update_workflow(
-            {"workflow_yaml": _SUBMITTED_LITERAL_YAML, "code_artifact_metadata": metadata}, ctx
-        )
-
-        assert result["ok"] is True
-        substitutions = result["data"]["imposed_substitutions"]
-        assert substitutions["scrubbed_stale_selected_goal_value_paths"] is True
-        assert "preserved_submitted_extraction_code" not in substitutions
-        parsed = parse_workflow_yaml(ctx.workflow_yaml)
-        assert isinstance(parsed, dict)
-        block = _single_code_block(parsed)
-        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
-        assert not workflow_update_module._artifact_declares_goal_values(ctx.code_artifact_metadata["search_registry"])
-
-    @pytest.mark.asyncio
-    async def test_output_intent_requires_artifact_metadata_before_persist(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
-        submitted = _yaml(
-            """
-            title: Provider lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: output, key: provider_result}
-              blocks:
-              - block_type: code
-                label: search_registry
-                prompt: Search the registry and return structured provider result data.
-                code: |
-                  await page.locator("input[placeholder='Search']").fill("Sample Search")
-                  await page.locator("button.lookup").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "must pass `code_artifact_metadata`" in result["error"]
-        assert "goal_value_paths" in result["error"]
-        assert ctx.workflow_yaml == ""
-        assert "authoring_repair_context" not in result["data"]
-        assert ctx.last_code_authoring_repair_context is None
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert ctx.last_code_authoring_reject_was_credential_priority is False
-
-    @pytest.mark.asyncio
-    async def test_missing_metadata_with_credential_gap_uses_credential_priority_counter(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-        submitted = _yaml(
-            """
-            title: Credentialed lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: workflow, workflow_parameter_type: credential_id, key: login_credential, default_value: cred_missing}
-              - {parameter_type: output, key: lookup_result}
-              blocks:
-              - block_type: code
-                label: lookup_with_saved_credential
-                parameter_keys: [login_credential]
-                prompt: Sign in and return the lookup result.
-                code: |
-                  await page.locator("#email").fill(login_credential.username)
-                  await page.locator("input[type='password']").fill(login_credential.password)
-                  return {"lookup_result": "sample"}
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "must pass `code_artifact_metadata`" in result["error"]
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert ctx.last_code_authoring_reject_was_credential_priority is True
-        assert ctx.blocker_signal is None
-
-    @pytest.mark.asyncio
-    async def test_output_intent_rejects_partial_metadata_without_output_label(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        submitted = _yaml(
-            """
-            title: Provider lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: output, key: provider_result}
-              blocks:
-              - block_type: code
-                label: open_registry
-                prompt: Open the registry.
-                code: |
-                  await page.goto("https://example.com/search")
-              - block_type: code
-                label: extract_registry
-                prompt: Return structured provider result data.
-                code: |
-                  records = [{"number": "REC-001"}]
-            """
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted,
-                "code_artifact_metadata": [_terminal_metadata("open_registry", "open the registry")],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is False
-        assert "extract_registry" in result["error"]
-        assert "must pass `code_artifact_metadata`" in result["error"]
-        assert ctx.workflow_yaml == ""
 
     @pytest.mark.asyncio
     async def test_enter_directory_location_output_block_metadata_passes_before_persist(
@@ -8309,67 +5998,6 @@ class TestCompiledAuthoringImposition:
         assert ctx.workflow_yaml
         assert "enter_directory_location" in ctx.code_artifact_metadata
         assert ctx.latest_recorded_build_test_outcome is None
-
-    @pytest.mark.asyncio
-    async def test_invalid_metadata_records_typed_outcome_without_prose_payload(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        submitted = _yaml(
-            """
-            title: Provider lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: search_registry
-                code: |
-                  records = [{"number": "REC-001"}]
-            """
-        )
-        metadata = [
-            {
-                "block_label": "search_registry",
-                "claimed_outcomes": [{"id": "claim:rows", "status": "satisfied"}],
-            }
-        ]
-
-        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
-
-        assert result["ok"] is False
-        assert "Artifact metadata" in result["error"]
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-        structural_payload = workflow_update_module._code_artifact_metadata_reject_payload(
-            workflow_yaml=submitted,
-            raw_metadata=metadata,
-            offending_labels=["search_registry"],
-            violation_categories=["missing_declared_goal", "missing_required_list", "missing_artifact_refs"],
-        )
-        assert structural_payload is not None
-        assert structural_payload["offending_labels"] == ["search_registry"]
-        assert structural_payload["missing_fields_by_label"] == {
-            "search_registry": [
-                "declared_goal",
-                "page_dependencies",
-                "completion_criteria",
-                "terminal_verifier_expectations",
-                "evidence_refs_or_observation_refs",
-            ]
-        }
-        assert structural_payload["code_block_output_status"] == {
-            "search_registry": {
-                "block_type": "code",
-                "has_code": True,
-                "declares_output_intent": False,
-                "declares_output_roots": [],
-                "has_meaningful_output": False,
-            }
-        }
-        payload_text = str(structural_payload)
-        assert "requires non-empty" not in payload_text
-        assert "claim:rows" not in payload_text
 
     @pytest.mark.asyncio
     async def test_imposition_preserves_submitted_extraction_suffix(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8419,50 +6047,6 @@ class TestCompiledAuthoringImposition:
         assert 'await page.locator("#provInput").fill(str(provider_name))' in browser_code
         assert 'records = [{"number": "REC-001", "status": "credentialed"}]' in output_code
         assert 'return {"records": records}' in output_code
-
-    @pytest.mark.asyncio
-    async def test_imposition_preserves_custom_extraction_code_with_goal_metadata(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-        synthesized_code = textwrap.dedent(synthesized.code).lstrip()
-        submitted_code = (
-            "records = []\n"
-            + synthesized_code.rstrip()
-            + '\nrecords.append({"number": "REC-001", "status": "credentialed"})\n'
-        )
-        submitted = yaml.safe_dump(
-            {
-                "title": "Provider lookup",
-                "workflow_definition": {
-                    "parameters": [
-                        {
-                            "parameter_type": "workflow",
-                            "workflow_parameter_type": "string",
-                            "key": "provider_name",
-                            "default_value": "Sample Search",
-                        }
-                    ],
-                    "blocks": [
-                        {
-                            "block_type": "code",
-                            "label": "search_registry",
-                            "code": submitted_code,
-                        }
-                    ],
-                },
-            },
-            sort_keys=False,
-        )
-        metadata = [_terminal_metadata("search_registry", "search the registry")]
-
-        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
-
-        assert result["ok"] is False
-        assert "selected output extraction boundary is ambiguous" in result["error"]
 
     def _download_ctx(self) -> CopilotContext:
         from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -8774,6 +6358,25 @@ class TestCompiledAuthoringImposition:
     async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "input[placeholder='Search']",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 13,
+                "role": "textbox",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "button.lookup",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Lookup",
+                "trajectory_index": 1,
+            },
+        ]
         ctx.workflow_yaml = _SUBMITTED_LITERAL_YAML
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
@@ -8872,72 +6475,6 @@ class TestCompiledAuthoringImposition:
         assert f'await page.locator("{expected_selector}").fill(str(provider_name))' in block["code"]
 
     @pytest.mark.asyncio
-    async def test_mixed_locator_fill_rejects_direct_synthesized_parameter_reference(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
-
-        result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LOCATOR_FILL_COMPUTED_LITERAL_YAML}, ctx)
-
-        assert result["ok"] is False
-        assert "submitted code mixes direct fills using `provider_name`" in result["error"]
-        assert ctx.workflow_yaml == ""
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["provider_name"]
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
-
-    @pytest.mark.asyncio
-    async def test_typed_default_contract_reject_clears_stale_repair_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._typed_default_ctx()
-        submitted = _yaml(
-            """
-            title: Product lookup
-            workflow_definition:
-              parameters: invalid
-              blocks:
-              - block_type: code
-                label: search_catalog
-                code: |
-                  await page.locator("#search").fill("example_sku_123")
-            """
-        )
-        ctx.workflow_yaml = submitted
-        ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "workflow_definition.parameters must be a list" in result["error"]
-        assert "authoring_repair_context" not in result["data"]
-        assert ctx.last_code_authoring_repair_context is None
-
-    @pytest.mark.asyncio
-    async def test_unknown_computed_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-
-        result = await _update_workflow({"workflow_yaml": _SUBMITTED_UNKNOWN_COMPUTED_LITERAL_YAML}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["provider_name"]
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-        assert ctx.workflow_yaml == ""
-
-    @pytest.mark.asyncio
     async def test_selector_join_aliases_synthesized_parameter_to_authored_fill_parameter(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -8968,169 +6505,6 @@ class TestCompiledAuthoringImposition:
         assert block["parameter_keys"] == ["search_term"]
         assert 'await page.locator("#provInput").fill(str(search_term))' in block["code"]
         assert "provider_name" not in block["code"]
-
-    @pytest.mark.asyncio
-    async def test_single_synthesized_key_without_bindable_fill_records_repair_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#location",
-                "source_url": "https://example.com/directory",
-                "typed_length": 5,
-                "role": "textbox",
-                "accessible_name": "Address City County or Zip Code",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: search_directory
-                code: |
-                  await page.locator("#submit").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
-        assert repair_context["selector"] == "#location"
-        assert repair_context["source_url"] == "https://example.com"
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-        assert ctx.workflow_yaml == ""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "workflow_yaml",
-        [_SUBMITTED_UNKNOWN_COMPUTED_LITERAL_YAML, _SUBMITTED_MIXED_LOCATOR_FILL_COMPUTED_LITERAL_YAML],
-    )
-    async def test_ambiguous_parameter_binding_rejects_without_count_authority(
-        self, monkeypatch: pytest.MonkeyPatch, workflow_yaml: str
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        ctx.output_contract_reject_count_by_signature = {"unrelated": 99}
-
-        result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
-
-        assert result["ok"] is False
-        assert result["data"]["authoring_repair_context"]["reason_code"] == ("synthesized_parameter_binding_ambiguous")
-        assert ctx.workflow_yaml == ""
-
-    @pytest.mark.asyncio
-    async def test_synthesized_parameter_repair_context_uses_safe_selector_atom(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        raw_selector = "#location-" + ("x" * 180)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": raw_selector,
-                "source_url": "https://example.com/directory?query=raw",
-                "typed_length": 5,
-                "role": "textbox",
-                "accessible_name": "Address City County or Zip Code",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: search_directory
-                code: |
-                  await page.locator("#submit").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
-        assert repair_context["selector"] in (None, "")
-        assert repair_context["source_url"] == "https://example.com"
-        assert raw_selector not in str(repair_context)
-
-    @pytest.mark.asyncio
-    async def test_multi_input_missing_synthesized_parameter_rejects_with_repair_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#confirmation",
-                "source_url": "https://example.com/orders",
-                "typed_length": 10,
-                "role": "textbox",
-                "accessible_name": "Enter Confirmation",
-                "trajectory_index": 0,
-            },
-            {
-                "tool_name": "type_text",
-                "selector": "#postal",
-                "source_url": "https://example.com/orders",
-                "typed_length": 5,
-                "role": "textbox",
-                "accessible_name": "ZIP Code",
-                "trajectory_index": 1,
-            },
-        ]
-        submitted = _yaml(
-            """
-            title: Order lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: workflow, workflow_parameter_type: string, key: order_lookup}
-              blocks:
-              - block_type: code
-                label: order_status
-                parameter_keys: [order_lookup]
-                code: |
-                  await page.locator("#confirmation").fill(str(order_lookup))
-                  await page.locator("#postal").fill(str(order_lookup))
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "authored selector-join alias is reused by another synthesized input" in result["error"]
-        assert ctx.workflow_yaml == ""
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["block_label"] == "order_status"
-        assert repair_context["unresolved_names"] == ["zip_code"]
-        assert repair_context["available_parameter_keys"] == ["order_lookup"]
-        assert repair_context["binding_candidates"] == ["zip_code", "order_lookup"]
-        assert "update_and_run_blocks" in repair_context["repair_instruction"]
-        assert "secret" not in str(repair_context).lower()
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.last_code_authoring_repair_context.model_dump(mode="json") == repair_context
 
     @pytest.mark.asyncio
     async def test_synthesized_internal_parameter_aliases_to_existing_declared_default(
@@ -9245,124 +6619,6 @@ class TestCompiledAuthoringImposition:
             "address_or_postal_code": "search_location"
         }
 
-    @pytest.mark.asyncio
-    async def test_synthesized_parameter_does_not_alias_by_typed_length_to_declared_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#locInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 17,
-                "role": "textbox",
-                "accessible_name": "Address or postal code",
-                "trajectory_index": 0,
-            },
-            {
-                "tool_name": "type_text",
-                "selector": "#firstName",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 5,
-                "role": "textbox",
-                "accessible_name": "Provider First Name",
-                "trajectory_index": 1,
-            },
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              parameters:
-              - {key: search_location, default_value: "Example City, USA"}
-              - {key: provider_first_name, default_value: "Given"}
-              blocks:
-              - block_type: code
-                label: search_directory
-                parameter_keys: [address_or_postal_code, provider_first_name]
-                code: |
-                  await page.locator("#location").fill(str(address_or_postal_code))
-                  await page.locator("#firstName").fill(str(provider_first_name))
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `address_or_postal_code`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["address_or_postal_code"]
-        assert ctx.workflow_yaml == ""
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
-    async def test_synthesized_provider_search_key_does_not_compose_declared_first_last_inputs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#locInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 17,
-                "typed_value": "Example City, USA",
-                "role": "textbox",
-                "accessible_name": "Address or postal code",
-                "trajectory_index": 0,
-            },
-            {
-                "tool_name": "type_text",
-                "selector": "#providerSearch",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 12,
-                "role": "textbox",
-                "accessible_name": "Provider name or identifier",
-                "trajectory_index": 1,
-            },
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              parameters:
-              - {key: search_location, default_value: "Example City, USA"}
-              - {key: provider_first_name, default_value: "Given"}
-              - {key: provider_last_name, default_value: "Family"}
-              blocks:
-              - block_type: code
-                label: search_directory
-                parameter_keys:
-                - address_or_postal_code
-                - provider_name_or_identifier
-                code: |
-                  await page.locator("#location").fill(str(address_or_postal_code))
-                  await page.locator("#providerSearch").fill(str(provider_name_or_identifier))
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `provider_name_or_identifier`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["provider_name_or_identifier"]
-        assert ctx.workflow_yaml == ""
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
     def test_identifier_rewrite_skips_string_literals_and_comments(self) -> None:
         source = (
             'await page.locator("#providerSearch").fill(str(provider_query))\n'
@@ -9399,217 +6655,6 @@ class TestCompiledAuthoringImposition:
         )
 
     @pytest.mark.asyncio
-    async def test_single_synthesized_location_key_rejects_unique_declared_search_location_without_exact_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#locInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 19,
-                "role": "textbox",
-                "accessible_name": "Address City County or Zip Code",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              parameters:
-              - {key: plan, default_value: "Coastal Complete Health"}
-              - {key: provider_first_name, default_value: "Jordan"}
-              - {key: provider_last_name, default_value: "Avery"}
-              - {key: provider_npi, default_value: "1457803926"}
-              - {key: search_location, default_value: "North Carolina, USA"}
-              blocks:
-              - block_type: code
-                label: open_directory_plan_selection
-                parameter_keys:
-                - address_city_county_or_zip_code
-                code: |
-                  await page.locator("#planContinue").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
-        assert repair_context["available_parameter_keys"] == [
-            "plan",
-            "provider_first_name",
-            "provider_last_name",
-            "provider_npi",
-            "search_location",
-        ]
-        assert ctx.workflow_yaml == ""
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
-    async def test_single_synthesized_location_key_rejects_unique_declared_search_location_without_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#locInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 19,
-                "role": "textbox",
-                "accessible_name": "Address City County or Zip Code",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: workflow, workflow_parameter_type: string, key: plan}
-              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_first_name}
-              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_last_name}
-              - {parameter_type: workflow, workflow_parameter_type: string, key: provider_npi}
-              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location}
-              blocks:
-              - block_type: code
-                label: open_directory_plan_selection
-                parameter_keys:
-                - address_city_county_or_zip_code
-                code: |
-                  await page.locator("#planContinue").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
-        assert repair_context["available_parameter_keys"] == [
-            "plan",
-            "provider_first_name",
-            "provider_last_name",
-            "provider_npi",
-            "search_location",
-        ]
-        assert ctx.workflow_yaml == ""
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
-    async def test_single_synthesized_location_key_rejects_ambiguous_declared_location_alias_without_defaults(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#locInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 19,
-                "role": "textbox",
-                "accessible_name": "Address City County or Zip Code",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              parameters:
-              - {parameter_type: workflow, workflow_parameter_type: string, key: search_location}
-              - {parameter_type: workflow, workflow_parameter_type: string, key: service_location}
-              blocks:
-              - block_type: code
-                label: open_directory_plan_selection
-                parameter_keys:
-                - address_city_county_or_zip_code
-                code: |
-                  await page.locator("#planContinue").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
-        assert repair_context["available_parameter_keys"] == ["search_location", "service_location"]
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
-    async def test_single_synthesized_location_key_keeps_authoritative_reject_when_length_alias_ambiguous(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#locInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 19,
-                "role": "textbox",
-                "accessible_name": "Address City County or Zip Code",
-                "trajectory_index": 0,
-            }
-        ]
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              parameters:
-              - {key: search_location, default_value: "North Carolina, USA"}
-              - {key: alternate_location, default_value: "South Carolina, USA"}
-              blocks:
-              - block_type: code
-                label: open_directory_plan_selection
-                parameter_keys:
-                - address_city_county_or_zip_code
-                code: |
-                  await page.locator("#planContinue").click()
-            """
-        )
-
-        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `address_city_county_or_zip_code`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["block_label"] == "open_directory_plan_selection"
-        assert repair_context["unresolved_names"] == ["address_city_county_or_zip_code"]
-        assert repair_context["available_parameter_keys"] == ["alternate_location", "search_location"]
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
     async def test_single_local_string_constant_is_lifted_for_synthesized_key(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -9634,46 +6679,12 @@ class TestCompiledAuthoringImposition:
         ]
 
     @pytest.mark.asyncio
-    async def test_single_submitted_string_parameter_is_not_adopted_by_length_for_synthesized_key(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-        ctx.scout_trajectory[0]["accessible_name"] = "Search by doctor name or specialty, hospital, procedure, and more"
-
-        result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_PARAMETER_YAML}, ctx)
-
-        synthesized_key = "search_by_doctor_name_or_specialty_hospital_procedure_and_more"
-        assert result["ok"] is False
-        assert f"Unable to bind synthesized parameter `{synthesized_key}`" in result["error"]
-        repair_context = result["data"]["authoring_repair_context"]
-        assert repair_context["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair_context["unresolved_names"] == [synthesized_key]
-        assert ctx.workflow_yaml == ""
-        assert isinstance(ctx.last_code_authoring_repair_context, CodeAuthoringRepairContext)
-        assert ctx.latest_recorded_build_test_outcome is not None
-        assert ctx.latest_recorded_build_test_outcome.reason_code == "synthesized_parameter_binding_ambiguous"
-        assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
-
-    @pytest.mark.asyncio
-    async def test_mixed_literal_and_computed_fill_rejects_before_persist(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = self._provider_search_ctx()
-
-        result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LITERAL_YAML}, ctx)
-
-        assert result["ok"] is False
-        assert "submitted code mixes direct fills using `provider_name`" in result["error"]
-        assert ctx.workflow_yaml == ""
-
-    @pytest.mark.asyncio
     async def test_promotes_scouted_typed_literal_across_multiple_and_nested_code_blocks(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._typed_default_ctx()
+        ctx.scout_trajectory = [self._cafe_search_capture(), {**ctx.scout_trajectory[0], "trajectory_index": 1}]
 
         result = await _update_workflow({"workflow_yaml": _SUBMITTED_TYPED_LITERAL_REWRITE_YAML}, ctx)
 
@@ -9709,6 +6720,7 @@ class TestCompiledAuthoringImposition:
     ) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._typed_default_ctx()
+        ctx.scout_trajectory = [self._cafe_search_capture(), {**ctx.scout_trajectory[0], "trajectory_index": 1}]
         submitted_yaml = _SUBMITTED_TYPED_LITERAL_REWRITE_YAML.replace("example_sku_123", "other_sku_456")
 
         result = await _update_workflow({"workflow_yaml": submitted_yaml}, ctx)
@@ -9907,31 +6919,6 @@ def test_literal_binding_sees_through_first_last_disambiguator() -> None:
     assert 'await page.get_by_role("textbox").last.type(str(search))' in rewritten
 
 
-def test_direct_parameter_binding_ignores_nested_function_assignment() -> None:
-    code = textwrap.dedent(
-        """
-        def normalize_search() -> str:
-            search = "local fallback"
-            return search
-
-        await page.locator("#search").fill(search)
-        """
-    ).strip()
-
-    assert workflow_update_module._submitted_uses_parameter_in_direct_fill_type(code, "search") is True
-
-
-def test_direct_parameter_binding_rejects_top_level_assignment() -> None:
-    code = textwrap.dedent(
-        """
-        search = "local fallback"
-        await page.locator("#search").fill(search)
-        """
-    ).strip()
-
-    assert workflow_update_module._submitted_uses_parameter_in_direct_fill_type(code, "search") is False
-
-
 def test_python_ast_offsets_are_utf8_byte_offsets_for_unicode_source() -> None:
     code = 'await page.locator("#café-search-résumé").fill("example_sku_123")'
     tree = workflow_update_module._wrapped_code_ast(code)
@@ -9955,45 +6942,6 @@ def test_python_ast_offsets_are_utf8_byte_offsets_for_unicode_source() -> None:
 
 
 class TestSeamSalvageIntoContext:
-    @pytest.mark.asyncio
-    async def test_conforming_label_persists_when_sibling_label_rejects(self) -> None:
-        workflow_yaml = _yaml(
-            """
-            title: Registry lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: block_one
-                code: |
-                  await page.goto("https://example.com/search")
-                  records = [{"number": "REC-001"}]
-              - block_type: code
-                label: block_two
-                code: |
-                  await page.goto("https://example.com/results")
-            """
-        )
-        metadata = [
-            _terminal_metadata("block_one", "search the registry"),
-            {
-                "block_label": "block_two",
-                "declared_goal": "expand the result rows",
-                "claimed_outcomes": [
-                    {"id": "claim:rows", "scope": "outcome", "text": "rows expanded", "status": "satisfied"}
-                ],
-            },
-        ]
-        ctx = _code_only_ctx()
-        result = await _update_workflow({"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata}, ctx)
-
-        assert result["ok"] is False
-        assert "block_two" in result["error"]
-        assert "block_one" not in result["error"]
-        assert list(ctx.code_artifact_metadata.keys()) == ["block_one"]
-        assert ctx.workflow_verification_evidence.code_artifact_metadata == ctx.code_artifact_metadata
-        assert "contract violation" not in result["user_facing_summary"]
-        assert "`" not in result["user_facing_summary"]
-
     @pytest.mark.asyncio
     async def test_stale_entry_dropped_and_draft_metadata_survives_unaccepted_submission(self) -> None:
         draft_yaml = _yaml(
@@ -10316,17 +7264,6 @@ class TestCredentialScoutPersistGate:
         assert "login_with_saved_credential" in ctx.workflow_yaml
         assert "expect_download" in ctx.workflow_yaml
         assert "login_credential.username" in ctx.workflow_yaml
-
-    @pytest.mark.asyncio
-    async def test_download_scout_gate_still_blocks_normal_code_only_authoring(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        result = await _update_workflow({"workflow_yaml": self._DOWNLOAD_CODE_YAML}, ctx)
-
-        assert result["ok"] is False
-        assert "Scout it first" in result["error"]
-        assert "download affordance" in result["error"]
 
     @pytest.mark.asyncio
     async def test_standard_mode_behavior_is_unchanged(self) -> None:
@@ -10745,25 +7682,6 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
-    async def test_repeated_output_policy_reject_halts_at_guardrail_backstop(self) -> None:
-        ctx = _code_only_ctx()
-
-        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
-            result = await _update_workflow(
-                {"workflow_yaml": _RAW_SECRET_OUTPUT_POLICY_YAML},
-                ctx,
-                allow_missing_credentials=True,
-            )
-            assert result["ok"] is False
-
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        churn = ctx.blocker_signal
-        assert isinstance(churn, CopilotToolBlockerSignal)
-        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
-        assert ctx.latest_tool_blocker_signal is churn
-        assert _kind_for_blocker_signal(churn) is TurnHaltKind.LOOP_DETECTED
-
-    @pytest.mark.asyncio
     async def test_nth_reject_stashes_churn_signal_and_resolves_to_loop_halt(self) -> None:
         ctx = _code_only_ctx()
         for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
@@ -11012,70 +7930,6 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert churn.user_facing_reason == CREDENTIAL_SCOUT_VERIFY_REPLY
 
     @pytest.mark.asyncio
-    async def test_name_safety_churn_still_halts_after_credential_priority_reject(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
-            await _update_workflow({"workflow_yaml": _page_evaluate_credential_collision_yaml(index)}, ctx)
-        assert ctx.last_code_authoring_reject_was_credential_priority is True
-
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "#search-submit",
-                "source_url": "https://example.com/search",
-                "trajectory_index": 0,
-            }
-        ]
-        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert ctx.last_code_authoring_reject_was_credential_priority is False
-        assert ctx.blocker_signal is None
-        assert _check_enforcement(ctx) is None
-
-    @pytest.mark.asyncio
-    async def test_non_credential_reject_resets_when_recorded_outcome_changes_after_precharge(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 1):
-            await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(index)}, ctx)
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS + 1
-        assert ctx.last_code_authoring_reject_was_credential_priority is True
-        assert ctx.blocker_signal is None
-        assert _check_enforcement(ctx) is None
-
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "#search-submit",
-                "source_url": "https://example.com/search",
-                "trajectory_index": 0,
-            }
-        ]
-        await _update_workflow({"workflow_yaml": _distinct_guardrail_yaml(0)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert ctx.last_code_authoring_reject_was_credential_priority is False
-        assert ctx.blocker_signal is None
-        assert _check_enforcement(ctx) is None
-
-    @pytest.mark.asyncio
-    async def test_changed_authoring_recorded_outcome_resets_guardrail_backstop(self) -> None:
-        ctx = _code_only_ctx()
-
-        await _update_workflow({"workflow_yaml": _code_yaml("value = missing_first_name()")}, ctx)
-        first_key = ctx.latest_recorded_build_test_outcome.structural_key
-        await _update_workflow({"workflow_yaml": _code_yaml("value = missing_second_name()")}, ctx)
-
-        assert first_key is not None
-        assert ctx.latest_recorded_build_test_outcome.structural_key != first_key
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert ctx.blocker_signal is None
-
-    @pytest.mark.asyncio
     async def test_identical_authoring_recorded_outcome_still_halts_at_backstop(self) -> None:
         ctx = _code_only_ctx()
         for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
@@ -11220,6 +8074,83 @@ def _submitted_with_sibling_code(sibling_code: str) -> str:
             label: preserved_code
             code: |
 {indented}
+        """
+    )
+
+
+_METADATA_LESS_DIRECTIVE_EVENT = "copilot_output_contract_spine_structure_directive_emitted"
+
+_RECORDED_METADATA_REJECT_BLOCK_LABEL = "validate_public_start_service_path"
+
+
+def _recorded_metadata_reject_yaml() -> str:
+    return _yaml(
+        f"""
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {{parameter_type: output, key: workflow_output}}
+          blocks:
+          - block_type: code
+            label: {_RECORDED_METADATA_REJECT_BLOCK_LABEL}
+            code: |
+              await page.locator("#start").click()
+        """
+    )
+
+
+def _metadata_less_output_yaml(selector: str = "#search-submit") -> str:
+    return _yaml(
+        f"""
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {{parameter_type: output, key: workflow_output}}
+          blocks:
+          - block_type: code
+            label: extract_provider
+            code: |
+              await page.locator("{selector}").click()
+        """
+    )
+
+
+def _metadata_less_page_read_yaml() -> str:
+    return _yaml(
+        """
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {parameter_type: output, key: workflow_output}
+          blocks:
+          - block_type: code
+            label: extract_provider
+            code: |
+              await page.locator("#search-submit").click()
+              value = await page.locator("#npi").inner_text()
+              return {"npi": value}
+        """
+    )
+
+
+def _metadata_less_two_block_yaml() -> str:
+    return _yaml(
+        """
+        title: Provider lookup
+        workflow_definition:
+          parameters:
+          - {parameter_type: output, key: workflow_output}
+          blocks:
+          - block_type: code
+            label: first_block
+            description: extract the provider data
+            code: |
+              await page.locator("#a").click()
+          - block_type: code
+            label: second_block
+            description: extract the license data
+            code: |
+              await page.locator("#b").click()
         """
     )
 
@@ -11868,132 +8799,6 @@ class TestWholeTrajectoryImposition:
         assert 'await page.locator("#zip").fill("99999")' not in code
 
     @pytest.mark.asyncio
-    async def test_assigned_parameter_key_does_not_preserve_submitted_extraction(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _quote_ctx()
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-        submitted_code = (
-            'zip_code = "99999"\n'
-            + textwrap.dedent(synthesized.code).rstrip()
-            + f'\n{workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output = {{"quote": "Q-001"}}\n'
-            + f"return {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output\n"
-        )
-        submitted = _yaml(
-            f"""
-            title: Quote
-            workflow_definition:
-              parameters:
-              - {{parameter_type: workflow, workflow_parameter_type: string, key: zip_code, default_value: "02110"}}
-              blocks:
-              - block_type: code
-                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
-                parameter_keys: [zip_code]
-                code: |
-{textwrap.indent(submitted_code, " " * 18)}
-            """
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted,
-                "code_artifact_metadata": [
-                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
-                ],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is False
-        assert "assigns synthesized parameter key(s) `zip_code`" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_destructured_parameter_key_does_not_preserve_submitted_extraction(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _quote_ctx()
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-        submitted_code = (
-            '(zip_code,) = ("99999",)\n'
-            + textwrap.dedent(synthesized.code).rstrip()
-            + f'\n{workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output = {{"quote": "Q-001"}}\n'
-            + f"return {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output\n"
-        )
-        submitted = _yaml(
-            f"""
-            title: Quote
-            workflow_definition:
-              parameters:
-              - {{parameter_type: workflow, workflow_parameter_type: string, key: zip_code, default_value: "02110"}}
-              blocks:
-              - block_type: code
-                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
-                parameter_keys: [zip_code]
-                code: |
-{textwrap.indent(submitted_code, " " * 18)}
-            """
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted,
-                "code_artifact_metadata": [
-                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
-                ],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is False
-        assert "assigns synthesized parameter key(s) `zip_code`" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_starred_parameter_key_does_not_preserve_submitted_extraction(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _quote_ctx()
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-        submitted_code = (
-            '*zip_code, = ["99999"]\n'
-            + textwrap.dedent(synthesized.code).rstrip()
-            + f'\n{workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output = {{"quote": "Q-001"}}\n'
-            + f"return {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}_output\n"
-        )
-        submitted = _yaml(
-            f"""
-            title: Quote
-            workflow_definition:
-              parameters:
-              - {{parameter_type: workflow, workflow_parameter_type: string, key: zip_code, default_value: "02110"}}
-              blocks:
-              - block_type: code
-                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
-                parameter_keys: [zip_code]
-                code: |
-{textwrap.indent(submitted_code, " " * 18)}
-            """
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted,
-                "code_artifact_metadata": [
-                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote")
-                ],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is False
-        assert "assigns synthesized parameter key(s) `zip_code`" in result["error"]
-
-    @pytest.mark.asyncio
     async def test_alias_reconciled_selected_spine_preserves_submitted_extraction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -12166,37 +8971,6 @@ class TestWholeTrajectoryImposition:
         assert 'records = [{"number": "Q-001"}]' in code
         assert 'return {"records": records}' in code
 
-    @pytest.mark.asyncio
-    async def test_author_parameter_reject_reopens_and_preserves_typed_violation(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#provInput",
-                "source_url": "https://example.com/find-care",
-                "typed_length": 13,
-                "role": "textbox",
-                "accessible_name": "Provider Name",
-                "trajectory_index": 0,
-            }
-        ]
-        ctx.update_workflow_called = True
-        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("synthesized_parameter_binding_ambiguous")
-        ctx.workflow_yaml = _SUBMITTED_LITERAL_YAML
-
-        result = await _update_workflow({"workflow_yaml": _SUBMITTED_UNKNOWN_COMPUTED_LITERAL_YAML}, ctx)
-
-        assert result["ok"] is False
-        assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
-        repair = result["data"]["authoring_repair_context"]
-        assert repair["reason_code"] == "synthesized_parameter_binding_ambiguous"
-        assert repair["unresolved_names"] == ["provider_name"]
-        assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
-
     def test_author_ambiguous_selector_reject_reopens_strict_imposition_with_typed_repair_context(self) -> None:
         ctx = _resale_ctx()
         ctx.update_workflow_called = True
@@ -12247,133 +9021,6 @@ class TestWholeTrajectoryImposition:
         assert result.violations == []
         assert result.substitutions is None
         assert result.workflow_yaml == submitted
-
-    @pytest.mark.asyncio
-    async def test_stale_selected_goal_paths_do_not_block_imposed_scout_spine(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _quote_ctx()
-        submitted = _yaml(
-            """
-            title: Quote
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: quote_flow
-                code: |
-                  await page.locator("#zip").fill(str(zip_code))
-                  await page.locator("#continue").click()
-                  await page.locator("#electricDate").fill("2026-07-01")
-                  await page.locator("#coverage-next").click()
-            """
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted,
-                "code_artifact_metadata": [_terminal_metadata("quote_flow", "quote result")],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is True
-        assert result["data"]["imposed_substitutions"]["scrubbed_stale_selected_goal_value_paths"] is True
-        parsed = parse_workflow_yaml(ctx.workflow_yaml)
-        assert isinstance(parsed, dict)
-        code = str(_single_code_block(parsed)["code"])
-        assert "#electricDate" not in code
-        assert 'await page.locator("#zip").fill(str(zip_code))' in code
-        artifact = ctx.code_artifact_metadata["quote_flow"]
-        assert not workflow_update_module._artifact_declares_goal_values(artifact)
-
-    @pytest.mark.asyncio
-    async def test_formation_prepared_directory_run_rescaffolds_metadata_after_imposition_scrub(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        scaffold = Mock(wraps=workflow_update_module._scaffold_metadata_contract_for_update)
-        envelope = Mock(wraps=workflow_update_module._impose_output_contract_envelope_after_steering)
-        monkeypatch.setattr(workflow_update_module, "_scaffold_metadata_contract_for_update", scaffold)
-        monkeypatch.setattr(workflow_update_module, "_impose_output_contract_envelope_after_steering", envelope)
-        ctx = _code_only_ctx()
-        _enable_imposition(ctx)
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "type_text",
-                "selector": "#npi",
-                "source_url": "https://example.com/directory",
-                "typed_length": 10,
-                "typed_value": "1234567890",
-                "role": "textbox",
-                "accessible_name": "NPI",
-                "trajectory_index": 0,
-            },
-            {
-                "tool_name": "click",
-                "selector": "#search_by",
-                "source_url": "https://example.com/directory",
-                "trajectory_index": 1,
-            },
-        ]
-        scouting_module._mint_current_loaded_result_source(
-            ctx,
-            {
-                "forms": [],
-                "navigation_targets": [],
-                "result_containers": [
-                    {"selector": "#coastalCard", "text": "Provider record is visible", "row_count": 1}
-                ],
-            },
-            url="https://example.com/directory",
-        )
-        ctx.request_policy = RequestPolicy(
-            completion_criteria=[
-                SimpleNamespace(
-                    id="requested_npi",
-                    output_path="output.npi",
-                    level="run",
-                    method_mandated=False,
-                    kind="outcome",
-                )
-            ]
-        )
-        submitted = _yaml(
-            """
-            title: Directory lookup
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: directory_flow
-                code: |
-                  await page.locator("#npi").fill(str(npi))
-                  await page.locator("#search_by").click()
-                  await page.locator("#coastalCard").wait_for(state="visible")
-            """
-        )
-        metadata = [
-            {
-                "block_label": "directory_flow",
-                "claimed_outcomes": [{"goal_value_paths": ["output.npi"]}],
-                "terminal_verifier_expectations": [{"goal_value_paths": ["output.npi"]}],
-            }
-        ]
-
-        result = await _update_workflow(
-            {"workflow_yaml": submitted, "code_artifact_metadata": metadata},
-            ctx,
-            allow_static_output_uncertainty=True,
-            formation_prepared=True,
-        )
-
-        assert result["ok"] is False
-        assert envelope.call_count == 1
-        assert scaffold.call_count == 1
-        artifact = workflow_update_module._metadata_item_for_block_label(
-            ctx.raw_code_artifact_metadata, "directory_flow"
-        )
-        assert artifact is not None
-        assert not workflow_update_module._artifact_declares_goal_values(artifact)
 
     @pytest.mark.asyncio
     async def test_metadata_selected_page_goto_extra_is_discarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -12498,41 +9145,6 @@ class TestWholeTrajectoryImposition:
         assert f"return {label}_output" in code
         assert all(label + "_output" not in str(block.get("code") or "") for block in code_blocks[:-1])
 
-    @pytest.mark.asyncio
-    async def test_invalid_selected_extraction_suffix_keeps_goal_path_rejection(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _quote_ctx()
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-        submitted_code = textwrap.dedent(synthesized.code).rstrip() + "\nheading = 'Review'\n"
-        submitted = _yaml(
-            f"""
-            title: Quote
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
-                code: |
-{textwrap.indent(submitted_code, " " * 18)}
-            """
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted,
-                "code_artifact_metadata": [
-                    _terminal_metadata(workflow_update_module._SYNTHESIZED_BLOCK_LABEL, "quote result")
-                ],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is False
-        assert "does not return a keyed structure" in result["error"]
-        assert "records" in result["error"]
-
     def test_rejects_selected_extraction_suffix_page_mutation(self) -> None:
         ctx = _quote_ctx()
         synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
@@ -12556,36 +9168,6 @@ class TestWholeTrajectoryImposition:
             "extraction suffix contains unscouted browser action" in violation for violation in result.violations
         )
         assert result.substitutions is None
-
-    @pytest.mark.asyncio
-    async def test_sibling_invalid_goal_paths_still_reject(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _quote_ctx()
-        submitted = _yaml(
-            f"""
-            title: Quote
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
-                code: |
-                  await page.locator("#zip").fill(str(zip_code))
-                  await page.locator("#continue").click()
-              - block_type: code
-                label: summarize_quote
-                code: |
-                  return await page.locator("h1").inner_text()
-            """
-        )
-
-        result = await _update_workflow(
-            {"workflow_yaml": submitted, "code_artifact_metadata": [_terminal_metadata("summarize_quote", "summary")]},
-            ctx,
-        )
-
-        assert result["ok"] is False
-        assert "summarize_quote" in result["error"]
-        assert "flat text blob" in result["error"]
 
     @pytest.mark.asyncio
     async def test_p10_shaped_stale_metadata_imposes_scout_spine(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -13023,6 +9605,8 @@ def _auto_act_scout_ctx() -> AgentContext:
     ctx.browser_session_id = None
     ctx.scouted_interactions = []
     ctx.scout_trajectory = []
+    ctx.scout_observed_terminal_criterion_ids = set()
+    ctx.completion_criteria_turn_state = None
     ctx.discovery_mcp_server = _AutoActClickServer()
     return ctx
 
@@ -13054,23 +9638,206 @@ def _declaration_stamp_ctx() -> CopilotContext:
     return ctx
 
 
-class TestDeclarationContractStamp:
-    def test_zero_output_block_persists_declared_blocker_on_first_contact(self) -> None:
-        ctx = _declaration_stamp_ctx()
-        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")')
+def _degraded_declaration_stamp_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.turn_id = "t-degraded-decl"
+    ctx.scout_trajectory = []
+    requested_paths = (
+        "output.confirmation_number",
+        "output.account_number",
+        "output.start_date",
+        "output.deposit_amount",
+        "output.next_owner",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            *[
+                CompletionCriterion(
+                    id=f"slot_{index}",
+                    outcome=f"The returned record includes {path}.",
+                    request_slot_id=f"slot_{index}",
+                    pinability="unpinnable",
+                    mint_disposition="degraded",
+                    mint_degrade="undecidable_judgment",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=path,
+                )
+                for index, path in enumerate(requested_paths)
+            ],
+            CompletionCriterion(
+                id="c_blocker",
+                outcome="A blocker is reported when the site blocks submission.",
+                contingent_on="the site blocks submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+    return ctx
 
-        new_yaml, _metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
-            ctx, workflow_yaml, []
+
+class TestDeclarationContractStamp:
+    @pytest.mark.parametrize("empty_value", ["None", "''", "'   '", "[]", "{}", "[None]", "[{}]", "{'a': None}"])
+    def test_static_empty_observation_value_is_non_run_eligible(self, empty_value: str) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(f'return {{"output": {{"record_id": {empty_value}, "blocker": None}}}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
         )
 
+        assert evaluation is not None
+        assert evaluation.missing_metadata_paths == []
+        assert evaluation.missing_schema_paths == []
+        assert evaluation.missing_return_paths == []
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+
+    @pytest.mark.parametrize("value", ["0", "False", "'record-123'", "[None, 'x']", "{'a': 'x'}"])
+    def test_static_value_bearing_observation_remains_run_eligible(self, value: str) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(f'return {{"output": {{"record_id": {value}, "blocker": None}}}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+        )
+
+        assert evaluation is not None
+        assert evaluation.has_deficiencies is False
+
+    def test_full_metadata_advisory_rejects_declaration_only_return(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        required_paths = {"output.record_id", "output.blocker"}
+        signature = workflow_update_module._stable_output_contract_key(
+            workflow_update_module._output_contract_scope_key(ctx), required_paths
+        )
+        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
+        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")\nreturn {"output": {"blocker": None}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
+        )
+
+        assert evaluation is not None
+        assert evaluation.missing_metadata_paths == []
+        assert evaluation.missing_schema_paths == []
+        assert evaluation.missing_return_paths == ["output.record_id"]
+        assert evaluation.payload["static_return_advisory_paths"] == []
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+
+    def test_degraded_requested_slots_make_declaration_only_contract_non_run_eligible(self) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+
+        formed_yaml, metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            formed_yaml,
+            metadata,
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
+        )
+
+        assert applied is False
+        assert formed_yaml == workflow_yaml
+        assert evaluation is not None
+        signature = evaluation.canonical_signature
+        assert ctx.output_contract_armed_directive_fingerprint_by_signature.get(signature) == (
+            workflow_update_module._VALUE_BEARING_PREARM_FINGERPRINT_PREFIX
+            + workflow_update_module._output_contract_structural_fingerprint(workflow_yaml, signature)
+        )
+        assert evaluation.payload["contract_liveness"] == "degraded_empty"
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+        assert "canonical_evaluation_paths" not in evaluation.payload
+        assert [row["request_slot_id"] for row in evaluation.payload["degraded_request_slots"]] == [
+            "slot_0",
+            "slot_1",
+            "slot_2",
+            "slot_3",
+            "slot_4",
+        ]
+        assert [row["floor_rekeyed_from_path"] for row in evaluation.payload["degraded_request_slots"]] == [
+            "output.confirmation_number",
+            "output.account_number",
+            "output.start_date",
+            "output.deposit_amount",
+            "output.next_owner",
+        ]
+
+    def test_degraded_declaration_only_directive_arm_is_idempotent(self) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+
+        first_yaml, _, first_applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        second_yaml, _, second_applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, first_yaml, []
+        )
+
+        assert first_applied is False
+        assert second_applied is False
+        assert first_yaml == workflow_yaml
+        assert second_yaml == workflow_yaml
+        assert len(ctx.output_contract_armed_directive_fingerprint_by_signature) == 1
+
+    def test_mixed_value_and_declaration_return_remains_valid(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(
+            'record_id = await page.locator("#record-id").text_content()\nreturn {"output": {"record_id": record_id}}'
+        )
+
+        formed_yaml, metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, formed_yaml, metadata)
+
         assert applied is True
-        code = str(workflow_blocks(parse_workflow_yaml(new_yaml))[0].get("code") or "")
-        produced = workflow_update_module._code_block_produced_output_paths(code)
-        assert "output.blocker" in produced  # nosemgrep: incomplete-url-substring-sanitization
-        assert "output.record_id" not in produced
+        assert evaluation is not None
+        assert evaluation.has_deficiencies is False
+        code = str(workflow_blocks(parse_workflow_yaml(formed_yaml))[0].get("code") or "")
+        assert '"record_id": record_id' in code
         assert '"blocker": None' in code
 
-    def test_stamp_applies_before_output_contract_actuation(self) -> None:
+    def test_formation_does_not_create_declaration_only_scaffold(self) -> None:
         ctx = _declaration_stamp_ctx()
         workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")\nreturn {}')
 
@@ -13079,8 +9846,12 @@ class TestDeclarationContractStamp:
         )
 
         assert applied is True
+        assert new_yaml == workflow_yaml
         code = str(workflow_blocks(parse_workflow_yaml(new_yaml))[0].get("code") or "")
-        assert 'return {"output": {"blocker": None}}' in code
+        assert "blocker" not in code
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, new_yaml, _metadata)
+        assert evaluation is not None
+        assert evaluation.can_attempt_run is False
 
     def test_stamp_is_idempotent_across_calls(self) -> None:
         ctx = _declaration_stamp_ctx()
@@ -13117,6 +9888,221 @@ class TestDeclarationContractStamp:
 
         assert applied is False
         assert new_yaml == workflow_yaml
+
+    def test_stamp_refused_for_statically_empty_observation_code(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"record_id": None}}')
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        stamped_yaml, applied = workflow_update_module._stamp_declaration_contract_defaults(
+            ctx, workflow_yaml, [], contract, "sig-declaration-stamp"
+        )
+
+        assert applied is False
+        assert stamped_yaml == workflow_yaml
+
+    def test_stamp_applies_for_runtime_populated_observation_code(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(
+            'record_id = await page.inner_text("#record")\nreturn {"output": {"record_id": record_id}}'
+        )
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        stamped_yaml, applied = workflow_update_module._stamp_declaration_contract_defaults(
+            ctx, workflow_yaml, [], contract, "sig-declaration-stamp"
+        )
+
+        assert applied is True
+        code = str(workflow_blocks(parse_workflow_yaml(stamped_yaml))[0].get("code") or "")
+        assert '"blocker": None' in code
+
+
+def test_static_return_synthesis_refuses_statically_none_observation_local() -> None:
+    code = "record_id = None"
+
+    keyed, violations = workflow_update_module._extraction_code_with_value_bearing_static_return(
+        code, required_paths={"output.record_id"}, declaration_paths={"output.blocker"}
+    )
+
+    assert violations
+    assert keyed == code
+
+
+def test_static_return_synthesis_accepts_runtime_populated_observation_local() -> None:
+    code = 'record_id = await page.inner_text("#record")'
+
+    keyed, violations = workflow_update_module._extraction_code_with_value_bearing_static_return(
+        code, required_paths={"output.record_id"}, declaration_paths={"output.blocker"}
+    )
+
+    assert violations == []
+    assert {"output.record_id", "output.blocker"} <= workflow_update_module._code_block_produced_output_paths(keyed)
+
+
+def test_static_return_synthesis_refuses_covered_statically_empty_return() -> None:
+    code = 'return {"output": {"record_id": None, "blocker": None}}'
+
+    _, violations = workflow_update_module._extraction_code_with_value_bearing_static_return(
+        code, required_paths={"output.record_id"}, declaration_paths={"output.blocker"}
+    )
+
+    assert violations
+
+
+def test_value_bearing_lattice_unpack_after_empty_literal_is_fail_open() -> None:
+    code = 'extra = await collect()\nreturn {"output": {"record_id": None, **extra}}'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+
+
+def test_value_bearing_lattice_top_level_unpack_after_output_key_is_fail_open() -> None:
+    code = 'extra = await collect()\nreturn {"output": {"record_id": None}, **extra}'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+
+
+def test_value_bearing_lattice_empty_literal_after_unpack_stays_refused() -> None:
+    code = 'extra = await collect()\nreturn {"output": {**extra, "record_id": None}}'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is True
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ('runtime_value = await collect()\nreturn {"output": runtime_value}', "proven"),
+        (
+            'runtime_value = await collect()\npayload = {"output": runtime_value}\nalias = payload\nreturn alias',
+            "proven",
+        ),
+        ("runtime_value = await collect()\nreturn runtime_value", "unknown"),
+        ('runtime_value = await collect()\nreturn {"request_id": runtime_value}', "absent"),
+        ('runtime_value = await collect()\nreturn {"output.request_id": runtime_value}', "absent"),
+        ('runtime_value = await collect()\noutput_key = "output"\nreturn {output_key: runtime_value}', "unknown"),
+        (
+            'runtime_value = await collect()\nextra = await collect_extra()\nreturn {"output": runtime_value, **extra}',
+            "unknown",
+        ),
+        (
+            'if should_return_output:\n    return {"output": runtime_value}\nreturn {"request_id": runtime_value}',
+            "absent",
+        ),
+        ('return payload\npayload = {"output": runtime_value}', "unknown"),
+        ("await page.click('#submit')", "absent"),
+    ],
+)
+def test_root_output_envelope_state_requires_literal_root_on_every_return(code: str, expected: str) -> None:
+    assert workflow_update_module._root_output_envelope_state(code) == expected
+
+
+def _saved_code_workflow(
+    code: str, label: str = "finalize_service", extra: dict[str, str] | None = None
+) -> SimpleNamespace:
+    blocks = [{"label": label, "block_type": "code", "code": code}]
+    blocks.extend(
+        {"label": extra_label, "block_type": "code", "code": extra_code}
+        for extra_label, extra_code in (extra or {}).items()
+    )
+    labels = {str(block["label"]) for block in blocks}
+    return SimpleNamespace(
+        workflow_id="w",
+        workflow_definition={"parameters": [], "blocks": blocks},
+        get_output_parameter=lambda requested: SimpleNamespace(label=requested) if requested in labels else None,
+    )
+
+
+class TestValueBearingDispatchPreflight:
+    @staticmethod
+    def _guarded_app(monkeypatch: pytest.MonkeyPatch, *, organization: None | EllipsisType = ...) -> AsyncMock:
+        if organization is ...:
+            get_organization = AsyncMock(side_effect=AssertionError("org lookup called"))
+        else:
+            get_organization = AsyncMock(return_value=organization)
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "DATABASE",
+            SimpleNamespace(organizations=SimpleNamespace(get_organization=get_organization)),
+        )
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow),
+        )
+        return prepare_workflow
+
+    @pytest.mark.asyncio
+    async def test_dispatch_of_mixed_contract_workflow_passes_preflight(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'record_id = await page.locator("#record-id").text_content()\n'
+            'return {"output": {"record_id": record_id, "blocker": None}}'
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_without_output_contract_passes_preflight_for_value_bearing_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'record_id = await page.locator("#record-id").text_content()\nreturn {"output": {"record_id": record_id}}'
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_owner_excluded_subset_run_dispatches_when_saved_workflow_bears_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'return {"logged_in": True}',
+            label="login",
+            extra={
+                "extract_record": (
+                    'record_id = await page.locator("#record-id").text_content()\n'
+                    'return {"output": {"record_id": record_id, "blocker": None}}'
+                )
+            },
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_solo_empty_setup_block_dispatches_in_value_bearing_workflow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+        ctx.staged_workflow = _saved_code_workflow(
+            "return {}",
+            label="setup",
+            extra={"extract_record": 'value = await fetch()\nreturn {"output": {"record_id": value}}'},
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["setup"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
 
 
 def _gate_blocks(sibling_code: str) -> list[dict[str, object]]:
@@ -13632,29 +10618,6 @@ class TestScoutedSpineUnderBuild:
         assert result.violations == []
         assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
 
-    @pytest.mark.asyncio
-    async def test_under_build_rejects_climb_churn_counter_to_stop(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            workflow_update_module, "synthesize_code_block", lambda *a, **k: _drifted_spine_synthesized()
-        )
-        ctx = _quote_ctx()
-        workflow_yaml = _under_build_draft_yaml()
-
-        for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1):
-            result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
-            assert result["ok"] is False
-            assert "scouted_spine_under_build" in result["error"]
-            assert ctx.code_authoring_guardrail_reject_count == index + 1
-        assert ctx.blocker_signal is None
-
-        final = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
-
-        assert final["ok"] is False
-        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-        held = ctx.blocker_signal
-        assert isinstance(held, CopilotToolBlockerSignal)
-        assert held.internal_reason_code == "code_authoring_guardrail_churn"
-
 
 def _records_spine_ctx() -> CopilotContext:
     ctx = _code_only_ctx()
@@ -13752,99 +10715,6 @@ def _credential_spine_block_yaml(synthesized: SynthesizedCodeBlock) -> str:
 
 
 class TestScoutedSpinePersistSeamCoverage:
-    @pytest.mark.asyncio
-    async def test_early_partial_persist_then_stub_resubmission_rejected_and_turn_end_fires(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _records_spine_ctx()
-        full_trajectory = list(ctx.scout_trajectory)
-        ctx.scout_trajectory = full_trajectory[:2]
-        partial_synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert partial_synthesized is not None
-
-        persisted = await _update_workflow({"workflow_yaml": _records_block_yaml(partial_synthesized.code)}, ctx)
-
-        assert persisted["ok"] is True
-        assert ctx.persisted_draft_browser_calls is not None
-        assert [pair for pair in ctx.persisted_draft_browser_calls if pair[0] == "click"] == [
-            ("click", "page.locator('#stage-a')"),
-            ("click", "page.locator('#stage-b')"),
-        ]
-
-        ctx.scout_trajectory = full_trajectory
-
-        with capture_logs() as logs:
-            rejected = await _update_workflow({"workflow_yaml": _records_block_yaml(partial_synthesized.code)}, ctx)
-
-        assert rejected["ok"] is False
-        assert "scouted_spine_under_build" in rejected["error"]
-        assert 'await page.locator("#stage-c").click()' in rejected["error"]
-        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
-
-        with capture_logs() as logs:
-            nudge = enforcement_module._scouted_spine_turn_end_nudge(ctx)
-
-        assert nudge is not None
-        assert "scouted_spine_under_build" in nudge
-        assert 'await page.locator("#stage-c").click()' in nudge
-        turn_end_events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert len(turn_end_events) == 1
-        assert turn_end_events[0]["site"] == "turn_end"
-
-    @pytest.mark.asyncio
-    async def test_post_update_skip_path_persist_under_coverage_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _records_spine_ctx()
-        ctx.update_workflow_called = True
-
-        with capture_logs() as logs:
-            result = await _update_workflow(
-                {"workflow_yaml": _records_block_yaml('await page.locator("#stage-a").click()')}, ctx
-            )
-
-        assert result["ok"] is False
-        assert "scouted_spine_under_build" in result["error"]
-        assert 'await page.locator("#stage-b").click()' in result["error"]
-        assert 'await page.locator("#stage-c").click()' in result["error"]
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert [log for log in logs if log["event"] == "copilot_imposition_skipped_after_update"]
-        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
-
-    @pytest.mark.asyncio
-    async def test_second_persist_dropping_all_code_blocks_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _checkpoint_eligible_ctx()
-        no_code_yaml = _yaml(
-            """
-            title: Records
-            workflow_definition:
-              blocks:
-              - block_type: send_email
-                label: notify
-                recipients:
-                - ops@example.com
-                subject: Records ready
-                body: Records run finished
-            """
-        )
-
-        with capture_logs() as logs:
-            result = await _update_workflow({"workflow_yaml": no_code_yaml}, ctx)
-
-        assert result["ok"] is False
-        assert "scouted_spine_under_build" in result["error"]
-        assert 'await page.locator("#stage-a").click()' in result["error"]
-        assert 'await page.locator("#stage-c").click()' in result["error"]
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
-
     def test_separated_split_branch_under_coverage_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         diagnostics = _spine_emission_diagnostics()
         diagnostics.emitted_interactions.append(
@@ -13900,61 +10770,6 @@ class TestScoutedSpinePersistSeamCoverage:
             ("click", "page.locator('#stage-c')"),
         ]
         assert enforcement_module._scouted_spine_turn_end_nudge(ctx) is None
-
-    @pytest.mark.asyncio
-    async def test_composite_route_resubmission_passes_credential_gate_and_persists(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _stub_successful_update(monkeypatch)
-        monkeypatch.setattr(
-            workflow_update_module, "_credential_reference_validation_error", AsyncMock(return_value=None)
-        )
-        ctx = _credential_spine_ctx()
-
-        with capture_logs() as logs:
-            rejected = await _update_workflow(
-                {"workflow_yaml": _records_block_yaml('await page.locator("#stage-a").click()')}, ctx
-            )
-
-        assert rejected["ok"] is False
-        assert "scouted_spine_under_build" in rejected["error"]
-        assert "fill_credential_field" in rejected["error"]
-        assert "click the submit control or press Enter" in rejected["error"]
-        assert "Missing rung source to reuse verbatim" in rejected["error"]
-        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert len(events) == 1
-        assert events[0]["site"] == "persist_seam"
-        assert events[0]["credential_scout_precondition_pending"] is True
-
-        ctx.scout_trajectory.append(_submit_interaction(source_url="https://example.com/records"))
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-
-        with capture_logs() as logs:
-            accepted = await _update_workflow({"workflow_yaml": _credential_spine_block_yaml(synthesized)}, ctx)
-
-        assert accepted["ok"] is True
-        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert enforcement_module._scouted_spine_turn_end_nudge(ctx) is None
-
-    @pytest.mark.asyncio
-    async def test_satisfied_credential_precondition_keeps_single_step_route(self) -> None:
-        ctx = _credential_spine_ctx()
-        ctx.scout_trajectory.append(_submit_interaction(source_url="https://example.com/records"))
-        ctx.synthesized_goal_complete_landed = True
-
-        with capture_logs() as logs:
-            rejected = await _update_workflow(
-                {"workflow_yaml": _records_block_yaml('await page.locator("#stage-a").click()')}, ctx
-            )
-
-        assert rejected["ok"] is False
-        assert "scouted_spine_under_build" in rejected["error"]
-        assert "fill_credential_field" not in rejected["error"]
-        assert "Missing rung source to reuse verbatim" in rejected["error"]
-        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert len(events) == 1
-        assert events[0]["credential_scout_precondition_pending"] is False
 
     @pytest.mark.asyncio
     async def test_credential_scout_reject_carries_open_obligation_artifact(self) -> None:
@@ -14145,35 +10960,6 @@ class TestFinalYamlStructuralGate:
         assert violation is not None
         assert "missing" in violation
 
-    def test_final_yaml_structural_gate_is_scoped_to_code_authoring(self) -> None:
-        ctx = _records_spine_ctx()
-        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
-        dangling_yaml = _yaml(
-            """
-            title: Records
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: a
-                next_block_label: missing
-              - block_type: code
-                label: b
-            """
-        )
-        assert (
-            workflow_update_module._final_yaml_structural_violations(
-                ctx,
-                dangling_yaml,
-                minted_parameter_keys=[],
-                promoted_parameter_keys=[],
-                carried_by_imposition=False,
-            )
-            == []
-        )
-        assert (
-            workflow_update_module._dangling_next_block_label_violation(parse_workflow_yaml(dangling_yaml)) is not None
-        )
-
     def test_resolved_next_block_label_passes(self) -> None:
         parsed = {
             "workflow_definition": {
@@ -14185,90 +10971,6 @@ class TestFinalYamlStructuralGate:
         }
         assert workflow_update_module._dangling_next_block_label_violation(parsed) is None
 
-    def test_orphan_minted_parameter_is_flagged_and_referenced_is_not(self) -> None:
-        parsed = {
-            "workflow_definition": {
-                "blocks": [
-                    {"block_type": "code", "label": "a", "code": "await page.locator('#x').fill(str(used_key))"},
-                ]
-            }
-        }
-        violation = workflow_update_module._orphan_minted_parameter_violation(parsed, ["used_key", "orphan_key"])
-        assert violation is not None
-        assert "orphan_key" in violation
-        assert "used_key" not in violation
-
-    def test_preexisting_authored_param_outside_manifest_is_untouched(self) -> None:
-        parsed = {
-            "workflow_definition": {
-                "blocks": [
-                    {"block_type": "code", "label": "a", "code": "await page.locator('#x').click()"},
-                ],
-                "parameters": [{"key": "unused_authored_input", "parameter_type": "workflow"}],
-            }
-        }
-        assert workflow_update_module._orphan_minted_parameter_violation(parsed, []) is None
-
-    def test_scaffolding_only_body_flagged_only_when_carried_by_imposition(self) -> None:
-        ctx = _records_spine_ctx()
-        scaffolding_yaml = _records_block_yaml("await page.goto('https://example.com/records')")
-        carried = workflow_update_module._final_yaml_structural_violations(
-            ctx,
-            scaffolding_yaml,
-            minted_parameter_keys=[],
-            promoted_parameter_keys=[],
-            carried_by_imposition=True,
-        )
-        assert any("no load-bearing" in violation for violation in carried)
-        not_carried = workflow_update_module._final_yaml_structural_violations(
-            ctx,
-            scaffolding_yaml,
-            minted_parameter_keys=[],
-            promoted_parameter_keys=[],
-            carried_by_imposition=False,
-        )
-        assert not any("no load-bearing" in violation for violation in not_carried)
-
-    def test_load_bearing_body_passes_the_gate(self) -> None:
-        ctx = _records_spine_ctx()
-        real_yaml = _records_block_yaml("await page.locator('#stage-a').click()")
-        assert (
-            workflow_update_module._final_yaml_structural_violations(
-                ctx,
-                real_yaml,
-                minted_parameter_keys=[],
-                promoted_parameter_keys=[],
-                carried_by_imposition=True,
-            )
-            == []
-        )
-
-    def test_stub_reproducing_raw_prompt_is_flagged(self) -> None:
-        ctx = _records_spine_ctx()
-        ctx.turn_context_packet = SimpleNamespace(
-            transcript_context=SimpleNamespace(earliest_user_turn="Log me in and stop")
-        )
-        stub_yaml = _yaml(
-            """
-            title: Records
-            workflow_definition:
-              blocks:
-              - block_type: code
-                label: search_registry
-                description: Log me in and stop
-                code: |
-                  await page.goto("https://example.com/records")
-            """
-        )
-        violations = workflow_update_module._final_yaml_structural_violations(
-            ctx,
-            stub_yaml,
-            minted_parameter_keys=[],
-            promoted_parameter_keys=[],
-            carried_by_imposition=True,
-        )
-        assert any("raw user request" in violation for violation in violations)
-
 
 def _full_coverage_calls() -> list[tuple[str, str]]:
     return [
@@ -14279,13 +10981,13 @@ def _full_coverage_calls() -> list[tuple[str, str]]:
 
 
 class TestScoutedSpineTurnHaltExit:
-    def test_repair_ceiling_halt_with_open_obligation_emits_unresolved_and_reframes_reply(self) -> None:
+    def test_terminal_halt_with_open_obligation_emits_unresolved_and_reframes_reply(self) -> None:
         ctx = _checkpoint_eligible_ctx()
         ctx.last_test_anti_bot = "challenge_detected"
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
         assert "verification challenge" in signal.user_facing_reason
         ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED, blocker_signal=signal)
+        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
 
         with capture_logs() as logs:
             result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
@@ -14327,9 +11029,9 @@ class TestScoutedSpineTurnHaltExit:
     def test_halt_without_open_obligation_emits_nothing_and_keeps_reply(self) -> None:
         ctx = _checkpoint_eligible_ctx()
         ctx.persisted_draft_browser_calls = _full_coverage_calls()
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
         ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED, blocker_signal=signal)
+        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
 
         with capture_logs() as logs:
             result = agent_module._build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
@@ -14338,10 +11040,10 @@ class TestScoutedSpineTurnHaltExit:
         assert result.user_response == signal.user_facing_reason
 
     @pytest.mark.asyncio
-    async def test_wrapped_exception_exit_with_stashed_repair_ceiling_halt_emits_unresolved(self) -> None:
+    async def test_wrapped_exception_exit_with_stashed_terminal_halt_emits_unresolved(self) -> None:
         ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
-        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
         ctx.blocker_signal = signal
 
         with capture_logs() as logs:
@@ -14360,9 +11062,9 @@ class TestScoutedSpineTurnHaltExit:
 
     def test_obligation_check_failure_never_blocks_the_halt_reply(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = _checkpoint_eligible_ctx()
-        signal = enforcement_module.repair_ceiling_stop_signal(ctx, None)
+        signal = enforcement_module.code_authoring_churn_stop_signal(ctx)
         ctx.blocker_signal = signal
-        halt = TurnHalt(kind=TurnHaltKind.REPAIR_CEILING_REACHED, blocker_signal=signal)
+        halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
 
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("synthesis unavailable")
@@ -14564,6 +11266,269 @@ class TestCredentialScoutGatePredicateCoherence:
         errors = workflow_update_module._credentialed_code_block_scout_gate_errors(self._TWO_FIELD_LOGIN_YAML, ctx)
         assert errors
         assert "password" in errors[0]
+
+
+class TestTerminalActionScoutGate:
+    _BUSINESS_URL = "https://portal.example.test/business/start-service"
+
+    @staticmethod
+    def _terminal_action_criterion(*, method_mandated: bool = False) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="start_service_request",
+            outcome="the business start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+            method_mandated=method_mandated,
+        )
+
+    def _login_prefix_ctx(self, *criteria: CompletionCriterion) -> CopilotContext:
+        helper = TestCredentialScoutGapMatcher
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._click(helper._PAGE_ONE),
+            helper._fill("cred_1", "password", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username", "password"})}
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        return ctx
+
+    def _business_spine(self) -> list[dict[str, object]]:
+        return [
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "textbox",
+                "accessible_name": "Service Address",
+                "trajectory_index": 4,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#find-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "button",
+                "accessible_name": "Find Address",
+                "trajectory_index": 5,
+            },
+        ]
+
+    def test_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_login_is_the_whole_goal_stays_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx()
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_method_mandated_terminal_action_criterion_does_not_gate(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion(method_mandated=True))
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_observed_terminal_action_does_not_bypass_post_credential_floor(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_observed_terminal_criterion_ids = {"start_service_request"}
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_post_credential_business_spine_records_terminal_action_observation(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + self._business_spine()
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_login_open_then_submit_reaches_terminal_action(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 4},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 5},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_login_three_click_business_spine_reaches_terminal_action(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            {"tool_name": "click", "selector": "#open-item", "trajectory_index": 4},
+            {"tool_name": "click", "selector": "#add-to-cart", "trajectory_index": 5},
+            {"tool_name": "click", "selector": "#place-order", "trajectory_index": 6},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_post_login_non_committing_click_sequence_stays_gated(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            {"tool_name": "click", "selector": "button", "role": "button", "trajectory_index": 4},
+            {"tool_name": "click", "selector": "button", "role": "button", "trajectory_index": 5},
+            {"tool_name": "click", "selector": "button", "role": "button", "trajectory_index": 6},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+
+    def test_sourceless_enter_login_submit_establishes_business_boundary(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "Enter", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 3},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_sourceless_non_enter_key_does_not_establish_login_boundary(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "Tab", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 3},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+
+    def test_post_login_boundary_ignores_divergent_sourced_click(self) -> None:
+        login_url = "https://portal.example.test/login"
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "source_url": login_url,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "accessible_name": "Learn more",
+                "source_url": "https://portal.example.test/help",
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "button[type='submit']",
+                "source_url": login_url,
+                "trajectory_index": 2,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#open-request",
+                "source_url": self._BUSINESS_URL,
+                "trajectory_index": 3,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#submit-request",
+                "source_url": self._BUSINESS_URL,
+                "trajectory_index": 4,
+            },
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_sourceless_divergent_click_uses_stable_login_submit_identity(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#login-help",
+                "accessible_name": "Trouble signing in?",
+                "trajectory_index": 1,
+            },
+            {"tool_name": "click", "accessible_name": "Sign in", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 4},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_mixed_fill_sources_use_latest_sourceless_login_identity(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._fill("cred_1", "password", ""),
+            {"tool_name": "click", "accessible_name": "Sign in", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 4},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_sourceless_login_submit_without_stable_identity_fails_closed(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "click", "accessible_name": "Help", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 4},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+
+    def test_login_only_trajectory_records_no_terminal_action_observation(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+
+    def test_mfa_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            helper._fill("cred_1", "totp", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {
+            "cred_1": frozenset({"username", "password", "totp"})
+        }
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
 
 
 class TestCredentialScoutReopenSeam:
@@ -15026,7 +11991,7 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         remaining = [block.get("label") for block in parsed["workflow_definition"]["blocks"]]
         assert "orphan_rung" not in remaining
 
-    def test_admitted_imposition_is_not_answered_by_the_persist_seam_guard(self) -> None:
+    def test_admitted_imposition_passes_the_pre_persist_gate(self) -> None:
         ctx = _quote_ctx()
         ctx.update_workflow_called = True
         ctx.synthesized_goal_complete_landed = True
@@ -15045,10 +12010,10 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert result.violations == []
         assert result.substitutions is not None
         assert ctx.spine_imposition_owned_attempt is True
-        assert workflow_update_module._persist_seam_spine_under_build_result(result.workflow_yaml, ctx) is None
+        assert workflow_update_module._pre_persist_scouted_spine_result(result.workflow_yaml, ctx) is None
         assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
 
-    def test_persist_seam_guard_still_fires_when_imposition_is_not_admitted(self) -> None:
+    def test_pre_persist_gate_still_fires_when_imposition_is_not_admitted(self) -> None:
         ctx = _records_spine_ctx()
         ctx.update_workflow_called = True
         under_built = _records_block_yaml('await page.locator("#stage-a").click()')
@@ -15059,12 +12024,12 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert imposition.substitutions is None
 
         with capture_logs() as logs:
-            guarded = workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx)
+            guarded = workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx)
 
         assert guarded is not None
         assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
-        assert events and events[0]["site"] == "persist_seam"
+        assert events and events[0]["site"] == "pre_persist"
 
     def test_ungrounded_sibling_mixing_ambiguous_and_concrete_calls_is_replaced_by_the_spine(self) -> None:
         ctx = _quote_ctx()
@@ -15246,7 +12211,7 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert ctx.spine_imposition_owned_attempt is True
         code = str(_single_code_block(parse_workflow_yaml(imposition.workflow_yaml))["code"])
         assert 'page.locator("#stage-b").click()' in code
-        assert workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx) is None
+        assert workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx) is None
 
 
 def _reaching_extraction_ctx() -> CopilotContext:
@@ -15259,6 +12224,175 @@ def _reaching_extraction_ctx() -> CopilotContext:
         already_registered=False,
     )
     return ctx
+
+
+def _commit_only_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    criteria = tuple(
+        CompletionCriterion(
+            id=field,
+            outcome=field.replace("_", " "),
+            output_path=f"output.{field}",
+        )
+        for field in (
+            "confirmation_number",
+            "account_number",
+            "selected_start_date",
+            "deposit_amount",
+            "next_owner",
+        )
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria))
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=criteria))
+    ctx.flow_evidence = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": 'button[data-action="openForm"]',
+            "source_url": "https://example.test/start-service",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": 'button[data-action="commitForm"]',
+            "source_url": "https://example.test/start-service",
+            "trajectory_index": 1,
+        },
+    ]
+    return ctx
+
+
+def _commit_only_submitted_yaml() -> str:
+    return _yaml(
+        """
+        title: Start service
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: start_service
+            code: |
+              await page.locator('button[data-action="openForm"]').click()
+        """
+    )
+
+
+class TestCommitOnlyReach:
+    def test_commit_only_two_click_trajectory_reaches_without_output_binding(self) -> None:
+        ctx = _commit_only_ctx()
+
+        assert enforcement_module.requested_output_extraction_plan(ctx) is None
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    @pytest.mark.parametrize(
+        "trajectory",
+        [
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="commitForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 0,
+                }
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="openForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 0,
+                },
+                {
+                    "tool_name": "click",
+                    "selector": "button",
+                    "role": "button",
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 1,
+                },
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="openForm"]',
+                    "source_url": "https://example.test/start-service",
+                },
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="commitForm"]',
+                    "source_url": "https://example.test/start-service",
+                },
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="openForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 2,
+                },
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="commitForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 1,
+                },
+            ],
+            [
+                {
+                    "tool_name": "navigate",
+                    "url": "https://example.test/start-service",
+                    "source_url": "https://example.test",
+                    "trajectory_index": 0,
+                }
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="loginForm"]',
+                    "source_url": "https://example.test/login",
+                    "trajectory_index": 0,
+                },
+                {
+                    "tool_name": "fill_credential_field",
+                    "selector": "#username",
+                    "source_url": "https://example.test/login",
+                    "credential_id": "cred_1",
+                    "credential_field": "username",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "click",
+                    "selector": "button",
+                    "role": "button",
+                    "source_url": "https://example.test/login",
+                    "trajectory_index": 2,
+                },
+            ],
+        ],
+    )
+    def test_commit_only_exclusions_do_not_reach(self, trajectory: list[dict[str, object]]) -> None:
+        ctx = _commit_only_ctx()
+        ctx.scout_trajectory = trajectory
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+
+    def test_commit_only_imposition_uses_goal_reaching_admission(self) -> None:
+        ctx = _commit_only_ctx()
+        ctx.update_workflow_called = True
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(_commit_only_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions
+        assert ctx.spine_imposition_owned_attempt is True
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "openForm" in code
+        assert "commitForm" in code
+        admitted = [entry for entry in logs if entry["event"] == "copilot_imposition_admitted_after_update"]
+        assert len(admitted) == 1
+        assert admitted[0]["admission_key"] == "goal_reaching_spine_unlanded"
+        assert admitted[0]["admission_key"] != "reopen_author_time_reject"
 
 
 class TestReachingTrajectoryOwnershipDeterminism:
@@ -15383,7 +12517,7 @@ class TestSequencedDownloadTerminalCoverage:
         later.update_workflow_called = True
 
         with capture_logs() as logs:
-            guarded = workflow_update_module._persist_seam_spine_under_build_result(imposed.workflow_yaml, later)
+            guarded = workflow_update_module._pre_persist_scouted_spine_result(imposed.workflow_yaml, later)
 
         assert guarded is None
         assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
@@ -15406,7 +12540,7 @@ class TestSequencedDownloadTerminalCoverage:
         assert imposition.substitutions is None
         assert ctx.spine_imposition_owned_attempt is False
 
-        guarded = workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx)
+        guarded = workflow_update_module._pre_persist_scouted_spine_result(imposition.workflow_yaml, ctx)
 
         assert guarded is not None
         assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
@@ -15489,8 +12623,6 @@ def test_producer_mixed_merged_single_return_passes_download_gate() -> None:
     assert envelope.code.count("return {") == 1
     assert '"downloaded_file_name": downloaded_file_name' in envelope.code
     assert workflow_update_module._code_uses_expect_download(envelope.code)
-    artifact = {"claimed_outcomes": [{"id": "claim", "goal_value_paths": ["output.downloaded_invoice_pdf"]}]}
-    assert workflow_update_module._download_return_shape_error("block", artifact, envelope.code) is None
     _, violations = workflow_update_module._extraction_code_with_required_static_return(
         envelope.code, required_paths={"output.statement_amount", "output.statement_date"}
     )
@@ -15978,6 +13110,1220 @@ def test_producer_preserves_the_models_download_descriptor_key() -> None:
     assert envelope.code.count("return {") == 1
     assert '"saved_as": dl_info.value.suggested_filename' in envelope.code
     assert "downloaded_file_name" not in envelope.code
-    artifact = {"claimed_outcomes": [{"id": "claim", "goal_value_paths": ["output.downloaded_invoice_pdf"]}]}
-    assert workflow_update_module._download_return_shape_error("block", artifact, envelope.code) is None
     assert {"output.statement_amount"} <= workflow_update_module._code_block_produced_output_paths(envelope.code)
+
+
+_WITNESS_SELECTOR = "a[href='/statements/100245_2026-05.pdf']"
+
+
+def _input_templated_provenance() -> dict[str, object]:
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": _WITNESS_SELECTOR},
+        {"account_number": "100245", "billing_period": "May 2026"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="selector", selector=_WITNESS_SELECTOR, role="", name="", holes=holes
+    )
+    return {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "selector",
+        "selector": _WITNESS_SELECTOR,
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+
+
+def test_input_templated_provenance_admitted() -> None:
+    assert workflow_update_module._locator_provenance_is_self_validating(_input_templated_provenance())
+
+
+def test_input_templated_accessible_name_shape_admitted() -> None:
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": "button", "accessible_name": "Download 100245", "role": "button"},
+        {"account_number": "100245"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="accessible_name", selector="", role="button", name="Download 100245", holes=holes
+    )
+    record = {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "accessible_name",
+        "role": "button",
+        "name": "Download 100245",
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+    assert workflow_update_module._locator_provenance_is_self_validating(record)
+
+
+def test_input_templated_provenance_rejects_tamper() -> None:
+    tampered_literal = _input_templated_provenance()
+    tampered_literal["emitted_literal"] = str(tampered_literal["emitted_literal"]).replace("account_number", "attacker")
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered_literal)
+
+    reordered = _input_templated_provenance()
+    reordered["holes"] = list(reversed(reordered["holes"]))  # type: ignore[arg-type]
+    assert not workflow_update_module._locator_provenance_is_self_validating(reordered)
+
+    missing_holes = _input_templated_provenance()
+    missing_holes["holes"] = []
+    assert not workflow_update_module._locator_provenance_is_self_validating(missing_holes)
+
+
+def test_input_templated_provenance_rejects_dropping_distinct_iso_projection() -> None:
+    selector = 'a[data-date="2026-05-01"][href="/statements/2026-05.pdf"]'
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": selector},
+        {"billing_start_date": "2026-05-01"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="selector", selector=selector, role="", name="", holes=holes
+    )
+    provenance = {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "selector",
+        "selector": selector,
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+    assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+
+    tampered = dict(provenance)
+    tampered["holes"] = [dict(holes[0])]
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+
+def test_dynamic_selection_row_input_templated_provenance_recomputes_and_rejects_capture_tamper() -> None:
+    selector = "div.statement-row >> nth=2"
+    row_evidence = {
+        "source_url": "https://example.com/statements",
+        "target_selector": selector,
+        "row_selector": "div.statement-row",
+        "row_text": "Statement May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+    }
+    row_evidence["evidence_fingerprint"] = code_block_synthesis_module.dynamic_row_evidence_fingerprint(**row_evidence)
+    interaction = {
+        "tool_name": "click",
+        "selector": selector,
+        "source_url": "https://example.com/statements",
+        "dynamic_row_evidence": row_evidence,
+    }
+    interaction["input_correspondences"] = workflow_update_module.input_correspondences_for_interaction(
+        interaction,
+        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
+    )
+    synthesized = code_block_synthesis_module.synthesize_code_block([interaction], strict_selectors=True)
+    assert synthesized is not None
+    provenance = next(
+        record for record in synthesized.diagnostics.locator_provenance if record.get("surface") == "row_text"
+    )
+    assert workflow_update_module._locator_provenance_is_self_validating(provenance)
+
+    tampered = dict(provenance)
+    tampered["row_text_match_count"] = 2
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+    tampered_period = json.loads(json.dumps(provenance))
+    tampered_period["period_matches"][0]["row_match_count"] = 2
+    tampered_period["evidence_fingerprint"] = code_block_synthesis_module.dynamic_row_evidence_fingerprint(
+        source_url=tampered_period["source_url"],
+        target_selector=tampered_period["target_selector"],
+        row_selector=tampered_period["row_selector"],
+        row_text=tampered_period["row_text"],
+        row_selector_count=tampered_period["row_selector_count"],
+        row_text_match_count=tampered_period["row_text_match_count"],
+        period_matches=tampered_period["period_matches"],
+        selected_index=tampered_period["selected_index"],
+    )
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered_period)
+
+
+def test_dynamic_selection_public_provenance_omits_page_text_query_and_credentials() -> None:
+    provenance = {
+        "trajectory_index": 2,
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "row_text",
+        "source_url": "https://user:password@example.com/statements?token=secret#private",
+        "target_selector": "div.row >> nth=2",
+        "row_selector": "div.row",
+        "row_text": "Customer Alice secret account text May 5, 2026",
+        "row_selector_count": 4,
+        "row_text_match_count": 1,
+        "period_matches": [
+            {"period": "2026-05", "selected_row_match_count": 1, "row_match_count": 1},
+        ],
+        "selected_index": 2,
+        "emitted_literal": "page.locator('div.row')",
+        "holes": [
+            {
+                "input_key": "download_start_date",
+                "matched_literal": "2026-05",
+                "parameter_value": "2026-05-01",
+                "transform": "iso_date_to_year_month",
+                "position": 35,
+            }
+        ],
+    }
+
+    public = workflow_update_module._public_locator_provenance([provenance])
+
+    serialized = json.dumps(public)
+    assert public == [
+        {
+            "trajectory_index": 2,
+            "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+            "surface": "row_text",
+            "source_origin": "https://example.com",
+            "input_keys": ["download_start_date"],
+            "transforms": ["iso_date_to_year_month"],
+        }
+    ]
+    for secret in ("Alice", "secret", "password", "token", "2026-05-01"):
+        assert secret not in serialized
+
+    tampered = dict(provenance)
+    tampered["source_url"] = "https://other.example.org/statements"
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered)
+
+
+def test_confluence_stamps_and_clears_input_correspondences() -> None:
+    ctx = _code_only_ctx()
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": _WITNESS_SELECTOR,
+            "source_url": "https://example.com/s",
+            "trajectory_index": 0,
+        }
+    ]
+    yaml_with_params = textwrap.dedent(
+        """
+        workflow_definition:
+          parameters:
+            - parameter_type: workflow
+              workflow_parameter_type: string
+              key: account_number
+              default_value: "100245"
+            - parameter_type: workflow
+              workflow_parameter_type: string
+              key: billing_period
+              default_value: "May 2026"
+          blocks: []
+        """
+    )
+    workflow_update_module._enrich_scout_trajectory_input_correspondences(yaml_with_params, ctx)
+    stamped = ctx.scout_trajectory[0].get("input_correspondences")
+    assert stamped is not None
+    assert {c["input_key"] for c in stamped} == {"account_number", "billing_period"}
+
+    yaml_without_params = "workflow_definition:\n  parameters: []\n  blocks: []\n"
+    workflow_update_module._enrich_scout_trajectory_input_correspondences(yaml_without_params, ctx)
+    assert "input_correspondences" not in ctx.scout_trajectory[0]
+
+
+def test_reconcile_scout_interaction_positional_map_skips_witness_rows() -> None:
+    scout_trajectory = [
+        {"tool_name": "type_text", "selector": "#account", "typed_length": 6},
+        {"tool_name": "type_text", "selector": "#period", "typed_length": 8},
+    ]
+    synthesized_parameters = [
+        {"key": "account_number", "default_value": "100245", "source": "locator_witness"},
+        {"key": "account_field"},
+        {"key": "period_field"},
+    ]
+    account = workflow_update_module._scout_interaction_for_synthesized_parameter(
+        synthesized_key="account_field",
+        scout_trajectory=scout_trajectory,
+        synthesized_parameters=synthesized_parameters,
+    )
+    period = workflow_update_module._scout_interaction_for_synthesized_parameter(
+        synthesized_key="period_field",
+        scout_trajectory=scout_trajectory,
+        synthesized_parameters=synthesized_parameters,
+    )
+    assert account is not None and account["selector"] == "#account"
+    assert period is not None and period["selector"] == "#period"
+
+
+class TestSynthesizedParameterMultiFillReconciliation:
+    def _reconcile(
+        self,
+        *,
+        submitted_code: str,
+        synthesized_parameters: list[dict[str, str]],
+        scout_trajectory: list[dict[str, object]],
+    ) -> tuple[dict[str, object], object]:
+        parsed: dict[str, object] = {"workflow_definition": {"parameters": [], "blocks": []}}
+        code_block: dict[str, object] = {"label": "search_directory", "code": submitted_code}
+        reconciliation = workflow_update_module._reconcile_synthesized_parameters(
+            parsed=parsed,
+            code_block=code_block,
+            submitted_code=submitted_code,
+            synthesized_parameters=synthesized_parameters,
+            scout_trajectory=scout_trajectory,
+        )
+        return parsed, reconciliation
+
+    def test_divergent_names_auto_declare_reusable_required_rows(self) -> None:
+        parsed, reconciliation = self._reconcile(
+            submitted_code='await page.locator("#submit").click()',
+            synthesized_parameters=[
+                {"key": "address_city_county_or_zip_code"},
+                {"key": "provider_specialty"},
+            ],
+            scout_trajectory=[
+                {"tool_name": "type_text", "selector": "#location", "typed_length": 7},
+                {"tool_name": "type_text", "selector": "#specialty", "typed_length": 10},
+            ],
+        )
+
+        assert reconciliation.violations == []
+        assert reconciliation.repair_context is None
+        assert reconciliation.parameter_keys == ["address_city_county_or_zip_code", "provider_specialty"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "address_city_county_or_zip_code",
+            },
+            {"parameter_type": "workflow", "workflow_parameter_type": "string", "key": "provider_specialty"},
+        ]
+
+    def test_duplicate_key_multi_fill_still_fails_closed(self) -> None:
+        parsed, reconciliation = self._reconcile(
+            submitted_code='await page.locator("#submit").click()',
+            synthesized_parameters=[
+                {"key": "address_city_county_or_zip_code"},
+                {"key": "address_city_county_or_zip_code"},
+            ],
+            scout_trajectory=[
+                {"tool_name": "type_text", "selector": "#location", "typed_length": 7},
+                {"tool_name": "type_text", "selector": "#location_again", "typed_length": 7},
+            ],
+        )
+
+        assert any("literal binding is ambiguous" in violation for violation in reconciliation.violations)
+        assert parsed["workflow_definition"]["parameters"] == []
+        assert reconciliation.repair_context is not None
+        assert reconciliation.repair_context.reason_code == "synthesized_parameter_binding_ambiguous"
+
+    def _directory_output_intent_yaml(self) -> str:
+        return _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: directory_result}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  await page.locator("#search").click()
+            """
+        )
+
+    def test_co_computed_metadata_contract_surfaces_when_output_contract_deficient(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c1", outcome="return the provider npi", output_path="provider.npi")
+            ]
+        )
+
+        contract = workflow_update_module._co_computed_metadata_repair_contract(
+            ctx, self._directory_output_intent_yaml(), None
+        )
+
+        assert contract is not None
+        assert contract["block_label"] == "search_directory"
+        assert any(path == "provider.npi" for path in contract["required_goal_value_paths"])
+
+    def test_co_computed_metadata_contract_is_none_without_output_intent(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c1", outcome="return the provider npi", output_path="provider.npi")
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: open_directory
+                code: |
+                  await page.goto("https://example.com/directory")
+            """
+        )
+
+        contract = workflow_update_module._co_computed_metadata_repair_contract(ctx, workflow_yaml, None)
+
+        assert contract is None
+
+    def test_co_computed_metadata_contract_labels_output_intent_block_in_multi_block(self) -> None:
+        # In a multi-block workflow the metadata-missing block is not necessarily the imposed carrier;
+        # the repair hint must point at the block that actually owns the output, derived from the yaml.
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c1", outcome="return the provider npi", output_path="provider.npi")
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: directory_result}
+              blocks:
+              - block_type: code
+                label: open_directory
+                code: |
+                  await page.goto("https://example.com/directory")
+              - block_type: code
+                label: read_provider
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  npi = (await page.locator("#npi").inner_text()).strip()
+                  return {"provider": {"npi": npi}}
+            """
+        )
+
+        contract = workflow_update_module._co_computed_metadata_repair_contract(ctx, workflow_yaml, None)
+
+        assert contract is not None
+        assert contract["block_label"] == "read_provider"
+
+    def _owned_carrier_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.spine_imposition_owned_attempt = True
+        ctx.spine_imposition_carrier_label = "search_directory"
+        return ctx
+
+    def _carrier_yaml(self, code: str) -> str:
+        return _yaml(
+            f"""
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {{parameter_type: output, key: directory_result}}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  {code}
+            """
+        )
+
+    def _divergent_multi_fill_scout(self) -> list[dict[str, object]]:
+        return [
+            {
+                "tool_name": "type_text",
+                "selector": "#location",
+                "source_url": "https://example.com/directory",
+                "typed_length": 7,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#specialty",
+                "source_url": "https://example.com/directory",
+                "typed_length": 10,
+                "role": "textbox",
+                "accessible_name": "Provider Specialty",
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#search",
+                "source_url": "https://example.com/directory",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 2,
+            },
+        ]
+
+    def _divergent_multi_fill_yaml(self, *, keyed_return: bool) -> str:
+        tail = (
+            '\n                  npi = (await page.locator("#npi").inner_text()).strip()'
+            '\n                  return {"provider": {"npi": npi}}'
+            if keyed_return
+            else ""
+        )
+        return _yaml(
+            f"""
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {{parameter_type: output, key: directory_result}}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  await page.locator("#location").fill("Raleigh")
+                  await page.locator("#specialty").fill("Cardiology")
+                  await page.locator("#search").click(){tail}
+            """
+        )
+
+
+def _goal_reaching_freehand_ctx(*, credential: bool = False) -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    if credential:
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#username",
+                "source_url": "https://example.com/login",
+                "credential_id": "cred_1",
+                "credential_name": "portal",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#signin",
+                "source_url": "https://example.com/login",
+                "role": "button",
+                "accessible_name": "Sign In",
+                "trajectory_index": 1,
+            },
+        ]
+    else:
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/find",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "button",
+                "source_url": "https://example.com/find",
+                "role": "button",
+                "accessible_name": "Sign In",
+                "trajectory_index": 1,
+            },
+        ]
+    return ctx
+
+
+def _freehand_block_yaml(code: str, *, label: str = "find_address", parameters: str = "") -> str:
+    indented = "\n".join(f"          {line}" for line in code.splitlines())
+    return (
+        "title: t\n"
+        "workflow_definition:\n"
+        f"{parameters}"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        f"    label: {label}\n"
+        "    code: |\n"
+        f"{indented}\n"
+    )
+
+
+_RENDER_PREFLIGHT_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "copilot" / "wr_jinja_unrenderable_proposed_workflow.json"
+)
+
+_PARAMETERS_NAMESPACE_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+      blocks:
+      - block_type: code
+        label: submit_request
+        parameter_keys: [business_name]
+        code: |
+          # Workflow input bindings: {{ parameters.business_name }}
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill(str(business_name).strip())
+    """
+)
+
+_UNDECLARED_ROOT_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: submit_request
+        code: |
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill("{{ frobnicator }}")
+    """
+)
+
+_TEMPLATE_SYNTAX_ERROR_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+      blocks:
+      - block_type: code
+        label: submit_request
+        parameter_keys: [business_name]
+        code: |
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill("{{ business_name")
+    """
+)
+
+_RENDERABLE_JINJA_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+      blocks:
+      - block_type: code
+        label: submit_request
+        parameter_keys: [business_name]
+        code: |
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill("{{ business_name }}")
+    """
+)
+
+
+class TestCodeBlockRenderPreflightSeam:
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_renderable_draft_persists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _RENDERABLE_JINJA_CODE_YAML}, ctx)
+        assert result["ok"] is True
+        assert "{{ business_name }}" in ctx.workflow_yaml
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_renderable_draft_with_envelope_imposition_persists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                _typed_completion_criterion(
+                    id="requested_value",
+                    output_path="output.record_id",
+                    level="run",
+                    method_mandated=False,
+                    kind="outcome",
+                )
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Entry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+              blocks:
+              - block_type: code
+                label: extract_entry_output
+                parameter_keys: [business_name]
+                code: |
+                  record_id = "{{ business_name }}"
+            """
+        )
+        result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx, allow_missing_credentials=True)
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "{{ business_name }}" in code
+        assert 'return {"output": {"record_id": record_id}}' in code
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_unchanged_legacy_block_is_not_rerejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _PARAMETERS_NAMESPACE_CODE_YAML
+        result = await _update_workflow({"workflow_yaml": _PARAMETERS_NAMESPACE_CODE_YAML}, ctx)
+        assert (result.get("data") or {}).get("reason_code") != "code_block_unrenderable"
+        assert result["ok"] is True
+
+
+def _under_scouted_order_status_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#confirmation",
+            "source_url": "https://portal.example.com/order-status",
+            "role": "textbox",
+            "accessible_name": "Confirmation number",
+            "typed_length": 8,
+            "trajectory_index": 0,
+        }
+    ]
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    return ctx
+
+
+def _pre_goal_wizard_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#username",
+            "source_url": "https://utility.example.com/login",
+            "credential_id": "cred_1",
+            "credential_name": "portal",
+            "credential_field": "username",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#password",
+            "source_url": "https://utility.example.com/login",
+            "credential_id": "cred_1",
+            "credential_name": "portal",
+            "credential_field": "password",
+            "trajectory_index": 1,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#sign-in",
+            "source_url": "https://utility.example.com/login",
+            "role": "button",
+            "accessible_name": "Sign In",
+            "trajectory_index": 2,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#business-toggle",
+            "source_url": "https://utility.example.com/start-service",
+            "role": "button",
+            "accessible_name": "Business",
+            "trajectory_index": 3,
+        },
+        {
+            "tool_name": "type_text",
+            "selector": "#service-address",
+            "source_url": "https://utility.example.com/start-service",
+            "role": "textbox",
+            "accessible_name": "Service address",
+            "typed_length": 20,
+            "trajectory_index": 4,
+        },
+    ]
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    return ctx
+
+
+def _wizard_block_yaml(*, include_business_block: bool) -> str:
+    sign_in_code = (
+        '          _scout_entry_target = page.locator("#username")\n'
+        "          if await _scout_entry_target.count() == 1:\n"
+        '              await page.locator("#username").fill(portal.username)\n'
+        '              await page.locator("#password").fill(portal.password)\n'
+        '              await page.locator("#sign-in").click()\n'
+    )
+    business_code = (
+        '          await page.locator("#business-toggle").click()\n'
+        '          await page.locator("#service-address").fill(str(service_address))\n'
+    )
+    yaml_text = (
+        "title: t\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "  - {parameter_type: credential, key: portal, credential_id: cred_1}\n"
+        "  - {parameter_type: workflow, workflow_parameter_type: string, key: service_address, default_value: addr}\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: sign_in_to_portal\n"
+        "    code: |\n"
+        f"{sign_in_code}"
+    )
+    if include_business_block:
+        yaml_text += "  - block_type: code\n    label: open_business_start_service\n    code: |\n" + business_code
+    return yaml_text
+
+
+class TestPreGoalWizardSpineReplay:
+    def test_sign_in_only_collapse_rejected_naming_dropped_rungs(self) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=False), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_under_build"
+        assert "#business-toggle" in result.violations[0]
+        assert "#service-address" in result.violations[0]
+
+    def test_multi_block_draft_covering_all_scouted_rungs_admitted(self) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=True), ctx
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_multi_block_covering_draft_persists_with_multiple_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+
+        async def _fake_process_from_yaml(**kwargs: object) -> SimpleNamespace:
+            parsed = yaml.safe_load(str(kwargs["workflow_yaml"]))
+            blocks = [SimpleNamespace(label=block.get("label")) for block in parsed["workflow_definition"]["blocks"]]
+            return SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks), proxy_location=None)
+
+        monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_process_from_yaml)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#business-toggle",
+                "source_url": "https://utility.example.com/start-service",
+                "role": "button",
+                "accessible_name": "Business",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": "https://utility.example.com/start-service",
+                "role": "textbox",
+                "accessible_name": "Service address",
+                "typed_length": 20,
+                "trajectory_index": 1,
+            },
+        ]
+        submitted = (
+            "title: t\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - {parameter_type: workflow, workflow_parameter_type: string, key: service_address, default_value: a}\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: open_business_services\n"
+            "    code: |\n"
+            '      await page.locator("#business-toggle").click()\n'
+            "  - block_type: code\n"
+            "    label: fill_service_address\n"
+            "    code: |\n"
+            '      await page.locator("#service-address").fill(str(service_address))\n'
+        )
+        ctx.workflow_yaml = submitted
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert result["data"]["block_count"] == 2
+
+
+class TestPrePersistScoutedSpineGate:
+    def test_covering_draft_returns_none(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        code = 'await page.locator("#search-submit").click()'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_draft_dropping_scouted_rung_rejected_with_rung_provenance(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        code = 'print(await page.locator("body").inner_text())'
+        result = workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_under_build"
+        assert "#search-submit" in result.violations[0]
+
+    def test_gate_skipped_without_imposition(self) -> None:
+        ctx = _code_only_ctx()
+        code = 'print(await page.locator("body").inner_text())'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_gate_skipped_without_scout_trajectory(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = []
+        code = 'print(await page.locator("body").inner_text())'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_gate_reuses_imposition_synthesized_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.imposition_synthesized_block = code_block_synthesis_module.synthesize_code_block(
+            ctx.scout_trajectory, strict_selectors=True, reached_download_target=None
+        )
+        assert ctx.imposition_synthesized_block is not None
+
+        def _fail_resynthesis(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("pre-persist gate re-synthesized instead of reusing the imposition result")
+
+        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", _fail_resynthesis)
+        code = 'await page.locator("#search-submit").click()'
+        assert workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(code), ctx) is None
+
+    def test_gate_declines_synthesizer_side_partition_findings(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#stage-a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#stage-b", "trajectory_index": 2},
+        ]
+        synthesized = code_block_synthesis_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        covering_code = synthesized.interaction_code or synthesized.code
+        draft_calls = [
+            (mutation.method, mutation.receiver)
+            for mutation in workflow_update_module._browser_surface_for_code(covering_code)[0]
+        ]
+        findings = code_block_synthesis_module.spine_partition_findings(
+            synthesized.diagnostics, draft_calls, ctx.scout_trajectory
+        )
+        assert any(finding.kind == code_block_synthesis_module.UNFORGIVEN_DROP_FINDING for finding in findings)
+
+        result = workflow_update_module._pre_persist_scouted_spine_result(_freehand_block_yaml(covering_code), ctx)
+
+        assert result is None
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_covering_draft_persists_through_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(workflow_update_module, "_workflow_requires_canonical_persist", lambda *_a, **_k: True)
+        canonical_writes: list[dict[str, object]] = []
+
+        async def _spy_update_workflow_definition(**kwargs: object) -> None:
+            canonical_writes.append(kwargs)
+
+        async def _fake_created_by_stamp(*_args: object, **_kwargs: object) -> str | None:
+            return "copilot"
+
+        async def _fake_canonical_workflow(**_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="submit_search")]),
+                title="t",
+                description=None,
+                proxy_location=None,
+                webhook_callback_url=None,
+                totp_verification_url=None,
+                totp_identifier=None,
+                persist_browser_session=False,
+                pin_saved_session_ip=False,
+                browser_profile_id=None,
+                browser_profile_key=None,
+                model=None,
+                max_screenshot_scrolls=None,
+                extra_http_headers=None,
+                cdp_connect_headers=None,
+                run_with=None,
+                ai_fallback=True,
+                cache_key=None,
+                adaptive_caching=None,
+                enable_self_healing=False,
+                code_version=None,
+                run_sequentially=False,
+                sequential_key=None,
+            )
+
+        monkeypatch.setattr(
+            workflow_update_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=_spy_update_workflow_definition),
+        )
+        monkeypatch.setattr(workflow_update_module, "resolve_copilot_created_by_stamp", _fake_created_by_stamp)
+        monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_canonical_workflow)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        submitted = _freehand_block_yaml('await page.locator("#search-submit").click()', label="submit_search")
+        ctx.workflow_yaml = submitted
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        assert len(canonical_writes) == 1
+        assert ctx.persisted_draft_browser_calls == [("click", "page.locator('#search-submit')")]
+
+
+_P6_UNDER_SCOUT_RECORDED_RUN_IDS = (
+    "wr_551756368310299524",
+    "wr_551757699750161408",
+    "wr_551759572355902654",
+)
+_P10_SPINE_COLLAPSE_RECORDED_RUN_ID = "wr_551770266824468500"
+
+# Selector shapes are transcribed verbatim from each recorded run's proposed workflow; only the mock
+# host is placeholder-normalized per this file's OSS-synced target convention.
+_P6_RECORDED_FREEHAND_BLOCKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "wr_551756368310299524": (
+        "lookup_order",
+        'await page.goto("https://example.com/order-status")\n'
+        'await page.locator("#confirmation").fill(str(enter_confirmation))\n'
+        "await page.locator('button[data-action=\"orderLookup\"]').click()\n"
+        'await page.locator(\'button[data-action="orderDocuments"]\').wait_for(state="visible", timeout=10000)\n'
+        "await page.locator('button[data-action=\"orderDocuments\"]').click()\n",
+        ("orderLookup", "orderDocuments"),
+    ),
+    "wr_551757699750161408": (
+        "lookup_order",
+        'await page.goto("https://example.com/order-status")\n'
+        'await page.locator("#confirmation").fill(str(enter_confirmation))\n'
+        "await page.locator('button[data-action=\"orderLookup\"]').click()\n",
+        ("orderLookup",),
+    ),
+    "wr_551759572355902654": (
+        "retrieve_resale_document",
+        "documents_button = page.locator('button[data-action=\"orderDocuments\"]')\n"
+        "await documents_button.click()\n"
+        'rows = page.locator("tr")\n',
+        ("documents_button",),
+    ),
+}
+
+
+class TestRecordedGauntletPacketReplay:
+    @pytest.mark.parametrize("run_id", [_P10_SPINE_COLLAPSE_RECORDED_RUN_ID])
+    def test_p10_recorded_sign_in_only_collapse_rejected_naming_dropped_rungs(self, run_id: str) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=False), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_under_build"
+        assert "#business-toggle" in result.violations[0]
+        assert "#service-address" in result.violations[0]
+
+    @pytest.mark.parametrize("run_id", [_P10_SPINE_COLLAPSE_RECORDED_RUN_ID])
+    def test_p10_recorded_covering_multi_block_spine_admitted(self, run_id: str) -> None:
+        ctx = _pre_goal_wizard_ctx()
+        result = workflow_update_module._pre_persist_scouted_spine_result(
+            _wizard_block_yaml(include_business_block=True), ctx
+        )
+        assert result is None
+
+
+_P3_PACKET_FIXTURE = json.loads(
+    (Path(__file__).parent / "copilot" / "fixtures" / "p3_definition_contract_reject_packets.json").read_text()
+)
+_P3_PACKETS_BY_RUN = {run["run"]: run for run in _P3_PACKET_FIXTURE["runs"]}
+_P3_REPLAY_BINDINGS: dict[str, dict[str, tuple[str, str]]] = {
+    "run1": {
+        "account_number": ("#accountNumberFilter", "100245"),
+        "billing_start_date": ("#billingPeriodStart", "2026-05-01"),
+        "billing_end_date": ("#billingPeriodEnd", "2026-05-31"),
+    },
+    "run2": {
+        "account_number": ("#accountNumberFilter", "100245"),
+        "billing_period_start": ("#billingPeriodStart", "2026-05-01"),
+        "billing_period_end": ("#billingPeriodEnd", "2026-05-31"),
+    },
+    "run3": {
+        "account_number": ("#accountNumberFilter", "100245"),
+        "billing_start_date": ("#billingPeriodStart", "2026-05-01"),
+        "billing_end_date": ("#billingPeriodEnd", "2026-05-31"),
+    },
+}
+
+
+def _p3_definition_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="The workflow uses the account number and the billing period dates as reusable inputs.",
+                level="definition",
+                output_path="workflow.parameters",
+            )
+        ]
+    )
+    return ctx
+
+
+def _p3_recorded_clicks(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    return [interaction for interaction in packet["scouted_interactions"] if interaction["tool_name"] == "click"]
+
+
+def _p3_draft_yaml(packet: dict[str, Any], declared_keys: Iterable[str]) -> str:
+    code = "".join(
+        f'await page.locator("{interaction["selector"]}").click()\n' for interaction in _p3_recorded_clicks(packet)
+    )
+    return yaml.safe_dump(
+        {
+            "title": "Download matching statement invoice",
+            "workflow_definition": {
+                "parameters": [
+                    {"parameter_type": "workflow", "key": key, "workflow_parameter_type": "string"}
+                    for key in sorted(declared_keys)
+                ],
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": packet["block_labels"][0],
+                        "parameter_keys": [],
+                        "code": code,
+                    }
+                ],
+            },
+        },
+        sort_keys=False,
+    )
+
+
+def _p3_scout_trajectory(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "tool_name": interaction["tool_name"],
+            "selector": interaction["selector"],
+            "source_url": interaction["source_url"],
+            "trajectory_index": interaction["trajectory_index"],
+        }
+        for interaction in _p3_recorded_clicks(packet)
+    ]
+
+
+def _p3_composition_evidence(
+    packet: dict[str, Any],
+    bindings: dict[str, tuple[str, str]],
+    *,
+    extra_fields: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    clicks = _p3_recorded_clicks(packet)
+    return {
+        "source_tool": "inspect_page_for_composition",
+        "current_url": clicks[0]["source_url"],
+        "forms": [
+            {
+                "fields": [{"selector": selector, "value": value} for selector, value in bindings.values()]
+                + (extra_fields or []),
+                "submit_controls": [{"selector": clicks[-1]["selector"]}],
+            }
+        ],
+    }
+
+
+def _recorded_summary_prefix(recorded_summary: str) -> str:
+    return recorded_summary[:-3] if recorded_summary.endswith("...") else recorded_summary
+
+
+class TestDefinitionContractRecordedPacketReplay:
+    @pytest.mark.parametrize("run_name", ["run1", "run2", "run3"])
+    def test_recorded_packets_reproduce_definition_plane_reject_byte_prefix(self, run_name: str) -> None:
+        packet = _P3_PACKETS_BY_RUN[run_name]
+        bindings = _P3_REPLAY_BINDINGS[run_name]
+        ctx = _p3_definition_ctx()
+        draft = _p3_draft_yaml(packet, bindings)
+
+        rejection = workflow_update_module._definition_plane_preflight_reject(ctx, draft)
+
+        assert rejection is not None
+        assert rejection.unreferenced_parameter_keys == tuple(sorted(bindings))
+        error = workflow_update_module._definition_plane_reject_error(rejection)
+        assert packet["reject_summaries"]
+        for summary in packet["reject_summaries"]:
+            assert ("Failed: " + error).startswith(_recorded_summary_prefix(summary["recorded_summary"]))
+        for stored in packet["stored_rejects"]:
+            assert stored["reason_code"] == "definition_contract_unsatisfied"
+            assert stored["verdict"] == "authoring_rejected"
+
+    def test_run1_recorded_reject_error_names_exactly_the_recorded_halt_keys(self) -> None:
+        packet = _P3_PACKETS_BY_RUN["run1"]
+        recorded_keys = packet["turn_halts"][0]["unresolved_parameter_keys"]
+        assert sorted(_P3_REPLAY_BINDINGS["run1"]) == recorded_keys
+        ctx = _p3_definition_ctx()
+        draft = _p3_draft_yaml(packet, recorded_keys)
+
+        rejection = workflow_update_module._definition_plane_preflight_reject(ctx, draft)
+
+        assert rejection is not None
+        error = workflow_update_module._definition_plane_reject_error(rejection)
+        # The contract is that the error names every unreferenced key and nothing else; the
+        # surrounding prose is free to change.
+        assert sorted(re.findall(r"`([^`]+)`", error)) == recorded_keys
+
+
+class TestScoutedSpineRepeatedOmissionSeam:
+    @staticmethod
+    def _uncovered_record(selector: str) -> dict[str, object]:
+        return {"tool_name": "click", "method": "click", "selector": selector, "trajectory_index": 1}
+
+    def test_repeated_flag_reopens_imposition_for_attempt_three(self) -> None:
+        ctx = _code_only_ctx()
+        assert workflow_update_module._should_impose_after_update_attempt(ctx) is False
+        assert workflow_update_module._should_impose_after_update_attempt(ctx, repeated_identical_omission=True) is True
+
+    @staticmethod
+    def _omitting_draft() -> str:
+        return _freehand_block_yaml('print(await page.locator("body").inner_text())')
+
+    def test_returning_omission_after_differing_draft_does_not_misfire_imposition(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#b",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 1,
+            },
+        ]
+        omitting = _freehand_block_yaml('await page.goto("https://example.com/records", wait_until="domcontentloaded")')
+        differing = _freehand_block_yaml('await page.locator("#a").fill("x")')
+        omitting_result = workflow_update_module._pre_persist_scouted_spine_result(omitting, ctx)
+        assert omitting_result is not None
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+        ctx.scouted_spine_previous_omission_digest = omitting_result.omission_digest
+
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(differing, ctx) is False
+        assert ctx.scouted_spine_repeated_identical_missing_steps is False
+        assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(omitting, ctx) is False
+
+    def test_identical_resubmission_no_op_still_names_at_persist_seam(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        draft = self._omitting_draft()
+        ctx.update_workflow_called = True
+        ctx.last_workflow_yaml = draft
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+
+        imposition = workflow_update_module._maybe_impose_synthesized_code_block(draft, ctx)
+        assert ctx.spine_imposition_owned_attempt is False
+        assert imposition.violations == []
+
+        naming = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
+        assert naming is not None
+        assert "#search-submit" in naming.violations[0]

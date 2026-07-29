@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 from typing import cast as typing_cast
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
@@ -206,8 +208,11 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        retried_from_workflow_run_id: str | None = None,
+        fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        start_fresh_browser: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -219,6 +224,7 @@ class WorkflowRunsRepository(BaseRepository):
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 browser_profile_id=browser_profile_id,
+                start_fresh_browser=start_fresh_browser,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
                 webhook_callback_url=webhook_callback_url,
@@ -237,6 +243,8 @@ class WorkflowRunsRepository(BaseRepository):
                 code_gen=code_gen,
                 trigger_type=trigger_type.value if trigger_type else None,
                 workflow_schedule_id=workflow_schedule_id,
+                retried_from_workflow_run_id=retried_from_workflow_run_id,
+                fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=copilot_session_id,
                 **kwargs,
@@ -245,6 +253,18 @@ class WorkflowRunsRepository(BaseRepository):
             await session.commit()
             await session.refresh(workflow_run)
             return convert_to_workflow_run(workflow_run)
+
+    @db_operation("get_workflow_run_retried_by")
+    async def get_workflow_run_retried_by(self, workflow_run_id: str, organization_id: str) -> str | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel.workflow_run_id)
+                .where(WorkflowRunModel.retried_from_workflow_run_id == workflow_run_id)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(1)
+            )
+            return (await session.scalars(query)).first()
 
     @db_operation("update_workflow_run")
     async def update_workflow_run(
@@ -266,6 +286,8 @@ class WorkflowRunsRepository(BaseRepository):
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_seed_source: str | None | object = _UNSET,
+        browser_sink_profile_id: str | None | object = _UNSET,
         proxy_location: ProxyLocationInput | object = _UNSET,
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
@@ -330,6 +352,10 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.verification_code_polling_started_at = None
                 if browser_profile_id is not _UNSET:
                     workflow_run.browser_profile_id = browser_profile_id
+                if browser_seed_source is not _UNSET:
+                    workflow_run.browser_seed_source = typing_cast(str | None, browser_seed_source)
+                if browser_sink_profile_id is not _UNSET:
+                    workflow_run.browser_sink_profile_id = typing_cast(str | None, browser_sink_profile_id)
                 if proxy_location is not _UNSET:
                     workflow_run.proxy_location = serialize_proxy_location(
                         typing_cast(ProxyLocationInput, proxy_location)
@@ -383,6 +409,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
         terminal state. Returns the updated row, or ``None`` when the row was
@@ -406,6 +433,8 @@ class WorkflowRunsRepository(BaseRepository):
             values["failure_reason"] = failure_reason
         if run_with is not None:
             values["run_with"] = run_with
+        if failure_category is not None:
+            values["failure_category"] = failure_category
 
         async with self.Session() as session:
             result = await session.execute(
@@ -430,38 +459,111 @@ class WorkflowRunsRepository(BaseRepository):
             await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
+    @db_operation("finish_preexisting_timed_out_workflow_run")
+    async def finish_preexisting_timed_out_workflow_run(
+        self,
+        workflow_run_id: str,
+        failure_reason: str | None = None,
+        run_with: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> WorkflowRun | None:
+        """Finish a status-only timeout written by bulk stuck-run cleanup.
+
+        A normal timeout transition always stamps ``finished_at``. Restricting
+        this repair to unfinished ``timed_out`` rows lets a cleanup retry fill
+        missing metadata without overwriting the attribution or completion
+        timestamp from another timeout finalizer.
+        """
+        now = naive_utc_now()
+        values: dict[str, Any] = {"finished_at": now}
+        if failure_reason is not None:
+            values["failure_reason"] = func.coalesce(WorkflowRunModel.failure_reason, failure_reason)
+        if run_with is not None:
+            values["run_with"] = func.coalesce(WorkflowRunModel.run_with, run_with)
+        if failure_category is not None:
+            values["failure_category"] = func.coalesce(
+                WorkflowRunModel.failure_category,
+                literal(failure_category, type_=WorkflowRunModel.failure_category.type),
+            )
+
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status == WorkflowRunStatus.timed_out.value,
+                    WorkflowRunModel.finished_at.is_(None),
+                )
+                .values(**values)
+                .returning(WorkflowRunModel.workflow_run_id)
+            )
+            affected = result.scalar_one_or_none()
+            await session.commit()
+            if affected is None:
+                return None
+            refreshed = (
+                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+            ).one()
+            await save_workflow_run_logs(workflow_run_id)
+            # save_workflow_run_logs reuses this session and commits, expiring `refreshed`.
+            # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
+            await session.refresh(refreshed)
+            return convert_to_workflow_run(refreshed)
+
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
         self,
         workflow_run_ids: list[str],
         status: WorkflowRunStatus | None = None,
         failure_reason: str | None = None,
-    ) -> None:
+        only_if_status_in: list[WorkflowRunStatus] | None = None,
+    ) -> list[str]:
         """Bulk update workflow runs by their IDs.
 
         Args:
             workflow_run_ids: List of workflow run IDs to update
             status: Optional status to set for all workflow runs
             failure_reason: Optional failure reason to set for all workflow runs
+            only_if_status_in: Optional status whitelist used as a compare-and-set guard
+
+        Returns:
+            IDs of rows that matched the update.
         """
         if not workflow_run_ids:
-            return
+            return []
 
         async with self.Session() as session:
-            update_values = {}
+            update_values: dict[str, Any] = {}
             if status:
                 update_values["status"] = status.value
+                if status == WorkflowRunStatus.timed_out:
+                    # Stuck-run cleanup intentionally writes only a timeout marker;
+                    # clear terminal metadata that may remain from the temporary
+                    # terminal -> running transition used by finally blocks. The
+                    # timeout activity then owns attribution, timestamps, and
+                    # completion side effects through
+                    # finish_preexisting_timed_out_workflow_run.
+                    update_values["finished_at"] = None
+                    update_values["failure_category"] = None
+                    if failure_reason is None:
+                        update_values["failure_reason"] = None
             if failure_reason:
                 update_values["failure_reason"] = failure_reason
 
-            if update_values:
-                update_stmt = (
-                    update(WorkflowRunModel)
-                    .where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
-                    .values(**update_values)
+            if not update_values:
+                return []
+
+            update_stmt = update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+            if only_if_status_in is not None:
+                update_stmt = update_stmt.where(
+                    WorkflowRunModel.status.in_([eligible_status.value for eligible_status in only_if_status_in])
                 )
-                await session.execute(update_stmt)
-                await session.commit()
+            result = await session.execute(
+                update_stmt.values(**update_values).returning(WorkflowRunModel.workflow_run_id)
+            )
+            updated_workflow_run_ids = list(result.scalars().all())
+            await session.commit()
+            return updated_workflow_run_ids
 
     @db_operation("clear_workflow_run_failure_reason")
     async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
@@ -584,8 +686,11 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[str] | None = None,
         search_key: str | None = None,
         run_type: list[str] | None = None,
+        workflow_permanent_ids: list[str] | None = None,
+        run_tags: Sequence[tuple[str | None, str | None]] | None = None,
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
+            run_tag_subqueries = run_tag_run_id_subqueries(run_tags, organization_id)
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
             # task_runs.workflow_permanent_id is unreliable on legacy workflow_run rows; the joined
             # workflow_runs row carries the canonical WPID, so coalesce both before deriving anything.
@@ -633,6 +738,12 @@ class WorkflowRunsRepository(BaseRepository):
             if run_type:
                 query = query.filter(TaskRunModel.task_run_type.in_(run_type))
 
+            if workflow_permanent_ids:
+                query = query.filter(effective_wpid.in_(workflow_permanent_ids))
+
+            for subquery in run_tag_subqueries:
+                query = query.filter(TaskRunModel.run_id.in_(subquery))
+
             if search_key:
                 query = query.filter(
                     or_(
@@ -650,16 +761,17 @@ class WorkflowRunsRepository(BaseRepository):
                 )
 
             offset = (page - 1) * page_size
-            # Search merges task_runs and fallback workflow_runs before slicing, so each source fetches enough rows.
-            query_limit = min(page * page_size, MAX_SEARCH_FETCH_LIMIT) if search_key else page_size
+            use_fallback_merge = bool(search_key) or bool(workflow_permanent_ids)
+            # Filtered merges slice task_runs and fallback workflow_runs together, so each source fetches enough rows.
+            query_limit = min(page * page_size, MAX_SEARCH_FETCH_LIMIT) if use_fallback_merge else page_size
             query = query.order_by(TaskRunModel.created_at.desc()).limit(query_limit)
-            if not search_key:
+            if not use_fallback_merge:
                 query = query.offset(offset)
 
             result = await session.execute(query)
             rows = [dict(row) for row in result.mappings().all()]
 
-            if search_key:
+            if use_fallback_merge:
                 # The fallback only yields workflow_run rows, so skip it when the run_type filter excludes them.
                 if not run_type or RunType.workflow_run in run_type:
                     task_run_exists = (
@@ -697,9 +809,16 @@ class WorkflowRunsRepository(BaseRepository):
                         .filter(WorkflowRunModel.copilot_session_id.is_(None))
                         .filter(~task_run_exists)
                     )
-                    fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
+                    if search_key:
+                        fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
                         fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                    if workflow_permanent_ids:
+                        fallback_query = fallback_query.filter(
+                            WorkflowRunModel.workflow_permanent_id.in_(workflow_permanent_ids)
+                        )
+                    for subquery in run_tag_subqueries:
+                        fallback_query = fallback_query.filter(WorkflowRunModel.workflow_run_id.in_(subquery))
                     fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
                     fallback_result = await session.execute(fallback_query)
                     rows.extend(dict(row) for row in fallback_result.mappings().all())
@@ -1200,6 +1319,7 @@ class WorkflowRunsRepository(BaseRepository):
         exclude_child_runs: bool = False,
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
+        run_tags: Sequence[tuple[str | None, str | None]] | None = None,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -1224,6 +1344,8 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter(WorkflowRunModel.created_at >= created_at_start)
             if created_at_end is not None:
                 query = query.filter(WorkflowRunModel.created_at < created_at_end)
+            for subquery in run_tag_run_id_subqueries(run_tags, organization_id):
+                query = query.filter(WorkflowRunModel.workflow_run_id.in_(subquery))
             query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             workflow_runs_and_titles_tuples = (await session.execute(query)).all()
             workflow_runs = [

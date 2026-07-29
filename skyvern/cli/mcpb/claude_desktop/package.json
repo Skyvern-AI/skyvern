@@ -8,6 +8,7 @@
     "mcp-remote": "0.1.38"
   },
   "overrides": {
-    "undici": "7.28.0"
+    "undici": "7.28.0",
+    "qs": "^6.15.2"
   }
 }

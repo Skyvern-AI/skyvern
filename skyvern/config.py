@@ -2,9 +2,9 @@ import logging
 import os
 import platform
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Script reviewer settings
     SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
+    SELF_HEAL_DAILY_CAP: int = 5
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -107,6 +108,10 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
+    # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
+    # an exact approval, so an enforcing value must be unrepresentable rather than merely unused.
+    BROWSER_ACTION_POLICY_MODE: Literal["disabled", "observe"] = "disabled"
     POPUP_VIDEO_PATH_TIMEOUT_SECONDS: float = 3.0
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
     # Page readiness settings for cached action execution
@@ -151,6 +156,7 @@ class Settings(BaseSettings):
     # Global kill-switch for select/autocomplete shadow-match observability (LLM-vs-deterministic
     # agreement logging). Not per-org; set false to silence the logs everywhere.
     SKYVERN_SELECT_SHADOW_MATCH: bool = True
+    FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS: float = Field(default=0, ge=0, le=60)
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
@@ -187,7 +193,6 @@ class Settings(BaseSettings):
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     # Consecutive repair runs that make no newly-verified forward progress before the
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
@@ -208,13 +213,14 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
+    WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
     # coordinate the poller with a /credential-response POST that may land on another worker,
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
-    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = False
+    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
@@ -223,6 +229,8 @@ class Settings(BaseSettings):
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
+    SELF_HEAL_MAX_ACTIONS: int = 15
+    SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     ALLOWED_ORIGIN_REGEX: str | None = None
@@ -231,10 +239,6 @@ class Settings(BaseSettings):
     # SFTP uploads connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
-
-    # Format: "http://<username>:<password>@host:port, http://<username>:<password>@host:port, ...."
-    HOSTED_PROXY_POOL: str = ""
-    ENABLE_PROXY: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
@@ -298,7 +302,7 @@ class Settings(BaseSettings):
     # Directory containing pre-built default browser profiles ({dir}/chrome/ and {dir}/chromium/).
     # When set, used as the default profile source for new browser sessions.
     # Cloud workers download S3 profiles here at startup; self-hosted users can point this at a
-    # local profile directory. Leave empty to use the in-repo template.
+    # local profile directory. Leave empty to use versioned temp caches and clean empty fallbacks.
     DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
@@ -593,6 +597,8 @@ class Settings(BaseSettings):
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
+    TOTP_RAW_FALLBACK_ENABLED: bool = False
+    TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
@@ -756,6 +762,10 @@ class Settings(BaseSettings):
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
 
+    TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS: float = 48.0
+    """Age gate (hours) for the always-on sweep of per-run LOG_PATH/DOWNLOAD_PATH dirs left behind on
+    crash paths. Non-positive disables the sweep."""
+
     # Workflow Schedule Settings
     ENABLE_WORKFLOW_SCHEDULES: bool = True
     """Enable recurring workflow schedules in the OSS/local server."""
@@ -771,6 +781,26 @@ class Settings(BaseSettings):
     OTEL_METRICS_ENABLED: bool = True
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
+    # Log level for the OTLP gRPC exporter's own logger. Raise above WARNING (e.g.
+    # "CRITICAL") to drop its retry/failure records where the OTLP endpoint is
+    # intentionally unavailable; the default keeps export failures visible.
+    OTEL_EXPORTER_LOG_LEVEL: str = "WARNING"
+    # Per-export deadline (seconds) for the OTLP span exporter. Must exceed the exporter's
+    # ~31s retry-backoff window (2**n over _MAX_RETRYS) so a brief node-local collector blip
+    # is retried to success instead of logged as a failure; the library default (10s) cuts
+    # the retry sequence short and turns each blip into an error burst.
+    OTEL_EXPORTER_TIMEOUT_SECONDS: float = Field(
+        default=45.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "OTEL_EXPORTER_TIMEOUT_SECONDS",
+            "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+            "OTEL_EXPORTER_OTLP_TIMEOUT",
+        ),
+    )
+    # BatchSpanProcessor queue depth (library default 2048); enlarged to buffer more spans
+    # while an export is retrying against a briefly unavailable collector.
+    OTEL_BSP_MAX_QUEUE_SIZE: int = 8192
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
@@ -789,6 +819,8 @@ class Settings(BaseSettings):
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
             ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
+            ("gemini-3.5-flash-lite", "VERTEX_GEMINI_3.5_FLASH_LITE", "GEMINI_3.5_FLASH_LITE", "Gemini 3.5 Flash Lite"),
+            ("gemini-3.6-flash", "VERTEX_GEMINI_3.6_FLASH", "GEMINI_3.6_FLASH", "Gemini 3.6 Flash"),
         ]
         for model_name, vertex_key, gemini_key, label in gemini_models:
             mapping[model_name] = {
@@ -916,6 +948,18 @@ class Settings(BaseSettings):
             mapping["claude-fable-5"] = {
                 "llm_key": "ANTHROPIC_CLAUDE5_FABLE",
                 "label": "Anthropic Claude Fable 5",
+            }
+
+        # Anthropic Claude Opus 5: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-opus-5"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Opus 5",
+            }
+        else:
+            mapping["claude-opus-5"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5_OPUS",
+                "label": "Anthropic Claude Opus 5",
             }
 
         try:

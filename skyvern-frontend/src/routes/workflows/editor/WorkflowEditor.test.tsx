@@ -145,7 +145,7 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
         .disabled,
     ).toBe(true);
     expect(screen.queryByLabelText("Save workflow")).toBeNull();
-    expect(screen.queryByRole("button", { name: /^Run agent$/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Run$/ })).toBeNull();
   });
 
   test("stays on the loading pulse while the run fallback is still loading", () => {

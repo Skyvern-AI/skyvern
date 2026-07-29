@@ -1,0 +1,385 @@
+{
+  "_copilot_code_artifact_metadata": {
+    "submit_commercial_water_request": {
+      "artifact_id": "code_artifact:submit_commercial_water_request",
+      "block_label": "submit_commercial_water_request",
+      "claimed_outcomes": [
+        {
+          "covered_criteria": [
+            "safe_result_terminal"
+          ],
+          "criteria_ids": [
+            "safe_result_terminal"
+          ],
+          "depends_on": [
+            "citrus_request_page"
+          ],
+          "entities": [
+            "Citrus County Utilities"
+          ],
+          "evidence_refs": [],
+          "extraction_schema": "{\"type\":\"object\",\"properties\":{\"output\":{\"type\":\"object\",\"properties\":{\"confirmation_number\":{\"type\":[\"string\",\"null\"]},\"account_number\":{\"type\":[\"string\",\"null\"]},\"selected_start_date\":{\"type\":[\"string\",\"null\"]},\"deposit_amount\":{\"type\":[\"string\",\"null\"]},\"next_owner\":{\"type\":[\"string\",\"null\"]},\"blocker\":{\"type\":[\"string\",\"null\"]},\"evidence_text\":{\"type\":\"string\"}},\"required\":[\"confirmation_number\",\"account_number\",\"selected_start_date\",\"deposit_amount\",\"next_owner\",\"blocker\",\"evidence_text\"]}},\"required\":[\"output\"]}",
+          "extraction_schema_provenance": "self_authored",
+          "goal_value_paths": [
+            "output.confirmation_number",
+            "output.account_number",
+            "output.selected_start_date",
+            "output.deposit_amount",
+            "output.next_owner",
+            "output.blocker",
+            "output.evidence_text"
+          ],
+          "id": "safe_request_result",
+          "observation_refs": [
+            "obs_form"
+          ],
+          "required_tokens": [
+            "Submit Request"
+          ],
+          "scope": "block",
+          "status": "observed_not_verified",
+          "text": "Returns confirmation number, account number, selected start date, deposit amount, next owner, and a nullable blocker from the visible terminal page."
+        }
+      ],
+      "completion_criteria": [
+        {
+          "id": "safe_result_terminal",
+          "level": "terminal",
+          "outcome": "safe_request_result",
+          "output_path": "output.blocker",
+          "requested_output_evidence_source": "runtime_output",
+          "terminal": true,
+          "text": "Return the safe structured result from the terminal confirmation page or the manual-service blocker."
+        }
+      ],
+      "declared_goal": "Submit the observed commercial water service form and safely return confirmation details or an explicit blocker.",
+      "evidence_refs": [],
+      "exploration_observations": [
+        {
+          "current_url": "http://localhost:8900/utility_services/citrus_water/",
+          "id": "observed_commercial_form",
+          "observation_ref": "obs_form",
+          "observation_step": 3,
+          "source_label": "commercial_request_form",
+          "source_tool": "inspect_page_for_composition",
+          "status": "observed_not_verified",
+          "text": "Observed the request form and enabled Submit Request button."
+        }
+      ],
+      "observation_refs": [
+        {
+          "claim_id": "safe_request_result",
+          "criterion_id": "safe_result_terminal",
+          "current_url": "http://localhost:8900/utility_services/citrus_water/",
+          "dependency_id": "citrus_request_page",
+          "observation_ref": "obs_form",
+          "observation_step": 3,
+          "source_label": "commercial_request_form",
+          "source_tool": "inspect_page_for_composition",
+          "status": "observed_not_verified"
+        }
+      ],
+      "page_dependencies": [
+        {
+          "evidence_refs": [],
+          "id": "citrus_request_page",
+          "observation_refs": [
+            "obs_form"
+          ],
+          "page_state_hint": "Commercial Water Service Request form.",
+          "required_affordances": [
+            "button[data-action=\"citrusForm\"]",
+            "#company",
+            "#email",
+            "#serviceAddress",
+            "#startDate",
+            "Submit Request button"
+          ],
+          "required_outcomes": [
+            "Form is visible and fillable"
+          ],
+          "scope": "page",
+          "status": "observed_not_verified",
+          "url_hint": "http://localhost:8900/utility_services/citrus_water/"
+        }
+      ],
+      "terminal_verifier_expectations": [
+        {
+          "claimed_outcome_ids": [
+            "safe_request_result"
+          ],
+          "criteria_ids": [
+            "safe_result_terminal"
+          ],
+          "extraction_schema": "{\"type\":\"object\",\"properties\":{\"output\":{\"type\":\"object\",\"properties\":{\"confirmation_number\":{\"type\":[\"string\",\"null\"]},\"account_number\":{\"type\":[\"string\",\"null\"]},\"selected_start_date\":{\"type\":[\"string\",\"null\"]},\"deposit_amount\":{\"type\":[\"string\",\"null\"]},\"next_owner\":{\"type\":[\"string\",\"null\"]},\"blocker\":{\"type\":[\"string\",\"null\"]},\"evidence_text\":{\"type\":\"string\"}},\"required\":[\"confirmation_number\",\"account_number\",\"selected_start_date\",\"deposit_amount\",\"next_owner\",\"blocker\",\"evidence_text\"]}},\"required\":[\"output\"]}",
+          "extraction_schema_provenance": "self_authored",
+          "goal_value_paths": [
+            "output.confirmation_number",
+            "output.account_number",
+            "output.selected_start_date",
+            "output.deposit_amount",
+            "output.next_owner",
+            "output.blocker",
+            "output.evidence_text"
+          ],
+          "id": "verify_safe_result",
+          "text": "The runtime output contains every requested field, with blocker null only when visible confirmation data is returned."
+        }
+      ]
+    }
+  },
+  "_copilot_unvalidated": true,
+  "_copilot_yaml": "title: Start Citrus County Commercial Water Service\nsummary: Submit a reusable commercial water service request and return its confirmation\n  details.\ndescription: Uses configurable business, contact, service address, and start date\n  inputs.\nproxy_location: NONE\nwebhook_callback_url: ''\npersist_browser_session: false\npin_saved_session_ip: false\nbrowser_profile_id: null\nbrowser_profile_key: null\nmodel: null\nmax_screenshot_scrolls: null\nmax_elapsed_time_minutes: null\ntotp_verification_url: null\nextra_http_headers: {}\nrun_with: agent\ncache_key: default\nai_fallback: true\nenable_self_healing: false\nworkflow_definition:\n  version: 2\n  parameters:\n  - parameter_type: workflow\n    key: business_name\n    workflow_parameter_type: string\n    description: Business or company name\n  - parameter_type: workflow\n    key: contact_email\n    workflow_parameter_type: string\n    description: Contact email for the request\n  - parameter_type: workflow\n    key: service_address\n    workflow_parameter_type: string\n    description: Full commercial service address\n  - parameter_type: workflow\n    key: desired_start_date\n    workflow_parameter_type: string\n    description: Requested service start date in YYYY-MM-DD format\n  blocks:\n  - block_type: code\n    label: submit_commercial_water_request\n    next_block_label: null\n    code: \"# Workflow input bindings: {{ parameters.business_name }}, {{ parameters.contact_email\\\n      \\ }}, {{ parameters.service_address }}, {{ parameters.desired_start_date }}\\n\\\n      await page.goto(\\\"http://localhost:8900/utility_services/citrus_water/\\\")\\n\\\n      await page.wait_for_load_state(\\\"domcontentloaded\\\")\\nawait page.locator(\\\"\\\n      button[data-action=\\\\\\\"citrusForm\\\\\\\"]\\\").click()\\nawait page.wait_for_load_state(\\\"\\\n      domcontentloaded\\\")\\nawait page.locator(\\\"#company\\\").wait_for(state=\\\"visible\\\"\\\n      )\\nawait page.locator(\\\"#company\\\").fill(str(business_name).strip())\\nawait\\\n      \\ page.locator(\\\"#email\\\").fill(str(contact_email).strip())\\nawait page.locator(\\\"\\\n      #serviceAddress\\\").fill(str(service_address).strip())\\nawait page.locator(\\\"\\\n      #startDate\\\").fill(str(desired_start_date).strip())\\nsubmit_button = page.get_by_role(\\\"\\\n      button\\\", name=\\\"Submit Request\\\", exact=True)\\nawait submit_button.wait_for(state=\\\"\\\n      visible\\\")\\nif not await submit_button.is_enabled():\\n    body_text = await\\\n      \\ page.locator(\\\"body\\\").inner_text()\\n    return {\\\"output\\\": {\\\"confirmation_number\\\"\\\n      : None, \\\"account_number\\\": None, \\\"selected_start_date\\\": None, \\\"deposit_amount\\\"\\\n      : None, \\\"next_owner\\\": None, \\\"blocker\\\": \\\"The online request form is not\\\n      \\ reviewable or submit-enabled.\\\", \\\"evidence_text\\\": body_text[:4000]}}\\nawait\\\n      \\ submit_button.click()\\nawait page.wait_for_timeout(700)\\nbody_text = await\\\n      \\ page.locator(\\\"body\\\").inner_text()\\nlines = [line.strip() for line in body_text.splitlines()\\\n      \\ if line.strip()]\\ndef value_after(labels):\\n    for index, line in enumerate(lines):\\n\\\n      \\        low = line.lower()\\n        for label in labels:\\n            if label\\\n      \\ in low:\\n                if \\\":\\\" in line:\\n                    value = line.split(\\\"\\\n      :\\\", 1)[1].strip()\\n                    if value:\\n                        return\\\n      \\ value\\n                if index + 1 < len(lines):\\n                    return\\\n      \\ lines[index + 1]\\n    return None\\nconfirmation_number = value_after([\\\"confirmation\\\n      \\ number\\\", \\\"confirmation #\\\"])\\naccount_number = value_after([\\\"account number\\\"\\\n      , \\\"account #\\\"])\\nselected_start_date = value_after([\\\"selected start date\\\"\\\n      , \\\"requested start date\\\", \\\"start date\\\"])\\ndeposit_amount = value_after([\\\"\\\n      deposit amount\\\", \\\"deposit\\\"])\\nnext_owner = value_after([\\\"next owner\\\", \\\"\\\n      assigned to\\\", \\\"owner\\\"])\\nlower_text = body_text.lower()\\nmanual_only = (\\\"\\\n      manual\\\" in lower_text or \\\"email us\\\" in lower_text) and confirmation_number\\\n      \\ is None\\nmissing_confirmation = confirmation_number is None and not manual_only\\n\\\n      blocker = \\\"The portal exposes an email/manual-service path instead of an online\\\n      \\ confirmation.\\\" if manual_only else (\\\"The submitted page did not expose a\\\n      \\ confirmation number.\\\" if missing_confirmation else None)\\nreturn {\\\"output\\\"\\\n      : {\\\"confirmation_number\\\": confirmation_number, \\\"account_number\\\": account_number,\\\n      \\ \\\"selected_start_date\\\": selected_start_date, \\\"deposit_amount\\\": deposit_amount,\\\n      \\ \\\"next_owner\\\": next_owner, \\\"blocker\\\": blocker, \\\"evidence_text\\\": body_text[:6000]}}\\n\"\n    parameter_keys:\n    - business_name\n    - contact_email\n    - desired_start_date\n    - service_address\n    extraction_schema: '{\"type\":\"object\",\"properties\":{\"output\":{\"type\":\"object\",\"properties\":{\"confirmation_number\":{\"type\":[\"string\",\"null\"]},\"account_number\":{\"type\":[\"string\",\"null\"]},\"selected_start_date\":{\"type\":[\"string\",\"null\"]},\"deposit_amount\":{\"type\":[\"string\",\"null\"]},\"next_owner\":{\"type\":[\"string\",\"null\"]},\"blocker\":{\"type\":[\"string\",\"null\"]},\"evidence_text\":{\"type\":\"string\"}},\"required\":[\"confirmation_number\",\"account_number\",\"selected_start_date\",\"deposit_amount\",\"next_owner\",\"blocker\",\"evidence_text\"]}},\"required\":[\"output\"]}'\n    prompt: Submit the observed commercial water service form and safely return confirmation\n      details or an explicit blocker.\nis_saved_task: false\nstatus: published\nrun_sequentially: false\nsequential_key: null\n",
+  "adaptive_caching": false,
+  "agent_id": "wpid_552079557434126732",
+  "ai_fallback": true,
+  "browser_profile_id": null,
+  "browser_profile_key": null,
+  "cache_key": "default",
+  "cdp_connect_headers": null,
+  "code_version": null,
+  "copilot_authored": false,
+  "created_at": "2026-07-16T17:53:26.232218Z",
+  "created_by": null,
+  "deleted_at": null,
+  "description": "Uses configurable business, contact, service address, and start date inputs.",
+  "edited_by": null,
+  "enable_self_healing": false,
+  "extra_http_headers": {},
+  "folder_id": null,
+  "generate_script_on_terminal": false,
+  "import_error": null,
+  "is_saved_task": false,
+  "is_template": false,
+  "max_elapsed_time_minutes": null,
+  "max_screenshot_scrolls": null,
+  "model": null,
+  "modified_at": "2026-07-16T17:53:26.232218Z",
+  "organization_id": "o_551846329558231414",
+  "persist_browser_session": false,
+  "pin_saved_session_ip": false,
+  "proxy_location": "NONE",
+  "run_sequentially": false,
+  "run_with": "agent",
+  "sequential_key": null,
+  "status": "published",
+  "title": "Start Citrus County Commercial Water Service",
+  "totp_identifier": null,
+  "totp_verification_url": null,
+  "version": 1,
+  "webhook_callback_url": "",
+  "workflow_definition": {
+    "blocks": [
+      {
+        "block_type": "code",
+        "code": "# Workflow input bindings: {{ parameters.business_name }}, {{ parameters.contact_email }}, {{ parameters.service_address }}, {{ parameters.desired_start_date }}\nawait page.goto(\"http://localhost:8900/utility_services/citrus_water/\")\nawait page.wait_for_load_state(\"domcontentloaded\")\nawait page.locator(\"button[data-action=\\\"citrusForm\\\"]\").click()\nawait page.wait_for_load_state(\"domcontentloaded\")\nawait page.locator(\"#company\").wait_for(state=\"visible\")\nawait page.locator(\"#company\").fill(str(business_name).strip())\nawait page.locator(\"#email\").fill(str(contact_email).strip())\nawait page.locator(\"#serviceAddress\").fill(str(service_address).strip())\nawait page.locator(\"#startDate\").fill(str(desired_start_date).strip())\nsubmit_button = page.get_by_role(\"button\", name=\"Submit Request\", exact=True)\nawait submit_button.wait_for(state=\"visible\")\nif not await submit_button.is_enabled():\n    body_text = await page.locator(\"body\").inner_text()\n    return {\"output\": {\"confirmation_number\": None, \"account_number\": None, \"selected_start_date\": None, \"deposit_amount\": None, \"next_owner\": None, \"blocker\": \"The online request form is not reviewable or submit-enabled.\", \"evidence_text\": body_text[:4000]}}\nawait submit_button.click()\nawait page.wait_for_timeout(700)\nbody_text = await page.locator(\"body\").inner_text()\nlines = [line.strip() for line in body_text.splitlines() if line.strip()]\ndef value_after(labels):\n    for index, line in enumerate(lines):\n        low = line.lower()\n        for label in labels:\n            if label in low:\n                if \":\" in line:\n                    value = line.split(\":\", 1)[1].strip()\n                    if value:\n                        return value\n                if index + 1 < len(lines):\n                    return lines[index + 1]\n    return None\nconfirmation_number = value_after([\"confirmation number\", \"confirmation #\"])\naccount_number = value_after([\"account number\", \"account #\"])\nselected_start_date = value_after([\"selected start date\", \"requested start date\", \"start date\"])\ndeposit_amount = value_after([\"deposit amount\", \"deposit\"])\nnext_owner = value_after([\"next owner\", \"assigned to\", \"owner\"])\nlower_text = body_text.lower()\nmanual_only = (\"manual\" in lower_text or \"email us\" in lower_text) and confirmation_number is None\nmissing_confirmation = confirmation_number is None and not manual_only\nblocker = \"The portal exposes an email/manual-service path instead of an online confirmation.\" if manual_only else (\"The submitted page did not expose a confirmation number.\" if missing_confirmation else None)\nreturn {\"output\": {\"confirmation_number\": confirmation_number, \"account_number\": account_number, \"selected_start_date\": selected_start_date, \"deposit_amount\": deposit_amount, \"next_owner\": next_owner, \"blocker\": blocker, \"evidence_text\": body_text[:6000]}}\n",
+        "continue_on_failure": false,
+        "disable_cache": false,
+        "ignore_workflow_system_prompt": false,
+        "label": "submit_commercial_water_request",
+        "model": null,
+        "next_block_label": null,
+        "next_loop_on_failure": false,
+        "output_parameter": {
+          "created_at": "2026-07-16T17:53:26.227963",
+          "deleted_at": null,
+          "description": "Output parameter for block submit_commercial_water_request",
+          "key": "submit_commercial_water_request_output",
+          "modified_at": "2026-07-16T17:53:26.227968",
+          "output_parameter_id": "op_552080278988632478",
+          "parameter_type": "output",
+          "workflow_id": "w_552079557434126730"
+        },
+        "parameters": [
+          {
+            "created_at": "2026-07-16T17:53:26.227993Z",
+            "default_value": null,
+            "deleted_at": null,
+            "description": "Business or company name",
+            "key": "business_name",
+            "modified_at": "2026-07-16T17:53:26.227993Z",
+            "parameter_type": "workflow",
+            "workflow_id": "w_552079557434126730",
+            "workflow_parameter_id": "wp_552080278988632480",
+            "workflow_parameter_type": "string"
+          },
+          {
+            "created_at": "2026-07-16T17:53:26.228010Z",
+            "default_value": null,
+            "deleted_at": null,
+            "description": "Contact email for the request",
+            "key": "contact_email",
+            "modified_at": "2026-07-16T17:53:26.228010Z",
+            "parameter_type": "workflow",
+            "workflow_id": "w_552079557434126730",
+            "workflow_parameter_id": "wp_552080278988632482",
+            "workflow_parameter_type": "string"
+          },
+          {
+            "created_at": "2026-07-16T17:53:26.228016Z",
+            "default_value": null,
+            "deleted_at": null,
+            "description": "Requested service start date in YYYY-MM-DD format",
+            "key": "desired_start_date",
+            "modified_at": "2026-07-16T17:53:26.228016Z",
+            "parameter_type": "workflow",
+            "workflow_id": "w_552079557434126730",
+            "workflow_parameter_id": "wp_552080278988632486",
+            "workflow_parameter_type": "string"
+          },
+          {
+            "created_at": "2026-07-16T17:53:26.228014Z",
+            "default_value": null,
+            "deleted_at": null,
+            "description": "Full commercial service address",
+            "key": "service_address",
+            "modified_at": "2026-07-16T17:53:26.228014Z",
+            "parameter_type": "workflow",
+            "workflow_id": "w_552079557434126730",
+            "workflow_parameter_id": "wp_552080278988632484",
+            "workflow_parameter_type": "string"
+          }
+        ],
+        "prompt": "Submit the observed commercial water service form and safely return confirmation details or an explicit blocker.",
+        "steps": [
+          {
+            "action_type": "goto_url",
+            "description": "Open http://localhost:8900/utility_services/citrus_water/",
+            "line_end": 2,
+            "line_start": 2,
+            "title": null
+          },
+          {
+            "action_type": "click",
+            "description": "Click the element",
+            "line_end": 4,
+            "line_start": 4,
+            "title": null
+          },
+          {
+            "action_type": "input_text",
+            "description": "Type into the element",
+            "line_end": 7,
+            "line_start": 7,
+            "title": null
+          },
+          {
+            "action_type": "input_text",
+            "description": "Type into the element",
+            "line_end": 8,
+            "line_start": 8,
+            "title": null
+          },
+          {
+            "action_type": "input_text",
+            "description": "Type into the element",
+            "line_end": 9,
+            "line_start": 9,
+            "title": null
+          },
+          {
+            "action_type": "input_text",
+            "description": "Type into the element",
+            "line_end": 10,
+            "line_start": 10,
+            "title": null
+          },
+          {
+            "action_type": "extract",
+            "description": "Extract information from the page",
+            "line_end": 14,
+            "line_start": 14,
+            "title": null
+          },
+          {
+            "action_type": "click",
+            "description": "Click the element",
+            "line_end": 16,
+            "line_start": 16,
+            "title": null
+          },
+          {
+            "action_type": "wait",
+            "description": "Wait",
+            "line_end": 17,
+            "line_start": 17,
+            "title": null
+          },
+          {
+            "action_type": "extract",
+            "description": "Extract information from the page",
+            "line_end": 18,
+            "line_start": 18,
+            "title": null
+          }
+        ]
+      }
+    ],
+    "error_code_mapping": null,
+    "finally_block_label": null,
+    "parameters": [
+      {
+        "created_at": "2026-07-16T17:53:26.227963",
+        "deleted_at": null,
+        "description": "Output parameter for block submit_commercial_water_request",
+        "key": "submit_commercial_water_request_output",
+        "modified_at": "2026-07-16T17:53:26.227968",
+        "output_parameter_id": "op_552080278988632478",
+        "parameter_type": "output",
+        "workflow_id": "w_552079557434126730"
+      },
+      {
+        "created_at": "2026-07-16T17:53:26.227993Z",
+        "default_value": null,
+        "deleted_at": null,
+        "description": "Business or company name",
+        "key": "business_name",
+        "modified_at": "2026-07-16T17:53:26.227993Z",
+        "parameter_type": "workflow",
+        "workflow_id": "w_552079557434126730",
+        "workflow_parameter_id": "wp_552080278988632480",
+        "workflow_parameter_type": "string"
+      },
+      {
+        "created_at": "2026-07-16T17:53:26.228010Z",
+        "default_value": null,
+        "deleted_at": null,
+        "description": "Contact email for the request",
+        "key": "contact_email",
+        "modified_at": "2026-07-16T17:53:26.228010Z",
+        "parameter_type": "workflow",
+        "workflow_id": "w_552079557434126730",
+        "workflow_parameter_id": "wp_552080278988632482",
+        "workflow_parameter_type": "string"
+      },
+      {
+        "created_at": "2026-07-16T17:53:26.228014Z",
+        "default_value": null,
+        "deleted_at": null,
+        "description": "Full commercial service address",
+        "key": "service_address",
+        "modified_at": "2026-07-16T17:53:26.228014Z",
+        "parameter_type": "workflow",
+        "workflow_id": "w_552079557434126730",
+        "workflow_parameter_id": "wp_552080278988632484",
+        "workflow_parameter_type": "string"
+      },
+      {
+        "created_at": "2026-07-16T17:53:26.228016Z",
+        "default_value": null,
+        "deleted_at": null,
+        "description": "Requested service start date in YYYY-MM-DD format",
+        "key": "desired_start_date",
+        "modified_at": "2026-07-16T17:53:26.228016Z",
+        "parameter_type": "workflow",
+        "workflow_id": "w_552079557434126730",
+        "workflow_parameter_id": "wp_552080278988632486",
+        "workflow_parameter_type": "string"
+      }
+    ],
+    "version": 2,
+    "workflow_system_prompt": null
+  },
+  "workflow_id": "w_552079557434126730",
+  "workflow_permanent_id": "wpid_552079557434126732"
+}

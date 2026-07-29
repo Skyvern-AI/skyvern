@@ -68,6 +68,7 @@ def test_is_blocked_host_bracketed_ipv6_internal(host: str) -> None:
         "fe80::1",
         "fc00::1",
         "10.0.0.1",
+        "100.100.100.200",
         "127.0.0.1",
         "169.254.169.254",
         "192.168.1.1",
@@ -110,6 +111,15 @@ def test_validate_url_allows_public_ipv6() -> None:
 
 
 @pytest.mark.parametrize(
+    "url",
+    ["http://2130706433/", "http://0x7f000001/", "http://017700000001/", "http://127.1/", "http://0/"],
+)
+def test_validate_fetch_url_rejects_nonstandard_ip_encodings(url: str) -> None:
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+
+@pytest.mark.parametrize(
     ("allowed_entry", "host"),
     [
         ("::1", "[::1]"),
@@ -129,6 +139,48 @@ def test_is_blocked_host_allowed_hosts_normalize_brackets_and_mapped(
 @pytest.mark.parametrize("host", ["LOCALHOST", "LocalHost", "localhost"])
 def test_is_blocked_host_blocked_hosts_case_insensitive(host: str) -> None:
     assert is_blocked_host(host) is True
+
+
+@pytest.mark.parametrize(
+    "blocked_ip",
+    [
+        "127.0.0.2",
+        "10.0.0.2",
+        "172.16.0.2",
+        "192.168.0.2",
+        "169.254.0.2",
+        "100.64.0.2",
+        "100.100.100.200",
+        "169.254.169.254",
+        "::1",
+        "fc00::2",
+        "fd00:ec2::254",
+    ],
+)
+def test_is_blocked_host_rejects_any_blocked_dns_answer(monkeypatch: pytest.MonkeyPatch, blocked_ip: str) -> None:
+    family = socket.AF_INET6 if ":" in blocked_ip else socket.AF_INET
+
+    def resolves_with_blocked_answer(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0)),
+            (family, socket.SOCK_STREAM, 0, "", (blocked_ip, port or 0)),
+        ]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_with_blocked_answer)
+
+    assert is_blocked_host("public.example.test", resolve_dns=True) is True
+
+
+def test_is_blocked_host_allows_public_dns_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2606:2800:220:1:248:1893:25c8:1946", port or 0)),
+        ]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
+    assert is_blocked_host("public.example.test", resolve_dns=True) is False
 
 
 def test_validate_fetch_url_blocks_hostname_resolving_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:

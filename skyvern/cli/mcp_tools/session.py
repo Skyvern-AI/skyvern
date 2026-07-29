@@ -5,6 +5,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -15,6 +16,7 @@ from skyvern.cli.core.session_ops import (
     do_session_create,
     do_session_list,
 )
+from skyvern.cli.core.trajectory_store import delete_session_trajectories
 from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import proxy_location_to_request
 
@@ -306,6 +308,7 @@ async def skyvern_browser_session_close(
     Closes the specified session or the current active session.
     """
     current = get_current_session()
+    await drain_action_log_events()
 
     with Timer() as timer:
         try:
@@ -322,6 +325,7 @@ async def skyvern_browser_session_close(
                 try:
                     result = await do_session_close(skyvern, session_id)
                     clear_session_ref_map(session_id=session_id)
+                    delete_session_trajectories(session_id)
                 except Exception as e:
                     close_error = e
 

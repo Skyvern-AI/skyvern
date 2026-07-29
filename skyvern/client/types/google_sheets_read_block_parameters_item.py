@@ -183,6 +183,8 @@ class GoogleSheetsReadBlockParametersItem_Credential(UniversalBaseModel):
     credential_parameter_id: str
     workflow_id: str
     credential_id: str
+    credential_ids: typing.Optional[typing.List[str]] = None
+    selection_strategy: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

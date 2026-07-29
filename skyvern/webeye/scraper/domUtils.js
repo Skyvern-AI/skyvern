@@ -765,6 +765,204 @@ function isHiddenOrDisabled(element) {
   return isHidden(element) || element.disabled;
 }
 
+// Report an open ARIA popup trigger so one scrolling screenshot can skip scrolling while it is
+// open. Combobox / menu / listbox / dialog / grid / tree popups (portal-rendered date/list
+// pickers) usually render in a portal that dismisses on scroll, which the post-action
+// and next-scrape screenshots would otherwise trigger before the agent can act on the popup.
+const ARIA_POPUP_HASPOPUP_VALUES = new Set([
+  "true",
+  "listbox",
+  "menu",
+  "dialog",
+  "grid",
+  "tree",
+]);
+
+function isAriaPopupElementVisible(element) {
+  if (isHidden(element)) return false;
+  const style = getElementComputedStyle(element);
+  if (style) {
+    if (style.visibility === "hidden" || style.visibility === "collapse") {
+      return false;
+    }
+    const opacity = parseFloat(style.opacity);
+    if (!Number.isNaN(opacity) && opacity === 0) return false;
+    if (style.contentVisibility === "hidden") return false;
+  }
+  // Native flat-tree check: Element.checkVisibility (Chromium) rejects an element hidden by an
+  // ancestor's display / content-visibility, or a UA shadow root (e.g. a closed <details>), up the
+  // flat tree — which the light-DOM parentElement walk below cannot see. WebKit (checkVisibility
+  // bug) and unit mocks fall through to the manual walk.
+  if (!isElementStyleVisibilityVisible(element, style)) return false;
+  // WebKit-safe, mockable fallback: display / opacity / content-visibility do not propagate to a
+  // descendant's own computed style, so walk the FULL ancestor chain to reject a hidden portal (a
+  // hidden ancestor can sit at any depth — no arbitrary cap). A visited Set (identity) guards a
+  // malformed/cyclic parentElement chain: each ancestor is inspected at most once, so traversal
+  // terminates in O(distinct ancestors) even on a pathological DOM.
+  let ancestor = element.parentElement;
+  const seenAncestors = new Set();
+  while (ancestor && !seenAncestors.has(ancestor)) {
+    seenAncestors.add(ancestor);
+    if (ancestor.hidden) return false;
+    const ancestorStyle = getElementComputedStyle(ancestor);
+    if (ancestorStyle) {
+      if (ancestorStyle.display === "none") return false;
+      if (
+        ancestorStyle.visibility === "hidden" ||
+        ancestorStyle.visibility === "collapse"
+      ) {
+        return false;
+      }
+      const ancestorOpacity = parseFloat(ancestorStyle.opacity);
+      if (!Number.isNaN(ancestorOpacity) && ancestorOpacity === 0) return false;
+      if (ancestorStyle.contentVisibility === "hidden") return false;
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return true;
+}
+
+// aria-controls / aria-owns are whitespace-separated IDREF lists; resolve them against the
+// light DOM only (IDREF resolution does not cross shadow boundaries). Returns the resolved
+// targets plus hadIdref: whether the trigger named at least one non-empty IDREF. A trigger that
+// named an IDREF but resolved nothing is a popup unmounted on close (dangling), which the caller
+// must distinguish from a trigger with no aria-controls at all (a portal wired without one).
+function resolveAriaPopupTargets(trigger) {
+  const targets = [];
+  let hadIdref = false;
+  for (const attr of ["aria-controls", "aria-owns"]) {
+    const raw = trigger.getAttribute(attr);
+    if (!raw) continue;
+    for (const id of raw.split(/\s+/)) {
+      if (!id) continue;
+      hadIdref = true;
+      const target = document.getElementById(id);
+      if (target) targets.push(target);
+    }
+  }
+  return { targets, hadIdref };
+}
+
+// A box paints an area only if its border box has positive width/height AND intersects the viewport
+// (shared by the trigger gate and the target rendered-area gate below). checkVisibility() and style
+// visibility pass for zero-area / transform:scale(0) / clipped elements, so geometry must be checked
+// separately or a target that renders nothing would false-positive as an open popup.
+function hasPositiveViewportArea(element) {
+  const rect = element.getBoundingClientRect();
+  return (
+    rect.width > 0 &&
+    rect.height > 0 &&
+    rect.bottom > 0 &&
+    rect.right > 0 &&
+    rect.top < window.innerHeight &&
+    rect.left < window.innerWidth
+  );
+}
+
+const CLIPPING_OVERFLOW_VALUES = new Set(["hidden", "clip", "scroll", "auto"]);
+
+function clipsOverflow(style) {
+  if (!style) return false;
+  return (
+    CLIPPING_OVERFLOW_VALUES.has(style.overflow) ||
+    CLIPPING_OVERFLOW_VALUES.has(style.overflowX) ||
+    CLIPPING_OVERFLOW_VALUES.has(style.overflowY)
+  );
+}
+
+// A descendant is clipped to nothing if a clipping-overflow ancestor between it and `boundary`
+// (inclusive) has zero on-screen area, so a zero-size scroll/hidden container swallows it. Identity
+// Set guards a malformed/cyclic chain; the walk stops at `boundary` (the resolved target).
+function isClippedByZeroAreaAncestor(descendant, boundary) {
+  let ancestor = descendant.parentElement;
+  const seen = new Set();
+  while (ancestor && !seen.has(ancestor)) {
+    seen.add(ancestor);
+    if (
+      clipsOverflow(getElementComputedStyle(ancestor)) &&
+      !hasPositiveViewportArea(ancestor)
+    ) {
+      return true;
+    }
+    if (ancestor === boundary) break;
+    ancestor = ancestor.parentElement;
+  }
+  return false;
+}
+
+// A resolved aria-controls target counts as an open popup only if it actually paints an area: its
+// own border box paints, or — when the target is a zero-area container that does NOT clip its
+// overflow (an overflow:visible portal mount point) — a genuinely rendered, visible descendant
+// escapes it. A zero-area target that clips its overflow (or has no rendered descendant) paints
+// nothing, so a stale aria-expanded=true trigger pointing at it is treated as closed. The subtree
+// walk needs no depth/count cap: a DOM subtree is finite and an identity Set visits each node once.
+function ariaPopupTargetHasRenderedArea(target) {
+  if (hasPositiveViewportArea(target)) return true;
+  if (clipsOverflow(getElementComputedStyle(target))) return false;
+  const stack = Array.from(target.children || []);
+  const seen = new Set();
+  while (stack.length) {
+    const descendant = stack.pop();
+    if (!descendant || seen.has(descendant)) continue;
+    seen.add(descendant);
+    if (
+      isAriaPopupElementVisible(descendant) &&
+      hasPositiveViewportArea(descendant) &&
+      !isClippedByZeroAreaAncestor(descendant, target)
+    ) {
+      return true;
+    }
+    for (const child of descendant.children || []) stack.push(child);
+  }
+  return false;
+}
+
+// Returns structural (non-PII) details of the first open ARIA popup trigger, or null. On a trigger
+// with no aria-controls/aria-owns at all, none-resolving => open (a sibling portal not wired via
+// aria-controls). On a trigger that named an IDREF: any resolved target visible+painting => open,
+// otherwise closed — a present-but-dangling IDREF is a popup unmounted on close, not an open one.
+// Scans the light DOM only, so triggers inside shadow roots are not detected. role / aria-haspopup
+// are page-controlled: only the matched allowlisted token is returned so arbitrary attacker-authored
+// attribute text never reaches telemetry.
+function getOpenAriaPopupTrigger() {
+  const candidates = document.querySelectorAll('[aria-expanded="true"]');
+  for (const trigger of candidates) {
+    const role = (trigger.getAttribute("role") || "").toLowerCase();
+    const hasPopup = (
+      trigger.getAttribute("aria-haspopup") || ""
+    ).toLowerCase();
+    const roleMatched = role === "combobox";
+    const hasPopupMatched = ARIA_POPUP_HASPOPUP_VALUES.has(hasPopup);
+    if (!roleMatched && !hasPopupMatched) {
+      continue;
+    }
+    if (!isAriaPopupElementVisible(trigger)) continue;
+    if (!hasPositiveViewportArea(trigger)) continue;
+
+    const { targets, hadIdref } = resolveAriaPopupTargets(trigger);
+    // No aria-controls/aria-owns at all => portal fallback (open). A named IDREF that resolves
+    // nothing => dangling => closed (falls through to targets.some over an empty list). A resolved
+    // target counts only if it is visible AND paints an area, so a stale trigger pointing at a
+    // zero-area/clipped target is treated as closed.
+    const open =
+      !hadIdref ||
+      targets.some(
+        (target) =>
+          isAriaPopupElementVisible(target) &&
+          ariaPopupTargetHasRenderedArea(target),
+      );
+    if (!open) continue;
+
+    return {
+      role: roleMatched ? "combobox" : null,
+      hasPopup: hasPopupMatched ? hasPopup : null,
+      tag: trigger.tagName ? trigger.tagName.toLowerCase() : null,
+      controlsResolved: targets.length,
+    };
+  }
+  return null;
+}
+
 function isScriptOrStyle(element) {
   const tagName = element.tagName.toLowerCase();
   return tagName === "script" || tagName === "style";
@@ -1738,6 +1936,145 @@ function enrichValidationState(attrs, element, elementTagNameLower) {
   }
 }
 
+// Destination-fact capture state (SKY-12875): OFF by default, switched on per build by
+// buildTreeFromBody only when the browser action policy is observing. Incremental builds,
+// single-element parses and tree-from-element never enable it.
+var __captureDestinationFacts = false;
+var __destinationFactBudget = 0;
+
+// Serialized overhead of one attached fact ({"kind":...,"url":null,"method":"get"} plus its
+// element-id key). Charging only url.length let 15,000 url-less facts through for 615,000 bytes:
+// an opaque fact is cheap, not free, and the budget bounds the PAYLOAD, not one field of it.
+const DESTINATION_FACT_OVERHEAD = 56;
+
+// Charge one fact against the per-build budget, or return null to attach nothing. Exhaustion
+// zeroes the budget, which is what stops all further capture WORK in buildElementObject —
+// resolution runs before the per-URL cap, so bounding only the output leaves the cost unbounded.
+function chargeDestinationBudget(facts) {
+  if (!facts) return null;
+  const cost =
+    DESTINATION_FACT_OVERHEAD +
+    (typeof facts.url === "string" ? facts.url.length : 0);
+  if (__destinationFactBudget < cost) {
+    __destinationFactBudget = 0;
+    return null;
+  }
+  __destinationFactBudget -= cost;
+  return facts;
+}
+
+function normalizeFormMethod(raw) {
+  if (typeof raw !== "string") return "get";
+  const method = raw.toLowerCase();
+  return method === "post" || method === "dialog" ? method : "get";
+}
+
+// Destination facts for the browser action firewall (SKY-12875): where would interacting with
+// this element send data? They are captured in the MAIN WORLD and are TAMPERABLE: hostile page
+// code can forge or suppress them, so they can be FALSE TELEMETRY. They may DENY or NARROW a
+// decision, but must never establish ALLOWED or authorization. Python strips them from element
+// dicts at the SkyvernFrame boundary. Malformed, clobbered, or throwing input fails closed:
+// null means "no destination structure"; url:null means unresolved; both are INCOMPLETE.
+function buildDestinationFacts(element, tagNameLower) {
+  // Capture remains deliberately disabled for SKY-12875. Re-enable only after: (1) F3 bounds
+  // resolution/serialization work before allocation instead of truncating the post-resolution
+  // result (that truncation is the defect, not the fix); (2) the MAIN-WORLD tamperability and
+  // cannot-authorize telemetry note has landed; (3) the (beforeunload, dismiss) capability-table
+  // gap is closed; and (4) the F5 consequence is load-bearing in with_resolved_target's docstring.
+  return null;
+  try {
+    const doc = element.ownerDocument;
+    // Length caps bound the RESOLVED value, not just the raw attribute: 4096 compact raw chars
+    // resolve to ~9x that once percent-encoded, and the fact is duplicated into every owned
+    // control — an O(controls x resolved-length) amplification. Over-cap degrades to opaque.
+    const bounded = (value) =>
+      typeof value === "string" && value !== "" && value.length <= 4096
+        ? value
+        : null;
+    // The BASE is capped for cost, not just the result: resolving a short relative href against a
+    // page-controlled 1MB <base> builds a 1MB string per element before any cap can reject it.
+    const baseURI =
+      doc && typeof doc.baseURI === "string" ? bounded(doc.baseURI) : null;
+    const resolve = (raw) => {
+      if (bounded(raw) === null) return null;
+      try {
+        return bounded(
+          baseURI ? new URL(raw, baseURI).href : new URL(raw).href,
+        );
+      } catch (e) {
+        return null;
+      }
+    };
+    if (tagNameLower === "a" || tagNameLower === "area") {
+      const rawHref = element.getAttribute("href");
+      if (rawHref === null) return null;
+      if (element.getAttribute("ping")) {
+        // ping= sends POST beacons to further destinations on activation; one URL cannot
+        // represent where the click sends data, so the anchor is opaque, not partially safe.
+        return { kind: "anchor", url: null };
+      }
+      return { kind: "anchor", url: resolve(rawHref) };
+    }
+    // element.form is the EFFECTIVE owner per spec: a form= attribute override wins, an invalid
+    // form= id means no owner (not the ancestor), and a hidden ancestor form still owns.
+    const form = element.form;
+    if (!form || typeof form.getAttribute !== "function") {
+      // Covers no owner AND a clobbered form: HTMLFormElement's named getter is
+      // [LegacyOverrideBuiltIns], so <input name=getAttribute> shadows the method itself.
+      return null;
+    }
+    const controlType = (element.getAttribute("type") || "").toLowerCase();
+    if (controlType === "button" || controlType === "reset") {
+      // A non-submitting click control stages no data and never submits: its activation is
+      // arbitrary script, and an ancestor form must not lend it a known destination. The same
+      // control outside a form is opaque; inside one it must classify the same way.
+      return null;
+    }
+    const documentUrl = () =>
+      doc && typeof doc.URL === "string" ? bounded(doc.URL) : null;
+    // "Empty" means empty AFTER the URL parser's leading/trailing strip, which is the C0-control
+    // and space set — NOT String.trim(), which also eats U+00A0 and would over-strip. A
+    // whitespace-only action submits to the DOCUMENT URL; resolving it instead resolves against
+    // <base>, which real Chromium contradicted across origins.
+    const isBlankUrl = (value) =>
+      value.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "") === "";
+    const rawAction = form.getAttribute("action");
+    // Per spec a missing or empty action attribute submits to the document's own URL.
+    let url;
+    if (rawAction === null || isBlankUrl(rawAction)) {
+      url = documentUrl();
+    } else {
+      url = resolve(rawAction);
+    }
+    let method = normalizeFormMethod(form.getAttribute("method"));
+    // Enumerated-attribute normalization: an INVALID button type defaults to "submit" (only
+    // "button" and "reset" opt out, and both returned opaque above), while an invalid input type
+    // defaults to "text". Treating a garbage-typed button as non-submit would record the owner
+    // form's action while the browser submits to the button's hostile formaction — a fail-open.
+    const isSubmitter =
+      tagNameLower === "button" ||
+      (tagNameLower === "input" &&
+        (controlType === "submit" || controlType === "image"));
+    if (isSubmitter) {
+      // A PRESENT-but-blank override still overrides (F6/L1): Chromium submits formaction="" AND
+      // formaction="   " to the DOCUMENT URL and normalizes formmethod="" to GET. Treating blank
+      // as absent recorded the owner form's action+method while the browser went elsewhere — the
+      // invalid-button-type fail-open's sibling.
+      const formAction = element.getAttribute("formaction");
+      if (formAction !== null) {
+        url = isBlankUrl(formAction) ? documentUrl() : resolve(formAction);
+      }
+      const formMethod = element.getAttribute("formmethod");
+      if (formMethod !== null) {
+        method = normalizeFormMethod(formMethod);
+      }
+    }
+    return { kind: "form", url: url, method: method };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function buildElementObject(
   frame,
   element,
@@ -1905,6 +2242,20 @@ async function buildElementObject(
     elementObj.attributes["selected"] = selectedValue;
   }
 
+  // The budget is checked BEFORE building: buildDestinationFacts resolves URLs, and resolution
+  // is the expensive half. Exhaustion zeroes the budget, so every later element in this build
+  // skips the call entirely instead of resolving and then being discarded. Over budget the fact
+  // is DROPPED, not nulled — an element with no fact is INCOMPLETE downstream, so this fails
+  // closed rather than fails large.
+  if (__captureDestinationFacts && __destinationFactBudget > 0) {
+    const destinationFacts = chargeDestinationBudget(
+      buildDestinationFacts(element, elementTagNameLower),
+    );
+    if (destinationFacts) {
+      elementObj.destination = destinationFacts;
+    }
+  }
+
   return elementObj;
 }
 
@@ -1913,6 +2264,7 @@ async function buildTreeFromBody(
   frame = "main.frame",
   frame_index = undefined,
   must_included_tags = [],
+  captureDestinationFacts = false,
 ) {
   if (
     window.GlobalSkyvernFrameIndex === undefined &&
@@ -1920,17 +2272,29 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
-  const maxElementNumber = 15000;
-  const elementsAndResultArray = await buildElementTree(
-    document.documentElement,
-    frame,
-    false,
-    undefined,
-    maxElementNumber,
-    must_included_tags,
-  );
-  DomUtils.elementListCache = elementsAndResultArray[0];
-  return elementsAndResultArray;
+  // Destination-fact capture (SKY-12875) runs ONLY when the caller opts in: for a page that has
+  // not interposed on this global, a disabled-mode build does zero capture work — no attribute
+  // reads, no URL resolution, no fact allocation. A page CAN still reach this argument by
+  // redefining the global between injection and the call (the export itself is no longer
+  // hijackable via a setter), so the per-build budget is the load-bearing bound rather than the
+  // flag: it caps total serialized fact bytes AND stops resolution once exhausted.
+  __captureDestinationFacts = captureDestinationFacts === true;
+  __destinationFactBudget = 524288;
+  try {
+    const maxElementNumber = 15000;
+    const elementsAndResultArray = await buildElementTree(
+      document.documentElement,
+      frame,
+      false,
+      undefined,
+      maxElementNumber,
+      must_included_tags,
+    );
+    DomUtils.elementListCache = elementsAndResultArray[0];
+    return elementsAndResultArray;
+  } finally {
+    __captureDestinationFacts = false;
+  }
 }
 
 async function buildElementTree(

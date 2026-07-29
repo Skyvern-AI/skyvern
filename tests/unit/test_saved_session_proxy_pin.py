@@ -44,7 +44,7 @@ def _workflow(
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=SimpleNamespace(parameters=parameters or []),
+        workflow_definition=SimpleNamespace(parameters=parameters or [], blocks=[]),
     )
 
 
@@ -90,7 +90,11 @@ def _workflow_run(
         workflow_run_id="wr_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        browser_session_id=None,
         browser_profile_id=browser_profile_id,
+        browser_seed_source=None,
+        browser_sink_profile_id=None,
+        retried_from_workflow_run_id=None,
         proxy_location=proxy_location,
     )
 
@@ -197,7 +201,7 @@ async def _prepare_profile(
     profile: SimpleNamespace | None = None,
     update_profile: AsyncMock | None = None,
     parameter_values: dict[str, object] | None = None,
-) -> SimpleNamespace:
+) -> str | None:
     workflow = workflow or _workflow()
     workflow_run = workflow_run or _workflow_run()
     profile = profile or _profile()
@@ -212,7 +216,7 @@ async def _prepare_profile(
     monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", AsyncMock(return_value=updated_run))
     _mock_storage(monkeypatch)
 
-    return await WorkflowService()._prepare_persisted_workflow_browser_profile(
+    return await WorkflowService()._ensure_managed_browser_profile(
         workflow=workflow,  # type: ignore[arg-type]
         workflow_run=workflow_run,  # type: ignore[arg-type]
         parameter_values=parameter_values or {"credential_id": "cred_a"},
@@ -763,6 +767,7 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         organization_id="org_test",
         browser_session_id="pbs_requested",
         browser_profile_id=None,
+        start_fresh_browser=request.start_fresh_browser,
         proxy_location=request.proxy_location,
         webhook_callback_url=request.webhook_callback_url,
         totp_verification_url=request.totp_verification_url,
@@ -781,6 +786,8 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         workflow_run_id=None,
         trigger_type=None,
         workflow_schedule_id=None,
+        retried_from_workflow_run_id=None,
+        fallback_attempt=None,
         ignore_inherited_workflow_system_prompt=False,
         copilot_session_id=None,
     )
@@ -802,7 +809,7 @@ async def test_prepare_managed_profile_sets_deterministic_pin(
     )
 
     expected_pin = derive_proxy_session_id("org_test", "wpid_test", digest)
-    assert result.browser_profile_id == "bp_managed"
+    assert result == "bp_managed"
     update_profile.assert_awaited_once_with(
         profile_id="bp_managed",
         organization_id="org_test",

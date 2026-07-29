@@ -14,6 +14,7 @@ from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificati
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.services import otp_service
 from skyvern.services.otp_service import (
     OTPValue,
     _get_otp_value_from_db,
@@ -470,6 +471,127 @@ class TestParseOtpLogin:
         assert parser["otp_type"] == "totp"
         assert parser["otp_value_found"] is True
         assert parser["otp_length"] == len(raw)
+
+    @pytest.mark.asyncio
+    async def test_off_schema_response_returns_none_without_leaking_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.services import otp_service
+
+        raw_content = "Long email body requesting OTP 424242 to finish sign in."
+        off_schema_resp = {"otp_type": "totp", "otp_value": "424242"}
+
+        async def fake_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return off_schema_resp
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", fake_handler, raising=False)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await parse_otp_login(content=raw_content, organization_id="o_test")
+
+        assert result is None
+
+        warning = next((r for r in logs if r.get("exception_type") == "ValidationError"), None)
+        assert warning is not None
+        assert warning["organization_id"] == "o_test"
+        assert "content" not in warning
+        assert "resp" not in warning
+        for record in logs:
+            assert raw_content not in repr(record)
+            assert "424242" not in repr(record)
+            for value in record.values():
+                assert raw_content not in str(value)
+                assert "424242" not in str(value)
+
+    @pytest.mark.asyncio
+    async def test_charges_for_parse_even_when_no_code_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        async def no_code_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"reasoning": "no code present", "otp_type": None, "otp_value_found": False, "otp_value": None}
+
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", no_code_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content="raw email body with no code inside it", organization_id="o_test")
+
+        assert result is None
+        charge.assert_awaited_once_with("o_test")
+
+    @pytest.mark.asyncio
+    async def test_does_not_charge_when_llm_call_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+        from skyvern.services import otp_service
+
+        async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise LLMProviderError("gemini-2.5-flash")
+
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", failing_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        with pytest.raises(LLMProviderError):
+            await parse_otp_login(content="raw email body that exceeds ten chars", organization_id="o_test")
+
+        charge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_llm_and_charge_when_out_of_credits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        llm_handler = AsyncMock()
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", llm_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=False),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content="raw email body with OTP 424242 inside", organization_id="o_test")
+
+        assert result is None
+        llm_handler.assert_not_awaited()
+        charge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_backend_provider_error_propagates_not_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+        from skyvern.services import otp_service
+
+        async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise LLMProviderError("gemini-2.5-flash")
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", failing_handler, raising=False)
+
+        with pytest.raises(LLMProviderError):
+            await parse_otp_login(content="raw email body that exceeds ten chars", organization_id="o_test")
 
 
 class TestPollOtpValueRetry:
@@ -1423,3 +1545,99 @@ async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_
     assert result == OTPValue(value="111111", type=OTPType.TOTP)
     assert get_otp_codes.await_args.kwargs["workflow_run_id"] is None
     assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is False
+
+
+def _raw_otp_row(totp_code_id: str = "otp_raw", task_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        totp_code_id=totp_code_id,
+        content="open the sign-in link",
+        workflow_run_id=None,
+        workflow_id=None,
+        task_id=task_id,
+        expired_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_raw_otp_reparse_promotes_expected_type() -> None:
+    raw = _raw_otp_row()
+    ineligible = [SimpleNamespace(**(vars(raw) | {"totp_code_id": f"skip_{i}", "task_id": "other"})) for i in range(3)]
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch(
+            "skyvern.services.otp_service.parse_otp_login",
+            new=AsyncMock(return_value=OTPValue(value="https://example.test/login", type=OTPType.MAGIC_LINK)),
+        ) as parse,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[*ineligible, raw])
+        mock_app.DATABASE.otp.promote_raw_otp_code = AsyncMock(return_value=SimpleNamespace())
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=otp_service.RawOTPVerificationContext(),
+        )
+    assert result == OTPValue(value="https://example.test/login", type=OTPType.MAGIC_LINK)
+    parse.assert_awaited_once_with(raw.content, "o_test", enforced_otp_type=OTPType.MAGIC_LINK)
+    mock_app.DATABASE.otp.promote_raw_otp_code.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_raw_otp_reparse_exception_retries_without_negative_cache() -> None:
+    raw, context = _raw_otp_row(), otp_service.RawOTPVerificationContext()
+    parsed = OTPValue(value="https://example.test/login", type=OTPType.MAGIC_LINK)
+    kwargs = {"expected_otp_type": OTPType.MAGIC_LINK, "raw_context": context}
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(side_effect=[RuntimeError, parsed])),
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[raw])
+        mock_app.DATABASE.otp.promote_raw_otp_code = AsyncMock(return_value=SimpleNamespace())
+        assert await _get_otp_value_from_db("o_test", "otp@example.test", **kwargs) is None
+        assert context.misses == set()
+        assert await _get_otp_value_from_db("o_test", "otp@example.test", **kwargs) == parsed
+    mock_app.DATABASE.otp.promote_raw_otp_code.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_raw_otp_wrong_type_is_negative_cached_per_session() -> None:
+    rows = [_raw_otp_row(f"otp_raw_{index}") for index in range(4)]
+    context = otp_service.RawOTPVerificationContext()
+
+    async def get_raw_otp_codes(**kwargs: object) -> list[SimpleNamespace]:
+        excluded_ids = kwargs["excluded_ids"]
+        return [row for row in rows if row.totp_code_id not in excluded_ids][:3]
+
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch(
+            "skyvern.services.otp_service.parse_otp_login",
+            new=AsyncMock(return_value=OTPValue(value="123456", type=OTPType.TOTP)),
+        ) as parse,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(side_effect=get_raw_otp_codes)
+        mock_app.DATABASE.otp.promote_raw_otp_code = AsyncMock()
+        for _ in range(2):
+            assert (
+                await _get_otp_value_from_db(
+                    "o_test",
+                    "otp@example.test",
+                    expected_otp_type=OTPType.MAGIC_LINK,
+                    raw_context=context,
+                )
+                is None
+            )
+    assert parse.await_count == 4
+    mock_app.DATABASE.otp.promote_raw_otp_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_raw_otp_rows_are_skipped_without_expected_type() -> None:
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock()
+        assert await _get_otp_value_from_db("o_test", "otp@example.test") is None
+    mock_app.DATABASE.otp.get_raw_otp_codes.assert_not_awaited()

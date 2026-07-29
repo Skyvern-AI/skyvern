@@ -43,7 +43,11 @@ class FileUploadBlockYaml(UniversalBaseModel):
     sftp_private_key_passphrase: typing.Optional[str] = None
     sftp_remote_path: typing.Optional[str] = None
     sftp_host_key: typing.Optional[str] = None
-    prompt: typing.Optional[str] = None
+    prompt: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional natural-language control over which downloaded files are uploaded; empty means upload all.
+    """
+
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:

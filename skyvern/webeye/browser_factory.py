@@ -4,13 +4,13 @@ import asyncio
 import os
 import pathlib
 import platform
-import random
 import re
 import shutil
 import socket
 import subprocess
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +29,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import (
     Page,
     Playwright,
+    Video,
 )
 
 from skyvern.config import settings
@@ -53,9 +54,9 @@ from skyvern.webeye.cdp_connection import (
     merge_cdp_connect_headers,
     parse_default_cdp_connect_headers,
 )
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
-from skyvern.webeye.session_cookies import restore_session_cookies
+from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -131,6 +132,25 @@ def sanitize_browser_headers(headers: dict[str, str] | None) -> dict[str, str] |
     return sanitized or None
 
 
+async def _capture_seed_profile_state(
+    browser_context: BrowserContext, browser_artifacts: BrowserArtifacts, kwargs: dict[str, Any]
+) -> None:
+    """Snapshot what the seed profile held at run start — its cookies (post-restore, pre-navigation) plus
+    a stored-archive fingerprint — so the write-back freshness guard can contribute only this run's own
+    cookie changes when the stored profile moved under it. Best-effort: never break browser creation."""
+    browser_profile_id = kwargs.get("browser_profile_id")
+    organization_id = kwargs.get("organization_id")
+    if not browser_profile_id or not organization_id or not browser_artifacts.browser_session_dir:
+        return
+    try:
+        cookies = await browser_context.cookies()
+        etag = await app.STORAGE.get_browser_profile_etag(organization_id, browser_profile_id)
+        browser_artifacts.record_seed_profile_state([dict(cookie) for cookie in cookies], etag)
+    except Exception:
+        LOG.warning("Failed to capture seed profile state for the write-back freshness guard", exc_info=True)
+        browser_artifacts.mark_seed_capture_failed()
+
+
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     if browser_artifacts.browser_console_log_path is None:
         log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
@@ -158,6 +178,40 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
+async def resolve_artifact_path(source: Video | Download, timeout_seconds: float) -> str | None:
+    """Await source.path() without ever cancelling a shared artifact future another awaiter may hold.
+
+    Patchright's Video resolves path() from one future shared across awaiters, so a bare
+    timeout-cancel on any awaiter poisons it for the others (SKY-12852 / SKY-12860). Download.path()
+    resolves via a fresh per-call future today and is not exposed, but is routed here too so a pin
+    bump that reintroduces a shared Download future cannot revive that orphan-hang class.
+    """
+    path_task = asyncio.ensure_future(source.path())
+    # Consume the task's eventual outcome even when it outlives this wait (timeout / caller
+    # cancelled), so a late PlaywrightError on page close doesn't log "Task exception was
+    # never retrieved".
+    path_task.add_done_callback(_consume_abandoned_task_result)
+    try:
+        raw_path = await asyncio.wait_for(asyncio.shield(path_task), timeout_seconds)
+    except TimeoutError:
+        # path_task keeps waiting harmlessly; the shared future stays live for other awaiters.
+        return None
+    except asyncio.CancelledError:
+        # path_task.cancelled() is direct evidence the shared artifact future was
+        # cancelled by another awaiter (shield keeps caller cancellation from reaching
+        # it); current_task().cancelling() is a counter that can read stale-nonzero
+        # after any caught-but-not-uncancelled CancelledError.
+        if path_task.cancelled():
+            return None
+        raise
+    return str(raw_path) if raw_path is not None else None
+
+
+def _consume_abandoned_task_result(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     tracked_paths: set[str] = set()
 
@@ -166,15 +220,19 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
             video = page.video
             if not video:
                 return
-            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
-                raw_path = await video.path()
-            if raw_path is None:
+            video_path_or_none = await resolve_artifact_path(video, settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS)
+            if video_path_or_none is None:
+                try:
+                    page_origin = urlparse(page.url).hostname or "unknown"
+                except Exception:
+                    page_origin = "unknown"
+                LOG.warning("Popup video path resolution timed out", page_origin=page_origin)
                 return
             # The await above may have raced a discard (RealBrowserState closing this page
             # before it ever became the working page) — honor it even though it landed after.
             if browser_artifacts.is_page_video_discarded(page):
                 return
-            video_path = str(raw_path)
+            video_path = video_path_or_none
             # After the await, another handler may have already registered this path
             if video_path in tracked_paths:
                 return
@@ -186,12 +244,6 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
             browser_artifacts.video_artifacts.append(VideoArtifact(video_path=video_path))
         except PlaywrightError:
             LOG.debug("Failed to register popup page video", exc_info=True)
-        except TimeoutError:
-            try:
-                page_origin = urlparse(page.url).hostname or "unknown"
-            except Exception:
-                page_origin = "unknown"
-            LOG.warning("Popup video path resolution timed out", page_origin=page_origin)
         except Exception:
             LOG.warning("Failed to register popup page video", exc_info=True)
 
@@ -218,72 +270,76 @@ def set_download_file_listener(
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
         task_id = (context.task_id if context else None) or kwargs.get("task_id")
         try:
-            async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
-                file_path = await download.path()
-                if not file_path.exists():
-                    # On an adopted persistent session the bytes live on the run connection, not
-                    # this worker connection; saving is the run side's job, so skip rather than crash.
-                    LOG.debug(
-                        "Download artifact absent on this connection; skipping worker-side rename",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        suggested_filename=download.suggested_filename,
-                    )
-                    return
-                if file_path.suffix:
-                    return
-
-                LOG.info(
-                    "No file extensions, going to add file extension automatically",
+            # Route path() through resolve_artifact_path so a timeout can never cancel a shared
+            # artifact future (see resolve_artifact_path). Everything after the await is synchronous
+            # filesystem work, so it does not need to run under a timeout.
+            resolved_path = await resolve_artifact_path(download, download_timeout or BROWSER_DOWNLOAD_TIMEOUT)
+            if resolved_path is None:
+                LOG.error(
+                    "timeout to download file, going to cancel the download",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                )
+                await download.cancel()
+                return
+            file_path = Path(resolved_path)
+            if not file_path.exists():
+                # On an adopted persistent session the bytes live on the run connection, not
+                # this worker connection; saving is the run side's job, so skip rather than crash.
+                LOG.debug(
+                    "Download artifact absent on this connection; skipping worker-side rename",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                     suggested_filename=download.suggested_filename,
-                    url=_redact_url_query(download.url),
                 )
-                suffix = Path(download.suggested_filename).suffix
-                if suffix:
-                    LOG.info(
-                        "Add extension according to suggested filename",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        filepath=str(file_path) + suffix,
-                    )
-                    file_path.rename(str(file_path) + suffix)
-                    return
+                return
+            if file_path.suffix:
+                return
 
-                parsed_url = urlparse(download.url)
-                parsed_qs = parse_qsl(parsed_url.query)
-                for key, value in parsed_qs:
-                    if key.lower() == "filename":
-                        suffix = Path(value).suffix
-                        if suffix:
-                            LOG.info(
-                                "Add extension according to the parsed query params of download url",
-                                workflow_run_id=workflow_run_id,
-                                task_id=task_id,
-                                filename=value,
-                            )
-                            file_path.rename(str(file_path) + suffix)
-                            return
-
-                suffix = Path(parsed_url.path).suffix
-                if suffix:
-                    LOG.info(
-                        "Add extension according to download url path",
-                        workflow_run_id=workflow_run_id,
-                        task_id=task_id,
-                        filepath=str(file_path) + suffix,
-                    )
-                    file_path.rename(str(file_path) + suffix)
-                    return
-                # TODO: maybe should try to parse it from URL response
-        except asyncio.TimeoutError:
-            LOG.error(
-                "timeout to download file, going to cancel the download",
+            LOG.info(
+                "No file extensions, going to add file extension automatically",
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
+                suggested_filename=download.suggested_filename,
+                url=_redact_url_query(download.url),
             )
-            await download.cancel()
+            suffix = Path(download.suggested_filename).suffix
+            if suffix:
+                LOG.info(
+                    "Add extension according to suggested filename",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    filepath=str(file_path) + suffix,
+                )
+                file_path.rename(str(file_path) + suffix)
+                return
+
+            parsed_url = urlparse(download.url)
+            parsed_qs = parse_qsl(parsed_url.query)
+            for key, value in parsed_qs:
+                if key.lower() == "filename":
+                    suffix = Path(value).suffix
+                    if suffix:
+                        LOG.info(
+                            "Add extension according to the parsed query params of download url",
+                            workflow_run_id=workflow_run_id,
+                            task_id=task_id,
+                            filename=value,
+                        )
+                        file_path.rename(str(file_path) + suffix)
+                        return
+
+            suffix = Path(parsed_url.path).suffix
+            if suffix:
+                LOG.info(
+                    "Add extension according to download url path",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    filepath=str(file_path) + suffix,
+                )
+                file_path.rename(str(file_path) + suffix)
+                return
+            # TODO: maybe should try to parse it from URL response
 
         except Exception:
             LOG.exception(
@@ -485,21 +541,6 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        # Custom per-request proxy URL takes precedence over the global proxy pool.
-        # Users may pass proxy_location={"url": "http://user:pass@host:port"} to
-        # route this specific task/session through their own proxy server.
-        if isinstance(proxy_location, dict) and "url" in proxy_location:
-            proxy_url = proxy_location["url"]
-            if _is_valid_proxy_url(proxy_url):
-                args["proxy"] = {"server": proxy_url}
-                LOG.info("Using custom per-request proxy URL", proxy_url=_redact_proxy_url(proxy_url))
-            else:
-                LOG.warning("Invalid custom proxy URL provided, ignoring", proxy_url=_redact_proxy_url(proxy_url))
-        elif settings.ENABLE_PROXY:
-            proxy_config = setup_proxy()
-            if proxy_config:
-                args["proxy"] = proxy_config
-
         if isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
@@ -531,12 +572,19 @@ class BrowserContextFactory:
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
+        cleanup_func: BrowserCleanupFunc = None
         try:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
+            # After session cookies so a verified-login heal (banked by the credential living-profile
+            # engine) wins over the profile's own older session cookies on a key clash. Gated on the
+            # engine kill-switch so a rollback also stops applying previously banked login state.
+            if await app.AGENT_FUNCTION.should_apply_banked_cookies(kwargs.get("organization_id")):
+                await restore_banked_cookies(browser_context, browser_artifacts.browser_session_dir)
+                await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
@@ -550,89 +598,20 @@ class BrowserContextFactory:
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
             return browser_context, browser_artifacts, cleanup_func
-        except Exception as e:
+        except BaseException as e:
             if browser_context is not None:
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
-                await browser_context.close()
+                with suppress(Exception):
+                    await browser_context.close()
+            if cleanup_func:
+                with suppress(Exception):
+                    await cleanup_func()
 
-            if isinstance(e, UnknownBrowserType):
+            if not isinstance(e, Exception) or isinstance(e, UnknownBrowserType):
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
-
-
-def setup_proxy() -> dict | None:
-    if not settings.HOSTED_PROXY_POOL or settings.HOSTED_PROXY_POOL.strip() == "":
-        LOG.warning("No proxy server value found. Continuing without using proxy...")
-        return None
-
-    proxy_servers = [server.strip() for server in settings.HOSTED_PROXY_POOL.split(",") if server.strip()]
-
-    if not proxy_servers:
-        LOG.warning("Proxy pool contains only empty values. Continuing without proxy...")
-        return None
-
-    valid_proxies = []
-    for proxy in proxy_servers:
-        if _is_valid_proxy_url(proxy):
-            valid_proxies.append(proxy)
-        else:
-            LOG.warning(f"Invalid proxy URL format: {proxy}")
-
-    if not valid_proxies:
-        LOG.warning("No valid proxy URLs found. Continuing without proxy...")
-        return None
-
-    try:
-        proxy_server = random.choice(valid_proxies)
-        proxy_creds = _get_proxy_server_creds(proxy_server)
-
-        LOG.info("Found proxy server creds, using them...")
-
-        return {
-            "server": proxy_server,
-            "username": proxy_creds.get("username", ""),
-            "password": proxy_creds.get("password", ""),
-        }
-    except Exception as e:
-        LOG.warning(f"Error setting up proxy: {e}. Continuing without proxy...")
-        return None
-
-
-def _redact_proxy_url(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-        if not parsed.hostname:
-            return "<redacted>"
-        host = parsed.hostname
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-        userinfo = ""
-        if parsed.username:
-            userinfo = f"{parsed.username}:***@" if parsed.password else f"{parsed.username}@"
-        return f"{parsed.scheme}://{userinfo}{host}"
-    except Exception:
-        return "<redacted>"
-
-
-def _is_valid_proxy_url(url: str) -> bool:
-    PROXY_PATTERN = re.compile(r"^(http|https|socks5):\/\/([^:@]+(:[^@]*)?@)?[^\s:\/]+(:\d+)?$")
-    try:
-        parsed = urlparse(url)
-        if not parsed.scheme or not parsed.netloc:
-            return False
-        return bool(PROXY_PATTERN.match(url))
-    except Exception:
-        return False
-
-
-def _get_proxy_server_creds(proxy: str) -> dict:
-    parsed_url = urlparse(proxy)
-    if parsed_url.username and parsed_url.password:
-        return {"username": parsed_url.username, "password": parsed_url.password}
-    LOG.warning("No credentials found in the proxy URL.")
-    return {}
 
 
 def _is_display_server_error(error: Exception) -> bool:
@@ -800,6 +779,7 @@ async def _create_headless_chromium(
                 har_path=browser_args["record_har_path"],
                 browser_session_dir=fallback_dir,
             )
+            browser_artifacts.mark_seed_load_failed()
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         else:
             raise
@@ -891,6 +871,7 @@ async def _create_headful_chromium(
                 har_path=browser_args["record_har_path"],
                 browser_session_dir=fallback_dir,
             )
+            browser_artifacts.mark_seed_load_failed()
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         else:
             raise
@@ -1069,16 +1050,8 @@ async def _connect_to_cdp_browser(
             except Exception:
                 LOG.warning("Failed to enable CDP intercept on page", page_url=page.url, exc_info=True)
 
-        # Auto-enable interception on new pages (e.g., target="_blank" links)
-        async def _on_new_page(page: Page) -> None:
-            try:
-                await interceptor.enable_for_page(page)
-            except Exception:
-                LOG.warning("Failed to enable CDP intercept on new page", page_url=page.url, exc_info=True)
-
-        browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
+        await bind_download_interceptor_to_context(interceptor, browser_context)
         browser_context._skyvern_cdp_download_active = True  # type: ignore[attr-defined]
-        browser_context._skyvern_cdp_download_interceptor = interceptor  # type: ignore[attr-defined]
         LOG.info(
             "CDP download interceptor enabled",
             download_dir=download_dir,

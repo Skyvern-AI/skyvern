@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from opentelemetry import trace as otel_trace
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import agent as copilot_agent
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    carry_criterion_metadata,
+    registered_download_completion_criterion,
+)
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     outcome_verification_turn_fields,
     record_completion_verification,
     record_gate_decision,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+    CompletionCriterion,
+    RequestPolicy,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
@@ -37,6 +48,61 @@ def _evaluated_result() -> CompletionVerificationResult:
             ),
         ],
     )
+
+
+def _abstention_engaged_result() -> CompletionVerificationResult:
+    outcome = CompletionCriterion(
+        id="c_outcome",
+        outcome="The requested outcome is reached.",
+        deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+    )
+    download = replace(
+        registered_download_completion_criterion(),
+        requested_output_path_mint_source="classifier_default",
+    )
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[outcome.id, download.id],
+        verdicts=[
+            CriterionVerdict(criterion_id=outcome.id, state="unsatisfied", reason_code="no_evidence"),
+            CriterionVerdict(
+                criterion_id=download.id,
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref=f"block_outputs:{download.id}",
+                evidence_source="registered_download",
+            ),
+        ],
+    )
+    return carry_criterion_metadata(result, [outcome, download])
+
+
+def test_record_completion_verification_logs_abstention_fingerprint() -> None:
+    ctx = SimpleNamespace()
+    with capture_logs() as logs:
+        record_completion_verification(ctx, _abstention_engaged_result(), workflow_run_id="wr_test_run")
+
+    events = [log for log in logs if log["event"] == "copilot.completion.plain_outcome_no_evidence_abstention"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["workflow_run_id"] == "wr_test_run"
+    assert event["plain_outcome_no_evidence_abstention_criterion_plane"] == "run"
+    assert event["plain_outcome_no_evidence_abstention_criterion_kind"] == "outcome"
+    assert event["plain_outcome_no_evidence_abstention_reason_code"] == "no_evidence"
+    assert event["plain_outcome_no_evidence_abstention_confirmed_independent_deliverable"] is True
+    assert event["plain_outcome_no_evidence_abstention_abstained_criterion_ids"] == ["c_outcome"]
+    assert event["plain_outcome_no_evidence_abstention_confirming_deliverable_sources"] == ["registered_download"]
+    assert event["plain_outcome_no_evidence_abstention_confirming_deliverable_mint_sources"] == ["classifier_default"]
+    snapshot = ctx.outcome_verification_trace_snapshot
+    assert snapshot["completion_verification_plain_outcome_no_evidence_abstention_engaged"] is True
+
+
+def test_record_completion_verification_skips_fingerprint_log_when_not_engaged() -> None:
+    ctx = SimpleNamespace()
+    with capture_logs() as logs:
+        record_completion_verification(ctx, _evaluated_result(), workflow_run_id="wr_test_run")
+
+    assert all(log["event"] != "copilot.completion.plain_outcome_no_evidence_abstention" for log in logs)
 
 
 def test_record_completion_verification_populates_evaluated_block() -> None:

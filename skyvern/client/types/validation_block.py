@@ -50,6 +50,7 @@ class ValidationBlock(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
+    without_page_information: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

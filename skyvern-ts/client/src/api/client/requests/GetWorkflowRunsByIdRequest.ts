@@ -8,7 +8,9 @@ import type * as Skyvern from "../../index.js";
  *         page: 1,
  *         page_size: 1,
  *         search_key: "search_key",
- *         error_code: "error_code"
+ *         error_code: "error_code",
+ *         created_at_start: "2024-01-15T09:30:00Z",
+ *         created_at_end: "2024-01-15T09:30:00Z"
  *     }
  */
 export interface GetWorkflowRunsByIdRequest {
@@ -22,4 +24,8 @@ export interface GetWorkflowRunsByIdRequest {
     search_key?: string;
     /** Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution. */
     error_code?: string;
+    /** Only include runs created at or after this UTC timestamp (ISO 8601). */
+    created_at_start?: string;
+    /** Only include runs created strictly before this UTC timestamp (ISO 8601). */
+    created_at_end?: string;
 }

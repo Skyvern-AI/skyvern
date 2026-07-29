@@ -351,84 +351,6 @@ def test_stash_churn_stop_does_not_replace_held_output_contract_terminal() -> No
     assert ctx.blocker_signal is oc_terminal
 
 
-def test_stash_grounding_replaces_synthesized_persistence_tool_error() -> None:
-    ctx = _Ctx()
-    existing = _make(
-        kind="tool_error",
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-        renders_final_reply=False,
-    )
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-
-    stash_blocker_signal(ctx, existing)
-    payload = stash_blocker_signal(ctx, grounding)
-
-    assert payload == grounding.agent_steering_text
-    assert ctx.blocker_signal is grounding
-    assert ctx.latest_tool_blocker_signal is grounding
-    assert ctx.tool_blocker_signals == [existing, grounding]
-
-
-def test_stash_grounding_replaces_generic_non_final_tool_error() -> None:
-    ctx = _Ctx()
-    existing = _make(kind="tool_error", internal_reason_code="tool_error_generic", renders_final_reply=False)
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-
-    stash_blocker_signal(ctx, existing)
-    stash_blocker_signal(ctx, grounding)
-
-    assert ctx.blocker_signal is grounding
-
-
-def test_stash_grounding_does_not_replace_final_reply_blocker() -> None:
-    ctx = _Ctx()
-    existing = _make(
-        kind="tool_error",
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-        renders_final_reply=True,
-    )
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-
-    stash_blocker_signal(ctx, existing)
-    stash_blocker_signal(ctx, grounding)
-
-    assert ctx.blocker_signal is existing
-    assert ctx.latest_tool_blocker_signal is grounding
-
-
-def test_stash_repair_ceiling_replaces_non_final_grounding_blocker() -> None:
-    ctx = _Ctx()
-    grounding = _make(
-        kind="missing_required_context",
-        internal_reason_code="recorded_outcome_grounding_required",
-        renders_final_reply=False,
-    )
-    repair_ceiling = _make(
-        kind="loop_detected",
-        internal_reason_code="repair_ceiling_reached",
-        renders_final_reply=True,
-    )
-
-    stash_blocker_signal(ctx, grounding)
-    payload = stash_blocker_signal(ctx, repair_ceiling)
-
-    assert payload == repair_ceiling.agent_steering_text
-    assert ctx.blocker_signal is repair_ceiling
-    assert ctx.latest_tool_blocker_signal is repair_ceiling
-
-
 def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> None:
     """The field is declared on both AgentContext (parent) and CopilotContext
     (child) per the field-shadowing convention. Default values must stay in
@@ -469,6 +391,28 @@ _LATE_RECORDED_REASON = (
     "on a public registry site with a search form and expandable result rows. "
     "Add an end-state confirmation (an extraction or validation block) that observes the outcome, then re-run."
 )
+
+
+def test_stash_non_final_signal_does_not_replace_a_held_final_reply_blocker() -> None:
+    """A non-final incoming signal must not displace a held final-reply blocker, while
+    latest_tool_blocker_signal still advances to it."""
+    ctx = _Ctx()
+    existing = _make(
+        kind="tool_error",
+        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+        renders_final_reply=True,
+    )
+    incoming = _make(
+        kind="missing_required_context",
+        internal_reason_code="tool_error_post_budget_page_inspection_required",
+        renders_final_reply=False,
+    )
+
+    stash_blocker_signal(ctx, existing)
+    stash_blocker_signal(ctx, incoming)
+
+    assert ctx.blocker_signal is existing
+    assert ctx.latest_tool_blocker_signal is incoming
 
 
 def test_stash_refreshes_held_loop_signal_with_evidence_recorded_after_the_stash() -> None:

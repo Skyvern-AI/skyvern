@@ -4,7 +4,7 @@ import {
   Pencil1Icon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { PINNED_RESIDENTIAL_ISP_PROXY_LOCATION } from "@/api/types";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -16,6 +16,7 @@ import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 
 import { DeleteBrowserProfileButton } from "./DeleteBrowserProfileButton";
+import { RefreshBrowserProfileButton } from "./RefreshBrowserProfileButton";
 import { RenameBrowserProfileDialog } from "./RenameBrowserProfileDialog";
 import { useBrowserProfileQuery } from "./hooks/useBrowserProfileQuery";
 import { useUpdateBrowserProfileMutation } from "./hooks/useBrowserProfileMutations";
@@ -30,6 +31,18 @@ function formatProxyIdentity(value?: string | null) {
 function BrowserProfileDetailPage() {
   const navigate = useNavigate();
   const { profileId } = useParams<{ profileId: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Captured once at mount so clearing the URL param below can't retract it before
+  // the (async-gated) Refresh button mounts and reads it.
+  const [autoRefresh] = useState(() => searchParams.get("refresh") != null);
+  useEffect(() => {
+    if (autoRefresh && searchParams.has("refresh")) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("refresh");
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- consume the param once
+  }, []);
   const [renameOpen, setRenameOpen] = useState(false);
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
   const [rotateProxyPin, setRotateProxyPin] = useState(false);
@@ -115,6 +128,13 @@ function BrowserProfileDetailPage() {
               )}
             </div>
             <div className="flex gap-2">
+              {!profile.deleted_at && (
+                <RefreshBrowserProfileButton
+                  profile={profile}
+                  label="Refresh"
+                  autoOpen={autoRefresh}
+                />
+              )}
               <Button
                 variant="secondary"
                 onClick={() => setRenameOpen(true)}

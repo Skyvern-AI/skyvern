@@ -4,12 +4,13 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 
 import structlog
 
 from skyvern.forge.sdk.copilot.build_test_outcome import maybe_satisfy_recorded_outcome_grounding_requirement
+from skyvern.forge.sdk.copilot.challenge_evidence import challenge_evidence_unsettled
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     RunEvidenceSnapshot,
@@ -65,6 +66,7 @@ from .scouting import (
     _consume_pending_browser_interaction_observation,
     _mark_page_inspected,
     _mark_post_run_page_observed,
+    solve_challenge_when_evidence_settles,
 )
 
 LOG = structlog.get_logger()
@@ -122,6 +124,9 @@ async def _active_run_terminal_evidence_sample(
         inspected_url=current_url,
         current_url=current_url,
         active_run_terminal_sample=True,
+        # The executor is still driving this page; solving here would act on a run this turn
+        # does not own, and spend the turn's attempts on a sample.
+        solve_challenges=False,
     )
     if html_error is not None or evidence is None:
         LOG.info(
@@ -221,8 +226,6 @@ def _active_run_terminal_evidence_result(
     }
 
 
-_COMPOSITION_INSPECTION_PER_CHAT_BUDGET = 6
-_COMPOSITION_INSPECTION_PER_TURN_BUDGET = 4
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
@@ -518,17 +521,6 @@ def _non_current_inspection_regression_error(copilot_ctx: Any, *, entry_url: str
     }
 
 
-def _page_inspection_budget_error(copilot_ctx: Any, *, scope: Literal["turn", "chat"]) -> str:
-    scope_label = "turn" if scope == "turn" else "chat"
-    return (
-        f"inspect_page_for_composition reached the page-inspection budget for this {scope_label}. "
-        "This is not evidence that scouting is complete. Use evaluate, get_browser_screenshot, or a browser "
-        "action on the current page to determine whether the goal is already satisfied, whether progress is still "
-        "possible, or whether a real blocker exists. Do not author downstream result, extraction, or confirmation "
-        "blocks unless the existing evidence already shows the page state those blocks will act on."
-    )
-
-
 _COMPOSITION_HOLLOW_RECAPTURE_RETRIES = 2
 _COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS = 2.5
 # The composition inspect navigates with `domcontentloaded`, so a heavier cap than
@@ -608,12 +600,17 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
     return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
+def _composition_capture_settled(evidence: dict[str, Any]) -> bool:
+    return has_bounded_page_schema(evidence) and not challenge_evidence_unsettled(evidence)
+
+
 async def _capture_composition_evidence(
     copilot_ctx: Any,
     *,
     inspected_url: str,
     current_url: str,
     active_run_terminal_sample: bool = False,
+    solve_challenges: bool = True,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
     evidence: dict[str, Any] | None = None
@@ -627,11 +624,16 @@ async def _capture_composition_evidence(
         if structured is not None:
             evidence = structured
             used_structured = True
-            if has_bounded_page_schema(evidence):
+            if _composition_capture_settled(evidence):
                 break
             if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
                 await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
                 continue
+        # get_html reads body only, so re-parsing cannot see a title-derived challenge signal.
+        # Guard the reparse itself, not one route to it: re-looks may be exhausted, or the
+        # extractor may have blinked on a later attempt while a signalled packet is in hand.
+        if used_structured and challenge_evidence_unsettled(evidence):
+            break
         html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
             if evidence is not None:
@@ -644,7 +646,7 @@ async def _capture_composition_evidence(
             skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         used_structured = False
-        if has_bounded_page_schema(evidence):
+        if _composition_capture_settled(evidence):
             break
         if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
@@ -659,6 +661,12 @@ async def _capture_composition_evidence(
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+    # Off for a capture that only reads a run's page: solving there would mutate the page being
+    # diagnosed and spend on a session this turn is not driving.
+    if solve_challenges:
+        await solve_challenge_when_evidence_settles(
+            copilot_ctx, evidence, url=current_url, observed_after_interaction=False
+        )
     return evidence, None
 
 
@@ -770,28 +778,10 @@ async def _inspect_page_for_composition_impl(
         on_target_page = _same_inspect_target(live_url, entry_url)
         inspect_target_url = live_url if on_target_page else entry_url
 
-    if (
-        not bypass_budget_for_post_run_current_page
-        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
-    ):
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
-    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
-    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
+    # Structured inspection is not rationed. Capping it sent the agent to hand-rolled `evaluate`
+    # probes once the budget ran out — on a heavy app that meant 22 small DOM reads in place of a
+    # handful of structured looks, and the turn's wall clock spent without understanding the page.
+    # The calls stay counted for telemetry.
     evidence = None
     html_error: str | None = None
     with copilot_span(
@@ -855,7 +845,12 @@ async def _inspect_page_for_composition_impl(
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if isinstance(run_id, str) and run_id:
         evidence = store_post_run_page_evidence(copilot_ctx, evidence, run_id=run_id, current_url=current_url)
-        _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
+        _mark_post_run_page_observed(
+            copilot_ctx,
+            source_tool="inspect_page_for_composition",
+            url=current_url,
+            page_evidence=evidence,
+        )
     else:
         copilot_ctx.composition_page_evidence = evidence
 

@@ -37,9 +37,9 @@ function SendEmailEditorBody({
     <div data-testid="send-email-block-form" className="space-y-4 px-4 py-4">
       <div className="space-y-2">
         <div className="flex justify-between">
-          <Label className="text-xs text-slate-300">Recipients</Label>
+          <Label className="text-xs text-tertiary-foreground">Recipients</Label>
           {isFirstWorkflowBlock ? (
-            <div className="flex justify-end text-xs text-slate-400">
+            <div className="flex justify-end text-xs text-muted-foreground">
               Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
@@ -54,7 +54,7 @@ function SendEmailEditorBody({
       </div>
       <Separator />
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">Subject</Label>
+        <Label className="text-xs text-tertiary-foreground">Subject</Label>
         <WorkflowBlockInput
           nodeId={blockId}
           onChange={(value) => update({ subject: value })}
@@ -64,7 +64,7 @@ function SendEmailEditorBody({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">Body</Label>
+        <Label className="text-xs text-tertiary-foreground">Body</Label>
         <WorkflowBlockInputTextarea
           aiImprove={AI_IMPROVE_CONFIGS.sendEmail.body}
           nodeId={blockId}
@@ -77,7 +77,9 @@ function SendEmailEditorBody({
       <Separator />
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File Attachments</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            File Attachments
+          </Label>
           <HelpTooltip content={helpTooltips["sendEmail"]["fileAttachments"]} />
         </div>
         <WorkflowBlockInput

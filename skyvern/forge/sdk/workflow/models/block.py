@@ -6,13 +6,16 @@ import asyncio
 import codecs
 import copy
 import csv
+import hashlib
 import html
+import inspect
 import json
 import keyword
 import os
 import re
 import shutil
 import smtplib
+import socket
 import textwrap
 import unicodedata
 import uuid
@@ -20,6 +23,7 @@ import zipfile
 from collections import defaultdict, deque
 from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
+from functools import partial
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
@@ -39,8 +43,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page
-from pydantic import BaseModel, Field, model_validator
+from playwright.async_api import Frame, Page
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
@@ -99,16 +103,22 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
+from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult, run_self_heal_recovery
+from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
@@ -160,19 +170,26 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    SENSITIVE_DESTINATION_FIELDS,
+    decrypt_secret_field_value,
+    is_encrypted_secret,
+)
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
     BlockStatus,
     BlockType,
+    FileDownloadTarget,
     FileStorageType,
     FileType,
     FileUploadDestination,
 )
 from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
+from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
@@ -185,6 +202,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.agent_functions import CodeBlockEngineFailure
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
 
@@ -440,6 +458,11 @@ class Block(BaseModel, abc.ABC):
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
 
+    # Set by record_output_parameter_value within a single execute_safe call; lets the
+    # failure handler tell a value recorded during THIS execution apart from a stale
+    # value left by a prior for-loop iteration.
+    _output_recorded_this_execution: bool = PrivateAttr(default=False)
+
     @property
     def override_llm_key(self) -> str | None:
         return self.override_llm_key_for_organization(None)
@@ -472,6 +495,7 @@ class Block(BaseModel, abc.ABC):
             parameter=self.output_parameter,
             value=value,
         )
+        self._output_recorded_this_execution = True
         await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
@@ -872,7 +896,8 @@ class Block(BaseModel, abc.ABC):
         description = None
         try:
             block_data = self.model_dump(
-                exclude={
+                exclude=SENSITIVE_DESTINATION_FIELDS
+                | {
                     "workflow_run_block_id",
                     "organization_id",
                     "task_id",
@@ -920,6 +945,24 @@ class Block(BaseModel, abc.ABC):
         """Return block-level error codes for unexpected failures. Override in subclasses."""
         return []
 
+    async def _invalidate_stale_output_on_failure(
+        self,
+        workflow_run_id: str,
+        current_index: int | None,
+        *,
+        include_missing_value_guard: bool,
+    ) -> None:
+        # On a failed execution, invalidate this block's output to None so a prior for-loop
+        # iteration's value can't leak into the failed iteration's downstream blocks; a value
+        # already recorded this execution is preserved and non-loop behavior is unchanged.
+        if self._output_recorded_this_execution:
+            return
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if current_index is not None or (
+            include_missing_value_guard and not workflow_run_context.has_value(self.output_parameter.key)
+        ):
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+
     @traced(name="skyvern.block.execute", role="wrapper")
     async def execute_safe(
         self,
@@ -935,6 +978,7 @@ class Block(BaseModel, abc.ABC):
         # have wildly different latency profiles. Set early so it's present even if
         # execute_safe raises before any child work.
         otel_trace.get_current_span().set_attribute("block_type", self.block_type.value)
+        self._output_recorded_this_execution = False
         workflow_run_block_id = None
         engine: RunEngine | None = None
         try:
@@ -997,13 +1041,21 @@ class Block(BaseModel, abc.ABC):
                 block_label=self.label,
                 block_type=self.block_type,
             )
-            return await self.execute(
+            result = await self.execute(
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 **kwargs,
             )
+            # Blocks that report failure by returning an unsuccessful BlockResult never reach the
+            # except branch, and build_block_result does not touch WorkflowRunContext, so invalidate
+            # stale loop output here too.
+            if not result.success:
+                await self._invalidate_stale_output_on_failure(
+                    workflow_run_id, current_index, include_missing_value_guard=False
+                )
+            return result
         except Exception as e:
             LOG.exception(
                 "Block execution failed",
@@ -1011,10 +1063,9 @@ class Block(BaseModel, abc.ABC):
                 block_label=self.label,
                 block_type=self.block_type,
             )
-            # Record output parameter value if it hasn't been recorded yet
-            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-            if not workflow_run_context.has_value(self.output_parameter.key):
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
+            await self._invalidate_stale_output_on_failure(
+                workflow_run_id, current_index, include_missing_value_guard=True
+            )
 
             failure_reason = get_user_facing_exception_message(e)
 
@@ -1109,6 +1160,12 @@ class BaseTaskBlock(Block):
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
+            LOG.info(
+                "download_suffix_rendered",
+                block_label=self.label,
+                current_index=workflow_run_context.get_block_metadata(self.label).get("current_index"),
+                download_suffix_fp=diagnostic_fingerprint(self.download_suffix),
+            )
 
         if self.navigation_goal:
             self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
@@ -3555,43 +3612,225 @@ class CodeBlockOTPError(Exception):
     """Sanitized OTP-primitive error: never includes the identifier, URL, code, or seed."""
 
 
+class CodeBlockCaptchaError(Exception):
+    """Sanitized CAPTCHA-primitive error with no site, selector, vendor, or token details."""
+
+
+_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
+    (
+        'input[type="checkbox"][id*="captcha" i]',
+        'input[type="checkbox"][id*="robot" i]',
+        'input[type="checkbox"][name*="captcha" i]',
+        '[role="checkbox"][aria-label*="robot" i]',
+        '[role="checkbox"][aria-label*="verify" i]',
+    )
+)
+_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR = ", ".join(
+    (
+        ".g-recaptcha",
+        ".cf-turnstile",
+        ".g-recaptcha[data-sitekey]",
+        ".cf-turnstile[data-sitekey]",
+        'iframe[src*="recaptcha" i]',
+        'iframe[src*="turnstile" i]',
+        'iframe[title*="recaptcha" i]',
+        'iframe[title*="challenge" i]',
+    )
+)
+_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR = ", ".join(
+    (
+        ".g-recaptcha",
+        '[data-sitekey][class*="recaptcha" i]',
+        'iframe[src*="recaptcha" i]',
+        'iframe[title*="recaptcha" i]',
+    )
+)
+_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]'
+_CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
+_CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
+_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
+# Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
+_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
+_CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
+    (
+        "[data-challenge-state] button[type='submit']",
+        "[data-challenge-state] button.btn-primary",
+        "[data-challenge-state] [data-action='verify']",
+        "[data-captcha-widget] button[type='submit']",
+        "[data-captcha-widget] button.btn-primary",
+        "[data-captcha-widget] [data-action='verify']",
+    )
+)
+
+
+async def _bounded_code_block_locator_count(locator: Any) -> int:
+    try:
+        return await asyncio.wait_for(locator.count(), timeout=1.0)
+    except Exception:
+        return 0
+
+
+def _is_trusted_code_block_recaptcha_anchor_url(frame_url: str | None) -> bool:
+    if not frame_url:
+        return False
+    try:
+        parsed = urlparse(frame_url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and hostname in _CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS
+        and parsed.path in _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS
+    )
+
+
+async def _bounded_code_block_recaptcha_token_populated(scope: Frame | Page | RecordingPage) -> bool | None:
+    try:
+        async with asyncio.timeout(1):
+            fields = scope.locator(_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR)
+            for index in range(await fields.count()):
+                value = await fields.nth(index).input_value()
+                if value and value.strip().lower() not in {"undefined", "null"}:
+                    return True
+    except (PlaywrightError, TimeoutError):
+        return None
+    return False
+
+
+async def _code_block_solve_captcha_builtin(
+    page: Page | RecordingPage,
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> None:
+    """Solve a detected challenge through the bounded platform ladder.
+
+    The initial structural probes are intentionally cheap. Solver routes are never
+    called when neither a challenge control nor vendor marker is present.
+    """
+    checkbox = page.locator(_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR)
+    checkbox_count = await _bounded_code_block_locator_count(checkbox)
+    marker = page.locator(_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR)
+    marker_count = await _bounded_code_block_locator_count(marker)
+    if checkbox_count == 0 and marker_count == 0:
+        return
+
+    if checkbox_count == 1:
+        candidate = checkbox.first
+        try:
+            if await candidate.is_visible() and await candidate.is_enabled():
+                await candidate.click()
+                await page.wait_for_timeout(100)
+                if await candidate.is_checked() or await _bounded_code_block_locator_count(checkbox) == 0:
+                    continuation = page.locator(_CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR)
+                    if await _bounded_code_block_locator_count(continuation) == 1:
+                        continuation_candidate = continuation.first
+                        if await continuation_candidate.is_visible() and await continuation_candidate.is_enabled():
+                            await continuation_candidate.click()
+                            await page.wait_for_timeout(100)
+                            if await _bounded_code_block_locator_count(checkbox) == 0:
+                                return
+                    else:
+                        # Checkbox challenges commonly complete on the checkbox
+                        # interaction itself and expose no associated continuation.
+                        return
+        except Exception:
+            LOG.info("code block CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
+
+    # A page-level locator cannot cross into reCAPTCHA's anchor iframe. Click the checkbox in-frame.
+    try:
+        async with asyncio.timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS):
+            for frame in page.frames:
+                if not _is_trusted_code_block_recaptcha_anchor_url(frame.url):
+                    continue
+                anchor = frame.locator("#recaptcha-anchor")
+                if await _bounded_code_block_locator_count(anchor) != 1:
+                    continue
+                candidate = await anchor.first.element_handle()
+                if candidate is None or not (await candidate.is_visible()):
+                    continue
+                # The handle is bound to the validated document. If the frame navigates after this
+                # re-check, Playwright detaches the handle instead of clicking the replacement page.
+                if not _is_trusted_code_block_recaptcha_anchor_url(frame.url):
+                    continue
+                token_scope = frame.parent_frame or page
+                token_was_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
+                if await candidate.get_attribute("aria-checked") == "true":
+                    break
+                page_url_before_click = urlparse(page.url)._replace(fragment="").geturl()
+                await candidate.click()
+                LOG.info("code block CAPTCHA anchor frame clicked", arm="recaptcha_anchor_frame")
+                await page.wait_for_timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS)
+                if frame.is_detached() and urlparse(page.url)._replace(fragment="").geturl() != page_url_before_click:
+                    LOG.info("code block CAPTCHA anchor frame solved after navigation", arm="recaptcha_anchor_frame")
+                    return
+                token_is_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
+                if (
+                    await candidate.get_attribute("aria-checked") == "true"
+                    and token_was_populated is False
+                    and token_is_populated is True
+                ):
+                    LOG.info("code block CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
+                    return
+                break
+    except Exception:
+        LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
+
+    try:
+        if await app.AGENT_FUNCTION.auto_solve_captchas(page):
+            return
+    except Exception:
+        LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
+
+    recaptcha = page.locator(_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR)
+    if await _bounded_code_block_locator_count(recaptcha) > 0:
+        try:
+            if await app.AGENT_FUNCTION.solve_recaptcha_token(
+                page,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+            ):
+                return
+        except Exception:
+            LOG.info("code block CAPTCHA token arm did not solve", arm="token")
+
+    raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+
+
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
     fresh_key = workflow_run_context.generate_random_secret_id()
     workflow_run_context.secrets[fresh_key] = value
 
 
-async def _resolve_code_block_otp(
-    credential_parameter_key: str,
+class OTPResult(str):
+    """A fetched OTP that still knows whether it is a code to type or a link to open.
+
+    Subclasses ``str`` so it can be typed into a field directly, while ``is_link`` lets
+    authored code branch without pattern-matching the value.
+    """
+
+    otp_type: OTPType
+
+    def __new__(cls, value: str, otp_type: OTPType) -> OTPResult:
+        result = super().__new__(cls, value)
+        result.otp_type = otp_type
+        return result
+
+    @property
+    def is_link(self) -> bool:
+        return self.otp_type is OTPType.MAGIC_LINK
+
+
+async def _poll_code_block_otp(
+    totp_identifier: str,
     organization_id: str | None,
-    workflow_run_id: str | None,
+    workflow_run_id: str,
+    workflow_run_context: WorkflowRunContext,
     *,
     budget_seconds: int,
-) -> str:
-    """Resolve a fresh OTP at call time for one credential: re-mint its TOTP (the staleness
-    fix) or poll its email/SMS/magic-link, registering the value as a secret before return.
-    The run context is re-resolved from workflow_run_id, never captured in the bound method's
-    closure, so user code cannot reach the seed through the method's cells."""
-    if not workflow_run_id:
-        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
-
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    if workflow_run_context is None:
-        raise CodeBlockOTPError("OTP is unavailable: the workflow run context could not be resolved.")
-
-    otp_value = otp_service.try_generate_totp_for_credential(
-        workflow_run_context, credential_parameter_key, workflow_run_id
-    )
-    if otp_value is not None:
-        _register_code_block_secret(workflow_run_context, otp_value.value)
-        return otp_value.value
-
-    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
-    if not totp_identifier:
-        raise CodeBlockOTPError(
-            "No OTP source is configured for this credential. "
-            "Add a TOTP secret or an email/SMS identifier to the credential."
-        )
-
+    subject: str,
+) -> otp_service.OTPValue:
     if not organization_id:
         raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
 
@@ -3609,19 +3848,90 @@ async def _resolve_code_block_otp(
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 totp_identifier=totp_identifier,
                 created_after=workflow_run.started_at,
+                expected_otp_type=OTPType.TOTP,
             ),
             timeout=budget_seconds,
         )
     except asyncio.TimeoutError:
         raise CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
     except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
-        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+        raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
     if polled is None:
-        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+        raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
     _register_code_block_secret(workflow_run_context, polled.value)
+    return polled
+
+
+def _code_block_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if workflow_run_context is None:
+        raise CodeBlockOTPError("OTP is unavailable: the workflow run context could not be resolved.")
+    return workflow_run_context
+
+
+async def _resolve_code_block_otp(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> str:
+    """Resolve a fresh OTP at call time for one credential: re-mint its TOTP (the staleness
+    fix) or poll its email/SMS/magic-link, registering the value as a secret before return.
+    The run context is re-resolved from workflow_run_id, never captured in the bound method's
+    closure, so user code cannot reach the seed through the method's cells."""
+    if not workflow_run_id:
+        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
+    workflow_run_context = _code_block_workflow_run_context(workflow_run_id)
+
+    otp_value = otp_service.try_generate_totp_for_credential(
+        workflow_run_context, credential_parameter_key, workflow_run_id
+    )
+    if otp_value is not None:
+        _register_code_block_secret(workflow_run_context, otp_value.value)
+        return otp_value.value
+
+    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
+    if not totp_identifier:
+        raise CodeBlockOTPError(
+            "No OTP source is configured for this credential. "
+            "Add a TOTP secret or an email/SMS identifier to the credential."
+        )
+
+    polled = await _poll_code_block_otp(
+        totp_identifier,
+        organization_id,
+        workflow_run_id,
+        workflow_run_context,
+        budget_seconds=budget_seconds,
+        subject="this credential",
+    )
     return polled.value
+
+
+async def _resolve_code_block_otp_for_identifier(
+    totp_identifier: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> OTPResult:
+    """Resolve a fresh OTP for a bare email/SMS identifier, with no credential in play."""
+    if not workflow_run_id:
+        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
+    workflow_run_context = _code_block_workflow_run_context(workflow_run_id)
+
+    polled = await _poll_code_block_otp(
+        totp_identifier,
+        organization_id,
+        workflow_run_id,
+        workflow_run_context,
+        budget_seconds=budget_seconds,
+        subject="this address",
+    )
+    return OTPResult(polled.value, polled.get_otp_type())
 
 
 def _bind_code_block_otp(
@@ -3643,11 +3953,25 @@ def _bind_code_block_otp(
     return otp
 
 
-async def _code_block_otp_builtin(credential: object) -> str:
-    """Top-level ``await otp(credential)`` sugar that forwards to the credential's bound otp()."""
+async def _code_block_otp_builtin(
+    credential: object,
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> str:
+    """Top-level ``await otp(...)`` sugar. Given a credential it forwards to that credential's
+    bound otp(); given a bare email/SMS address it resolves against the address alone and
+    returns an OTPResult that still knows whether it is a code or a link."""
+    if isinstance(credential, str):
+        return await _resolve_code_block_otp_for_identifier(
+            credential,
+            organization_id,
+            workflow_run_id,
+            budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+        )
     bound = getattr(credential, "otp", None)
     if not callable(bound):
-        raise CodeBlockOTPError("otp() expects a credential with an OTP source.")
+        raise CodeBlockOTPError("otp() expects a credential with an OTP source, or an email address.")
     return await bound()
 
 
@@ -3712,17 +4036,37 @@ class CodeBlock(Block):
             "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
             "otp": _code_block_otp_builtin,
+            "solve_captcha": _code_block_solve_captcha_builtin,
         }
 
     def generate_async_user_function(
-        self, code: str, page: Page | RecordingPage, parameters: dict[str, Any] | None = None
+        self,
+        code: str,
+        page: Page | RecordingPage,
+        parameters: dict[str, Any] | None = None,
+        *,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
         self.is_safe_code(code)
+        code_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        code_len = len(code)
         code = textwrap.indent(textwrap.dedent(code), "    ")
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
+        safe_vars["solve_captcha"] = partial(
+            _code_block_solve_captcha_builtin,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+        )
+        safe_vars["otp"] = partial(
+            _code_block_otp_builtin,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+        )
         parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():
@@ -3741,6 +4085,19 @@ async def wrapper({default_args}):
         safe_vars["__param_defaults"] = parameter_defaults
         # Compile under a recognizable filename so tracebacks map back to user code lines.
         compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        inline_exec_context = skyvern_context.current()
+        LOG.info(
+            "codeblock.inline_exec_entered",
+            code_sha256=code_sha256,
+            code_len=code_len,
+            in_process=True,
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            trace_id=inline_exec_context.request_id if inline_exec_context else None,
+        )
         exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
         if not parameter_defaults:
@@ -4035,6 +4392,35 @@ async def wrapper({default_args}):
                 return line_url
         return ""
 
+    def _matched_step_index_for_failing_line(self, failing_line: int | None) -> int | None:
+        if failing_line is None:
+            return None
+        matched_step = self._match_step_for_failing_line(failing_line)
+        if matched_step is None:
+            return None
+        steps = self.steps or []
+        for idx, step in enumerate(steps):
+            if step is matched_step:
+                return idx
+        return None
+
+    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
+        safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
+        matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
+        if matched_step is None or not matched_step.description:
+            return safe_main
+        steps = self.steps or []
+        matched_index = next((idx for idx, step in enumerate(steps) if step is matched_step), None)
+        if matched_index is None:
+            matched_index = len(steps) - 1
+        descriptions = [matched_step.description] + [
+            step.description for step in steps[matched_index + 1 :] if step.description
+        ]
+        safe_mini = "\nThen: ".join(
+            workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+        )
+        return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4063,11 +4449,18 @@ async def wrapper({default_args}):
             )
             return False
 
-    def _is_healable_page_failure(self, exception: Exception, recording_page: RecordingPage) -> bool:
+    def _is_healable_page_failure(
+        self,
+        exception: Exception,
+        recording_page: RecordingPage,
+        engine_selection: BrowserEngineSelection | None = None,
+    ) -> bool:
         """Heal genuine page failures only: a recorded page call raised, or an (unmapped) Playwright
         page error surfaced. A deliberate non-Playwright raise in user logic stays non-healable."""
         if recording_page.last_recorded_exception() is exception:
             return True
+        if engine_selection is not None:
+            return engine_selection.is_engine_error(exception) is True
         return isinstance(exception, PlaywrightError)  # locator/timeout/navigation errors subclass this
 
     async def _finalize_recovery_block(
@@ -4148,10 +4541,21 @@ async def wrapper({default_args}):
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         if not await self._self_heal_enabled(workflow_run_context):
             return None
-        effective_classification = classification or HealClassification(
-            healable=self._is_healable_page_failure(exception, recording_page),
-            skip_reason=None,
-        )
+        effective_classification = classification
+        if effective_classification is None:
+            engine_selection = (
+                browser_state.engine_selection
+                if browser_state and inspect.getattr_static(browser_state, "engine_selection", None) is not None
+                else None
+            )
+            effective_classification = HealClassification(
+                healable=self._is_healable_page_failure(
+                    exception,
+                    recording_page,
+                    engine_selection,
+                ),
+                skip_reason=None,
+            )
         if not effective_classification.healable:
             return None
         if not self.prompt:
@@ -4166,27 +4570,10 @@ async def wrapper({default_args}):
         escalation_step: Step | None = None
         recovery_block_id: str | None = None
         try:
-            # block.prompt is the operative goal; a confidently-matched step only narrows it. The match
-            # is advisory (spans are display-oriented and render-shifted), so any miss heals on the prompt.
-            safe_main = workflow_run_context.mask_secrets_in_data(self.prompt)
-            matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
-            if matched_step is not None and matched_step.description:
-                # The heal owns the failing step plus every subsequent authored step — a
-                # step-only goal would complete the block while trailing steps ran by no one.
-                steps = self.steps or []
-                # Identity scan, not .index(): value equality would match an earlier duplicate step.
-                matched_index = next((i for i, step in enumerate(steps) if step is matched_step), None)
-                if matched_index is None:
-                    matched_index = len(steps) - 1  # defensive; matched_step always comes from self.steps
-                descriptions = [matched_step.description] + [
-                    step.description for step in steps[matched_index + 1 :] if step.description
-                ]
-                safe_mini = "\nThen: ".join(
-                    workflow_run_context.mask_secrets_in_data(description) for description in descriptions
-                )
-                navigation_goal = compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
-            else:
-                navigation_goal = safe_main
+            navigation_goal = self._compose_heal_goal(
+                workflow_run_context=workflow_run_context,
+                failing_line=failing_line,
+            )
 
             workflow_system_prompt = (
                 None
@@ -4392,6 +4779,117 @@ async def wrapper({default_args}):
             skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
         )
 
+    @staticmethod
+    def _workflow_definition_hash(workflow_definition: Any) -> str:
+        if hasattr(workflow_definition, "model_dump"):
+            payload = workflow_definition.model_dump(mode="json")
+        else:
+            payload = workflow_definition
+        normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    async def _self_heal_mutation_guard_snapshot(
+        self,
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> tuple[int, str]:
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if workflow is None:
+            raise RuntimeError("workflow_not_found_for_self_heal_guard")
+        versions = await app.DATABASE.workflows.get_workflow_versions_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        return len(versions), self._workflow_definition_hash(workflow.workflow_definition)
+
+    @staticmethod
+    def _output_obligation_for_heal_result(result: BlockResult | None) -> OutputObligation:
+        if result is None or not result.success:
+            return OutputObligation.none
+        if result.output_parameter_value is not None:
+            return OutputObligation.observed
+        return OutputObligation.vestigial
+
+    @staticmethod
+    def _heal_parameter_binding_keys(workflow_run_context: WorkflowRunContext) -> list[str]:
+        # Episode metadata is best-effort; it must never fail the heal path.
+        try:
+            return sorted(str(key) for key in workflow_run_context.parameters.keys())
+        except Exception:
+            return []
+
+    async def _write_heal_episode_safe(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        block_label: str,
+        engine: str,
+        status: Literal["fired_completed", "fired_failed", "fired_unverified", "skipped"],
+        skip_reason: HealSkipReason | None,
+        parameter_binding_keys: list[str],
+        exception_class: str | None,
+        failing_line: int | None,
+        matched_step_index: int | None,
+        failure_message: str | None,
+        wall_clock_ms: int | None,
+        action_count: int | None,
+        output_obligation: OutputObligation,
+    ) -> None:
+        LOG.info(
+            "self-heal episode",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=block_label,
+            engine=engine,
+            status=status,
+            skip_reason=skip_reason.value if skip_reason is not None else None,
+            origin=TurnOrigin.runtime_self_heal.value,
+        )
+        try:
+            await app.DATABASE.self_heal.create_heal_episode(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=block_label,
+                engine=engine,
+                status=HealStatus(status),
+                skip_reason=skip_reason,
+                snapshot_available=False,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=failure_message,
+                wall_clock_ms=wall_clock_ms,
+                action_count=action_count,
+                output_obligation=output_obligation,
+            )
+        except Exception:
+            LOG.warning(
+                "self-heal episode persistence failed; continuing",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=block_label,
+                engine=engine,
+                status=status,
+                exc_info=True,
+            )
+
     async def _resolve_failure_with_heal(
         self,
         *,
@@ -4408,13 +4906,60 @@ async def wrapper({default_args}):
         browser_state: BrowserState | None = None,
         page: Page | None = None,
     ) -> BlockResult:
-        healed: BlockResult | None = None
-        if classification.healable:
-            live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(
-                workflow_run_id=workflow_run_id
+        async def _finalize_heal_result(result: BlockResult | None) -> BlockResult:
+            if result is not None:
+                output_obligation = self._output_obligation_for_heal_result(result)
+                # Record output before finalizing so a failed write fails closed, never leaving a
+                # completed block without the output downstream consumers require.
+                if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
+                    await self.record_output_parameter_value(
+                        workflow_run_context,
+                        workflow_run_id,
+                        result.output_parameter_value,
+                    )
+                await recorder.finalize(success=result.success)
+                return result
+            await recorder.finalize(success=False)
+            return await build_failure_result()
+
+        if not classification.healable:
+            return await _finalize_heal_result(None)
+        if not await self._self_heal_enabled(workflow_run_context):
+            return await _finalize_heal_result(None)
+        if not organization_id:
+            return await _finalize_heal_result(None)
+
+        workflow_permanent_id = workflow_run_context.workflow_permanent_id
+        workflow_id = workflow_run_context.workflow_id
+        exception_for_heal = exception or RuntimeError("CodeBlock failed")
+        exception_class = type(exception_for_heal).__name__
+        matched_step_index = self._matched_step_index_for_failing_line(failing_line)
+        parameter_binding_keys = self._heal_parameter_binding_keys(workflow_run_context)
+        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+
+        async def _record_harness_skip(skip_reason: HealSkipReason, failure_message: str | None = None) -> None:
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="skipped",
+                skip_reason=skip_reason,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=failure_message,
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
             )
-            exception_for_heal = exception or RuntimeError("CodeBlock failed")
-            healed = await self._attempt_self_heal(
+
+        async def _run_floor_recovery() -> BlockResult | None:
+            floor_result = await self._attempt_self_heal(
                 exception=exception_for_heal,
                 failing_line=failing_line,
                 recording_page=recorder.recording_page,
@@ -4428,26 +4973,252 @@ async def wrapper({default_args}):
                 page=page,
                 record_output_parameter=False,
             )
-        if healed is not None:
-            output_obligation = OutputObligation.none
-            if healed.success:
-                output_obligation = (
-                    OutputObligation.observed
-                    if healed.output_parameter_value is not None
-                    else OutputObligation.vestigial
+            floor_output_obligation = self._output_obligation_for_heal_result(floor_result)
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="floor",
+                status="fired_completed" if floor_result is not None and floor_result.success else "fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=floor_result.failure_reason if floor_result is not None else "floor_no_result",
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=floor_output_obligation,
+            )
+            return floor_result
+
+        api_key = await app.AGENT_FUNCTION.resolve_self_heal_api_key(organization_id)
+        if not api_key:
+            await _record_harness_skip(
+                HealSkipReason.credential_unavailable, failure_message="self_heal_api_key_missing"
+            )
+            return await _finalize_heal_result(await _run_floor_recovery())
+
+        browser_context = (
+            getattr(live_browser_state, "browser_context", None) if live_browser_state is not None else None
+        )
+        if live_browser_state is None or not _browser_context_is_attachable(browser_context):
+            await _record_harness_skip(HealSkipReason.adoption_failed, failure_message="self_heal_browser_unavailable")
+            return await _finalize_heal_result(await _run_floor_recovery())
+        # Reserve cap only once harness preconditions are satisfied so transient infra skips
+        # do not consume slots; cap limits harness attempts, not floor fallback attempts.
+        cap_reserved = await check_and_increment_self_heal_cap(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        if cap_reserved is None:
+            await _record_harness_skip(HealSkipReason.capped, failure_message="self_heal_daily_cap_exceeded")
+            return await _finalize_heal_result(await _run_floor_recovery())
+
+        recovery: SelfHealRecoveryResult | None = None
+        try:
+            before_snapshot = await self._self_heal_mutation_guard_snapshot(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            recovery = await run_self_heal_recovery(
+                block=self,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_state=live_browser_state,
+                failing_line=failing_line,
+                api_key=api_key,
+                max_actions=settings.SELF_HEAL_MAX_ACTIONS,
+                wall_clock_budget_seconds=settings.SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS,
+            )
+            after_snapshot = await self._self_heal_mutation_guard_snapshot(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            if before_snapshot != after_snapshot:
+                raise RuntimeError("workflow_mutated_during_runtime_self_heal")
+
+            if recovery.success:
+                # Compute the obligation from a non-persisted result: an unverified or
+                # fail-closed outcome must never leave the block row marked completed, so the
+                # block row is written only on the verified path below.
+                harness_result = await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=None,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=None,
+                    organization_id=organization_id,
                 )
-            # Record output before finalizing so a failed write fails closed, never leaving a
-            # completed block without the output downstream consumers require.
-            if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
-                await self.record_output_parameter_value(
-                    workflow_run_context,
-                    workflow_run_id,
-                    healed.output_parameter_value,
+                harness_output_obligation = self._output_obligation_for_heal_result(harness_result)
+                if not recovery.verified:
+                    await self._write_heal_episode_safe(
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        block_label=self.label,
+                        engine="harness",
+                        status="fired_unverified",
+                        skip_reason=None,
+                        parameter_binding_keys=parameter_binding_keys,
+                        exception_class=exception_class,
+                        failing_line=failing_line,
+                        matched_step_index=matched_step_index,
+                        failure_message=recovery.failure_note,
+                        wall_clock_ms=recovery.wall_clock_ms,
+                        action_count=recovery.action_count,
+                        output_obligation=harness_output_obligation,
+                    )
+                    # Fail closed when an unverified harness run already mutated controls:
+                    # rerunning floor could duplicate side effects (submit/send/delete).
+                    if recovery.performed_mutation:
+                        LOG.info(
+                            "Runtime self-heal unverified after mutating actions; suppressing floor fallback",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                            organization_id=organization_id,
+                            block_label=self.label,
+                            origin=TurnOrigin.runtime_self_heal.value,
+                        )
+                        return await _finalize_heal_result(None)
+                    return await _finalize_heal_result(await _run_floor_recovery())
+                # Verified: only now write status=completed to the block row.
+                harness_result = await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=None,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
-            await recorder.finalize(success=healed.success)
-            return healed
-        await recorder.finalize(success=False)
-        return await build_failure_result()
+                await self._write_heal_episode_safe(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                    engine="harness",
+                    status="fired_completed",
+                    skip_reason=None,
+                    parameter_binding_keys=parameter_binding_keys,
+                    exception_class=exception_class,
+                    failing_line=failing_line,
+                    matched_step_index=matched_step_index,
+                    failure_message=None,
+                    wall_clock_ms=recovery.wall_clock_ms,
+                    action_count=recovery.action_count,
+                    output_obligation=harness_output_obligation,
+                )
+                return await _finalize_heal_result(harness_result)
+
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=recovery.failure_note,
+                wall_clock_ms=recovery.wall_clock_ms,
+                action_count=recovery.action_count,
+                output_obligation=OutputObligation.none,
+            )
+            # A failed harness turn that already mutated controls must not hand off to floor:
+            # rerunning could duplicate the side effect (submit/send/delete).
+            if recovery.performed_mutation:
+                LOG.info(
+                    "Runtime self-heal failed after mutating actions; suppressing floor fallback",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    origin=TurnOrigin.runtime_self_heal.value,
+                )
+                return await _finalize_heal_result(None)
+            return await _finalize_heal_result(await _run_floor_recovery())
+        except HealAdoptionFailed as exc:
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=str(exc),
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
+            )
+            return await _finalize_heal_result(await _run_floor_recovery())
+        except Exception as exc:
+            LOG.error(
+                "Runtime self-heal harness recovery failed",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                block_label=self.label,
+                origin=TurnOrigin.runtime_self_heal.value,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            await self._write_heal_episode_safe(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                engine="harness",
+                status="fired_failed",
+                skip_reason=None,
+                parameter_binding_keys=parameter_binding_keys,
+                exception_class=exception_class,
+                failing_line=failing_line,
+                matched_step_index=matched_step_index,
+                failure_message=type(exc).__name__,
+                wall_clock_ms=None,
+                action_count=None,
+                output_obligation=OutputObligation.none,
+            )
+            # If the harness already mutated a control before the error (e.g. the workflow-mutation
+            # guard tripped after a click), a floor rerun could duplicate the side effect.
+            if recovery is not None and recovery.performed_mutation:
+                LOG.info(
+                    "Runtime self-heal errored after mutating actions; suppressing floor fallback",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    origin=TurnOrigin.runtime_self_heal.value,
+                )
+                return await _finalize_heal_result(None)
+            return await _finalize_heal_result(await _run_floor_recovery())
 
     async def execute(
         self,
@@ -4601,9 +5372,9 @@ async def wrapper({default_args}):
             block_label=self.label,
         )
 
-        # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
-        # the standard action/artifact timeline and the agent can later take over on failure.
-        # Promptless blocks have no task and persist neither actions nor screenshots.
+        # Every code block gets a container task v1 + step so its recorded calls render through
+        # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
+        # task also seats a later agent takeover on failure.
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,
@@ -4698,7 +5469,22 @@ async def wrapper({default_args}):
                         secure_code_block_result.block_result.output_parameter_value,
                     )
                     return secure_code_block_result.block_result
-            user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
+                LOG.warning(
+                    "codeblock.secure_runner_downgrade",
+                    selection_reason="override_returned_none",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                )
+            user_function = self.generate_async_user_function(
+                self.code,
+                recording_page,
+                parameter_values,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
@@ -4739,6 +5525,8 @@ async def wrapper({default_args}):
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
                     Action(
+                        # Synthesized outside the recorder, so it needs its own stable id for the upsert path.
+                        action_id=generate_action_id(),
                         action_type=ActionType.NULL_ACTION,
                         status=ActionStatus.failed,
                         action_order=len(recorded),
@@ -4748,7 +5536,16 @@ async def wrapper({default_args}):
                     )
                 )
             await recorder.persist(recorded)
-            legacy_healable = self._is_healable_page_failure(e, recording_page)
+            engine_selection = (
+                browser_state.engine_selection
+                if browser_state and inspect.getattr_static(browser_state, "engine_selection", None) is not None
+                else None
+            )
+            legacy_healable = self._is_healable_page_failure(
+                e,
+                recording_page,
+                engine_selection,
+            )
             legacy_classification = HealClassification(
                 healable=legacy_healable,
                 skip_reason=None if legacy_healable else HealSkipReason.unclassifiable,
@@ -5538,7 +6335,6 @@ class UploadToS3Block(Block):
             client = self.get_async_aws_client()
             # is the file path a file or a directory?
             if os.path.isdir(resolved_path):
-                # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(resolved_path)
                 if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
@@ -5571,12 +6367,11 @@ class UploadToS3Block(Block):
         )
 
 
-class FileUploadBlock(Block):
-    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
-    # Parameter 1 of Literal[...] cannot be of type "Any"
-    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+class UnsupportedStorageTypeError(Exception):
+    pass
 
-    storage_type: FileStorageType = FileStorageType.S3
+
+class FileDestinationBlock(Block):
     s3_bucket: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
@@ -5608,11 +6403,7 @@ class FileUploadBlock(Block):
         ),
     )
 
-    def get_all_parameters(
-        self,
-        workflow_run_id: str,
-    ) -> list[PARAMETER_TYPE]:
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+    def _get_destination_parameters(self, workflow_run_context: WorkflowRunContext) -> list[PARAMETER_TYPE]:
         parameters = []
 
         if self.path and workflow_run_context.has_parameter(self.path):
@@ -5668,7 +6459,7 @@ class FileUploadBlock(Block):
 
         return parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+    def _format_destination_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
 
@@ -5738,7 +6529,38 @@ class FileUploadBlock(Block):
                 self.sftp_host_key, workflow_run_context
             )
 
-        self._apply_workflow_system_prompt(workflow_run_context)
+    def _validate_destination_fields(self, storage_type: FileStorageType) -> list[str]:
+        missing_parameters = []
+        if storage_type == FileStorageType.S3:
+            if not self.s3_bucket:
+                missing_parameters.append("s3_bucket")
+            if not self.aws_access_key_id:
+                missing_parameters.append("aws_access_key_id")
+            if not self.aws_secret_access_key:
+                missing_parameters.append("aws_secret_access_key")
+        elif storage_type == FileStorageType.AZURE:
+            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
+                missing_parameters.append("azure_storage_account_name")
+            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
+                missing_parameters.append("azure_storage_account_key")
+            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
+                missing_parameters.append("azure_blob_container_name")
+        elif storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not self.google_credential_id:
+                missing_parameters.append("google_credential_id")
+            if not self.google_drive_folder_id:
+                missing_parameters.append("google_drive_folder_id")
+        elif storage_type == FileStorageType.SFTP:
+            if not self.sftp_host:
+                missing_parameters.append("sftp_host")
+            if not self.sftp_username:
+                missing_parameters.append("sftp_username")
+            if not self.sftp_password and not self.sftp_private_key:
+                missing_parameters.append("sftp_password or sftp_private_key")
+        else:
+            raise UnsupportedStorageTypeError(storage_type)
+
+        return missing_parameters
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
@@ -5758,8 +6580,21 @@ class FileUploadBlock(Block):
         folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
         return folder_path + "/" + blob_name
 
-    def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
+    @staticmethod
+    def _validate_azure_storage_account_name(azure_storage_account_name: str) -> None:
+        if re.fullmatch(r"[a-z0-9]{3,24}", azure_storage_account_name) is None:
+            raise AzureConfigurationError("Azure Storage account name must match ^[a-z0-9]{3,24}$")
+
+    def _get_azure_blob_uri(
+        self,
+        workflow_run_id: str,
+        blob_name: str,
+        azure_storage_account_name: str,
+    ) -> str:
+        self._validate_azure_storage_account_name(azure_storage_account_name)
+        return (
+            f"https://{azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
+        )
 
     def _build_s3_destination(
         self,
@@ -5792,7 +6627,7 @@ class FileUploadBlock(Block):
         azure_storage_account_key: str,
     ) -> FileUploadDestination:
         blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
-        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
+        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name, azure_storage_account_name)
         sdk_uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
         return FileUploadDestination(
             storage_type=FileStorageType.AZURE,
@@ -5847,6 +6682,187 @@ class FileUploadBlock(Block):
             sftp_remote_path=remote_path,
             sftp_host_key=host_key,
         )
+
+    @staticmethod
+    async def _resolve_sensitive_destination_credential(
+        workflow_run_context: WorkflowRunContext,
+        value: str | None,
+        field_name: str,
+    ) -> str | None:
+        if not value:
+            return None
+        if is_encrypted_secret(value):
+            return await decrypt_secret_field_value(
+                value,
+                organization_id=workflow_run_context.organization_id,
+                field_name=field_name,
+            )
+        resolved_value = workflow_run_context.get_original_secret_value_or_none(value)
+        if resolved_value is not None:
+            return resolved_value
+        return value
+
+    async def _dispatch_files_to_storage(
+        self,
+        *,
+        storage_type: FileStorageType,
+        files_to_upload: list[str],
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+    ) -> list[str]:
+        uploaded_uris: list[str] = []
+        if not files_to_upload:
+            return uploaded_uris
+        if storage_type == FileStorageType.S3:
+            actual_aws_secret_access_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.aws_secret_access_key,
+                "aws_secret_access_key",
+            )
+            actual_aws_access_key_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id) or self.aws_access_key_id
+            )
+            if (
+                not isinstance(actual_aws_access_key_id, str)
+                or not actual_aws_access_key_id.strip()
+                or not isinstance(actual_aws_secret_access_key, str)
+                or not actual_aws_secret_access_key.strip()
+            ):
+                raise ValueError("S3 is not configured: resolved AWS credentials are empty")
+            for file_path in files_to_upload:
+                destination = self._build_s3_destination(
+                    workflow_run_id=workflow_run_id,
+                    file_path=file_path,
+                    aws_access_key_id=actual_aws_access_key_id,
+                    aws_secret_access_key=actual_aws_secret_access_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to S3 customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.AZURE:
+            actual_azure_storage_account_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.azure_storage_account_key,
+                "azure_storage_account_key",
+            )
+            resolved_azure_storage_account_name = workflow_run_context.get_original_secret_value_or_none(
+                self.azure_storage_account_name
+            )
+            actual_azure_storage_account_name = (
+                self.azure_storage_account_name
+                if resolved_azure_storage_account_name is None
+                else resolved_azure_storage_account_name
+            )
+            if (
+                not isinstance(actual_azure_storage_account_name, str)
+                or not actual_azure_storage_account_name.strip()
+                or not isinstance(actual_azure_storage_account_key, str)
+                or not actual_azure_storage_account_key.strip()
+            ):
+                raise AzureConfigurationError("Azure Storage is not configured")
+            self._validate_azure_storage_account_name(actual_azure_storage_account_name)
+
+            for file_path in files_to_upload:
+                LOG.info("Uploading file to Azure Blob Storage customer storage", file_path=file_path)
+                destination = self._build_azure_destination(
+                    workflow_run_id=workflow_run_id,
+                    file_path=file_path,
+                    azure_storage_account_name=actual_azure_storage_account_name,
+                    azure_storage_account_key=actual_azure_storage_account_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to Azure Blob Storage customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.GOOGLE_DRIVE:
+            org_id = organization_id or workflow_run_context.organization_id
+            if not org_id:
+                raise ValueError("organization_id is required for Google Drive uploads")
+            google_credential_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
+                or self.google_credential_id
+            )
+            if not google_credential_id:
+                raise ValueError("Google credential id is required")
+
+            google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+                organization_id=org_id,
+                credential_id=google_credential_id,
+                required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+            )
+            if not google_credentials or not google_credentials.token:
+                raise ValueError("Google Drive credential is not connected or is missing required scopes")
+
+            folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
+            for file_path in files_to_upload:
+                LOG.info("Uploading file to Google Drive customer storage", file_path=file_path)
+                destination = self._build_google_drive_destination(
+                    access_token=google_credentials.token,
+                    folder_id=folder_id,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=org_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to Google Drive customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.SFTP:
+            actual_sftp_password = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_password,
+                "sftp_password",
+            )
+            actual_sftp_private_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_private_key,
+                "sftp_private_key",
+            )
+            actual_sftp_passphrase = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_private_key_passphrase,
+                "sftp_private_key_passphrase",
+            )
+            actual_sftp_username = (
+                workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
+            )
+            sftp_port = 22 if self.sftp_port is None else self.sftp_port
+            for file_path in files_to_upload:
+                destination = self._build_sftp_destination(
+                    file_path=file_path,
+                    host=self.sftp_host or "",
+                    port=sftp_port,
+                    username=actual_sftp_username or "",
+                    password=actual_sftp_password,
+                    private_key=actual_sftp_private_key,
+                    private_key_passphrase=actual_sftp_passphrase,
+                    remote_path=self.sftp_remote_path,
+                    host_key=self.sftp_host_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to SFTP customer storage", file_path=self.path)
+        else:
+            raise ValueError(f"Unsupported storage type: {storage_type}")
+
+        return uploaded_uris
 
     @staticmethod
     def _candidate_download_signal_run_ids(
@@ -6153,6 +7169,24 @@ class FileUploadBlock(Block):
 
         return registered_downloaded_files
 
+
+class FileUploadBlock(FileDestinationBlock):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self._get_destination_parameters(self.get_workflow_run_context(workflow_run_id))
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self._format_destination_template_parameters(workflow_run_context)
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -6165,34 +7199,9 @@ class FileUploadBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
         # data validate before uploading
-        missing_parameters = []
-        if self.storage_type == FileStorageType.S3:
-            if not self.s3_bucket:
-                missing_parameters.append("s3_bucket")
-            if not self.aws_access_key_id:
-                missing_parameters.append("aws_access_key_id")
-            if not self.aws_secret_access_key:
-                missing_parameters.append("aws_secret_access_key")
-        elif self.storage_type == FileStorageType.AZURE:
-            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
-                missing_parameters.append("azure_storage_account_name")
-            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
-                missing_parameters.append("azure_storage_account_key")
-            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
-                missing_parameters.append("azure_blob_container_name")
-        elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
-            if not self.google_credential_id:
-                missing_parameters.append("google_credential_id")
-            if not self.google_drive_folder_id:
-                missing_parameters.append("google_drive_folder_id")
-        elif self.storage_type == FileStorageType.SFTP:
-            if not self.sftp_host:
-                missing_parameters.append("sftp_host")
-            if not self.sftp_username:
-                missing_parameters.append("sftp_username")
-            if not self.sftp_password and not self.sftp_private_key:
-                missing_parameters.append("sftp_password or sftp_private_key")
-        else:
+        try:
+            missing_parameters = self._validate_destination_fields(self.storage_type)
+        except UnsupportedStorageTypeError:
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Unsupported storage type: {self.storage_type}",
@@ -6351,131 +7360,14 @@ class FileUploadBlock(Block):
                         organization_id=organization_id,
                     )
 
-            if self.storage_type == FileStorageType.S3:
-                actual_aws_access_key_id = (
-                    workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id)
-                    or self.aws_access_key_id
-                )
-                actual_aws_secret_access_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
-                    or self.aws_secret_access_key
-                )
-                for file_path in files_to_upload:
-                    destination = self._build_s3_destination(
-                        workflow_run_id=workflow_run_id,
-                        file_path=file_path,
-                        aws_access_key_id=actual_aws_access_key_id,
-                        aws_secret_access_key=actual_aws_secret_access_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to S3", file_path=self.path)
-            elif self.storage_type == FileStorageType.AZURE:
-                actual_azure_storage_account_name = (
-                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_name)
-                    or self.azure_storage_account_name
-                )
-                actual_azure_storage_account_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
-                    or self.azure_storage_account_key
-                )
-                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
-                    raise AzureConfigurationError("Azure Storage is not configured")
-
-                for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock Uploading file to Azure Blob Storage", file_path=file_path)
-                    destination = self._build_azure_destination(
-                        workflow_run_id=workflow_run_id,
-                        file_path=file_path,
-                        azure_storage_account_name=actual_azure_storage_account_name,
-                        azure_storage_account_key=actual_azure_storage_account_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
-            elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
-                org_id = organization_id or workflow_run_context.organization_id
-                if not org_id:
-                    raise ValueError("organization_id is required for Google Drive uploads")
-                google_credential_id = (
-                    workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
-                    or self.google_credential_id
-                )
-                if not google_credential_id:
-                    raise ValueError("Google credential id is required")
-
-                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                    organization_id=org_id,
-                    credential_id=google_credential_id,
-                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
-                )
-                if not google_credentials or not google_credentials.token:
-                    raise ValueError("Google Drive credential is not connected or is missing required scopes")
-
-                folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
-                for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock Uploading file to Google Drive", file_path=file_path)
-                    destination = self._build_google_drive_destination(
-                        access_token=google_credentials.token,
-                        folder_id=folder_id,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=org_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
-            elif self.storage_type == FileStorageType.SFTP:
-                actual_sftp_username = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
-                )
-                actual_sftp_password = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_password) or self.sftp_password
-                )
-                actual_sftp_private_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key)
-                    or self.sftp_private_key
-                )
-                actual_sftp_passphrase = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key_passphrase)
-                    or self.sftp_private_key_passphrase
-                )
-                sftp_port = 22 if self.sftp_port is None else self.sftp_port
-                for file_path in files_to_upload:
-                    destination = self._build_sftp_destination(
-                        file_path=file_path,
-                        host=self.sftp_host or "",
-                        port=sftp_port,
-                        username=actual_sftp_username or "",
-                        password=actual_sftp_password,
-                        private_key=actual_sftp_private_key,
-                        private_key_passphrase=actual_sftp_passphrase,
-                        remote_path=self.sftp_remote_path,
-                        host_key=self.sftp_host_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to SFTP", file_path=self.path)
-            else:
-                # This case should ideally be caught by the initial validation
-                raise ValueError(f"Unsupported storage type: {self.storage_type}")
+            uploaded_uris = await self._dispatch_files_to_storage(
+                storage_type=self.storage_type,
+                files_to_upload=files_to_upload,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+            )
 
         except Exception as e:
             LOG.exception("FileUploadBlock Failed to upload file", file_path=self.path, storage_type=self.storage_type)
@@ -8535,10 +9427,246 @@ class LoginBlock(BaseTaskBlock):
     skip_saved_profile: bool = False
 
 
-class FileDownloadBlock(BaseTaskBlock):
+class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
+    download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        parameters = super().get_all_parameters(workflow_run_id)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        existing_keys = {p.key for p in parameters}
+        for destination_param in self._get_destination_parameters(workflow_run_context):
+            if destination_param.key not in existing_keys:
+                parameters.append(destination_param)
+                existing_keys.add(destination_param.key)
+        return parameters
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        download_files_path = ""
+        baseline_unknown = False
+        pre_names: set[str] = set()
+        pre_hashes: dict[str, str] = {}
+        pre_mtimes: dict[str, int] = {}
+        colliding_normalized_names: set[str] = set()
+        if self.download_target != FileDownloadTarget.WEBSITE:
+            # Fail fast on a misconfigured destination before running the (expensive) browser
+            # download, so a missing required field does not waste a download that cannot be delivered.
+            early_storage_type = FileStorageType(self.download_target.value)
+            early_context = self.get_workflow_run_context(workflow_run_id)
+            try:
+                early_missing_parameters = self._validate_destination_fields(early_storage_type)
+            except UnsupportedStorageTypeError as e:
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to send downloaded file(s) to {early_storage_type}: {e}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            if early_missing_parameters:
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        f"Required block values are missing in the FileDownloadBlock (label: {self.label}): "
+                        f"{', '.join(early_missing_parameters)}"
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            context = skyvern_context.current()
+            run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+            download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
+            try:
+                pre_download_filenames = os.listdir(download_files_path)
+            except FileNotFoundError:
+                pre_download_filenames = []
+            except OSError:
+                baseline_unknown = True
+                pre_download_filenames = []
+            for filename in pre_download_filenames:
+                local_file = os.path.join(download_files_path, filename)
+                if not os.path.isfile(local_file):
+                    continue
+                normalized_filename = unicodedata.normalize("NFC", filename)
+                if normalized_filename in pre_names:
+                    colliding_normalized_names.add(normalized_filename)
+                pre_names.add(normalized_filename)
+                try:
+                    pre_hashes[normalized_filename] = calculate_sha256_for_file(local_file)
+                    pre_mtimes[filename] = os.stat(local_file).st_mtime_ns
+                except OSError:
+                    continue
+            if baseline_unknown:
+                # Fail fast before the download: the baseline scan failed, so delivery would be
+                # refused anyway (to avoid leaking earlier files) — do not download customer data.
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        "Could not establish the pre-download baseline; refusing to deliver files to "
+                        f"{early_storage_type} to avoid leaking earlier files."
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+        result = await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+        if self.download_target == FileDownloadTarget.WEBSITE:
+            return result
+        if not result.success:
+            return result
+
+        storage_type = FileStorageType(self.download_target.value)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            self._format_destination_template_parameters(workflow_run_context)
+            max_file_count = (
+                MAX_UPLOAD_FILE_COUNT
+                if storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
+                else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            )
+            try:
+                post_download_filenames = os.listdir(download_files_path)
+            except FileNotFoundError:
+                post_download_filenames = []
+            except OSError as e:
+                # Symmetric with the pre-download baseline: a real post-download scan failure (not a
+                # missing directory) must fail closed rather than report success without delivering.
+                raise RuntimeError("Could not scan the download directory after the download completed") from e
+
+            files_to_upload: list[str] = []
+            for filename in post_download_filenames:
+                local_file = os.path.join(download_files_path, filename)
+                try:
+                    if not os.path.isfile(local_file):
+                        if os.path.isdir(local_file):
+                            LOG.warning("FileDownloadBlock skipping directory", file=filename)
+                        continue
+                    normalized_filename = unicodedata.normalize("NFC", filename)
+                except OSError:
+                    continue
+
+                if normalized_filename in colliding_normalized_names:
+                    # Multiple byte-distinct directory entries normalized to this name at baseline,
+                    # so neither content hash nor write time can be attributed to a single entry;
+                    # fail closed rather than risk delivering an earlier block's file.
+                    continue
+
+                if normalized_filename not in pre_names:
+                    files_to_upload.append(local_file)
+                    continue
+                if normalized_filename not in pre_hashes:
+                    continue
+                try:
+                    current_hash = calculate_sha256_for_file(local_file)
+                except OSError:
+                    continue
+                if current_hash != pre_hashes[normalized_filename]:
+                    files_to_upload.append(local_file)
+                    continue
+                # Identical content means hashing cannot distinguish a genuine re-download
+                # from an earlier block's leftover; fall back to write time, keyed by the raw
+                # directory-entry name so Unicode-normalization-equivalent names never share a
+                # baseline. Deliver only if this block rewrote this exact entry in its own window.
+                baseline_mtime_ns = pre_mtimes.get(filename)
+                if baseline_mtime_ns is None:
+                    continue
+                try:
+                    current_mtime_ns = os.stat(local_file).st_mtime_ns
+                except OSError:
+                    continue
+                if current_mtime_ns > baseline_mtime_ns:
+                    files_to_upload.append(local_file)
+
+            if not files_to_upload:
+                return result
+
+            if len(files_to_upload) > max_file_count:
+                raise ValueError(f"Too many scoped downloaded files to upload. Max: {max_file_count}")
+
+            if files_to_upload and self.prompt and self.prompt.strip():
+                candidate_count = len(files_to_upload)
+                files_to_upload, selection_reasoning = await self._select_files_to_upload_with_prompt(
+                    prompt=self.prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                selected_count = len(files_to_upload)
+                LOG.info(
+                    "FileDownloadBlock prompt selection completed",
+                    block_label=self.label,
+                    candidate_count=candidate_count,
+                    selected_count=selected_count,
+                )
+
+                if not files_to_upload:
+                    LOG.warning(
+                        "FileDownloadBlock prompt selected no files; treating as no-op",
+                        block_label=self.label,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        candidate_count=candidate_count,
+                        selected_count=selected_count,
+                        reasoning=selection_reasoning,
+                    )
+                    return result
+
+            uploaded_uris = await self._dispatch_files_to_storage(
+                storage_type=storage_type,
+                files_to_upload=files_to_upload,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+            )
+        except Exception as e:
+            LOG.exception(
+                "FileDownloadBlock failed to send downloaded file(s)",
+                block_label=self.label,
+                storage_type=storage_type,
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to send downloaded file(s) to {storage_type}: {e}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        LOG.info(
+            "FileDownloadBlock sent downloaded file(s) to customer storage",
+            block_label=self.label,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            storage_type=storage_type,
+            uploaded_file_count=len(uploaded_uris),
+        )
+        return result
 
 
 class UrlBlock(BaseTaskBlock):

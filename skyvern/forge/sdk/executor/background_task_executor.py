@@ -1,3 +1,6 @@
+import asyncio
+from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from typing import Any
 
 import structlog
@@ -20,7 +23,45 @@ from skyvern.utils.files import initialize_skyvern_state_file
 LOG = structlog.get_logger()
 
 
+async def _run_with_own_context(
+    func: Callable[..., Coroutine[Any, Any, Any]],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Give a fire-and-forget run its own SkyvernContext instance.
+
+    asyncio.create_task copies the ContextVar binding but not the object it points at, and the
+    caller keeps running (WorkflowTriggerBlock dispatches a child and resumes). Both would then
+    write the same context — execute_workflow assigns generate_script on it, block execution
+    assigns task_id/step_id — and clobber each other. Shallow-copy so scalar writes stay local
+    while inherited values survive.
+    """
+    parent = skyvern_context.current()
+    if parent is not None:
+        skyvern_context.set(replace(parent))
+    await func(*args, **kwargs)
+
+
 class BackgroundTaskExecutor(AsyncExecutor):
+    # Prevent GC of fire-and-forget asyncio tasks (e.g. when running without FastAPI BackgroundTasks).
+    _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+
+    def _schedule(
+        self,
+        background_tasks: BackgroundTasks | None,
+        func: Callable[..., Coroutine[Any, Any, Any]],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if background_tasks:
+            background_tasks.add_task(func, *args, **kwargs)
+            return
+        task = asyncio.create_task(_run_with_own_context(func, *args, **kwargs))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def execute_task(
         self,
         request: Request | None,
@@ -70,19 +111,19 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.max_steps_override = max_steps_override
         context.max_screenshot_scrolls = task.max_screenshot_scrolls
 
-        if background_tasks:
-            await load_custom_llm_configs_for_organization(app.DATABASE, organization_id)
-            await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
-            background_tasks.add_task(
-                app.agent.execute_step,
-                organization,
-                task,
-                step,
-                api_key,
-                close_browser_on_completion=close_browser_on_completion,
-                browser_session_id=browser_session_id,
-                engine=engine,
-            )
+        await load_custom_llm_configs_for_organization(app.DATABASE, organization_id)
+        await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
+        self._schedule(
+            background_tasks,
+            app.agent.execute_step,
+            organization,
+            task,
+            step,
+            api_key,
+            close_browser_on_completion=close_browser_on_completion,
+            browser_session_id=browser_session_id,
+            engine=engine,
+        )
 
     async def execute_workflow(
         self,
@@ -99,28 +140,26 @@ class BackgroundTaskExecutor(AsyncExecutor):
         block_outputs: dict[str, Any] | None,
         **kwargs: dict,
     ) -> None:
-        if background_tasks:
-            LOG.info(
-                "Executing workflow using background task executor",
-                workflow_run_id=workflow_run_id,
-            )
+        LOG.info(
+            "Executing workflow using background task executor",
+            workflow_run_id=workflow_run_id,
+        )
 
-            await initialize_skyvern_state_file(
-                workflow_run_id=workflow_run_id, organization_id=organization.organization_id
-            )
-            await load_custom_llm_configs_for_organization(app.DATABASE, organization.organization_id)
+        await initialize_skyvern_state_file(
+            workflow_run_id=workflow_run_id, organization_id=organization.organization_id
+        )
+        await load_custom_llm_configs_for_organization(app.DATABASE, organization.organization_id)
 
-            background_tasks.add_task(
-                app.WORKFLOW_SERVICE.execute_workflow,
-                workflow_run_id=workflow_run_id,
-                api_key=api_key,
-                organization=organization,
-                browser_session_id=browser_session_id,
-                block_labels=block_labels,
-                block_outputs=block_outputs,
-            )
-        else:
-            LOG.warning("Background tasks not enabled, skipping workflow execution")
+        self._schedule(
+            background_tasks,
+            app.WORKFLOW_SERVICE.execute_workflow,
+            workflow_run_id=workflow_run_id,
+            api_key=api_key,
+            organization=organization,
+            browser_session_id=browser_session_id,
+            block_labels=block_labels,
+            block_outputs=block_outputs,
+        )
 
     async def execute_task_v2(
         self,
@@ -157,18 +196,16 @@ class BackgroundTaskExecutor(AsyncExecutor):
             status=WorkflowRunStatus.queued,
         )
 
-        if background_tasks:
-            await initialize_skyvern_state_file(
-                workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id
-            )
-            background_tasks.add_task(
-                task_v2_service.run_task_v2,
-                organization=organization,
-                task_v2_id=task_v2_id,
-                max_steps_override=max_steps_override,
-                max_iterations_override=max_iterations_override,
-                browser_session_id=browser_session_id,
-            )
+        await initialize_skyvern_state_file(workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id)
+        self._schedule(
+            background_tasks,
+            task_v2_service.run_task_v2,
+            organization=organization,
+            task_v2_id=task_v2_id,
+            max_steps_override=max_steps_override,
+            max_iterations_override=max_iterations_override,
+            browser_session_id=browser_session_id,
+        )
 
     async def execute_script(
         self,
@@ -180,12 +217,12 @@ class BackgroundTaskExecutor(AsyncExecutor):
         background_tasks: BackgroundTasks | None = None,
         **kwargs: dict,
     ) -> None:
-        if background_tasks:
-            background_tasks.add_task(
-                script_service.execute_script,
-                script_id=script_id,
-                organization_id=organization_id,
-                parameters=parameters,
-                workflow_run_id=workflow_run_id,
-                background_tasks=background_tasks,
-            )
+        self._schedule(
+            background_tasks,
+            script_service.execute_script,
+            script_id=script_id,
+            organization_id=organization_id,
+            parameters=parameters,
+            workflow_run_id=workflow_run_id,
+            background_tasks=background_tasks,
+        )

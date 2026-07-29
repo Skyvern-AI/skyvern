@@ -38,8 +38,9 @@ export function getReviewGateVerdict(
 }
 
 const VERDICT_PILL_CLASSES: Record<"tested" | "untested", string> = {
-  tested: "border-emerald-500/30 bg-emerald-500/15 text-emerald-300",
-  untested: "border-sky-500/30 bg-sky-500/15 text-sky-300",
+  tested:
+    "border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+  untested: "border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300",
 };
 
 const VERDICT_PILL_LABELS: Record<"tested" | "untested", string> = {
@@ -79,7 +80,7 @@ export function ReviewGateCard({
   const rejected = settled === "rejected";
   const accepted = settled === "accepted";
   const itemClassName = rejected
-    ? "ml-2 text-xs text-slate-500 line-through opacity-60"
+    ? "ml-2 text-xs text-muted-foreground dark:text-slate-500 line-through opacity-60"
     : "ml-2 text-xs text-foreground";
   const priorLabels = new Set(
     (turn?.blocks ?? [])
@@ -144,7 +145,7 @@ export function ReviewGateCard({
           <button
             type="button"
             onClick={onReview}
-            className="rounded-md border border-border px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-elevation4"
+            className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
           >
             Review
           </button>
@@ -158,14 +159,14 @@ export function ReviewGateCard({
           <button
             type="button"
             onClick={onAlwaysAccept}
-            className="rounded-md px-3 py-1.5 text-xs text-slate-400 hover:bg-slate-elevation4 hover:text-slate-200"
+            className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
           >
             Always accept
           </button>
           <button
             type="button"
             onClick={onReject}
-            className="rounded-md px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10 hover:text-red-400"
+            className="rounded-md px-3 py-1.5 text-xs text-red-700 hover:bg-red-500/10 hover:text-red-800 dark:text-red-300 dark:hover:text-red-400"
           >
             Reject
           </button>
@@ -175,15 +176,15 @@ export function ReviewGateCard({
         <div
           className={`flex items-center gap-2 border-l-2 px-3 py-2 text-xs ${
             accepted
-              ? "border-l-success text-slate-200"
-              : "border-l-slate-600 text-slate-400"
+              ? "border-l-success text-foreground dark:text-slate-200"
+              : "border-l-slate-600 text-muted-foreground"
           }`}
         >
           <span
             className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded text-[11px] ${
               accepted
-                ? "bg-emerald-500/15 text-emerald-400"
-                : "bg-slate-elevation4 text-slate-400"
+                ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
+                : "bg-slate-elevation4 text-muted-foreground"
             }`}
           >
             {accepted ? "✓" : "↺"}

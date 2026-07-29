@@ -34,6 +34,23 @@ if t.TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+@functools.lru_cache(maxsize=None)
+def _load_js_asset(file_name: str) -> str:
+    # Module-level so the cache key is the asset name only. A method-level lru_cache
+    # keys on `self`, pinning every channel instance (and its Playwright driver) for
+    # the lifetime of the process.
+    base_path = pathlib.Path(__file__).parent / "js"
+    file_name = file_name.lstrip("/")
+
+    if not file_name.endswith(".js"):
+        file_name += ".js"
+
+    full_path = base_path / pathlib.Path(file_name)
+
+    with open(full_path, encoding="utf-8") as f:
+        return f.read()
+
+
 class CdpChannel:
     """
     CdpChannel. Relies on a VncChannel - without one, a CdpChannel has no
@@ -54,6 +71,10 @@ class CdpChannel:
         self.page: Page | None = None
         self.pw: Playwright | None = None
         self.url: str | None = None
+        # Set True by a terminal stop() so the browser "disconnected" callback (registered
+        # in connect()) does not resurrect the connection during teardown. close() stays
+        # reconnect-neutral because connect() calls it to recycle a dropped connection.
+        self._closing = False
 
     @property
     def class_name(self) -> str:
@@ -69,6 +90,11 @@ class CdpChannel:
         """
         Idempotent.
         """
+
+        # A channel torn down by stop() never reconnects: this also neutralizes a
+        # reconnect task the "disconnected" callback may have scheduled just before teardown.
+        if self._closing:
+            return self
 
         if self.browser and self.browser.is_connected():
             return self
@@ -100,6 +126,8 @@ class CdpChannel:
             headers["X-Session-Id"] = self.vnc_channel.browser_session.persistent_browser_session_id
 
         def on_close() -> None:
+            if self._closing:
+                return
             LOG.warning(
                 f"{self.class_name} closing because the persistent browser disconnected itself.", **self.identity
             )
@@ -157,21 +185,35 @@ class CdpChannel:
     async def close(self) -> None:
         LOG.info(f"{self.class_name} closing connection", **self.identity)
 
-        if self.browser:
-            try:
-                await self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
+        try:
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+        finally:
+            # Release the driver even when browser.close() raised on a dead target;
+            # a skipped stop() orphans the node subprocess for the process lifetime.
+            if self.pw:
+                try:
+                    await self.pw.stop()
+                except Exception:
+                    LOG.warning(f"{self.class_name} failed to stop playwright driver", **self.identity, exc_info=True)
+                self.pw = None
 
-        if self.pw:
-            await self.pw.stop()
-            self.pw = None
-
-        self.browser_context = None
-        self.page = None
+            self.browser_context = None
+            self.page = None
 
         LOG.info(f"{self.class_name} closed", **self.identity)
+
+    async def stop(self) -> t.Self:
+        """Terminal close: unlike close() (which connect() reuses to recycle a dropped
+        connection), stop() marks the channel closing so the browser "disconnected"
+        callback registered in connect() cannot resurrect a fresh driver."""
+        self._closing = True
+        await self.close()
+        return self
 
     async def evaluate_js(
         self,
@@ -193,16 +235,5 @@ class CdpChannel:
             LOG.exception(f"{self.class_name} failed to evaluate js", expression=expression, **self.identity)
             raise
 
-    @functools.lru_cache(maxsize=None)
     def js(self, file_name: str) -> str:
-        base_path = pathlib.Path(__file__).parent / "js"
-        file_name = file_name.lstrip("/")
-
-        if not file_name.endswith(".js"):
-            file_name += ".js"
-
-        relative_path = pathlib.Path(file_name)
-        full_path = base_path / relative_path
-
-        with open(full_path, encoding="utf-8") as f:
-            return f.read()
+        return _load_js_asset(file_name)

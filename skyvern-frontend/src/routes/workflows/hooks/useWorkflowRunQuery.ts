@@ -7,7 +7,7 @@ import {
   statusIsRunningOrQueued,
 } from "@/routes/tasks/types";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import {
   getActiveOrgQueryKeyScope,
@@ -21,7 +21,7 @@ function useWorkflowRunQuery(options?: {
 }) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
   const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const activeOrgId = useActiveOrgId();

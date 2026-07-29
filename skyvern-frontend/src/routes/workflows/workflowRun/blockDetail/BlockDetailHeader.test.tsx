@@ -168,9 +168,10 @@ describe("BlockDetailHeader two-tier hierarchy", () => {
     const primaryText = primary?.textContent ?? "";
     const metaText = meta?.textContent ?? "";
 
-    // Primary row is the glance: identity + outcome only.
+    // Primary row is the glance: identity + outcome only. StatusBadge renders
+    // the raw status token ("completed") and capitalizes it via CSS.
     expect(primaryText).toContain("HTTP Request");
-    expect(primaryText).toContain("Completed");
+    expect(primaryText).toContain("completed");
 
     // The UUID is debug detail — demoted out of the primary row into meta.
     expect(primaryText).not.toContain("wrb_531711929286793050");

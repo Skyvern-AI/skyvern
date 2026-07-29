@@ -4,8 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    ensure_browser_session,
+    mcp_browser_context,
+    resolve_browser_state_for_context,
+)
 from skyvern.forge.sdk.copilot.turn_origin import (
     HealAdoptionFailed,
     TurnOrigin,
@@ -146,11 +152,19 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
     assert result is None
     assert ctx.browser_session_id == expected_session_id
 
-    async with mcp_browser_context(ctx):
-        assert register_mock.call_args.args[0] == expected_session_id
+    with capture_logs() as logs:
+        async with mcp_browser_context(ctx):
+            assert register_mock.call_args.args[0] == expected_session_id
 
     unregister_mock.assert_called_once_with(expected_session_id)
     manager.get_browser_state.assert_not_awaited()
+    registered = [entry for entry in logs if entry["event"] == "registered self-heal browser session"]
+    unregistered = [entry for entry in logs if entry["event"] == "unregistered self-heal browser session"]
+    assert len(registered) == 1
+    assert registered[0]["session_id"] == expected_session_id
+    assert registered[0]["organization_id"] == "org_1"
+    assert len(unregistered) == 1
+    assert unregistered[0]["session_id"] == expected_session_id
 
 
 @pytest.mark.asyncio
@@ -243,3 +257,39 @@ async def test_ensure_browser_session_interactive_still_auto_creates(monkeypatch
     assert result is None
     assert ctx.browser_session_id == "pbs_new"
     manager.create_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin", "session_id"),
+    [
+        pytest.param(TurnOrigin.runtime_self_heal, "selfheal:wr_123", id="runtime_self_heal_origin"),
+        pytest.param(TurnOrigin.interactive, "selfheal:wr_123", id="selfheal_prefix_session"),
+    ],
+)
+async def test_resolve_browser_state_for_context_skips_persistent_lookup_for_self_heal_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    origin: TurnOrigin,
+    session_id: str | None,
+) -> None:
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    fake_browser_state = SimpleNamespace(
+        browser_context=_FakeBrowserContext(),
+        get_working_page=AsyncMock(return_value=MagicMock()),
+    )
+    persistent_lookup = AsyncMock(side_effect=AssertionError("persistent lookup must not run for self-heal paths"))
+    manager = SimpleNamespace(get_browser_state=persistent_lookup)
+    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+
+    ctx = _make_ctx(
+        turn_origin=origin,
+        injected_browser_state=fake_browser_state,
+        heal_workflow_run_id="wr_123",
+        browser_session_id=session_id,
+    )
+
+    resolved = await resolve_browser_state_for_context(ctx, session_id=session_id)
+
+    assert resolved is fake_browser_state
+    persistent_lookup.assert_not_awaited()

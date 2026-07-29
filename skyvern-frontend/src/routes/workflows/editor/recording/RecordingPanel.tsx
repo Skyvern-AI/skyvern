@@ -255,7 +255,7 @@ function DraftStepCard({
           <button
             type="button"
             title="Delete block"
-            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-slate-elevation5 hover:text-red-400"
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-slate-elevation5 hover:text-red-700 dark:hover:text-red-400"
             onClick={onDelete}
           >
             <TrashIcon className="h-3.5 w-3.5" />
@@ -577,7 +577,7 @@ function RecordingPanel({ browserSessionId }: Props) {
       </div>
 
       {insertionPointMissing && (
-        <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-400">
+        <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-400">
           Could not determine where to insert recorded blocks. Discard and start
           recording from the workflow editor again.
         </div>
@@ -607,7 +607,7 @@ function RecordingPanel({ browserSessionId }: Props) {
           variant="outline"
           size="icon"
           title="Discard recording"
-          className="h-8 w-8 hover:border-red-500/40 hover:text-red-400"
+          className="h-8 w-8 hover:border-red-500/40 hover:text-red-700 dark:hover:text-red-400"
           disabled={isCommitting}
           onClick={onDiscardClick}
         >

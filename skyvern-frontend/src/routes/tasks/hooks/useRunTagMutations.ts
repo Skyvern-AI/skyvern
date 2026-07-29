@@ -6,7 +6,27 @@ import type {
   RunTagsResponse,
   TagApplyRequest,
 } from "@/routes/workflows/types/tagTypes";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  type QueryClient,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
+
+const RUN_TAG_QUERY_KEYS = [
+  ["run-tags"],
+  ["run-tag-suggestions"],
+  ["tag-keys"],
+  ["tag-values"],
+  ["runs"],
+  ["workflowRuns"],
+  ["tasks"],
+] as const;
+
+function invalidateRunTagQueries(queryClient: QueryClient) {
+  for (const queryKey of RUN_TAG_QUERY_KEYS) {
+    queryClient.invalidateQueries({ queryKey });
+  }
+}
 
 function useApplyRunTagsMutation() {
   const credentialGetter = useCredentialGetter();
@@ -26,11 +46,7 @@ function useApplyRunTagsMutation() {
         .then((response) => response.data);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["run-tags"] });
-      queryClient.invalidateQueries({ queryKey: ["tag-keys"] });
-      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      invalidateRunTagQueries(queryClient);
     },
     onError: (error: unknown) => {
       toast({
@@ -42,4 +58,4 @@ function useApplyRunTagsMutation() {
   });
 }
 
-export { useApplyRunTagsMutation };
+export { invalidateRunTagQueries, useApplyRunTagsMutation };

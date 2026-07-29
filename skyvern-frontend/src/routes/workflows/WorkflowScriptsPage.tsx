@@ -72,7 +72,7 @@ function PinButton({
             size="icon"
             className={`size-8 ${
               script.is_pinned
-                ? "text-amber-500 hover:text-amber-400"
+                ? "text-amber-500 hover:text-amber-700 dark:hover:text-amber-400"
                 : "text-muted-foreground hover:text-foreground"
             }`}
             disabled={pinMutation.isPending}
@@ -290,8 +290,8 @@ function ScriptsTableRows({
       <TableRow>
         <TableCell colSpan={TABLE_COL_COUNT}>
           <div className="flex flex-col items-center gap-2 py-12 text-center">
-            <FileTextIcon className="size-8 text-slate-400" />
-            <p className="text-sm text-slate-500">
+            <FileTextIcon className="size-8 text-muted-foreground" />
+            <p className="text-sm text-muted-foreground dark:text-slate-500">
               No scripts yet. Scripts are created automatically when this agent
               runs with Code mode enabled.
             </p>
@@ -391,7 +391,7 @@ function ScriptRow({
             <div className="flex flex-col gap-0.5">
               <Link
                 to={`/agents/${workflowPermanentId}/scripts/${script.script_id}`}
-                className="font-mono text-sm text-blue-400 hover:underline"
+                className="font-mono text-sm text-blue-700 hover:underline dark:text-blue-400"
                 onClick={(e) => e.stopPropagation()}
               >
                 {script.cache_key_value || "(default)"}
@@ -438,7 +438,7 @@ function ScriptRow({
                   {group.run_id ? (
                     <Link
                       to={`/agents/${workflowPermanentId}/${group.run_id}/code`}
-                      className="font-mono text-xs text-blue-400 hover:underline"
+                      className="font-mono text-xs text-blue-700 hover:underline dark:text-blue-400"
                       onClick={(e) => e.stopPropagation()}
                     >
                       {group.run_id}
@@ -514,7 +514,7 @@ function WorkflowScriptsPage() {
             <>
               <Link
                 to={`/agents/${workflowPermanentId}/runs`}
-                className="text-lg font-semibold hover:text-blue-400 hover:underline"
+                className="text-lg font-semibold hover:text-blue-700 hover:underline dark:hover:text-blue-400"
               >
                 {workflow?.title}
               </Link>

@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from skyvern.forge.sdk.copilot.output_utils import is_valid_image_base64
-
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.runtime import AgentContext
 
@@ -23,6 +21,27 @@ REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 _SESSION_SCRUB_VALUES: dict[str, list[str]] = {}
 # No deterministic per-session teardown exists, so FIFO-evict to bound worker memory.
 _MAX_SCRUB_SESSIONS = 1024
+
+# Substring-replacing a short value into stored content corrupts it: a six-digit OTP occurs by
+# chance inside ports, counts, and ids. Rewrites that persist apply this floor; log redaction does
+# not, because over-redacting a log line is cheap and leaking a secret into one is not.
+MIN_PERSISTED_REDACTION_LENGTH = 8
+
+_ALL_VALUES_CACHE: tuple[tuple[tuple[str, int], ...], list[str]] | None = None
+
+
+def _registry_fingerprint() -> tuple[tuple[str, int], ...]:
+    """Cheap key that changes on any registry mutation, including a direct one.
+
+    Keyed per session rather than on totals: aggregate counts alone collide whenever one session is
+    dropped and another registers the same number of values, which served the dropped session's
+    values as the live list and left the new session's credential unscrubbed. Values are
+    append-only within a session, so a per-session count moves on every addition.
+
+    Deriving the key from the data rather than a hand-maintained counter means a caller that
+    mutates the dict directly cannot be served a stale list.
+    """
+    return tuple(sorted((session_id, len(values)) for session_id, values in _SESSION_SCRUB_VALUES.items()))
 
 
 def _session_id(ctx: AgentContext) -> str | None:
@@ -52,6 +71,32 @@ def clear_session_scrub_values(session_id: str | None) -> None:
         _SESSION_SCRUB_VALUES.pop(session_id, None)
 
 
+def all_registered_secret_values() -> list[str]:
+    """Every credential value registered by any session in this process, longest first.
+
+    The log seam has no ``AgentContext`` to scope against — a credential value must never reach
+    log output regardless of which session filled it. Callers that rewrite persisted content must
+    use ``registered_scrub_values`` instead: replacing across sessions there would let one session's
+    short value corrupt another's stored data.
+    """
+    global _ALL_VALUES_CACHE
+    fingerprint = _registry_fingerprint()
+    cached = _ALL_VALUES_CACHE
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    merged: set[str] = set()
+    for values in _SESSION_SCRUB_VALUES.values():
+        merged.update(value for value in values if isinstance(value, str) and value)
+    computed = sorted(merged, key=len, reverse=True)
+    _ALL_VALUES_CACHE = (fingerprint, computed)
+    return computed
+
+
+def registered_scrub_values(ctx: AgentContext) -> list[str]:
+    """This turn's and this session's registered values, longest first."""
+    return _registered_scrub_values(ctx)
+
+
 def _registered_scrub_values(ctx: AgentContext) -> list[str]:
     merged: list[str] = []
     values = getattr(ctx, "secret_scrub_values", None)
@@ -70,7 +115,22 @@ def scrub_secrets_from_text(ctx: AgentContext, text: str) -> str:
     return text
 
 
+def scrub_all_registered_from_text(text: str) -> str:
+    """Session-agnostic counterpart to ``scrub_secrets_from_text`` for reporting seams.
+
+    Exception text is serialized where no ``AgentContext`` is in scope, so this scrubs against
+    every session's values for the same reason ``all_registered_secret_values`` does.
+    """
+    for value in all_registered_secret_values():
+        text = text.replace(value, REDACTED_SECRET_PLACEHOLDER)
+    return text
+
+
 def scrub_secrets_from_structure(ctx: AgentContext, obj: Any) -> Any:
+    # Lazy: output_utils costs ~7.7s to import, and this module is on the logging and span
+    # exception paths, where that would be paid by whichever request raises first.
+    from skyvern.forge.sdk.copilot.output_utils import is_valid_image_base64  # noqa: PLC0415
+
     values = _registered_scrub_values(ctx)
     if not values:
         return obj

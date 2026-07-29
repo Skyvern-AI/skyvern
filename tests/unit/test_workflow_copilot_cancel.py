@@ -32,7 +32,7 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _build_exit_result
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
     _copilot_cancel_key,
@@ -593,6 +593,45 @@ async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
 
     workflow_params.update_workflow_copilot_chat.assert_awaited_once()
     assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_persists_prior_context_never_none() -> None:
+    """A pre-agent cancel must carry the prior finalized context forward, not None."""
+    prior_context = StructuredContext(
+        user_goal="g", entrypoint_url="http://localhost:8955/analytics_console/pathfold/?date_from=-7d"
+    ).to_json_str()
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="keep going",
+        agent_result=None,
+        prior_global_llm_context=prior_context,
+    )
+
+    ai_insert = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1]
+    persisted = ai_insert.kwargs["global_llm_context"]
+    assert persisted == prior_context
+    assert StructuredContext.from_json_str(persisted).entrypoint_url is not None
 
 
 @pytest.mark.asyncio

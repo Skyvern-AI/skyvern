@@ -1,6 +1,7 @@
 """Capture short-lived visible page text during explicitly scoped browser waits."""
 
 import re
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,7 @@ from playwright.async_api import Page
 from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -112,30 +114,36 @@ class TransientPageTextObserver:
         self.page = page
         self.events: list[dict[str, Any]] = []
         self._binding_state: _TransientPageTextBinding | None = None
+        self._started_at = time.monotonic()
+        self._document_install_attempt_count = 0
+        self._document_install_success_count = 0
         self._log_context = {
             "task_id": task_id,
             "step_id": step_id,
             "workflow_run_id": workflow_run_id,
         }
 
-    async def start(self) -> None:
+    async def start(self, *, scan_initial_visible_state: bool = True) -> None:
         binding_state = _get_transient_text_binding(self.page)
+        previous_active_observer = binding_state.active_observer
 
         def record_text_event(_source: dict[str, Any], payload: Any) -> None:
             if binding_state.active_observer is not None:
                 _append_text_event(binding_state.active_observer.events, payload)
 
         try:
+            self._document_install_attempt_count += 1
             if not binding_state.registered:
                 await self.page.expose_binding(TRANSIENT_TEXT_BINDING_NAME, record_text_event)
                 binding_state.registered = True
             binding_state.active_observer = self
-            await self.page.evaluate(
-                """
-                ({ bindingName, stateKey, minLength, maxLength }) => {
+            await SkyvernFrame.evaluate(
+                frame=self.page,
+                expression="""
+                ({ bindingName, stateKey, minLength, maxLength, scanInitialVisibleState }) => {
                   const key = stateKey;
                   const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
-                  try { window[key]?.observer?.disconnect?.(); } catch (e) {}
+                  const previousState = window[key];
 
                   const isVisible = (element) => {
                     if (!element || !(element instanceof Element)) return false;
@@ -170,36 +178,72 @@ class TransientPageTextObserver:
                     })).catch(() => {});
                   };
 
-                  const observer = new MutationObserver((mutations) => {
-                    for (const mutation of mutations) {
-                      for (const node of mutation.addedNodes) emit(node);
-                      if (mutation.type === "characterData" || mutation.type === "attributes") {
-                        emit(mutation.target);
+                  let observer;
+                  try {
+                    observer = new MutationObserver((mutations) => {
+                      for (const mutation of mutations) {
+                        for (const node of mutation.addedNodes) emit(node);
+                        if (mutation.type === "characterData" || mutation.type === "attributes") {
+                          emit(mutation.target);
+                        }
+                      }
+                    });
+                    observer.observe(document.documentElement || document.body, {
+                      subtree: true,
+                      childList: true,
+                      characterData: true,
+                      attributes: true,
+                      attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-live"],
+                    });
+                    const selectors = "[role='alert'],[role='status'],[aria-live]:not([aria-live='off'])";
+                    const visibleSemanticElements = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
+                    const textForElement = (element) => normalize(
+                      element instanceof HTMLElement && typeof element.innerText === "string"
+                        ? element.innerText
+                        : element.textContent || ""
+                    );
+                    const visibleSemanticTexts = visibleSemanticElements.map(textForElement);
+                    if (scanInitialVisibleState) {
+                      const staleVisibleTexts = new Set(previousState?.visibleSemanticTexts || []);
+                      for (const element of visibleSemanticElements) {
+                        if (!staleVisibleTexts.has(textForElement(element))) emit(element);
                       }
                     }
-                  });
-                  observer.observe(document.documentElement || document.body, {
-                    subtree: true,
-                    childList: true,
-                    characterData: true,
-                    attributes: true,
-                    attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-live"],
-                  });
-                  window[key] = { observer, bindingName };
+                    window[key] = { observer, bindingName, visibleSemanticTexts };
+                    try { previousState?.observer?.disconnect?.(); } catch (e) {}
+                  } catch (error) {
+                    try { observer?.disconnect?.(); } catch (e) {}
+                    throw error;
+                  }
                 }
                 """,
-                {
+                arg={
                     "bindingName": TRANSIENT_TEXT_BINDING_NAME,
                     "stateKey": TRANSIENT_TEXT_OBSERVER_STATE_KEY,
                     "minLength": TRANSIENT_TEXT_MIN_LENGTH,
                     "maxLength": TRANSIENT_TEXT_MAX_LENGTH,
+                    "scanInitialVisibleState": scan_initial_visible_state,
                 },
             )
             self._binding_state = binding_state
+            self._document_install_success_count += 1
+            LOG.info(
+                "Transient page text observer installed",
+                **self._log_context,
+                document_scope="main_frame",
+                document_install_attempt_count=self._document_install_attempt_count,
+                document_install_success_count=self._document_install_success_count,
+            )
         except Exception:
             if binding_state.active_observer is self:
-                binding_state.active_observer = None
-            LOG.warning("Failed to start transient page text observer", **self._log_context, exc_info=True)
+                binding_state.active_observer = previous_active_observer
+            LOG.warning(
+                "Failed to start transient page text observer",
+                **self._log_context,
+                document_scope="main_frame",
+                document_install_attempt_count=self._document_install_attempt_count,
+                exc_info=True,
+            )
 
     async def stop(self) -> None:
         binding_state = self._binding_state
@@ -207,8 +251,9 @@ class TransientPageTextObserver:
             return
         if binding_state.active_observer is self:
             try:
-                await self.page.evaluate(
-                    """
+                await SkyvernFrame.evaluate(
+                    frame=self.page,
+                    expression="""
                     ({ bindingName, stateKey }) => {
                       const state = window[stateKey];
                       if (state?.bindingName === bindingName) {
@@ -217,13 +262,22 @@ class TransientPageTextObserver:
                       }
                     }
                     """,
-                    {"bindingName": TRANSIENT_TEXT_BINDING_NAME, "stateKey": TRANSIENT_TEXT_OBSERVER_STATE_KEY},
+                    arg={"bindingName": TRANSIENT_TEXT_BINDING_NAME, "stateKey": TRANSIENT_TEXT_OBSERVER_STATE_KEY},
                 )
             except Exception:
                 LOG.warning("Failed to stop transient page text observer", **self._log_context, exc_info=True)
             finally:
                 binding_state.active_observer = None
         self._binding_state = None
+        LOG.info(
+            "Transient page text observer stopped",
+            **self._log_context,
+            document_scope="main_frame",
+            document_install_attempt_count=self._document_install_attempt_count,
+            document_install_success_count=self._document_install_success_count,
+            accepted_event_count=len(self.events),
+            elapsed_seconds=time.monotonic() - self._started_at,
+        )
 
 
 def match_user_defined_errors_from_transient_text(
@@ -243,30 +297,29 @@ def match_user_defined_errors_from_transient_text(
         return []
 
     normalized_observed_texts = [_normalize_for_match(text) for text in observed_texts]
-    combined_observed_text = "\n".join(normalized_observed_texts)
     matched_errors: list[UserDefinedError] = []
     for error_code, error_description in task.error_code_mapping.items():
         normalized_code = error_code.casefold()
         # Restrict code matching to machine-style codes; natural words are too collision-prone in page text.
-        code_matches = (
-            "_" in error_code and re.search(rf"\b{re.escape(normalized_code)}\b", combined_observed_text) is not None
-        )
+        code_pattern = re.compile(rf"\b{re.escape(normalized_code)}\b") if "_" in error_code else None
         normalized_description = _normalize_for_match(error_description) if isinstance(error_description, str) else ""
-        description_matches = bool(
-            normalized_description
-            and (
-                normalized_description in combined_observed_text
-                or any(
-                    _has_meaningful_text_overlap(observed_text, normalized_description)
-                    for observed_text in normalized_observed_texts
+        matched_texts = [
+            observed_texts[index]
+            for index, observed_text in enumerate(normalized_observed_texts)
+            if (code_pattern is not None and code_pattern.search(observed_text) is not None)
+            or (
+                normalized_description
+                and (
+                    normalized_description in observed_text
+                    or _has_meaningful_text_overlap(observed_text, normalized_description)
                 )
             )
-        )
-        if code_matches or description_matches:
+        ]
+        if matched_texts:
             matched_errors.append(
                 UserDefinedError(
                     error_code=error_code,
-                    reasoning=f"Observed transient text during browser wait: {_format_observed_text_reasoning(observed_texts)}",
+                    reasoning=f"Observed transient text during browser wait: {_format_observed_text_reasoning(matched_texts)}",
                     confidence_float=TRANSIENT_TEXT_MATCH_CONFIDENCE,
                 )
             )

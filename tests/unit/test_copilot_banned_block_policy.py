@@ -73,6 +73,8 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx.workflow_id = "w_test"
     ctx.workflow_permanent_id = "wpid_test"
     ctx.organization_id = "o_test"
+    ctx.code_authoring_guardrail_reject_count = 0
+    ctx.recorded_build_test_outcome_history = []
     return ctx
 
 
@@ -253,6 +255,11 @@ def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> No
     assert "already-authenticated page anchor" in prompt
     assert "only fill username/password" in prompt
     assert "login fields are visible" in prompt
+    assert "await solve_captcha(page)" in prompt
+    assert "platform-managed verification challenge" in prompt
+    assert "await <credential_key>.otp()" in prompt
+    assert "Do not treat disappearance of the" in prompt
+    assert "login fields as proof of authentication" in prompt
 
 
 @pytest.mark.parametrize("block_type", ["task", "task_v2"])

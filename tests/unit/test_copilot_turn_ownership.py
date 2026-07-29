@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
@@ -7,8 +9,14 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
+    _record_code_authoring_guardrail_reject,
+)
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
+    raise_if_turn_halt,
     retire_outranked_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
@@ -50,6 +58,23 @@ def _churn_signal() -> CopilotToolBlockerSignal:
     return _signal("code_authoring_guardrail_churn")
 
 
+_REPLAY_STRUCTURAL_KEY = "b3d8aac91f1ae3a92d60ebd15ebee04216af45b03f18fe39d6deeefa77140e33"
+
+
+def _synthesized_force_signal() -> CopilotToolBlockerSignal:
+    return _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False)
+
+
+def _synthesized_replay_context() -> CopilotContext:
+    ctx = make_copilot_context()
+    ctx.impose_synthesized_code_block = True
+    ctx.recorded_build_test_outcome_history = [
+        {"structural_key": _REPLAY_STRUCTURAL_KEY, "phase": "build_test"},
+        {"structural_key": _REPLAY_STRUCTURAL_KEY, "phase": "build_test"},
+    ]
+    return ctx
+
+
 def _grant_ladder(ctx: CopilotContext) -> None:
     ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
 
@@ -84,22 +109,22 @@ def test_r31_three_way_contradiction_yields_single_owner() -> None:
     _grant_ladder(ctx)
     claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
 
-    rescout = claim_turn(ctx, TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER)
+    credential_churn = claim_turn(ctx, TurnClaimant.CREDENTIAL_PRIORITY_CHURN)
     persistence_payload = claim_and_stash_blocker_signal(
         ctx,
         TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
         _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False),
     )
 
-    assert rescout is ClaimOutcome.YIELDED
+    assert credential_churn is ClaimOutcome.YIELDED
     assert persistence_payload is None
     assert ctx.blocker_signal is None
     owner = current_turn_owner(ctx)
     assert owner is not None
     assert owner.claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
     assert sorted(_conflict_fingerprints(ctx)) == [
+        "output_contract_actuation>credential_priority_authoring_churn",
         "output_contract_actuation>synthesized_block_persistence_force",
-        "output_contract_actuation>uncovered_output_rescout_steer",
     ]
 
 
@@ -107,41 +132,6 @@ def test_precedence_order_covers_every_claimant_once() -> None:
     assert len(set(_PRECEDENCE_ORDER)) == len(_PRECEDENCE_ORDER)
     assert set(_PRECEDENCE_ORDER) == set(TurnClaimant)
     assert set(CLAIMANT_REASON_CODE_FAMILIES) == set(TurnClaimant)
-
-
-def test_rescout_outranks_grounding_and_persistence_per_cascade_order() -> None:
-    ctx = make_copilot_context()
-    assert claim_turn(ctx, TurnClaimant.RECORDED_OUTCOME_GROUNDING) is ClaimOutcome.OWNED
-    assert claim_turn(ctx, TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER) is ClaimOutcome.OWNED
-
-    ctx2 = make_copilot_context()
-    assert claim_and_stash_blocker_signal(
-        ctx2,
-        TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
-        _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False),
-    )
-    assert claim_turn(ctx2, TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER) is ClaimOutcome.OWNED
-
-
-def test_grounding_outranks_persistence_per_nested_exception() -> None:
-    ctx = make_copilot_context()
-    persisted = claim_and_stash_blocker_signal(
-        ctx,
-        TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
-        _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False),
-    )
-    assert persisted is not None
-    grounding = claim_and_stash_blocker_signal(
-        ctx,
-        TurnClaimant.RECORDED_OUTCOME_GROUNDING,
-        _signal(
-            "recorded_outcome_grounding_required", blocker_kind="missing_required_context", renders_final_reply=False
-        ),
-    )
-    assert grounding is not None
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "recorded_outcome_grounding_required"
-    assert "recorded_outcome_grounding>synthesized_block_persistence_force" in _conflict_fingerprints(ctx)
 
 
 def test_genuinely_terminal_family_is_the_shared_blocker_signal_set() -> None:
@@ -320,9 +310,9 @@ def test_unclaimed_signal_fails_open_to_render_while_owner_live() -> None:
     assert ctx.gate_precedence_conflict_events == []
 
 
-def test_preflight_claim_never_outlives_the_rejecting_call() -> None:
+def test_transient_claim_never_outlives_the_claiming_call() -> None:
     ctx = make_copilot_context()
-    assert claim_turn(ctx, TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT) is ClaimOutcome.OWNED
+    assert claim_turn(ctx, TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION) is ClaimOutcome.OWNED
     assert current_turn_owner(ctx) is None
 
     churn = _churn_signal()
@@ -330,11 +320,11 @@ def test_preflight_claim_never_outlives_the_rejecting_call() -> None:
     assert blocker_signal_render_allowed(ctx, churn) is True
 
 
-def test_preflight_claim_yields_to_live_ladder_and_records_conflict() -> None:
+def test_transient_claim_yields_to_live_ladder_and_records_conflict() -> None:
     ctx = make_copilot_context()
     _grant_ladder(ctx)
-    assert claim_turn(ctx, TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT) is ClaimOutcome.YIELDED
-    assert _conflict_fingerprints(ctx) == ["output_contract_actuation>metadata_run_preflight_reject"]
+    assert claim_turn(ctx, TurnClaimant.POST_RUN_PAGE_PATH_INTERACTION) is ClaimOutcome.YIELDED
+    assert _conflict_fingerprints(ctx) == ["output_contract_actuation>post_run_page_path_interaction"]
 
 
 def test_carve_out_claimants_are_transient() -> None:
@@ -416,3 +406,44 @@ def test_fresh_context_has_no_owner() -> None:
     ctx = make_copilot_context()
     assert current_turn_owner(ctx) is None
     assert ctx.gate_precedence_conflict_events == []
+
+
+def test_exhausted_churn_owns_over_held_synthesized_force_and_halts() -> None:
+    ctx = _synthesized_replay_context()
+    assert (
+        claim_and_stash_blocker_signal(
+            ctx, TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE, _synthesized_force_signal()
+        )
+        is not None
+    )
+
+    for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+        _record_code_authoring_guardrail_reject(ctx)
+
+    owner = current_turn_owner(ctx)
+    assert owner is not None
+    assert owner.claimant is TurnClaimant.CODE_AUTHORING_CHURN
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "code_authoring_guardrail_churn"
+    assert blocker_signal_render_allowed(ctx, ctx.blocker_signal) is True
+    assert "code_authoring_guardrail_churn>synthesized_block_persistence_force" in _conflict_fingerprints(ctx)
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+
+    stash_turn_halt_from_blocker_signal(ctx, ctx.blocker_signal, source="enforcement_backstop")
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx)
+
+
+def test_standard_path_churn_precedence_unchanged() -> None:
+    ctx = make_copilot_context()
+    assert (
+        claim_and_stash_blocker_signal(
+            ctx, TurnClaimant.CREDENTIAL_PRIORITY_CHURN, _signal("credential_priority_authoring_churn")
+        )
+        is not None
+    )
+    assert claim_turn(ctx, TurnClaimant.CODE_AUTHORING_CHURN) is ClaimOutcome.YIELDED
+
+    ctx2 = make_copilot_context()
+    assert claim_and_stash_blocker_signal(ctx2, TurnClaimant.CODE_AUTHORING_CHURN, _churn_signal()) is not None
+    assert claim_turn(ctx2, TurnClaimant.LOOP_DETECTED) is ClaimOutcome.YIELDED

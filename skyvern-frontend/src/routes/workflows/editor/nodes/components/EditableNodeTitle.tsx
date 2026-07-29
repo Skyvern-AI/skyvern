@@ -6,7 +6,7 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 import { HorizontallyResizingInput } from "./HorizontallyResizingInput";
-import { useRef, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 
 type Props = {
   value: string;
@@ -14,6 +14,9 @@ type Props = {
   onChange: (value: string) => void;
   titleClassName?: string;
   inputClassName?: string;
+  // Replaces the default click-to-edit <h1> in idle mode; the caller renders
+  // idle (e.g. a link) and enters edit via startEditing. Edit flow unchanged.
+  renderIdle?: (args: { startEditing: () => void }) => ReactNode;
 };
 
 function EditableNodeTitle({
@@ -22,6 +25,7 @@ function EditableNodeTitle({
   onChange,
   titleClassName,
   inputClassName,
+  renderIdle,
 }: Props) {
   const [editing, setEditing] = useState(false);
   const [isTruncated, setIsTruncated] = useState(false);
@@ -37,6 +41,9 @@ function EditableNodeTitle({
   };
 
   if (!editing) {
+    if (renderIdle) {
+      return <>{renderIdle({ startEditing: () => setEditing(true) })}</>;
+    }
     return (
       <TooltipProvider>
         <Tooltip>

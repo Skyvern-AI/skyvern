@@ -12,14 +12,17 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    carrier_backed_anti_bot_categories,
+    interactive_challenge_controls,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
     only_degraded_blocking,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, workflow_target_url
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.result_evidence import (
@@ -45,6 +48,7 @@ BuildTestOutcomeReasonCode = Literal[
     "sandbox_unresolved_name",
     "synthesized_parameter_binding_ambiguous",
     "code_safety_reject",
+    "code_block_unrenderable",
     "credential_scout_reject",
     "schema_incompatibility",
     "verified_success",
@@ -53,6 +57,7 @@ BuildTestOutcomeReasonCode = Literal[
     "terminal_challenge_blocker",
     "blocker_reported",
     "failed_run",
+    "run_completed_unevaluated",
     "suspicious_success",
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
@@ -60,10 +65,20 @@ BuildTestOutcomeReasonCode = Literal[
     "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
+    "definition_contract_unsatisfied",
     "fallback_floor_turn_unsatisfiable",
     "output_source_unobservable",
     "actuation_exhausted",
 ]
+MetadataRejectFamily = Literal[
+    "missing_code_artifact_metadata",
+    "metadata_normalization",
+    "recorded_outcome_output_candidate",
+    "recorded_outcome_output_coverage",
+]
+MetadataRejectLadderAction = Literal["rung_1", "rung_2", "terminal"]
+PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
+PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
@@ -78,6 +93,27 @@ _PLAYWRIGHT_LOCATOR_WAIT_RE = re.compile(
     re.IGNORECASE,
 )
 _PLAYWRIGHT_HIDDEN_TAG_RE = re.compile(r"locator resolved to hidden <(?P<tag>[a-z0-9:-]+)", re.IGNORECASE)
+
+
+class PostRunPagePathTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: PostRunPagePathTargetKind
+    selector: str = Field(min_length=1)
+
+
+class PostRunPagePathFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: PostRunPagePathKind
+    workflow_run_id: str = Field(min_length=1)
+    current_url: str = Field(min_length=1)
+    continuation_targets: tuple[PostRunPagePathTarget, ...]
+    enter_allowed: bool = False
+
+    @property
+    def is_page_path(self) -> bool:
+        return self.kind != "non_page_outcome" and bool(self.continuation_targets)
 
 
 class RecordedBuildTestOutcome(BaseModel):
@@ -100,6 +136,7 @@ class RecordedBuildTestOutcome(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
     runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
+    page_path_failure: PostRunPagePathFailure | None = None
     authored_structure_signature: str | None = None
     display_text: str = ""
     observed_page_value_excerpt: str = ""
@@ -139,6 +176,76 @@ class RecordedBuildTestOutcome(BaseModel):
     @property
     def is_authoritative(self) -> bool:
         return self.structural_key is not None
+
+
+class MetadataRejectLadderInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reject_family: MetadataRejectFamily
+    structural_key: str = Field(min_length=1)
+    gate_id: Literal["code_artifact_metadata"] = "code_artifact_metadata"
+    missing_fields_by_label: dict[str, list[str]]
+
+
+class MetadataRejectLadderState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reject_family: MetadataRejectFamily
+    structural_key: str = Field(min_length=1)
+    gate_id: Literal["code_artifact_metadata"] = "code_artifact_metadata"
+    missing_fields_by_label: dict[str, list[str]]
+    streak_count: int = Field(ge=1)
+
+
+class MetadataRejectLadderDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: MetadataRejectLadderAction
+    rung: Literal[1, 2] | None
+    gate_id: Literal["code_artifact_metadata"] = "code_artifact_metadata"
+    missing_fields_by_label: dict[str, list[str]]
+    state: MetadataRejectLadderState
+
+
+def adjudicate_metadata_reject_ladder(
+    prior_state: MetadataRejectLadderState | None,
+    reject: MetadataRejectLadderInput,
+) -> MetadataRejectLadderDecision:
+    same_reject = (
+        prior_state is not None
+        and prior_state.reject_family == reject.reject_family
+        and prior_state.structural_key == reject.structural_key
+        and prior_state.gate_id == reject.gate_id
+        and prior_state.missing_fields_by_label == reject.missing_fields_by_label
+    )
+    if same_reject:
+        assert prior_state is not None
+        streak_count = prior_state.streak_count + 1
+    else:
+        streak_count = 1
+    state = MetadataRejectLadderState(
+        reject_family=reject.reject_family,
+        structural_key=reject.structural_key,
+        gate_id=reject.gate_id,
+        missing_fields_by_label=reject.missing_fields_by_label,
+        streak_count=streak_count,
+    )
+    if streak_count >= 3:
+        action: MetadataRejectLadderAction = "terminal"
+        rung = None
+    elif streak_count == 2:
+        action = "rung_2"
+        rung = 2
+    else:
+        action = "rung_1"
+        rung = 1
+    return MetadataRejectLadderDecision(
+        action=action,
+        rung=rung,
+        gate_id=reject.gate_id,
+        missing_fields_by_label=reject.missing_fields_by_label,
+        state=state,
+    )
 
 
 class RecordedOutcomeGroundingPayload(BaseModel):
@@ -231,6 +338,7 @@ class RecordedOutcomeBindingConstraint(BaseModel):
 
 
 class _RecordedBuildTestOutcomeContext(Protocol):
+    workflow_yaml: str
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
     recorded_build_test_outcome_history: list[dict[str, object]]
     recorded_persisted_block_run_workflow_run_id: str | None
@@ -271,6 +379,32 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
         workflow_run_id=outcome.workflow_run_id,
         authored_structure_signature=outcome.authored_structure_signature,
     )
+
+
+def bind_post_run_page_path_failure(
+    ctx: _RecordedBuildTestOutcomeContext,
+    page_evidence: Mapping[str, object],
+) -> bool:
+    """Bind a fresh same-run page-path condition without changing the outcome's structural identity."""
+    latest = ctx.latest_recorded_build_test_outcome
+    if (
+        not isinstance(latest, RecordedBuildTestOutcome)
+        or not latest.is_authoritative
+        or latest.phase != "persisted_block_run"
+        or latest.reason_code != "outcome_not_demonstrated"
+        or latest.verdict != "repairable_failure"
+        or not latest.workflow_run_id
+    ):
+        return False
+    condition = _post_run_page_path_failure(
+        page_evidence,
+        latest.workflow_run_id,
+        required_target_url=workflow_target_url(ctx.workflow_yaml),
+    )
+    if condition is None:
+        return False
+    ctx.latest_recorded_build_test_outcome = latest.model_copy(update={"page_path_failure": condition})
+    return True
 
 
 def authored_structure_signature_from_workflow(
@@ -344,6 +478,7 @@ def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontie
         "sandbox_unresolved_name",
         "synthesized_parameter_binding_ambiguous",
         "required_input_unbound",
+        "definition_contract_unsatisfied",
     }:
         return "amend_in_place"
     if outcome.reason_code in {"outcome_not_demonstrated", "no_meaningful_output", "runtime_missing_output_dependency"}:
@@ -459,22 +594,6 @@ def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGr
 def clear_recorded_outcome_grounding_requirement(ctx: object) -> None:
     ctx.recorded_outcome_grounding_requirement = None  # type: ignore[attr-defined]
     ctx.recorded_outcome_binding_constraint = None  # type: ignore[attr-defined]
-
-
-def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
-    requirement = getattr(ctx, "recorded_outcome_grounding_requirement", None)
-    if not isinstance(requirement, RecordedOutcomeGroundingRequirement) or requirement.satisfied:
-        return False
-    if isinstance(requirement.workflow_run_id, str) and requirement.workflow_run_id:
-        return True
-    evidence = getattr(ctx, "composition_page_evidence", None)
-    if isinstance(evidence, dict) and _evidence_current_url(evidence):
-        return True
-    contract = getattr(ctx, "scout_observation_contract", None)
-    if scout_observation_contract_valid(contract):
-        return True
-    observed_urls = getattr(ctx, "observed_browser_urls", None)
-    return isinstance(observed_urls, list) and any(isinstance(url, str) and url.strip() for url in observed_urls)
 
 
 def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
@@ -789,19 +908,6 @@ def recorded_outcome_from_author_time_reject(
     )
 
 
-def author_time_reject_missing_output_paths(latest: RecordedBuildTestOutcome | None) -> set[str]:
-    if latest is None or latest.phase != "author_time_reject":
-        return set()
-    paths: set[str] = set()
-    for fact in latest.missing_requested_output_facts:
-        if not isinstance(fact, Mapping):
-            continue
-        output_path = fact.get("output_path")
-        if isinstance(output_path, str) and output_path:
-            paths.add(output_path)
-    return paths
-
-
 def recorded_outcome_from_loaded_result_evidence(
     evidence: LoadedResultCompositionEvidence,
 ) -> RecordedBuildTestOutcome:
@@ -979,6 +1085,7 @@ def recorded_outcome_from_run_blocks_result(
     authoritative_workflow_run_id = (
         recorded_run_outcome.workflow_run_id if recorded_run_outcome is not None else None
     ) or workflow_run_id
+    page_path_failure = _post_run_page_path_failure(page_evidence, authoritative_workflow_run_id or None)
     runtime_output_facts = _runtime_output_repair_facts(
         completion_verification,
         blocks,
@@ -1092,6 +1199,7 @@ def recorded_outcome_from_run_blocks_result(
             evidence_refs=evidence_refs,
             missing_requested_output_facts=missing_output_facts,
             runtime_output_repair_facts=runtime_output_facts,
+            page_path_failure=page_path_failure,
             authored_structure_signature=authored_structure_signature,
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
@@ -1100,6 +1208,7 @@ def recorded_outcome_from_run_blocks_result(
                 "evidence_refs": "run output structure",
                 "missing_requested_output_facts": "CompletionVerificationResult unsatisfied output paths and run output shape",
                 "runtime_output_repair_facts": "same-run registered output parameters and completion verdicts",
+                "page_path_failure": "same-run bounded post-run page structure and executable continuations",
             },
         )
     run_status = _safe_str(data.get("overall_status"))
@@ -1134,7 +1243,11 @@ def recorded_outcome_from_run_blocks_result(
     verdict: BuildTestOutcomeVerdict = "repairable_failure" if bool(result.get("ok")) is False else "progress_observed"
     if not structural_identity and not page_refs and not output_refs:
         verdict = "not_authoritative"
-    reason_code = "runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run"
+    reason_code = (
+        "runtime_block_failure"
+        if failed_block is not None or not bool(result.get("ok"))
+        else "run_completed_unevaluated"
+    )
     has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
     if (
         verdict == "repairable_failure"
@@ -1495,6 +1608,159 @@ def _page_evidence_refs(page_evidence: Mapping[str, object] | None) -> list[str]
     return refs[:12]
 
 
+def _post_run_page_path_failure(
+    page_evidence: Mapping[str, object] | None,
+    workflow_run_id: str | None,
+    *,
+    required_target_url: str | None = None,
+) -> PostRunPagePathFailure | None:
+    if (
+        page_evidence is None
+        or not workflow_run_id
+        or page_evidence.get("observed_after_workflow_run") is not True
+        or page_evidence.get("workflow_run_id") != workflow_run_id
+    ):
+        return None
+    current_url = _safe_str(page_evidence.get("current_url")) or _safe_str(page_evidence.get("inspected_url"))
+    if not current_url:
+        return None
+
+    def collect_targets(kind: PostRunPagePathTargetKind, controls: object) -> list[PostRunPagePathTarget]:
+        return [
+            PostRunPagePathTarget(kind=kind, selector=selector)
+            for control in _mapping_list(controls)
+            if control.get("disabled") is not True and (selector := _safe_str(control.get("selector")).strip())
+        ]
+
+    def structural_submit_controls(
+        controls: Sequence[Mapping[str, object]],
+    ) -> list[Mapping[str, object]]:
+        return [
+            control
+            for control in controls
+            if control.get("disabled") is not True and _safe_str(control.get("type")).strip().casefold() == "submit"
+        ]
+
+    def structural_challenge_controls(
+        controls: Sequence[Mapping[str, object]],
+    ) -> list[Mapping[str, object]]:
+        # Admission must never key on page text: labels are untrusted, page-controlled
+        # input. Only carrier membership plus typed control structure may mint a target.
+        enabled = [control for control in controls if control.get("disabled") is not True]
+        toggles = [
+            control
+            for control in enabled
+            if _safe_str(control.get("tag")).strip().casefold() == "input"
+            and _safe_str(control.get("type")).strip().casefold() in {"checkbox", "radio"}
+            and control.get("checked") is not True
+        ]
+        non_toggle_controls = [
+            control
+            for control in enabled
+            if (
+                _safe_str(control.get("tag")).strip().casefold() == "button"
+                or (
+                    _safe_str(control.get("tag")).strip().casefold() == "input"
+                    and _safe_str(control.get("type")).strip().casefold() in {"button", "submit"}
+                )
+            )
+        ]
+        submit_controls = structural_submit_controls(non_toggle_controls)
+        return [*toggles, *submit_controls]
+
+    forms = _mapping_list(page_evidence.get("forms"))
+    login_targets: list[PostRunPagePathTarget] = []
+    for form in forms:
+        fields = _mapping_list(form.get("fields"))
+        has_password_field = any(_safe_str(field.get("type")).strip().casefold() == "password" for field in fields)
+        if not has_password_field:
+            continue
+        login_targets.extend(
+            collect_targets(
+                "form_submit",
+                structural_submit_controls(_mapping_list(form.get("submit_controls"))),
+            )
+        )
+
+    challenge_state = page_evidence.get("challenge_state")
+    challenge_targets: list[PostRunPagePathTarget] = []
+    if isinstance(challenge_state, Mapping):
+        gated_submit_controls = _mapping_list(challenge_state.get("gated_submit_controls"))
+        challenge_targets.extend(collect_targets("challenge", gated_submit_controls))
+    challenge_targets.extend(
+        collect_targets(
+            "challenge",
+            structural_challenge_controls(
+                interactive_challenge_controls(_mapping_list(page_evidence.get("challenge_controls")))
+            ),
+        )
+    )
+
+    navigation_targets: list[PostRunPagePathTarget] = []
+    if required_target_url:
+        for control in _mapping_list(page_evidence.get("navigation_targets")):
+            if not _same_navigation_target_url(_safe_str(control.get("href")), required_target_url):
+                continue
+            navigation_targets.extend(collect_targets("navigation", [control]))
+
+    challenge_associated = isinstance(challenge_state, Mapping) and (
+        challenge_state.get("gates_submit_controls") is True or bool(challenge_targets)
+    )
+    if challenge_associated and challenge_targets:
+        kind: PostRunPagePathKind = "challenge"
+        targets = _dedupe_page_path_targets(challenge_targets)
+    elif login_targets:
+        kind = "login"
+        targets = _dedupe_page_path_targets(login_targets)
+    elif navigation_targets:
+        kind = "incomplete_navigation"
+        targets = _dedupe_page_path_targets(navigation_targets)
+    else:
+        kind = "non_page_outcome"
+        targets = []
+    return PostRunPagePathFailure(
+        kind=kind,
+        workflow_run_id=workflow_run_id,
+        current_url=current_url,
+        continuation_targets=targets,
+        enter_allowed=kind in {"login", "challenge"}
+        and any(target.kind in {"form_submit", "challenge"} for target in targets),
+    )
+
+
+def _dedupe_page_path_targets(
+    targets: Sequence[PostRunPagePathTarget],
+) -> list[PostRunPagePathTarget]:
+    deduped: list[PostRunPagePathTarget] = []
+    seen: set[str] = set()
+    for target in targets:
+        if target.selector in seen:
+            continue
+        seen.add(target.selector)
+        deduped.append(target)
+    return deduped
+
+
+def _same_navigation_target_url(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    left_parts = urlsplit(left)
+    right_parts = urlsplit(right)
+    return (
+        left_parts.scheme.casefold(),
+        left_parts.netloc.casefold(),
+        left_parts.path.rstrip("/") or "/",
+        left_parts.query,
+        left_parts.fragment,
+    ) == (
+        right_parts.scheme.casefold(),
+        right_parts.netloc.casefold(),
+        right_parts.path.rstrip("/") or "/",
+        right_parts.query,
+        right_parts.fragment,
+    )
+
+
 def _form_refs(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -1550,6 +1816,8 @@ def _run_outcome_reason_code(recorded_run_outcome: RecordedRunOutcome) -> BuildT
         return reason_code
     if recorded_run_outcome.verdict == "demonstrated":
         return "verified_success"
+    if recorded_run_outcome.verdict == "not_evaluated":
+        return "run_completed_unevaluated"
     return "failed_run"
 
 
