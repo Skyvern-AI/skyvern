@@ -75,15 +75,50 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
     return reverse_mapping
 
 
-def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
-    """Recursively replaces Jinja references in a value (string, dict, or list)."""
-    if isinstance(value, str):
-        return replace_jinja_reference(value, old_key, new_key)
-    elif isinstance(value, dict):
-        return {k: _replace_references_in_value(v, old_key, new_key) for k, v in value.items()}
-    elif isinstance(value, list):
-        return [_replace_references_in_value(item, old_key, new_key) for item in value]
-    return value
+def _make_sentinels(substitutions: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
+    """Pairs each (old, new) substitution with a unique, un-typeable sentinel token.
+
+    The sentinels let a whole substitution set be applied atomically: every old identifier is
+    swapped to its sentinel first, then every sentinel to its new identifier. That breaks the
+    chain when one substitution's new identifier matches another's old one (e.g. foo-bar ->
+    foo_bar AND foo_bar -> foo_bar_2), which a naive sequential rewrite would compound.
+    """
+    return [(old, new, f"\x00SKY_SANITIZE_{i}\x00") for i, (old, new) in enumerate(substitutions)]
+
+
+def _apply_atomic_jinja_substitutions(text: str, sentinels: list[tuple[str, str, str]]) -> str:
+    """Applies a sentinel-guarded set of Jinja reference substitutions to a single string."""
+    for old, _new, sentinel in sentinels:
+        text = replace_jinja_reference(text, old, sentinel)
+    for _old, new, sentinel in sentinels:
+        text = text.replace(sentinel, new)
+    return text
+
+
+def _rewrite_jinja_refs_atomic(value: Any, substitutions: list[tuple[str, str]]) -> Any:
+    """Atomically rewrites Jinja references in a value (string, dict, or list).
+
+    Every reference is resolved against the whole substitution set in one pass via unique
+    sentinels, so a collision rename chain (my-key -> my_key AND my_key -> my_key_2) can't
+    compound a reference into the wrong target. Order still matters within the set: place the
+    more specific substitution (e.g. {label}_output) before the bare label so the bare pass
+    does not partially match an already-sentinelled reference.
+    """
+    if not substitutions:
+        return value
+
+    sentinels = _make_sentinels(substitutions)
+
+    def _walk(v: Any) -> Any:
+        if isinstance(v, str):
+            return _apply_atomic_jinja_substitutions(v, sentinels)
+        if isinstance(v, dict):
+            return {k: _walk(item) for k, item in v.items()}
+        if isinstance(v, list):
+            return [_walk(item) for item in v]
+        return v
+
+    return _walk(value)
 
 
 def _rewrite_error_code_mapping_refs_atomic(mapping: Any, substitutions: list[tuple[str, str]]) -> Any:
@@ -95,28 +130,35 @@ def _rewrite_error_code_mapping_refs_atomic(mapping: Any, substitutions: list[tu
     if not isinstance(mapping, dict) or not substitutions:
         return mapping
 
-    sentinels = [(old, new, f"\x00SKY_SANITIZE_{i}\x00") for i, (old, new) in enumerate(substitutions)]
-
-    def _apply(text: str) -> str:
-        for old, _new, sentinel in sentinels:
-            text = replace_jinja_reference(text, old, sentinel)
-        for _old, new, sentinel in sentinels:
-            text = text.replace(sentinel, new)
-        return text
+    sentinels = _make_sentinels(substitutions)
 
     return {
-        (_apply(k) if isinstance(k, str) else k): (_apply(v) if isinstance(v, str) else v) for k, v in mapping.items()
+        (_apply_atomic_jinja_substitutions(k, sentinels) if isinstance(k, str) else k): (
+            _apply_atomic_jinja_substitutions(v, sentinels) if isinstance(v, str) else v
+        )
+        for k, v in mapping.items()
     }
 
 
-def _replace_direct_string_in_value(value: Any, old_key: str, new_key: str) -> Any:
-    """Recursively replaces exact string matches in a value (for fields like source_parameter_key)."""
+def _replace_direct_string_param_refs(value: Any, key_mapping: dict[str, str], *, _in_key_field: bool = False) -> Any:
+    """Rewrites exact-match direct string references to renamed keys (e.g. source_parameter_key).
+
+    Resolves each string against the whole mapping in a single pass and stops at the first match,
+    so a collision-driven rename chain (my-key -> my_key AND my_key -> my_key_2) can't compound a
+    reference into the wrong target. The parameter's own `key` field is never rewritten here: it is
+    already finalized by _sanitize_parameters, and re-applying the mapping to it would collapse two
+    distinct keys into the same name.
+    """
     if isinstance(value, str):
-        return new_key if value == old_key else value
+        if _in_key_field:
+            return value
+        return key_mapping.get(value, value)
     elif isinstance(value, dict):
-        return {k: _replace_direct_string_in_value(v, old_key, new_key) for k, v in value.items()}
+        return {
+            k: _replace_direct_string_param_refs(v, key_mapping, _in_key_field=(k == "key")) for k, v in value.items()
+        }
     elif isinstance(value, list):
-        return [_replace_direct_string_in_value(item, old_key, new_key) for item in value]
+        return [_replace_direct_string_param_refs(item, key_mapping) for item in value]
     return value
 
 
@@ -299,67 +341,47 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
         sanitized_parameter_keys=param_key_mapping if param_key_mapping else None,
     )
 
-    # Step 3: Update all block label references
+    # Step 3: Update all block label references. Build every label substitution up front and apply
+    # it in a single atomic pass so a collision rename (foo/bar -> foo_bar AND foo-bar -> foo_bar_2)
+    # can't chain one {{ ... }} reference through into the wrong target across blocks, parameters,
+    # and the workflow system prompt. The more specific {label}_output substitution is listed before
+    # the bare label so the bare pass never partially matches an already-handled output reference.
+    label_substitutions: list[tuple[str, str]] = []
+    output_key_mapping: dict[str, str] = {}
     for old_label, new_label in label_mapping.items():
         old_output_key = f"{old_label}_output"
         new_output_key = f"{new_label}_output"
+        label_substitutions.append((old_output_key, new_output_key))
+        label_substitutions.append((old_label, new_label))
+        output_key_mapping[old_output_key] = new_output_key
 
-        # Update Jinja references in blocks for {label}_output pattern
-        if "blocks" in workflow_definition:
-            workflow_definition["blocks"] = _replace_references_in_value(
-                workflow_definition["blocks"], old_output_key, new_output_key
-            )
-            # Also update shorthand {{ label }} references (must be done after _output to avoid partial matches)
-            workflow_definition["blocks"] = _replace_references_in_value(
-                workflow_definition["blocks"], old_label, new_label
-            )
+    if label_substitutions:
+        for jinja_field in ("blocks", "parameters", "workflow_system_prompt"):
+            if jinja_field in workflow_definition:
+                workflow_definition[jinja_field] = _rewrite_jinja_refs_atomic(
+                    workflow_definition[jinja_field], label_substitutions
+                )
 
-        # Update Jinja references in parameters for {label}_output pattern
-        if "parameters" in workflow_definition:
-            workflow_definition["parameters"] = _replace_references_in_value(
-                workflow_definition["parameters"], old_output_key, new_output_key
-            )
-            # Also update shorthand {{ label }} references
-            workflow_definition["parameters"] = _replace_references_in_value(
-                workflow_definition["parameters"], old_label, new_label
-            )
-            # Also update direct string references (e.g., source_parameter_key)
-            workflow_definition["parameters"] = _replace_direct_string_in_value(
-                workflow_definition["parameters"], old_output_key, new_output_key
-            )
+    # Step 4: Update all parameter key references. Same anti-chaining reasoning as Step 3: a collision
+    # rename (my-key -> my_key AND my_key -> my_key_2) must not compound {{ my-key }} into
+    # {{ my_key_2 }} across defaults, blocks, and the system prompt, so resolve them in one atomic pass.
+    param_substitutions = list(param_key_mapping.items())
+    if param_substitutions:
+        for jinja_field in ("blocks", "parameters", "workflow_system_prompt"):
+            if jinja_field in workflow_definition:
+                workflow_definition[jinja_field] = _rewrite_jinja_refs_atomic(
+                    workflow_definition[jinja_field], param_substitutions
+                )
 
-        # workflow_system_prompt is rendered through Jinja at execution time, so
-        # references inside it need the same rename treatment as block fields.
-        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
-            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
-                workflow_definition["workflow_system_prompt"], old_output_key, new_output_key
-            )
-            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
-                workflow_definition["workflow_system_prompt"], old_label, new_label
-            )
-
-    # Step 4: Update all parameter key references
-    for old_key, new_key in param_key_mapping.items():
-        # Update Jinja references in blocks (e.g., {{ old_key }})
-        if "blocks" in workflow_definition:
-            workflow_definition["blocks"] = _replace_references_in_value(
-                workflow_definition["blocks"], old_key, new_key
-            )
-
-        # Update Jinja references in parameters (e.g., default values that reference other params)
-        if "parameters" in workflow_definition:
-            workflow_definition["parameters"] = _replace_references_in_value(
-                workflow_definition["parameters"], old_key, new_key
-            )
-            # Also update direct string references (e.g., source_parameter_key)
-            workflow_definition["parameters"] = _replace_direct_string_in_value(
-                workflow_definition["parameters"], old_key, new_key
-            )
-
-        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
-            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
-                workflow_definition["workflow_system_prompt"], old_key, new_key
-            )
+    # Direct (non-Jinja) string references live on parameters: source_parameter_key points at a
+    # parameter key, and some fields point at a {label}_output key. Resolve each against the whole
+    # mapping exactly once (first match) so collisions don't chain, and never rewrite a parameter's
+    # own already-final `key` field back into a duplicate.
+    direct_string_mapping = {**output_key_mapping, **param_key_mapping}
+    if direct_string_mapping and "parameters" in workflow_definition:
+        workflow_definition["parameters"] = _replace_direct_string_param_refs(
+            workflow_definition["parameters"], direct_string_mapping
+        )
 
     # Rewrite workflow-level error_code_mapping atomically so substitutions don't chain
     # (e.g. foo-bar -> foo_bar and foo_bar -> foo_bar_2 must not combine into foo_bar_2).
