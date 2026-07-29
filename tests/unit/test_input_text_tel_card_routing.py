@@ -131,6 +131,7 @@ async def test_tel_card_number_field_uses_card_readback_not_phone_format(attrs: 
         tag_name="input",
         text=VISA_16,
         expected_digits=VISA_16,
+        engine_selection=None,
     )
     phone_format.assert_not_awaited()
     tel_verify.assert_not_awaited()
@@ -153,6 +154,7 @@ async def test_ten_digit_tel_phone_uses_tel_readback_not_card_readback() -> None
         allow_nanp_country_prefix=False,
         pattern=None,
         maxlength=None,
+        engine_selection=None,
     )
     card_readback.assert_not_awaited()
     phone_format.assert_not_awaited()
@@ -249,6 +251,7 @@ async def test_blocking_tel_input_rechecks_constraints_before_readback() -> None
         allow_nanp_country_prefix=False,
         pattern="[0-9]{10}",
         maxlength="10",
+        engine_selection=None,
     )
 
 
@@ -272,6 +275,7 @@ async def test_secret_tel_value_uses_tel_verifier_not_secret_readback() -> None:
         allow_nanp_country_prefix=False,
         pattern=None,
         maxlength=None,
+        engine_selection=None,
     )
     secret_readback.assert_not_awaited()
     card_readback.assert_not_awaited()
@@ -368,6 +372,7 @@ async def test_secret_in_exact_value_input_uses_readback(input_type: str | None)
         text="mysecretvalue",
         input_type=input_type or "",
         maxlength=None,
+        engine_selection=None,
     )
     el.input_sequentially.assert_not_awaited()
 
@@ -425,6 +430,7 @@ async def test_secret_readback_runs_on_retargeted_element_type() -> None:
         text="mysecretvalue",
         input_type="password",
         maxlength=None,
+        engine_selection=None,
     )
 
 

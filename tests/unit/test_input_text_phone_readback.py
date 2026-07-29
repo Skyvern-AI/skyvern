@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from skyvern.exceptions import PhoneNumberInputMismatch
 from skyvern.webeye.actions.handler import (
@@ -10,9 +11,30 @@ from skyvern.webeye.actions.handler import (
     _log_tel_fallback_fill_digit_counts,
     verify_phone_input_digits,
 )
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 
 NANP_DIGITS = "2245550199"
 NANP_E164 = f"+1{NANP_DIGITS}"
+_NOT_INPUTELEMENT_ERROR = "Node is not an HTMLInputElement, HTMLTextAreaElement or HTMLSelectElement"
+
+
+class _EngineError(Exception):
+    pass
+
+
+async def _never_start() -> None:  # pragma: no cover
+    raise AssertionError("start_driver must not be called")
+
+
+def _engine_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name="engine-a",
+        start_driver=_never_start,
+        error_type=_EngineError,
+        timeout_error_type=_EngineError,
+        metadata=BrowserEngineMetadata(name="engine-a", version="0.0.0"),
+        selection_reason="test",
+    )
 
 
 def _make_element(locator: MagicMock) -> MagicMock:
@@ -132,6 +154,64 @@ async def test_phone_readback_digit_drop_raises() -> None:
 
     assert exc.value.expected_digit_count == 10
     assert exc.value.actual_digit_count == 9
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_threads_selected_engine_incompatible_error() -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(side_effect=_EngineError(_NOT_INPUTELEMENT_ERROR))
+
+    with pytest.raises(PhoneNumberInputMismatch):
+        await verify_phone_input_digits(
+            tag_name="input",
+            locator=locator,
+            expected_value=NANP_DIGITS,
+            engine_selection=_engine_selection(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_propagates_foreign_engine_error() -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(side_effect=PlaywrightError(_NOT_INPUTELEMENT_ERROR))
+
+    with pytest.raises(PlaywrightError):
+        await verify_phone_input_digits(
+            tag_name="input",
+            locator=locator,
+            expected_value=NANP_DIGITS,
+            engine_selection=_engine_selection(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_tel_fill_and_fallback_log_thread_engine_selection() -> None:
+    selection = _engine_selection()
+    element = _make_element(MagicMock())
+    with patch(
+        "skyvern.webeye.actions.handler.get_input_value",
+        new=AsyncMock(side_effect=[NANP_DIGITS, NANP_DIGITS]),
+    ) as get_input_value:
+        assert (
+            await _fill_nanp_tel_with_readback(
+                skyvern_element=element,
+                tag_name="input",
+                national_digits=NANP_DIGITS,
+                e164_fallback=NANP_E164,
+                engine_selection=selection,
+            )
+            is None
+        )
+        await _log_tel_fallback_fill_digit_counts(
+            skyvern_element=element,
+            tag_name="input",
+            expected_value=NANP_DIGITS,
+            task_id="tsk_1",
+            step_id="stp_1",
+            engine_selection=selection,
+        )
+
+    assert [call.kwargs["engine_selection"] for call in get_input_value.await_args_list] == [selection, selection]
 
 
 @pytest.mark.asyncio
