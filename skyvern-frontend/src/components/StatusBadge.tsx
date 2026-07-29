@@ -138,8 +138,11 @@ function StatusBadge({
         "justify-center gap-1.5 px-1.5 capitalize",
         // Container query (no plugin — Tailwind core arbitrary at-rule variant)
         // so the label returns once the `status` container is wide enough.
+        // The collapsible variant lives in flowing chip rows, so the expanded
+        // pill hugs its label; the fixed w-28 column width is a table concern
+        // and stays on the viewport-breakpoint variant only.
         collapsible
-          ? "[@container_status_(min-width:384px)]:w-28 [@container_status_(min-width:384px)]:justify-start [@container_status_(min-width:384px)]:px-2.5"
+          ? "[@container_status_(min-width:384px)]:px-2.5"
           : "md:w-28 md:justify-start md:px-2.5",
         className,
       )}
