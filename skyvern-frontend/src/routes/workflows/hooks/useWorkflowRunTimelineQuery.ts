@@ -72,12 +72,16 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
       if (isGlobalWorkflow) {
         params.set("template", "true");
       }
-      return client
-        .get(
-          `/workflows/${workflowPermanentId}/runs/${workflowRunId}/timeline`,
-          { params, signal },
-        )
-        .then((response) => response.data);
+      const { data } = await client.get(
+        `/workflows/${workflowPermanentId}/runs/${workflowRunId}/timeline`,
+        { params, signal },
+      );
+      // axios hands back the raw string when a 2xx body fails JSON.parse, so an
+      // unvalidated response.data reaches callers typed as an array but isn't one.
+      if (!Array.isArray(data)) {
+        throw new Error("Workflow run timeline response was not an array");
+      }
+      return data;
     },
     // No independent refetchInterval - timeline follows workflow run query's timing
     // via the useEffect above that invalidates on dataUpdatedAt changes

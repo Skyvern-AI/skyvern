@@ -89,6 +89,7 @@ class TasksRepository(BaseRepository):
         async with self.Session() as session:
             new_task = TaskModel(
                 status=status,
+                started_at=naive_utc_now() if str(status) == TaskStatus.running.value else None,
                 task_type=task_type,
                 url=url,
                 title=title,
