@@ -195,6 +195,14 @@ def _add_argument_validation_middleware() -> None:
     mcp.add_middleware(MCPArgumentValidationMiddleware())
 
 
+def _add_arg_repair_middleware() -> None:
+    if _FASTMCP_IMPORT_ERROR is not None:
+        return
+    from .arg_repair import ArgRepairMiddleware  # noqa: PLC0415
+
+    mcp.add_middleware(ArgRepairMiddleware())
+
+
 # -- Tool annotation factories --
 # Every tool registered with FastMCP must carry a human-readable `title`
 # (required by the Claude Connectors Directory). We build per-tool
@@ -378,6 +386,7 @@ Use skyvern_click's resolved_selector response to get xpaths for production scri
 """,
 )
 _add_telemetry_middleware()
+_add_arg_repair_middleware()
 _add_argument_validation_middleware()
 
 # -- Browser session management --
