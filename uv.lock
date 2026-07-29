@@ -22,7 +22,7 @@ constraints = [
     { name = "joserfc", specifier = ">=1.6.8" },
     { name = "jupyter-server", specifier = ">=2.20.0" },
     { name = "mako", specifier = ">=1.3.12" },
-    { name = "mistune", specifier = ">=3.2.1" },
+    { name = "mistune", specifier = ">=3.3.0" },
     { name = "msgpack", specifier = ">=1.2.1" },
     { name = "pyasn1", specifier = ">=0.6.4" },
     { name = "starlette", specifier = ">=1.3.1" },
