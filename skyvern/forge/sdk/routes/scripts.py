@@ -230,6 +230,7 @@ async def get_script_blocks_response(
     description="Create a new script with optional files and metadata",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "create_script",
     },
 )
@@ -276,6 +277,7 @@ async def deploy_cached_script(
     description="Retrieves a specific script by its ID",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "get_script",
     },
 )
@@ -499,6 +501,7 @@ async def get_script_version_detail(
     description="Retrieves a paginated list of scripts for the current organization",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "get_scripts",
     },
 )
@@ -546,6 +549,7 @@ async def get_scripts(
     description="Deploy a script with updated files, creating a new version",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "deploy_script",
     },
 )
@@ -695,6 +699,7 @@ async def deploy_script(
     summary="Run script",
     description="Run a script",
     tags=["Scripts"],
+    openapi_extra={"x-hidden": True},
 )
 @base_router.post(
     "/scripts/{script_id}/run/",

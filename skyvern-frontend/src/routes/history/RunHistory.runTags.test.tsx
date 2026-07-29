@@ -210,7 +210,11 @@ describe("RunHistory run tags", () => {
     ).toContain("2 selected");
 
     fireEvent.contextMenu(screen.getByRole("row", { name: /tsk_1 Task Run/ }));
-    expect(screen.queryByRole("menu")).toBeNull();
+    // Task rows get the shared row-actions menu too; during a bulk selection
+    // it steers to the Actions bar instead of offering single-row actions.
+    expect(screen.getByRole("menu").textContent).toContain(
+      "Acts on this run only",
+    );
   });
 
   it("hides selection when workflow tagging is disabled", () => {

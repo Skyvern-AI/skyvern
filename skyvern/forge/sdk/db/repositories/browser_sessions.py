@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import and_, case, desc, func, or_, select
+from sqlalchemy import and_, case, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
@@ -51,6 +51,11 @@ _UNSET = object()
 _VISIBLE_TO_CUSTOMER = or_(
     PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
     PersistentBrowserSessionModel.browser_address.isnot(None),
+)
+
+_VENDOR_HELD = and_(
+    PersistentBrowserSessionModel.upstream_cdp_url.isnot(None),
+    PersistentBrowserSessionModel.browser_address.is_(None),
 )
 
 
@@ -697,6 +702,38 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_session)
             return PersistentBrowserSession.model_validate(browser_session)
 
+    @db_operation("get_stale_vendor_held_browser_sessions")
+    async def get_stale_vendor_held_browser_sessions(
+        self,
+        *,
+        stale_before: datetime,
+        limit: int,
+    ) -> list[PersistentBrowserSession]:
+        """Vendor-held rows whose proxy lease has aged past ``stale_before``, oldest first.
+
+        The lease is ``last_activity_at`` — the proxy restamps it while it relays client commands,
+        so it ages by itself the moment the owning process stops, whether that was graceful or a
+        SIGKILL. ``started_at`` covers a session that died before its first relayed command. When
+        both are NULL the COALESCE comparison is NULL and the row is excluded: a row that cannot be
+        dated is never reaped.
+        """
+        async with self.Session() as session:
+            lease_at = func.coalesce(
+                PersistentBrowserSessionModel.last_activity_at,
+                PersistentBrowserSessionModel.started_at,
+            )
+            query = (
+                select(PersistentBrowserSessionModel)
+                .filter(_VENDOR_HELD)
+                .filter_by(deleted_at=None, completed_at=None)
+                .filter(PersistentBrowserSessionModel.status.not_in(FINAL_STATUSES))
+                .filter(lease_at < stale_before)
+                .order_by(lease_at)
+                .limit(limit)
+            )
+            rows = (await session.scalars(query)).all()
+            return [PersistentBrowserSession.model_validate(row) for row in rows]
+
     @db_operation("get_persistent_browser_session_unscoped")
     async def get_persistent_browser_session_unscoped(self, session_id: str) -> PersistentBrowserSession | None:
         """Primary-key read without organization scoping, for trusted internal session
@@ -711,6 +748,30 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
+
+    @db_operation("touch_last_activity")
+    async def touch_last_activity(self, session_id: str, last_activity_at: datetime | None = None) -> None:
+        """Record that a session was actively driven, for activity-based lease renewal.
+
+        Unscoped by organization on purpose: the CDP proxy calls this and learns the owning
+        org from the row, never from client input. A single UPDATE with no read-back — a
+        best-effort, no-op when the row is gone — so it stays cheap on the relay hot path.
+        """
+        ts = to_naive_utc(last_activity_at) if last_activity_at is not None else naive_utc_now()
+        async with self.Session() as session:
+            await session.execute(
+                update(PersistentBrowserSessionModel)
+                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+                .where(PersistentBrowserSessionModel.deleted_at.is_(None))
+                # Monotonic write: touches are fire-and-forget from the proxy, so an out-of-order
+                # commit must never move last_activity_at backward and shorten a live lease.
+                .values(
+                    last_activity_at=func.greatest(
+                        func.coalesce(PersistentBrowserSessionModel.last_activity_at, ts), ts
+                    )
+                )
+            )
+            await session.commit()
 
     @db_operation("create_persistent_browser_session")
     async def create_persistent_browser_session(

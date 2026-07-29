@@ -332,7 +332,7 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
                 ),
                 user_facing_reason="I kept the existing target for this workflow instead of starting over.",
                 recovery_hint="retry_with_different_tool",
-                cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
+                cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks", "edit_block"}),
                 renders_final_reply=False,
                 internal_reason_code="build_phase_discovery_disallowed_post_compose",
                 blocked_tool=tool_name,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,6 +20,7 @@ from skyvern.forge.sdk.workflow.service import (
     WorkflowBrowserCleanupResult,
     WorkflowService,
 )
+from skyvern.schemas.workflows import BlockStatus
 
 
 def _workflow(browser_profile_key: str | None = None) -> SimpleNamespace:
@@ -434,6 +436,210 @@ async def test_execute_workflow_persists_managed_profile_before_final_status(
 
 
 @pytest.mark.asyncio
+async def test_execute_workflow_persists_profile_when_only_finally_block_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    workflow.workflow_definition.finally_block_label = "cleanup"
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    failed_run.failure_reason = "cleanup failed"
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    monkeypatch.setattr(
+        svc,
+        "_execute_finally_block_if_configured",
+        AsyncMock(
+            return_value=(
+                SimpleNamespace(label="cleanup", block_type="cloud_storage", continue_on_failure=False),
+                SimpleNamespace(
+                    status=BlockStatus.failed,
+                    failure_reason="cleanup failed",
+                    output_parameter_value=None,
+                ),
+            )
+        ),
+    )
+    apply_finally_result = AsyncMock(
+        return_value=(failed_run, WorkflowRunStatus.failed, failed_run.failure_reason),
+    )
+    monkeypatch.setattr(svc, "_apply_finally_block_result", apply_finally_result)
+    clean_up_browser = _patch_browser_cleanup(monkeypatch, svc, order)
+    monkeypatch.setattr(
+        svc,
+        "_persist_workflow_browser_session_if_needed",
+        AsyncMock(side_effect=lambda **_kwargs: order.append("store")),
+    )
+    _patch_finalize(monkeypatch, svc, order, failed_run)
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock(side_effect=lambda *a, **k: order.append("video")))
+    monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock(side_effect=lambda *a, **k: order.append("webhook")))
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is failed_run
+    assert order == ["teardown", "store", "finalize", "video", "webhook"]
+    clean_up_browser.assert_awaited_once()
+    svc._persist_workflow_browser_session_if_needed.assert_awaited_once()
+    assert apply_finally_result.await_args is not None
+    assert apply_finally_result.await_args.kwargs["pre_finally_status"] == WorkflowRunStatus.running
+    assert apply_finally_result.await_args.kwargs["defer_status_write"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_defers_finally_failure_status_until_after_writeback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    workflow.persist_browser_session = False
+    workflow.workflow_definition.finally_block_label = "cleanup"
+    running_run = _execute_workflow_run(WorkflowRunStatus.running)
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    failed_run.failure_reason = "cloud_storage block failed. failure reason: upload failed"
+    finally_block = SimpleNamespace(
+        block_type="cloud_storage",
+        label="cleanup",
+        continue_on_failure=False,
+    )
+    finally_result = SimpleNamespace(
+        status=BlockStatus.failed,
+        failure_reason="upload failed",
+        output_parameter_value=None,
+    )
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, running_run)
+    monkeypatch.setattr(
+        svc,
+        "_execute_finally_block_if_configured",
+        AsyncMock(return_value=(finally_block, finally_result)),
+    )
+    status_write = AsyncMock(side_effect=RuntimeError("status write must remain deferred"))
+    monkeypatch.setattr(svc, "_update_workflow_run_status_if_not_final", status_write)
+    order: list[str] = []
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    persist_browser_session = AsyncMock(side_effect=lambda **_kwargs: order.append("store"))
+    monkeypatch.setattr(
+        svc,
+        "_persist_workflow_browser_session_if_needed",
+        persist_browser_session,
+    )
+
+    async def finalize_side_effect(**_kwargs: object) -> SimpleNamespace:
+        order.append("finalize")
+        return failed_run
+
+    finalize = AsyncMock(side_effect=finalize_side_effect)
+    monkeypatch.setattr(svc, "_finalize_workflow_run_status", finalize)
+    clean_up = AsyncMock()
+    monkeypatch.setattr(svc, "clean_up_workflow", clean_up)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is failed_run
+    assert order == ["teardown", "store", "finalize"]
+    status_write.assert_not_awaited()
+    persist_browser_session.assert_awaited_once()
+    assert persist_browser_session.await_args is not None
+    assert persist_browser_session.await_args.kwargs["workflow_run_status"] == WorkflowRunStatus.completed
+    finalize.assert_awaited_once()
+    assert finalize.await_args is not None
+    assert finalize.await_args.kwargs["pre_finally_status"] == WorkflowRunStatus.failed
+    assert (
+        finalize.await_args.kwargs["pre_finally_failure_reason"]
+        == "cloud_storage block failed. failure reason: upload failed"
+    )
+    assert finalize.await_args.kwargs["pre_finally_failure_category"]
+    clean_up.assert_awaited_once()
+    assert clean_up.await_args is not None
+    assert clean_up.await_args.kwargs["browser_persistence_status"] == WorkflowRunStatus.completed
+    assert clean_up.await_args.kwargs["schedule_credential_fallback_retry"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_skips_profile_persistence_when_timeout_precedes_body_status_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    running_run = _execute_workflow_run(WorkflowRunStatus.running)
+    timed_out_run = _execute_workflow_run(WorkflowRunStatus.timed_out)
+    timed_out_run.failure_reason = "Workflow exceeded its elapsed-time limit."
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, running_run)
+
+    async def slow_refresh(**_kwargs: object) -> SimpleNamespace:
+        await asyncio.sleep(0.05)
+        return running_run
+
+    service_module.app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=slow_refresh)
+    timeout_seconds = iter([10.0, 0.01])
+    monkeypatch.setattr(
+        service_module,
+        "_get_workflow_run_max_elapsed_timeout_seconds",
+        lambda _workflow_run: next(timeout_seconds),
+    )
+    monkeypatch.setattr(
+        svc,
+        "_shield_post_run_elapsed_timeout",
+        AsyncMock(
+            return_value=(
+                timed_out_run,
+                WorkflowRunStatus.timed_out,
+                timed_out_run.failure_reason,
+            )
+        ),
+    )
+    prefinal_browser_cleanup = AsyncMock()
+    persist_browser_session = AsyncMock()
+    monkeypatch.setattr(svc, "_clean_up_workflow_browser", prefinal_browser_cleanup)
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", persist_browser_session)
+    monkeypatch.setattr(svc, "_finalize_workflow_run_status", AsyncMock(return_value=timed_out_run))
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "clean_up_workflow", AsyncMock())
+    monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock())
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is timed_out_run
+    prefinal_browser_cleanup.assert_not_awaited()
+    persist_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_rechecks_terminal_winner_before_healthy_writeback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    running_run = _execute_workflow_run(WorkflowRunStatus.running)
+    timed_out_run = _execute_workflow_run(WorkflowRunStatus.timed_out)
+    timed_out_run.failure_reason = "Workflow exceeded its elapsed-time limit."
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, running_run)
+    initial_run = svc.get_workflow_run.return_value
+    monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(side_effect=[initial_run, timed_out_run]))
+    prefinal_browser_cleanup = AsyncMock()
+    persist_browser_session = AsyncMock()
+    monkeypatch.setattr(svc, "_clean_up_workflow_browser", prefinal_browser_cleanup)
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", persist_browser_session)
+    finalize = AsyncMock(return_value=timed_out_run)
+    monkeypatch.setattr(svc, "_finalize_workflow_run_status", finalize)
+    clean_up = AsyncMock()
+    monkeypatch.setattr(svc, "clean_up_workflow", clean_up)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is timed_out_run
+    prefinal_browser_cleanup.assert_not_awaited()
+    persist_browser_session.assert_not_awaited()
+    finalize.assert_awaited_once()
+    clean_up.assert_awaited_once()
+    assert clean_up.await_args is not None
+    assert clean_up.await_args.kwargs["browser_persistence_status"] == WorkflowRunStatus.timed_out
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_retries_write_back_when_pre_final_persist_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -460,8 +666,37 @@ async def test_execute_workflow_retries_write_back_when_pre_final_persist_fails(
     result = await _run_execute_workflow(svc)
 
     assert result is completed_run
-    # A failed pre-final write-back must not suppress clean_up_workflow's retry after final status.
-    assert order == ["teardown", "store_fail", "finalize", "video", "store_retry", "webhook"]
+    # Sequential dependents remain blocked until the write-back retry has also completed.
+    assert order == ["teardown", "store_fail", "store_retry", "finalize", "video", "webhook"]
+    assert svc._persist_workflow_browser_session_if_needed.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_exhausts_write_back_before_final_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    order: list[str] = []
+    persist_calls = {"n": 0}
+
+    async def persist_side_effect(**_kwargs: object) -> None:
+        persist_calls["n"] += 1
+        order.append(f"store_fail_{persist_calls['n']}")
+        raise RuntimeError("storage down")
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", AsyncMock(side_effect=persist_side_effect))
+    _patch_finalize(monkeypatch, svc, order, completed_run)
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock(side_effect=lambda *a, **k: order.append("video")))
+    monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock(side_effect=lambda *a, **k: order.append("webhook")))
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is completed_run
+    assert order == ["teardown", "store_fail_1", "store_fail_2", "finalize", "video", "webhook"]
     assert svc._persist_workflow_browser_session_if_needed.await_count == 2
 
 
@@ -495,7 +730,7 @@ async def test_execute_workflow_does_not_prestore_blob_for_failed_canceled_or_ti
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_non_persist_workflow_tears_down_once_after_final_status(
+async def test_execute_workflow_non_persist_workflow_writes_sink_before_final_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = _execute_workflow()
@@ -506,8 +741,8 @@ async def test_execute_workflow_non_persist_workflow_tears_down_once_after_final
     svc = WorkflowService()
     _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
     clean_up_browser = _patch_browser_cleanup(monkeypatch, svc, order)
-    monkeypatch.setattr(service_module.app.STORAGE, "store_browser_profile", AsyncMock())
-    monkeypatch.setattr(service_module.app.STORAGE, "store_browser_session", AsyncMock())
+    persist_browser_session = AsyncMock(side_effect=lambda **_kwargs: order.append("store"))
+    monkeypatch.setattr(svc, "_persist_workflow_browser_session_if_needed", persist_browser_session)
     _patch_finalize(monkeypatch, svc, order, completed_run)
     monkeypatch.setattr(svc, "persist_video_data", AsyncMock(side_effect=lambda *a, **k: order.append("video")))
     monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock())
@@ -515,10 +750,11 @@ async def test_execute_workflow_non_persist_workflow_tears_down_once_after_final
     result = await _run_execute_workflow(svc)
 
     assert result is completed_run
-    assert order[:2] == ["finalize", "teardown"]
+    assert order[:3] == ["teardown", "store", "finalize"]
     clean_up_browser.assert_awaited_once()
-    service_module.app.STORAGE.store_browser_profile.assert_not_awaited()
-    service_module.app.STORAGE.store_browser_session.assert_not_awaited()
+    persist_browser_session.assert_awaited_once()
+    assert persist_browser_session.await_args is not None
+    assert persist_browser_session.await_args.kwargs["workflow_run_status"] == WorkflowRunStatus.completed
 
 
 @pytest.mark.asyncio
@@ -551,4 +787,5 @@ async def test_execute_workflow_finalizes_when_pre_status_browser_cleanup_fails(
     result = await _run_execute_workflow(svc)
 
     assert result is completed_run
-    assert order[:2] == ["teardown_error", "finalize"]
+    assert order[:4] == ["teardown_error", "teardown_cleanup", "persist_helper", "finalize"]
+    assert svc._clean_up_workflow_browser.await_count == 2
