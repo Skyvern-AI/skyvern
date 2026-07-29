@@ -21,6 +21,7 @@ from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
 from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage
 from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
@@ -29,6 +30,29 @@ _NOW = datetime.now(UTC)
 _ORG = make_organization(_NOW)
 _TASK = make_task(_NOW, _ORG, navigation_payload={}, navigation_goal="Fill the field")
 _STEP = make_step(_NOW, _TASK, step_id="stp-1", status=StepStatus.created, order=0, output=None)
+
+
+class _EngineError(Exception):
+    pass
+
+
+class _EngineTimeout(_EngineError):
+    pass
+
+
+async def _never_start():  # pragma: no cover - never awaited
+    raise AssertionError("start_driver must not be called")
+
+
+def _engine_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name="engine-a",
+        start_driver=_never_start,
+        error_type=_EngineError,
+        timeout_error_type=_EngineTimeout,
+        metadata=BrowserEngineMetadata(name="engine-a", version="0.0.0"),
+        selection_reason="test",
+    )
 
 
 @pytest.mark.asyncio
@@ -50,7 +74,9 @@ async def test_incremental_element_tree_propagates_when_both_attempts_time_out()
     assert skyvern_frame.get_incremental_element_tree.await_count == 2
 
 
-async def _run_input_with_incremental_error(error: BaseException) -> list:
+async def _run_input_with_incremental_error(
+    error: BaseException, engine_selection: BrowserEngineSelection | None = None
+) -> list:
     skyvern_el = make_input_element_mock(element_id="AADC")
     dom_instance = MagicMock()
     dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
@@ -79,6 +105,10 @@ async def _run_input_with_incremental_error(error: BaseException) -> list:
             return_value="123456",
         ),
         patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch(
+            "skyvern.webeye.actions.handler.resolve_engine_selection_for_task",
+            return_value=engine_selection,
+        ),
     ):
         return await handle_input_text_action(
             action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
@@ -102,3 +132,36 @@ async def test_input_action_still_swallows_unrelated_incremental_error() -> None
     semantic timeout only."""
     results = await _run_input_with_incremental_error(RuntimeError("unexpected DOM state"))
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_input_action_tolerates_selected_engine_navigation_error() -> None:
+    """A pinned non-stock engine's navigation error during incremental processing is tolerated
+    exactly like the stock Playwright navigation error (silently continue, action succeeds)."""
+    results = await _run_input_with_incremental_error(
+        _EngineError("Execution context was destroyed"), engine_selection=_engine_selection()
+    )
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_input_action_reraises_selected_engine_non_navigation_error() -> None:
+    """A pinned engine's non-navigation error must be re-raised, mirroring the stock
+    Playwright-error contract, instead of being swallowed into an ActionSuccess."""
+    with pytest.raises(_EngineError):
+        await _run_input_with_incremental_error(
+            _EngineError("something genuinely unexpected"), engine_selection=_engine_selection()
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["Execution context was destroyed", "something genuinely unexpected"])
+async def test_input_action_reraises_foreign_error_under_selected_engine(message: str) -> None:
+    """Under a pinned non-stock engine, a stock Playwright error is foreign — it is not one of this
+    engine's tolerances, so it must propagate exactly as the pre-PR ``except PlaywrightError`` re-raised
+    it, never fall through to a false ``ActionSuccess``. This holds even for a navigation-shaped message:
+    the navigation tolerance belongs to the selected engine's own errors, not to a foreign driver."""
+    from playwright.async_api import Error as PlaywrightError
+
+    with pytest.raises(PlaywrightError):
+        await _run_input_with_incremental_error(PlaywrightError(message), engine_selection=_engine_selection())

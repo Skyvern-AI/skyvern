@@ -80,6 +80,18 @@ async def test_otp_repository_can_include_unscoped_workflow_run_rows_in_sql():
     assert "totp_codes.workflow_run_id = :workflow_run_id_1" in sql
     assert "totp_codes.workflow_run_id IS NULL" in sql
     assert " OR " in sql
+    assert "totp_codes.parse_status = :parse_status_1" in sql
+    await repo.get_raw_otp_codes(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        workflow_run_id="wr_test",
+        include_unscoped_workflow_run=True,
+        created_after=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    sql = str(session.query)
+    assert "totp_codes.parse_status = :parse_status_1" in sql
+    assert "totp_codes.workflow_run_id IS NULL" in sql
+    assert "totp_codes.created_at >=" in sql
 
 
 @pytest.mark.asyncio
@@ -123,6 +135,45 @@ async def test_otp_repository_stores_blank_run_scoping_ids_as_null():
     assert session.added.workflow_run_id is None
     assert session.added.workflow_id is None
     assert session.added.task_id is None
+
+
+@pytest.mark.asyncio
+async def test_otp_repository_creates_raw_row_without_fabricated_code():
+    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+
+    class CapturingWriteSession:
+        added = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def add(self, obj):
+            self.added = obj
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            obj.totp_code_id = "otp_raw"
+            obj.created_at = obj.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    session = CapturingWriteSession()
+    repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
+    result = await repo.create_raw_otp_code(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        content="unparsed content",
+        workflow_run_id="",
+    )
+
+    assert result.totp_code_id == "otp_raw"
+    assert session.added.code is None
+    assert session.added.otp_type is None
+    assert session.added.parse_status == "raw"
+    assert session.added.workflow_run_id is None
 
 
 def test_debug_repository_instantiation():
