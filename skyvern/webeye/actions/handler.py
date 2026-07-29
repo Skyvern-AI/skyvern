@@ -733,6 +733,33 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
+def _blob_download_candidate_pages(download: Download, page: Page) -> list[Page]:
+    """Pages to try when reading a blob: download's bytes, owner-first and deduped.
+
+    A blob: URL only resolves inside the document that minted it, and a download-triggering
+    click frequently opens that document in a new tab, so the owning page may not be the one
+    the action ran on. Fan out over every open page the way the CDP download monitor does.
+    """
+    candidates: list[Page] = []
+    seen: set[int] = set()
+
+    def _add(candidate: Page | None) -> None:
+        if candidate is None or id(candidate) in seen:
+            return
+        seen.add(id(candidate))
+        candidates.append(candidate)
+
+    _add(download.page)
+    _add(page)
+    try:
+        context_pages = list(page.context.pages)
+    except Exception:
+        context_pages = []
+    for context_page in context_pages:
+        _add(context_page)
+    return candidates
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
@@ -766,12 +793,25 @@ async def _save_adopted_session_download(
 
     # Ordering: ``save_as`` above has already run and failed (empty or raised).
     # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
-    # the scheme), so route them through an in-page fetch from a same-origin frame.
+    # the scheme), so route them through an in-page fetch from the document that
+    # owns the blob. That document may be a different tab than the one clicked, so
+    # probe every open page (owner first) rather than reading from ``page`` alone.
     if download.url.startswith("blob:"):
-        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
-            page=page, blob_url=download.url, workflow_run_id=workflow_run_id
-        )
+        candidate_pages = _blob_download_candidate_pages(download, page)
+        blob_bytes: bytes | None = None
+        for candidate in candidate_pages:
+            blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+                page=candidate, blob_url=download.url, workflow_run_id=workflow_run_id, probe=True
+            )
+            if blob_bytes is not None:
+                break
         if blob_bytes is None:
+            LOG.warning(
+                "Adopted-session blob download could not be read from any open page",
+                download_dir=str(download_dir),
+                workflow_run_id=workflow_run_id,
+                candidate_page_count=len(candidate_pages),
+            )
             return None
         download_target.write_bytes(blob_bytes)
         return download_target
