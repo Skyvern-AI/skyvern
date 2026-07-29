@@ -9,7 +9,11 @@ import pytest
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot import secret_scrub
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.forge_log import setup_logger
+
+_REGISTERED_CREDENTIAL = "fake-registered-pa55w0rd-9f3c1a"
 
 
 @pytest.fixture
@@ -54,6 +58,75 @@ def test_foreign_stdlib_exception_renders_single_structured_line(json_stream: io
     assert record["error_type"] == "builtins.ValueError"
     assert record["error_category"] == "ERROR"
     assert record["exception_hash"]
+
+
+@pytest.fixture
+def registered_credential() -> Iterator[str]:
+    secret_scrub._SESSION_SCRUB_VALUES.clear()
+    secret_scrub._SESSION_SCRUB_VALUES["pbs_foreign_traceback"] = [_REGISTERED_CREDENTIAL]
+    try:
+        yield _REGISTERED_CREDENTIAL
+    finally:
+        secret_scrub._SESSION_SCRUB_VALUES.clear()
+
+
+def _raise_with_credential_in_message(credential: str) -> None:
+    """A driver renders a bound parameter — including a credential — into the exception message."""
+    raise RuntimeError(f"(psycopg.errors.UniqueViolation) INSERT failed [parameters: ('{credential}',)]")
+
+
+@pytest.mark.parametrize("logger_name", ["temporalio.activity", "asyncio", "sqlalchemy.engine.Engine"])
+def test_foreign_record_exception_text_is_redacted(
+    json_stream: io.StringIO, registered_credential: str, logger_name: str
+) -> None:
+    """Foreign stdlib records reach the same serializer as native ones and must be scrubbed there.
+
+    The redaction processors used to run only in the structlog chain, so anything logged through a
+    stdlib logger (temporal, asyncio, sqlalchemy, uvicorn) shipped its exception text unredacted.
+    """
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    try:
+        _raise_with_credential_in_message(registered_credential)
+    except RuntimeError:
+        logger.error("statement failed", exc_info=True)
+
+    payload = json_stream.getvalue()
+    assert registered_credential not in payload
+    assert REDACTED_SECRET_PLACEHOLDER in payload
+
+
+def test_redaction_does_not_blind_the_foreign_traceback(json_stream: io.StringIO, registered_credential: str) -> None:
+    """Only the credential is removed — type, frame, and traceback structure survive."""
+    logger = logging.getLogger("temporalio.activity")
+    logger.setLevel(logging.INFO)
+    try:
+        _raise_with_credential_in_message(registered_credential)
+    except RuntimeError:
+        logger.error("statement failed", exc_info=True)
+
+    record = json.loads(json_stream.getvalue().strip().splitlines()[0])
+    assert "Traceback (most recent call last)" in record["exception"]
+    assert "RuntimeError" in record["exception"]
+    assert "_raise_with_credential_in_message" in record["exception"]
+    assert "psycopg.errors.UniqueViolation" in record["exception"]
+    assert record["error_type"] == "builtins.RuntimeError"
+
+
+def test_native_structlog_exception_text_stays_redacted(json_stream: io.StringIO, registered_credential: str) -> None:
+    """Guards the additive fix: the structlog chain must keep its own redaction pass.
+
+    ``skyvern_logs_processor`` copies the event dict into ``context.log`` (persisted to the per-run
+    S3 log artifact) BEFORE the formatter runs, so moving the redactors instead of adding them
+    would close the stdout leak and open one into run artifacts.
+    """
+    logger = structlog.get_logger("skyvern.native_redaction_test")
+    try:
+        _raise_with_credential_in_message(registered_credential)
+    except RuntimeError:
+        logger.exception("statement failed")
+
+    assert registered_credential not in json_stream.getvalue()
 
 
 def test_native_structlog_exception_not_double_processed(json_stream: io.StringIO) -> None:
