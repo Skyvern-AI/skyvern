@@ -308,7 +308,7 @@ from skyvern.forge.sdk.copilot.tools import _maybe_clear_reconciliation_flag  # 
 
 
 def _ctx_with_pending(run_id: str | None) -> _NS:
-    return _NS(pending_reconciliation_run_id=run_id)
+    return _NS(pending_reconciliation_run_id=run_id, last_failure_category_top=None)
 
 
 def test_reconciliation_flag_clears_on_matching_trusted_final_status() -> None:

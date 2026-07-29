@@ -8,7 +8,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
@@ -316,3 +316,95 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
     assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
     assert "page_results: #results No matching records" in prompt
     assert "case=secret" not in ctx.last_code_authoring_repair_context.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_live_seam_evaluate_records_scouted_read_from_prehook_stash() -> None:
+    # Enters through the same two hooks the MCP adapter drives, with a response shaped like the
+    # real one: the expression exists only in the invocation, never in the response.
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
+
+    ctx = _ctx()
+    pre = await _evaluate_pre_hook({"expression": "document.querySelector('#count').textContent"}, ctx)
+    assert pre is None
+
+    result = {"ok": True, "data": {"result": "778 logs found", "url": "https://dash.example.test/logs"}}
+    await _evaluate_post_hook(result, raw={"name": "evaluate"}, ctx=ctx)
+
+    reads = [i for i in ctx.scout_trajectory if i.get("tool_name") == "read_value"]
+    assert len(reads) == 1
+    assert reads[0]["read_expression"] == "document.querySelector('#count').textContent"
+    assert reads[0]["read_result_shape"] == "str"
+    assert ctx.pending_scout_read_expression is None
+
+
+@pytest.mark.asyncio
+async def test_scouted_read_binds_to_a_canonical_slot_when_that_is_the_requested_output() -> None:
+    # A rekeyed requested output carries a digest instead of a word. Binding the read anonymously
+    # keys the producer differently from the criterion, so completion verification reports no
+    # evidence for an outcome the scout already demonstrated.
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
+
+    slot_path = "output.request_slot_5a2fc98725209bfe8366101490eab27e9c75426782ec20214_00"
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c0", outcome="the azure error count", output_path=slot_path)]
+    )
+
+    await _evaluate_pre_hook({"expression": "document.querySelector('#count').textContent"}, ctx)
+    await _evaluate_post_hook(
+        {"ok": True, "data": {"result": "778 logs found", "url": "https://dash.example.test/logs"}},
+        raw={"name": "evaluate"},
+        ctx=ctx,
+    )
+
+    reads = [i for i in ctx.scout_trajectory if i.get("tool_name") == "read_value"]
+    assert [read["read_output_path"] for read in reads] == [slot_path]
+
+
+@pytest.mark.asyncio
+async def test_a_later_diagnostic_read_does_not_evict_the_requested_output_read() -> None:
+    # Reads sharing an output path collapse to the last one, so a page dump taken after the value
+    # would silently replace the read the criterion is graded against.
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
+
+    slot_path = "output.request_slot_5a2fc98725209bfe8366101490eab27e9c75426782ec20214_00"
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[CompletionCriterion(id="c0", outcome="the azure error count", output_path=slot_path)]
+    )
+
+    for expression, result in (
+        ("document.querySelector('#count').textContent", "778 logs found"),
+        ("document.body.innerText", "a whole page of unrelated text"),
+    ):
+        await _evaluate_pre_hook({"expression": expression}, ctx)
+        await _evaluate_post_hook(
+            {"ok": True, "data": {"result": result, "url": "https://dash.example.test/logs"}},
+            raw={"name": "evaluate"},
+            ctx=ctx,
+        )
+
+    reads = [i for i in ctx.scout_trajectory if i.get("tool_name") == "read_value"]
+    assert [read["read_output_path"] for read in reads] == [slot_path, slot_path]
+    # Both are retained with their own expressions; synthesis, not capture, chooses between them.
+    assert [read["read_expression"] for read in reads] == [
+        "document.querySelector('#count').textContent",
+        "document.body.innerText",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_evaluate_does_not_leak_expression_into_next_read() -> None:
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
+
+    ctx = _ctx()
+    await _evaluate_pre_hook({"expression": "document.title"}, ctx)
+    await _evaluate_post_hook({"ok": False, "error": "boom"}, raw={}, ctx=ctx)
+
+    # Next evaluate carries no expression (adapter reject path) — the stale stash must not attach.
+    pre = await _evaluate_pre_hook({}, ctx)
+    assert pre is None
+    await _evaluate_post_hook({"ok": True, "data": {"result": "still here"}}, raw={}, ctx=ctx)
+
+    assert [i for i in ctx.scout_trajectory if i.get("tool_name") == "read_value"] == []

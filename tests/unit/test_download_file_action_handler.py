@@ -33,11 +33,11 @@ from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_organization, make_step, make_task
 
-# One second is only a test-side runaway guard. The behavior under test is
+# Five seconds is only a test-side runaway guard. The behavior under test is
 # asserted through configured timeout values, cleanup, and span attributes
-# below; it tolerates the hundreds of ms a loaded CI runner can delay a
+# below; it tolerates the scheduling delay a loaded CI runner can add to a
 # completed coroutine without turning scheduling latency into a product failure.
-CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 1.0
+CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 5.0
 
 
 class _EventEmitter:
