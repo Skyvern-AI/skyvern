@@ -48,6 +48,7 @@ class CodeBlockSandboxNameDiagnostic:
     unresolved_names: tuple[str, ...]
     class_names: tuple[str, ...]
     parameter_keys: tuple[str, ...]
+    block_bound_names: tuple[str, ...]
     allowed_global_names: tuple[str, ...]
     allowed_helper_surface: dict[str, tuple[str, ...]]
 
@@ -461,6 +462,45 @@ def sandbox_unresolved_name_diagnostics(
     return [CodeBlockPreflightDiagnostic(code=repair_diagnostic.code, message=repair_diagnostic.message)]
 
 
+def sandbox_absent_name_diagnostics(
+    code: str,
+    *,
+    parameter_keys: Iterable[str] = (),
+) -> list[CodeBlockPreflightDiagnostic]:
+    """Find names the sandbox can never supply, ignoring definite-assignment gaps.
+
+    A name the block binds on some path resolves whenever that path runs, so a run
+    is the oracle for it; only a name bound nowhere can never resolve.
+    """
+
+    diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+    if diagnostic is None:
+        return []
+    bound = set(diagnostic.block_bound_names)
+    absent = [name for name in diagnostic.unresolved_names if name not in bound]
+    if not absent and not diagnostic.class_names:
+        return []
+
+    detail_parts: list[str] = []
+    if absent:
+        detail_parts.append(f"unresolved names: {', '.join(f'`{name}`' for name in absent)}")
+    if diagnostic.class_names:
+        detail_parts.append(
+            "class definitions unavailable in the code sandbox: "
+            + ", ".join(f"`{name}`" for name in diagnostic.class_names)
+        )
+    return [
+        CodeBlockPreflightDiagnostic(
+            code=diagnostic.code,
+            message=(
+                f"Code block references names that are unavailable in the runtime code sandbox "
+                f"({'; '.join(detail_parts)}). The sandbox provides `page`, declared code-block parameter "
+                "keys, and its explicit safe helper namespace; `Exception` is the only available exception type."
+            ),
+        )
+    ]
+
+
 def sandbox_unresolved_name_repair_diagnostic(
     code: str,
     *,
@@ -472,7 +512,8 @@ def sandbox_unresolved_name_repair_diagnostic(
         return None
 
     parameter_key_list = sorted(key for key in dict.fromkeys(parameter_keys) if _valid_python_identifier(key))
-    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_key_list).analyze(tree.body)
+    analyzer = _SandboxNameAnalyzer(parameter_keys=parameter_key_list)
+    unresolved_names, class_names = analyzer.analyze(tree.body)
     if not unresolved_names and not class_names:
         return None
 
@@ -497,6 +538,7 @@ def sandbox_unresolved_name_repair_diagnostic(
         unresolved_names=tuple(names),
         class_names=tuple(rejected_classes),
         parameter_keys=tuple(parameter_key_list),
+        block_bound_names=tuple(sorted(analyzer.block_bound_names)),
         allowed_global_names=tuple(sandbox_allowed_global_names()),
         allowed_helper_surface={
             helper: tuple(attributes) for helper, attributes in sandbox_allowed_helper_surface().items()
@@ -692,10 +734,12 @@ class _SandboxNameAnalyzer:
         self.outer_names = set(outer_names)
         self.unresolved_names: set[str] = set()
         self.class_names: set[str] = set()
+        self.block_bound_names: set[str] = set()
 
     def analyze(self, statements: list[ast.stmt]) -> tuple[set[str], set[str]]:
         local_names = self._local_names(statements)
         function_names = self._function_names(statements)
+        self.block_bound_names = set(local_names) | set(function_names)
         self._statements(
             statements,
             set(self.parameter_names),

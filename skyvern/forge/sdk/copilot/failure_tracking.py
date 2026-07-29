@@ -49,8 +49,6 @@ ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY = "ANTI_BOT_CHALLENGE"
 # Stable active-run terminal evidence identifiers. The category is stored in
 # tool result ``failure_categories``; the reason code is stored on blocker
 # signals that convert that tool result into product-safe final copy.
-ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY = "ACTIVE_RUN_TERMINAL_EVIDENCE"
-ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE = "tool_error_active_run_terminal_evidence"
 
 _ROOT_CAUSE_CATEGORY_ALIASES = {
     **{alias: ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY for alias in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES},
