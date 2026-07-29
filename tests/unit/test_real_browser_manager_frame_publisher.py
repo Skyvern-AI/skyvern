@@ -250,6 +250,8 @@ async def test_inherited_child_workflow_starts_publisher_for_child_key(
     # Parent was created via a remote-CDP creator; the marker is set to True.
     # Bool literal (not a Mock auto-attribute) so the gate accepts it.
     parent_state.browser_artifacts.needs_cdp_frame_publisher = True
+    # A live parent browser has a working page, so the child adopts it.
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
     manager.pages["wfr_parent"] = parent_state
 
     workflow_run = MagicMock()

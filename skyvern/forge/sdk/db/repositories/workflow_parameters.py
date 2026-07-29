@@ -906,6 +906,7 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("get_task_generation_by_prompt_hash")
     async def get_task_generation_by_prompt_hash(
         self,
+        organization_id: str,
         user_prompt_hash: str,
         query_window_hours: int = settings.PROMPT_CACHE_WINDOW_HOURS,
     ) -> TaskGeneration | None:
@@ -913,9 +914,11 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             query = (
                 select(TaskGenerationModel)
-                .filter_by(user_prompt_hash=user_prompt_hash)
+                .filter_by(organization_id=organization_id, user_prompt_hash=user_prompt_hash)
                 .filter(TaskGenerationModel.llm.is_not(None))
                 .filter(TaskGenerationModel.created_at > before_time)
+                .order_by(TaskGenerationModel.created_at.desc())
+                .limit(1)
             )
             task_generation = (await session.scalars(query)).first()
             if not task_generation:
@@ -984,6 +987,10 @@ class WorkflowParametersRepository(BaseRepository):
             "confidence_float": action.confidence_float,
             "created_by": action.created_by,
         }
+        if action.created_at is not None:
+            values["created_at"] = action.created_at
+        if action.modified_at is not None:
+            values["modified_at"] = action.modified_at
         async with self.Session() as session:
             stmt = pg_insert(ActionModel).values(**values)
             stmt = stmt.on_conflict_do_update(
@@ -991,7 +998,7 @@ class WorkflowParametersRepository(BaseRepository):
                 set_={
                     "screenshot_artifact_id": stmt.excluded.screenshot_artifact_id,
                     "action_json": stmt.excluded.action_json,
-                    "modified_at": datetime.now(timezone.utc),
+                    "modified_at": stmt.excluded.modified_at,
                 },
             )
             await session.execute(stmt)

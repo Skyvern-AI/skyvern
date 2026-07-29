@@ -43,8 +43,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page
-from pydantic import BaseModel, Field, model_validator
+from playwright.async_api import Frame, Page
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
@@ -458,6 +458,11 @@ class Block(BaseModel, abc.ABC):
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
 
+    # Set by record_output_parameter_value within a single execute_safe call; lets the
+    # failure handler tell a value recorded during THIS execution apart from a stale
+    # value left by a prior for-loop iteration.
+    _output_recorded_this_execution: bool = PrivateAttr(default=False)
+
     @property
     def override_llm_key(self) -> str | None:
         return self.override_llm_key_for_organization(None)
@@ -490,6 +495,7 @@ class Block(BaseModel, abc.ABC):
             parameter=self.output_parameter,
             value=value,
         )
+        self._output_recorded_this_execution = True
         await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
@@ -939,6 +945,24 @@ class Block(BaseModel, abc.ABC):
         """Return block-level error codes for unexpected failures. Override in subclasses."""
         return []
 
+    async def _invalidate_stale_output_on_failure(
+        self,
+        workflow_run_id: str,
+        current_index: int | None,
+        *,
+        include_missing_value_guard: bool,
+    ) -> None:
+        # On a failed execution, invalidate this block's output to None so a prior for-loop
+        # iteration's value can't leak into the failed iteration's downstream blocks; a value
+        # already recorded this execution is preserved and non-loop behavior is unchanged.
+        if self._output_recorded_this_execution:
+            return
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if current_index is not None or (
+            include_missing_value_guard and not workflow_run_context.has_value(self.output_parameter.key)
+        ):
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+
     @traced(name="skyvern.block.execute", role="wrapper")
     async def execute_safe(
         self,
@@ -954,6 +978,7 @@ class Block(BaseModel, abc.ABC):
         # have wildly different latency profiles. Set early so it's present even if
         # execute_safe raises before any child work.
         otel_trace.get_current_span().set_attribute("block_type", self.block_type.value)
+        self._output_recorded_this_execution = False
         workflow_run_block_id = None
         engine: RunEngine | None = None
         try:
@@ -1016,13 +1041,21 @@ class Block(BaseModel, abc.ABC):
                 block_label=self.label,
                 block_type=self.block_type,
             )
-            return await self.execute(
+            result = await self.execute(
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 **kwargs,
             )
+            # Blocks that report failure by returning an unsuccessful BlockResult never reach the
+            # except branch, and build_block_result does not touch WorkflowRunContext, so invalidate
+            # stale loop output here too.
+            if not result.success:
+                await self._invalidate_stale_output_on_failure(
+                    workflow_run_id, current_index, include_missing_value_guard=False
+                )
+            return result
         except Exception as e:
             LOG.exception(
                 "Block execution failed",
@@ -1030,10 +1063,9 @@ class Block(BaseModel, abc.ABC):
                 block_label=self.label,
                 block_type=self.block_type,
             )
-            # Record output parameter value if it hasn't been recorded yet
-            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-            if not workflow_run_context.has_value(self.output_parameter.key):
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
+            await self._invalidate_stale_output_on_failure(
+                workflow_run_id, current_index, include_missing_value_guard=True
+            )
 
             failure_reason = get_user_facing_exception_message(e)
 
@@ -3613,6 +3645,12 @@ _CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR = ", ".join(
         'iframe[title*="recaptcha" i]',
     )
 )
+_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]'
+_CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
+_CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
+_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
+# Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
+_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
     (
         "[data-challenge-state] button[type='submit']",
@@ -3630,6 +3668,34 @@ async def _bounded_code_block_locator_count(locator: Any) -> int:
         return await asyncio.wait_for(locator.count(), timeout=1.0)
     except Exception:
         return 0
+
+
+def _is_trusted_code_block_recaptcha_anchor_url(frame_url: str | None) -> bool:
+    if not frame_url:
+        return False
+    try:
+        parsed = urlparse(frame_url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and hostname in _CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS
+        and parsed.path in _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS
+    )
+
+
+async def _bounded_code_block_recaptcha_token_populated(scope: Frame | Page | RecordingPage) -> bool | None:
+    try:
+        async with asyncio.timeout(1):
+            fields = scope.locator(_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR)
+            for index in range(await fields.count()):
+                value = await fields.nth(index).input_value()
+                if value and value.strip().lower() not in {"undefined", "null"}:
+                    return True
+    except (PlaywrightError, TimeoutError):
+        return None
+    return False
 
 
 async def _code_block_solve_captcha_builtin(
@@ -3671,6 +3737,45 @@ async def _code_block_solve_captcha_builtin(
                         return
         except Exception:
             LOG.info("code block CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
+
+    # A page-level locator cannot cross into reCAPTCHA's anchor iframe. Click the checkbox in-frame.
+    try:
+        async with asyncio.timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS):
+            for frame in page.frames:
+                if not _is_trusted_code_block_recaptcha_anchor_url(frame.url):
+                    continue
+                anchor = frame.locator("#recaptcha-anchor")
+                if await _bounded_code_block_locator_count(anchor) != 1:
+                    continue
+                candidate = await anchor.first.element_handle()
+                if candidate is None or not (await candidate.is_visible()):
+                    continue
+                # The handle is bound to the validated document. If the frame navigates after this
+                # re-check, Playwright detaches the handle instead of clicking the replacement page.
+                if not _is_trusted_code_block_recaptcha_anchor_url(frame.url):
+                    continue
+                token_scope = frame.parent_frame or page
+                token_was_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
+                if await candidate.get_attribute("aria-checked") == "true":
+                    break
+                page_url_before_click = urlparse(page.url)._replace(fragment="").geturl()
+                await candidate.click()
+                LOG.info("code block CAPTCHA anchor frame clicked", arm="recaptcha_anchor_frame")
+                await page.wait_for_timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS)
+                if frame.is_detached() and urlparse(page.url)._replace(fragment="").geturl() != page_url_before_click:
+                    LOG.info("code block CAPTCHA anchor frame solved after navigation", arm="recaptcha_anchor_frame")
+                    return
+                token_is_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
+                if (
+                    await candidate.get_attribute("aria-checked") == "true"
+                    and token_was_populated is False
+                    and token_is_populated is True
+                ):
+                    LOG.info("code block CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
+                    return
+                break
+    except Exception:
+        LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
 
     try:
         if await app.AGENT_FUNCTION.auto_solve_captchas(page):
@@ -3743,6 +3848,7 @@ async def _poll_code_block_otp(
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 totp_identifier=totp_identifier,
                 created_after=workflow_run.started_at,
+                expected_otp_type=OTPType.TOTP,
             ),
             timeout=budget_seconds,
         )
@@ -6229,7 +6335,6 @@ class UploadToS3Block(Block):
             client = self.get_async_aws_client()
             # is the file path a file or a directory?
             if os.path.isdir(resolved_path):
-                # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(resolved_path)
                 if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")

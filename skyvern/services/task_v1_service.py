@@ -55,7 +55,9 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
     # check if there's a same user_prompt within the past x Hours
     # in the future, we can use vector db to fetch similar prompts
     existing_task_generation = await app.DATABASE.workflow_params.get_task_generation_by_prompt_hash(
-        user_prompt_hash=user_prompt_hash, query_window_hours=settings.PROMPT_CACHE_WINDOW_HOURS
+        organization_id=organization.organization_id,
+        user_prompt_hash=user_prompt_hash,
+        query_window_hours=settings.PROMPT_CACHE_WINDOW_HOURS,
     )
     if existing_task_generation:
         new_task_generation = await app.DATABASE.workflow_params.create_task_generation(

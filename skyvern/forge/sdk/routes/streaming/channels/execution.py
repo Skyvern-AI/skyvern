@@ -12,6 +12,7 @@ Channel data:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import typing as t
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_SCREENSHOT_BYTES
 from skyvern.forge.sdk.routes.streaming.registries import get_vnc_channel
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
@@ -95,7 +97,7 @@ class ExecutionChannel(CdpChannel):
         if not self.page:
             raise RuntimeError(f"{self.class_name} navigate: not connected to a page.")
 
-        normalized = self._normalize_url(url)
+        normalized = await asyncio.to_thread(validate_fetch_url, self._normalize_url(url))
 
         await self.page.goto(
             normalized,
@@ -218,6 +220,8 @@ class ExecutionChannel(CdpChannel):
 
     @staticmethod
     def _normalize_url(url: str) -> str:
+        """Settle the scheme only. This says nothing about the destination — callers must pass the
+        result through ``validate_fetch_url`` before navigating."""
         candidate = url.strip()
         if not candidate:
             raise ValueError("URL must not be empty")

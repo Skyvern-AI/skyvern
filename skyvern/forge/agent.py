@@ -58,6 +58,7 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
+    ScreenshotTargetClosed,
     SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
@@ -113,6 +114,12 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
+from skyvern.forge.sdk.experimentation.transient_ui_capture import (
+    decide_transient_ui_suppression,
+    emit_transient_ui_popup_telemetry,
+    resolve_transient_ui_capture_arm,
+    transient_ui_capture_arm,
+)
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
@@ -121,7 +128,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.submission import shadow as submission_shadow
-from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
+from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -142,7 +149,11 @@ from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import poll_otp_value, resolve_otp_value
-from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import (
+    WEBHOOK_DELIVERY_MAX_ATTEMPTS,
+    deliver_webhook_with_retries,
+    describe_delivery_error,
+)
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
     PROMPT_HARD_CEILING_TOKENS,
@@ -1397,6 +1408,25 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return step, detailed_output, None
+        except ScreenshotTargetClosed as e:
+            LOG.warning("Browser target closed mid-run, marking the task as failed")
+            await self.fail_task(
+                task,
+                step,
+                "The browser page closed while Skyvern was working on it. This can happen when the site, the browser, or the run itself closes the page mid-run.",
+                browser_state,
+                exception=e,
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+                download_suffix=task_block.download_suffix if task_block else None,
+                list_files_before=list_files_before,
+            )
+            return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
@@ -1720,6 +1750,7 @@ class ForgeAgent:
             FailedToParseActionInstruction,
             ScrapingFailed,
             MissingBrowserStatePage,
+            ScreenshotTargetClosed,
         ):
             raise
 
@@ -3421,6 +3452,24 @@ class ForgeAgent:
 
         if engine in CUA_ENGINES:
             scrolling_number = 0
+        elif scrolling_number > 0 and skyvern_frame is not None:
+            arm = transient_ui_capture_arm(context)
+            if arm != "off":
+                # Shadow-detect an open transient popup in control; only treatment suppresses the
+                # scroll that would dismiss it (e.g. a portal date-picker popup) before the next step.
+                # This post-action screenshot shares the per-run consecutive-suppression cap with the
+                # agent-step scrape so a stale expanded trigger cannot pin captures at one viewport.
+                popup_trigger = await skyvern_frame.get_open_aria_popup_trigger()
+                _span.set_attribute("transient_ui_arm", arm)
+                if popup_trigger is not None:
+                    _span.set_attribute("transient_ui_detected", True)
+                    emit_transient_ui_popup_telemetry(_span, popup_trigger)
+                decision = decide_transient_ui_suppression(context, arm, detected=popup_trigger is not None)
+                if decision.suppress:
+                    scrolling_number = 0
+                    _span.set_attribute("transient_ui_scroll_suppressed", True)
+                elif decision.capped:
+                    _span.set_attribute("transient_ui_suppression_capped", True)
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
         screenshot_artifact_id: str | None = None
@@ -3446,7 +3495,7 @@ class ForgeAgent:
                 # step=None and speculative steps force the non-bundled path.
                 _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.agent.artifact.screenshot_action") as _ss_art_span:
+                with traced_span(_tracer, "skyvern.agent.artifact.screenshot_action") as _ss_art_span:
                     apply_context_attrs(_ss_art_span)
                     _ss_art_span.set_attribute("screenshot_bytes", len(screenshot))
                     _ss_art_span.set_attribute("bundled", _bundled)
@@ -3471,6 +3520,11 @@ class ForgeAgent:
                                 if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
                                     screenshot_artifact_id = artifact_data.artifact_model.artifact_id
                                     break
+        except ScreenshotTargetClosed:
+            # Teardown, browser death, or the site closing the tab. HTML capture below reads the same
+            # dead target, so returning here avoids trading this for an ERROR from get_content().
+            LOG.info("Skipping post-action artifacts because the browser target closed")
+            return
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -3487,7 +3541,7 @@ class ForgeAgent:
             html_bytes = html.encode("utf-8")
             _bundled = bool(step and not step.is_speculative and _ctx and _ctx.use_artifact_bundling)
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.agent.artifact.html_action") as _html_art_span:
+            with traced_span(_tracer, "skyvern.agent.artifact.html_action") as _html_art_span:
                 apply_context_attrs(_html_art_span)
                 _html_art_span.set_attribute("html_bytes", len(html_bytes))
                 _html_art_span.set_attribute("bundled", _bundled)
@@ -3506,7 +3560,7 @@ class ForgeAgent:
 
         if artifacts:
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.agent.artifact.bulk_create") as _bulk_span:
+            with traced_span(_tracer, "skyvern.agent.artifact.bulk_create") as _bulk_span:
                 apply_context_attrs(_bulk_span)
                 # Count underlying artifacts (main + screenshots per request), not request wrappers.
                 _bulk_span.set_attribute("artifact_count", sum(len(a.artifacts) for a in artifacts if a is not None))
@@ -3529,7 +3583,7 @@ class ForgeAgent:
                 )
             else:
                 _tracer = otel_trace.get_tracer("skyvern")
-                with _tracer.start_as_current_span("skyvern.agent.artifact.update_action_screenshot_fk") as _fk_span:
+                with traced_span(_tracer, "skyvern.agent.artifact.update_action_screenshot_fk") as _fk_span:
                     apply_context_attrs(_fk_span)
                     try:
                         await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
@@ -3631,6 +3685,9 @@ class ForgeAgent:
             max_screenshot_number=max_screenshot_number,
             draw_boxes=draw_boxes,
             scroll=scroll,
+            # Only this agent-step scrape opts into transient-UI scroll suppression (SKY-12735);
+            # verification / extraction / error-detection scrapes keep legacy scrolling.
+            allow_transient_ui_suppression=True,
         )
 
     @traced(name="skyvern.agent.scrape_and_prompt", role="wrapper")
@@ -3722,6 +3779,8 @@ class ForgeAgent:
                     )
                     context.use_artifact_bundling = False
 
+                await resolve_transient_ui_capture_arm(context)
+
             # start the async tasks while running scrape_website
             if engine not in CUA_ENGINES:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
@@ -3754,6 +3813,15 @@ class ForgeAgent:
                             url=task.url,
                         )
                         continue
+                    if isinstance(e, ScreenshotTargetClosed):
+                        LOG.warning(
+                            "All scrape attempts failed because the browser target closed",
+                            total_attempts=len(SCRAPE_TYPE_ORDER),
+                            url=task.url,
+                            step_order=step.order,
+                            step_retry=step.retry_index,
+                        )
+                        raise e
                     LOG.error(
                         "All scrape attempts failed",
                         total_attempts=len(SCRAPE_TYPE_ORDER),
@@ -4844,7 +4912,7 @@ class ForgeAgent:
 
         if task.organization_id:
             _tracer = otel_trace.get_tracer("skyvern")
-            with _tracer.start_as_current_span("skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
+            with traced_span(_tracer, "skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
                 apply_context_attrs(_cl_save_span)
                 try:
                     # Keep both finalize and save inside a single timeout budget so a hung
@@ -4927,19 +4995,19 @@ class ForgeAgent:
         await self.async_operation_pool.remove_task(task.task_id)
 
         _tracer = otel_trace.get_tracer("skyvern")
-        with _tracer.start_as_current_span("skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
+        with traced_span(_tracer, "skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
             apply_context_attrs(_cl_br_span)
             await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
             )
 
         # Wait for all tasks to complete before generating the links for the artifacts
-        with _tracer.start_as_current_span("skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
+        with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            with _tracer.start_as_current_span("skyvern.agent.cleanup.webhook") as _cl_wh_span:
+            with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:
                 apply_context_attrs(_cl_wh_span)
                 await self.execute_task_webhook(task=task, api_key=api_key)
 
@@ -4995,15 +5063,37 @@ class ForgeAgent:
                 headers=signed_data.headers,
             )
 
-            resp = await deliver_webhook_with_retries(
-                url=task.webhook_callback_url,
-                payload=signed_data.signed_payload,
-                headers=signed_data.headers,
-                timeout_seconds=30.0,
-                organization_id=task.organization_id,
-                run_id=task.task_id,
-                max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
-            )
+            try:
+                resp = await deliver_webhook_with_retries(
+                    url=task.webhook_callback_url,
+                    payload=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout_seconds=30.0,
+                    organization_id=task.organization_id,
+                    run_id=task.task_id,
+                    max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
+                )
+            except Exception as delivery_error:
+                LOG.warning(
+                    "Task webhook delivery failed after attempting delivery",
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    error=describe_delivery_error(delivery_error),
+                    exc_info=True,
+                )
+                try:
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=task.organization_id,
+                        webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to record task webhook delivery error",
+                        task_id=task.task_id,
+                        exc_info=True,
+                    )
+                raise
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
@@ -5194,17 +5284,23 @@ class ForgeAgent:
                         data=video_artifact.video_data,
                     )
                     continue
-                # No pre-registered artifact row: a recording attached at browser teardown
-                # (remote-CDP path) needs a RECORDING artifact created from the on-disk file.
-                # Upload by path so the bytes stream straight from disk to storage.
+                # A teardown-attached recording has no pre-registered artifact row.
+                # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
                 video_path = video_artifact.video_path
-                if not video_path or not os.path.exists(video_path):
+                if video_artifact.video_data:
+                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                    )
+                elif video_path and os.path.exists(video_path):
+                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                    )
+                else:
                     continue
-                video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    path=video_path,
-                )
 
             _ctx = skyvern_context.current()
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
@@ -6474,6 +6570,7 @@ class ForgeAgent:
             workflow_run_id=task.workflow_run_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
+            expected_otp_type=OTPType.MAGIC_LINK,
         )
         if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
             return []
@@ -6512,7 +6609,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = await resolve_otp_value(task)
+        otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response

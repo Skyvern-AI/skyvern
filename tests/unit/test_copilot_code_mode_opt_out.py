@@ -49,7 +49,6 @@ def _outcome(
     mode: str | None,
     code_available: bool = True,
     last_code_build_failed: bool = False,
-    repair_ceiling_hit: bool = False,
     pending_capability: str | None = None,
     turn_id: str | None = "prior-turn",
 ) -> TurnOutcome:
@@ -58,7 +57,6 @@ def _outcome(
         copilot_effective_mode=mode,
         copilot_code_available=code_available,
         copilot_last_code_build_failed=last_code_build_failed,
-        copilot_repair_ceiling_hit=repair_ceiling_hit,
         copilot_pending_capability=pending_capability,
         copilot_turn_id=turn_id,
     )
@@ -126,7 +124,7 @@ def test_should_emit_copilot_code_mode_opt_out_transitions(
     ("prior", "expected"),
     [
         (_outcome(mode="code", last_code_build_failed=True, pending_capability="capability"), "failure"),
-        (_outcome(mode="code", repair_ceiling_hit=True, pending_capability="capability"), "failure"),
+        (_outcome(mode="code", last_code_build_failed=True, pending_capability="capability"), "failure"),
         (
             TurnOutcome(
                 response_kind=ResponseKind.RECOVER,
@@ -151,7 +149,6 @@ def test_capture_copilot_code_mode_opt_out_uses_chat_id_as_distinct_id(monkeypat
     prior = _outcome(
         mode="code",
         last_code_build_failed=True,
-        repair_ceiling_hit=False,
         pending_capability="credential-typed code synthesis",
         turn_id="turn-prior",
     )
@@ -173,7 +170,6 @@ def test_capture_copilot_code_mode_opt_out_uses_chat_id_as_distinct_id(monkeypat
             "to_mode": "ask",
             "reason_category": "failure",
             "last_code_build_failed": True,
-            "repair_ceiling_hit": False,
             "pending_capability": "credential-typed code synthesis",
             "org_id": "org-123",
             "workflow_permanent_id": "wpid-123",
@@ -257,19 +253,30 @@ def test_with_copilot_code_mode_metadata_preserves_turn_outcome_fields() -> None
 
 
 def test_derive_copilot_code_mode_diagnostics_uses_context_state() -> None:
-    ctx = type("Ctx", (), {})()
-    ctx.last_test_ok = False
-    ctx.last_failed_workflow_yaml = None
-    ctx.code_native_pending_capability = "credential-typed code synthesis"
-    ctx.turn_halt = type("Halt", (), {"kind": type("Kind", (), {"value": "repair_ceiling_reached"})()})()
+    ctx = SimpleNamespace(
+        last_test_ok=False,
+        last_failed_workflow_yaml=None,
+        code_native_pending_capability="credential-typed code synthesis",
+        turn_halt=SimpleNamespace(kind=SimpleNamespace(value="loop_detected")),
+    )
 
-    diagnostics = derive_copilot_code_mode_diagnostics(ctx)
-
-    assert diagnostics == {
+    assert derive_copilot_code_mode_diagnostics(ctx) == {
         "copilot_last_code_build_failed": True,
-        "copilot_repair_ceiling_hit": True,
         "copilot_pending_capability": "credential-typed code synthesis",
-        "copilot_schema_incompatibility": None,
+    }
+
+
+def test_derive_copilot_code_mode_diagnostics_on_a_clean_turn() -> None:
+    ctx = SimpleNamespace(
+        last_test_ok=True,
+        last_failed_workflow_yaml=None,
+        code_native_pending_capability=None,
+        turn_halt=None,
+    )
+
+    assert derive_copilot_code_mode_diagnostics(ctx) == {
+        "copilot_last_code_build_failed": False,
+        "copilot_pending_capability": None,
     }
 
 

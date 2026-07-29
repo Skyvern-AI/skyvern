@@ -459,38 +459,111 @@ class WorkflowRunsRepository(BaseRepository):
             await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
+    @db_operation("finish_preexisting_timed_out_workflow_run")
+    async def finish_preexisting_timed_out_workflow_run(
+        self,
+        workflow_run_id: str,
+        failure_reason: str | None = None,
+        run_with: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> WorkflowRun | None:
+        """Finish a status-only timeout written by bulk stuck-run cleanup.
+
+        A normal timeout transition always stamps ``finished_at``. Restricting
+        this repair to unfinished ``timed_out`` rows lets a cleanup retry fill
+        missing metadata without overwriting the attribution or completion
+        timestamp from another timeout finalizer.
+        """
+        now = naive_utc_now()
+        values: dict[str, Any] = {"finished_at": now}
+        if failure_reason is not None:
+            values["failure_reason"] = func.coalesce(WorkflowRunModel.failure_reason, failure_reason)
+        if run_with is not None:
+            values["run_with"] = func.coalesce(WorkflowRunModel.run_with, run_with)
+        if failure_category is not None:
+            values["failure_category"] = func.coalesce(
+                WorkflowRunModel.failure_category,
+                literal(failure_category, type_=WorkflowRunModel.failure_category.type),
+            )
+
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status == WorkflowRunStatus.timed_out.value,
+                    WorkflowRunModel.finished_at.is_(None),
+                )
+                .values(**values)
+                .returning(WorkflowRunModel.workflow_run_id)
+            )
+            affected = result.scalar_one_or_none()
+            await session.commit()
+            if affected is None:
+                return None
+            refreshed = (
+                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+            ).one()
+            await save_workflow_run_logs(workflow_run_id)
+            # save_workflow_run_logs reuses this session and commits, expiring `refreshed`.
+            # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
+            await session.refresh(refreshed)
+            return convert_to_workflow_run(refreshed)
+
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
         self,
         workflow_run_ids: list[str],
         status: WorkflowRunStatus | None = None,
         failure_reason: str | None = None,
-    ) -> None:
+        only_if_status_in: list[WorkflowRunStatus] | None = None,
+    ) -> list[str]:
         """Bulk update workflow runs by their IDs.
 
         Args:
             workflow_run_ids: List of workflow run IDs to update
             status: Optional status to set for all workflow runs
             failure_reason: Optional failure reason to set for all workflow runs
+            only_if_status_in: Optional status whitelist used as a compare-and-set guard
+
+        Returns:
+            IDs of rows that matched the update.
         """
         if not workflow_run_ids:
-            return
+            return []
 
         async with self.Session() as session:
-            update_values = {}
+            update_values: dict[str, Any] = {}
             if status:
                 update_values["status"] = status.value
+                if status == WorkflowRunStatus.timed_out:
+                    # Stuck-run cleanup intentionally writes only a timeout marker;
+                    # clear terminal metadata that may remain from the temporary
+                    # terminal -> running transition used by finally blocks. The
+                    # timeout activity then owns attribution, timestamps, and
+                    # completion side effects through
+                    # finish_preexisting_timed_out_workflow_run.
+                    update_values["finished_at"] = None
+                    update_values["failure_category"] = None
+                    if failure_reason is None:
+                        update_values["failure_reason"] = None
             if failure_reason:
                 update_values["failure_reason"] = failure_reason
 
-            if update_values:
-                update_stmt = (
-                    update(WorkflowRunModel)
-                    .where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
-                    .values(**update_values)
+            if not update_values:
+                return []
+
+            update_stmt = update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+            if only_if_status_in is not None:
+                update_stmt = update_stmt.where(
+                    WorkflowRunModel.status.in_([eligible_status.value for eligible_status in only_if_status_in])
                 )
-                await session.execute(update_stmt)
-                await session.commit()
+            result = await session.execute(
+                update_stmt.values(**update_values).returning(WorkflowRunModel.workflow_run_id)
+            )
+            updated_workflow_run_ids = list(result.scalars().all())
+            await session.commit()
+            return updated_workflow_run_ids
 
     @db_operation("clear_workflow_run_failure_reason")
     async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:

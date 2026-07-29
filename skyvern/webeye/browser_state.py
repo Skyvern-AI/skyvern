@@ -121,4 +121,5 @@ class BrowserState(Protocol):
         support_empty_page: bool = False,
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
+        allow_transient_ui_suppression: bool = False,
     ) -> ScrapedPage: ...

@@ -1428,6 +1428,14 @@ class WorkflowRunContext:
                 and isinstance(parameter.source, OutputParameter)
                 and parameter.source.key == output_parameter.key
             ):
+                # A None source value means the producing block failed or has no output this
+                # iteration; propagate None like the errors branch below instead of raising, so an
+                # invalidated output neither crashes the run nor leaves a stale ContextParameter.
+                if value is None:
+                    parameter.value = None
+                    self.parameters[parameter.key] = parameter
+                    self.values[parameter.key] = parameter.value
+                    continue
                 # If task isn't completed, we should skip setting the value
                 if (
                     isinstance(value, dict)

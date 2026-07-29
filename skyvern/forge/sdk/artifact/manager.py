@@ -17,6 +17,7 @@ from skyvern.forge.sdk.api.files import create_named_temporary_file
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
+    artifact_url_expiry_seconds_for_type,
     effective_artifact_url_expiry_seconds,
     parse_keyring,
     sign_artifact_url,
@@ -1262,7 +1263,12 @@ class ArtifactManager:
         storage presigned URL would download the wrong bytes — fall through to
         the endpoint, which knows how to extract the member). Otherwise the
         storage backend's presigned URL (S3 / Azure SAS / local URI).
+
+        Screenshot and recording URLs are capped to
+        ``SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS`` regardless of the caller's
+        value (SKY-12527).
         """
+        expiry_seconds = artifact_url_expiry_seconds_for_type(artifact.artifact_type, expiry_seconds)
         if _bundling_enabled() or artifact.bundle_key:
             # Legacy unsigned URLs expose ``artifact_name`` for download display.
             # Bundled members carry the in-ZIP filename
@@ -1315,7 +1321,7 @@ class ArtifactManager:
                     artifact.artifact_id,
                     artifact_name=artifact.bundle_key,
                     artifact_type=artifact.artifact_type,
-                    expiry_seconds=expiry_seconds,
+                    expiry_seconds=artifact_url_expiry_seconds_for_type(artifact.artifact_type, expiry_seconds),
                 )
                 for artifact in artifacts
             ]
@@ -1339,7 +1345,7 @@ class ArtifactManager:
                 a.artifact_id,
                 artifact_name=a.bundle_key,
                 artifact_type=a.artifact_type,
-                expiry_seconds=expiry_seconds,
+                expiry_seconds=artifact_url_expiry_seconds_for_type(a.artifact_type, expiry_seconds),
             )
 
         LOG.debug(

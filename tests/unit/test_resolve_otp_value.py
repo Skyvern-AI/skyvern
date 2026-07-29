@@ -118,7 +118,7 @@ async def test_falls_through_to_poll_when_no_payload_or_credential(monkeypatch: 
         patch("skyvern.services.otp_service.try_generate_totp_from_credential", return_value=None),
         patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock(return_value=poll_value)) as poll,
     ):
-        result = await resolve_otp_value(task)
+        result = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
 
     assert result is poll_value
     db_get.assert_awaited_once_with("wr_test")
@@ -131,6 +131,7 @@ async def test_falls_through_to_poll_when_no_payload_or_credential(monkeypatch: 
     assert kwargs["workflow_permanent_id"] == "wpid_test"
     assert kwargs["totp_verification_url"] == "https://example.com/webhook"
     assert kwargs["totp_identifier"] == "user@example.com"
+    assert kwargs["expected_otp_type"] == OTPType.TOTP
 
 
 @pytest.mark.asyncio

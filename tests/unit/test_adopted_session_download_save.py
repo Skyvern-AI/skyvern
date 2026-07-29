@@ -26,6 +26,9 @@ def _download(suggested: str = "153743777.pdf", url: str = "https://example.com/
     download.suggested_filename = suggested
     download.url = url
     download.save_as = AsyncMock()
+    # Playwright reports the owning page here; default to unknown so tests exercise the
+    # click-page + context fan-out unless they set it explicitly.
+    download.page = None
     return download
 
 
@@ -190,6 +193,9 @@ def _blob_capable_page(*frames: MagicMock, main_frame_url: str = OTHER_ORIGIN_FR
         side_effect=Exception("page.evaluate must not be called when matched frame is a sub-frame")
     )
     page.frames = list(frames)
+    # A lone adopted-session page is the only page in its context by default; multi-tab
+    # tests override this to add the blob's true owner.
+    page.context.pages = [page]
     return page
 
 
@@ -359,6 +365,73 @@ async def test_blob_url_main_frame_routes_through_main_world_prefix_when_configu
         page.main_frame.evaluate.assert_not_awaited()
     finally:
         clear_main_world_prefix(context)
+
+
+# ---------------------------------------------------------------------------
+# Multi-tab blobs: "View Document" opens the statement in a new tab, so the blob is
+# owned by a page other than the one clicked. The helper must fan out over every open
+# page in the context instead of reading from the click page alone (SKY-12621).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blob_url_reads_from_other_context_page_when_click_page_lacks_blob(tmp_path) -> None:
+    download = _download(url=BLOB_URL)
+    download.save_as.side_effect = Exception("closed")
+
+    click_page = _blob_capable_page(_frame(OTHER_ORIGIN_FRAME_URL))
+    owner_frame = _frame(
+        BLOB_ORIGIN_FRAME_URL,
+        evaluate_return={"ok": True, "base64": base64.b64encode(PDF_BODY).decode("ascii")},
+    )
+    owner_page = _blob_capable_page(owner_frame)
+    click_page.context.pages = [click_page, owner_page]
+
+    saved = await _save_adopted_session_download(download, click_page, tmp_path, workflow_run_id="wr")
+
+    assert saved is not None and saved.exists(), "blob bytes from the owning tab must be persisted"
+    assert saved.read_bytes() == PDF_BODY
+    owner_frame.evaluate.assert_awaited_once()
+    assert sorted(p.name for p in tmp_path.iterdir()) == [saved.name]
+
+
+@pytest.mark.asyncio
+async def test_blob_url_prefers_download_owner_page(tmp_path) -> None:
+    download = _download(url=BLOB_URL)
+    download.save_as.side_effect = Exception("closed")
+
+    owner_frame = _frame(
+        BLOB_ORIGIN_FRAME_URL,
+        evaluate_return={"ok": True, "base64": base64.b64encode(PDF_BODY).decode("ascii")},
+    )
+    owner_page = _blob_capable_page(owner_frame)
+    click_frame = _frame(
+        BLOB_ORIGIN_FRAME_URL,
+        evaluate_return={"ok": True, "base64": base64.b64encode(b"WRONG").decode("ascii")},
+    )
+    click_page = _blob_capable_page(click_frame)
+    click_page.context.pages = [click_page, owner_page]
+    download.page = owner_page
+
+    saved = await _save_adopted_session_download(download, click_page, tmp_path, workflow_run_id="wr")
+
+    assert saved is not None and saved.read_bytes() == PDF_BODY
+    owner_frame.evaluate.assert_awaited_once()
+    click_frame.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_blob_url_no_page_owns_blob_returns_none(tmp_path) -> None:
+    download = _download(url=BLOB_URL)
+    download.save_as.side_effect = Exception("closed")
+    click_page = _blob_capable_page(_frame(OTHER_ORIGIN_FRAME_URL))
+    other_page = _blob_capable_page(_frame(OTHER_ORIGIN_FRAME_URL))
+    click_page.context.pages = [click_page, other_page]
+
+    saved = await _save_adopted_session_download(download, click_page, tmp_path, workflow_run_id="wr")
+
+    assert saved is None
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio

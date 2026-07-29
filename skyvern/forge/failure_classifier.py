@@ -12,10 +12,15 @@ def classify_from_failure_reason(
     failure_reason: str | None,
     exception: Exception | None = None,
     fallback_to_unknown: bool = False,
+    exception_name: str | None = None,
 ) -> list[dict] | None:
     """Classify failure from failure_reason text and/or exception type.
 
     Returns list of categories sorted by confidence, or None if no classification.
+
+    ``exception_name`` classifies from a bare exception class name when the instance is
+    unavailable — e.g. a Temporal activity failure whose cause type only crosses the
+    serialization boundary as a string. Ignored when ``exception`` is provided.
 
     When ``fallback_to_unknown`` is True and no keywords match, returns a single
     UNKNOWN category instead of None.  Use True for paths that are *always* failures
@@ -30,11 +35,11 @@ def classify_from_failure_reason(
         MAX_STEPS_EXCEEDED, LLM_REASONING_ERROR, INFRASTRUCTURE_ERROR,
         PARAMETER_BINDING_ERROR, UNKNOWN
     """
-    if not failure_reason and not exception:
+    if not failure_reason and not exception and not exception_name:
         return None
 
     reason = (failure_reason or "").lower()
-    exc_name = type(exception).__name__ if exception else ""
+    exc_name = type(exception).__name__ if exception else (exception_name or "")
 
     categories: list[dict] = []
 

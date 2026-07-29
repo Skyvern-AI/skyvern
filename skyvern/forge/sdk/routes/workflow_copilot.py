@@ -203,7 +203,6 @@ def _reason_category_for_copilot_code_mode_opt_out(
 ) -> str:
     if (
         prior_turn_outcome.copilot_last_code_build_failed
-        or prior_turn_outcome.copilot_repair_ceiling_hit
         or prior_turn_outcome.terminal_reason == COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
     ):
         return "failure"
@@ -236,7 +235,6 @@ def _capture_copilot_code_mode_opt_out(
                 "to_mode": to_mode,
                 "reason_category": _reason_category_for_copilot_code_mode_opt_out(prior_turn_outcome),
                 "last_code_build_failed": prior_turn_outcome.copilot_last_code_build_failed,
-                "repair_ceiling_hit": prior_turn_outcome.copilot_repair_ceiling_hit,
                 "pending_capability": prior_turn_outcome.copilot_pending_capability,
                 "org_id": organization_id,
                 "workflow_permanent_id": workflow_permanent_id,

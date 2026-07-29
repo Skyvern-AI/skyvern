@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/util/utils";
 import {
+  formatDestinationLabel,
   newEntryId,
   parseColumnMapping,
   resolveDestination,
@@ -53,15 +54,6 @@ function ColumnMappingEditor({
     // internal edit and loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
-
-  const headerOptions = useMemo(
-    () =>
-      headers.map((h) => ({
-        value: h.letter,
-        label: `${h.letter} - ${h.name}`,
-      })),
-    [headers],
-  );
 
   const commit = (next: ColumnMappingEntry[]) => {
     setEntries(next);
@@ -142,12 +134,10 @@ function ColumnMappingEditor({
               disabled={disabled}
               onChange={(e) => updateLetter(index, e.target.value)}
             />
-            {headerOptions.length > 0 ? (
+            {headers.length > 0 ? (
               <datalist id={`column-mapping-headers-${idScope}-${rowId}`}>
-                {headerOptions.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
+                {headers.map((h) => (
+                  <option key={h.letter} value={formatDestinationLabel(h)} />
                 ))}
               </datalist>
             ) : null}
