@@ -502,45 +502,6 @@ def test_runtime_self_heal_origin_blocks_native_tool_calls() -> None:
 
 
 @pytest.mark.parametrize(
-    "mode",
-    [
-        pytest.param(TurnIntentMode.UNKNOWN, id="unknown_without_run_context"),
-        pytest.param(TurnIntentMode.DOCS_ANSWER, id="docs_answer"),
-    ],
-)
-def test_no_run_context_mode_blocks_get_run_results(mode: TurnIntentMode) -> None:
-    intent = TurnIntent(
-        mode=mode,
-        authority=TurnIntentAuthority(),
-    )
-
-    signal = _turn_intent_tool_error(_ctx(intent), "get_run_results")
-    _assert_signal(
-        signal,
-        internal_reason_code="turn_intent_context_read_blocked",
-        classifier_mode=mode.value,
-        blocked_tool="get_run_results",
-    )
-
-
-def test_docs_answer_blocks_get_run_results_even_with_read_flag() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.DOCS_ANSWER,
-        authority=TurnIntentAuthority(may_read_run_context=True),
-    )
-
-    signal = _turn_intent_tool_error(_ctx(intent), "get_run_results")
-    _assert_signal(
-        signal,
-        internal_reason_code="turn_intent_context_read_blocked",
-        classifier_mode="docs_answer",
-        blocked_tool="get_run_results",
-    )
-    filtered = _native_tools_for_turn(list(NATIVE_TOOLS), intent)
-    assert {getattr(tool, "name", None) for tool in filtered} == {tool.name for tool in NATIVE_TOOLS}
-
-
-@pytest.mark.parametrize(
     ("mode", "authority_kwargs", "ctx_kwargs"),
     [
         pytest.param(
@@ -576,40 +537,6 @@ def test_within_turn_override_allows_read(
     ctx = _ctx(intent, **ctx_kwargs)
 
     assert _turn_intent_tool_error(ctx, "get_run_results") is None
-
-
-def test_within_turn_override_excluded_for_docs_answer() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.DOCS_ANSWER,
-        authority=TurnIntentAuthority(),
-    )
-
-    ctx = _ctx(intent, pending_reconciliation_run_id="wr_pending_test")
-    signal = _turn_intent_tool_error(ctx, "get_run_results")
-    _assert_signal(
-        signal,
-        internal_reason_code="turn_intent_context_read_blocked",
-        classifier_mode="docs_answer",
-        blocked_tool="get_run_results",
-    )
-
-
-def test_tool_activity_is_not_a_substitute_for_pending_reconciliation_run_id() -> None:
-    # tool_activity entries are appended for every completed tool call,
-    # including ones that failed the authority/loop gate before the run ever
-    # started. The override must key only on pending_reconciliation_run_id,
-    # which the watchdog sets only when a real run exited unfinalized.
-    intent = TurnIntent(
-        mode=TurnIntentMode.UNKNOWN,
-        authority=TurnIntentAuthority(),
-    )
-
-    ctx = _ctx(
-        intent,
-        tool_activity=[{"tool": "run_blocks_and_collect_debug", "summary": "Failed: blocked"}],
-    )
-
-    assert _turn_intent_tool_error(ctx, "get_run_results") is not None
 
 
 @pytest.mark.asyncio

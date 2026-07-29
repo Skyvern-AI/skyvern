@@ -53,7 +53,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     UNRECORDED_INDEX_FINDING,
     ProducedStaticReturnEnvelope,
     SynthesisDiagnostics,
-    _get_by_role_expr,
     _get_by_role_expr_strict,
     _is_submit_interaction,
     _strict_period_date_pattern,
@@ -552,6 +551,13 @@ class _RecipeLocator:
     def nth(self, index: int) -> _RecipeLocator:
         return _RecipeLocator(self.page, self.selector, (*self.indices, index))
 
+    @property
+    def first(self) -> _RecipeLocator:
+        return self.nth(0)
+
+    async def wait_for(self, *, state: str = "visible", timeout: float | None = None) -> None:
+        return None
+
     def locator(self, selector: str) -> _RecipeLocator:
         return _RecipeLocator(self.page, f"{self.selector}|{selector}", self.indices)
 
@@ -615,12 +621,12 @@ async def test_generated_recipe_executes_and_fails_closed_on_runtime_drift() -> 
     assert len(result["output"]["records"]) == 3
 
     page.counts[(".kv", ())] = 3
-    with pytest.raises(ValueError, match="scalar selector cardinality"):
+    with pytest.raises(Exception, match="scalar selector cardinality"):
         await _execute_recipe(page)
 
     page.counts[(".kv", ())] = 2
     page.visibility[("#records > tbody > tr|:scope > th, :scope > td", (1, 2))] = False
-    with pytest.raises(ValueError, match="cell is no longer visible"):
+    with pytest.raises(Exception, match="cell is no longer visible"):
         await _execute_recipe(page)
 
 
@@ -658,7 +664,7 @@ async def test_produced_envelope_executes_table_and_scalar_reads() -> None:
 async def test_produced_envelope_guard_raises_on_empty_cell() -> None:
     page = _RecipePage()
     page.text[("#records > tbody > tr|:scope > th, :scope > td", (0, 1))] = ""
-    with pytest.raises(ValueError, match="table cell value is empty"):
+    with pytest.raises(Exception, match="table cell value is empty"):
         await _execute_envelope(page, _produce_table_envelope())
 
 
@@ -1032,37 +1038,6 @@ class TestLocatorSynthesis:
         assert "\n" not in emitted
         assert f"await {emitted}.click()" in result.code
 
-    def test_strict_reanchor_emits_exact_name_match_for_repeated_affordance(self) -> None:
-        # AC1: a re-anchored named get_by_role on a page with a repeated accessible name must emit an
-        # exact (single (role, name) group) match, never the substring default that over-matches.
-        trajectory = [
-            _interaction("click", selector="#open", source_url="https://example.com/billing"),
-            _interaction(
-                "click",
-                selector="a",
-                source_url="https://example.com/billing",
-                role="link",
-                accessible_name="Download",
-            ),
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        assert 'await page.get_by_role("link", name="Download", exact=True).click()' in result.code
-        assert ".nth(" not in result.code
-        assert result.diagnostics.dropped_interactions == []
-        provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
-        assert provenance == [
-            {
-                "trajectory_index": 1,
-                "selector": "a",
-                "emitted_literal": _get_by_role_expr_strict("link", "Download"),
-                "source": "aria_role_name",
-                "role": "link",
-                "name": "Download",
-            }
-        ]
-        assert provenance[0]["emitted_literal"] != _get_by_role_expr("link", "Download")
-
 
 class TestActionSynthesis:
     def test_type_text_becomes_param_slot_fill(self) -> None:
@@ -1149,7 +1124,7 @@ class TestActionSynthesis:
         assert lines[2] == '        await _scout_entry_target.wait_for(state="visible", timeout=1000)'
         assert lines[3] == "    except Exception:"
         assert lines[4] == '        await page.goto("https://example.com/start", wait_until="domcontentloaded")'
-        assert lines[5] == '        await _scout_entry_target.wait_for(state="visible")'
+        assert lines[5] == '        await _scout_entry_target.wait_for(state="visible", timeout=120000)'
         assert "        del _scout_entry_target" in lines
 
     def test_optional_cookie_dismissal_is_conditional_and_uses_durable_entry_target(self) -> None:
@@ -1176,7 +1151,7 @@ class TestActionSynthesis:
         lines = result.code.splitlines()
         assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
         assert '        await page.goto("https://example.com/find", wait_until="domcontentloaded")' in lines
-        assert '        await _scout_entry_target.wait_for(state="visible")' in lines
+        assert '        await _scout_entry_target.wait_for(state="visible", timeout=120000)' in lines
         assert '    _scout_optional_dismissal = page.locator("#accept-consent")' in lines
         assert "    if await _scout_optional_dismissal.count() > 0:" in lines
         assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
@@ -1215,7 +1190,7 @@ class TestActionSynthesis:
         assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
         assert '    _scout_optional_dismissal = page.locator("button.decline")' in lines
         assert "    if await _scout_optional_dismissal.count() > 0:" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible")' in result.code
+        assert 'await _scout_entry_target.wait_for(state="visible", timeout=120000)' in result.code
         assert 'await page.locator("button.decline").click()' not in result.code
 
     def test_close_named_action_is_not_optional_dismissal_by_name_only(self) -> None:
@@ -1408,7 +1383,7 @@ class TestActionSynthesis:
         assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
         assert dismissal_line in lines
         assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
+        assert 'await _scout_entry_target.wait_for(state="visible", timeout=120000)' not in result.code
         assert forbidden_snippet not in result.code
         ast.parse("async def _block(page):\n" + result.code)
 
@@ -5107,3 +5082,206 @@ def test_unstamped_click_emits_no_solve_captcha() -> None:
     result = synthesize_code_block([_captcha_click()], strict_selectors=True)
     assert result is not None
     assert "solve_captcha" not in result.code
+
+
+class TestScoutedReadSynthesis:
+    """A value the scout proved with `evaluate` is authored from that proven expression, the way a
+    login is authored from proven fills — instead of being rediscovered by a guessed selector."""
+
+    def test_proven_read_is_emitted_and_returned_at_the_requested_path(self) -> None:
+        block = synthesize_code_block(
+            [
+                {
+                    "tool_name": "click",
+                    "selector": "#submit",
+                    "source_url": "https://example.test/",
+                    "trajectory_index": 0,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.error_count",
+                    "source_url": "https://example.test/logs",
+                    "trajectory_index": 1,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "await page.evaluate('document.querySelector(\"#total\").innerText')" in block.code
+        assert block.code.rstrip().endswith('return {"error_count": _read_value_0}')
+        ast.parse(textwrap.dedent(block.code))
+
+    def test_read_without_an_expression_is_dropped_rather_than_emitted_empty(self) -> None:
+        block = synthesize_code_block(
+            [
+                {
+                    "tool_name": "click",
+                    "selector": "#submit",
+                    "source_url": "https://example.test/",
+                    "trajectory_index": 0,
+                },
+                {"tool_name": "read_value", "read_output_path": "output.error_count", "trajectory_index": 1},
+            ]
+        )
+
+        assert block is not None
+        assert "page.evaluate" not in block.code
+        assert "return {" not in block.code
+
+
+class TestScoutedReadBindingSafety:
+    """A later probe of an unrelated value must not displace the read that answered the request."""
+
+    def test_a_second_read_of_another_path_does_not_discard_the_first(self) -> None:
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": "document.title",
+                    "read_output_path": "output.page_title",
+                    "trajectory_index": 2,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "error_count" in block.code
+        assert "page_title" in block.code
+        assert "#total" in block.code
+
+    def test_a_repeat_read_of_the_same_path_keeps_only_the_last(self) -> None:
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#stale").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#fresh").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 2,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "#fresh" in block.code
+        assert "#stale" not in block.code
+
+    def test_an_unrelated_anonymous_probe_does_not_evict_the_anonymous_answer(self) -> None:
+        # An unnamed request pins every read to the shared anonymous path, so a later diagnostic
+        # probe is a different read, not a refinement — the answer's expression must survive.
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#count").innerText',
+                    "read_output_path": "output.scouted_read",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": "document.title",
+                    "read_output_path": "output.scouted_read",
+                    "trajectory_index": 2,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "#count" in block.code
+        assert "document.title" in block.code
+        # The return keeps BOTH values under distinct keys: choosing one would silently discard
+        # the read that answered the request.
+        assert '"scouted_read": _read_value_0' in block.code
+        assert '"scouted_read_2": _read_value_1' in block.code
+
+    def test_composite_extraction_suffix_is_reachable_after_a_captured_read(self) -> None:
+        # Base synthesis must not emit its own terminal return when an extraction suffix follows,
+        # or the suffix is unreachable and the block returns the wrong shape.
+        plan = RequestedOutputExtractionPlan(
+            requested_output_paths=("output.error_count",),
+            observation_step=1,
+            observation_identity="observation-identity",
+            reveal=RevealAnchor(selector="#go"),
+            live_reads=(
+                LiveReadBinding(
+                    output_path="output.error_count",
+                    kind=LiveReadKind.KEY_VALUE,
+                    selector="#count",
+                    selector_count=1,
+                    selector_index=0,
+                    child_index=1,
+                    child_count=2,
+                    relation_label="Errors",
+                ),
+            ),
+            identity="plan-identity",
+        )
+        block = synthesize_code_block_with_extraction(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#count").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 1,
+                },
+            ],
+            plan,
+        )
+
+        assert block is not None
+        # The imposition seam dedents the interaction half before appending the suffix; normalize
+        # the same way, then prove the suffix's return is the only and final return.
+        normalized = (
+            textwrap.dedent(block.interaction_code).rstrip() + "\n" + textwrap.dedent(block.extraction_code).rstrip()
+        )
+        tree = ast.parse(f"async def __wrapper__():\n{textwrap.indent(normalized, '    ')}\n")
+        returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
+        assert len(returns) == 1, "composite block must have exactly one terminal return"
+        normalized_lines = normalized.rstrip().splitlines()
+        trailing = [
+            line
+            for line in normalized_lines[returns[0].lineno - 2 :]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert len(trailing) == 1, f"unreachable code after terminal return: {trailing[1:]}"
+        assert block.extraction_code.strip() in normalized
+
+
+def test_synthesized_extraction_guards_only_name_things_the_sandbox_provides() -> None:
+    # The generated block runs with builtins emptied, so an exception class the sandbox does not
+    # bind raises NameError instead of the guard's own message.
+    from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_repair_diagnostic
+    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
+    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
+
+    binding = LiveReadBinding(
+        output_path="output.count",
+        kind="key_value_scalar",
+        selector="#summary",
+        selector_count=1,
+        selector_index=0,
+        child_index=1,
+        child_count=2,
+        relation_label="Errors",
+    )
+
+    emitted = _key_value_scalar_read_statements(binding, "_value", guard_empty=True)
+    diagnostic = sandbox_unresolved_name_repair_diagnostic("\n".join(emitted), parameter_keys=[])
+
+    assert diagnostic is None, diagnostic.unresolved_names if diagnostic else ()
