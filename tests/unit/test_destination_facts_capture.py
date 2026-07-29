@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.webeye.scraper.scraper import build_element_dict, hash_element
-from skyvern.webeye.utils.page import SkyvernFrame, load_js_script, pop_destination_facts
+from skyvern.webeye.utils.page import SkyvernFrame, pop_destination_facts
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _PAGE_MODULE = _REPO_ROOT / "skyvern" / "webeye" / "utils" / "page.py"
@@ -305,19 +305,3 @@ class TestDestinationFactsJs:
             timeout=30,
         )
         assert result.returncode == 0, f"Failed:\n{result.stdout}\n{result.stderr}"
-
-
-class TestInjectionExportsCannotBeIntercepted:
-    """Gate finding M2: the wrapper exported entry points with `globalThis.x = x`, so a page that
-    installed a SETTER on one of those globals before injection was handed our genuine builder
-    synchronously and could then drive it with arguments we never passed — forcing destination
-    capture on with the policy disabled.
-
-    The behavior lives in tests/unit/test_domutils_injection_scope.js (run by
-    test_dom_scrape_crash_guards.py), which drives the real generated script in a vm against all
-    three descriptor shapes. This pins only that no bare-assignment export can come back."""
-
-    def test_no_export_is_a_bare_assignment(self) -> None:
-        script = load_js_script()
-        assert "__skyvernExport(" in script
-        assert "globalThis.buildTreeFromBody = buildTreeFromBody" not in script
