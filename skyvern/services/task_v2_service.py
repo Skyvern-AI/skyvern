@@ -15,6 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
     FailedToSendWebhook,
+    ScreenshotTargetClosed,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
@@ -893,6 +894,9 @@ async def run_task_v2_helper(
                 )
                 if page is None:
                     page = await browser_state.get_working_page()
+            except ScreenshotTargetClosed:
+                LOG.warning("Skipping task v2 iteration because the browser target closed", iteration=i, url=url)
+                continue
             except Exception:
                 LOG.exception(
                     "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url

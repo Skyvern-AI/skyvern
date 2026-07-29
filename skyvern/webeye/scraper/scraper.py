@@ -16,6 +16,7 @@ from skyvern.exceptions import (
     NoElementFound,
     ScrapingFailed,
     ScrapingFailedBlankPage,
+    ScreenshotTargetClosed,
     SkyvernPageAnalysisTimeout,
     UnknownElementTreeFormat,
 )
@@ -270,6 +271,12 @@ async def scrape_website(
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > max_retries:
+            if isinstance(e, ScreenshotTargetClosed):
+                # Expected teardown/site-initiated close, and this log is duplicative either way: a
+                # caller with strategies left treats it as retryable, and one out of attempts logs
+                # its own terminal record.
+                LOG.warning("Scraping stopped because the browser target closed", url=url)
+                raise e
             LOG.error(
                 "Scraping failed after max retries, aborting.",
                 max_retries=max_retries,
