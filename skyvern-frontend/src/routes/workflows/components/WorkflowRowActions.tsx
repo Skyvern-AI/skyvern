@@ -11,18 +11,12 @@ import {
 } from "@radix-ui/react-icons";
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
-import { Button } from "@/components/ui/button";
 import {
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuLabel,
-  ContextMenuSeparator,
-  ContextMenuSub,
-  ContextMenuSubContent,
-  ContextMenuSubTrigger,
-  ContextMenuTrigger,
-} from "@/components/ui/context-menu";
+  RowActionsContextMenu,
+  RowActionsKebab,
+  type RowActionItem,
+} from "@/components/RowActions";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -30,10 +24,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { cn } from "@/util/utils";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
 import { useApplyWorkflowTagsMutation } from "../hooks/useWorkflowTagMutations";
@@ -58,10 +50,12 @@ type Props = {
   selectedCount?: number;
   // Defaults to shown; only an explicit false (cloud flag off) hides tagging.
   taggingEnabled?: boolean;
-  children: React.ReactNode;
+  // The row renderer; place the provided kebab last in the actions cell. It is
+  // null while a selection is active (row menus yield to the bulk bar).
+  children: (kebab: React.ReactNode) => React.ReactElement;
 };
 
-function WorkflowRowContextMenu({
+function WorkflowRowActions({
   workflow,
   tagKeys,
   labelSuggestions,
@@ -77,7 +71,6 @@ function WorkflowRowContextMenu({
   const updateFolderMutation = useUpdateWorkflowFolderMutation();
   const applyTagsMutation = useApplyWorkflowTagsMutation();
   const [deleteOpen, setDeleteOpen] = React.useState(false);
-  const [menuOpen, setMenuOpen] = React.useState(false);
   const [tagError, setTagError] = React.useState<string | null>(null);
   // Right-click still targets the single clicked row; until SKY-11504 lets it act
   // on the whole selection, steer multi-select to the bulk Actions bar.
@@ -149,15 +142,129 @@ function WorkflowRowContextMenu({
     }
   }
 
-  // Keep the row highlighted while its context menu is open (the cursor leaves it).
-  // Children.only throws a clear error if the trigger ever wraps more than one node.
-  const child = React.Children.only(children) as React.ReactElement<{
-    className?: string;
-  }>;
-  const rowProps = {
-    className: cn(child.props.className, "data-[row-active]:bg-muted/50"),
-    "data-row-active": menuOpen ? "" : undefined,
-  };
+  const items: Array<RowActionItem> = [];
+  if (isMultiSelect) {
+    items.push(
+      {
+        kind: "note",
+        label: (
+          <>
+            Acts on this agent only — use the Actions bar for all{" "}
+            {selectedCount}.
+          </>
+        ),
+      },
+      { kind: "separator" },
+    );
+  }
+  if (selectedCount <= 1) {
+    items.push(
+      {
+        kind: "item",
+        label: "Open in editor",
+        icon: <Pencil2Icon className="mr-2 h-4 w-4" />,
+        onSelect: () =>
+          onNavigate(
+            workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
+          ),
+      },
+      {
+        kind: "item",
+        label: "Run",
+        icon: <PlayIcon className="mr-2 h-4 w-4" />,
+        onSelect: () =>
+          onNavigate(`/agents/${workflow.workflow_permanent_id}/run`),
+      },
+      { kind: "separator" },
+    );
+  }
+  if (taggingEnabled) {
+    items.push({
+      kind: "sub",
+      label: "Tags",
+      icon: <TokensIcon className="mr-2 h-4 w-4" />,
+      contentClassName: "w-72 p-0",
+      onOpenChange: (open) => {
+        if (!open) {
+          setTagError(null);
+        }
+      },
+      content: (
+        <TagPickerCommand
+          tagKeys={tagKeys}
+          labelSuggestions={labelSuggestions}
+          valueSuggestionsByKey={valueSuggestionsByKey}
+          currentTags={currentTags}
+          error={tagError}
+          onErrorChange={setTagError}
+          disabled={applyTagsMutation.isPending}
+          onApply={applyTag}
+          onRemove={removeTag}
+        />
+      ),
+    });
+  }
+  items.push(
+    {
+      kind: "sub",
+      label: "Move to folder",
+      icon: <FolderIcon className="mr-2 h-4 w-4" />,
+      contentClassName: "w-72 p-0",
+      content: (
+        <FolderPickerCommand
+          currentFolderId={workflow.folder_id ?? null}
+          onSelect={(folderId) => void moveToFolder(folderId)}
+        />
+      ),
+    },
+    { kind: "separator" },
+    {
+      kind: "item",
+      label: "Duplicate Agent",
+      icon: <CopyIcon className="mr-2 h-4 w-4" />,
+      onSelect: () => clone(),
+      disabled: isMultiSelect,
+    },
+    {
+      kind: "item",
+      label: workflow.is_template ? "Remove from template" : "Save as template",
+      icon: workflow.is_template ? (
+        <BookmarkFilledIcon className="mr-2 h-4 w-4" />
+      ) : (
+        <BookmarkIcon className="mr-2 h-4 w-4" />
+      ),
+      onSelect: () => toggleTemplate(),
+      disabled: isMultiSelect || isTogglingTemplate,
+    },
+    {
+      kind: "sub",
+      label: "Export",
+      icon: <DownloadIcon className="mr-2 h-4 w-4" />,
+      disabled: isMultiSelect,
+      items: [
+        { label: "YAML", onSelect: () => exportAs("yaml") },
+        { label: "JSON", onSelect: () => exportAs("json") },
+      ],
+    },
+    { kind: "separator" },
+    {
+      kind: "item",
+      label: "Delete",
+      icon: <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />,
+      destructive: true,
+      disabled: isMultiSelect,
+      dialogTrigger: true,
+    },
+  );
+
+  // Row kebabs yield to the bulk Actions bar while any selection is active.
+  const kebab =
+    selectedCount > 0 ? null : (
+      <RowActionsKebab
+        items={items}
+        ariaLabel={`Actions for ${workflow.title}`}
+      />
+    );
 
   return (
     <Dialog
@@ -168,134 +275,16 @@ function WorkflowRowContextMenu({
         }
       }}
     >
-      <ContextMenu
+      <RowActionsContextMenu
+        items={items}
         onOpenChange={(open) => {
-          setMenuOpen(open);
           if (!open) {
             setTagError(null);
           }
         }}
       >
-        <ContextMenuTrigger asChild>
-          {React.cloneElement(child, rowProps)}
-        </ContextMenuTrigger>
-        <ContextMenuContent className="w-56">
-          {isMultiSelect && (
-            <>
-              <ContextMenuLabel className="text-xs font-normal text-muted-foreground">
-                Acts on this agent only — use the Actions bar for all{" "}
-                {selectedCount}.
-              </ContextMenuLabel>
-              <ContextMenuSeparator />
-            </>
-          )}
-          {selectedCount <= 1 && (
-            <>
-              <ContextMenuItem
-                onSelect={() =>
-                  onNavigate(
-                    workflowEditorPath(
-                      workflow.workflow_permanent_id,
-                      studioEnabled,
-                    ),
-                  )
-                }
-              >
-                <Pencil2Icon className="mr-2 h-4 w-4" />
-                Open in editor
-              </ContextMenuItem>
-              <ContextMenuItem
-                onSelect={() =>
-                  onNavigate(`/agents/${workflow.workflow_permanent_id}/run`)
-                }
-              >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                Run
-              </ContextMenuItem>
-              <ContextMenuSeparator />
-            </>
-          )}
-          {taggingEnabled ? (
-            <ContextMenuSub
-              onOpenChange={(open) => {
-                if (!open) {
-                  setTagError(null);
-                }
-              }}
-            >
-              <ContextMenuSubTrigger>
-                <TokensIcon className="mr-2 h-4 w-4" />
-                Tags
-              </ContextMenuSubTrigger>
-              <ContextMenuSubContent className="w-72 p-0">
-                <TagPickerCommand
-                  tagKeys={tagKeys}
-                  labelSuggestions={labelSuggestions}
-                  valueSuggestionsByKey={valueSuggestionsByKey}
-                  currentTags={currentTags}
-                  error={tagError}
-                  onErrorChange={setTagError}
-                  disabled={applyTagsMutation.isPending}
-                  onApply={applyTag}
-                  onRemove={removeTag}
-                />
-              </ContextMenuSubContent>
-            </ContextMenuSub>
-          ) : null}
-          <ContextMenuSub>
-            <ContextMenuSubTrigger>
-              <FolderIcon className="mr-2 h-4 w-4" />
-              Move to folder
-            </ContextMenuSubTrigger>
-            <ContextMenuSubContent className="w-72 p-0">
-              <FolderPickerCommand
-                currentFolderId={workflow.folder_id ?? null}
-                onSelect={(folderId) => void moveToFolder(folderId)}
-              />
-            </ContextMenuSubContent>
-          </ContextMenuSub>
-          <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => clone()} disabled={isMultiSelect}>
-            <CopyIcon className="mr-2 h-4 w-4" />
-            Duplicate Agent
-          </ContextMenuItem>
-          <ContextMenuItem
-            onSelect={() => toggleTemplate()}
-            disabled={isMultiSelect || isTogglingTemplate}
-          >
-            {workflow.is_template ? (
-              <BookmarkFilledIcon className="mr-2 h-4 w-4" />
-            ) : (
-              <BookmarkIcon className="mr-2 h-4 w-4" />
-            )}
-            {workflow.is_template ? "Remove from template" : "Save as template"}
-          </ContextMenuItem>
-          <ContextMenuSub>
-            <ContextMenuSubTrigger disabled={isMultiSelect}>
-              <DownloadIcon className="mr-2 h-4 w-4" />
-              Export
-            </ContextMenuSubTrigger>
-            <ContextMenuSubContent>
-              <ContextMenuItem onSelect={() => exportAs("yaml")}>
-                YAML
-              </ContextMenuItem>
-              <ContextMenuItem onSelect={() => exportAs("json")}>
-                JSON
-              </ContextMenuItem>
-            </ContextMenuSubContent>
-          </ContextMenuSub>
-          <ContextMenuSeparator />
-          <DialogTrigger asChild>
-            <ContextMenuItem
-              className="text-destructive focus:text-destructive"
-              disabled={isMultiSelect}
-            >
-              <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-              Delete
-            </ContextMenuItem>
-          </DialogTrigger>
-        </ContextMenuContent>
-      </ContextMenu>
+        {children(kebab)}
+      </RowActionsContextMenu>
       <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
@@ -334,4 +323,4 @@ function WorkflowRowContextMenu({
   );
 }
 
-export { WorkflowRowContextMenu };
+export { WorkflowRowActions };

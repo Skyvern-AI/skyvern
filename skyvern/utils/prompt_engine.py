@@ -232,6 +232,7 @@ def enforce_prompt_ceiling_tracked(
     if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
         return prompt, working_kwargs
     fallback_keys = CEILING_FALLBACK_KEYS_BY_TEMPLATE.get(template_name, [])
+    drops_applied = 0
     for drop_key in fallback_keys:
         if working_kwargs.get(drop_key) is None:
             continue
@@ -243,6 +244,7 @@ def enforce_prompt_ceiling_tracked(
             hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
         )
         working_kwargs[drop_key] = None
+        drops_applied += 1
         if elements is None:
             prompt = prompt_engine.load_prompt(template_name, **working_kwargs)
         else:
@@ -250,11 +252,18 @@ def enforce_prompt_ceiling_tracked(
         final_token_count = count_tokens(prompt)
         if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
             return prompt, working_kwargs
+    # The breakdown normally stashed on SkyvernContext is computed after this
+    # function returns, so the prompt that actually failed never reports one.
+    html_token_count = count_tokens(elements) if elements else None
     LOG.error(
-        "Prompt still exceeds hard ceiling after all fallback drops",
+        "Prompt still exceeds hard ceiling",
         template_name=template_name,
         final_token_count=final_token_count,
         hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
+        fallback_keys_configured=len(fallback_keys),
+        drops_applied=drops_applied,
+        html_token_count=html_token_count,
+        html_pct=round(html_token_count / final_token_count, 4) if html_token_count and final_token_count else None,
     )
     raise SkyvernContextWindowExceededError(prompt_name=template_name)
 

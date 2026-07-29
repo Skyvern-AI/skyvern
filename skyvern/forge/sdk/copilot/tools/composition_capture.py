@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 
 import structlog
@@ -226,8 +226,6 @@ def _active_run_terminal_evidence_result(
     }
 
 
-_COMPOSITION_INSPECTION_PER_CHAT_BUDGET = 6
-_COMPOSITION_INSPECTION_PER_TURN_BUDGET = 4
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
@@ -523,17 +521,6 @@ def _non_current_inspection_regression_error(copilot_ctx: Any, *, entry_url: str
     }
 
 
-def _page_inspection_budget_error(copilot_ctx: Any, *, scope: Literal["turn", "chat"]) -> str:
-    scope_label = "turn" if scope == "turn" else "chat"
-    return (
-        f"inspect_page_for_composition reached the page-inspection budget for this {scope_label}. "
-        "This is not evidence that scouting is complete. Use evaluate, get_browser_screenshot, or a browser "
-        "action on the current page to determine whether the goal is already satisfied, whether progress is still "
-        "possible, or whether a real blocker exists. Do not author downstream result, extraction, or confirmation "
-        "blocks unless the existing evidence already shows the page state those blocks will act on."
-    )
-
-
 _COMPOSITION_HOLLOW_RECAPTURE_RETRIES = 2
 _COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS = 2.5
 # The composition inspect navigates with `domcontentloaded`, so a heavier cap than
@@ -791,28 +778,10 @@ async def _inspect_page_for_composition_impl(
         on_target_page = _same_inspect_target(live_url, entry_url)
         inspect_target_url = live_url if on_target_page else entry_url
 
-    if (
-        not bypass_budget_for_post_run_current_page
-        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
-    ):
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
-    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
-    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
+    # Structured inspection is not rationed. Capping it sent the agent to hand-rolled `evaluate`
+    # probes once the budget ran out — on a heavy app that meant 22 small DOM reads in place of a
+    # handful of structured looks, and the turn's wall clock spent without understanding the page.
+    # The calls stay counted for telemetry.
     evidence = None
     html_error: str | None = None
     with copilot_span(
