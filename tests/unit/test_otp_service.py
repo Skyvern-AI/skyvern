@@ -431,6 +431,37 @@ class TestGetOtpValueFromUrl:
             for value in record.values():
                 assert raw_content not in str(value)
 
+    @pytest.mark.asyncio
+    async def test_insufficient_credit_skip_does_not_log_webhook_parse_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.services import otp_service
+
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": "Long relayed authentication message."},
+            is_json_response=True,
+        )
+        monkeypatch.setattr(
+            otp_service,
+            "parse_otp_login",
+            AsyncMock(side_effect=otp_service.InsufficientCreditsForOTPParse),
+        )
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="",
+                task_id="tsk_test",
+            )
+
+        assert result is None
+        assert all(record.get("event") != "Failed to parse OTP content by LLM call" for record in logs)
+        assert all(record.get("event") != "Failed to parse otp login from the totp url" for record in logs)
+
 
 class TestParseOtpLogin:
     @pytest.mark.asyncio
@@ -559,6 +590,7 @@ class TestParseOtpLogin:
     async def test_skips_llm_and_charge_when_out_of_credits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.services import otp_service
 
+        raw_content = "Long relayed message without a verification code."
         llm_handler = AsyncMock()
         charge = AsyncMock()
         monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
@@ -573,9 +605,14 @@ class TestParseOtpLogin:
             raising=False,
         )
 
-        result = await parse_otp_login(content="raw email body with OTP 424242 inside", organization_id="o_test")
+        with structlog.testing.capture_logs() as logs:
+            with pytest.raises(otp_service.InsufficientCreditsForOTPParse):
+                await parse_otp_login(content=raw_content, organization_id="o_test")
 
-        assert result is None
+        assert any(
+            record.get("event") == "Skipping OTP parse; organization has insufficient credits" for record in logs
+        )
+        assert all(raw_content not in repr(record) for record in logs)
         llm_handler.assert_not_awaited()
         charge.assert_not_awaited()
 
@@ -1599,6 +1636,28 @@ async def test_raw_otp_reparse_exception_retries_without_negative_cache() -> Non
         assert context.misses == set()
         assert await _get_otp_value_from_db("o_test", "otp@example.test", **kwargs) == parsed
     mock_app.DATABASE.otp.promote_raw_otp_code.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_raw_otp_reparse_rechecks_after_credit_recovers_without_failure_log() -> None:
+    raw, context = _raw_otp_row(), otp_service.RawOTPVerificationContext()
+    parsed = OTPValue(value="https://example.test/login", type=OTPType.MAGIC_LINK)
+    kwargs = {"expected_otp_type": OTPType.MAGIC_LINK, "raw_context": context}
+    parse = AsyncMock(side_effect=[otp_service.InsufficientCreditsForOTPParse, parsed])
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=parse),
+        structlog.testing.capture_logs() as logs,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[raw])
+        mock_app.DATABASE.otp.promote_raw_otp_code = AsyncMock()
+        assert await _get_otp_value_from_db("o_test", "otp@example.test", **kwargs) is None
+        assert await _get_otp_value_from_db("o_test", "otp@example.test", **kwargs) == parsed
+
+    assert parse.await_count == 2
+    mock_app.DATABASE.otp.promote_raw_otp_code.assert_awaited_once()
+    assert all(record.get("event") != "Raw OTP reparse failed" for record in logs)
 
 
 @pytest.mark.asyncio
