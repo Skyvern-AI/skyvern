@@ -8144,6 +8144,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -8567,6 +8572,7 @@
         "enum": [
           "click",
           "input_text",
+          "paste_text",
           "upload_file",
           "download_file",
           "select_option",
@@ -13121,6 +13127,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -13776,6 +13787,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -17115,6 +17131,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -17803,6 +17824,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -18601,6 +18627,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -18981,6 +19012,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -19187,6 +19223,21 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Optional additional password credential metadata fields"
           }
         },
         "type": "object",
@@ -22512,6 +22563,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -24740,6 +24796,7 @@
           "authenticator",
           "email",
           "text",
+          "passkey",
           "none"
         ],
         "title": "TotpType",
@@ -25170,6 +25227,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -25608,6 +25670,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [

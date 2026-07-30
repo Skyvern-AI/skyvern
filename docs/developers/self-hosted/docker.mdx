@@ -305,7 +305,10 @@ Update the frontend environment to use your domain:
 VITE_API_BASE_URL=https://api.your-domain.com/api/v1
 VITE_WSS_BASE_URL=wss://api.your-domain.com/api/v1
 VITE_ARTIFACT_API_BASE_URL=https://artifacts.your-domain.com
+ARTIFACT_ALLOWED_ORIGIN=https://your-domain.com
 ```
+
+`ARTIFACT_ALLOWED_ORIGIN` must match the browser-visible UI origin (`https://your-domain.com`), not the artifact server URL.
 
 <Warning>
 If exposing Skyvern to the internet, add authentication at the reverse proxy layer or use a VPN.
