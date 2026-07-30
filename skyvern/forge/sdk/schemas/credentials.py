@@ -284,6 +284,7 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
     )
+    run_sequentially: bool = False
     folder_id: str | None = Field(
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
@@ -383,6 +384,7 @@ class Credential(BaseModel):
         default=False,
         description="Whether the user intends to save a browser session, regardless of test outcome",
     )
+    run_sequentially: bool = False
     folder_id: str | None = Field(
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
@@ -433,6 +435,15 @@ class UpdateCredentialRequest(BaseModel):
     save_browser_session_intent: bool | None = Field(
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
+    run_sequentially: bool | None = Field(
+        default=None,
+        description=(
+            "Whether runs using this credential are serialized so at most one runs at a time. "
+            "Serialization applies only to runs created after this flag is enabled: runs already "
+            "queued or running when it is turned on are not stamped and are not serialized against "
+            "later runs. Drain in-flight runs on this credential before enabling for full protection."
+        ),
     )
     proxy_location: ProxyLocationInput = Field(
         default=None,

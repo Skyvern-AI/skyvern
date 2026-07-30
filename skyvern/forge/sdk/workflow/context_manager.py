@@ -1,5 +1,6 @@
 import copy
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
@@ -16,10 +17,12 @@ from skyvern.exceptions import (
     CredentialParameterNotFoundError,
     CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
+    InvalidCredentialId,
     OnePasswordGetItemError,
     OnePasswordRateLimitError,
     OnePasswordServiceUnavailableError,
     OnePasswordSessionExpiredError,
+    RuntimeSequentialCredentialUnsupported,
     SkyvernException,
     WorkflowRunContextNotInitialized,
     sanitize_credential_for_error,
@@ -82,6 +85,32 @@ _CREDENTIAL_PARAMETER_TYPES: tuple[type, ...] = (
 )
 
 _SECRET_FIELD_KEY_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
+
+# Registered secrets are masked by substring across run outputs, so a low-entropy value corrupts
+# unrelated text — a registered "visa" blanks that word wherever it appears. Only fields the safe
+# credential API already returns belong here; billing fields are excluded from that API on purpose.
+NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
+
+# Secrets shorter than this mask only on exact whole-string match: substring-replacing a short
+# value (a CVV, a 2-digit expiry) corrupts unrelated scalars such as timestamp milliseconds.
+_SECRET_SUBSTRING_MIN_LENGTH = 5
+
+
+def resolve_credential_parameter_binding(
+    parameter: CredentialParameter,
+    parameter_values: Mapping[str, Any],
+    selected_credential_id: str | None = None,
+) -> str:
+    credential_id = (
+        selected_credential_id
+        if selected_credential_id is not None
+        else parameter_values.get(parameter.credential_id, parameter.credential_id)
+    )
+    if not isinstance(credential_id, str):
+        raise InvalidCredentialId(f"<non-string value of type {type(credential_id).__name__}>")
+    if not credential_id:
+        raise InvalidCredentialId(credential_id)
+    return credential_id
 
 
 class WorkflowRunContext:
@@ -487,10 +516,11 @@ class WorkflowRunContext:
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         """
-        Recursively replace any real secret values in data with a mask.
+        Recursively replace registered secret values in data with a mask.
         Used to sanitize HttpRequestBlock output before storing.
 
-        Only masks values that exist in self.secrets (registered credentials).
+        Values shorter than _SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
+        string; a short secret embedded inside a longer scalar is knowingly left unmasked.
         """
         if not self.secrets:
             return data
@@ -502,9 +532,12 @@ class WorkflowRunContext:
             return data
 
         if isinstance(data, str):
+            if data in secret_values:
+                return mask
             result = data
             for secret in secret_values:
-                result = result.replace(secret, mask)
+                if len(secret) >= _SECRET_SUBSTRING_MIN_LENGTH:
+                    result = result.replace(secret, mask)
             return result
         elif isinstance(data, dict):
             return {k: self.mask_secrets_in_data(v, mask) for k, v in data.items()}
@@ -644,6 +677,13 @@ class WorkflowRunContext:
         )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
+        if db_credential.run_sequentially is True:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                self.workflow_run_id,
+                organization.organization_id,
+            )
+            if workflow_run is None or workflow_run.sequential_credential_id != credential_id:
+                raise RuntimeSequentialCredentialUnsupported(self.workflow_run_id)
 
         self.resolved_credential_parameter_ids[parameter.key] = credential_id
 
@@ -673,6 +713,9 @@ class WorkflowRunContext:
                 continue
             for field_key, field_value in self._flatten_credential_secret_field(key, value):
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                if field_key in NON_SECRET_CREDENTIAL_FIELDS:
+                    self.values[parameter.key][field_key] = field_value
+                    continue
                 random_secret_id = self.generate_random_secret_id()
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = field_value
@@ -721,19 +764,7 @@ class WorkflowRunContext:
     ) -> None:
         LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
-        credential_id = None
-        if parameter.credential_ids or parameter.fallback_credential_ids:
-            credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
-        elif parameter.credential_id:
-            if self.has_parameter(parameter.credential_id) and self.has_value(parameter.credential_id):
-                credential_id = self.values[parameter.credential_id]
-            else:
-                credential_id = parameter.credential_id
-
-        if credential_id is None:
-            LOG.error("Credential ID not found", parameter_key=parameter.key)
-            raise CredentialParameterNotFoundError(parameter.credential_id)
-
+        credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
         await self._register_credential_parameter_value(credential_id, parameter, organization)
 
     async def resolve_credential_parameter_id(
@@ -744,26 +775,30 @@ class WorkflowRunContext:
         cached = self.resolved_credential_parameter_ids.get(parameter.key)
         if cached:
             return cached
-        if not parameter.credential_ids:
-            credential_id = parameter.credential_id
-            if parameter.fallback_credential_ids:
-                selected = await app.DATABASE.workflow_run_credential_selections.get_selection(
-                    workflow_run_id=self.workflow_run_id,
-                    parameter_key=parameter.key,
-                )
-                if selected:
-                    credential_id = selected
-                elif self.has_parameter(credential_id) and self.has_value(credential_id):
-                    credential_id = self.values[credential_id]
-            self.resolved_credential_parameter_ids[parameter.key] = credential_id
-            return credential_id
-        credential_id = await select_credential_for_run(
-            workflow_run_id=self.workflow_run_id,
-            organization_id=organization_id,
-            workflow_permanent_id=self.workflow_permanent_id,
-            parameter_key=parameter.key,
-            credential_ids=parameter.credential_ids,
-            selection_strategy=parameter.selection_strategy,
+        selected_credential_id = None
+        if parameter.credential_ids:
+            selected_credential_id = await select_credential_for_run(
+                workflow_run_id=self.workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=self.workflow_permanent_id,
+                parameter_key=parameter.key,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
+            )
+        elif parameter.fallback_credential_ids:
+            selected_credential_id = await app.DATABASE.workflow_run_credential_selections.get_selection(
+                workflow_run_id=self.workflow_run_id,
+                parameter_key=parameter.key,
+            )
+        registered_parameter_values = {
+            key: self.resolved_credential_parameter_ids.get(key, self.values[key])
+            for key in self.parameters
+            if key in self.values
+        }
+        credential_id = resolve_credential_parameter_binding(
+            parameter,
+            registered_parameter_values,
+            selected_credential_id,
         )
         self.resolved_credential_parameter_ids[parameter.key] = credential_id
         return credential_id
@@ -1322,6 +1357,9 @@ class WorkflowRunContext:
                 if not field_key:
                     continue
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                if field_key in NON_SECRET_CREDENTIAL_FIELDS:
+                    parameter_value[field_key] = credit_card_data[data_key]
+                    continue
                 random_secret_id = self.generate_random_secret_id()
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = credit_card_data[data_key]

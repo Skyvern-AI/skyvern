@@ -463,6 +463,78 @@ class InvalidCredentialId(SkyvernHTTPException):
         )
 
 
+class SequentialCredentialLimitExceeded(SkyvernHTTPException):
+    def __init__(self, credential_ids: list[str]) -> None:
+        sanitized = ", ".join(sanitize_credential_for_error(credential_id) for credential_id in credential_ids)
+        super().__init__(
+            f"This workflow run resolves to {len(credential_ids)} credentials marked run_sequentially "
+            f"({sanitized}), but a run may use at most one sequential credential. Mark only one of them "
+            "run_sequentially, or split the workflow so each run resolves to a single sequential credential.",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+class SequentialCredentialWorkerUnavailable(SkyvernHTTPException):
+    def __init__(self, credential_id: str) -> None:
+        super().__init__(
+            f"This run resolves to a sequential credential ({sanitize_credential_for_error(credential_id)}), whose "
+            "org-wide serialization gate lives only in the Temporal V2 worker, but workers are globally disabled "
+            "(ENABLE_WORKER). Routing it to the legacy engine would run it unserialized, so the run fails closed. "
+            "Re-enable workers, or clear run_sequentially on the credential to run it without the sequential lane.",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+
+class RuntimeSequentialCredentialUnsupported(SkyvernException):
+    def __init__(self, workflow_run_id: str) -> None:
+        super().__init__(
+            f"Workflow run {workflow_run_id} resolved a sequential credential only at runtime, after publication "
+            "without that credential's serialization lane. The run fails closed before loading the credential "
+            "rather than using it outside the gate."
+        )
+
+
+class BackgroundSequentialCredentialUnsupported(SkyvernException):
+    def __init__(self, workflow_run_id: str) -> None:
+        super().__init__(
+            f"Workflow run {workflow_run_id} resolves to a sequential credential, but the background executor "
+            "has no org-wide serialization gate. The run fails closed before execution rather than using the "
+            "credential outside its lane."
+        )
+
+
+class ScheduledSequentialCredentialUnsupported(SkyvernException):
+    def __init__(self, workflow_run_id: str) -> None:
+        super().__init__(
+            f"Scheduled run {workflow_run_id} resolves to a sequential credential, but scheduled credential "
+            "serialization is not yet supported. The run fails closed rather than publishing an ungated row that "
+            "would race on the credential. Every subsequent fire of this schedule fails the same way until scheduled "
+            "parity ships or run_sequentially is cleared on the credential."
+        )
+
+
+class SyncTriggeredSequentialCredentialUnsupported(SkyvernException):
+    def __init__(self, workflow_run_id: str) -> None:
+        super().__init__(
+            f"Triggered run {workflow_run_id} resolves to a sequential credential, but a synchronous "
+            "workflow_trigger child runs inline and never reaches the Temporal V2 serialization gate, so "
+            "it cannot be serialized against other runs using the same credential. The child fails closed "
+            "rather than running unserialized. Clear run_sequentially on the credential, or run the child "
+            "as an async (fire-and-forget) trigger so it publishes through the gate."
+        )
+
+
+class CopilotInlineSequentialCredentialUnsupported(SkyvernException):
+    def __init__(self, workflow_run_id: str) -> None:
+        super().__init__(
+            f"Copilot run {workflow_run_id} resolves to a sequential credential, but the copilot inline "
+            "block-run path executes in-process and never reaches the Temporal V2 serialization gate, so it "
+            "cannot be serialized against other runs using the same credential. The run fails closed rather "
+            "than running unserialized. Clear run_sequentially on the credential, or enable the copilot "
+            "dispatch flag so the run publishes through the gate."
+        )
+
+
 class WorkflowParameterNotFound(SkyvernHTTPException):
     def __init__(self, workflow_parameter_id: str) -> None:
         super().__init__(

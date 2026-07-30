@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.exceptions import CopilotInlineSequentialCredentialUnsupported
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -847,6 +848,40 @@ def _runtime_code_security_failure_for_selected_labels(
             "blocks": [],
             "failure_categories": [error.to_failure_category() for error in errors],
             "failure_category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
+        },
+    }
+
+
+def _inline_sequential_credential_fence_failure(
+    *,
+    workflow_run_id: str,
+    sequential_credential_id: str | None,
+    dispatch_to_worker: bool,
+    block_labels: list[str],
+    labels_to_execute: list[str],
+    frontier_start_label: str | None,
+) -> dict[str, Any] | None:
+    # The copilot inline path runs execute_workflow in-process: the run never queues, never gets a
+    # queued_at, and never reaches the Temporal V2 serialization gate, yet setup stamped its
+    # sequential_credential_id. The gate filters queued_at IS NOT NULL, so a concurrent run sharing the
+    # credential would neither see this run nor be waited on by it. Fail closed before it uses the
+    # credential — the same fence the scheduled and sync-trigger paths apply. The dispatch path enqueues
+    # through the executor (stamped queued_at, gated), so it is exempt.
+    if dispatch_to_worker or not sequential_credential_id:
+        return None
+    failure_reason = str(CopilotInlineSequentialCredentialUnsupported(workflow_run_id))
+    return {
+        "ok": False,
+        "error": failure_reason,
+        "data": {
+            "workflow_run_id": workflow_run_id,
+            "overall_status": "failed",
+            "failure_reason": failure_reason,
+            "requested_block_labels": list(block_labels),
+            "executed_block_labels": [],
+            "planned_block_labels": list(labels_to_execute),
+            "frontier_start_label": frontier_start_label,
+            "blocks": [],
         },
     }
 
@@ -1736,6 +1771,21 @@ async def _run_blocks_and_collect_debug(
             inline_run_context = skyvern_context.current()
             if inline_run_context is not None:
                 inline_run_context.copilot_inline_execution = True
+
+            inline_fence_failure = _inline_sequential_credential_fence_failure(
+                workflow_run_id=workflow_run.workflow_run_id,
+                sequential_credential_id=workflow_run.sequential_credential_id,
+                dispatch_to_worker=dispatch_to_worker,
+                block_labels=block_labels,
+                labels_to_execute=labels_to_execute,
+                frontier_start_label=frontier_start_label,
+            )
+            if inline_fence_failure is not None:
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=inline_fence_failure["error"],
+                )
+                return inline_fence_failure
 
             await initialize_skyvern_state_file(
                 workflow_run_id=workflow_run.workflow_run_id,
