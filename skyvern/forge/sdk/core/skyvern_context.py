@@ -100,6 +100,10 @@ class SkyvernContext:
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
+    # Set only by the in-process copilot block-test path, on that run's own context. A dispatched
+    # run's context is rebuilt on the worker and never carries it, so runner selection can tell the
+    # two apart instead of inferring it from a process-wide capability.
+    copilot_inline_execution: bool = False
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     download_suffix: str | None = None

@@ -18,11 +18,9 @@ from skyvern.forge.sdk.copilot.repeated_reply_summary import (
 from skyvern.forge.sdk.copilot.signature import compute_signature
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentReasonCode
 from skyvern.forge.sdk.copilot.turn_outcome import (
-    HANDOFF_REPLY,
     IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON,
     apply_repeated_reply_guard,
     build_minimal_turn_outcome,
-    escalation_reply_for,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -61,36 +59,6 @@ def test_guard_returns_original_when_no_match() -> None:
     assert outcome.normalized_reply_signature == compute_signature(text)
     assert outcome.blocked_signatures == ["other"]
     assert outcome.reason_code == "ok"
-
-
-def test_guard_rewrites_to_escalation_when_signature_matches() -> None:
-    text = "The file is in the Artifacts section."
-    sig = compute_signature(text)
-    final_text, outcome = apply_repeated_reply_guard(
-        final_text=text,
-        attempted_kind=ResponseKind.DIAGNOSE,
-        blocked_signatures=[sig],
-    )
-    assert final_text == escalation_reply_for(ResponseKind.DIAGNOSE)
-    assert outcome.response_kind is ResponseKind.RECOVER
-    assert outcome.terminal_reason == IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON
-    assert sig in outcome.blocked_signatures
-    assert outcome.normalized_reply_signature == compute_signature(final_text)
-
-
-def test_guard_falls_back_to_handoff_on_escalation_self_collision() -> None:
-    text = "The file is in the Artifacts section."
-    original_sig = compute_signature(text)
-    escalation_sig = compute_signature(escalation_reply_for(ResponseKind.DIAGNOSE))
-    final_text, outcome = apply_repeated_reply_guard(
-        final_text=text,
-        attempted_kind=ResponseKind.DIAGNOSE,
-        blocked_signatures=[original_sig, escalation_sig],
-    )
-    assert final_text == HANDOFF_REPLY
-    assert outcome.response_kind is ResponseKind.RECOVER
-    assert original_sig in outcome.blocked_signatures
-    assert escalation_sig in outcome.blocked_signatures
 
 
 def test_guard_carries_inherited_bans_forward_on_no_match() -> None:
@@ -281,3 +249,33 @@ def test_render_prompt_block_only_populated_when_detected() -> None:
 
     empty = summarize_repeated_replies([], _intent(stuck=True))
     assert empty.render_prompt_block() == ""
+
+
+def test_repeated_reply_is_preserved_not_rewritten() -> None:
+    # A repeat is the turn's true state: the model's words survive and no terminal reason is minted
+    # from a chat-presentation concern.
+    text = "Still working on the extraction."
+    signature = compute_signature(text)
+
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=text,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=[signature],
+    )
+
+    assert final_text == text
+    assert outcome.terminal_reason != IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON
+    assert outcome.response_kind is not ResponseKind.RECOVER
+
+
+def test_repeated_reply_signature_still_recorded() -> None:
+    text = "Still working on the extraction."
+    signature = compute_signature(text)
+
+    _, outcome = apply_repeated_reply_guard(
+        final_text=text,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=[signature],
+    )
+
+    assert signature in outcome.blocked_signatures

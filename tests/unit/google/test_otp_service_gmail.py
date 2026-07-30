@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog.testing
 
 from skyvern.forge import agent_functions
 from skyvern.forge.agent_functions import AgentFunction
@@ -194,6 +195,71 @@ async def test_get_otp_value_from_gmail_retries_candidate_after_parser_error(
     assert second_result == otp_service.OTPValue(value="112233", type=OTPType.TOTP)
     assert parse.await_count == 2
     create_otp_code.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_gmail_rechecks_unseen_candidate_after_credit_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(
+        id="goac_1",
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+    )
+    monkeypatch.setattr(
+        agent_functions.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[credential]),
+    )
+    monkeypatch.setattr(
+        agent,
+        "get_google_workspace_credentials",
+        AsyncMock(return_value=SimpleNamespace(token=object())),
+    )
+    create_otp_code = AsyncMock()
+    monkeypatch.setattr(
+        agent_functions.app, "DATABASE", SimpleNamespace(otp=SimpleNamespace(create_otp_code=create_otp_code))
+    )
+    candidates = [
+        google_gmail_service.GmailMessageCandidate(
+            message_id=f"msg_credit_skipped_{index}",
+            content=f"Long relayed authentication message {index}.",
+            internal_date=datetime.now(timezone.utc),
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(
+        agent_functions.google_gmail_service,
+        "search_recent_otp_messages",
+        AsyncMock(return_value=candidates),
+    )
+    parsed = otp_service.OTPValue(value="placeholder", type=OTPType.TOTP)
+    parse = AsyncMock(side_effect=[otp_service.InsufficientCreditsForOTPParse, parsed])
+    monkeypatch.setattr(otp_service, "parse_otp_login", parse)
+    context = GmailOTPVerificationContext()
+
+    with structlog.testing.capture_logs() as logs:
+        first_result = await agent.get_otp_value_from_gmail(
+            organization_id="org_1",
+            totp_identifier="relay@example.test",
+            context=context,
+        )
+        context.last_searched_at_by_credential["goac_1"] = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        second_result = await agent.get_otp_value_from_gmail(
+            organization_id="org_1",
+            totp_identifier="relay@example.test",
+            context=context,
+        )
+
+    assert first_result is None
+    assert second_result == parsed
+    assert parse.await_count == 2
+    assert parse.await_args_list[0].args[0] == candidates[0].content
+    assert parse.await_args_list[1].args[0] == candidates[1].content
+    create_otp_code.assert_awaited_once()
+    assert context.has_seen_message_id(candidates[0].message_id)
+    assert context.has_seen_message_id(candidates[1].message_id)
+    assert all(record.get("event") != "Failed to parse Gmail OTP candidate" for record in logs)
 
 
 @pytest.mark.asyncio

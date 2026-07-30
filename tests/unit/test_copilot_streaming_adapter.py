@@ -609,10 +609,10 @@ async def test_stream_to_sse_cancels_and_stops_on_terminal_turn_halt() -> None:
 
     signal = CopilotToolBlockerSignal(
         blocker_kind="loop_detected",
-        agent_steering_text="LOOP DETECTED: 'update_workflow' has already failed 3 times.",
+        agent_steering_text="LOOP DETECTED: 'update_workflow' has been called 3 times.",
         user_facing_reason="I retried without making progress. Tell me what to change and I'll try again.",
         recovery_hint="report_blocker_to_user",
-        internal_reason_code="loop_detected_repeated_failed_step",
+        internal_reason_code="loop_detected_consecutive_same_tool",
         blocked_tool="update_workflow",
     )
 

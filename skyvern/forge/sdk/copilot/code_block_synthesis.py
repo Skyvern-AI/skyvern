@@ -346,6 +346,11 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
     re.I,
 )
 
+# Ceiling for a wait the scout proved must succeed (entry target, replayed read, extraction
+# container). A wait returns the moment its condition holds, so a fast page pays nothing; only a
+# genuinely absent state pays the full budget. Distinct from the deliberate 1s speculative probes.
+_REQUIRED_STATE_TIMEOUT_MS = 120_000
+
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
@@ -2090,16 +2095,32 @@ def synthesize_code_block(
     reached_download_target: ReachedDownloadTarget | None = None,
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
     file_match_transform: SameMonthFileMatchTransform | None = None,
+    emit_read_return: bool = True,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
         return None
+    # A named path keeps only its latest read: a re-read of the same requested value is a
+    # refinement, including one that corrects a stale selector. The anonymous path is shared by every
+    # read of an unnamed request, so there a different expression is an unrelated probe.
+    latest_read_by_identity: dict[tuple[str, str], int] = {}
+    for i, step in enumerate(trajectory):
+        if str(step.get("tool_name") or "") == "read_value":
+            path = str(step.get("read_output_path") or "")
+            expression = str(step.get("read_expression") or "") if path == "output.scouted_read" else ""
+            latest_read_by_identity[(path, expression)] = i
+    if latest_read_by_identity:
+        keep = set(latest_read_by_identity.values())
+        trajectory = [
+            step for i, step in enumerate(trajectory) if str(step.get("tool_name") or "") != "read_value" or i in keep
+        ]
 
     lines: list[str] = []
     notes: list[str] = []
     parameters: list[dict[str, str]] = []
     diagnostics = SynthesisDiagnostics()
     steps: list[dict[str, Any]] = []
+    read_bindings: list[tuple[str, str]] = []
     used_param_keys: set[str] = set()
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
@@ -2433,9 +2454,13 @@ def synthesize_code_block(
                         line_start=recovery_line_start,
                         lane="entry_recovery",
                     )
-                lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
+                lines.append(
+                    f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
+                )
             elif not login_only_presence_guard_active:
-                lines.append(f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
+                lines.append(
+                    f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
+                )
         else:
             lines.append(
                 f"{_INDENT}await page.goto("
@@ -2556,6 +2581,28 @@ def synthesize_code_block(
             if trajectory_index in captcha_boundary_indices:
                 lines.append(f"{action_indent}await solve_captcha(page)")
             append_step(f"Press {key}", "keypress", line_start)
+            emitted += 1
+            continue
+
+        if tool_name == "read_value":
+            expression = str(interaction.get("read_expression") or "").strip()
+            output_path = str(interaction.get("read_output_path") or "").strip()
+            if not expression or not output_path.startswith("output."):
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_read"}
+                )
+                continue
+            line_start = len(lines) + 1
+            variable = f"_read_value_{len(read_bindings)}"
+            lines.append(f"{action_indent}{variable} = await page.evaluate({expression!r})")
+            poll_rounds = _REQUIRED_STATE_TIMEOUT_MS // 1000
+            lines.append(f"{action_indent}for _ in range({poll_rounds}):")
+            lines.append(f'{action_indent}{_INDENT}if {variable} is not None and {variable} != "":')
+            lines.append(f"{action_indent}{_INDENT * 2}break")
+            lines.append(f"{action_indent}{_INDENT}await page.wait_for_timeout(1000)")
+            lines.append(f"{action_indent}{_INDENT}{variable} = await page.evaluate({expression!r})")
+            read_bindings.append((output_path, variable))
+            append_step(f"Read {output_path.removeprefix('output.')}", "read", line_start)
             emitted += 1
             continue
 
@@ -2845,6 +2892,17 @@ def synthesize_code_block(
         lines.append(f"{_INDENT * 2}del {scout_var}")
         lines.append(f"{_INDENT}except Exception:")
         lines.append(f"{_INDENT * 2}pass")
+    if read_bindings and emit_read_return:
+        return_root = _ExtractionReturnNode()
+        # Distinct reads that share a path (only the anonymous path can) each keep their value under
+        # a suffixed key: choosing one would silently discard evidence.
+        seen_paths: dict[str, int] = {}
+        for output_path, variable in read_bindings:
+            occurrence = seen_paths.get(output_path, 0)
+            seen_paths[output_path] = occurrence + 1
+            keyed_path = output_path if occurrence == 0 else f"{output_path}_{occurrence + 1}"
+            _set_return_expression(return_root, output_path_segments(keyed_path.removeprefix("output.")), variable)
+        lines.append(f"{_INDENT}return {_return_node_expression(return_root)}")
     if steps:
         steps[-1]["line_end"] = len(lines)
 
@@ -3247,25 +3305,26 @@ def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *
     target = f"{container}.nth({binding.selector_index})"
     children = f'{target}.locator(":scope > *")'
     statements = [
+        f'await {container}.first.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})',
         f"if await {container}.count() != {binding.selector_count}:",
-        f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
+        f'{_INDENT}raise Exception("Observed scalar selector cardinality changed")',
         f"if not await {target}.is_visible():",
-        f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
+        f'{_INDENT}raise Exception("Observed scalar relation is no longer visible")',
         f"if await {children}.count() != {binding.child_count}:",
-        f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
+        f'{_INDENT}raise Exception("Observed scalar direct-child shape changed")',
         f"if not await {children}.nth(0).is_visible():",
-        f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
+        f'{_INDENT}raise Exception("Observed scalar label is no longer visible")',
         f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
-        f'{_INDENT}raise ValueError("Observed scalar label changed")',
+        f'{_INDENT}raise Exception("Observed scalar label changed")',
         f"if not await {children}.nth({binding.child_index}).is_visible():",
-        f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
+        f'{_INDENT}raise Exception("Observed scalar value is no longer visible")',
         f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
     ]
     if guard_empty:
         statements.extend(
             [
                 f"if not {variable}:",
-                f'{_INDENT}raise ValueError("Observed scalar value is empty")',
+                f'{_INDENT}raise Exception("Observed scalar value is empty")',
             ]
         )
     return statements
@@ -3294,20 +3353,20 @@ def _table_group_read_lines(
     rows = f"page.locator({json.dumps(row_selector)})"
     headers = f'{table}.nth({exemplar.selector_index}).locator(":scope > thead > tr > th")'
     lines.append(f"if await {table}.count() != {exemplar.selector_count}:")
-    lines.append(f'{_INDENT}raise ValueError("Observed table identity changed")')
+    lines.append(f'{_INDENT}raise Exception("Observed table identity changed")')
     lines.append(f"if not await {table}.nth({exemplar.selector_index}).is_visible():")
-    lines.append(f'{_INDENT}raise ValueError("Observed table is no longer visible")')
+    lines.append(f'{_INDENT}raise Exception("Observed table is no longer visible")')
     lines.append(f'if await {selected_table}.locator(":scope table").count() != 0:')
-    lines.append(f'{_INDENT}raise ValueError("Observed table gained a nested table")')
+    lines.append(f'{_INDENT}raise Exception("Observed table gained a nested table")')
     lines.append(f'if await {table}.nth({exemplar.selector_index}).locator("[colspan], [rowspan]").count() != 0:')
-    lines.append(f'{_INDENT}raise ValueError("Observed table gained spanning cells")')
+    lines.append(f'{_INDENT}raise Exception("Observed table gained spanning cells")')
     lines.append(f"if await {headers}.count() != {len(exemplar.headers)}:")
-    lines.append(f'{_INDENT}raise ValueError("Observed table header cardinality changed")')
+    lines.append(f'{_INDENT}raise Exception("Observed table header cardinality changed")')
     for header_index, header_text in enumerate(exemplar.headers):
         lines.append(f"if (await {headers}.nth({header_index}).inner_text()).strip() != {json.dumps(header_text)}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table header identity changed")')
+        lines.append(f'{_INDENT}raise Exception("Observed table header identity changed")')
     lines.append(f"if await {rows}.count() != {row_count}:")
-    lines.append(f'{_INDENT}raise ValueError("Observed table row count changed")')
+    lines.append(f'{_INDENT}raise Exception("Observed table row count changed")')
     row_expressions: list[str] = []
     if not assemble_as_literal:
         lines.append(f"{records_variable} = []")
@@ -3315,23 +3374,23 @@ def _table_group_read_lines(
         row = f"{rows}.nth({row_index})"
         cells = f'{row}.locator(":scope > th, :scope > td")'
         lines.append(f"if not await {row}.is_visible():")
-        lines.append(f'{_INDENT}raise ValueError("Observed table row is no longer visible")')
+        lines.append(f'{_INDENT}raise Exception("Observed table row is no longer visible")')
         lines.append(f"if await {cells}.count() != {exemplar.row_cell_counts[row_index]}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table direct-cell cardinality changed")')
+        lines.append(f'{_INDENT}raise Exception("Observed table direct-cell cardinality changed")')
         lines.append(f'if await {row}.locator(":scope > th").count() != 0:')
-        lines.append(f'{_INDENT}raise ValueError("Observed table row gained a row header")')
+        lines.append(f'{_INDENT}raise Exception("Observed table row gained a row header")')
         lines.append(
             f'if " ".join((await {row}.inner_text()).split()) != {json.dumps(exemplar.row_identities[row_index])}:'
         )
-        lines.append(f'{_INDENT}raise ValueError("Observed table row identity changed")')
+        lines.append(f'{_INDENT}raise Exception("Observed table row identity changed")')
         for binding_index, binding in enumerate(sorted(bindings, key=lambda item: item.output_path)):
             value_variable = f"{cell_variable_base}_{group_index}_{row_index}_{binding_index}"
             lines.append(f"if not await {cells}.nth({binding.column_index}).is_visible():")
-            lines.append(f'{_INDENT}raise ValueError("Observed table cell is no longer visible")')
+            lines.append(f'{_INDENT}raise Exception("Observed table cell is no longer visible")')
             lines.append(f"{value_variable} = (await {cells}.nth({binding.column_index}).inner_text()).strip()")
             if guard_empty:
                 lines.append(f"if not {value_variable}:")
-                lines.append(f'{_INDENT}raise ValueError("Observed table cell value is empty")')
+                lines.append(f'{_INDENT}raise Exception("Observed table cell value is empty")')
             _set_return_expression(
                 record_root, output_path_segments(binding.output_path)[len(prefix) :], value_variable
             )
@@ -3629,12 +3688,15 @@ def synthesize_code_block_with_extraction(
 ) -> SynthesizedCodeBlock | None:
     if not _trajectory_contains_reveal(trajectory, extraction_plan):
         return None
+    # The suffix carries the terminal return; a base read-return here would sit above the appended
+    # suffix and make it unreachable.
     interaction = synthesize_code_block(
         trajectory,
         strict_selectors=strict_selectors,
         reached_download_target=reached_download_target,
         parameter_binding_snapshot=parameter_binding_snapshot,
         file_match_transform=file_match_transform,
+        emit_read_return=False,
     )
     suffix = synthesize_extraction_suffix(extraction_plan)
     if interaction is None or suffix is None:

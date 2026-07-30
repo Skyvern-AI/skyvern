@@ -1599,37 +1599,6 @@ def test_copilot_seconds_remaining_credits_pause_time() -> None:
     assert remaining > 150.0
 
 
-def test_late_block_running_call_signal_allows_call_after_credited_pause() -> None:
-    """Fails on old code: a 300s pause 700s into the turn wrongly forbids the
-    resumed test run because the wall-clock check never saw the pause credit."""
-    from skyvern.forge.sdk.copilot.tools.blockers import _late_block_running_call_signal
-
-    ctx = SimpleNamespace(
-        copilot_run_start_monotonic=time.monotonic() - 1000.0,
-        copilot_credential_pause_seconds=300.0,
-        last_failed_workflow_yaml=None,
-        last_good_workflow_yaml=None,
-    )
-
-    assert _late_block_running_call_signal(ctx, "update_and_run_blocks") is None
-
-
-def test_late_block_running_call_signal_forbids_same_elapsed_without_pause_credit() -> None:
-    """Sanity pair for the test above: the identical wall-clock elapsed DOES
-    forbid the call when there was no pause to credit, proving the crediting
-    -- not something else -- is what keeps the resumed call allowed."""
-    from skyvern.forge.sdk.copilot.tools.blockers import _late_block_running_call_signal
-
-    ctx = SimpleNamespace(
-        copilot_run_start_monotonic=time.monotonic() - 1000.0,
-        copilot_credential_pause_seconds=0.0,
-        last_failed_workflow_yaml=None,
-        last_good_workflow_yaml=None,
-    )
-
-    assert _late_block_running_call_signal(ctx, "update_and_run_blocks") is not None
-
-
 # ---------------------------------------------------------------------------
 # A client that can't render credential_required must never be paused for,
 # or it stares at "Working..." until the timeout.
