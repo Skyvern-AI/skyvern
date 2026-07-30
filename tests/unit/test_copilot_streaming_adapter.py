@@ -20,8 +20,14 @@ from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
-from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.streaming_adapter import _sanitize_input, _update_enforcement_from_tool, stream_to_sse
+from skyvern.forge.sdk.copilot.context import CopilotContext, InFlightStreamToolCall
+from skyvern.forge.sdk.copilot.narration import NarratorState, TransitionKind
+from skyvern.forge.sdk.copilot.streaming_adapter import (
+    _sanitize_input,
+    _update_enforcement_from_tool,
+    flush_goal_satisfied_tool_result,
+    stream_to_sse,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 
 
@@ -311,13 +317,13 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_to_sse_emits_narration_on_workflow_updated_transition(
+async def test_stream_to_sse_suppresses_narration_on_an_iteration_with_typed_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end: a completed update_workflow tool round-trip flips
-    ctx.update_workflow_called, which should register as a workflow_updated
-    transition on the narrator state and produce a NARRATION SSE payload in
-    addition to the existing TOOL_CALL / TOOL_RESULT frames.
+    """End-to-end: a completed update_workflow round-trip registers a
+    workflow_updated transition and the narrator handler is available, but the
+    iteration already carries typed TOOL_CALL / TOOL_RESULT rows, so no
+    NARRATION frame is emitted or persisted for it.
     """
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
@@ -390,12 +396,13 @@ async def test_stream_to_sse_emits_narration_on_workflow_updated_transition(
     await stream_to_sse(result, stream, ctx)
 
     narration_payloads = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
-    assert len(narration_payloads) == 1
-    assert narration_payloads[0].narration == "Revising the workflow draft."
-    # The tool round-trip also emitted TOOL_CALL + TOOL_RESULT.
+    assert narration_payloads == []
+    assert [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"] == []
+    # The typed rows the operator sees instead.
     tool_types = [getattr(p, "type", None) for p in sent]
     assert WorkflowCopilotStreamMessageType.TOOL_CALL in tool_types
     assert WorkflowCopilotStreamMessageType.TOOL_RESULT in tool_types
+    assert ctx.narrator_state.iterations_with_tool_activity == {0}
 
 
 @pytest.mark.asyncio
@@ -1631,3 +1638,119 @@ async def test_codegen_progress_is_disconnected_bounded_when_client_gone(
     # 20 deltas were pumped with a clock that never advances (gap never elapses) and no
     # new labels; is_disconnected must be checked only at the initial ItemAdded emit.
     assert stream.is_disconnected.call_count == 1
+
+
+def _label_probe_ctx() -> SimpleNamespace:
+    return SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
+
+
+def _tool_round_trip(tool_name: str, arguments: str, output: str) -> list[RunItemStreamEvent]:
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": tool_name, "arguments": arguments}
+    output_item = MagicMock(spec=RunItem)
+    output_item.raw_item = {"call_id": "c1"}
+    output_item.output = output
+    return [
+        RunItemStreamEvent(name="tool_called", item=call_item),
+        RunItemStreamEvent(name="tool_output", item=output_item),
+    ]
+
+
+async def _drive(events: list[RunItemStreamEvent], ctx: SimpleNamespace) -> list[Any]:
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    await stream_to_sse(result, stream, ctx)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_tool_result_reuses_the_tool_calls_target_block_label() -> None:
+    ctx = _label_probe_ctx()
+    events = _tool_round_trip("edit_block", '{"label": "Log in"}', json.dumps({"ok": True, "data": {}}))
+
+    sent = await _drive(events, ctx)
+
+    calls = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_CALL]
+    results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [p.display_label for p in calls] == ['Editing block "Log In"']
+    assert [p.display_label for p in results] == ['Editing block "Log In"']
+    assert calls[0].tool_call_id == results[0].tool_call_id == "c1"
+
+    activity = ctx.narrator_state.design_activity
+    assert [e["displayLabel"] for e in activity] == ['Editing block "Log In"', 'Editing block "Log In"']
+    assert all("Working" not in e["text"] for e in activity)
+
+
+@pytest.mark.asyncio
+async def test_non_dict_tool_arguments_degrade_to_the_generic_label_and_keep_draining() -> None:
+    ctx = _label_probe_ctx()
+    events = _tool_round_trip("edit_block", "[1, 2]", json.dumps({"ok": True, "data": {}}))
+
+    sent = await _drive(events, ctx)
+
+    calls = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_CALL]
+    results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [p.display_label for p in calls] == ["Editing block"]
+    assert [p.display_label for p in results] == ["Editing block"]
+
+
+@pytest.mark.asyncio
+async def test_typed_activity_suppression_set_is_cleared_on_each_stream_pass() -> None:
+    ctx = _label_probe_ctx()
+    await _drive(_tool_round_trip("edit_block", '{"label": "Log in"}', json.dumps({"ok": True, "data": {}})), ctx)
+    assert ctx.narrator_state.iterations_with_tool_activity == {0}
+
+    # A transition banked in pass 1 must survive pass 2, and its iteration tag
+    # must reset — pass 2's iteration numbers restart, so a stale tag could let
+    # a same-numbered armed iteration consume pass 1's pending narration.
+    ctx.narrator_state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    assert ctx.narrator_state.pending_transition_iteration is not None
+
+    await _drive([], ctx)
+
+    assert ctx.narrator_state.iterations_with_tool_activity == set()
+    assert ctx.narrator_state.pending_transition is TransitionKind.WORKFLOW_UPDATED
+    assert ctx.narrator_state.pending_transition_iteration is None
+
+
+@pytest.mark.asyncio
+async def test_goal_satisfied_flush_reuses_the_pending_calls_label() -> None:
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    narrator_state = NarratorState()
+    ctx = SimpleNamespace(
+        in_flight_stream_tool_call=InFlightStreamToolCall(
+            call_id="c9", tool_name="edit_block", iteration=3, display_label='Editing block "Log In"'
+        ),
+        goal_satisfied_tool_name="edit_block",
+        goal_satisfied_tool_output={"ok": True, "data": {}},
+        narrator_state=narrator_state,
+    )
+
+    await flush_goal_satisfied_tool_result(stream, ctx)
+
+    assert [p.display_label for p in sent] == ['Editing block "Log In"']
+    assert narrator_state.design_activity[-1]["displayLabel"] == 'Editing block "Log In"'

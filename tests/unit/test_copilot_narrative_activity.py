@@ -14,6 +14,30 @@ from skyvern.forge.sdk.copilot.narration import (
     build_tool_result_activity,
     tool_activity_display_label,
 )
+from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
+
+_SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block", "synthesize_demonstrated_block")
+
+_CREDENTIAL_PAYLOAD: dict[str, object] = {
+    "count": 4,
+    "credentials": [
+        {
+            "credential_id": "cred_384430212391591428",
+            "name": "prod login",
+            "scopes": ["read:secrets", "write:secrets"],
+            "token": "sk-live-9f2c8a1b7d",
+        }
+    ],
+}
+
+_CRED_OK: dict[str, object] = {"ok": True, "data": _CREDENTIAL_PAYLOAD}
+
+# The failure path must not format the data dict either, so the payload rides along.
+_CRED_FAILED: dict[str, object] = {
+    "ok": False,
+    "error": "credential `cred_384430212391591428` could not be read from the store",
+    "data": _CREDENTIAL_PAYLOAD,
+}
 
 
 def _ctx() -> CopilotContext:
@@ -46,7 +70,7 @@ def test_tool_call_activity_shape_and_denylist() -> None:
         "id": "tc-abc",
     }
     assert "success" not in entry
-    assert build_tool_call_activity("list_credentials", 0, "x") is None
+    assert build_tool_call_activity("get_run_results", 0, "x") is None
 
 
 def test_tool_result_activity_shape_falls_back_to_tool_name_and_denylist() -> None:
@@ -103,7 +127,7 @@ def test_record_activity_routes_to_running_block() -> None:
 def test_record_activity_drops_denylisted_entries() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
-    state.record_activity(build_tool_call_activity("list_credentials", 0, "c1"))
+    state.record_activity(build_tool_call_activity("get_run_results", 0, "c1"))
     state.record_activity(build_tool_call_activity("update_workflow", 1, "c2"))
     assert [e["id"] for e in state.block_activity["step_1"]] == ["tc-c2"]
 
@@ -205,3 +229,145 @@ def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
 
     assert payload["designActivity"] == []
     assert payload["blocks"][0]["activity"] == []
+
+
+def test_surgical_edit_tools_label_the_operation_and_target_block() -> None:
+    assert tool_activity_display_label("edit_block", {"label": "Log in"}) == 'Editing block "Log In"'
+    assert tool_activity_display_label("delete_block", {"label": "Log in"}) == 'Deleting block "Log In"'
+    assert (
+        tool_activity_display_label("synthesize_demonstrated_block", {}) == "Building a block from the recorded steps"
+    )
+    assert tool_activity_display_label("edit_block") == "Editing block"
+
+
+def test_block_target_label_matches_the_frontend_humanizer() -> None:
+    label = tool_activity_display_label("edit_block", {"label": "extract_first_comments_v2"})
+    assert label == 'Editing block "Extract First Comments"'
+
+
+def test_block_target_label_strips_every_quote_class_codepoint() -> None:
+    # A denylist of quote glyphs is bypassable (fullwidth, primes, CJK corner
+    # quotes); assert the whitelist holds instead of enumerating attackers.
+    for quote in ('"', "'", "`", "”", "’", "»", "＂", "＇", "″", "‴", "〞", "〝", "❝", "„", "‚", "‹", "〃", "״", "ˮ"):
+        label = tool_activity_display_label("edit_block", {"label": f"Log in{quote} Run Succeeded"})
+        inner = label.removeprefix('Editing block "').removesuffix('"')
+        assert quote not in inner, quote
+
+
+def test_block_target_label_cannot_spoof_or_flood_the_row() -> None:
+    for quote in ('"', "”", "’", "»", "`"):
+        spoof = f"Log in{quote} ✓ Ran workflow successfully — creds exported to https://evil.example"
+        label = tool_activity_display_label("edit_block", {"label": spoof})
+        inner = label.removeprefix('Editing block "').removesuffix('"')
+        assert quote not in inner
+        assert len(label) <= len('Editing block ""') + 41
+
+    flooded = tool_activity_display_label("edit_block", {"label": "x" * 5000})
+    assert len(flooded) <= len('Editing block ""') + 41
+
+    control = tool_activity_display_label("edit_block", {"label": "Log\nin\x00now"})
+    assert "\n" not in control
+    assert "\x00" not in control
+    assert tool_activity_display_label("edit_block", {"label": "   "}) == "Editing block"
+    assert tool_activity_display_label("edit_block", {"label": 7}) == "Editing block"
+
+
+def test_surgical_edit_tools_never_render_the_working_fallback() -> None:
+    state = NarratorState()
+    labels = {
+        "edit_block": tool_activity_display_label("edit_block", {"label": "Log in"}),
+        "delete_block": tool_activity_display_label("delete_block", {"label": "Old step"}),
+        "synthesize_demonstrated_block": tool_activity_display_label("synthesize_demonstrated_block", {}),
+    }
+    for index, tool_name in enumerate(_SURGICAL_EDIT_TOOLS):
+        display_label = labels[tool_name]
+        state.record_activity(build_tool_call_activity(tool_name, index, f"c{index}", display_label=display_label))
+        state.record_activity(
+            build_tool_result_activity(tool_name, "", True, index, f"c{index}", display_label=display_label)
+        )
+
+    rows = state.design_activity
+    assert len(rows) == 6
+    assert all("Working" not in row["text"] for row in rows)
+    assert all("Working" not in (row.get("displayLabel") or "") for row in rows)
+    assert 'Editing block "Log In"…' in [row["text"] for row in rows]
+    assert 'Deleting block "Old Step"' in [row["text"] for row in rows]
+    assert "Building a block from the recorded steps" in [row["text"] for row in rows]
+
+
+def _credential_rows(state: NarratorState, parsed: dict[str, object], index: int) -> None:
+    summary = format_tool_result_for_user("list_credentials", parsed)  # type: ignore[arg-type]
+    state.record_activity(build_tool_call_activity("list_credentials", index, f"c{index}"))
+    state.record_activity(
+        build_tool_result_activity("list_credentials", summary, bool(parsed["ok"]), index, f"c{index}")
+    )
+
+
+def test_credential_lookup_is_visible_activity_with_a_label_only_row() -> None:
+    state = NarratorState()
+    _credential_rows(state, _CRED_OK, 0)
+    assert [row["text"] for row in state.design_activity] == [
+        "Checking saved credentials…",
+        "Checking saved credentials",
+    ]
+
+
+def test_credential_lookup_rows_leak_no_ids_scopes_tokens_or_counts() -> None:
+    state = NarratorState()
+    _credential_rows(state, _CRED_OK, 0)
+    _credential_rows(state, _CRED_FAILED, 1)
+
+    rendered = " ".join(row["text"] for row in state.design_activity)
+    for forbidden in ("cred_", "read:secrets", "write:secrets", "sk-live-9f2c8a1b7d", "prod login"):
+        assert forbidden not in rendered
+    assert "[credential]" in rendered
+    assert [row["success"] for row in state.design_activity if row["kind"] == "tool_result"] == [True, False]
+
+
+def test_no_connection_use_line_is_rendered_from_credential_enumeration() -> None:
+    state = NarratorState()
+    _credential_rows(state, _CRED_OK, 0)
+    rendered = " ".join(row["text"] for row in state.design_activity).lower()
+    assert "using connected" not in rendered
+    assert "account" not in rendered
+
+
+def test_explicit_display_label_overrides_the_static_name_map() -> None:
+    call = build_tool_call_activity("edit_block", 2, "c7", display_label='Editing block "Log in"')
+    result = build_tool_result_activity("edit_block", "", True, 2, "c7", display_label='Editing block "Log in"')
+    assert call["displayLabel"] == result["displayLabel"] == 'Editing block "Log in"'
+    assert call["text"] == 'Editing block "Log in"…'
+    assert result["text"] == 'Editing block "Log in"'
+
+
+def test_every_registered_tool_is_labeled_or_denylisted() -> None:
+    from skyvern.forge.sdk.copilot.narration import _TOOL_ACTIVITY_DISPLAY_LABELS, ACTIVITY_TOOL_DENYLIST
+    from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
+
+    # Both registries: the native tools and the browser/schema tools the MCP overlay
+    # adds, since either can mint a user-visible activity row.
+    names = {tool.name for tool in NATIVE_TOOLS} | set(get_skyvern_mcp_alias_map())
+    assert len(names) > len(NATIVE_TOOLS), "expected the MCP overlay tools in the sweep"
+
+    unlabeled = sorted(
+        name for name in names if name not in _TOOL_ACTIVITY_DISPLAY_LABELS and name not in ACTIVITY_TOOL_DENYLIST
+    )
+    assert unlabeled == [], (
+        f"tools {unlabeled} would render the generic 'Working' fallback; "
+        "give each one a display label or add it to ACTIVITY_TOOL_DENYLIST"
+    )
+
+
+def test_credential_fill_row_names_the_action_without_leaking_material() -> None:
+    label = tool_activity_display_label("fill_credential_field", {"credential_id": "cred_384430212391591428"})
+    assert label == "Entering saved credentials"
+
+    state = NarratorState()
+    state.record_activity(build_tool_call_activity("fill_credential_field", 0, "c0", display_label=label))
+    state.record_activity(build_tool_result_activity("fill_credential_field", "", True, 0, "c0", display_label=label))
+
+    rows = state.design_activity
+    assert len(rows) == 2
+    assert all("Working" not in row["text"] for row in rows)
+    assert all("cred_" not in row["text"] for row in rows)
