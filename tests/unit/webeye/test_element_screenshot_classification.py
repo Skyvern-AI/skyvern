@@ -10,6 +10,7 @@ from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import Locator, Page
 
 from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.utils.page import take_element_screenshot
 
 
@@ -20,6 +21,21 @@ def _make_locator(*, closed: bool = False) -> MagicMock:
     locator.page = page
     locator.screenshot = AsyncMock(return_value=b"image-bytes")
     return locator
+
+
+class _SelectedError(Exception):
+    pass
+
+
+class _SelectedTimeout(_SelectedError):
+    pass
+
+
+def _selection() -> BrowserEngineSelection:
+    selection = MagicMock(spec=BrowserEngineSelection)
+    selection.is_engine_error.side_effect = lambda exc: isinstance(exc, _SelectedError)
+    selection.is_engine_timeout_error.side_effect = lambda exc: isinstance(exc, _SelectedTimeout)
+    return selection
 
 
 class TestTakeElementScreenshot:
@@ -73,6 +89,27 @@ class TestTakeElementScreenshot:
         assert locator.screenshot.await_count == 2
         assert locator.screenshot.await_args_list[0].kwargs["animations"] == "disabled"
         assert locator.screenshot.await_args_list[1].kwargs["animations"] == "allow"
+
+    @pytest.mark.asyncio
+    async def test_selected_timeout_retries_with_animations_allowed(self) -> None:
+        locator = _make_locator()
+        locator.screenshot = AsyncMock(side_effect=[_SelectedTimeout("timed out"), b"image-bytes"])
+
+        result = await take_element_screenshot(locator, timeout=1000, engine_selection=_selection())
+
+        assert result == b"image-bytes"
+        assert locator.screenshot.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_foreign_error_propagates_under_selected_engine(self) -> None:
+        locator = _make_locator()
+        error = PlaywrightTimeoutError("foreign")
+        locator.screenshot = AsyncMock(side_effect=error)
+
+        with pytest.raises(PlaywrightTimeoutError) as exc_info:
+            await take_element_screenshot(locator, timeout=1000, engine_selection=_selection())
+
+        assert exc_info.value is error
 
     @pytest.mark.asyncio
     async def test_retry_failure_is_wrapped(self) -> None:
