@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getClient } from "@/api/AxiosClient";
 import type { CredentialApiResponse } from "@/api/types";
 import { copyText } from "@/util/copyText";
+import { CredentialAuthenticatorSupportProvider } from "./CredentialAuthenticatorSupportContext";
 import { CredentialItem } from "./CredentialItem";
 
 vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
@@ -62,6 +63,40 @@ afterEach(() => {
 });
 
 describe("CredentialItem TOTP code preview", () => {
+  it("uses the context label for an additional two-factor method", () => {
+    render(
+      <CredentialAuthenticatorSupportProvider
+        value={{
+          additionalTwoFactorMethods: [
+            {
+              value: "security_device",
+              requestType: "none",
+              label: "Security Device",
+              renderFields: () => null,
+              validate: () => null,
+              onSaved: vi.fn(),
+            },
+          ],
+        }}
+      >
+        <CredentialItem
+          credential={
+            makePasswordCredential({
+              credential: {
+                username: "user@example.com",
+                totp_type: "security_device" as never,
+                totp_identifier: null,
+              },
+            }) as unknown as CredentialApiResponse
+          }
+        />
+      </CredentialAuthenticatorSupportProvider>,
+    );
+
+    expect(screen.getByText("Security Device")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Show 2FA code" })).toBeNull();
+  });
+
   it("loads and copies the current authenticator code on demand", async () => {
     mockedGetClient.mockResolvedValue({
       get: vi.fn().mockResolvedValue({
