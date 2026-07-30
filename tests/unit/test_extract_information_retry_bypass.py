@@ -111,7 +111,11 @@ def test_retry_index_gt_one_evicts_in_run_entry_and_calls_llm(monkeypatch) -> No
     # retry_index = 2 → past the bypass threshold (> 1)
     step = MagicMock(step_id="stp_retry2", retry_index=2)
 
-    asyncio.run(handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page))
+    asyncio.run(
+        handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
+    )
 
     # LLM must have been called (cache was bypassed, not consumed).
     assert llm_calls == [1], "retry bypass must force a fresh LLM call"
@@ -145,7 +149,9 @@ def test_retry_index_one_still_uses_cache(monkeypatch) -> None:
     step = MagicMock(step_id="stp_retry1", retry_index=1)
 
     result = asyncio.run(
-        handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page)
+        handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
     )
 
     # Cache hit path — no LLM call.

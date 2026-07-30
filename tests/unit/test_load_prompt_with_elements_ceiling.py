@@ -27,6 +27,7 @@ def test_ceiling_fallback_keys_by_template_has_known_mappings() -> None:
     from skyvern.utils.prompt_engine import CEILING_FALLBACK_KEYS_BY_TEMPLATE
 
     assert CEILING_FALLBACK_KEYS_BY_TEMPLATE["extract-information"] == [
+        "virtualized_grid_rows",
         "previous_extracted_information",
         "extracted_information_schema",
         "extracted_text",
@@ -145,6 +146,63 @@ def test_load_prompt_with_elements_tracked_drops_extracted_text_as_last_resort(
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
     assert "UNIQUE_EXTRACTED_TEXT" not in rendered
     assert post_kwargs["extracted_text"] is None
+
+
+def test_extract_information_ceiling_drops_grid_rows_before_required_inputs(small_prompt_ceiling: int) -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import load_prompt_with_elements_tracked
+
+    schema_marker = "REQUIRED_SCHEMA_MARKER"
+    text_marker = "REQUIRED_EXTRACTED_TEXT_MARKER"
+    rendered, post_kwargs = load_prompt_with_elements_tracked(
+        element_tree_builder=_make_element_tree_builder(),
+        prompt_engine=engine_module,
+        template_name="extract-information",
+        data_extraction_goal="Extract documents",
+        extracted_information_schema={"type": "object", "description": schema_marker},
+        current_url="https://example.test",
+        extracted_text=text_marker,
+        error_code_mapping_str=None,
+        navigation_payload=None,
+        local_datetime="2026-04-14T12:00:00",
+        previous_extracted_information=None,
+        virtualized_grid_rows="OPTIONAL_GRID_MARKER " + ("lorem " * (small_prompt_ceiling + 100)),
+    )
+
+    assert "OPTIONAL_GRID_MARKER" not in rendered
+    assert schema_marker in rendered
+    assert text_marker in rendered
+    assert post_kwargs["virtualized_grid_rows"] is None
+    assert post_kwargs["extracted_information_schema"] is not None
+    assert post_kwargs["extracted_text"] == text_marker
+
+
+def test_extract_information_ceiling_preserves_legacy_order_without_grid_rows(small_prompt_ceiling: int) -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import load_prompt_with_elements_tracked
+
+    rendered, post_kwargs = load_prompt_with_elements_tracked(
+        element_tree_builder=_make_element_tree_builder(),
+        prompt_engine=engine_module,
+        template_name="extract-information",
+        data_extraction_goal="Extract documents",
+        extracted_information_schema={"type": "object", "description": "RETAINED_SCHEMA_MARKER"},
+        current_url="https://example.test",
+        extracted_text="RETAINED_TEXT_MARKER",
+        error_code_mapping_str=None,
+        navigation_payload=None,
+        local_datetime="2026-04-14T12:00:00",
+        previous_extracted_information="LEGACY_PREVIOUS_MARKER " + ("lorem " * (small_prompt_ceiling + 100)),
+        virtualized_grid_rows=None,
+    )
+
+    assert "LEGACY_PREVIOUS_MARKER" not in rendered
+    assert "RETAINED_SCHEMA_MARKER" in rendered
+    assert "RETAINED_TEXT_MARKER" in rendered
+    assert post_kwargs["virtualized_grid_rows"] is None
+    assert post_kwargs["previous_extracted_information"] is None
+    assert post_kwargs["extracted_information_schema"] is not None
+    assert post_kwargs["extracted_text"] == "RETAINED_TEXT_MARKER"
 
 
 def test_enforce_prompt_ceiling_tracked_reports_dropped_keys(small_prompt_ceiling: int) -> None:
