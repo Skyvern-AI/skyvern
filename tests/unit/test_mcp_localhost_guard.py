@@ -59,12 +59,21 @@ def test_is_localhost_url_handles_garbage_input() -> None:
 
 
 @pytest.mark.asyncio
-async def test_navigate_rejects_localhost_on_cloud_session(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        ("skyvern_navigate_and_screenshot", {}),
+        ("skyvern_navigate_extract_and_screenshot", {"prompt": "read"}),
+    ],
+)
+async def test_navigate_rejects_localhost_on_cloud_session(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, kwargs: dict[str, str]
+) -> None:
     page = object()
     ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
 
-    result = await mcp_browser.skyvern_navigate(url="http://localhost:3000")
+    result = await getattr(mcp_browser, tool_name)(url="http://localhost:3000", **kwargs)
 
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT

@@ -41,7 +41,10 @@ def _setup_app(
         ),
         STORAGE=SimpleNamespace(delete_browser_profile=storage_delete_profile),
         CREDENTIAL_VAULT_SERVICES={credentials.CredentialVaultType.BITWARDEN: vault_service},
-        AGENT_FUNCTION=SimpleNamespace(is_browser_memory_engine_enabled_for_org=AsyncMock(return_value=engine_enabled)),
+        AGENT_FUNCTION=SimpleNamespace(
+            is_browser_memory_engine_enabled_for_org=AsyncMock(return_value=engine_enabled),
+            should_lock_credential_write=AsyncMock(return_value=False),
+        ),
     )
     monkeypatch.setattr(credentials, "app", fake_app)
     monkeypatch.setattr(credentials, "_clear_cached_totp_code_preview", lambda **kwargs: None)
