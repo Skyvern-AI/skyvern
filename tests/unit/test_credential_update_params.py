@@ -404,6 +404,7 @@ async def test_route_pin_only_update_does_not_pass_browser_profile_id(monkeypatc
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=existing))),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: vault_service},
+        AGENT_FUNCTION=AgentFunction(),
     )
     monkeypatch.setattr(credentials_routes, "app", fake_app)
     monkeypatch.setattr(credentials_routes, "_update_credential_or_profile_conflict", conflict)
@@ -1551,7 +1552,10 @@ async def test_oss_route_allows_disabling_sequential_credential(monkeypatch: pyt
     monkeypatch.setattr(
         forge_app,
         "AGENT_FUNCTION",
-        SimpleNamespace(supports_sequential_credentials=lambda: False),
+        SimpleNamespace(
+            supports_sequential_credentials=lambda: False,
+            should_lock_credential_write=AsyncMock(return_value=False),
+        ),
     )
 
     response = await credentials_routes.rename_credential(

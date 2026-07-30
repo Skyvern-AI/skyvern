@@ -59,6 +59,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     NewTabAction,
     NullAction,
+    PasteTextAction,
     ReloadPageAction,
     ScrollAction,
     SelectOption,
@@ -89,6 +90,7 @@ OBSERVED_HASH = "eh-observed"
 CONCRETE_ACTIONS: dict[ActionType, Action] = {
     ActionType.CLICK: ClickAction(element_id="1"),
     ActionType.INPUT_TEXT: InputTextAction(element_id="1", text="hello"),
+    ActionType.PASTE_TEXT: PasteTextAction(element_id="1", text="a\tb"),
     ActionType.UPLOAD_FILE: UploadFileAction(element_id="1", file_url="https://example.com/f.pdf"),
     ActionType.DOWNLOAD_FILE: DownloadFileAction(file_name="f.pdf"),
     ActionType.SELECT_OPTION: SelectOptionAction(element_id="1", option=SelectOption(label="a")),

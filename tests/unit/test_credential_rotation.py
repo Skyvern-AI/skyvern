@@ -1016,6 +1016,10 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
             return_value=SimpleNamespace(sequential_credential_id=stamped_credential_id)
         )
         mock_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
+        # Mirror the OSS no-op hook: return the resolved item unchanged.
+        mock_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
+            side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
+        )
 
         await context.register_credential_parameter_value(login, organization)
 

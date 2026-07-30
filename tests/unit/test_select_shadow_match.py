@@ -807,7 +807,7 @@ async def test_click_ingress_routes_no_target_and_emits_nothing(monkeypatch: pyt
             anchor_element=MagicMock(get_id=Mock(return_value="field-id")),
             dom=MagicMock(),
             page=SimpleNamespace(url="https://test"),
-            skyvern_frame=SimpleNamespace(safe_wait_for_animation_end=AsyncMock()),
+            skyvern_frame=SimpleNamespace(safe_wait_for_animation_end=AsyncMock(), engine_selection=object()),
             scraped_page=scraped_page,
             incremental_scraped=incremental_scraped,
             task=_OUTCOME_TASK,

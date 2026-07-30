@@ -109,3 +109,27 @@ async def test_unknown_action_still_raises_failed_to_parse(
 
     with pytest.raises(FailedToParseActionInstruction):
         await _build_for_action_task(patched_agent, "Drag the card to the other column")
+
+
+@pytest.mark.asyncio
+async def test_planner_umbrella_provider_failure_still_builds_prompt(
+    patched_agent: ForgeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_infer_response(
+        monkeypatch,
+        {"inferred_actions": [{"action_type": "HOVER", "confidence_float": 0.9}]},
+    )
+    provider = MagicMock()
+
+    async def resolve_flag(flag_name: str, *_args: object, **_kwargs: object) -> bool:
+        if flag_name == "PLANNER_MINI_GOAL_IMPROVEMENTS":
+            raise RuntimeError("provider unavailable")
+        return False
+
+    provider.is_feature_enabled_cached = AsyncMock(side_effect=resolve_flag)
+    monkeypatch.setattr("skyvern.forge.agent.settings.PLANNER_MINI_GOAL_IMPROVEMENTS", False)
+    monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER", provider)
+
+    build_result = await _build_for_action_task(patched_agent, "Hover over the account menu")
+
+    assert build_result.prompt_name == "single-hover-action"

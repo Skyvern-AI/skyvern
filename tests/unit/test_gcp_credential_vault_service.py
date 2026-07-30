@@ -26,6 +26,9 @@ TEST_PROJECT = "test-project"
 TEST_ORG = "o_123"
 
 
+_PASSWORD_METADATA = {"tenant": "north"}
+
+
 def _service() -> tuple[GcpCredentialVaultService, AsyncMock]:
     """Return a service plus the mock vault client it delegates to.
 
@@ -50,7 +53,12 @@ class TestGcpSecretItemCreation:
 
         item_id = await svc._create_gcp_secret_item(
             organization_id=TEST_ORG,
-            credential=PasswordCredential(username="user@example.com", password="pw", totp="JBSWY3DPEHPK3PXP"),
+            credential=PasswordCredential(
+                username="user@example.com",
+                password="pw",
+                totp="JBSWY3DPEHPK3PXP",
+                metadata=_PASSWORD_METADATA,
+            ),
         )
 
         assert item_id == "ret-id"
@@ -62,6 +70,7 @@ class TestGcpSecretItemCreation:
             "password": "pw",
             "username": "user@example.com",
             "totp": "JBSWY3DPEHPK3PXP",
+            "metadata": _PASSWORD_METADATA,
         }
 
     async def test_create_credit_card_secret_item(self) -> None:
@@ -136,7 +145,15 @@ class TestGetCredentialItem:
     async def test_get_password_credential(self) -> None:
         svc, client = _service()
         client.get_secret = AsyncMock(
-            return_value=json.dumps({"type": "password", "username": "u", "password": "p", "totp": "T"})
+            return_value=json.dumps(
+                {
+                    "type": "password",
+                    "username": "u",
+                    "password": "p",
+                    "totp": "T",
+                    "metadata": _PASSWORD_METADATA,
+                }
+            )
         )
         db_cred = _db_credential(item_id="sid", totp_type=TotpType.NONE, name="My Login")
 
@@ -148,6 +165,17 @@ class TestGetCredentialItem:
         assert isinstance(item.credential, PasswordCredential)
         assert item.credential.username == "u"
         assert item.credential.password == "p"
+        assert item.credential.metadata == _PASSWORD_METADATA
+
+    async def test_get_legacy_password_credential_without_metadata(self) -> None:
+        svc, client = _service()
+        client.get_secret = AsyncMock(return_value='{"type":"password","username":"u","password":"p"}')
+        db_cred = _db_credential(item_id="sid", totp_type=TotpType.NONE, name="My Login")
+
+        item = await svc.get_credential_item(db_cred)
+
+        assert isinstance(item.credential, PasswordCredential)
+        assert item.credential.metadata is None
 
     async def test_get_credit_card_credential(self) -> None:
         svc, client = _service()
