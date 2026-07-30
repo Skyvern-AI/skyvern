@@ -111,8 +111,11 @@ stringData:
   VITE_API_BASE_URL: "http://skyvern.example.com/api/v1"
   VITE_WSS_BASE_URL: "ws://skyvern.example.com/api/v1"
   VITE_ARTIFACT_API_BASE_URL: "http://skyvern.example.com/artifacts"
+  ARTIFACT_ALLOWED_ORIGIN: "http://skyvern.example.com"
   VITE_SKYVERN_API_KEY: ""  # Leave empty for initial deploy
 ```
+
+`ARTIFACT_ALLOWED_ORIGIN` must match the browser-visible UI origin (`http://skyvern.example.com`), not the artifact server URL.
 
 Replace `skyvern.example.com` with your actual domain.
 
