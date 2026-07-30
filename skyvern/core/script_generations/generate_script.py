@@ -421,6 +421,15 @@ MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
 
 
+def _actions_support_cached_scripts(actions: list[dict[str, Any]]) -> bool:
+    return not any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+
+
+def _ensure_actions_support_cached_scripts(actions: list[dict[str, Any]]) -> None:
+    if not _actions_support_cached_scripts(actions):
+        raise ValueError("PASTE_TEXT has no cached-script representation")
+
+
 def _build_value_to_param_lookup(
     actions_by_task: dict[str, list[dict[str, Any]]],
     workflow_parameters: dict[str, Any] | None = None,
@@ -1406,6 +1415,8 @@ def _build_block_fn(
     all_blocks: list[dict[str, Any]] | None = None,
     credential_param_keys: frozenset[str] = frozenset(),
 ) -> FunctionDef:
+    _ensure_actions_support_cached_scripts(actions)
+
     # Check for platform-specific pipeline (cloud-only; returns None in OSS)
     if use_semantic_selectors:
         ats_platform = _detect_block_ats_platform(block, all_blocks=all_blocks)
@@ -1469,9 +1480,7 @@ def _build_block_fn(
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
                 ActionType.NULL_ACTION,
-                # Tab management isn't represented in generated scripts yet (no ACTION_MAP
-                # entry); skip so cached replay of a multi-tab run falls back to the agent
-                # instead of raising KeyError and breaking script generation.
+                # These actions have no ACTION_MAP representation in cached scripts.
                 ActionType.NEW_TAB,
                 ActionType.SWITCH_TAB,
             ]:
@@ -3354,6 +3363,17 @@ async def generate_workflow_script_python_code(
             continue
 
         block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
+        task_id = task.get("task_id", "")
+        block_actions = actions_by_task.get(task_id, [])
+        if not _actions_support_cached_scripts(block_actions):
+            LOG.warning(
+                "Skipping cached script generation for block with unsupported actions",
+                block_label=block_name,
+                script_id=script_id,
+            )
+            blocks_failed += 1
+            continue
+
         cached_source = cached_blocks.get(block_name)
         use_cached = cached_source is not None and block_name not in updated_block_labels
         input_fields = _collect_block_input_fields(task, actions_by_task)
@@ -3367,9 +3387,6 @@ async def generate_workflow_script_python_code(
             block_workflow_run_id = cached_source.workflow_run_id
             block_workflow_run_block_id = cached_source.workflow_run_block_id
         else:
-            task_id = task.get("task_id", "")
-            block_actions = actions_by_task.get(task_id, [])
-
             # Skip blocks that have no actions AND no task_id — they haven't executed yet.
             # Creating script_block entries for actionless blocks causes a permanent
             # stuck state where generate_script_if_needed thinks they're cached but
@@ -3429,6 +3446,17 @@ async def generate_workflow_script_python_code(
     for task_v2 in task_v2_blocks:
         task_v2_label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
         child_blocks = task_v2_child_blocks.get(task_v2_label, [])
+        if any(
+            not _actions_support_cached_scripts(actions_by_task.get(child_block.get("task_id", ""), []))
+            for child_block in child_blocks
+        ):
+            LOG.warning(
+                "Skipping cached script generation for task v2 block with unsupported child actions",
+                block_label=task_v2_label,
+                script_id=script_id,
+            )
+            blocks_failed += 1
+            continue
 
         cached_source = cached_blocks.get(task_v2_label)
         use_cached = cached_source is not None and task_v2_label not in updated_block_labels
@@ -3645,6 +3673,15 @@ async def generate_workflow_script_python_code(
                     or loop_block.get("title")
                     or f"block_{loop_block.get('workflow_run_block_id')}"
                 )
+                inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
+                if not _actions_support_cached_scripts(inner_actions):
+                    LOG.warning(
+                        "Skipping cached script generation for loop child block with unsupported actions",
+                        block_label=inner_label,
+                        script_id=script_id,
+                    )
+                    blocks_failed += 1
+                    continue
 
                 # Check if already cached (for progressive caching)
                 cached_inner = cached_blocks.get(inner_label)
@@ -3657,7 +3694,6 @@ async def generate_workflow_script_python_code(
                     inner_wrbi = cached_inner.workflow_run_block_id
                     inner_wri = cached_inner.workflow_run_id
                 else:
-                    inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
                     if not inner_actions:
                         # No actions from agent run = can't generate cached function.
                         # No script_block row is created; the block will be cached on

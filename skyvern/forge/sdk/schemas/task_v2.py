@@ -13,6 +13,7 @@ from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
+TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL = "__timeout_webhook_delivered__"
 
 
 class TaskV2Status(StrEnum):
@@ -130,6 +131,12 @@ class TaskV2(BaseModel):
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
+
+    @field_serializer("webhook_failure_reason")
+    def _mask_internal_webhook_delivery_marker(self, failure_reason: str | None) -> str | None:
+        if failure_reason == TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL:
+            return None
+        return failure_reason
 
 
 class ThoughtType(StrEnum):

@@ -758,6 +758,7 @@ def block_yaml_to_block(
             totp_identifier=block_yaml.totp_identifier,
             disable_cache=block_yaml.disable_cache,
             complete_criterion=block_yaml.complete_criterion,
+            complete_criterion_is_untrusted=block_yaml.complete_criterion_is_untrusted,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
             include_action_history_in_verification=block_yaml.include_action_history_in_verification,

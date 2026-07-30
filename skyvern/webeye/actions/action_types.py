@@ -4,6 +4,7 @@ from enum import StrEnum
 class ActionType(StrEnum):
     CLICK = "click"
     INPUT_TEXT = "input_text"
+    PASTE_TEXT = "paste_text"
     UPLOAD_FILE = "upload_file"
 
     # This action is not used in the current implementation. Click actions are used instead."
@@ -39,6 +40,7 @@ class ActionType(StrEnum):
         return self in [
             ActionType.CLICK,
             ActionType.INPUT_TEXT,
+            ActionType.PASTE_TEXT,
             ActionType.UPLOAD_FILE,
             ActionType.DOWNLOAD_FILE,
             ActionType.SELECT_OPTION,
@@ -51,6 +53,7 @@ POST_ACTION_EXECUTION_ACTION_TYPES = [
     ActionType.CLICK,
     ActionType.HOVER,
     ActionType.INPUT_TEXT,
+    ActionType.PASTE_TEXT,
     ActionType.UPLOAD_FILE,
     ActionType.DOWNLOAD_FILE,
     ActionType.SELECT_OPTION,

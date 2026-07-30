@@ -3266,6 +3266,9 @@ class ForgeAgent:
             navigation_goal=unwrapped_goals.navigation_goal,
             navigation_payload=task.navigation_payload,
             complete_criterion=unwrapped_goals.complete_criterion,
+            complete_criterion_is_untrusted=bool(
+                unwrapped_goals.complete_criterion and _ctx and _ctx.complete_criterion_is_untrusted
+            ),
             terminate_criterion=unwrapped_goals.terminate_criterion,
             big_goal_context=unwrapped_goals.big_goal_context,
             action_history=actions_and_results_str,
@@ -3994,11 +3997,12 @@ class ForgeAgent:
         slim_output: str | None = None,
         has_data_extraction_goal: bool = False,
         enable_new_planner_actions: bool = False,
+        planner_mini_goal_improvements: bool = False,
         extra_action_guidance: str | None = None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, close-page availability, complete criteria, slim output,
+        differ meaningfully (OTP, close-page availability, complete-criterion presence, slim output,
         data extraction goal availability, new planner actions) do not reuse the same Vertex cache object.
         """
         variant_parts: list[str] = []
@@ -4017,14 +4021,14 @@ class ForgeAgent:
             variant_parts.append("de")
         if enable_new_planner_actions:
             variant_parts.append("np")
+        if planner_mini_goal_improvements:
+            variant_parts.append("oi")
         if enriched_tree_enabled:
             variant_parts.append("et")
         if enriched_tree_enabled and not llm_screenshots_enabled:
             variant_parts.append("ni")
         if complete_criterion:
-            normalized = " ".join(complete_criterion.split())
-            digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
-            variant_parts.append(f"cc{digest}")
+            variant_parts.append("cc")
         if slim_output:
             variant_parts.append(f"slim_{slim_output}")
         return "-".join(variant_parts) if variant_parts else "std"
@@ -4188,6 +4192,8 @@ class ForgeAgent:
 
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
+        context = skyvern_context.ensure_context()
+        complete_criterion_is_untrusted = bool(task.complete_criterion and context.complete_criterion_is_untrusted)
         starting_url = task.url
         page = await browser_state.get_working_page()
         current_url = (
@@ -4245,7 +4251,6 @@ class ForgeAgent:
 
         # Validation evidence router (SKY-10620 Route B)
         error_code_mapping_str = json.dumps(task.error_code_mapping) if task.error_code_mapping else None
-        context = skyvern_context.ensure_context()
         local_datetime = datetime.now(context.tz_info).isoformat()
         if task_type == TaskType.validation:
             router_result = await resolve_validation_evidence_route(
@@ -4349,6 +4354,24 @@ class ForgeAgent:
         )
         extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
 
+        # Offer PASTE_TEXT (fill a spreadsheet grid with one tab/newline block) only under the umbrella,
+        # so grid-fill guidance is scoped to the eval org until proven out.
+        planner_mini_goal_improvements = settings.PLANNER_MINI_GOAL_IMPROVEMENTS
+        if not planner_mini_goal_improvements:
+            try:
+                planner_mini_goal_improvements = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "PLANNER_MINI_GOAL_IMPROVEMENTS",
+                    task.organization_id,
+                    properties={"organization_id": task.organization_id},
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to resolve PLANNER_MINI_GOAL_IMPROVEMENTS feature flag; using settings default",
+                    organization_id=task.organization_id,
+                    exc_info=True,
+                )
+                planner_mini_goal_improvements = settings.PLANNER_MINI_GOAL_IMPROVEMENTS
+
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
         recent_dialog_messages_str = (
@@ -4369,12 +4392,14 @@ class ForgeAgent:
                     "current_url": current_url,
                     "data_extraction_goal": task.data_extraction_goal,
                     "enable_new_planner_actions": enable_new_planner_actions,
+                    "planner_mini_goal_improvements": planner_mini_goal_improvements,
                     "action_history": actions_and_results_str,
                     "error_code_mapping_str": error_code_mapping_str,
                     "local_datetime": local_datetime,
                     "verification_code_check": verification_code_check,
                     "extra_action_guidance": extra_action_guidance,
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
+                    "complete_criterion_is_untrusted": complete_criterion_is_untrusted,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "show_close_page_action": show_close_page_action,
                     "show_new_tab_action": show_new_tab_action,
@@ -4397,6 +4422,7 @@ class ForgeAgent:
                     slim_output=slim_output,
                     has_data_extraction_goal=bool(task.data_extraction_goal),
                     enable_new_planner_actions=enable_new_planner_actions,
+                    planner_mini_goal_improvements=planner_mini_goal_improvements,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -4496,12 +4522,14 @@ class ForgeAgent:
                 current_url=current_url,
                 data_extraction_goal=task.data_extraction_goal,
                 enable_new_planner_actions=enable_new_planner_actions,
+                planner_mini_goal_improvements=planner_mini_goal_improvements,
                 action_history=actions_and_results_str,
                 error_code_mapping_str=error_code_mapping_str,
                 local_datetime=local_datetime,
                 verification_code_check=verification_code_check,
                 extra_action_guidance=extra_action_guidance,
                 complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                complete_criterion_is_untrusted=complete_criterion_is_untrusted,
                 terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
                 show_close_page_action=show_close_page_action,
                 show_new_tab_action=show_new_tab_action,

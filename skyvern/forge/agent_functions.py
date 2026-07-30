@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
 
 import aiohttp
 import httpx
@@ -508,20 +508,55 @@ async def _check_svg_eligibility(
     return True
 
 
+def _svg_cache_inputs(element: dict) -> tuple[str, str]:
+    svg_html = json_to_html(_remove_skyvern_attributes(element))
+    svg_hash = hashlib.sha256(svg_html.encode("utf-8")).hexdigest()
+    return svg_html, _get_svg_cache_key(svg_hash)
+
+
+def _svg_cache_key_for_element(element: dict) -> str:
+    return _svg_cache_inputs(element)[1]
+
+
+def _partition_svgs_by_cache_key(
+    elements: list[dict],
+    key_fn: Callable[[dict], str] = _svg_cache_key_for_element,
+) -> tuple[list[dict], list[dict]]:
+    """Split SVG elements into one representative per unique cache key plus the duplicates.
+
+    Converting the representatives first warms the cache, so the duplicates resolve from cache
+    instead of each firing its own identical svg-convert LLM call (the thundering-herd flood).
+    """
+    seen: set[str] = set()
+    representatives: list[dict] = []
+    duplicates: list[dict] = []
+    for element in elements:
+        try:
+            key = key_fn(element)
+        except Exception:
+            representatives.append(element)
+            continue
+        if key in seen:
+            duplicates.append(element)
+        else:
+            seen.add(key)
+            representatives.append(element)
+    return representatives, duplicates
+
+
 async def _convert_svg_to_string(
     element: dict,
     task: Task | None = None,
     step: Step | None = None,
+    *,
+    svg_html: str | None = None,
+    svg_key: str | None = None,
 ) -> None:
     """Convert an SVG element to a string description. Assumes element has already passed eligibility checks."""
     element_id = element.get("id", "")
 
-    svg_element = _remove_skyvern_attributes(element)
-    svg_html = json_to_html(svg_element)
-    hash_object = hashlib.sha256()
-    hash_object.update(svg_html.encode("utf-8"))
-    svg_hash = hash_object.hexdigest()
-    svg_key = _get_svg_cache_key(svg_hash)
+    if svg_html is None or svg_key is None:
+        svg_html, svg_key = _svg_cache_inputs(element)
 
     svg_shape: str | None = None
     refresh_svg_cache = False
@@ -1940,14 +1975,31 @@ class AgentFunction:
                 )
 
             if eligible_svgs:
-                await asyncio.gather(*[_convert_svg_to_string(element, task, step) for element, frame in eligible_svgs])
+                svg_cache_inputs: dict[int, tuple[str, str]] = {}
+
+                def cache_key(element: dict) -> str:
+                    inputs = _svg_cache_inputs(element)
+                    svg_cache_inputs[id(element)] = inputs
+                    return inputs[1]
+
+                async def convert_svg(element: dict) -> None:
+                    svg_html, svg_key = svg_cache_inputs.get(id(element), (None, None))
+                    await _convert_svg_to_string(element, task, step, svg_html=svg_html, svg_key=svg_key)
+
+                svg_representatives, svg_duplicates = _partition_svgs_by_cache_key(
+                    [element for element, _frame in eligible_svgs],
+                    key_fn=cache_key,
+                )
+                await asyncio.gather(*[convert_svg(element) for element in svg_representatives])
+                if svg_duplicates:
+                    await asyncio.gather(*[convert_svg(element) for element in svg_duplicates])
 
             return element_tree
 
         return cleanup_element_tree_func
 
     async def has_code_block_access(self, organization_id: str | None = None) -> bool:
-        return settings.ENABLE_CODE_BLOCK
+        return settings.ENABLE_CODE_BLOCK and not settings.DISABLE_CODE_BLOCK_EXECUTION
 
     async def validate_code_block(self, organization_id: str | None = None) -> None:
         if not await self.has_code_block_access(organization_id):

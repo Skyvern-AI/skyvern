@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -135,6 +136,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     InputOrSelectContext,
     InputTextAction,
+    PasteTextAction,
     ScrapeResult,
     SelectOption,
     SelectOptionAction,
@@ -186,6 +188,11 @@ DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
     "No file download was observed or credited after this action. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
 )
+SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
+    "The sensitive paste completed, but the clipboard could not be cleared. "
+    "Do not repeat the paste; stop and report the clipboard safety failure."
+)
+_PASTE_TEXT_CLIPBOARD_LOCK = asyncio.Lock()
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
@@ -3277,6 +3284,10 @@ class ActionHandler:
         try:
             async with asyncio.timeout(execution_timeout_seconds) as execution_timeout_scope:
                 if action.action_type in ActionHandler._handled_action_types:
+                    if isinstance(action, PasteTextAction) and not await _is_paste_text_action_enabled(task):
+                        actions_result.append(ActionFailure(Exception("PASTE_TEXT action is disabled")))
+                        return actions_result
+
                     invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
                     if invalid_web_action_check:
                         actions_result.extend(invalid_web_action_check)
@@ -3389,6 +3400,24 @@ def _resolve_action_execution_timeout(action: actions.Action) -> float:
     return base
 
 
+async def _is_paste_text_action_enabled(task: Task) -> bool:
+    if settings.PLANNER_MINI_GOAL_IMPROVEMENTS:
+        return True
+    try:
+        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "PLANNER_MINI_GOAL_IMPROVEMENTS",
+            task.organization_id,
+            properties={"organization_id": task.organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to resolve PASTE_TEXT execution gate; refusing execution",
+            organization_id=task.organization_id,
+            exc_info=True,
+        )
+        return False
+
+
 def check_for_invalid_web_action(
     action: actions.Action,
     page: Page,
@@ -3399,7 +3428,7 @@ def check_for_invalid_web_action(
     if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
         return []
 
-    if isinstance(action, InputTextAction) and not action.element_id:
+    if isinstance(action, (InputTextAction, PasteTextAction)) and not action.element_id:
         return []
 
     if isinstance(action, WebAction) and action.element_id not in scraped_page.id_to_element_dict:
@@ -5884,6 +5913,182 @@ async def handle_keypress_action(
     return [ActionSuccess()]
 
 
+async def _write_clipboard_text_in_isolated_world(page: Page, text: str) -> None:
+    cdp_session = await page.context.new_cdp_session(page)
+    try:
+        frame_tree = await cdp_session.send("Page.getFrameTree")
+        frame_id = frame_tree["frameTree"]["frame"]["id"]
+        isolated_world = await cdp_session.send(
+            "Page.createIsolatedWorld",
+            {"frameId": frame_id, "worldName": "skyvern-paste-text"},
+        )
+        result = await cdp_session.send(
+            "Runtime.callFunctionOn",
+            {
+                "functionDeclaration": (
+                    "function(text) {"
+                    "if (!navigator.clipboard) { throw new Error('navigator.clipboard is undefined'); }"
+                    "return navigator.clipboard.writeText(text);"
+                    "}"
+                ),
+                "arguments": [{"value": text}],
+                "executionContextId": isolated_world["executionContextId"],
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        if "exceptionDetails" in result:
+            exception_details = result["exceptionDetails"]
+            description = (
+                (exception_details.get("exception") or {}).get("description")
+                or result.get("result", {}).get("description")
+                or exception_details.get("text")
+            )
+            raise RuntimeError(description or "clipboard write failed")
+    finally:
+        with contextlib.suppress(Exception):
+            await cdp_session.detach()
+
+
+async def _clear_clipboard_after_paste(page: Page) -> bool:
+    try:
+        await _write_clipboard_text_in_isolated_world(page, "")
+        return True
+    except Exception:
+        LOG.warning("paste_text: clipboard clear failed; retrying after navigation settles", exc_info=True)
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.debug("paste_text: page did not settle before clipboard clear retry", exc_info=True)
+
+    try:
+        parsed = urllib.parse.urlparse(page.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+        if origin is not None:
+            await page.context.grant_permissions(["clipboard-write"], origin=origin)
+        await _write_clipboard_text_in_isolated_world(page, "")
+        return True
+    except Exception:
+        LOG.error(
+            "paste_text: clipboard clear failed after navigation-aware retry; pasted text may remain on the clipboard",
+            exc_info=True,
+        )
+        return False
+
+
+@traced(name="skyvern.agent.action.paste_text")
+async def handle_paste_text_action(
+    action: actions.PasteTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    resolved_sensitive_text = False
+    text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+    if text_result is None:
+        return [ActionFailure(FailedToFetchSecret())]
+    paste_text = text_result
+    if task.workflow_run_id is not None:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+        if workflow_run_context is not None:
+            resolved_sensitive_text = workflow_run_context.get_original_secret_value_or_none(action.text) is not None
+            placeholder_tokens = workflow_run_context.find_embedded_placeholder_tokens(action.text)
+            if placeholder_tokens:
+                paste_text = action.text
+                for token in placeholder_tokens:
+                    if workflow_run_context.get_original_secret_value_or_none(token) is not None:
+                        resolved_sensitive_text = True
+                    token_value = get_actual_value_of_parameter_if_secret_with_task(task, token)
+                    if token_value is None:
+                        return [ActionFailure(FailedToFetchSecret())]
+                    if is_unresolved_totp_placeholder(token_value):
+                        return [ActionFailure(NoTOTPSecretFound())]
+                    if is_unresolved_totp_value(token_value):
+                        resolved_sensitive_text = True
+                        try:
+                            token_value = generate_totp_value_with_task(task, token)
+                        except NoTOTPSecretFound as exc:
+                            return [ActionFailure(exc)]
+                    paste_text = paste_text.replace(token, token_value, 1)
+
+    if is_unresolved_totp_placeholder(paste_text):
+        return [ActionFailure(NoTOTPSecretFound())]
+    if is_unresolved_totp_value(paste_text):
+        resolved_sensitive_text = True
+        try:
+            paste_text = generate_totp_value_with_task(task, action.text)
+        except NoTOTPSecretFound as exc:
+            return [ActionFailure(exc)]
+
+    if resolved_sensitive_text and not action.element_id:
+        return [ActionFailure(MissingElement(element_id=action.element_id))]
+
+    # Focus the anchor cell so the paste lands at the intended top-left position.
+    if action.element_id:
+        dom = DomUtil(scraped_page, page)
+        skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+        locator = skyvern_element.get_locator()
+        try:
+            await locator.scroll_into_view_if_needed(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        except Exception:
+            LOG.debug("paste_text: scroll_into_view_if_needed failed", exc_info=True)
+        # Best-effort focus: a grid's inline cell-editing box intercepts pointer events, so a strict
+        # click times out. force clicks through, and a failure still lets the paste land at the
+        # current selection.
+        try:
+            await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, force=True)
+        except Exception as exc:
+            if resolved_sensitive_text:
+                LOG.warning("paste_text: refusing sensitive paste because target focus failed", exc_info=True)
+                return [ActionFailure(exc)]
+            LOG.debug("paste_text: focus click failed; pasting at current selection", exc_info=True)
+        # Exit any inline cell editor the focus opened, then anchor the grid selection at the
+        # top-left cell (Ctrl+Home) so the block distributes across cells from A1, rather than
+        # landing in the formula/name bar as a single merged value.
+        await handler_utils.keypress(page, ["Escape"])
+        await handler_utils.keypress(page, ["ctrl", "Home"])
+
+    # Canvas grid editors expose no per-cell DOM, so cell-by-cell typing truncates.
+    # Set the clipboard and paste so a tab/newline-separated block fills the grid in one atomic operation.
+    # Grant only clipboard write and scope it to this page's origin; skip when no origin can be determined
+    # so later navigations in the same context never inherit a context-wide clipboard grant.
+    try:
+        parsed = urllib.parse.urlparse(page.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+        if origin is None:
+            LOG.debug(
+                "paste_text: skipping clipboard permissions grant because page origin is unavailable", url=page.url
+            )
+        else:
+            await page.context.grant_permissions(["clipboard-write"], origin=origin)
+    except Exception:
+        LOG.debug("paste_text: grant clipboard permissions failed (may already be granted)", exc_info=True)
+    async with _PASTE_TEXT_CLIPBOARD_LOCK:
+        # navigator.clipboard is undefined outside a secure context, so this throws on plain-http pages.
+        try:
+            await _write_clipboard_text_in_isolated_world(page, paste_text)
+        except Exception as e:
+            LOG.info("paste_text: clipboard write unavailable on this page", exc_info=True)
+            return [ActionFailure(e)]
+        try:
+            await handler_utils.keypress(page, ["ControlOrMeta", "v"])
+        finally:
+            clipboard_cleared = await _clear_clipboard_after_paste(page)
+
+    if resolved_sensitive_text and not clipboard_cleared:
+        return [
+            ActionResult(
+                success=True,
+                needs_followup=True,
+                followup_message=SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE,
+                skip_remaining_actions=True,
+            )
+        ]
+    return [ActionSuccess()]
+
+
 @traced(name="skyvern.agent.action.move")
 async def handle_move_action(
     action: actions.MoveAction,
@@ -6109,6 +6314,7 @@ async def handle_execute_js_action(
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
+ActionHandler.register_action_type(ActionType.PASTE_TEXT, handle_paste_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
 ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
