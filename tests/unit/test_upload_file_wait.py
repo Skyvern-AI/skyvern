@@ -6,7 +6,7 @@ import ast
 import asyncio
 import inspect
 import textwrap
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from playwright._impl._errors import Error as PlaywrightError
@@ -14,6 +14,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.actions import handler as handler_module
+from skyvern.webeye.actions.actions import UploadFileAction
 from skyvern.webeye.actions.handler import _wait_for_upload_processing
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 
@@ -56,22 +57,95 @@ async def _run_with_page_ready_error(error: BaseException, engine_selection: Bro
 
 @pytest.mark.asyncio
 async def test_calls_wait_for_page_ready_with_settle_delay() -> None:
+    page = AsyncMock()
+    engine_selection = _engine_selection()
     mock_frame = AsyncMock()
     with (
         patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new_callable=AsyncMock) as mock_create,
         patch("skyvern.webeye.actions.handler.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
     ):
         mock_create.return_value = mock_frame
-        await _wait_for_upload_processing(AsyncMock())
+        await _wait_for_upload_processing(page, engine_selection=engine_selection)
 
     # Settle delay before readiness polling
     mock_sleep.assert_awaited_once_with(0.5)
+    mock_create.assert_awaited_once_with(page, engine_selection=engine_selection)
     mock_frame.wait_for_page_ready.assert_awaited_once_with(
         loading_indicator_timeout_ms=3000,
         network_idle_timeout_ms=3000,
         dom_stable_ms=300,
         dom_stability_timeout_ms=2000,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_selection", [_engine_selection(), None])
+async def test_input_or_select_context_reuses_task_engine_selection(
+    engine_selection: BrowserEngineSelection | None,
+) -> None:
+    task = Mock()
+    step = Mock()
+    frame = Mock()
+    element = Mock()
+    element.get_frame.return_value = frame
+    element.get_element_handler = AsyncMock(return_value=Mock())
+    element.get_frame_id.return_value = "frame-id"
+    element.get_locator.return_value.locator.return_value.element_handle = AsyncMock(return_value=Mock())
+    skyvern_frame = AsyncMock()
+    skyvern_frame.get_element_dom_depth.return_value = 6
+    skyvern_frame.build_tree_from_element.return_value = ([], [])
+    cleanup_factory = Mock(return_value=AsyncMock(return_value=[]))
+    app_instance = object.__getattribute__(handler_module.app, "_inst")
+
+    with (
+        patch.object(handler_module, "resolve_engine_selection_for_task", return_value=engine_selection) as resolve,
+        patch.object(handler_module.SkyvernFrame, "create_instance", AsyncMock(return_value=skyvern_frame)) as create,
+        patch.object(handler_module.app.AGENT_FUNCTION, "cleanup_element_tree_factory", cleanup_factory),
+        patch.object(app_instance, "PARSE_SELECT_LLM_API_HANDLER", AsyncMock(return_value={}), create=True),
+    ):
+        await handler_module._get_input_or_select_context(
+            action=handler_module.AbstractActionForContextParse(reasoning=None, element_id="element", intention=None),
+            skyvern_element=element,
+            element_tree_builder=Mock(),
+            task=task,
+            step=step,
+            engine_selection=engine_selection,
+        )
+    resolve.assert_not_called()
+    create.assert_awaited_once_with(frame, engine_selection=engine_selection)
+    cleanup_factory.assert_called_once_with(step=step, engine_selection=engine_selection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", [_engine_selection(), None])
+async def test_upload_resolves_before_dispatch_and_reuses_exact_selection(selection: object | None) -> None:
+    events: list[str] = []
+    locator = MagicMock(set_input_files=AsyncMock(side_effect=lambda *args, **kwargs: events.append("dispatch")))
+    element = MagicMock(locator=locator, is_file_input=AsyncMock(return_value=True))
+    dom = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element))
+    task = MagicMock(navigation_goal="https://example.test/file", navigation_payload={}, organization_id="org")
+    resolver = Mock(side_effect=lambda *args: events.append("resolve") or selection)
+    wait = AsyncMock(side_effect=lambda *args, **kwargs: events.append("wait"))
+    with (
+        patch.object(handler_module, "DomUtil", return_value=dom),
+        patch.object(
+            handler_module, "get_actual_value_of_parameter_if_secret_with_task", side_effect=lambda _, url: url
+        ),
+        patch.object(handler_module.handler_utils, "download_file", AsyncMock(return_value="/tmp/file")),
+        patch.object(handler_module.SkyvernElement, "wait_until_enabled", AsyncMock(return_value=True)),
+        patch.object(handler_module, "resolve_engine_selection_for_task", resolver),
+        patch.object(handler_module, "_wait_for_upload_processing", wait),
+    ):
+        await handler_module.handle_upload_file_action(
+            UploadFileAction(element_id="file", file_url="https://example.test/file"),
+            MagicMock(),
+            MagicMock(),
+            task,
+            MagicMock(),
+        )
+    assert events == ["resolve", "dispatch", "wait"]
+    resolver.assert_called_once_with(task, handler_module.app.BROWSER_MANAGER)
+    assert wait.await_args.kwargs["engine_selection"] is selection
 
 
 @pytest.mark.asyncio
