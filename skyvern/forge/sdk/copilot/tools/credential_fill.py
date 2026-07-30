@@ -7,15 +7,16 @@ import structlog
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, admit_credential_for_live_page
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
-from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential, TotpType
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialVaultType, PasswordCredential, TotpType
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 
 from .banned_blocks import _copilot_block_authoring_policy
@@ -68,7 +69,7 @@ def _scrub_secret_from_text(text: str, secret_value: str) -> str:
     return text.replace(secret_value, REDACTED_SECRET_PLACEHOLDER)
 
 
-def _credential_fill_policy_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
+def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
     if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return (
             "fill_credential_field is only available in code-only browser authoring mode. "
@@ -80,10 +81,26 @@ def _credential_fill_policy_error(copilot_ctx: AgentContext, credential_id: str)
             "Saved-credential scouting is not authorized for this request. "
             "Ask the user for the required credential or clarification before filling credential fields."
         )
+    return None
+
+
+def _still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
+    """Whether the browser is still on the origin whose login page granted this credential.
+
+    Compared at origin, not at the tier that granted it: a real sign-in walks email -> password ->
+    one-time code across several paths of the same site, and refusing those would refuse the login
+    the grant exists for. What it still stops is the secret following a redirect off the site.
+    """
+    admitted_parts = url_parts(admitted_url)
+    current_parts = url_parts(current_url or "")
+    return bool(current_parts and admitted_parts and current_parts[2] == admitted_parts[2])
+
+
+def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
+    policy = copilot_ctx.request_policy
     resolved_ids = {
         credential.credential_id
-        for credential in policy.resolved_credentials
-        if isinstance(getattr(credential, "credential_id", None), str)
+        for credential in (policy.resolved_credentials if isinstance(policy, RequestPolicy) else [])
     }
     if credential_id not in resolved_ids:
         return (
@@ -93,6 +110,43 @@ def _credential_fill_policy_error(copilot_ctx: AgentContext, credential_id: str)
             "credential to use, or bind the credential as an untested draft parameter without running it."
         )
     return None
+
+
+async def _credential_fill_gate_error(copilot_ctx: AgentContext, credential_id: str) -> tuple[str | None, str | None]:
+    """Refuse only after asking the live page whether it vouches for this credential.
+
+    Returns the refusal (if any) and the page URL that justified an admission, so the caller can
+    confirm the browser is still on that page before the secret is typed.
+    """
+    prerequisite_error = _credential_fill_prerequisite_error(copilot_ctx, credential_id)
+    if prerequisite_error:
+        return prerequisite_error, None
+    policy = copilot_ctx.request_policy
+    authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
+    if not authority_error:
+        # A grant the live page made stays bound to that page: re-checking only the call that
+        # made it would let the retry after a redirect inherit authority it never earned.
+        admitted = policy.live_page_admitted_urls.get(credential_id) if isinstance(policy, RequestPolicy) else None
+        return None, admitted
+
+    if not isinstance(policy, RequestPolicy):
+        return authority_error, None
+
+    async def load_once() -> list[Credential]:
+        if copilot_ctx.org_credentials_for_turn is None:
+            copilot_ctx.org_credentials_for_turn = await load_credentials(copilot_ctx.organization_id)
+        return copilot_ctx.org_credentials_for_turn
+
+    admission = await admit_credential_for_live_page(
+        policy,
+        organization_id=copilot_ctx.organization_id,
+        credential_id=credential_id,
+        page_url=await _live_working_page_url(copilot_ctx) or "",
+        load_org_credentials=load_once,
+    )
+    if admission.admitted:
+        return None, admission.page_url
+    return admission.steer or authority_error, None
 
 
 async def _resolve_credential_fill_value(
@@ -201,7 +255,7 @@ async def _fill_credential_field_impl(
         return finish({"ok": False, "error": "fill_credential_field requires a CSS selector for the input field."})
     if field not in _CREDENTIAL_FILL_FIELDS:
         return finish({"ok": False, "error": "fill_credential_field `field` must be one of: username, password, totp."})
-    policy_error = _credential_fill_policy_error(copilot_ctx, credential_id)
+    policy_error, admitted_page = await _credential_fill_gate_error(copilot_ctx, credential_id)
     if policy_error:
         LOG.info(
             "copilot fill_credential_field rejected tool-side",
@@ -222,6 +276,19 @@ async def _fill_credential_field_impl(
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
+            # Checked on the page about to be filled, with nothing awaited in between: the vault read
+            # and the evidence capture above both give a redirect room to move the browser.
+            if admitted_page and not _still_on_admitted_site(page.url, admitted_page):
+                return finish(
+                    {
+                        "ok": False,
+                        "error": (
+                            "The browser left the site whose login page authorized this credential "
+                            "before it could be filled. Re-inspect the current page and fill again if "
+                            "the sign-in is still in progress there."
+                        ),
+                    }
+                )
             await page.fill(selector, value, mode="direct", timeout=_CREDENTIAL_FILL_TIMEOUT_MS)
     except Exception as exc:
         error_text = scrub_secrets_from_text(copilot_ctx, _scrub_secret_from_text(str(exc), value))

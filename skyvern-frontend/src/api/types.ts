@@ -1013,7 +1013,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
 
@@ -1092,7 +1092,7 @@ export type PasswordCredential = {
   username: string;
   password: string;
   totp: string | null;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
 

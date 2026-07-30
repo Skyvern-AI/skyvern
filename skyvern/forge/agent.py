@@ -3994,6 +3994,7 @@ class ForgeAgent:
         slim_output: str | None = None,
         has_data_extraction_goal: bool = False,
         enable_new_planner_actions: bool = False,
+        extra_action_guidance: str | None = None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
@@ -4003,6 +4004,9 @@ class ForgeAgent:
         variant_parts: list[str] = []
         if verification_code_check:
             variant_parts.append("vc")
+        if extra_action_guidance:
+            digest = hashlib.sha256(extra_action_guidance.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+            variant_parts.append(f"g{digest}")
         if show_close_page_action:
             variant_parts.append("cp")
         if show_new_tab_action:
@@ -4343,6 +4347,7 @@ class ForgeAgent:
             task.workflow_run_id if task.workflow_run_id else task.task_id,
             properties={"task_url": task.url, "organization_id": task.organization_id},
         )
+        extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
 
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
@@ -4368,6 +4373,7 @@ class ForgeAgent:
                     "error_code_mapping_str": error_code_mapping_str,
                     "local_datetime": local_datetime,
                     "verification_code_check": verification_code_check,
+                    "extra_action_guidance": extra_action_guidance,
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "show_close_page_action": show_close_page_action,
@@ -4381,6 +4387,7 @@ class ForgeAgent:
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
+                    extra_action_guidance=extra_action_guidance,
                     show_close_page_action=show_close_page_action,
                     show_new_tab_action=show_new_tab_action,
                     show_switch_tab_action=show_switch_tab_action,
@@ -4493,6 +4500,7 @@ class ForgeAgent:
                 error_code_mapping_str=error_code_mapping_str,
                 local_datetime=local_datetime,
                 verification_code_check=verification_code_check,
+                extra_action_guidance=extra_action_guidance,
                 complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                 terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
                 show_close_page_action=show_close_page_action,

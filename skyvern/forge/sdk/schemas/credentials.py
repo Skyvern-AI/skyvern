@@ -33,6 +33,7 @@ class TotpType(StrEnum):
     AUTHENTICATOR = "authenticator"
     EMAIL = "email"
     TEXT = "text"
+    PASSKEY = "passkey"
     NONE = "none"
 
 
@@ -125,6 +126,16 @@ class PasswordCredential(BaseModel):
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
     )
+    metadata: dict[str, str] | None = Field(
+        default=None,
+        description="Optional additional password credential metadata fields",
+    )
+
+    @model_validator(mode="after")
+    def normalize_empty_optional_fields(self) -> Self:
+        if self.metadata == {}:
+            self.metadata = None
+        return self
 
 
 class NonEmptyPasswordCredential(PasswordCredential):

@@ -35,6 +35,10 @@ def make_workflow_run(
     return wfr
 
 
+def configure_browser_context_acquired_hook(mock_app: MagicMock) -> None:
+    mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+
+
 class _StopBeforeBrowserContext(Exception):
     pass
 
@@ -76,6 +80,7 @@ async def test_pbs_workflow_run_cache_hit_on_second_call() -> None:
 
     workflow_run = make_workflow_run("wfr_child")
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         result = await manager.get_or_create_for_workflow_run(
             workflow_run=workflow_run,
             url="https://example.com",
@@ -100,6 +105,7 @@ async def test_pbs_workflow_run_does_not_inherit_parent_browser() -> None:
     pbs_state.get_or_create_page = AsyncMock()
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
 
@@ -257,6 +263,7 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
     session = make_session(proxy_location=session_proxy)
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
@@ -283,6 +290,7 @@ async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -
     session = make_session(proxy_location="RESIDENTIAL_ISP", proxy_session_id="abc1234567")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
@@ -311,6 +319,7 @@ async def test_task_browser_uses_task_proxy_when_session_has_no_proxy() -> None:
     session = make_session(proxy_location=None)
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -339,6 +348,7 @@ async def test_workflow_run_browser_inherits_session_proxy_when_no_browser_state
     session = make_session(proxy_location=session_proxy)
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -369,6 +379,7 @@ async def test_workflow_run_browser_inherits_session_proxy_pin_when_no_browser_s
     session = make_session(proxy_location="RESIDENTIAL_ISP", proxy_session_id="abc1234567")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
@@ -403,6 +414,7 @@ async def test_workflow_run_browser_uses_workflow_proxy_when_session_has_no_prox
     session = make_session(proxy_location=None)
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -717,6 +729,7 @@ async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
         patch("skyvern.webeye.real_browser_manager.app") as mock_app,
         patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
     ):
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
 
@@ -744,6 +757,7 @@ async def test_pbs_adoption_skips_rebind_when_no_browser() -> None:
         patch("skyvern.webeye.real_browser_manager.app") as mock_app,
         patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
     ):
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
 
@@ -818,6 +832,7 @@ async def test_pbs_navigate_evicts_and_retries_on_connection_closed_driver_error
     workflow_run = make_workflow_run("wfr_pbs")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -855,6 +870,7 @@ async def test_pbs_navigate_does_not_retry_on_unrelated_error() -> None:
     workflow_run = make_workflow_run("wfr_pbs")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=stale)
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -890,6 +906,7 @@ async def test_pbs_navigate_does_not_evict_on_page_only_close() -> None:
     workflow_run = make_workflow_run("wfr_pbs")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=stale)
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -929,6 +946,7 @@ async def test_pbs_recovery_path_passes_expected_state_to_public_evict() -> None
         patch("skyvern.webeye.real_browser_manager.app") as mock_app,
         patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock),
     ):
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -969,6 +987,7 @@ async def test_pbs_recovery_path_rebinds_download_dir_on_fresh_browser() -> None
         patch("skyvern.webeye.real_browser_manager.app") as mock_app,
         patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
     ):
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -1006,6 +1025,7 @@ async def test_pbs_navigate_skips_recovery_when_manager_cannot_reconnect() -> No
     workflow_run = make_workflow_run("wfr_pbs")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=stale)
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -1047,6 +1067,7 @@ async def test_pbs_recovery_falls_through_to_get_or_create_page_when_fresh_state
     workflow_run = make_workflow_run("wfr_pbs")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
         mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()

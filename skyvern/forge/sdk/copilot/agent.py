@@ -1898,8 +1898,8 @@ def _make_agent_result(
             pause_outcome = ctx.credential_pause_outcome
             if pause_outcome:
                 pause_payload = {"outcome": pause_outcome}
-                if pause_outcome == "connected" and ctx.request_policy and ctx.request_policy.resolved_credentials:
-                    pause_payload["credentialId"] = ctx.request_policy.resolved_credentials[-1].credential_id
+                if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
+                    pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
                 payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
             payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))

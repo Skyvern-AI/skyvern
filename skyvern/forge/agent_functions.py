@@ -6,7 +6,7 @@ import hashlib
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -39,6 +39,16 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_poli
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.credentials import (
+    CreateCredentialRequest,
+    Credential,
+    CredentialItem,
+    CredentialType,
+    CredentialVaultType,
+    NonEmptyCreditCardCredential,
+    NonEmptyPasswordCredential,
+    SecretCredential,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import (
@@ -66,6 +76,7 @@ if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -1165,6 +1176,13 @@ class AgentFunction:
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
+    async def on_browser_context_acquired(
+        self,
+        browser_context: Any,
+        workflow_run_id: str | None,
+    ) -> None:
+        return
+
     async def validate_step_execution(
         self,
         task: Task,
@@ -1218,6 +1236,62 @@ class AgentFunction:
         totp_secret: str,
         organization_id: str | None = None,
     ) -> str | None:
+        return None
+
+    async def validate_credential_write(
+        self,
+        *,
+        organization_id: str,
+        credential_type: CredentialType,
+        credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential | SecretCredential,
+        existing_credential: Credential | None = None,
+    ) -> None:
+        return
+
+    async def prepare_credential_update(
+        self,
+        *,
+        credential_service: CredentialVaultService,
+        existing_credential: Credential,
+        data: CreateCredentialRequest,
+    ) -> CreateCredentialRequest:
+        return data
+
+    async def should_lock_credential_write(
+        self,
+        *,
+        credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential | SecretCredential | None,
+        existing_credential: Credential,
+    ) -> bool:
+        return False
+
+    def credential_write_lock(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+    ) -> AbstractAsyncContextManager[None]:
+        return nullcontext()
+
+    async def on_credential_item_orphaned(
+        self,
+        *,
+        organization_id: str,
+        item_id: str,
+        vault_type: CredentialVaultType,
+    ) -> None:
+        return
+
+    async def process_registered_credential_item(
+        self,
+        *,
+        workflow_run_id: str | None,
+        db_credential: Credential,
+        credential_item: CredentialItem,
+    ) -> CredentialItem:
+        return credential_item
+
+    async def get_extra_extract_action_guidance(self, task: Task) -> str | None:
         return None
 
     async def parse_enterprise_totp_secret_result(
@@ -2254,6 +2328,16 @@ class AgentFunction:
         organization_id: str,
         workflow_id: str,
         status: WorkflowRunStatus | None = None,
+    ) -> None:
+        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        return None
+
+    async def on_workflow_run_terminal(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
     ) -> None:
         """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
         return None
