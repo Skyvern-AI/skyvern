@@ -46,7 +46,7 @@ class TotpCode(UniversalBaseModel):
 
     type: typing.Optional[OtpType] = pydantic.Field(default=None)
     """
-    Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+    Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
     """
 
     totp_code_id: str = pydantic.Field()
