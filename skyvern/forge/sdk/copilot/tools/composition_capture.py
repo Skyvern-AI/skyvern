@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -11,11 +10,6 @@ import structlog
 
 from skyvern.forge.sdk.copilot.build_test_outcome import maybe_satisfy_recorded_outcome_grounding_requirement
 from skyvern.forge.sdk.copilot.challenge_evidence import challenge_evidence_unsettled
-from skyvern.forge.sdk.copilot.completion_verification import (
-    CompletionVerificationResult,
-    RunEvidenceSnapshot,
-    evaluate_completion_criteria,
-)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
@@ -27,13 +21,8 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
-)
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.request_policy import completion_criterion_requires_active_run_terminal_monitor
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
 )
@@ -50,13 +39,10 @@ from ._shared import (
     _discovery_navigate,
     _fallback_page_info,
     _same_page_ignoring_fragment,
-    _valid_runtime_anchor_url,
     _workflow_verification_evidence,
 )
 from .blockers import _allows_post_run_current_page_inspection_budget_bypass
 from .completion import (
-    _completion_verification_criteria,
-    _completion_verification_handler,
     _maybe_run_completion_verification_from_page_observation,
 )
 from .discovery import _resolve_discovery_entry_url
@@ -70,160 +56,6 @@ from .scouting import (
 )
 
 LOG = structlog.get_logger()
-
-
-@dataclass(frozen=True)
-class ActiveRunTerminalEvidenceSample:
-    current_url: str | None
-    page_title: str | None
-    page_evidence: dict[str, Any]
-    completion_verification: CompletionVerificationResult
-    sample_index: int
-
-
-async def _active_run_terminal_monitor_enabled(copilot_ctx: Any) -> bool:
-    if not getattr(copilot_ctx, "browser_session_id", None):
-        return False
-    if not getattr(copilot_ctx, "discovery_mcp_server", None):
-        return False
-    criteria = _completion_verification_criteria(copilot_ctx)
-    if not criteria:
-        return False
-    if not any(completion_criterion_requires_active_run_terminal_monitor(criterion) for criterion in criteria):
-        return False
-    return await _completion_verification_handler(copilot_ctx) is not None
-
-
-def _active_run_terminal_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
-    if page_evidence_needs_visual_fallback(evidence):
-        return True
-    return evidence.get("screenshot_used") is not True
-
-
-async def _active_run_terminal_evidence_sample(
-    copilot_ctx: Any,
-    *,
-    workflow_run_id: str,
-    labels_to_execute: list[str],
-    sample_index: int,
-) -> ActiveRunTerminalEvidenceSample | None:
-    criteria = _completion_verification_criteria(copilot_ctx)
-    if not criteria:
-        return None
-    handler = await _completion_verification_handler(copilot_ctx)
-    if handler is None:
-        return None
-
-    current_url_raw, page_title_raw = await _fallback_page_info(copilot_ctx)
-    current_url = _valid_runtime_anchor_url(current_url_raw)
-    if current_url is None:
-        return None
-
-    evidence, html_error = await _capture_composition_evidence(
-        copilot_ctx,
-        inspected_url=current_url,
-        current_url=current_url,
-        active_run_terminal_sample=True,
-        # The executor is still driving this page; solving here would act on a run this turn
-        # does not own, and spend the turn's attempts on a sample.
-        solve_challenges=False,
-    )
-    if html_error is not None or evidence is None:
-        LOG.info(
-            "copilot active-run terminal evidence sample skipped",
-            workflow_run_id=workflow_run_id,
-            sample_index=sample_index,
-            html_error=html_error,
-        )
-        return None
-
-    page_title = evidence.get("page_title")
-    if not isinstance(page_title, str) or not page_title.strip():
-        page_title = page_title_raw if isinstance(page_title_raw, str) and page_title_raw.strip() else None
-    evidence = {
-        **evidence,
-        "workflow_run_id": workflow_run_id,
-        "observed_during_active_workflow_run": True,
-    }
-    snapshot = RunEvidenceSnapshot(
-        workflow_run_id=workflow_run_id,
-        current_url=current_url,
-        page_title=page_title,
-        executed_block_labels=list(labels_to_execute),
-        page_evidence=evidence,
-    )
-    if not snapshot.has_evidence():
-        return None
-
-    result = await evaluate_completion_criteria(criteria, snapshot, handler)
-    LOG.info(
-        "copilot active-run terminal evidence sample",
-        workflow_run_id=workflow_run_id,
-        sample_index=sample_index,
-        completion_verification_status=result.status,
-        completion_verification_fully_satisfied=result.is_fully_satisfied(),
-    )
-    if result.status != "evaluated" or not result.is_fully_satisfied():
-        return None
-    copilot_ctx.composition_page_evidence = evidence
-    return ActiveRunTerminalEvidenceSample(
-        current_url=current_url,
-        page_title=page_title,
-        page_evidence=evidence,
-        completion_verification=result,
-        sample_index=sample_index,
-    )
-
-
-def _active_run_terminal_evidence_result(
-    *,
-    workflow_run_id: str,
-    run_status: str | None,
-    sample: Any,
-    requested_block_labels: list[str],
-    executed_block_labels: list[str],
-    current_url: str | None = None,
-    page_title: str | None = None,
-) -> dict[str, Any]:
-    observed_url = current_url or getattr(sample, "current_url", None)
-    observed_title = page_title or getattr(sample, "page_title", None)
-    completion = getattr(sample, "completion_verification", None)
-    completion_trace = completion.to_trace_data() if isinstance(completion, CompletionVerificationResult) else {}
-    reason = (
-        "The active run reached the requested browser state while the workflow was still running, "
-        "so Copilot interrupted it before further browser actions could overshoot that state. "
-        "The current page evidence is not a durable full-workflow verification; inspect the run boundary, "
-        "repair the workflow if needed, and verify the corrected workflow run."
-    )
-    return {
-        "ok": False,
-        "error": reason,
-        "data": {
-            "workflow_run_id": workflow_run_id,
-            "overall_status": run_status,
-            "failure_reason": reason,
-            "requested_block_labels": list(requested_block_labels),
-            "executed_block_labels": list(executed_block_labels),
-            "current_url": observed_url,
-            "page_title": observed_title,
-            "active_run_terminal_evidence_detected": True,
-            "active_run_terminal_evidence_reason_code": ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
-            "active_run_terminal_evidence_sample_index": getattr(sample, "sample_index", None),
-            "full_workflow_verified": False,
-            "current_page_evidence": getattr(sample, "page_evidence", None),
-            "active_run_terminal_completion_verification": completion_trace,
-            "failure_categories": [
-                {
-                    "category": ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-                    "confidence_float": 1.0,
-                    "reasoning": (
-                        "Bounded current-page evidence matched the request-policy completion criteria "
-                        "while the workflow run was still active; the run was interrupted for diagnosis/repair."
-                    ),
-                }
-            ],
-        },
-    }
 
 
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
@@ -609,7 +441,6 @@ async def _capture_composition_evidence(
     *,
     inspected_url: str,
     current_url: str,
-    active_run_terminal_sample: bool = False,
     solve_challenges: bool = True,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
@@ -657,7 +488,6 @@ async def _capture_composition_evidence(
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
-        or (active_run_terminal_sample and _active_run_terminal_evidence_needs_visual_fallback(evidence))
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)

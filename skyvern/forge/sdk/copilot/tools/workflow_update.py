@@ -67,7 +67,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
     author_time_code_block_diagnostics,
-    sandbox_unresolved_name_diagnostics,
+    sandbox_absent_name_diagnostics,
     sandbox_unresolved_name_repair_diagnostic,
     strip_redundant_sandbox_imports,
 )
@@ -166,8 +166,6 @@ from skyvern.forge.sdk.copilot.output_contracts import (
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
 from skyvern.forge.sdk.copilot.output_policy import (
-    OutputPolicyReason,
-    OutputPolicyVerdict,
     demote_author_time_steer_reasons,
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -1010,9 +1008,9 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
             f"Code block `{label}` failed the generated-code preflight check: {item.message}"
             for item in author_time_diagnostics
         )
-        unresolved_diagnostics = sandbox_unresolved_name_diagnostics(code, parameter_keys=parameter_keys)
+        absent_diagnostics = sandbox_absent_name_diagnostics(code, parameter_keys=parameter_keys)
         errors.extend(
-            f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
+            f"Code block `{label}` failed the sandbox name check: {item.message}" for item in absent_diagnostics
         )
     return errors
 
@@ -10430,7 +10428,6 @@ async def _update_workflow(
                 "steered_reason_codes": [reason.value for reason in output_policy_steered_reasons],
             }
         output_policy_error = format_output_policy_tool_error(output_policy_verdict)
-        _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
             "copilot output policy tool body verdict",
             **output_policy_trace_data,
@@ -10607,22 +10604,6 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
             "input_proxy_location_present": input_present,
             "input_proxy_location": input_proxy_location,
             "effective_proxy_location": effective_proxy_location,
-        },
-    ):
-        pass
-
-
-def _record_code_only_raw_secret_reject_span(ctx: AgentContext, verdict: OutputPolicyVerdict) -> None:
-    if OutputPolicyReason.RAW_SECRET_LEAK not in verdict.reason_codes:
-        return
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return
-    with copilot_span(
-        "update_workflow_code_only_raw_secret_reject",
-        data={
-            "tool_name": "update_workflow",
-            "reason_code": OutputPolicyReason.RAW_SECRET_LEAK.value,
-            "block_authoring_policy": BlockAuthoringPolicy.CODE_ONLY_BROWSER.value,
         },
     ):
         pass

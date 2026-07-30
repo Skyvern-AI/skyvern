@@ -6,6 +6,16 @@ import re
 # timeout finalizes a run. Word-anchored so "inactivity timeout" (a distinct page-level reason)
 # is NOT caught and correctly stays PAGE_LOAD_TIMEOUT.
 _INFRA_TIMEOUT_RE = re.compile(r"\b(?:activity|heartbeat) timeout\b")
+# Playwright names the operation that timed out. A locator operation waiting for an element to
+# reach a state is not a page-load failure, and telling the user to confirm the URL for one sends
+# both them and copilot repair after the wrong thing. Truncated messages keep only the call-log
+# tail ("waiting for locator(...)"), so the bare forms match too.
+_ELEMENT_OPERATION_RE = re.compile(
+    r"\b(?:locator\.[a-z_]+\b|locator\(|wait_for_selector\b|waiting for selector\b|get_by_[a-z_]+)"
+)
+# Selector payloads name page structure, not failure semantics: `locator('#password')` is the
+# element waited for, not a rejected login. Auth keyword scans run on text with these excised.
+_SELECTOR_PAYLOAD_RE = re.compile(r"(?:locator|get_by_[a-z_]+|wait_for_selector)\([^)]*\)|selector ['\"][^'\"]*['\"]")
 
 
 def classify_from_failure_reason(
@@ -28,9 +38,9 @@ def classify_from_failure_reason(
     where the absence of a classification may simply mean the termination was
     user-guided / expected.
 
-    Categories (16):
+    Categories (17):
         ANTI_BOT_DETECTION, PROXY_ERROR, BROWSER_ERROR, NAVIGATION_FAILURE,
-        PAGE_LOAD_TIMEOUT, AUTH_FAILURE, LLM_ERROR, CREDENTIAL_ERROR,
+        PAGE_LOAD_TIMEOUT, ELEMENT_STATE_TIMEOUT, AUTH_FAILURE, LLM_ERROR, CREDENTIAL_ERROR,
         DATA_EXTRACTION_FAILURE, ELEMENT_NOT_FOUND, WRONG_PAGE_STATE,
         MAX_STEPS_EXCEEDED, LLM_REASONING_ERROR, INFRASTRUCTURE_ERROR,
         PARAMETER_BINDING_ERROR, UNKNOWN
@@ -39,13 +49,14 @@ def classify_from_failure_reason(
         return None
 
     reason = (failure_reason or "").lower()
+    auth_scan_reason = _SELECTOR_PAYLOAD_RE.sub(" ", reason)
     exc_name = type(exception).__name__ if exception else (exception_name or "")
 
     categories: list[dict] = []
 
     # Bot detection / CAPTCHA — use specific phrases to avoid false positives
     _auth_context_keywords = ["login", "auth", "password", "permission", "credential"]
-    _has_auth_context = any(kw in reason for kw in _auth_context_keywords)
+    _has_auth_context = any(kw in auth_scan_reason for kw in _auth_context_keywords)
     _antibot_keywords = [
         "captcha",
         "cloudflare",
@@ -130,8 +141,22 @@ def classify_from_failure_reason(
             }
         )
 
+    _is_timeout = "Timeout" in exc_name or "timeout" in reason
+    _is_element_state_timeout = _is_timeout and bool(_ELEMENT_OPERATION_RE.search(reason))
+
+    # Element-state timeout — a locator operation that never reached the state it waited for.
+    if _is_element_state_timeout:
+        categories.append(
+            {
+                "category": "ELEMENT_STATE_TIMEOUT",
+                "confidence_float": 0.85,
+                "reason_code": "locator_wait_for_timeout",
+                "reasoning": "Locator operation timed out waiting for element state",
+            }
+        )
+
     # Page load timeout
-    if ("Timeout" in exc_name or "timeout" in reason) and not _is_infra_timeout:
+    if _is_timeout and not _is_infra_timeout and not _is_element_state_timeout:
         categories.append(
             {
                 "category": "PAGE_LOAD_TIMEOUT",
@@ -140,9 +165,10 @@ def classify_from_failure_reason(
             }
         )
 
-    # Auth failure — also catches "access denied" when auth context is present
-    if any(kw in reason for kw in ["login fail", "authentication fail", "auth fail", "mfa", "password"]) or (
-        "access denied" in reason and _has_auth_context
+    # Auth failure — also catches "access denied" when auth context is present. Selector payloads
+    # are stripped above, so a genuine auth message keeps its signal even alongside a locator timeout.
+    if any(kw in auth_scan_reason for kw in ["login fail", "authentication fail", "auth fail", "mfa", "password"]) or (
+        "access denied" in auth_scan_reason and _has_auth_context
     ):
         categories.append(
             {

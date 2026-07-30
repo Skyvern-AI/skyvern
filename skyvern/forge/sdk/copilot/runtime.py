@@ -216,6 +216,11 @@ class ScoutedInteraction(TypedDict):
     control_value_satisfied: NotRequired[bool]
     trajectory_index: NotRequired[int]
     carried: NotRequired[bool]
+    # A read the scout proved on the live page: the expression it ran and the output path the
+    # value answers. Recorded so authoring quotes a proven read instead of guessing a selector.
+    read_expression: NotRequired[str]
+    read_output_path: NotRequired[str]
+    read_result_shape: NotRequired[str]
     # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
     # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
     ambiguous: NotRequired[bool]
@@ -237,16 +242,6 @@ class ScoutedInteraction(TypedDict):
     # Stamped when exploration met a challenge here; read back by composition_challenge_carrier
     # so synthesis emits solve_captcha(page) at this boundary.
     challenge_state: NotRequired[dict[str, Any]]
-
-
-@dataclass(frozen=True)
-class PostRunPagePathInteractionWindow:
-    structural_key: str
-    workflow_run_id: str
-    trajectory_anchor: int
-    admitted_attempts: int = 0
-    observation_generation: int = 0
-    observed_successful_interactions: int = 0
 
 
 @dataclass
@@ -412,7 +407,6 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_page_observation_generation: int = 0
-    post_run_page_path_interaction_window: PostRunPagePathInteractionWindow | None = None
     post_run_current_page_inspection_workflow_run_id: str | None = None
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
@@ -436,7 +430,6 @@ class AgentContext:
     # Ordered (method, receiver) browser mutations of the last successfully persisted draft's code
     # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
     persisted_draft_browser_calls: list[tuple[str, str]] | None = None
-    scouted_spine_checkpoint_fired: bool = False
     scouted_spine_previous_omission_digest: str | None = None
     scouted_spine_repeated_identical_missing_steps: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
@@ -542,6 +535,9 @@ class AgentContext:
     # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
     # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
     pending_scout_dynamic_row: ScoutedDynamicRowEvidence | None = None
+    # Expression of an in-flight evaluate, stashed pre-dispatch: the MCP response carries only the
+    # result, so a post-hook that wants the expression must receive it from the invocation side.
+    pending_scout_read_expression: str | None = None
     # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
     # directly instead of silently accepting a dynamically attached dependency.
     discovery_mcp_server: SkyvernOverlayMCPServer | None = None
