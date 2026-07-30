@@ -92,8 +92,12 @@ class ActivePageCdpInputSession:
             fall_back_to_captured=self.cdp_session is None,
         )
         if page is None:
-            self.page_resolution_failed = True
             self.next_refresh_at = now + self.refresh_interval
+            if self.cdp_session is not None:
+                # _resolve_working_page returns None on a transient failure precisely so the caller
+                # keeps the live page; dropping the bound session here strands user input instead.
+                return self.cdp_session
+            self.page_resolution_failed = True
             return None
 
         self.page_resolution_failed = False

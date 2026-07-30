@@ -541,6 +541,10 @@ def setup_logger() -> None:
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             foreign_pre_chain=[
+                # Without this, `extra={...}` on a stdlib log call is silently dropped
+                # and never becomes a queryable attribute. Modules that run in images
+                # without structlog installed have no other route to structured fields.
+                structlog.stdlib.ExtraAdder(),
                 add_error_processor,
                 structlog.processors.format_exc_info,
             ],

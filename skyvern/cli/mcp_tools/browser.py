@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import mimetypes
 import os
 import re
+import stat
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 from uuid import uuid4
 
 import structlog
+from playwright.async_api import FilePayload
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
@@ -54,8 +58,11 @@ from skyvern.cli.core.guards import (
 )
 from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
+from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 
@@ -88,6 +95,7 @@ from ._session import (
     get_current_session,
     get_page,
     get_session_ref,
+    is_stdio_local_file_access_enabled,
     no_browser_error,
     page_ref_key,
     replace_session_ref_map,
@@ -101,6 +109,71 @@ _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _ERROR_MESSAGE_MAX_CHARS = 500
 _ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
+_LOCAL_UPLOAD_MAX_FILES = 20
+_LOCAL_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+_LOCAL_UPLOAD_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+
+
+def _read_run_owned_upload(candidate_path: str, run_id: str, max_bytes: int) -> FilePayload:
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nonblocking_flag = getattr(os, "O_NONBLOCK", None)
+    if nofollow_flag is None or directory_flag is None or nonblocking_flag is None or not _LOCAL_UPLOAD_SUPPORTS_DIR_FD:
+        raise PermissionError("Secure local file access is not supported on this platform")
+
+    allowed_root = (Path(settings.DOWNLOAD_PATH) / run_id).resolve(strict=True)
+    resolved_candidate = Path(candidate_path).resolve(strict=True)
+    try:
+        relative_path = resolved_candidate.relative_to(allowed_root)
+    except ValueError as exc:
+        raise PermissionError("Local file is outside the run upload directory") from exc
+    if not relative_path.parts:
+        raise PermissionError("Local upload path must identify a file")
+
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_open_flags = os.O_RDONLY | close_on_exec | nofollow_flag | directory_flag
+    file_open_flags = os.O_RDONLY | close_on_exec | nofollow_flag | nonblocking_flag
+    directory_fds: list[int] = []
+    file_fd: int | None = None
+    try:
+        directory_fds.append(os.open(allowed_root, directory_open_flags))
+        for component in relative_path.parts[:-1]:
+            directory_fds.append(os.open(component, directory_open_flags, dir_fd=directory_fds[-1]))
+        file_fd = os.open(relative_path.parts[-1], file_open_flags, dir_fd=directory_fds[-1])
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise PermissionError("Local upload path must identify a regular file")
+        if file_stat.st_size > max_bytes:
+            raise ValueError("Local upload file exceeds the size limit")
+
+        with os.fdopen(file_fd, "rb") as upload_file:
+            file_fd = None
+            content = upload_file.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValueError("Local upload file exceeds the size limit")
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+    mime_type = mimetypes.guess_type(resolved_candidate.name)[0] or "application/octet-stream"
+    return FilePayload(name=resolved_candidate.name, mimeType=mime_type, buffer=content)
+
+
+def _read_run_owned_uploads(file_paths: list[str], run_id: str | None) -> list[FilePayload]:
+    if run_id is None:
+        raise PermissionError("Local file upload requires an allowed download scope")
+    if len(file_paths) > _LOCAL_UPLOAD_MAX_FILES:
+        raise ValueError("Too many local upload files")
+
+    payloads: list[FilePayload] = []
+    remaining_bytes = _LOCAL_UPLOAD_MAX_BYTES
+    for file_path in file_paths:
+        payload = _read_run_owned_upload(file_path, run_id, remaining_bytes)
+        payloads.append(payload)
+        remaining_bytes -= len(payload["buffer"])
+    return payloads
 
 
 def _trajectory_source_url(page: Any) -> str | None:
@@ -747,7 +820,11 @@ async def skyvern_file_upload(
     file_paths: Annotated[
         list[str],
         Field(
-            description="List of file paths or URLs to upload. URLs are downloaded automatically. Max 50MB per file."
+            description=(
+                "List of file paths or URLs to upload. Local files must be in the active run's download directory, "
+                "or the local server download directory for stdio, and require a selector, with at most 20 files "
+                "and 50MB total. URLs are downloaded automatically."
+            )
         ),
     ],
     selector: Annotated[
@@ -763,7 +840,7 @@ async def skyvern_file_upload(
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Upload files to a file input element. Accepts local paths or URLs (auto-downloaded).
-    Supports AI intent, CSS/XPath selector, or both to find the input.
+    Local paths must be in an allowed download scope and use a CSS/XPath selector.
     """
     if not file_paths:
         return make_result(
@@ -826,10 +903,40 @@ async def skyvern_file_upload(
             ),
         )
 
+    if has_local and not selector:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Local file upload requires a selector",
+                "Provide selector='input[type=file]' for local file uploads",
+            ),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
+
+    local_uploads: list[FilePayload] | None = None
+    if has_local:
+        run_id = resolve_run_download_id(skyvern_context.current())
+        if run_id is None and is_stdio_local_file_access_enabled():
+            run_id = str(None)
+        try:
+            local_uploads = await asyncio.to_thread(_read_run_owned_uploads, file_paths, run_id)
+        except (OSError, RuntimeError, ValueError):
+            return make_result(
+                "skyvern_file_upload",
+                ok=False,
+                browser_context=ctx,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "Local file access denied",
+                    "Use a regular file from an allowed download directory",
+                ),
+            )
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -849,20 +956,11 @@ async def skyvern_file_upload(
                 else:
                     assert selector is not None
                     await page.upload_file(selector=selector, files=fp, timeout=action_timeout)
-            elif ai_mode is not None and len(file_paths) == 1:
-                # Single local file + intent: use SDK for AI element resolution
-                await page.upload_file(
-                    selector=selector,  # type: ignore[arg-type]
-                    files=file_paths[0],
-                    prompt=intent,
-                    ai=ai_mode,
-                    timeout=action_timeout,
-                )
             else:
-                # Local files + selector: set directly via Playwright
                 assert selector is not None
+                assert local_uploads is not None
                 locator = page.page.locator(selector).first
-                await locator.set_input_files(file_paths, timeout=action_timeout)
+                await locator.set_input_files(local_uploads, timeout=action_timeout)
 
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:

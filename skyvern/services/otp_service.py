@@ -62,6 +62,10 @@ class _TOTPWebhookRequestError(Exception):
     pass
 
 
+class InsufficientCreditsForOTPParse(Exception):
+    """Control-flow signal indicating that paid OTP extraction was not attempted."""
+
+
 class OTPValue(BaseModel):
     value: str = Field(..., description="The value of the OTP code.")
     type: OTPType | None = Field(None, description="The type of the OTP code.")
@@ -91,7 +95,7 @@ async def parse_otp_login(
     # credits should not incur the secondary-LLM cost only to be charged for it.
     if not await app.AGENT_FUNCTION.has_sufficient_credit_for_otp_parse(organization_id):
         LOG.info("Skipping OTP parse; organization has insufficient credits", organization_id=organization_id)
-        return None
+        raise InsufficientCreditsForOTPParse
     prompt = prompt_engine.load_prompt(
         "parse-otp-login",
         content=content,
@@ -651,6 +655,8 @@ async def _get_otp_value_from_url(
     if isinstance(content, str) and len(content) > 10:
         try:
             otp_value = await parse_otp_login(content, organization_id)
+        except InsufficientCreditsForOTPParse:
+            return None
         except Exception as e:
             otp_value = None
             LOG.warning(
@@ -743,6 +749,8 @@ async def _get_otp_value_from_db(
         attempts += 1
         try:
             otp_value = await parse_otp_login(row.content, organization_id, enforced_otp_type=expected_otp_type)
+        except InsufficientCreditsForOTPParse:
+            return None
         except Exception:
             LOG.warning(
                 "Raw OTP reparse failed", totp_code_id=row.totp_code_id, otp_type=expected_otp_type, exc_info=True

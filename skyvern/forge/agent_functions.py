@@ -964,7 +964,7 @@ class AgentFunction:
         organization_id: str,
         workflow_permanent_id: str,
     ) -> bool:
-        """Base no-op (copilot runs its block test inline); overridden per deployment."""
+        """Base no-op; callers fail closed when worker dispatch is unavailable."""
         return False
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
@@ -1521,7 +1521,7 @@ class AgentFunction:
         if "@" not in totp_identifier:
             return None
 
-        from skyvern.services.otp_service import parse_otp_login
+        from skyvern.services.otp_service import InsufficientCreditsForOTPParse, parse_otp_login
 
         lookup_context = context or GmailOTPVerificationContext()
         now = datetime.now(timezone.utc)
@@ -1589,6 +1589,11 @@ class AgentFunction:
                         continue
                     try:
                         otp_value = await parse_otp_login(candidate.content, organization_id)
+                    except InsufficientCreditsForOTPParse:
+                        # Credit eligibility is organization-wide, so stop this scan.
+                        # Remember the candidate so later polls do not retry the same material.
+                        lookup_context.remember_message_id(candidate.message_id)
+                        return None
                     except Exception:
                         LOG.warning(
                             "Failed to parse Gmail OTP candidate",

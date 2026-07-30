@@ -26,16 +26,13 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.enforcement import (
-    TOTAL_TIMEOUT_SECONDS,
     synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
-from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
+from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import (
@@ -46,11 +43,9 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
-    _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS,
     _DATA_PRODUCING_BLOCK_TYPES,
     _FAILED_BLOCK_STATUSES,
     BLOCK_RUNNING_TOOLS,
-    COPILOT_FINAL_REPLY_RESERVE_SECONDS,
     PAGE_INSPECTION_TOOLS,
     PAGE_SCHEMA_CONTEXT_TOOLS,
     PER_TOOL_CALL_BUDGET_SECONDS,
@@ -120,54 +115,6 @@ def _trusted_post_drain_status(run: WorkflowRun | None) -> str | None:
     if WorkflowRunStatus(run.status).is_final_excluding_canceled():
         return run.status
     return None
-
-
-def _active_run_terminal_evidence_detected(result: Mapping[str, object]) -> bool:
-    data_value = result.get("data")
-    data = data_value if isinstance(data_value, Mapping) else {}
-    return data.get("active_run_terminal_evidence_detected") is True
-
-
-def _active_run_terminal_evidence_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    evidence = getattr(ctx, "workflow_verification_evidence", None)
-    has_active_terminal_evidence = getattr(
-        ctx, "last_failure_category_top", None
-    ) == ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY or bool(
-        getattr(evidence, "active_run_terminal_evidence_detected", False)
-    )
-    if not has_active_terminal_evidence:
-        return None
-
-    run_id = getattr(evidence, "active_run_terminal_evidence_workflow_run_id", None) or getattr(
-        ctx, "last_run_blocks_workflow_run_id", None
-    )
-    location = (
-        getattr(evidence, "page_title", None) or getattr(evidence, "current_url", None) or "the current browser page"
-    )
-    run_detail = f" Workflow run: {run_id}." if isinstance(run_id, str) and run_id else ""
-    agent_steering = (
-        "The prior active workflow run emitted typed ACTIVE_RUN_TERMINAL_EVIDENCE while the browser task "
-        f"was still running.{run_detail} The current page evidence already matched the user's terminal "
-        "browser-state criteria, but the reusable workflow is not verified end-to-end. "
-        f"Do not call {tool_name} again in this turn; reply with a partial-verification/blocker state that "
-        "says the requested browser state was observed, the active run was interrupted before overshoot, "
-        "and the workflow still needs a clean corrected run before it can be offered as tested."
-    )
-    user_facing = (
-        f"I reached the requested browser state on {location} and stopped before continuing, "
-        "but the reusable workflow still needs a clean verification run before it is ready."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
-        blocked_tool=tool_name,
-    )
 
 
 def _per_tool_budget_problem_label_set(ctx: Any) -> set[str]:
@@ -845,7 +792,6 @@ def _pending_reconciliation_no_input_signal(*, pending_run_id: str, blocked_tool
 # per each of the three preceding identical runs). Calibration note: the
 # repeated-frontier streak in failure_tracking.py uses STOP_AT=3 for the same
 # shape of escalation.
-REPEATED_ACTION_STREAK_ABORT_AT = 3
 MAX_CHALLENGE_GATED_PROXY_RETRIES = 1
 
 _STRUCTURED_BLOCKER_KEY_TERMS: frozenset[str] = frozenset(
@@ -1304,64 +1250,12 @@ def _code_output_has_registered_download_content(value: Any) -> bool:
 
 
 def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
+    """One outer wall clock bounds the turn; reserving a slice of it for a reply the model may not
+    need shortens every run for a composition step that costs seconds."""
     remaining = _copilot_seconds_remaining(ctx)
     if remaining is None:
         return PER_TOOL_CALL_BUDGET_SECONDS
-    remaining_after_reply_reserve = remaining - COPILOT_FINAL_REPLY_RESERVE_SECONDS
-    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining_after_reply_reserve)))
-
-
-def _late_block_running_call_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    remaining = _copilot_seconds_remaining(ctx)
-    if remaining is None or remaining > COPILOT_FINAL_REPLY_RESERVE_SECONDS:
-        return None
-
-    last_failed_workflow_yaml = getattr(ctx, "last_failed_workflow_yaml", None)
-    last_good_workflow_yaml = getattr(ctx, "last_good_workflow_yaml", None)
-    if (
-        isinstance(last_failed_workflow_yaml, str)
-        and last_failed_workflow_yaml
-        and isinstance(last_good_workflow_yaml, str)
-        and last_good_workflow_yaml
-    ):
-        agent_steering = (
-            f"Wall-clock budget too low to retry: about {int(max(0.0, remaining))}s remain of the "
-            f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified workflow exists from before the failure. "
-            "Do NOT call update_and_run_blocks or run_blocks_and_collect_debug again. REPLY now: summarize "
-            "what worked, name the block that failed, and tell the user they can keep the verified prefix or discard."
-        )
-    elif isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
-        agent_steering = (
-            f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn "
-            "after the previous workflow run failed. Do NOT retry block-running tools. Use only existing "
-            "run evidence and quick browser inspection tools such as get_run_results, evaluate, or "
-            "get_browser_screenshot if one more read is needed. If the current page contains the requested "
-            "answer, answer from that observed page evidence. If evidence is incomplete, report exactly "
-            "which browser state was verified and which requested data remains unverified. Never repeat "
-            "this tool-error text as the user-facing answer."
-        )
-    else:
-        agent_steering = (
-            f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn. "
-            "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
-            "progress gathered so far, and make clear which parts have not been verified end-to-end."
-        )
-
-    user_facing = "I'm running out of time on this turn. I'll wrap up with what I have so far."
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint="stop",
-        cleared_by_tools=frozenset(),
-        # The "wrap up with what we have" semantic means the draft saved
-        # earlier in the turn should still surface — only the chat reply
-        # is overridden by the renderer.
-        preserves_workflow_draft=True,
-        renders_final_reply=False,
-        internal_reason_code="tool_error_late_block_running",
-        blocked_tool=tool_name,
-    )
+    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining)))
 
 
 def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:
@@ -1507,18 +1401,15 @@ def _challenge_gated_anti_bot_rerun_signal(
 LOOP_PLANE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
     {
         "loop_detected_credential_or_parameter_misconfig",
-        "loop_detected_repeated_failed_step",
         "loop_detected_consecutive_same_tool",
         "loop_detected_generic",
         "loop_detected_no_forward_progress_interaction",
         "loop_detected_discovery_exhausted_no_entry_url",
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
-        "tool_error_active_run_terminal_evidence",
         "tool_error_terminal_challenge_blocker",
         "tool_error_synthesized_block_persistence_required",
         "tool_error_challenge_gated_submit_disabled",
-        "tool_error_late_block_running",
         "tool_error_non_retriable_nav",
         "tool_error_pending_reconciliation_no_input",
         "tool_error_pending_reconciliation_requires_input",
@@ -1527,7 +1418,6 @@ LOOP_PLANE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
         "tool_error_post_budget_upstream_replay",
         "tool_error_post_budget_challenge_result_evidence",
         "tool_error_post_budget_challenge_blocker",
-        "tool_error_repeated_action_abort",
         "runtime_self_heal_native_tool_blocked",
     }
 )
@@ -1570,35 +1460,6 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
             )
 
-    # Consecutive same-name guard: false-positives on the intended iterative
-    # build (one new block per update_and_run_blocks). Block-running tools
-    # rely on the progress-aware checks below instead. fill_credential_field is
-    # exempt because a username+password+TOTP form legitimately needs three
-    # consecutive calls; its failed-step guard above stays argument-aware.
-    tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if (
-        isinstance(tracker, list)
-        and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
-        and not output_contract_owns_turn
-    ):
-        detected = detect_tool_loop(tracker, tool_name, arguments)
-        if detected is not None:
-            return _emit_loop_plane_refusal(
-                ctx,
-                _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
-            )
-
-    if tool_name == "update_workflow" or tool_name in BLOCK_RUNNING_TOOLS:
-        active_terminal_signal = _active_run_terminal_evidence_signal(ctx, tool_name)
-        if active_terminal_signal is not None:
-            return _emit_loop_plane_refusal(ctx, active_terminal_signal)
-
-    # Hard-abort when the agent has re-fired the same action sequence against
-    # the page N times without intervening success. This is the signal that
-    # the form is blocked (captcha / anti-bot / error banner the agent isn't
-    # detecting) and further attempts will just burn the tool timeout. Scoped
-    # to block-running tools so planning/metadata tools (update_workflow,
-    # list_credentials, get_run_results) stay unaffected.
     if tool_name in BLOCK_RUNNING_TOOLS:
         # Reconciliation guard: the previous block-running tool call exited
         # without a trustworthy terminal status for its workflow run (the
@@ -1644,33 +1505,6 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         if challenge_signal is not None:
             return _emit_loop_plane_refusal(ctx, challenge_signal)
 
-        streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
-        streak = streak_raw if isinstance(streak_raw, int) else 0
-        if streak >= REPEATED_ACTION_STREAK_ABORT_AT:
-            agent_steering = (
-                f"Repeated-action abort: the last {streak} runs fired the same "
-                "action sequence against the page without making progress. "
-                "The site is likely blocked by a captcha, popup, anti-bot "
-                "challenge, or hidden validation error that the agent is not "
-                "detecting. Do NOT retry this tool — conclude the workflow is "
-                "not automatable as-is and report back to the user."
-            )
-            user_facing = (
-                "I tried the same actions a few times without making progress. The site looks blocked. I'll stop here."
-            )
-            return _emit_loop_plane_refusal(
-                ctx,
-                CopilotToolBlockerSignal(
-                    blocker_kind="tool_error",
-                    agent_steering_text=agent_steering,
-                    user_facing_reason=user_facing,
-                    recovery_hint="stop",
-                    cleared_by_tools=frozenset(),
-                    internal_reason_code="tool_error_repeated_action_abort",
-                    blocked_tool=tool_name,
-                ),
-            )
-
         # Within-turn fail-fast for permanent navigation errors (DNS / cert /
         # SSL / invalid URL). The enforcement-loop stop nudge only runs
         # BETWEEN agent turns, so without this check the LLM is free to make
@@ -1701,9 +1535,6 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 ),
             )
 
-        late_signal = _late_block_running_call_signal(ctx, tool_name)
-        if late_signal is not None:
-            return _emit_loop_plane_refusal(ctx, late_signal)
     return None
 
 
