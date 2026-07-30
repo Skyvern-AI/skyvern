@@ -56,7 +56,7 @@ from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDe
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.browser_engine import BrowserEngineSelection, resolve_engine_selection_for_task
+from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -479,7 +479,7 @@ async def _check_svg_eligibility(
             locator=locater,
             frame=skyvern_frame.get_frame(),
             static_element=element,
-            engine_selection=_resolve_engine_selection(task),
+            engine_selection=skyvern_frame.engine_selection,
         )
 
         _, blocked = await skyvern_frame.get_blocking_element_id(
@@ -665,7 +665,7 @@ async def _convert_css_shape_to_string(
                 locator=locater,
                 frame=skyvern_frame.get_frame(),
                 static_element=element,
-                engine_selection=_resolve_engine_selection(task),
+                engine_selection=skyvern_frame.engine_selection,
             )
 
             _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
@@ -692,7 +692,11 @@ async def _convert_css_shape_to_string(
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
             # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below,
             # which drops the element from future scrape passes and aborts the conversion.
-            screenshot = await take_element_screenshot(locater, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            screenshot = await take_element_screenshot(
+                locater,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                engine_selection=skyvern_frame.engine_selection,
+            )
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today
@@ -1789,8 +1793,11 @@ class AgentFunction:
         self,
         task: Task | None = None,
         step: Step | None = None,
+        engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
+        if engine_selection is UNSET_SELECTION:
+            engine_selection = _resolve_engine_selection(task)
 
         @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
@@ -1804,7 +1811,7 @@ class AgentFunction:
             """
             context = skyvern_context.ensure_context()
             # page won't be in the context.frame_index_map, so the index is going to be 0
-            skyvern_frame = await SkyvernFrame.create_instance(frame=frame)
+            skyvern_frame = await SkyvernFrame.create_instance(frame=frame, engine_selection=engine_selection)
             current_frame_index = context.frame_index_map.get(frame, 0)
 
             queue = []
@@ -1829,7 +1836,10 @@ class AgentFunction:
                     new_frame = next(
                         (k for k, v in context.frame_index_map.items() if v == queue_ele.get("frame_index")), frame
                     )
-                    skyvern_frame = await SkyvernFrame.create_instance(frame=new_frame)
+                    skyvern_frame = await SkyvernFrame.create_instance(
+                        frame=new_frame,
+                        engine_selection=engine_selection,
+                    )
                     current_frame_index = queue_ele.get("frame_index", 0)
 
                 _remove_rect(queue_ele)

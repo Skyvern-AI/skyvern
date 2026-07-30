@@ -2360,7 +2360,10 @@ class SkyvernPage(Page):
             try:
                 from skyvern.webeye.utils.page import SkyvernFrame
 
-                skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+                skyvern_frame = await SkyvernFrame.create_instance(
+                    frame=self.page,
+                    engine_selection=self.engine_selection,
+                )
                 await skyvern_frame.wait_for_page_ready(
                     network_idle_timeout_ms=3000,
                     loading_indicator_timeout_ms=5000,

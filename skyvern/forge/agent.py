@@ -191,6 +191,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     download_filename_from_suffix,
@@ -3440,7 +3441,10 @@ class ForgeAgent:
 
         skyvern_frame: SkyvernFrame | None = None
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=working_page,
+                engine_selection=browser_state.engine_selection,
+            )
             await skyvern_frame.safe_wait_for_animation_end(caller="post_action_artifact")
         except Exception:
             LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
@@ -3533,7 +3537,10 @@ class ForgeAgent:
 
         try:
             if skyvern_frame is None:
-                skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+                skyvern_frame = await SkyvernFrame.create_instance(
+                    frame=working_page,
+                    engine_selection=browser_state.engine_selection,
+                )
             html = await skyvern_frame.get_content()
             _ctx = skyvern_context.current()
             # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
@@ -3680,7 +3687,11 @@ class ForgeAgent:
 
         return await browser_state.scrape_website(
             url=task.url,
-            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                task=task,
+                step=step,
+                engine_selection=browser_state.engine_selection,
+            ),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=max_screenshot_number,
             draw_boxes=draw_boxes,
@@ -5742,6 +5753,7 @@ class ForgeAgent:
                 task=task,
                 step=step,
                 page=page,
+                engine_selection=browser_state.engine_selection,
             )
             failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
             errors = [ReachMaxStepsError().model_dump()] + [
@@ -5845,6 +5857,7 @@ class ForgeAgent:
                 step=step,
                 page=page,
                 max_retries=max_retries_per_step,
+                engine_selection=browser_state.engine_selection if browser_state is not None else None,
             )
 
             # Only pass new errors — update_task() appends to existing errors in the DB
@@ -5924,6 +5937,7 @@ class ForgeAgent:
         task: Task,
         step: Step,
         page: Page | None,
+        engine_selection: BrowserEngineSelection | None,
     ) -> MaxStepsReasonResponse:
         steps_results = []
         llm_errors: list[str] = []
@@ -5991,7 +6005,12 @@ class ForgeAgent:
 
             screenshots: list[bytes] = []
             if page is not None:
-                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url, scroll=scroll)
+                screenshots = await SkyvernFrame.take_split_screenshots(
+                    page=page,
+                    url=page.url,
+                    scroll=scroll,
+                    engine_selection=engine_selection,
+                )
 
             prompt = prompt_engine.load_prompt(
                 "summarize-max-steps-reason",
@@ -6045,6 +6064,7 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         max_retries: int,
+        engine_selection: BrowserEngineSelection | None,
     ) -> MaxStepsReasonResponse:
         html = ""
         screenshots: list[bytes] = []
@@ -6134,11 +6154,16 @@ class ForgeAgent:
                 )
 
             if page is not None:
-                skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+                skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
                 html = truncate_page_html_for_summary(await skyvern_frame.get_content())
                 # scroll=False: one current-viewport shot (the failing region) is enough for a
                 # failure summary; avoids 10 full-page strips. SKY-10626.
-                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url, scroll=False)
+                screenshots = await SkyvernFrame.take_split_screenshots(
+                    page=page,
+                    url=page.url,
+                    scroll=False,
+                    engine_selection=engine_selection,
+                )
 
             prompt = prompt_engine.load_prompt(
                 "summarize-max-retries-reason",
@@ -6456,6 +6481,7 @@ class ForgeAgent:
                 task=task,
                 step=step,
                 page=page,
+                engine_selection=browser_state.engine_selection if browser_state is not None else None,
             )
             failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
             errors = [ReachMaxStepsError().model_dump()] + [
