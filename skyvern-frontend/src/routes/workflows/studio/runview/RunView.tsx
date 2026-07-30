@@ -27,6 +27,7 @@ import { findActiveItem } from "../../workflowRun/workflowTimelineUtils";
 import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
+  ELAPSED_NEVER_STARTED,
   formatElapsed,
   formatRunTimesTooltip,
   runHasOutputs,
@@ -381,10 +382,16 @@ export function RunView({
     return <RunPlaceholder loading={isLoading || runIdPending} />;
   }
 
-  const elapsed = formatElapsed(
-    workflowRun.started_at ?? workflowRun.created_at ?? null,
+  // Same rule as the summary strip: created_at is always set, so falling back to
+  // it shows a queued run an elapsed time it never accrued. The never-started
+  // sentinel is dropped so the timeline omits the value entirely rather than
+  // rendering a bare dash.
+  const elapsedValue = formatElapsed(
+    workflowRun.started_at ?? null,
     finalized ? (workflowRun.finished_at ?? null) : null,
   );
+  const elapsed =
+    elapsedValue === ELAPSED_NEVER_STARTED ? undefined : elapsedValue;
   const elapsedTitle = formatRunTimesTooltip(workflowRun);
   const failureReason = formatFailureReason(
     workflowRun.failure_reason ?? "The run failed.",
