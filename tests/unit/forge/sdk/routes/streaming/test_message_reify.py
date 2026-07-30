@@ -13,7 +13,6 @@ from fastapi import WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from skyvern.config import settings
-from skyvern.forge.sdk.routes.streaming.channels import execution as execution_module
 from skyvern.forge.sdk.routes.streaming.channels import message as message_module
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, LocalExecutionChannel
 from skyvern.forge.sdk.routes.streaming.channels.message import (
@@ -249,7 +248,7 @@ class TestExecutionChannelHelpers:
     @pytest.mark.asyncio
     async def test_navigate_uses_the_validated_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         validate = MagicMock(return_value="https://example.test/validated")
-        monkeypatch.setattr(execution_module, "validate_fetch_url", validate)
+        monkeypatch.setattr("skyvern.forge.sdk.routes.streaming.channels.execution.validate_fetch_url", validate)
         channel = ExecutionChannel(vnc_channel=MagicMock(identity={"client_id": "abc"}))
         channel.page = MagicMock()
         channel.page.goto = AsyncMock()
