@@ -21,6 +21,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _rewrite_failed_test_response,
     _verified_workflow_or_none,
 )
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    compose_loop_blocker_user_facing_reason,
+    loop_blocker_evidence_from_ctx,
+)
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
@@ -3289,6 +3293,25 @@ def test_tool_visible_result_fails_when_confirmation_block_outcome_unmet() -> No
     assert visible["data"]["failure_categories"][0]["category"] == "OUTCOME_UNVERIFIED"
 
 
+def test_tool_visible_result_leads_with_the_raised_blocks_own_reason() -> None:
+    """Live shape: the block raised, but the agent was told the run completed, so it repaired the
+    extraction instead of the failing call."""
+    ctx = _ctx_with_blocks("extraction")
+    result = _failed_code_block_result()
+    result["data"]["failure_reason"] = (
+        "code block failed. failure reason: Failed to execute code block. "
+        "Reason: Exception: Could not parse visitor total from the page"
+    )
+
+    visible = _tool_visible_result_after_completion_verification(ctx, result, _evaluated(("c0", False)))
+
+    assert not visible["error"].startswith("The run completed")
+    assert "Could not parse visitor total" in visible["error"]
+    assert "Could not parse visitor total" in visible["data"]["failure_reason"]
+    assert "item in cart" in visible["error"]
+    assert visible["data"]["failure_categories"][0]["category"] == "OUTCOME_UNVERIFIED"
+
+
 def test_tool_visible_result_keeps_mid_build_run_visible_success() -> None:
     ctx = _ctx_with_blocks("goto_url", "navigation")
 
@@ -4724,12 +4747,26 @@ def _failed_code_block_result() -> dict:
     }
 
 
-def test_failed_run_records_gate_reason_separately_from_raw_block_failure() -> None:
+def test_failed_run_leaves_no_outcome_unverified_reason_and_reports_the_block_failure() -> None:
     ctx = _ctx_with_blocks("extraction")
     _record_run_blocks_result(ctx, _failed_code_block_result(), completion_verification=_evaluated(("c0", False)))
-    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
-    assert "TimeoutError" not in (ctx.last_outcome_gate_reason or "")
+    assert ctx.last_outcome_gate_reason is None
+    assert ctx.last_outcome_gate_workflow_run_id == "wr_x"
     assert "TimeoutError" in (ctx.last_test_failure_reason or "")
+    composed, _ = compose_loop_blocker_user_facing_reason("loop_detected_generic", loop_blocker_evidence_from_ctx(ctx))
+    assert "The run completed" not in composed
+
+
+def test_ok_run_still_records_the_outcome_unverified_reason() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+    assert ctx.last_outcome_gate_workflow_run_id == "wr_x"
+    composed, tiers = compose_loop_blocker_user_facing_reason(
+        "loop_detected_generic", loop_blocker_evidence_from_ctx(ctx)
+    )
+    assert "The run completed" in composed
+    assert "verdict" in tiers
 
 
 def test_gate_reason_survives_a_later_run_without_verification() -> None:

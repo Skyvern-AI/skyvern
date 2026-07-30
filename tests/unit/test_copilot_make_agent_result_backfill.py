@@ -10,6 +10,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _make_agent_result
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.build_test_outcome import record_build_test_outcome
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CopilotContext,
@@ -17,8 +18,9 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
-from tests.unit.copilot_test_helpers import make_verified_goal_contract
+from tests.unit.copilot_test_helpers import make_verified_goal_contract, passing_run, two_page_login_yaml
 
 
 def _verified_goal_ctx() -> CopilotContext:
@@ -44,7 +46,7 @@ def _payload(**overrides: object) -> dict:
         "blocks": [],
         "terminal": "response",
         "terminalMessage": "done",
-        "narrativeSummary": None,
+        "narrativeSummary": "Built it.",
         "priorBlockCount": None,
         "designActivity": [],
         "startedAt": None,
@@ -175,3 +177,96 @@ def test_make_agent_result_records_resolved_credentials_as_durable_approval() ->
 
     approved = StructuredContext.from_json_str(result.global_llm_context).approved_credentials
     assert [record.credential_id for record in approved] == ["cred_portal"]
+
+
+def _ctx_with_open_second_factor_failure(
+    *, later_run_labels: list[str], final_selector: str = "Login"
+) -> CopilotContext:
+    ctx = _ctx(workflow_yaml=two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", later_run_labels))
+    ctx.workflow_yaml = two_page_login_yaml(submit_selector=final_selector)
+    return ctx
+
+
+def test_build_turn_reports_the_failure_no_later_run_re_exercised() -> None:
+    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
+
+    result = _result(
+        ctx,
+        user_response="Built it. The workflow reads the visitor count.",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    unresolved = result.turn_outcome.unresolved_runtime_failure
+    assert unresolved is not None
+    assert unresolved.workflow_run_id == "wr_1"
+    assert unresolved.block_label == "sign_in_and_read"
+    assert "wr_1" in result.user_response
+    assert "sign_in_and_read" in result.user_response
+    assert "Built it. The workflow reads the visitor count." in result.user_response
+
+
+def test_the_qualified_turn_is_still_a_success() -> None:
+    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
+
+    result = _result(
+        ctx,
+        user_response="Built it.",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is not None
+    assert result.turn_outcome.response_kind == ResponseKind.BUILD
+    assert result.turn_outcome.terminal_reason is None
+
+
+def test_a_re_exercised_failure_leaves_the_reply_and_outcome_unqualified() -> None:
+    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"], final_selector="Continue")
+
+    result = _result(
+        ctx,
+        user_response="Built it.",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is None
+    assert result.user_response == "Built it."
+
+
+def test_a_clarifying_turn_is_never_qualified() -> None:
+    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
+
+    result = _result(
+        ctx,
+        user_response="Which metric did you want?",
+        turn_outcome=_outcome(ResponseKind.CLARIFY),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is None
+    assert result.user_response == "Which metric did you want?"
+
+
+def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
+    """The chat panel renders the narrative card, not the raw reply, so both carry the note."""
+    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
+
+    result = _result(
+        ctx,
+        user_response="Built it.",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(terminalMessage="All done.", narrativeSummary="All done."),
+    )
+
+    assert result.narrative_payload is not None
+    for key in ("terminalMessage", "narrativeSummary"):
+        assert "wr_1" in result.narrative_payload[key], key
+        assert "sign_in_and_read" in result.narrative_payload[key], key

@@ -310,6 +310,7 @@ class TestWorkflowRunCompleteHookFires:
         mock_agent_fn.on_workflow_run_completed = AsyncMock()
 
         mock_workflow_run = MagicMock()
+        mock_workflow_run.workflow_run_id = "wr_1"
         mock_workflow_run.organization_id = "o_789"
         mock_workflow_run.workflow_id = "wf_1"
         mock_workflow_run.workflow_permanent_id = "wpid_1"
@@ -326,6 +327,7 @@ class TestWorkflowRunCompleteHookFires:
 
         mock_db = MagicMock()
         mock_db.workflow_runs.update_workflow_run = AsyncMock(return_value=mock_workflow_run)
+        mock_db.tags.apply_system_run_tag_changes = AsyncMock()
 
         with (
             patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
@@ -345,12 +347,67 @@ class TestWorkflowRunCompleteHookFires:
                 workflow_run_id="wr_1",
                 status=mock_status,
             )
-            await asyncio.sleep(0)
+            while svc._background_tasks:
+                await asyncio.gather(*tuple(svc._background_tasks))
 
         mock_agent_fn.on_workflow_run_completed.assert_awaited_once_with(
             organization_id="o_789",
             workflow_id="wf_1",
             status=mock_status,
+        )
+        mock_agent_fn.on_workflow_run_terminal.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_awaits_terminal_hook_before_browser_cleanup(self) -> None:
+        mock_agent_fn = MagicMock(spec=AgentFunction)
+        mock_agent_fn.on_workflow_run_terminal = AsyncMock()
+
+        mock_workflow = MagicMock()
+        mock_workflow_run = MagicMock()
+        mock_workflow_run.workflow_run_id = "wr_1"
+        mock_workflow_run.organization_id = "o_789"
+        mock_workflow_run.status = "completed"
+
+        browser_cleanup_result = MagicMock()
+        browser_cleanup_result.browser_state = None
+        browser_cleanup_result.tasks = []
+        browser_cleanup_result.all_workflow_task_ids = []
+        browser_cleanup_result.child_workflow_run_ids = []
+        browser_cleanup_result.close_browser_on_completion = True
+
+        async def clean_up_browser(**_: object) -> MagicMock:
+            mock_agent_fn.on_workflow_run_terminal.assert_awaited_once_with(
+                workflow_run_id="wr_1",
+                organization_id="o_789",
+                status="completed",
+            )
+            return browser_cleanup_result
+
+        with (
+            patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.service.analytics.capture"),
+        ):
+            mock_app.AGENT_FUNCTION = mock_agent_fn
+            mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+            mock_app.STORAGE.save_downloaded_files = AsyncMock()
+            mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+
+            from skyvern.forge.sdk.workflow.service import WorkflowService
+
+            svc = WorkflowService.__new__(WorkflowService)
+            svc._clean_up_workflow_browser = AsyncMock(side_effect=clean_up_browser)
+            svc._schedule_credential_fallback_retry = MagicMock()
+
+            await svc.clean_up_workflow(
+                workflow=mock_workflow,
+                workflow_run=mock_workflow_run,
+                need_call_webhook=False,
+            )
+
+        mock_agent_fn.on_workflow_run_terminal.assert_awaited_once_with(
+            workflow_run_id="wr_1",
+            organization_id="o_789",
+            status="completed",
         )
 
     @pytest.mark.asyncio
@@ -386,3 +443,4 @@ class TestWorkflowRunCompleteHookFires:
             await asyncio.sleep(0)
 
         mock_agent_fn.on_workflow_run_completed.assert_not_awaited()
+        mock_agent_fn.on_workflow_run_terminal.assert_not_awaited()

@@ -901,6 +901,7 @@ async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+        mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
 
         await service.clean_up_workflow(
             workflow=workflow,
@@ -938,6 +939,7 @@ async def test_clean_up_workflow_preserves_body_success_without_retrying_finally
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+        mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
 
         await service.clean_up_workflow(
             workflow=workflow,
@@ -980,6 +982,7 @@ async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> N
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+        mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
 
         with pytest.raises(RuntimeError):
             await service.clean_up_workflow(
@@ -1017,6 +1020,7 @@ async def test_clean_up_workflow_schedules_retry_when_earlier_cleanup_step_raise
         mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock(side_effect=RuntimeError("upload drain failed"))
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+        mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
 
         with pytest.raises(RuntimeError):
             await service.clean_up_workflow(

@@ -24,6 +24,10 @@ def _fake_page(url: str = "https://example.com") -> AsyncMock:
     return page
 
 
+def _fake_browser_state(list_valid_pages: AsyncMock, engine_selection: object | None = None) -> SimpleNamespace:
+    return SimpleNamespace(list_valid_pages=list_valid_pages, engine_selection=engine_selection)
+
+
 @pytest.fixture
 def artifact_manager(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     manager = SimpleNamespace(create_thought_artifact=AsyncMock(return_value="art_id"))
@@ -41,7 +45,7 @@ def stub_screenshot(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 @pytest.mark.asyncio
 async def test_captures_one_artifact_per_open_tab(artifact_manager: AsyncMock) -> None:
     pages = [_fake_page() for _ in range(3)]
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=pages))
+    browser_state = _fake_browser_state(AsyncMock(return_value=pages))
     thought = _fake_thought()
 
     captured = await _persist_completion_tab_screenshots(browser_state, thought)
@@ -59,7 +63,7 @@ async def test_captures_one_artifact_per_open_tab(artifact_manager: AsyncMock) -
 async def test_enumerates_without_closing_tabs(artifact_manager: AsyncMock) -> None:
     # The whole point of the feature is to prove tabs are still open, so enumeration must use
     # max_pages=0 to avoid list_valid_pages' close-oldest behavior.
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[_fake_page()]))
+    browser_state = _fake_browser_state(AsyncMock(return_value=[_fake_page()]))
 
     await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
@@ -70,7 +74,7 @@ async def test_enumerates_without_closing_tabs(artifact_manager: AsyncMock) -> N
 async def test_respects_max_cap(artifact_manager: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(task_v2_service.settings, "MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2", 2)
     pages = [_fake_page() for _ in range(5)]
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=pages))
+    browser_state = _fake_browser_state(AsyncMock(return_value=pages))
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
@@ -80,7 +84,7 @@ async def test_respects_max_cap(artifact_manager: AsyncMock, monkeypatch: pytest
 
 @pytest.mark.asyncio
 async def test_enumeration_failure_returns_zero(artifact_manager: AsyncMock) -> None:
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(side_effect=RuntimeError("boom")))
+    browser_state = _fake_browser_state(AsyncMock(side_effect=RuntimeError("boom")))
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
@@ -93,7 +97,7 @@ async def test_single_tab_failure_does_not_abort_others(
     artifact_manager: AsyncMock, stub_screenshot: AsyncMock
 ) -> None:
     pages = [_fake_page() for _ in range(3)]
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=pages))
+    browser_state = _fake_browser_state(AsyncMock(return_value=pages))
     stub_screenshot.side_effect = [[b"a"], RuntimeError("screenshot fail"), [b"c"]]
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
@@ -106,7 +110,7 @@ async def test_single_tab_failure_does_not_abort_others(
 async def test_bring_to_front_failure_still_captures(artifact_manager: AsyncMock) -> None:
     pages = [_fake_page(), _fake_page()]
     pages[0].bring_to_front = AsyncMock(side_effect=RuntimeError("no front"))
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=pages))
+    browser_state = _fake_browser_state(AsyncMock(return_value=pages))
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
@@ -118,7 +122,7 @@ async def test_bring_to_front_failure_still_captures(artifact_manager: AsyncMock
 @pytest.mark.asyncio
 async def test_single_tab_is_skipped(artifact_manager: AsyncMock) -> None:
     # The lone active tab is already persisted by the completion check; re-capturing it is waste.
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[_fake_page()]))
+    browser_state = _fake_browser_state(AsyncMock(return_value=[_fake_page()]))
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
@@ -131,7 +135,7 @@ async def test_persist_failure_does_not_propagate(artifact_manager: AsyncMock) -
     # Best-effort: a transient artifact/DB write failure must not flip an already-successful run.
     artifact_manager.side_effect = RuntimeError("db down")
     pages = [_fake_page(), _fake_page()]
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=pages))
+    browser_state = _fake_browser_state(AsyncMock(return_value=pages))
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
@@ -145,17 +149,21 @@ async def test_slow_tab_times_out_and_does_not_block_others(
 ) -> None:
     monkeypatch.setattr(task_v2_service.settings, "BROWSER_SCREENSHOT_TIMEOUT_MS", 50)
     slow_page, fast_page = _fake_page("https://slow"), _fake_page("https://fast")
+    pinned_selection = object()
+    seen_selections = []
 
-    async def fake_take(page: object, scroll: bool = False) -> list[bytes]:
+    async def fake_take(page: object, scroll: bool = False, engine_selection: object | None = None) -> list[bytes]:
+        seen_selections.append(engine_selection)
         if getattr(page, "url", "") == "https://slow":
             await asyncio.sleep(5)
         return [b"png-bytes"]
 
     monkeypatch.setattr(task_v2_service.SkyvernFrame, "take_split_screenshots", fake_take)
-    browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[slow_page, fast_page]))
+    browser_state = _fake_browser_state(AsyncMock(return_value=[slow_page, fast_page]), pinned_selection)
 
     captured = await _persist_completion_tab_screenshots(browser_state, _fake_thought())
 
     # The hung tab is abandoned at the per-tab deadline; the healthy tab is still captured.
     assert captured == 1
     assert artifact_manager.await_count == 1
+    assert seen_selections and all(selection is pinned_selection for selection in seen_selections)
