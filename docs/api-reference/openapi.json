@@ -11745,6 +11745,11 @@
             "title": "Save Browser Session Intent",
             "description": "Whether the user intends to save a browser session, regardless of test outcome"
           },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
+          },
           "folder_id": {
             "anyOf": [
               {
@@ -28217,6 +28222,17 @@
               }
             ],
             "title": "Sequential Key"
+          },
+          "sequential_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Credential Id"
           },
           "ai_fallback": {
             "anyOf": [

@@ -285,6 +285,7 @@ class WorkflowRun(BaseModel):
     job_id: str | None = None
     depends_on_workflow_run_id: str | None = None
     sequential_key: str | None = None
+    sequential_credential_id: str | None = None
     ai_fallback: bool | None = None
     code_gen: bool | None = None
     trigger_type: WorkflowRunTriggerType | None = None

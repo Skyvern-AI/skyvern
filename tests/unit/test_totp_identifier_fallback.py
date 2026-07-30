@@ -22,6 +22,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         organization_id="org-1",
         vault_type=CredentialVaultType.BITWARDEN,
         totp_identifier="user@example.com",
+        run_sequentially=False,
     )
 
     class FakeCredential:
@@ -80,6 +81,7 @@ async def _register_with_credential(monkeypatch: pytest.MonkeyPatch, credential:
         organization_id="org-1",
         vault_type=CredentialVaultType.BITWARDEN,
         totp_identifier=None,
+        run_sequentially=False,
     )
 
     class FakeCredentialItem:

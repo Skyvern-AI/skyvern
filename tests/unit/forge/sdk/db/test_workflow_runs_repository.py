@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
-from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel, TaskRunModel, WorkflowRunModel
+from skyvern.forge.sdk.db.models import (
+    Base,
+    PersistentBrowserSessionModel,
+    TaskRunModel,
+    WorkflowModel,
+    WorkflowRunModel,
+)
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
@@ -100,22 +109,280 @@ def _workflow_run_model(
     workflow_run_id: str,
     queued_at: datetime,
     browser_session_id: str | None = None,
+    debug_session_id: str | None = None,
     sequential_key: str | None = None,
     workflow_permanent_id: str = "wpid_test",
+    workflow_id: str = "wf_test",
     status: str = WorkflowRunStatus.queued.value,
+    organization_id: str = "org_test",
+    sequential_credential_id: str | None = None,
 ) -> WorkflowRunModel:
     return WorkflowRunModel(
         workflow_run_id=workflow_run_id,
-        workflow_id="wf_test",
+        workflow_id=workflow_id,
         workflow_permanent_id=workflow_permanent_id,
-        organization_id="org_test",
+        organization_id=organization_id,
         browser_session_id=browser_session_id,
+        debug_session_id=debug_session_id,
         status=status,
         sequential_key=sequential_key,
+        sequential_credential_id=sequential_credential_id,
         created_at=queued_at,
         modified_at=queued_at,
         queued_at=queued_at,
     )
+
+
+def _credential_run(
+    workflow_run_id: str, queued_at: datetime, credential_id: str | None, **kwargs: Any
+) -> WorkflowRunModel:
+    kwargs.setdefault("browser_session_id", f"pbs_{workflow_run_id}")
+    return _workflow_run_model(
+        workflow_run_id=workflow_run_id,
+        queued_at=queued_at,
+        sequential_credential_id=credential_id,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_credential_gate_crosses_workflows_and_respects_scope_and_status(sqlite_db: AgentDB) -> None:
+    # The three excluded peers (other-org / completed / disjoint-credential) are stamped strictly
+    # EARLIER than the legitimate blocker, so if the org-scope, non-terminal-status, or credential
+    # exact-equality predicate regressed, that peer would sort first and become the returned blocker.
+    # The `blocker == wr_a_overlap` assertion is therefore falsifiable for each predicate, not an
+    # artifact of the strict (queued_at, workflow_run_id) total order.
+    early_at = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    mid_at = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    probe_at = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        # wf_seq is run_sequentially, so its runs serialize whole-workflow even with a disjoint cred.
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_seq",
+                workflow_permanent_id="wpid_ws",
+                title="seq",
+                workflow_definition={},
+                run_sequentially=True,
+            )
+        )
+        session.add_all(
+            [
+                # Excluded peers, each strictly earlier than wr_a_overlap so a broken predicate surfaces here.
+                _credential_run(
+                    "wr_other_org",
+                    early_at,
+                    "cred_a",
+                    workflow_permanent_id="wpid_other",
+                    organization_id="org_other",
+                ),
+                _credential_run(
+                    "wr_completed",
+                    early_at,
+                    "cred_a",
+                    workflow_permanent_id="wpid_other",
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _credential_run("wr_disjoint", early_at, "cred_b", workflow_permanent_id="wpid_other"),
+                # The one legitimate cross-workflow same-credential blocker.
+                _credential_run("wr_a_overlap", mid_at, "cred_a", workflow_permanent_id="wpid_other"),
+                _credential_run("wr_b_self", probe_at, "cred_a"),
+                # Disjoint-credential peers that must still serialize via a shared sequential_key or a
+                # run_sequentially workflow: the credential lane composes with the legacy lanes.
+                _credential_run("wr_key_prior", mid_at, "cred_x", workflow_permanent_id="wpid_key", sequential_key="K"),
+                _workflow_run_model(
+                    workflow_run_id="wr_key_plain_session",
+                    queued_at=early_at,
+                    workflow_permanent_id="wpid_key",
+                    sequential_key="K",
+                    browser_session_id="pbs_key_plain",
+                ),
+                _credential_run(
+                    "wr_key_self", probe_at, "cred_y", workflow_permanent_id="wpid_key", sequential_key="K"
+                ),
+                # A plain browser-session occupant belongs only to its session lane and must not
+                # displace the real whole-workflow predecessor for a credential-composed probe.
+                _workflow_run_model(
+                    workflow_run_id="wr_ws_plain_session",
+                    queued_at=early_at,
+                    workflow_permanent_id="wpid_ws",
+                    workflow_id="wf_seq",
+                    browser_session_id="pbs_plain",
+                ),
+                _credential_run("wr_ws_prior", mid_at, "cred_p", workflow_permanent_id="wpid_ws", workflow_id="wf_seq"),
+                _credential_run(
+                    "wr_ws_self", probe_at, "cred_q", workflow_permanent_id="wpid_ws", workflow_id="wf_seq"
+                ),
+            ]
+        )
+        await session.commit()
+
+    # Same credential + same org + different workflow blocks; disjoint / other-org / completed do not,
+    # even though all three are strictly earlier than both the probe and the legitimate blocker.
+    blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_b_self")
+    assert blocker is not None
+    assert blocker.workflow_run_id == "wr_a_overlap"
+    # A disjoint credential still blocks via a shared manual key ...
+    key_blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_key_self")
+    assert key_blocker is not None and key_blocker.workflow_run_id == "wr_key_prior"
+    # ... and via a run_sequentially workflow.
+    ws_blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_ws_self")
+    assert ws_blocker is not None and ws_blocker.workflow_run_id == "wr_ws_prior"
+
+    async with sqlite_db.Session() as session:
+        overlap = await session.get(WorkflowRunModel, "wr_a_overlap")
+        assert overlap is not None
+        overlap.status = WorkflowRunStatus.canceled.value
+        await session.commit()
+
+    # With the only legitimate blocker canceled, the strictly-earlier excluded peers still do not block.
+    assert await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_b_self") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "peer_credential, peer_kwargs, guard",
+    [
+        ("cred_other", {"workflow_permanent_id": "wpid_other"}, "credential exact-equality"),
+        ("cred_self", {"organization_id": "org_other"}, "org scoping"),
+        ("cred_self", {"status": WorkflowRunStatus.completed.value}, "non-terminal status"),
+    ],
+)
+async def test_credential_gate_excludes_earlier_non_matching_peer(
+    sqlite_db: AgentDB, peer_credential: str, peer_kwargs: dict[str, Any], guard: str
+) -> None:
+    # A single earlier peer that shares the credential lane in every dimension but the one under test.
+    # Because it is strictly earlier than the probe, a regression in the org-scope, non-terminal-status,
+    # or credential exact-equality predicate would return it as the blocker — so `is None` here is a
+    # falsifiable proof that the guarding predicate fires, not a total-ordering artifact.
+    earlier = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add(
+            _credential_run("wr_peer_earlier", earlier, peer_credential, browser_session_id=None, **peer_kwargs)
+        )
+        session.add(_credential_run("wr_probe_later", later, "cred_self", browser_session_id=None))
+        await session.commit()
+
+    assert await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_probe_later") is None, guard
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "debug_session_id, expected_blocker",
+    [
+        # A debug run is excluded from browser-session serialization at enqueue
+        # (is_browser_session_workflow is False when debug_session_id is set), so the credential branch
+        # must not re-add the browser-session lane for it — it gates only on its credential.
+        ("dbg_1", None),
+        # A non-debug credential run sharing the session still composes the browser-session lane.
+        (None, "wr_session_peer"),
+    ],
+)
+async def test_credential_gate_browser_session_lane_honors_debug_exclusion(
+    sqlite_db: AgentDB, debug_session_id: str | None, expected_blocker: str | None
+) -> None:
+    earlier = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add(
+            _credential_run(
+                "wr_session_peer",
+                earlier,
+                "cred_other",
+                browser_session_id="pbs_shared",
+                workflow_permanent_id="wpid_other",
+            )
+        )
+        session.add(
+            _credential_run(
+                "wr_probe",
+                later,
+                "cred_self",
+                browser_session_id="pbs_shared",
+                debug_session_id=debug_session_id,
+                workflow_permanent_id="wpid_debug",
+            )
+        )
+        await session.commit()
+
+    blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_probe")
+    assert (blocker.workflow_run_id if blocker else None) == expected_blocker
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_run_preserves_sequential_credential_id(sqlite_db: AgentDB) -> None:
+    queued_at = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_seq_snapshot",
+                queued_at=queued_at,
+                sequential_credential_id="cred_a",
+            )
+        )
+        await session.commit()
+
+    # The enqueue executor and scheduled-setup activity read this identity off the
+    # converted schema to arm credential serialization; it must survive conversion.
+    fetched = await sqlite_db.workflow_runs.get_workflow_run("wr_seq_snapshot", organization_id="org_test")
+    assert fetched is not None
+    assert fetched.sequential_credential_id == "cred_a"
+
+
+@pytest.mark.asyncio
+async def test_composed_credential_queued_at_advances_past_cross_lane_publication_despite_clock_skew(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prior_ticket = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    skewed_host_clock = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.db.repositories.workflow_runs.naive_utc_now",
+        lambda: skewed_host_clock.replace(tzinfo=None),
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_first_publisher",
+                    status=WorkflowRunStatus.created.value,
+                    queued_at=None,
+                    sequential_key="shared_lane",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_second_publisher",
+                    status=WorkflowRunStatus.created.value,
+                    queued_at=None,
+                    sequential_credential_id="cred_skew",
+                ),
+            ]
+        )
+        await session.commit()
+
+    publication_lock = asyncio.Lock()
+    first_published = asyncio.Event()
+
+    async def publish_first() -> None:
+        async with publication_lock:
+            await sqlite_db.workflow_runs.update_workflow_run(
+                "wr_first_publisher",
+                status=WorkflowRunStatus.queued,
+                queued_at=prior_ticket,
+            )
+            first_published.set()
+
+    async def publish_second() -> Any:
+        await first_published.wait()
+        async with publication_lock:
+            return await sqlite_db.workflow_runs.update_workflow_run(
+                "wr_second_publisher",
+                status=WorkflowRunStatus.queued,
+            )
+
+    _, second = await asyncio.gather(publish_first(), publish_second())
+
+    assert second.queued_at is not None
+    assert second.queued_at > prior_ticket.replace(tzinfo=None)
 
 
 def _task_run_model(
@@ -984,6 +1251,7 @@ async def test_get_blocking_sequential_workflow_run_scans_earlier_active_same_ke
     fake_run.workflow_run_id = "wr_self"
     fake_run.organization_id = "o_test"
     fake_run.workflow_permanent_id = "wpid_test"
+    fake_run.sequential_credential_id = None
     fake_run.sequential_key = "cred_test-sequential-key"
     fake_run.browser_session_id = None
     fake_run.browser_address = None
@@ -1036,6 +1304,7 @@ async def test_get_blocking_sequential_workflow_run_prefers_browser_session_lane
     fake_run.workflow_run_id = "wr_self"
     fake_run.organization_id = "o_test"
     fake_run.workflow_permanent_id = "wpid_test"
+    fake_run.sequential_credential_id = None
     fake_run.sequential_key = "cred_test-sequential-key"
     fake_run.browser_session_id = "pbs_test"
     fake_run.debug_session_id = None
@@ -1077,6 +1346,7 @@ async def test_get_blocking_sequential_workflow_run_debug_session_uses_key_lane(
     fake_run.workflow_run_id = "wr_self"
     fake_run.organization_id = "o_test"
     fake_run.workflow_permanent_id = "wpid_test"
+    fake_run.sequential_credential_id = None
     fake_run.sequential_key = "cred_test-sequential-key"
     fake_run.browser_session_id = "pbs_test"
     fake_run.debug_session_id = "dbg_test"
@@ -1101,3 +1371,300 @@ async def test_get_blocking_sequential_workflow_run_debug_session_uses_key_lane(
     assert "workflow_runs.sequential_key = 'cred_test-sequential-key'" in where_clause
     assert "workflow_runs.browser_session_id IS NULL" in where_clause
     assert "workflow_runs.browser_session_id = 'pbs_test'" not in where_clause
+
+
+@pytest.mark.asyncio
+async def test_get_last_queued_workflow_run_admits_credential_composed_session_row(sqlite_db: AgentDB) -> None:
+    # A credential-composed predecessor carries a browser_session_id but is a K-lane occupant by the
+    # PR's gate contract, so the legacy K lookup must admit it. A plain (non-credential) session+K row
+    # stays excluded even though it is later-modified — legacy session-lane priority is preserved.
+    early = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_cred_session",
+                    browser_session_id="pbs_cred",
+                    sequential_key="K",
+                    sequential_credential_id="cred_a",
+                    queued_at=early,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_plain_session",
+                    browser_session_id="pbs_plain",
+                    sequential_key="K",
+                    queued_at=late,
+                ),
+            ]
+        )
+        await session.commit()
+
+    result = await sqlite_db.workflow_runs.get_last_queued_workflow_run("wpid_test", "org_test", "K")
+
+    assert result is not None
+    assert result.workflow_run_id == "wr_cred_session"
+
+
+@pytest.mark.asyncio
+async def test_composed_lane_predecessor_queries_limit_each_index_candidate() -> None:
+    captured: list[Any] = []
+
+    async def _scalars(query: Any) -> Any:
+        captured.append(query)
+        return _Result(None)
+
+    session = MagicMock()
+    session.scalars = AsyncMock(side_effect=_scalars)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_last_queued_workflow_run("wpid_test", "o_test", "K")
+    await repo.get_last_running_workflow_run("wpid_test", "o_test", "K")
+
+    assert len(captured) == 4
+    for query in captured:
+        rendered = str(query.compile(compile_kwargs={"literal_binds": True}))
+        assert "LIMIT 1" in rendered
+
+
+@pytest.mark.asyncio
+async def test_get_last_queued_workflow_run_can_keep_legacy_batch_predecessor(sqlite_db: AgentDB) -> None:
+    early = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        legacy = _workflow_run_model(
+            workflow_run_id="wr_batch_legacy",
+            sequential_key="K",
+            queued_at=early,
+        )
+        credential = _workflow_run_model(
+            workflow_run_id="wr_credential_newer",
+            browser_session_id="pbs_cred",
+            sequential_key="K",
+            sequential_credential_id="cred_a",
+            queued_at=late,
+        )
+        legacy.modified_at = early
+        credential.modified_at = late
+        session.add_all([legacy, credential])
+        await session.commit()
+
+    cross_lane = await sqlite_db.workflow_runs.get_last_queued_workflow_run("wpid_test", "org_test", "K")
+    legacy_only = await sqlite_db.workflow_runs.get_last_queued_workflow_run(
+        "wpid_test",
+        "org_test",
+        "K",
+        include_credential_composed_rows=False,
+    )
+
+    assert cross_lane is not None
+    assert cross_lane.workflow_run_id == "wr_credential_newer"
+    assert legacy_only is not None
+    assert legacy_only.workflow_run_id == "wr_batch_legacy"
+
+
+@pytest.mark.asyncio
+async def test_get_last_running_workflow_run_admits_credential_composed_session_row(sqlite_db: AgentDB) -> None:
+    early = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        cred = _workflow_run_model(
+            workflow_run_id="wr_cred_session",
+            browser_session_id="pbs_cred",
+            sequential_key="K",
+            sequential_credential_id="cred_a",
+            status=WorkflowRunStatus.running.value,
+            queued_at=early,
+        )
+        cred.started_at = early
+        plain = _workflow_run_model(
+            workflow_run_id="wr_plain_session",
+            browser_session_id="pbs_plain",
+            sequential_key="K",
+            status=WorkflowRunStatus.running.value,
+            queued_at=late,
+        )
+        plain.started_at = late
+        session.add_all([cred, plain])
+        await session.commit()
+
+    result = await sqlite_db.workflow_runs.get_last_running_workflow_run("wpid_test", "org_test", "K")
+
+    assert result is not None
+    assert result.workflow_run_id == "wr_cred_session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pred_status", [WorkflowRunStatus.queued.value, WorkflowRunStatus.running.value])
+async def test_gate_noncredential_key_blocks_on_credential_composed_session_predecessor(
+    sqlite_db: AgentDB, pred_status: str
+) -> None:
+    # A later non-credential K run must see and wait on an earlier credential+session+K occupant,
+    # for both queued and running predecessors — the gate's non-credential K branch admits it.
+    early = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_pred",
+                    browser_session_id="pbs_pred",
+                    sequential_key="K",
+                    sequential_credential_id="cred_a",
+                    status=pred_status,
+                    queued_at=early,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_self",
+                    sequential_key="K",
+                    queued_at=late,
+                ),
+            ]
+        )
+        await session.commit()
+
+    blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_self")
+
+    assert blocker is not None
+    assert blocker.workflow_run_id == "wr_pred"
+
+
+@pytest.mark.asyncio
+async def test_gate_noncredential_whole_workflow_blocks_on_credential_composed_session_predecessor(
+    sqlite_db: AgentDB,
+) -> None:
+    # A later non-credential whole-workflow run must see and wait on an earlier credential+session
+    # occupant of the same wpid — the gate's non-credential whole-workflow branch admits it.
+    early = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_pred",
+                    browser_session_id="pbs_pred",
+                    sequential_credential_id="cred_a",
+                    queued_at=early,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_self",
+                    queued_at=late,
+                ),
+            ]
+        )
+        await session.commit()
+
+    blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_self")
+
+    assert blocker is not None
+    assert blocker.workflow_run_id == "wr_pred"
+
+
+@pytest.mark.asyncio
+async def test_gate_noncredential_key_ignores_plain_session_predecessor(sqlite_db: AgentDB) -> None:
+    # Legacy-priority regression pin (stays green before and after): a plain non-credential session+K
+    # row must remain invisible to a later non-credential K run — the OR admits only credential rows.
+    early = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_plain_session",
+                    browser_session_id="pbs_plain",
+                    sequential_key="K",
+                    queued_at=early,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_self",
+                    sequential_key="K",
+                    queued_at=late,
+                ),
+            ]
+        )
+        await session.commit()
+
+    blocker = await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_self")
+
+    assert blocker is None
+
+
+def _capture_sql(engine: AsyncEngine) -> tuple[list[str], Any]:
+    """Collect every SQL statement emitted on the engine so a test can assert query shape."""
+    statements: list[str] = []
+
+    def _on_execute(conn: Any, cursor: Any, statement: str, *args: Any) -> None:  # noqa: ANN401
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _on_execute)
+    return statements, _on_execute
+
+
+# The de-indexing OR the legacy partial index (ix_workflow_runs_sequential_key_lookup, partial on
+# `browser_session_id IS NULL`) can no longer serve. A regex, not a substring, so column-order or
+# alias changes in the compiled SQL cannot silently let the OR slip back in.
+_DEINDEXING_OR = re.compile(
+    r"browser_session_id IS NULL\s+OR\s+\S*sequential_credential_id IS NOT NULL",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.asyncio
+async def test_get_last_queued_workflow_run_keeps_legacy_lane_index_eligible(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    # The non-session lookup must scan the legacy lane with a standalone `browser_session_id IS
+    # NULL` (index-eligible via ix_workflow_runs_sequential_key_lookup), never ORed with
+    # `sequential_credential_id IS NOT NULL` — that OR de-indexes the high-write lookup.
+    statements, listener = _capture_sql(sqlite_engine)
+    try:
+        await sqlite_db.workflow_runs.get_last_queued_workflow_run("wpid_test", "org_test", "K")
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", listener)
+
+    lookups = [s for s in statements if "FROM workflow_runs" in s and "browser_session_id IS NULL" in s]
+    assert lookups, "expected a legacy-lane lookup that filters browser_session_id IS NULL"
+    for statement in statements:
+        assert not _DEINDEXING_OR.search(statement), f"legacy lane de-indexed by widened OR: {statement}"
+
+
+@pytest.mark.asyncio
+async def test_get_last_running_workflow_run_keeps_legacy_lane_index_eligible(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    statements, listener = _capture_sql(sqlite_engine)
+    try:
+        await sqlite_db.workflow_runs.get_last_running_workflow_run("wpid_test", "org_test", "K")
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", listener)
+
+    lookups = [s for s in statements if "FROM workflow_runs" in s and "browser_session_id IS NULL" in s]
+    assert lookups, "expected a legacy-lane lookup that filters browser_session_id IS NULL"
+    for statement in statements:
+        assert not _DEINDEXING_OR.search(statement), f"legacy lane de-indexed by widened OR: {statement}"
+
+
+@pytest.mark.asyncio
+async def test_gate_noncredential_key_lane_keeps_index_eligible_shape(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    # The gate's non-credential sequential_key branch admits credential-composed predecessors, but must
+    # do so without ORing the credential predicate into the keyed lane scan (which de-indexes it).
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_self",
+                sequential_key="K",
+                queued_at=datetime(2026, 7, 22, 11, 0, tzinfo=timezone.utc),
+            )
+        )
+        await session.commit()
+
+    statements, listener = _capture_sql(sqlite_engine)
+    try:
+        await sqlite_db.workflow_runs.get_blocking_sequential_workflow_run("wr_self")
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", listener)
+
+    for statement in statements:
+        assert not _DEINDEXING_OR.search(statement), f"gate keyed lane de-indexed by widened OR: {statement}"

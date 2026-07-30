@@ -637,6 +637,7 @@ def convert_to_workflow_run(
         job_id=workflow_run_model.job_id,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
+        sequential_credential_id=workflow_run_model.sequential_credential_id,
         script_run=ScriptRunResponse.model_validate(workflow_run_model.script_run)
         if workflow_run_model.script_run
         else None,

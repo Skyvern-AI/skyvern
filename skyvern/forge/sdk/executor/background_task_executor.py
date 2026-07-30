@@ -6,13 +6,14 @@ from typing import Any
 import structlog
 from fastapi import BackgroundTasks, Request
 
-from skyvern.exceptions import OrganizationNotFound
+from skyvern.exceptions import BackgroundSequentialCredentialUnsupported, OrganizationNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -144,6 +145,42 @@ class BackgroundTaskExecutor(AsyncExecutor):
             "Executing workflow using background task executor",
             workflow_run_id=workflow_run_id,
         )
+
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id,
+            organization_id=organization.organization_id,
+        )
+        if workflow_run and workflow_run.sequential_credential_id:
+            if workflow_run.browser_session_id:
+                persistent_browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                    session_id=workflow_run.browser_session_id,
+                    organization_id=organization.organization_id,
+                )
+                if (
+                    persistent_browser_session
+                    and persistent_browser_session.runnable_type == FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+                ):
+                    try:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization.organization_id,
+                            workflow_run.browser_session_id,
+                        )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to close forced browser session before rejecting sequential credential run",
+                            organization_id=organization.organization_id,
+                            workflow_run_id=workflow_run_id,
+                            browser_session_id=workflow_run.browser_session_id,
+                        )
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                workflow_run_id=workflow_run_id,
+                failure_reason=(
+                    "Sequential credential execution is unavailable in the background executor; "
+                    "the run failed closed before execution."
+                ),
+                cascade_children=True,
+            )
+            raise BackgroundSequentialCredentialUnsupported(workflow_run_id)
 
         await initialize_skyvern_state_file(
             workflow_run_id=workflow_run_id, organization_id=organization.organization_id

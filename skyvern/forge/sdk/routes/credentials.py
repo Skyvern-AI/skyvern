@@ -876,6 +876,13 @@ async def rename_credential(
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
         update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
+    if data.run_sequentially is True and not app.AGENT_FUNCTION.supports_sequential_credentials():
+        raise HTTPException(
+            status_code=400,
+            detail="Sequential credential execution is not supported by this deployment",
+        )
+    if data.run_sequentially is not None:
+        update_kwargs["run_sequentially"] = data.run_sequentially
     _apply_proxy_pin_update(
         update_kwargs,
         proxy_location_was_set="proxy_location" in data.model_fields_set,
@@ -3212,6 +3219,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            run_sequentially=credential.run_sequentially,
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
@@ -3232,6 +3240,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            run_sequentially=credential.run_sequentially,
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
@@ -3249,6 +3258,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            run_sequentially=credential.run_sequentially,
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,

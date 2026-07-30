@@ -9,6 +9,7 @@ import structlog
 from sqlalchemy import (
     ColumnElement,
     Label,
+    Select,
     Text,
     and_,
     cast,
@@ -69,6 +70,22 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
+
+
+def _noncredential_lane_variants(base: Select) -> tuple[Select, Select]:
+    """Split the widened non-session lane into two index-eligible candidates whose union equals
+    ``browser_session_id IS NULL OR sequential_credential_id IS NOT NULL``.
+
+    A single OR of those two predicates cannot use ``ix_workflow_runs_sequential_key_lookup`` (partial
+    on ``browser_session_id IS NULL``), so it de-indexes the pre-existing sequential-key/whole-workflow
+    lookups on the high-write ``workflow_runs`` table. Kept apart, the legacy lane stays on that partial
+    index and the rare credential-composed lane rides the ``workflow_permanent_id`` index. Callers run
+    both and pick the winner by the caller's own ordering — identical result set, index-eligible shape.
+    """
+    return (
+        base.filter(WorkflowRunModel.browser_session_id.is_(None)),
+        base.filter(WorkflowRunModel.sequential_credential_id.isnot(None)),
+    )
 
 
 def _merge_script_run(
@@ -201,6 +218,7 @@ class WorkflowRunsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         sequential_key: str | None = None,
+        sequential_credential_id: str | None = None,
         run_with: str | None = None,
         debug_session_id: str | None = None,
         ai_fallback: bool | None = None,
@@ -237,6 +255,7 @@ class WorkflowRunsRepository(BaseRepository):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 sequential_key=sequential_key,
+                sequential_credential_id=sequential_credential_id,
                 run_with=run_with,
                 debug_session_id=debug_session_id,
                 ai_fallback=ai_fallback,
@@ -279,6 +298,7 @@ class WorkflowRunsRepository(BaseRepository):
         job_id: str | None = None,
         run_with: str | None = None,
         sequential_key: str | None = None,
+        sequential_credential_id: str | None = None,
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
@@ -305,7 +325,51 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    workflow_run.queued_at = naive_utc_now()
+                    credential_id = sequential_credential_id or workflow_run.sequential_credential_id
+                    serialized_publication = bool(
+                        credential_id
+                        or (workflow_run.browser_session_id and not workflow_run.debug_session_id)
+                        or workflow_run.browser_address
+                        or workflow_run.sequential_key
+                    )
+                    if not serialized_publication and workflow_run.workflow_id:
+                        workflow = await session.get(WorkflowModel, workflow_run.workflow_id)
+                        serialized_publication = bool(workflow and workflow.run_sequentially)
+                    if serialized_publication:
+                        # The caller holds every composed publication-lane lock until this transaction
+                        # commits. Advance beyond every active serialized ticket in the organization,
+                        # so all composed lanes share one comparable clock even when database transaction
+                        # time or an application host clock moved backwards.
+                        latest_ticket = await session.scalar(
+                            select(func.max(WorkflowRunModel.queued_at))
+                            .where(WorkflowRunModel.organization_id == workflow_run.organization_id)
+                            .where(WorkflowRunModel.workflow_run_id != workflow_run_id)
+                            .where(
+                                WorkflowRunModel.status.in_(
+                                    [
+                                        WorkflowRunStatus.queued,
+                                        WorkflowRunStatus.running,
+                                        WorkflowRunStatus.paused,
+                                    ]
+                                )
+                            )
+                        )
+                        database_now = await session.scalar(select(func.now()))
+                        if database_now is None:
+                            raise RuntimeError("Database did not return a credential publication timestamp")
+                        database_now = to_naive_utc(database_now)
+                        assert database_now is not None
+                        if latest_ticket is not None:
+                            latest_ticket_utc = to_naive_utc(latest_ticket)
+                            assert latest_ticket_utc is not None
+                            workflow_run.queued_at = max(
+                                database_now,
+                                latest_ticket_utc + timedelta(microseconds=1),
+                            )
+                        else:
+                            workflow_run.queued_at = database_now
+                    else:
+                        workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
                     workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
@@ -327,6 +391,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.run_with = run_with
                 if sequential_key:
                     workflow_run.sequential_key = sequential_key
+                if sequential_credential_id is not None:
+                    workflow_run.sequential_credential_id = sequential_credential_id
                 if ai_fallback is not None:
                     workflow_run.ai_fallback = ai_fallback
                 if depends_on_workflow_run_id:
@@ -859,19 +925,40 @@ class WorkflowRunsRepository(BaseRepository):
         organization_id: str | None = None,
         sequential_key: str | None = None,
         include_browser_session_rows: bool = False,
+        include_credential_composed_rows: bool = True,
     ) -> WorkflowRun | None:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
-            if not include_browser_session_rows:
-                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(status=WorkflowRunStatus.queued)
             if sequential_key:
                 query = query.filter_by(sequential_key=sequential_key)
-            query = query.order_by(WorkflowRunModel.modified_at.desc())
-            workflow_run = (await session.scalars(query)).first()
-            return convert_to_workflow_run(workflow_run) if workflow_run else None
+            query = query.order_by(WorkflowRunModel.modified_at.desc()).limit(1)
+            if include_browser_session_rows:
+                workflow_run = (await session.scalars(query)).first()
+                return convert_to_workflow_run(workflow_run) if workflow_run else None
+            # Credential-composed rows occupy the manual-key/whole-workflow lane by the gate contract
+            # even though they carry a browser_session_id, so a later non-credential run in that lane
+            # must still see them; plain (non-credential) session rows stay excluded. Run the two
+            # index-eligible lane candidates separately (not one de-indexing OR) and keep the most
+            # recently modified — the same row the OR would have returned.
+            legacy_query, credential_query = _noncredential_lane_variants(query)
+            if not include_credential_composed_rows:
+                workflow_run = (await session.scalars(legacy_query)).first()
+                return convert_to_workflow_run(workflow_run) if workflow_run else None
+            candidates = [
+                candidate
+                for candidate in (
+                    (await session.scalars(legacy_query)).first(),
+                    (await session.scalars(credential_query)).first(),
+                )
+                if candidate is not None
+            ]
+            if not candidates:
+                return None
+            workflow_run = max(candidates, key=lambda run: run.modified_at)
+            return convert_to_workflow_run(workflow_run)
 
     @db_operation("get_workflow_runs_by_ids")
     async def get_workflow_runs_by_ids(
@@ -896,11 +983,10 @@ class WorkflowRunsRepository(BaseRepository):
         organization_id: str | None = None,
         sequential_key: str | None = None,
         include_browser_session_rows: bool = False,
+        include_credential_composed_rows: bool = True,
     ) -> WorkflowRun | None:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
-            if not include_browser_session_rows:
-                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(status=WorkflowRunStatus.running)
@@ -909,9 +995,28 @@ class WorkflowRunsRepository(BaseRepository):
             query = query.filter(
                 WorkflowRunModel.started_at.isnot(None)
             )  # filter out workflow runs that does not have a started_at timestamp
-            query = query.order_by(WorkflowRunModel.started_at.desc())
-            workflow_run = (await session.scalars(query)).first()
-            return convert_to_workflow_run(workflow_run) if workflow_run else None
+            query = query.order_by(WorkflowRunModel.started_at.desc()).limit(1)
+            if include_browser_session_rows:
+                workflow_run = (await session.scalars(query)).first()
+                return convert_to_workflow_run(workflow_run) if workflow_run else None
+            # Same composed-lane admission as the queued lookup, split into two index-eligible lane
+            # candidates instead of one de-indexing OR; keep the most recently started.
+            legacy_query, credential_query = _noncredential_lane_variants(query)
+            if not include_credential_composed_rows:
+                workflow_run = (await session.scalars(legacy_query)).first()
+                return convert_to_workflow_run(workflow_run) if workflow_run else None
+            candidates = [
+                candidate
+                for candidate in (
+                    (await session.scalars(legacy_query)).first(),
+                    (await session.scalars(credential_query)).first(),
+                )
+                if candidate is not None and candidate.started_at is not None
+            ]
+            if not candidates:
+                return None
+            workflow_run = max(candidates, key=lambda run: run.started_at)
+            return convert_to_workflow_run(workflow_run)
 
     @db_operation("get_blocking_sequential_workflow_run")
     async def get_blocking_sequential_workflow_run(self, workflow_run_id: str) -> WorkflowRun | None:
@@ -952,56 +1057,105 @@ class WorkflowRunsRepository(BaseRepository):
                         exc_info=True,
                     )
 
-            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
-            # > sequential_key > whole workflow. Debug and forced-session runs carry a
-            # browser_session_id but are excluded from the session lane as they are at enqueue.
+            # A credential run composes lanes: it blocks on any earlier active run sharing its
+            # single credential (exact equality), browser session, browser address, sequential_key,
+            # or a run_sequentially workflow — one bounded SQL query, not a scan + set intersection.
+            # A non-credential run keeps strict lane priority:
+            # browser_session_id > browser_address > sequential_key > whole workflow.
             query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
-            if run.browser_session_id and not run.debug_session_id and not self_forced:
-                query = query.filter_by(browser_session_id=run.browser_session_id)
+            credential_id = run.sequential_credential_id
+            # Each lane candidate is an independently index-eligible query; the earliest blocker across
+            # them is the run's blocker. The non-credential manual-key / whole-workflow lanes must admit
+            # credential-composed predecessors, but as two separate candidates (legacy browser_session_id
+            # IS NULL lane + credential lane) rather than one OR that de-indexes the sequential-key index.
+            lane_queries: list[Select]
+            if credential_id:
+                run_workflow = await session.get(WorkflowModel, run.workflow_id) if run.workflow_id else None
+                whole_workflow_sequential = bool(run_workflow and run_workflow.run_sequentially)
+                lanes = [WorkflowRunModel.sequential_credential_id == credential_id]
+                if not self_forced and run.browser_session_id and not run.debug_session_id:
+                    lanes.append(WorkflowRunModel.browser_session_id == run.browser_session_id)
+                if run.browser_address:
+                    lanes.append(WorkflowRunModel.browser_address == run.browser_address)
+                if whole_workflow_sequential:
+                    lanes.append(
+                        and_(
+                            WorkflowRunModel.workflow_permanent_id == run.workflow_permanent_id,
+                            or_(
+                                WorkflowRunModel.browser_session_id.is_(None),
+                                WorkflowRunModel.sequential_credential_id.isnot(None),
+                            ),
+                        )
+                    )
+                elif run.sequential_key:
+                    lanes.append(
+                        and_(
+                            WorkflowRunModel.workflow_permanent_id == run.workflow_permanent_id,
+                            WorkflowRunModel.sequential_key == run.sequential_key,
+                            or_(
+                                WorkflowRunModel.browser_session_id.is_(None),
+                                WorkflowRunModel.sequential_credential_id.isnot(None),
+                            ),
+                        )
+                    )
+                lane_queries = [query.filter(or_(*lanes))]
+            elif run.browser_session_id and not run.debug_session_id and not self_forced:
+                lane_queries = [query.filter_by(browser_session_id=run.browser_session_id)]
             elif run.browser_address:
-                query = query.filter_by(browser_address=run.browser_address)
+                lane_queries = [query.filter_by(browser_address=run.browser_address)]
             elif run.sequential_key:
-                query = query.filter_by(
+                keyed = query.filter_by(
                     workflow_permanent_id=run.workflow_permanent_id,
                     sequential_key=run.sequential_key,
                 )
-                if not self_forced:
-                    query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+                # self_forced runs already saw every keyed occupant (including plain session rows), so
+                # they keep the single unfiltered lane; a non-forced run splits into the two admission
+                # candidates so a credential-composed predecessor is seen while plain session rows stay
+                # excluded — index-eligible either way.
+                lane_queries = [keyed] if self_forced else list(_noncredential_lane_variants(keyed))
             else:
-                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id)
-                if not self_forced:
-                    query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+                whole = query.filter_by(workflow_permanent_id=run.workflow_permanent_id)
+                lane_queries = [whole] if self_forced else list(_noncredential_lane_variants(whole))
 
             # Sequential runs are stamped queued_at before Temporal submission; the fallback
             # only guards hand-created rows (e.g. tests) from comparing against None.
             self_queued_at = run.queued_at if run.queued_at is not None else run.created_at
 
-            query = query.filter(
-                WorkflowRunModel.status.in_(
-                    [
-                        WorkflowRunStatus.queued,
-                        WorkflowRunStatus.running,
-                        WorkflowRunStatus.paused,
-                    ]
+            def _apply_gate_tail(lane_query: Select) -> Select:
+                lane_query = lane_query.filter(
+                    WorkflowRunModel.status.in_(
+                        [
+                            WorkflowRunStatus.queued,
+                            WorkflowRunStatus.running,
+                            WorkflowRunStatus.paused,
+                        ]
+                    )
                 )
-            )
-            # Safe because a sequential run is always stamped queued_at (passes through queued)
-            # before it can reach running/paused, so this filter never hides a real blocker.
-            query = query.filter(WorkflowRunModel.queued_at.isnot(None))
-            query = query.filter(
-                or_(
-                    WorkflowRunModel.queued_at < self_queued_at,
-                    and_(
-                        WorkflowRunModel.queued_at == self_queued_at,
-                        WorkflowRunModel.workflow_run_id < run.workflow_run_id,
-                    ),
+                # Safe because a sequential run is always stamped queued_at (passes through queued)
+                # before it can reach running/paused, so this filter never hides a real blocker.
+                lane_query = lane_query.filter(WorkflowRunModel.queued_at.isnot(None))
+                lane_query = lane_query.filter(
+                    or_(
+                        WorkflowRunModel.queued_at < self_queued_at,
+                        and_(
+                            WorkflowRunModel.queued_at == self_queued_at,
+                            WorkflowRunModel.workflow_run_id < run.workflow_run_id,
+                        ),
+                    )
                 )
-            )
-            query = query.order_by(
-                WorkflowRunModel.queued_at.asc(),
-                WorkflowRunModel.workflow_run_id.asc(),
-            )
-            blocker = (await session.scalars(query)).first()
+                return lane_query.order_by(
+                    WorkflowRunModel.queued_at.asc(),
+                    WorkflowRunModel.workflow_run_id.asc(),
+                )
+
+            blocker: WorkflowRunModel | None = None
+            for lane_query in lane_queries:
+                candidate = (await session.scalars(_apply_gate_tail(lane_query))).first()
+                if candidate is not None and (
+                    blocker is None
+                    or (candidate.queued_at, candidate.workflow_run_id) < (blocker.queued_at, blocker.workflow_run_id)
+                ):
+                    blocker = candidate
             return convert_to_workflow_run(blocker) if blocker else None
 
     async def _get_last_workflow_run_by_filter(
