@@ -5,12 +5,14 @@ import {
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   applyNarrativeEvent,
+  hydrateNarrativeFromPayload,
 } from "./narrativeState";
 import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
+  WorkflowCopilotToolResultUpdate,
   WorkflowCopilotTurnStartUpdate,
 } from "./workflowCopilotTypes";
 
@@ -135,7 +137,7 @@ describe("applyNarrativeEvent — lastActivityAtMs", () => {
   it("stamps even when the tool is denylisted from the visible activity log", () => {
     const s = applyNarrativeEvent(
       EMPTY_NARRATIVE,
-      toolCall({ tool_name: "list_credentials" }),
+      toolCall({ tool_name: "get_run_results" }),
       777,
     );
     expect(s.lastActivityAtMs).toBe(777);
@@ -362,5 +364,147 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
     expect(s.authoringCount).toBe(0);
     expect(s.lastRunOutcome).toBeNull();
     expect(s.activitySeq).toBe(0);
+  });
+});
+
+describe("applyNarrativeEvent — server-authored display labels", () => {
+  const toolResult = (
+    overrides: Partial<WorkflowCopilotToolResultUpdate> = {},
+  ): WorkflowCopilotToolResultUpdate => ({
+    type: "tool_result",
+    tool_name: "edit_block",
+    success: true,
+    summary: "",
+    iteration: 0,
+    tool_call_id: "call-1",
+    ...overrides,
+  });
+
+  it("renders a credential lookup label-only even when an older backend sends a count summary", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolResult({
+        tool_name: "list_credentials",
+        summary: "Found 4 credential(s)",
+        success: true,
+      }),
+    );
+    expect(s.designActivity).toHaveLength(1);
+    expect(s.designActivity[0]!.text).toBe("Checking saved credentials");
+  });
+
+  it("keeps a credential blocker explanation that arrives as a successful summary", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolResult({
+        tool_name: "list_credentials",
+        summary:
+          "Saved-credential scouting is not authorized for this request.",
+        success: true,
+      }),
+    );
+    expect(s.designActivity[0]!.text).toBe(
+      "Saved-credential scouting is not authorized for this request.",
+    );
+  });
+
+  it("still renders a credential lookup failure summary", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolResult({
+        tool_name: "list_credentials",
+        summary: "Failed: the credential store could not be reached",
+        success: false,
+      }),
+    );
+    expect(s.designActivity[0]!.text).toBe(
+      "Failed: the credential store could not be reached",
+    );
+  });
+
+  it("prefers the server display_label over the local map on tool_call and tool_result", () => {
+    let s: TurnNarrativeState = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolCall({
+        tool_name: "edit_block",
+        display_label: 'Editing block "Log in"',
+      }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      toolResult({ display_label: 'Editing block "Log in"' }),
+    );
+    expect(s.designActivity.map((e) => e.displayLabel)).toEqual([
+      'Editing block "Log in"',
+      'Editing block "Log in"',
+    ]);
+    expect(s.designActivity.map((e) => e.text)).toEqual([
+      'Editing block "Log in"…',
+      'Editing block "Log in"',
+    ]);
+    expect(s.designActivity.every((e) => !e.text.includes("Working"))).toBe(
+      true,
+    );
+  });
+
+  it("falls back to the local label map when the server sends no display_label", () => {
+    const s = applyNarrativeEvent(EMPTY_NARRATIVE, toolResult());
+    expect(s.designActivity[0]?.displayLabel).toBe("Editing block");
+  });
+
+  it("renders a credential-lookup row instead of suppressing it", () => {
+    let s: TurnNarrativeState = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolCall({ tool_name: "list_credentials", tool_call_id: "call-9" }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      toolResult({ tool_name: "list_credentials", tool_call_id: "call-9" }),
+    );
+    expect(s.designActivity.map((e) => e.text)).toEqual([
+      "Checking saved credentials…",
+      "Checking saved credentials",
+    ]);
+  });
+
+  it("keeps the persisted displayLabel when hydrating from narrative_payload", () => {
+    const s = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      mode: "build",
+      designStarted: true,
+      designEnded: true,
+      draft: null,
+      blocks: [],
+      terminal: "response",
+      terminalMessage: "Done.",
+      narrativeSummary: "Done.",
+      priorBlockCount: null,
+      designActivity: [
+        {
+          kind: "tool_call",
+          text: 'Editing block "Log in"…',
+          iteration: 0,
+          toolName: "edit_block",
+          displayLabel: 'Editing block "Log in"',
+          id: "tc-call-1",
+        },
+        {
+          kind: "tool_result",
+          text: "Checking saved credentials",
+          iteration: 1,
+          toolName: "list_credentials",
+          displayLabel: "Checking saved credentials",
+          success: true,
+          id: "tr-call-9",
+        },
+      ],
+      startedAt: "2026-06-10T00:00:00Z",
+      endedAt: "2026-06-10T00:02:00Z",
+    });
+    expect(s?.designActivity.map((e) => e.displayLabel)).toEqual([
+      'Editing block "Log in"',
+      "Checking saved credentials",
+    ]);
   });
 });

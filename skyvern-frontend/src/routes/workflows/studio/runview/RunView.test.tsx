@@ -737,6 +737,24 @@ describe("RunView live affordances", () => {
     expect(scope.queryByText(/Run queued/)).not.toBeNull();
     expect(scope.queryByRole("button", { name: "Live" })).toBeNull();
   });
+
+  test("a queued run reports no elapsed time in the strip or the timeline", () => {
+    // created_at is always populated by the API, so only started_at can decide
+    // whether the run has actually accrued elapsed time.
+    seedCompletedRun({
+      status: Status.Queued,
+      created_at: "2026-06-30T23:59:00Z",
+      queued_at: "2026-06-30T23:59:30Z",
+      started_at: null,
+      finished_at: null,
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(scope.queryByText(/^Ran for /)).toBeNull();
+    expect(scope.queryByText(/·\s*\d+[ms]/)).toBeNull();
+    expect(scope.queryByText(/·\s*—/)).toBeNull();
+  });
 });
 
 describe("RunView iteration selection", () => {
