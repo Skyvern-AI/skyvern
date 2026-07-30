@@ -26,6 +26,7 @@ export const actionTypeIcons: Record<ActionType, ReactNode> = {
   ),
   [ActionTypes.Hover]: <HandIcon className="size-3.5" />,
   [ActionTypes.InputText]: <InputIcon className="size-3.5" />,
+  [ActionTypes.PasteText]: <InputIcon className="size-3.5" />,
   [ActionTypes.DownloadFile]: (
     <WorkflowBlockIcon workflowBlockType="file_download" className="size-3.5" />
   ),

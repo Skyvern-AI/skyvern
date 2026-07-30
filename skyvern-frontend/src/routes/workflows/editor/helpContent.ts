@@ -107,9 +107,9 @@ export const helpTooltips = {
   google_sheets_read: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:
-      "Paste a Google Sheets URL, or click the table icon to pick from your connected account. Jinja templates work too.",
+      "Paste a Google Sheets URL or pick from your connected account. Click the </> button to pass in a custom value instead — for example {{ target_spreadsheet_url }}.",
     sheetName:
-      "Pick a tab via the layers icon once a spreadsheet is selected, or type the name directly.",
+      "Pick a tab once a spreadsheet is selected, or type the name directly. Click the </> button to pass in a custom value like sheet_{{ current_index }}.",
     range: "A1 notation range to read (optional, defaults to all data)",
     credentialId: "The credential ID for Google OAuth authentication",
     hasHeaderRow:
@@ -130,11 +130,11 @@ export const helpTooltips = {
   google_sheets_write: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:
-      "The full URL of the Google Sheet to write to. Use the picker to browse your connected account.",
+      "The Google Sheet to write to. Pick from your connected account, or click the </> button to pass in a custom value instead — for example {{ target_spreadsheet_url }}.",
     credentialId:
       "The Google account used to authenticate with the spreadsheet.",
     sheetName:
-      "The sheet tab to write to. Use the picker to list tabs or create a new one.",
+      "The sheet tab to write to. Pick a tab or create a new one. Click the </> button to pass in a custom value like sheet_{{ current_index }}.",
     writeMode:
       "Append adds new rows below existing data. Update Range overwrites the exact cells in the range you specify.",
     range:

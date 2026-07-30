@@ -37,6 +37,7 @@ import { toast } from "@/components/ui/use-toast";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 import { getCredentialErrorMessage } from "./authenticatorSaveError";
+import { useCredentialAuthenticatorSupport } from "./CredentialAuthenticatorSupportContext";
 
 type Props = {
   credential: CredentialApiResponse;
@@ -258,6 +259,8 @@ function CredentialItem({
   hasSelection = false,
   onSelect,
 }: Props) {
+  const { additionalTwoFactorMethods = [] } =
+    useCredentialAuthenticatorSupport();
   const [editModalOpen, setEditModalOpen] = useState(false);
   const activeTest = useCredentialTestStore((s) =>
     s.activeTest?.credentialId === credential.credential_id
@@ -292,8 +295,12 @@ function CredentialItem({
       case "text":
         return "Text Message";
       case "none":
-      default:
         return "";
+      default:
+        return (
+          additionalTwoFactorMethods.find(({ value }) => value === totpType)
+            ?.label ?? ""
+        );
     }
   };
 
