@@ -41,6 +41,10 @@ def create_forge_stub_app() -> ForgeApp:
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
+    # Grid-collection seam — _LazyNamespace would auto-mock this as a truthy AsyncMock whose
+    # awaited value is a non-None MagicMock, poisoning the extract-information prompt/cache key.
+    # Match the real OSS base no-op (None → no grid rows injected).
+    fake_app_module.AGENT_FUNCTION.collect_virtualized_grid_rows = AsyncMock(return_value=None)
     fake_app_module.agent = _LazyNamespace()
     fake_app_module.DATABASE.observer.update_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.observer.create_workflow_run_block = AsyncMock()

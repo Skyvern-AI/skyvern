@@ -121,7 +121,11 @@ def test_extract_information_forwards_system_prompt(monkeypatch) -> None:
     step = MagicMock(step_id="stp_sp", retry_index=0)
     scraped_page = _make_scraped_page()
 
-    asyncio.run(handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page))
+    asyncio.run(
+        handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
+    )
 
     assert captured.get("system_prompt") == "Respond only in uppercase."
     extraction_cache._reset_for_tests()
@@ -172,7 +176,11 @@ def test_extract_information_passes_none_system_prompt_when_task_has_none(monkey
     step = MagicMock(step_id="stp_none", retry_index=0)
     scraped_page = _make_scraped_page()
 
-    asyncio.run(handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page))
+    asyncio.run(
+        handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
+    )
 
     assert "system_prompt" in captured
     assert captured["system_prompt"] is None
