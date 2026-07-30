@@ -101,6 +101,22 @@ class RawTOTPCode(BaseModel):
     expired_at: datetime | None
 
 
-class RawTOTPCodeAccepted(BaseModel):
-    totp_code_id: str
+class RawTOTPCodeAccepted(TOTPCode):
     status: Literal["raw_pending"] = "raw_pending"
+
+    @classmethod
+    def from_raw_row(cls, raw_row: RawTOTPCode) -> "RawTOTPCodeAccepted":
+        return cls(
+            totp_code_id=raw_row.totp_code_id,
+            totp_identifier=raw_row.totp_identifier,
+            organization_id=raw_row.organization_id,
+            content=raw_row.content,
+            code="",
+            task_id=raw_row.task_id,
+            workflow_id=raw_row.workflow_id,
+            workflow_run_id=raw_row.workflow_run_id,
+            source=raw_row.source,
+            created_at=raw_row.created_at,
+            modified_at=raw_row.created_at,
+            expired_at=raw_row.expired_at,
+        )

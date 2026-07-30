@@ -4247,16 +4247,6 @@
               }
             }
           },
-          "202": {
-            "description": "Raw OTP content accepted for later parsing",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RawTOTPCodeAccepted"
-                }
-              }
-            }
-          },
           "402": {
             "description": "Insufficient credits to parse OTP content"
           },
