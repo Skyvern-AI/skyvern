@@ -567,6 +567,7 @@ export interface CustomCredentialServiceConfigResponse {
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",
+  PasteText: "paste_text",
   Click: "click",
   Hover: "hover",
   SelectOption: "select_option",
@@ -596,6 +597,7 @@ export const ReadableActionTypes: {
   [key in ActionType]: string;
 } = {
   input_text: "Input Text",
+  paste_text: "Paste Text",
   click: "Click",
   hover: "Hover",
   select_option: "Select Option",
@@ -1013,7 +1015,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
 
@@ -1092,7 +1094,7 @@ export type PasswordCredential = {
   username: string;
   password: string;
   totp: string | null;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
 

@@ -102,6 +102,8 @@ vi.mock("@/routes/workflows/components/SpreadsheetCombobox", () => ({
     displayName: string | null;
     placeholder?: string;
     allowCreate: boolean;
+    templateMode: boolean;
+    onTemplateModeChange: (enabled: boolean) => void;
     onChange: (value: string) => void;
     onSelect: (selection: {
       url: string;
@@ -114,6 +116,7 @@ vi.mock("@/routes/workflows/components/SpreadsheetCombobox", () => ({
       data-value={props.value}
       data-display-name={props.displayName ?? ""}
       data-has-selected-account={String(props.hasSelectedAccount)}
+      data-template-mode={String(props.templateMode)}
     >
       <input
         data-testid="spreadsheet-input"
@@ -130,6 +133,10 @@ vi.mock("@/routes/workflows/components/SpreadsheetCombobox", () => ({
           })
         }
       />
+      <button
+        data-testid="spreadsheet-template-mode-on"
+        onClick={() => props.onTemplateModeChange(true)}
+      />
     </div>
   ),
 }));
@@ -143,10 +150,16 @@ vi.mock("@/routes/workflows/components/SheetTabCombobox", () => ({
     value: string;
     placeholder?: string;
     allowCreate: boolean;
+    templateMode: boolean;
+    onTemplateModeChange: (enabled: boolean) => void;
     onChange: (value: string) => void;
     onSelect: (tabName: string) => void;
   }) => (
-    <div data-testid="sheet-tab-combobox" data-value={props.value}>
+    <div
+      data-testid="sheet-tab-combobox"
+      data-value={props.value}
+      data-template-mode={String(props.templateMode)}
+    >
       <input
         data-testid="sheet-tab-input"
         value={props.value}
@@ -155,6 +168,10 @@ vi.mock("@/routes/workflows/components/SheetTabCombobox", () => ({
       <button
         data-testid="sheet-tab-select"
         onClick={() => props.onSelect("Tab2")}
+      />
+      <button
+        data-testid="sheet-template-mode-on"
+        onClick={() => props.onTemplateModeChange(true)}
       />
     </div>
   ),
@@ -175,6 +192,14 @@ vi.mock("@/hooks/useGoogleOAuthCredentials", () => ({
 
 vi.mock("@/hooks/useGoogleSpreadsheet", () => ({
   useGoogleSpreadsheet: () => ({ data: null }),
+}));
+
+vi.mock("@/hooks/useCurrentOrgId", () => ({
+  useCurrentOrgId: () => "org_test",
+}));
+
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: vi.fn() }),
 }));
 
 vi.mock("@/components/ui/switch", () => ({
@@ -347,6 +372,66 @@ describe("GoogleSheetsReadBlockForm (SKY-9361)", () => {
       spreadsheetUrl: "https://docs.google.com/spreadsheets/d/abc123/edit",
       sheetName: "Sheet1",
     });
+  });
+
+  test("switching blocks clears the selected spreadsheet display name", () => {
+    setGoogleSheetsReadNode("g1");
+    setGoogleSheetsReadNode("g2", {
+      spreadsheetUrl: "https://docs.google.com/spreadsheets/d/xyz456/edit",
+    });
+    const { rerender } = render(<GoogleSheetsReadBlockForm blockId="g1" />);
+
+    fireEvent.click(screen.getByTestId("spreadsheet-select"));
+    expect(screen.getByTestId("spreadsheet-combobox").dataset.displayName).toBe(
+      "My Sheet",
+    );
+
+    rerender(<GoogleSheetsReadBlockForm blockId="g2" />);
+
+    expect(screen.getByTestId("spreadsheet-combobox").dataset.displayName).toBe(
+      "",
+    );
+    expect(screen.getByTestId("spreadsheet-combobox").dataset.value).toBe(
+      "https://docs.google.com/spreadsheets/d/xyz456/edit",
+    );
+  });
+
+  test("repeated true requests keep spreadsheet template mode on", () => {
+    setGoogleSheetsReadNode("g1", {
+      spreadsheetUrl: "{{ target_spreadsheet_url }}",
+    });
+    render(<GoogleSheetsReadBlockForm blockId="g1" />);
+
+    const requestTemplateMode = screen.getByTestId(
+      "spreadsheet-template-mode-on",
+    );
+    fireEvent.click(requestTemplateMode);
+    fireEvent.click(requestTemplateMode);
+
+    expect(
+      screen
+        .getByRole("button", { name: "Pick from your spreadsheets" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(updateNodeData).not.toHaveBeenCalled();
+  });
+
+  test("repeated true requests keep sheet template mode on", () => {
+    setGoogleSheetsReadNode("g1", {
+      sheetName: "{{ target_sheet_name }}",
+    });
+    render(<GoogleSheetsReadBlockForm blockId="g1" />);
+
+    const requestTemplateMode = screen.getByTestId("sheet-template-mode-on");
+    fireEvent.click(requestTemplateMode);
+    fireEvent.click(requestTemplateMode);
+
+    expect(
+      screen
+        .getByRole("button", { name: "Pick from your sheet tabs" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(updateNodeData).not.toHaveBeenCalled();
   });
 
   test("selecting a sheet propagates sheetName", () => {
