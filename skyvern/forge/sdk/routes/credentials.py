@@ -412,19 +412,13 @@ async def fetch_credential_item_background(item_id: str) -> None:
 
 @legacy_base_router.post(
     "/totp",
-    responses={
-        202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"},
-        402: {"description": "Insufficient credits to parse OTP content"},
-    },
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
 )
 @legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
-    responses={
-        202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"},
-        402: {"description": "Insufficient credits to parse OTP content"},
-    },
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
     summary="Send TOTP code",
     description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
@@ -443,10 +437,7 @@ async def fetch_credential_item_background(item_id: str) -> None:
 @base_router.post(
     "/credentials/totp/",
     response_model=TOTPCode,
-    responses={
-        202: {"model": RawTOTPCodeAccepted, "description": "Raw OTP content accepted for later parsing"},
-        402: {"description": "Insufficient credits to parse OTP content"},
-    },
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
     include_in_schema=False,
 )
 async def send_totp_code(
@@ -490,9 +481,7 @@ async def send_totp_code(
             otp_value = None
             parse_exception_type_name = type(e).__name__
 
-    if otp_parse_skipped_for_insufficient_credits and (
-        not settings.TOTP_RAW_FALLBACK_ENABLED or len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH
-    ):
+    if otp_parse_skipped_for_insufficient_credits and len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Insufficient credits to parse OTP content",
@@ -519,17 +508,6 @@ async def send_totp_code(
         )
 
     if not otp_value:
-        if not settings.TOTP_RAW_FALLBACK_ENABLED:
-            LOG.error(
-                "Failed to parse otp login",
-                organization_id=curr_org.organization_id,
-                totp_identifier=redacted_totp_identifier,
-                task_id=data.task_id,
-                workflow_id=data.workflow_id,
-                workflow_run_id=data.workflow_run_id,
-                content_length=len(data.content),
-            )
-            raise HTTPException(status_code=400, detail="Failed to parse otp login")
         if len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
             raise HTTPException(status_code=400, detail="Failed to parse otp login")
         raw_row = await app.DATABASE.otp.create_raw_otp_code(
@@ -549,9 +527,9 @@ async def send_totp_code(
             totp_code_id=raw_row.totp_code_id,
             content_length=len(data.content),
         )
-        pending = RawTOTPCodeAccepted(totp_code_id=raw_row.totp_code_id)
+        pending = RawTOTPCodeAccepted.from_raw_row(raw_row)
         return Response(  # type: ignore[return-value]
-            content=pending.model_dump_json(), status_code=202, media_type="application/json"
+            content=pending.model_dump_json(), status_code=200, media_type="application/json"
         )
 
     return await app.DATABASE.otp.create_otp_code(
