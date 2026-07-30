@@ -56,7 +56,36 @@ class RealAsyncAzureVaultClient(AsyncAzureVaultClient):
     async def create_or_update_secret(self, secret_name: str, secret_value: str, vault_name: str) -> str:
         secret_client = await self._get_secret_client(vault_name)
         try:
+            previous_versions: list[str] = []
+            try:
+                async for properties in secret_client.list_properties_of_secret_versions(secret_name):
+                    if properties.enabled is not False and properties.version is not None:
+                        previous_versions.append(properties.version)
+            except ResourceNotFoundError:
+                pass
+            except Exception:
+                # An identity permitted to set but not list secret versions raises an authorization
+                # error here. Disabling prior versions is best-effort, so log and continue rather than
+                # failing every write (and, via delete_credential, orphaning material after the row is gone).
+                LOG.warning(
+                    "Could not enumerate prior Azure secret versions to disable; proceeding with the write",
+                    secret_name=secret_name,
+                    exc_info=True,
+                )
+
             secret = await secret_client.set_secret(secret_name, secret_value)
+            # Azure Key Vault leaves every prior version enabled and readable by explicit version id; disable
+            # the ones that predate this write so a rotated/detached secret value can't be read back.
+            for version in previous_versions:
+                try:
+                    await secret_client.update_secret_properties(secret_name, version, enabled=False)
+                except Exception:
+                    LOG.warning(
+                        "Failed to disable prior Azure secret version",
+                        secret_name=secret_name,
+                        version=version,
+                        exc_info=True,
+                    )
             return secret.name
         except Exception as e:
             LOG.exception("Failed to create secret from Azure Key Vault.", secret_name=secret_name, error=e)

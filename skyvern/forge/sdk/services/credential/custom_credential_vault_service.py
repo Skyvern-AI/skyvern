@@ -1,6 +1,7 @@
 import json
 
 import structlog
+from pydantic import ValidationError
 
 from skyvern.exceptions import SkyvernException
 from skyvern.forge import app
@@ -13,8 +14,10 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     CreditCardCredential,
+    PasswordCredential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credentials import safe_error_message
 
 LOG = structlog.get_logger()
 
@@ -174,7 +177,14 @@ class CustomCredentialVaultService(CredentialVaultService):
         try:
             client = await self._get_client_for_organization(credential.organization_id)
             credential_data = data.credential
-            if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+            if data.credential_type == CredentialType.PASSWORD and isinstance(credential_data, PasswordCredential):
+                credential_data = await self._preserve_omitted_password_metadata(
+                    credential=credential,
+                    updated_credential=credential_data,
+                )
+            elif data.credential_type == CredentialType.CREDIT_CARD and isinstance(
+                credential_data, CreditCardCredential
+            ):
                 credential_data = await self._preserve_omitted_credit_card_fields(
                     credential=credential,
                     updated_credential=credential_data,
@@ -193,21 +203,18 @@ class CustomCredentialVaultService(CredentialVaultService):
                     data=data,
                     item_id=new_item_id,
                 )
-            except Exception:
+            except BaseException:
                 LOG.warning(
-                    "DB update failed, attempting to clean up new external credential",
+                    "DB update failed; reclaiming the new external credential",
                     organization_id=credential.organization_id,
                     new_item_id=new_item_id,
                 )
-                try:
-                    await client.delete_credential(new_item_id)
-                except Exception as cleanup_error:
-                    LOG.error(
-                        "Failed to clean up orphaned external credential",
-                        organization_id=credential.organization_id,
-                        new_item_id=new_item_id,
-                        error=str(cleanup_error),
-                    )
+                await self._reclaim_orphaned_vault_item(
+                    delete=lambda: client.delete_credential(new_item_id),
+                    organization_id=credential.organization_id,
+                    item_id=new_item_id,
+                    vault_type=CredentialVaultType.CUSTOM,
+                )
                 raise
 
             LOG.info(
@@ -230,7 +237,7 @@ class CustomCredentialVaultService(CredentialVaultService):
             )
             raise
 
-    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> None:
+    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> bool:
         """
         Background task to delete the old credential item from the custom vault
         after an update or delete operation.
@@ -242,7 +249,7 @@ class CustomCredentialVaultService(CredentialVaultService):
                     item_id=item_id,
                     organization_id=organization_id,
                 )
-                return
+                return False
 
             if self._client is not None:
                 client = self._client
@@ -255,14 +262,15 @@ class CustomCredentialVaultService(CredentialVaultService):
                 organization_id=organization_id,
                 item_id=item_id,
             )
-        except Exception as e:
+            return True
+        except Exception as exc:
             LOG.warning(
                 "Failed to delete credential item from custom vault in background",
                 organization_id=organization_id,
                 item_id=item_id,
-                error=str(e),
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
+            return False
 
     async def delete_credential(self, credential: Credential) -> None:
         """
@@ -347,7 +355,7 @@ class CustomCredentialVaultService(CredentialVaultService):
                 organization_id=db_credential.organization_id,
                 credential_id=db_credential.credential_id,
                 item_id=db_credential.item_id,
-                error=str(e),
-                exc_info=True,
+                error=safe_error_message(e),
+                exc_info=not isinstance(e, ValidationError),
             )
             raise

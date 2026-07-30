@@ -33,6 +33,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
 }
+_SENSITIVE_ENDPOINT_PATTERNS = (re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
@@ -92,8 +93,11 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
 
 
 def _is_sensitive_endpoint(request: Request) -> bool:
-    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS or (
-        request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None
+    endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
+    return (
+        endpoint in _SENSITIVE_ENDPOINTS
+        or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
+        or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
 
 
@@ -114,15 +118,16 @@ def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> s
     return text
 
 
-def _is_sensitive_key(key: str) -> bool:
-    return key.lower() in _SENSITIVE_FIELDS
+def _is_sensitive_key(key: str, *, redact_metadata: bool = False) -> bool:
+    normalized = key.lower()
+    return normalized in _SENSITIVE_FIELDS or (redact_metadata and normalized == "metadata")
 
 
 def _strip_artifact_url_query(value: str) -> str:
     return _ARTIFACT_CONTENT_URL_QUERY_RE.sub(r"\1", value)
 
 
-def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
+def redact_sensitive_fields(obj: typing.Any, _depth: int = 0, *, redact_metadata: bool = False) -> typing.Any:
     """Redact sensitive fields and strip capability queries from artifact URLs.
 
     Field names use exact-match (case-insensitive) rather than substring/regex
@@ -130,18 +135,35 @@ def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
     ``page_token`` which contain sensitive substrings but are not secrets.
     """
     if isinstance(obj, str):
-        return _strip_artifact_url_query(obj)
+        sanitized_value = _strip_artifact_url_query(obj)
+        if _depth > 20:
+            return sanitized_value
+        try:
+            parsed_value = json.loads(sanitized_value)
+        except (json.JSONDecodeError, TypeError):
+            return sanitized_value
+        if isinstance(parsed_value, (dict, list)):
+            redacted_value = redact_sensitive_fields(parsed_value, _depth + 1, redact_metadata=redact_metadata)
+            return json.dumps(redacted_value) if redacted_value != parsed_value else sanitized_value
+        return sanitized_value
     if _depth > 20:
         # Stop recursing but still redact sensitive keys at this level
         if isinstance(obj, dict):
-            return {k: _REDACTED if _is_sensitive_key(k) else v for k, v in obj.items()}
+            return {
+                k: _REDACTED if _is_sensitive_key(k, redact_metadata=redact_metadata) else v for k, v in obj.items()
+            }
         return obj
     if isinstance(obj, dict):
         return {
-            k: _REDACTED if _is_sensitive_key(k) else redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
+            k: (
+                _REDACTED
+                if _is_sensitive_key(k, redact_metadata=redact_metadata)
+                else redact_sensitive_fields(v, _depth + 1, redact_metadata=redact_metadata)
+            )
+            for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [redact_sensitive_fields(item, _depth + 1) for item in obj]
+        return [redact_sensitive_fields(item, _depth + 1, redact_metadata=redact_metadata) for item in obj]
     return obj
 
 

@@ -9,6 +9,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     CreditCardCredential,
+    PasswordCredential,
 )
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -57,7 +58,12 @@ class BitwardenCredentialVaultService(CredentialVaultService):
             raise HTTPException(status_code=404, detail="Credential account not found. It might have been deleted.")
 
         credential_data = data.credential
-        if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+        if data.credential_type == CredentialType.PASSWORD and isinstance(credential_data, PasswordCredential):
+            credential_data = await self._preserve_omitted_password_metadata(
+                credential=credential,
+                updated_credential=credential_data,
+            )
+        elif data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
             credential_data = await self._preserve_omitted_credit_card_fields(
                 credential=credential,
                 updated_credential=credential_data,
@@ -77,21 +83,18 @@ class BitwardenCredentialVaultService(CredentialVaultService):
                 data=data,
                 item_id=new_item_id,
             )
-        except Exception:
+        except BaseException:
             LOG.warning(
-                "DB update failed, attempting to clean up new Bitwarden vault item",
+                "DB update failed; reclaiming the new Bitwarden vault item",
                 organization_id=credential.organization_id,
                 new_item_id=new_item_id,
             )
-            try:
-                await BitwardenService.delete_credential_item(new_item_id)
-            except Exception as cleanup_error:
-                LOG.error(
-                    "Failed to clean up orphaned Bitwarden vault item",
-                    organization_id=credential.organization_id,
-                    new_item_id=new_item_id,
-                    error=str(cleanup_error),
-                )
+            await self._reclaim_orphaned_vault_item(
+                delete=lambda: BitwardenService.delete_credential_item(new_item_id),
+                organization_id=credential.organization_id,
+                item_id=new_item_id,
+                vault_type=CredentialVaultType.BITWARDEN,
+            )
             raise
 
         return updated_credential
@@ -109,20 +112,21 @@ class BitwardenCredentialVaultService(CredentialVaultService):
         await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
         await BitwardenService.delete_credential_item(credential.item_id)
 
-    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> None:
+    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> bool:
         try:
             await BitwardenService.delete_credential_item(item_id)
             LOG.info(
                 "Successfully deleted credential item from Bitwarden in background",
                 item_id=item_id,
             )
-        except Exception as e:
+            return True
+        except Exception as exc:
             LOG.warning(
                 "Failed to delete credential item from Bitwarden in background",
                 item_id=item_id,
-                error=str(e),
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
+            return False
 
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         return await BitwardenService.get_credential_item(db_credential.item_id)

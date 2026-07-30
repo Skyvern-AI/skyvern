@@ -117,7 +117,11 @@ async def _detect_errors_from_page(
         )
         scraped_page = await browser_state.scrape_website(
             url=page.url,
-            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                task=task,
+                step=step,
+                engine_selection=browser_state.engine_selection,
+            ),
             take_screenshots=True,
             draw_boxes=False,
         )
