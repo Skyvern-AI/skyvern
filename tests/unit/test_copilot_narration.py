@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -1337,3 +1338,132 @@ async def test_poll_tick_block_ended_at_overwritten_by_latest_terminal_and_clear
             await state.in_flight_task
         except (asyncio.CancelledError, Exception):
             pass
+
+
+def _armed_state(iteration: int) -> NarratorState:
+    state = NarratorState()
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.record_activity(narration.build_tool_call_activity("edit_block", iteration, f"c{iteration}"))
+    return state
+
+
+def test_should_emit_false_for_an_iteration_carrying_typed_tool_activity() -> None:
+    state = _armed_state(2)
+    assert state.iterations_with_tool_activity == {2}
+    assert should_emit(state, now=100.0, iteration=2) is False
+
+
+def test_should_emit_true_for_a_clean_iteration_alongside_an_armed_one() -> None:
+    state = _armed_state(2)
+    assert should_emit(state, now=100.0, iteration=3) is True
+
+
+def test_should_emit_true_when_the_iterations_only_tool_is_denylisted() -> None:
+    state = NarratorState()
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.record_activity(narration.build_tool_call_activity("get_run_results", 0, "c0"))
+    assert state.iterations_with_tool_activity == set()
+    assert should_emit(state, now=100.0, iteration=0) is True
+
+
+def test_tool_result_alone_arms_the_iteration() -> None:
+    state = NarratorState()
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.record_activity(narration.build_tool_result_activity("edit_block", "done", True, 5, "c5"))
+    assert should_emit(state, now=100.0, iteration=5) is False
+
+
+def test_narration_activity_does_not_arm_its_own_iteration() -> None:
+    state = NarratorState()
+    state.record_activity(
+        narration.build_narration_activity("Refining the workflow's code", 1, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    )
+    assert state.iterations_with_tool_activity == set()
+
+
+@pytest.mark.asyncio
+async def test_narration_dropped_when_the_iteration_arms_while_the_narrator_is_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = NarratorState()
+    released = asyncio.Event()
+
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
+        await released.wait()
+        return "Working on your goal."
+
+    await _install_handler(monkeypatch, _handler)
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    stream = _FakeStream()
+
+    schedule_narration(state, stream, iteration=4)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    state.record_activity(narration.build_tool_call_activity("edit_block", 4, "c4"))
+    released.set()
+    await state.in_flight_task
+
+    assert stream.sent == []
+    assert [e for e in state.design_activity if e["kind"] == "narration"] == []
+    assert state.last_emitted_at is None
+
+
+@pytest.mark.asyncio
+async def test_narration_emits_for_a_clean_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
+        return "Reading the page before editing."
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState()
+    state.record_activity(narration.build_tool_call_activity("edit_block", 4, "c4"))
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    stream = _FakeStream()
+
+    schedule_narration(state, stream, iteration=5)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert [p.narration for p in stream.sent] == ["Reading the page before editing."]
+
+
+def test_extract_tool_details_reports_no_credential_count() -> None:
+    parsed = {
+        "ok": True,
+        "data": {"count": 4, "credentials": [{"credential_id": "cred_384430212391591428"}]},
+    }
+    assert narration.extract_tool_details("list_credentials", parsed) == ""
+
+
+def test_suppressed_iteration_consumes_its_transition_instead_of_banking_it() -> None:
+    state = NarratorState()
+    stream = _StubStream()
+    # streaming_adapter sets current_iteration before recording the transition.
+    state.current_iteration = 3
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    state.record_activity(narration.build_tool_call_activity("update_workflow", 3, "c3"))
+
+    schedule_narration(state, stream, 3)
+
+    assert state.pending_transition is None
+    assert state.in_flight_task is None
+
+    # A later unarmed iteration must not inherit the earlier transition.
+    state.record_activity(narration.build_tool_call_activity("get_browser_screenshot", 7, "c7"))
+    assert should_emit(state, 300.0, 7) is False
+
+
+def test_suppression_keeps_a_transition_banked_by_an_earlier_clean_iteration() -> None:
+    state = NarratorState()
+    stream = _StubStream()
+
+    # Iteration 5's only tool is denylisted, so nothing typed describes it.
+    state.current_iteration = 5
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_activity(narration.build_tool_call_activity("get_browser_screenshot", 5, "c5"))
+
+    # Iteration 6 carries a typed row and is suppressed; it must not consume
+    # iteration 5's transition.
+    state.current_iteration = 6
+    state.record_activity(narration.build_tool_call_activity("click", 6, "c6"))
+    schedule_narration(state, stream, 6)
+
+    assert state.pending_transition is TransitionKind.TOOL_STARTED

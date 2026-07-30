@@ -3,8 +3,10 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import hydrate_action
+from skyvern.forge.sdk.schemas import sdk_actions
 from skyvern.forge.sdk.schemas.sdk_actions import InputTextAction as SdkInputTextAction
 from skyvern.forge.sdk.schemas.sdk_actions import SdkActionType
 from skyvern.schemas.steps import AgentStepOutput
@@ -45,6 +47,21 @@ def _mock_scraped_page() -> MagicMock:
 
 def test_sdk_input_text_action_type_constant_matches_sdk_enum() -> None:
     assert SDK_INPUT_TEXT_ACTION_TYPE == SdkActionType.AI_INPUT_TEXT.value
+
+
+def test_sdk_action_timeout_defaults_are_environment_independent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "BROWSER_ACTION_TIMEOUT_MS", 4242)
+    action_types = (
+        sdk_actions.ClickAction,
+        sdk_actions.InputTextAction,
+        sdk_actions.SelectOptionAction,
+        sdk_actions.UploadFileAction,
+    )
+
+    assert [action_type().timeout for action_type in action_types] == [4242] * 4
+    assert [action_type.model_json_schema()["properties"]["timeout"]["default"] for action_type in action_types] == [
+        10000
+    ] * 4
 
 
 def test_action_parse__no_element_id() -> None:

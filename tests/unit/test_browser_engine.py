@@ -2,16 +2,21 @@
 
 These tests stay driver-agnostic: they exercise the registry, per-run selection, capability gate,
 and exception-identity classification with fake engine specs, so they hold on an image that ships
-only stock Playwright. Cloud-only concerns (the cloud-private engine, the multivariate flag) are
-left to the cloud wiring slice that introduces them.
+only stock Playwright. The rustwright cases simulate the driver package's presence or absence
+explicitly, so they assert behaviour and capability, never whether the optional group is installed.
+Cloud-only concerns (the cloud-private engine, the multivariate flag) are left to the cloud wiring
+slice that introduces them.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import re
+import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -95,6 +100,74 @@ def _restore_resolver():
     browser_engine.reset_browser_engine_resolver()
 
 
+_RUSTWRIGHT_DRIVER_MODULES = ("rustwright", "rustwright.async_api")
+
+
+class _RustwrightImportBlocker:
+    """Meta-path finder that fails every ``rustwright`` import with the same ModuleNotFoundError an
+    image without the wheel raises, so the fail-closed-when-absent contract is verified deterministically
+    instead of relying on the ambient environment lacking the package."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "rustwright" or fullname.startswith("rustwright."):
+            raise ModuleNotFoundError(f"No module named {fullname!r}", name="rustwright")
+        return None
+
+
+@contextlib.contextmanager
+def _rustwright_driver_absent():
+    saved = {name: sys.modules.get(name) for name in _RUSTWRIGHT_DRIVER_MODULES}
+    for name in _RUSTWRIGHT_DRIVER_MODULES:
+        sys.modules.pop(name, None)
+    blocker = _RustwrightImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        yield
+    finally:
+        sys.meta_path.remove(blocker)
+        for name, module in saved.items():
+            if module is not None:
+                sys.modules[name] = module
+
+
+@contextlib.contextmanager
+def _rustwright_driver_present():
+    """Make ``rustwright.async_api`` importable with the exact public surface the OSS module binds
+    (``Error`` / ``TimeoutError`` / ``TargetClosedError`` in the hierarchy the real wheel documents), so
+    the group-installed behaviour is exercised without depending on a real install of the PyO3 wheel."""
+    saved = {name: sys.modules.get(name) for name in _RUSTWRIGHT_DRIVER_MODULES}
+    package = types.ModuleType("rustwright")
+    async_api = types.ModuleType("rustwright.async_api")
+
+    class Error(Exception):
+        pass
+
+    class TimeoutError(Error):
+        pass
+
+    class TargetClosedError(Error):
+        pass
+
+    async def async_playwright():  # pragma: no cover - a selection never starts the driver here
+        raise AssertionError("the rustwright driver must not be started in these tests")
+
+    async_api.Error = Error
+    async_api.TimeoutError = TimeoutError
+    async_api.TargetClosedError = TargetClosedError
+    async_api.async_playwright = async_playwright
+    package.async_api = async_api
+    sys.modules["rustwright"] = package
+    sys.modules["rustwright.async_api"] = async_api
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
 def test_registry_has_stock_and_rustwright_and_rejects_unknown():
     names = browser_engine.REGISTRY.names()
     assert STOCK_ENGINE_NAME in names
@@ -129,31 +202,61 @@ def test_stock_spec_selects_with_playwright_identity():
 
 
 def test_rustwright_spec_fails_closed_when_driver_absent():
-    # rustwright is not installed in the OSS test image: selecting it must fail closed, never fall back.
+    # With the driver package absent, selecting rustwright must fail closed, never fall back. Absence is
+    # forced here rather than read from the environment, so the contract holds even where the optional
+    # group is installed.
     spec = browser_engine.REGISTRY.get(browser_engine.RUSTWRIGHT_ENGINE_NAME)
-    assert spec.is_installed() is False
-    with pytest.raises(browser_engine.BrowserEngineUnavailable):
-        spec.select(selection_reason="explicit-rustwright")
+    with _rustwright_driver_absent():
+        assert spec.is_installed() is False
+        with pytest.raises(browser_engine.BrowserEngineUnavailable):
+            spec.select(selection_reason="explicit-rustwright")
 
 
-def test_rustwright_spec_has_rich_error_loader_wired_and_lazy():
-    # Every candidate engine (not just stock) binds the richer families: the rustwright spec carries a
-    # rich loader. It must stay lazy — importing this module registered the spec without importing the
-    # (absent) rustwright package, so the loader is only invoked at select().
+def test_rustwright_spec_has_rich_error_loader_wired_and_stays_lazy():
+    # The rustwright spec carries the rich loader by reference, and registering it never imports the
+    # driver. Laziness is probed in a fresh subprocess so it holds whether or not the wheel is installed,
+    # instead of asserting about this process's already-populated sys.modules.
     spec = browser_engine.REGISTRY.get(browser_engine.RUSTWRIGHT_ENGINE_NAME)
     assert spec._load_rich_error_types is browser_engine._rustwright_rich_error_types
-    assert "rustwright" not in sys.modules  # registering the spec never imported the driver
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, skyvern.webeye.browser_engine; "
+            "print(any(m == 'rustwright' or m.startswith('rustwright.') for m in sys.modules))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip() == "False", probe.stdout + probe.stderr
 
 
 def test_rustwright_rich_loader_imports_the_real_driver_and_fails_closed_when_absent():
     # The rich loader binds the REAL native identity (a lazy ``from rustwright.async_api import
     # TargetClosedError``), not a stub: with the package absent it raises ModuleNotFoundError naming
     # the driver, and select() surfaces that as BrowserEngineUnavailable (never silent empty families).
-    with pytest.raises(ModuleNotFoundError) as excinfo:
-        browser_engine._rustwright_rich_error_types()
-    assert excinfo.value.name == "rustwright"
-    with pytest.raises(browser_engine.BrowserEngineUnavailable):
-        browser_engine.RUSTWRIGHT_SPEC.select(selection_reason="explicit-rustwright")
+    with _rustwright_driver_absent():
+        with pytest.raises(ModuleNotFoundError) as excinfo:
+            browser_engine._rustwright_rich_error_types()
+        assert excinfo.value.name == "rustwright"
+        with pytest.raises(browser_engine.BrowserEngineUnavailable):
+            browser_engine.RUSTWRIGHT_SPEC.select(selection_reason="explicit-rustwright")
+
+
+def test_installing_rustwright_group_keeps_it_deny_all_not_selectable():
+    # The blocker this guards: merely installing the optional rustwright group must not make the engine
+    # selectable. With the driver importable, select() succeeds (no BrowserEngineUnavailable), but the
+    # selection stays deny-all — every source, attributed or not, is rejected before any provisioning —
+    # so installing the wheel never turns rustwright into a routable engine.
+    spec = browser_engine.REGISTRY.get(browser_engine.RUSTWRIGHT_ENGINE_NAME)
+    with _rustwright_driver_present():
+        assert spec.is_installed() is True
+        selection = spec.select(selection_reason="explicit-rustwright")
+        assert selection.metadata.allowed_browser_sources == frozenset()
+        for source in ("chromium-headful", "cdp-connect", None):
+            with pytest.raises(BrowserSourceNotSupportedByEngine):
+                selection.ensure_supports(source)
 
 
 # Representative neutral source strings (not a canonical source registry — that belongs to the cloud
@@ -251,6 +354,14 @@ async def test_rejected_unattributed_source_does_not_start_driver():
 @pytest.mark.asyncio
 async def test_default_resolver_is_stock_playwright():
     sel = await resolve_browser_engine(BrowserEngineContext(browser_source="local-browser"))
+    assert sel.name == STOCK_ENGINE_NAME
+
+
+@pytest.mark.asyncio
+async def test_default_resolver_stays_stock_even_when_rustwright_installed():
+    # Installing the optional group must not shift the OSS default runtime selection.
+    with _rustwright_driver_present():
+        sel = await resolve_browser_engine(BrowserEngineContext(browser_source="local-browser"))
     assert sel.name == STOCK_ENGINE_NAME
 
 
