@@ -554,6 +554,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return "Updated the workflow and ran it"
     if tool_name == "list_credentials":
         return f"Found {data.get('count', 0)} credential(s)"
+    if tool_name == "list_integrations":
+        return f"Found {data.get('count', 0)} connected integration(s)"
     if tool_name == "get_block_schema":
         if "block_types" in data:
             return f"Listed {data.get('count', '?')} block types"
