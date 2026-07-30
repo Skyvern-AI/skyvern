@@ -9,7 +9,9 @@ User is planning to {% if is_link %}go to a list of links{% else %}go through a 
 ```
 {{ loop_values }}
 ```
-
+{% if planner_mini_goal_improvements|default(false) %}
+IMPORTANT — This goal is run once per {% if is_link %}link{% else %}value{% endif %}: it is executed as a separate task for each {% if is_link %}link{% else %}value{% endif %} in the list above, each time starting from a fresh browser state. Write the navigation goal and data extraction goal for a SINGLE {% if is_link %}link{% else %}value{% endif %} only. Do NOT copy the individual {% if is_link %}links{% else %}values{% endif %} into the goal, do NOT write "for each" or enumerate the list, and do NOT tell the agent to work through more than one {% if is_link %}link{% else %}value{% endif %} — the iteration over the list is handled for you. The plan above may describe the work for the whole list; treat that as background only and still write the goal for one {% if is_link %}link{% else %}value{% endif %}.{% if not is_link %} Refer to the value for the current iteration with the literal placeholder {% raw %}{{ current_value }}{% endraw %}, which is substituted with the actual value on each iteration (for example: "Search for the official website of {% raw %}{{ current_value }}{% endraw %}, then ..."). {% endif %}Keep the goal small enough to finish for one {% if is_link %}link{% else %}value{% endif %} in a few steps.
+{% endif %}
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:

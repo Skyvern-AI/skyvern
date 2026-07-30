@@ -23,7 +23,7 @@ Same parameters as `launch_cloud_browser` / `launchCloudBrowser`. Options are on
 
 | Parameter (Python) | Parameter (TS) | Type | Required | Default | Description |
 |-------------------|----------------|------|----------|---------|-------------|
-| `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (5--1440). |
+| `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (min 5, capped at 240). |
 | `proxy_location` | `proxyLocation` | `ProxyLocation` | No | `None` / `undefined` | Geographic proxy location for browser traffic. |
 
 ## Returns `SkyvernBrowser`

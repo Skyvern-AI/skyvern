@@ -226,6 +226,79 @@ class TestConditionalBlockCodeGeneration:
         assert BlockType.CONDITIONAL.value == "conditional"
 
 
+@pytest.mark.asyncio
+async def test_paste_text_excludes_only_its_own_cached_block() -> None:
+    blocks = [
+        {
+            "block_type": "navigation",
+            "label": "cacheable_block",
+            "task_id": "task_cacheable",
+            "navigation_goal": "Continue",
+            "workflow_run_id": "wr_1",
+            "workflow_run_block_id": "wfrb_cacheable",
+        },
+        {
+            "block_type": "navigation",
+            "label": "paste_block",
+            "task_id": "task_paste",
+            "navigation_goal": "Paste a grid",
+            "workflow_run_id": "wr_1",
+            "workflow_run_block_id": "wfrb_paste",
+        },
+    ]
+    actions_by_task = {
+        "task_cacheable": [
+            {
+                "action_type": "click",
+                "xpath": "//button",
+                "reasoning": "Continue",
+                "intention": "Continue",
+            }
+        ],
+        "task_paste": [
+            {
+                "action_type": "paste_text",
+                "text": "a\tb",
+                "reasoning": "Paste rows",
+                "intention": "Paste rows",
+            }
+        ],
+    }
+
+    with (
+        patch(
+            "skyvern.core.script_generations.generate_script.generate_workflow_parameters_schema",
+            new_callable=AsyncMock,
+            return_value=("", {}),
+        ),
+        patch(
+            "skyvern.core.script_generations.generate_script.create_or_update_script_block",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as create_block,
+    ):
+        result = await generate_workflow_script_python_code(
+            file_name="test.py",
+            workflow_run_request={"workflow_id": "wpid_test"},
+            workflow={
+                "workflow_id": "wf_test",
+                "title": "Test",
+                "workflow_definition": {"parameters": []},
+            },
+            blocks=blocks,
+            actions_by_task=actions_by_task,
+            updated_block_labels={"cacheable_block", "paste_block", "__start_block__"},
+            script_id="script_123",
+            script_revision_id="rev_123",
+            organization_id="org_123",
+        )
+
+    created_labels = {call.kwargs["block_label"] for call in create_block.call_args_list}
+    assert "cacheable_block" in created_labels
+    assert "paste_block" not in created_labels
+    assert result.blocks_failed == 1
+
+
 # ---------------------------------------------------------------------------
 # SKY-7815: Tests for cached block preservation during regeneration
 # ---------------------------------------------------------------------------

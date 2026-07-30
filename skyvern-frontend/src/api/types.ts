@@ -567,6 +567,7 @@ export interface CustomCredentialServiceConfigResponse {
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",
+  PasteText: "paste_text",
   Click: "click",
   Hover: "hover",
   SelectOption: "select_option",
@@ -596,6 +597,7 @@ export const ReadableActionTypes: {
   [key in ActionType]: string;
 } = {
   input_text: "Input Text",
+  paste_text: "Paste Text",
   click: "Click",
   hover: "Hover",
   select_option: "Select Option",
@@ -1173,6 +1175,10 @@ export type PylonEmailHash = {
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
+
+// Mirrors MIN_TIMEOUT/MAX_TIMEOUT in skyvern/schemas/browser_session_timeouts.py.
+export const BROWSER_SESSION_MIN_TIMEOUT_MINUTES = 5 as const;
+export const BROWSER_SESSION_MAX_TIMEOUT_MINUTES = 240 as const;
 
 export type TestLoginResponse = {
   credential_id: string;

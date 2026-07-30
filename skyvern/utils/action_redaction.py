@@ -9,6 +9,7 @@ REDACTED_OTP_VALUE = "<redacted otp value>"
 REDACTED_OTP_IDENTIFIER = "<redacted otp identifier>"
 REDACTED_OTP_URL = "<redacted otp url>"
 REDACTED_OTP_SECRET = "<redacted otp secret>"
+REDACTED_INPUT_VALUE = "<redacted input value>"
 SDK_INPUT_TEXT_ACTION_TYPE = "ai_input_text"  # Mirrors SdkActionType.AI_INPUT_TEXT without importing sdk_actions.
 
 
@@ -22,6 +23,10 @@ def redact_action_payload_for_log(action_payload: Mapping[str, Any]) -> dict[str
     sdk_action_type = redacted_payload.get("type")
 
     if action_type == "input_text":
+        return redact_input_text_payload_for_log(redacted_payload, value_key="text")
+
+    if action_type == "paste_text":
+        redacted_payload["text"] = REDACTED_INPUT_VALUE
         return redact_input_text_payload_for_log(redacted_payload, value_key="text")
 
     if sdk_action_type == SDK_INPUT_TEXT_ACTION_TYPE:
