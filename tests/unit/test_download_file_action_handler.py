@@ -40,6 +40,13 @@ from tests.unit.helpers import make_organization, make_step, make_task
 CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 5.0
 
 
+async def _assert_background_tasks_drained(tasks: set[asyncio.Task[None]]) -> None:
+    if tasks:
+        await asyncio.wait(tuple(tasks), timeout=0.25)
+        await asyncio.sleep(0)
+    assert not tasks
+
+
 class _EventEmitter:
     def __init__(self, context: object = None, url: str = "https://example.test/files") -> None:
         self.listeners: dict[str, list[Callable]] = {}
@@ -796,7 +803,7 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
                 )
 
         assert time.monotonic() - started_at < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
-        assert not interceptor._browser_download_tasks
+        await _assert_background_tasks_drained(interceptor._browser_download_tasks)
 
 
 @pytest.mark.asyncio
@@ -2497,7 +2504,7 @@ async def test_handle_action_download_cancellation_cleans_extended_wait_listener
                 await handle_task
 
         assert body_cancelled.is_set()
-        assert captures[0]._response_tasks == set()
+        await _assert_background_tasks_drained(captures[0]._response_tasks)
         assert captures[0]._drained.is_set()
         assert not staging_dir.exists()
         assert not (staging_dir / "report.pdf").exists()
