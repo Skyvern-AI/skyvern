@@ -83,6 +83,15 @@ _CREDENTIAL_PARAMETER_TYPES: tuple[type, ...] = (
 
 _SECRET_FIELD_KEY_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 
+# Registered secrets are masked by substring across run outputs, so a low-entropy value corrupts
+# unrelated text — a registered "visa" blanks that word wherever it appears. Only fields the safe
+# credential API already returns belong here; billing fields are excluded from that API on purpose.
+NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
+
+# Secrets shorter than this mask only on exact whole-string match: substring-replacing a short
+# value (a CVV, a 2-digit expiry) corrupts unrelated scalars such as timestamp milliseconds.
+_SECRET_SUBSTRING_MIN_LENGTH = 5
+
 
 class WorkflowRunContext:
     @classmethod
@@ -487,10 +496,11 @@ class WorkflowRunContext:
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         """
-        Recursively replace any real secret values in data with a mask.
+        Recursively replace registered secret values in data with a mask.
         Used to sanitize HttpRequestBlock output before storing.
 
-        Only masks values that exist in self.secrets (registered credentials).
+        Values shorter than _SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
+        string; a short secret embedded inside a longer scalar is knowingly left unmasked.
         """
         if not self.secrets:
             return data
@@ -502,9 +512,12 @@ class WorkflowRunContext:
             return data
 
         if isinstance(data, str):
+            if data in secret_values:
+                return mask
             result = data
             for secret in secret_values:
-                result = result.replace(secret, mask)
+                if len(secret) >= _SECRET_SUBSTRING_MIN_LENGTH:
+                    result = result.replace(secret, mask)
             return result
         elif isinstance(data, dict):
             return {k: self.mask_secrets_in_data(v, mask) for k, v in data.items()}
@@ -673,6 +686,9 @@ class WorkflowRunContext:
                 continue
             for field_key, field_value in self._flatten_credential_secret_field(key, value):
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                if field_key in NON_SECRET_CREDENTIAL_FIELDS:
+                    self.values[parameter.key][field_key] = field_value
+                    continue
                 random_secret_id = self.generate_random_secret_id()
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = field_value
@@ -1322,6 +1338,9 @@ class WorkflowRunContext:
                 if not field_key:
                     continue
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                if field_key in NON_SECRET_CREDENTIAL_FIELDS:
+                    parameter_value[field_key] = credit_card_data[data_key]
+                    continue
                 random_secret_id = self.generate_random_secret_id()
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = credit_card_data[data_key]

@@ -93,7 +93,13 @@ def _extract_runtime_result(result: dict[str, Any]) -> Any:
     return None
 
 
-async def evaluate_in_main_world(page: Page, expression: str, arg: Any = None) -> Any:
+async def evaluate_in_main_world(
+    page: Page,
+    expression: str,
+    arg: Any = None,
+    *,
+    force_cdp: bool = False,
+) -> Any:
     """Evaluate ``expression`` in the page main world when a prefix is configured.
 
     No prefix → identical to ``page.evaluate(expression, arg)``. Prefix → single
@@ -104,7 +110,7 @@ async def evaluate_in_main_world(page: Page, expression: str, arg: Any = None) -
     an unprefixed function head, which a leading prefix line breaks.
     """
     prefix = _resolve_prefix(page)
-    if prefix is None:
+    if prefix is None and not force_cdp:
         if arg is None:
             return await page.evaluate(expression)
         return await page.evaluate(expression, arg)
@@ -117,7 +123,7 @@ async def evaluate_in_main_world(page: Page, expression: str, arg: Any = None) -
             wrapped = f"({expression})({json.dumps(arg)})"
     else:
         wrapped = expression
-    body = f"{prefix}\n{wrapped}"
+    body = f"{prefix or ''}\n{wrapped}"
     # ``replMode`` only for statement-form bodies that begin with a lexical
     # top-level declaration (``let``/``const``/``class``). Bare expressions
     # and value-returning forms must skip it — Chromium rewrites their
