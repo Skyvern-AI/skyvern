@@ -1,8 +1,10 @@
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
 
 from skyvern.exceptions import HttpException
+from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
@@ -11,6 +13,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     SecretCredential,
 )
+from skyvern.forge.sdk.services.credentials import safe_error_message
 
 LOG = structlog.get_logger()
 
@@ -41,15 +44,18 @@ class CustomCredentialAPIClient:
     ) -> dict[str, Any]:
         """Convert Skyvern credential to API payload format."""
         if isinstance(credential, PasswordCredential):
-            return {
+            payload: dict[str, Any] = {
                 "type": "password",
                 "username": credential.username,
                 "password": credential.password,
                 "totp": credential.totp,
                 "totp_type": credential.totp_type,
             }
+            if credential.metadata:
+                payload["metadata"] = credential.metadata
+            return payload
         elif isinstance(credential, CreditCardCredential):
-            payload: dict[str, Any] = {
+            payload = {
                 "type": "credit_card",
                 "card_holder_name": credential.card_holder_name,
                 "card_number": credential.card_number,
@@ -83,13 +89,14 @@ class CustomCredentialAPIClient:
     @staticmethod
     def _format_error_response(response_body: Any) -> str:
         """Extract a human-readable error message from an HTTP error response body."""
-        if isinstance(response_body, dict):
+        redacted_body = redact_sensitive_fields(response_body, redact_metadata=True)
+        if isinstance(redacted_body, dict):
             for key in ["message", "error", "detail", "error_message"]:
-                if key in response_body and response_body[key]:
-                    return str(response_body[key])
-            return str(response_body)
-        if isinstance(response_body, str) and response_body.strip():
-            return response_body.strip()
+                if key in redacted_body and redacted_body[key]:
+                    return str(redacted_body[key])
+            return str(redacted_body)
+        if isinstance(redacted_body, str) and redacted_body.strip():
+            return redacted_body.strip()
         return ""
 
     def _api_response_to_credential(self, credential_data: dict[str, Any], name: str, item_id: str) -> CredentialItem:
@@ -107,6 +114,7 @@ class CustomCredentialAPIClient:
                 password=credential_data["password"],
                 totp=credential_data.get("totp"),
                 totp_type=credential_data.get("totp_type", "none"),
+                metadata=credential_data.get("metadata"),
             )
             return CredentialItem(
                 item_id=item_id,
@@ -162,7 +170,7 @@ class CustomCredentialAPIClient:
                 credential_type=CredentialType.SECRET,
             )
         else:
-            raise ValueError(f"Unsupported credential type from API: {credential_type}")
+            raise ValueError("Unsupported credential type from API")
 
     async def create_credential(
         self, name: str, credential: PasswordCredential | CreditCardCredential | SecretCredential
@@ -212,7 +220,7 @@ class CustomCredentialAPIClient:
                     "Custom credential API returned error",
                     url=url,
                     status_code=status_code,
-                    response_body=response_body,
+                    response_body=redact_sensitive_fields(response_body, redact_metadata=True),
                 )
                 raise HttpException(status_code, url, msg)
 
@@ -225,7 +233,7 @@ class CustomCredentialAPIClient:
                 LOG.error(
                     "Custom credential API response missing id field",
                     url=url,
-                    response=response_body,
+                    response_body=redact_sensitive_fields(response_body, redact_metadata=True),
                 )
                 raise HttpException(500, url, "Invalid response format from custom credential API: missing 'id' field")
 
@@ -233,7 +241,6 @@ class CustomCredentialAPIClient:
                 "Successfully created credential via custom API",
                 url=url,
                 name=name,
-                credential_id=credential_id,
             )
 
             return str(credential_id)
@@ -241,14 +248,15 @@ class CustomCredentialAPIClient:
         except HttpException:
             raise
         except Exception as e:
+            safe_error = safe_error_message(e)
             LOG.error(
                 "Failed to create credential via custom API",
                 url=url,
                 name=name,
-                error=str(e),
-                exc_info=True,
+                error=safe_error,
+                exc_info=not isinstance(e, ValidationError),
             )
-            raise HttpException(500, url, f"Failed to create credential via custom API: {e!s}") from e
+            raise HttpException(500, url, f"Failed to create credential via custom API: {safe_error}") from e
 
     async def get_credential(self, credential_id: str, name: str) -> CredentialItem:
         """
@@ -289,7 +297,7 @@ class CustomCredentialAPIClient:
                     "Custom credential API returned error",
                     url=url,
                     status_code=status_code,
-                    response_body=response_body,
+                    response_body=redact_sensitive_fields(response_body, redact_metadata=True),
                 )
                 raise HttpException(status_code, url, msg)
 
@@ -307,14 +315,15 @@ class CustomCredentialAPIClient:
         except HttpException:
             raise
         except Exception as e:
+            safe_error = safe_error_message(e)
             LOG.error(
                 "Failed to retrieve credential via custom API",
                 url=url,
                 credential_id=credential_id,
-                error=str(e),
-                exc_info=True,
+                error=safe_error,
+                exc_info=not isinstance(e, ValidationError),
             )
-            raise HttpException(500, url, f"Failed to retrieve credential via custom API: {e!s}") from e
+            raise HttpException(500, url, f"Failed to retrieve credential via custom API: {safe_error}") from e
 
     async def delete_credential(self, credential_id: str) -> None:
         """
@@ -351,7 +360,7 @@ class CustomCredentialAPIClient:
                     "Custom credential API returned error on delete",
                     url=url,
                     status_code=status_code,
-                    response_body=response_body,
+                    response_body=redact_sensitive_fields(response_body, redact_metadata=True),
                 )
                 raise HttpException(status_code, url, msg)
 
@@ -364,11 +373,12 @@ class CustomCredentialAPIClient:
         except HttpException:
             raise
         except Exception as e:
+            safe_error = safe_error_message(e)
             LOG.error(
                 "Failed to delete credential via custom API",
                 url=url,
                 credential_id=credential_id,
-                error=str(e),
-                exc_info=True,
+                error=safe_error,
+                exc_info=not isinstance(e, ValidationError),
             )
-            raise HttpException(500, url, f"Failed to delete credential via custom API: {e!s}") from e
+            raise HttpException(500, url, f"Failed to delete credential via custom API: {safe_error}") from e

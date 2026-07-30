@@ -5,6 +5,7 @@ from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, u
 
 import pyotp
 import structlog
+from pydantic import ValidationError
 
 LOG = structlog.get_logger()
 
@@ -29,6 +30,12 @@ _ONEPASSWORD_CREDENTIAL_ERROR_PATTERN = re.compile(
     r"|"
     r"(?:\b(?:token|credential|service\s+account)\b.{0,48}\b(?:invalid|expired|malformed|not\s+valid|parse(?:d)?)\b)"
 )
+
+
+def safe_error_message(error: Exception) -> str:
+    if isinstance(error, ValidationError):
+        return "; ".join(f"{entry['loc']}: {entry['msg']}" for entry in error.errors())
+    return str(error)
 
 
 def extract_onepassword_upstream_5xx_status(message: str) -> int | None:

@@ -693,6 +693,11 @@ class WorkflowRunContext:
             raise CredentialVaultNotConfiguredError(vault_type=vault_type.value, credential_id=credential_id)
 
         credential_item = await credential_service.get_credential_item(db_credential)
+        credential_item = await app.AGENT_FUNCTION.process_registered_credential_item(
+            workflow_run_id=self.workflow_run_id,
+            db_credential=db_credential,
+            credential_item=credential_item,
+        )
         credential = credential_item.credential
 
         credential_totp_identifier = db_credential.totp_identifier or getattr(credential, "totp_identifier", None)

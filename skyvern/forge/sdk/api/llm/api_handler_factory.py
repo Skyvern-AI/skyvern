@@ -2254,6 +2254,10 @@ class LLMAPIHandlerFactory:
                         active_parameters["client"] = custom_http_client
                     # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                     # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
+                    # num_retries>0 lets litellm back off + retry transient errors (429/timeout) instead of failing the run.
+                    # Only set when configured, so the default direct call stays kwarg-identical to the router variant.
+                    if settings.LLM_DIRECT_NUM_RETRIES > 0:
+                        active_parameters.setdefault("num_retries", settings.LLM_DIRECT_NUM_RETRIES)
                     response = await litellm.acompletion(
                         model=model_name,
                         messages=active_messages,
