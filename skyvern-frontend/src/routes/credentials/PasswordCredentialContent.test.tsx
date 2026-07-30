@@ -20,7 +20,7 @@ type Values = {
   username: string;
   password: string;
   totp: string;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: string;
   totp_identifier: string;
 };
 
@@ -71,6 +71,143 @@ const ENTERPRISE_APPS = {
   description:
     "Scan the QR as usual - Skyvern detects these setup codes automatically.",
 };
+
+describe("PasswordCredentialContent — additional two-factor methods", () => {
+  const additionalMethod = {
+    value: "security_device",
+    requestType: "none" as const,
+    label: "Security Device",
+    initialState: { deviceCode: "" },
+    renderFields: ({
+      state,
+      setState,
+      configured,
+    }: {
+      state: Record<string, string | number | boolean>;
+      setState: (next: Record<string, string | number | boolean>) => void;
+      disabled: boolean;
+      isEditMode: boolean;
+      configured: boolean;
+    }) => (
+      <>
+        <label>
+          Device code
+          <input
+            aria-label="Device code"
+            value={String(state.deviceCode ?? "")}
+            onChange={(event) =>
+              setState({ ...state, deviceCode: event.target.value })
+            }
+          />
+        </label>
+        <span>{configured ? "Configured" : "Not configured"}</span>
+      </>
+    ),
+    validate: () => null,
+    onSaved: vi.fn(),
+  };
+
+  it("renders methods supplied by the context as additional cards", () => {
+    render(
+      <CredentialAuthenticatorSupportProvider
+        value={{ additionalTwoFactorMethods: [additionalMethod] }}
+      >
+        <MemoryRouter>
+          <PasswordCredentialContent
+            values={INITIAL_VALUES}
+            onChange={vi.fn()}
+            additionalTwoFactorStates={{
+              security_device: additionalMethod.initialState,
+            }}
+            onAdditionalTwoFactorStateChange={vi.fn()}
+          />
+        </MemoryRouter>
+      </CredentialAuthenticatorSupportProvider>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByText("Security Device"));
+
+    expect(screen.getByLabelText("Device code")).toBeTruthy();
+    expect(screen.getByText("Not configured")).toBeTruthy();
+  });
+
+  it("marks a response-matched method as configured in edit mode", () => {
+    render(
+      <CredentialAuthenticatorSupportProvider
+        value={{ additionalTwoFactorMethods: [additionalMethod] }}
+      >
+        <MemoryRouter>
+          <PasswordCredentialContent
+            values={{ ...INITIAL_VALUES, totp_type: "security_device" }}
+            onChange={vi.fn()}
+            editMode
+            editingGroups={{ name: false, values: true }}
+            configuredAdditionalTwoFactorMethod="security_device"
+            additionalTwoFactorStates={{
+              security_device: additionalMethod.initialState,
+            }}
+            onAdditionalTwoFactorStateChange={vi.fn()}
+          />
+        </MemoryRouter>
+      </CredentialAuthenticatorSupportProvider>,
+    );
+
+    expect(screen.getByText("Security Device")).toBeTruthy();
+    expect(screen.getByText("Configured")).toBeTruthy();
+  });
+
+  it("does not render an additional card with the default context", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={INITIAL_VALUES}
+          onChange={vi.fn()}
+          additionalTwoFactorStates={{}}
+          onAdditionalTwoFactorStateChange={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+
+    expect(screen.queryByText("Security Device")).toBeNull();
+  });
+});
+
+describe("PasswordCredentialContent — built-in two-factor methods", () => {
+  it("exposes every method as a focusable pressed button and updates selection", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent values={INITIAL_VALUES} onChange={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+
+    const methodNames = ["Authenticator App", "Email", "Text Message"];
+    const methodButtons = methodNames.map((name) =>
+      screen.getByRole("button", { name }),
+    );
+
+    for (const [index, button] of methodButtons.entries()) {
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      expect((button as HTMLButtonElement).type).toBe("button");
+      expect(button.tabIndex).toBe(0);
+      expect(button.getAttribute("aria-pressed")).toBe(
+        index === 0 ? "true" : "false",
+      );
+    }
+
+    const emailButton = methodButtons[1]!;
+    emailButton.focus();
+    expect(document.activeElement).toBe(emailButton);
+    fireEvent.click(emailButton);
+
+    expect(emailButton.getAttribute("aria-pressed")).toBe("true");
+    expect(methodButtons[0]?.getAttribute("aria-pressed")).toBe("false");
+  });
+});
 
 // Mirrors CredentialsModal: starts the form at INITIAL_VALUES, then after mount
 // applies the loaded credential via setPasswordCredentialValues — same flow

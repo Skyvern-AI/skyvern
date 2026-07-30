@@ -23,6 +23,7 @@ import { ColumnMappingEditor } from "@/routes/workflows/components/ColumnMapping
 import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import { SheetTabCombobox } from "@/routes/workflows/components/SheetTabCombobox";
 import { SpreadsheetCombobox } from "@/routes/workflows/components/SpreadsheetCombobox";
+import { TemplateModeToggle } from "@/routes/workflows/components/TemplateModeToggle";
 import { parseColumnMapping } from "@/util/columnMappingSerialization";
 import {
   columnLettersToIndex,
@@ -38,6 +39,7 @@ import {
   type GoogleSheetsWriteNode,
   type GoogleSheetsWriteNodeData,
 } from "./types";
+import { useTemplateMode } from "../../hooks/useTemplateMode";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useUpdate } from "../../useUpdate";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
@@ -50,8 +52,14 @@ function GoogleSheetsWriteEditor({ blockId }: { blockId: string }) {
   if (!nodeSlice || nodeSlice.type !== "googleSheetsWrite") {
     return null;
   }
+  // Key by blockId: the sidebar reuses one GoogleSheetsWriteEditorBody instance
+  // across same-type blocks; remounting resets local template-mode state.
   return (
-    <GoogleSheetsWriteEditorBody blockId={blockId} data={nodeSlice.data} />
+    <GoogleSheetsWriteEditorBody
+      key={blockId}
+      blockId={blockId}
+      data={nodeSlice.data}
+    />
   );
 }
 
@@ -77,15 +85,40 @@ function GoogleSheetsWriteEditorBody({
     editable,
   });
 
+  const [spreadsheetDisplayName, setSpreadsheetDisplayName] = useState<
+    string | null
+  >(null);
+  const {
+    pressed: spreadsheetTemplateModePressed,
+    onChange: handleSpreadsheetTemplateModeChange,
+  } = useTemplateMode({
+    value: data.spreadsheetUrl,
+    event: "sheets.spreadsheet.picker.template_mode_toggled",
+    blockType: "google_sheets_write",
+    onClear: () => {
+      setSpreadsheetDisplayName(null);
+      update({ spreadsheetUrl: "" });
+    },
+  });
+  const {
+    pressed: sheetTemplateModePressed,
+    onChange: handleSheetTemplateModeChange,
+  } = useTemplateMode({
+    value: data.sheetName,
+    event: "sheets.tab.template_mode_toggled",
+    blockType: "google_sheets_write",
+    onClear: () => update({ sheetName: "" }),
+  });
+
   const headersQuery = useGoogleSheetHeaders({
     credentialId: data.credentialId,
     spreadsheetUrlOrId: data.spreadsheetUrl,
-    sheetName: data.sheetName,
+    sheetName: sheetTemplateModePressed ? "" : data.sheetName,
   });
   const dimensionsQuery = useGoogleSheetDimensions({
     credentialId: data.credentialId,
     spreadsheetUrlOrId: data.spreadsheetUrl,
-    sheetName: data.sheetName,
+    sheetName: sheetTemplateModePressed ? "" : data.sheetName,
   });
   const needsReconnect = isReconnectRequired(headersQuery.error);
 
@@ -106,10 +139,6 @@ function GoogleSheetsWriteEditorBody({
     }
     return out;
   }, [dimensionsQuery.data, data.columnMapping]);
-
-  const [spreadsheetDisplayName, setSpreadsheetDisplayName] = useState<
-    string | null
-  >(null);
 
   const { credentials } = useGoogleOAuthCredentials();
   const hasSelectedAccount =
@@ -164,15 +193,22 @@ function GoogleSheetsWriteEditorBody({
         </div>
 
         <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Spreadsheet
-            </Label>
-            <HelpTooltip
-              content={
-                helpTooltips["google_sheets_write"]?.["spreadsheetUrl"] ??
-                "The spreadsheet to write to. Type to search your Google Drive, or paste a spreadsheet URL."
-              }
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-xs text-tertiary-foreground">
+                Spreadsheet
+              </Label>
+              <HelpTooltip
+                content={
+                  helpTooltips["google_sheets_write"]?.["spreadsheetUrl"] ??
+                  "The spreadsheet to write to. Type to search your Google Drive, or paste a spreadsheet URL."
+                }
+              />
+            </div>
+            <TemplateModeToggle
+              pressed={spreadsheetTemplateModePressed}
+              pickerTitle="Pick from your spreadsheets"
+              onToggle={handleSpreadsheetTemplateModeChange}
             />
           </div>
           <SpreadsheetCombobox
@@ -184,6 +220,8 @@ function GoogleSheetsWriteEditorBody({
             placeholder="Search or paste a spreadsheet URL"
             allowCreate={true}
             blockType="google_sheets_write"
+            templateMode={spreadsheetTemplateModePressed}
+            onTemplateModeChange={handleSpreadsheetTemplateModeChange}
             onChange={(next) => {
               setSpreadsheetDisplayName(null);
               const oldId = extractSpreadsheetIdFromUrl(data.spreadsheetUrl);
@@ -276,15 +314,22 @@ function GoogleSheetsWriteEditorBody({
               </div>
 
               <div className="space-y-2">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-tertiary-foreground">
-                    Sheet Name
-                  </Label>
-                  <HelpTooltip
-                    content={
-                      helpTooltips["google_sheets_write"]?.["sheetName"] ??
-                      "The sheet tab to write to. Type to search tabs in the selected spreadsheet."
-                    }
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Sheet Name
+                    </Label>
+                    <HelpTooltip
+                      content={
+                        helpTooltips["google_sheets_write"]?.["sheetName"] ??
+                        "The sheet tab to write to. Type to search tabs in the selected spreadsheet."
+                      }
+                    />
+                  </div>
+                  <TemplateModeToggle
+                    pressed={sheetTemplateModePressed}
+                    pickerTitle="Pick from your sheet tabs"
+                    onToggle={handleSheetTemplateModeChange}
                   />
                 </div>
                 <SheetTabCombobox
@@ -296,6 +341,8 @@ function GoogleSheetsWriteEditorBody({
                   placeholder="Sheet1"
                   allowCreate={true}
                   blockType="google_sheets_write"
+                  templateMode={sheetTemplateModePressed}
+                  onTemplateModeChange={handleSheetTemplateModeChange}
                   onChange={(next) => update({ sheetName: next })}
                   onSelect={(tabName) => update({ sheetName: tabName })}
                 />
