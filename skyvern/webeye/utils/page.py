@@ -137,7 +137,16 @@ def _is_json_inlinable(arg: Any) -> bool:
     return True
 
 
-async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None) -> Any:
+async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None, *, force_cdp: bool = False) -> Any:
+    # force_cdp callers require the CDP main-world path regardless of prefix, so
+    # short-circuit before the page/frame/JSON heuristics below. That path
+    # dereferences page-only APIs (``page.context``); a Frame here is a caller
+    # contract violation, so reject it explicitly instead of failing with an
+    # incidental AttributeError deep inside the main-world hook.
+    if force_cdp:
+        if not is_page_like(frame):
+            raise TypeError("force_cdp evaluation requires a top-level Page, not a Frame")
+        return await evaluate_in_main_world(frame, expression, arg, force_cdp=True)
     # Page + prefix + JSON-safe arg → main-world hook (preserves the marker).
     # Iframe Frames and non-JSON args fall back to per-frame evaluate so iframe
     # contexts and Playwright handle-marshalling keep working.
@@ -599,9 +608,11 @@ class SkyvernFrame:
         arg: Any | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         engine_selection: BrowserEngineSelection | None = None,
+        *,
+        force_cdp: bool = False,
     ) -> Any:
         async def evaluate_expression() -> Any:
-            return await _dispatch_evaluate(frame, expression, arg)
+            return await _dispatch_evaluate(frame, expression, arg, force_cdp=force_cdp)
 
         return await SkyvernFrame._evaluate_expression(
             frame=frame,
