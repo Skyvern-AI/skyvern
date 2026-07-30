@@ -253,7 +253,7 @@ async def test_observation_seam_non_candidate_does_not_fire() -> None:
     assert verification is None
 
 
-def test_empty_fallback_marker_records_built_unverified_not_no_meaningful_output() -> None:
+def test_empty_fallback_marker_does_not_block_a_produced_output() -> None:
     ctx = _ctx()
     ctx.request_policy = RequestPolicy(completion_criteria=[], classifier_status="fallback")
     ctx.last_workflow = SimpleNamespace(
@@ -267,11 +267,8 @@ def test_empty_fallback_marker_records_built_unverified_not_no_meaningful_output
     recorded = _record_run_blocks_result(ctx, _real_output_result(), completion_verification=marker)
 
     assert isinstance(recorded, RecordedRunOutcome)
-    assert recorded.verdict == "not_demonstrated"
-    assert recorded.reason_code != "no_meaningful_output"
+    assert recorded.verdict == "demonstrated"
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is False
-    assert _NO_GRADEABLE_PROSE in (recorded.display_reason or "")
 
 
 def test_marker_does_not_leak_into_verdict_consumers() -> None:

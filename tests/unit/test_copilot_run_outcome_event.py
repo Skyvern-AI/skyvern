@@ -318,7 +318,8 @@ async def test_negative_adjudication_emits_outcome_not_demonstrated(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_mid_build_fall_through_still_emits_not_demonstrated(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_judge_dissatisfaction_does_not_change_the_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The outcome derives from what the run produced; a judge re-reading the same run does not."""
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -329,10 +330,8 @@ async def test_mid_build_fall_through_still_emits_not_demonstrated(monkeypatch: 
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
-    assert frames[-1].reason_code == "outcome_not_demonstrated"
+    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is False
 
 
 @pytest.mark.asyncio
@@ -383,7 +382,7 @@ async def test_satisfied_adjudication_emits_demonstrated_with_unverified_prefix(
 
 
 @pytest.mark.asyncio
-async def test_verification_skipped_emits_not_evaluated(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_verification_skipped_still_emits_demonstrated(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -394,7 +393,7 @@ async def test_verification_skipped_emits_not_evaluated(monkeypatch: pytest.Monk
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
+    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
     assert ctx.last_test_suspicious_success is False
 
 
@@ -490,7 +489,7 @@ def test_adjudication_keeps_committed_same_run_demonstrated_outcome() -> None:
 
     assert committed == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
 
-    adjudicated = _adjudicated_run_outcome(ctx, _evaluated(satisfied=False))
+    adjudicated = _adjudicated_run_outcome(ctx)
     stashed = _stash_recorded_run_outcome(
         ctx,
         RecordedRunOutcome(
@@ -510,9 +509,10 @@ def test_adjudication_does_not_keep_committed_outcome_for_new_run() -> None:
     ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_prior")
     ctx.last_run_blocks_workflow_run_id = "wr_test"
 
-    adjudicated = _adjudicated_run_outcome(ctx, _evaluated(satisfied=False))
+    adjudicated = _adjudicated_run_outcome(ctx)
 
-    assert adjudicated.verdict == "not_demonstrated"
+    assert adjudicated is not ctx.last_run_outcome
+    assert adjudicated.workflow_run_id != "wr_prior"
 
 
 @pytest.mark.asyncio
@@ -533,10 +533,8 @@ async def test_missing_run_id_does_not_emit_committed_demonstrated_outcome(
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
+    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
     assert frames[-1].workflow_run_id != "wr_test"
-    assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.verdict == "not_demonstrated"
 
 
 def test_both_consumers_route_through_single_producer() -> None:
@@ -648,3 +646,61 @@ def test_trusted_terminal_challenge_category_requires_carrier() -> None:
     assert trusted_terminal_challenge_category_name(carried) == "ANTI_BOT_DETECTION"
     assert trusted_terminal_challenge_category_name(keyword) is None
     assert trusted_terminal_challenge_category_name(legacy) is None
+
+
+@pytest.mark.asyncio
+async def test_demonstrated_run_tells_the_model_it_may_conclude(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The record satisfying the request is a signal the model reads, not a stop the harness takes."""
+    result = _clean_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    async def _stub_verification(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert "reply to the user now" in result["data"]["next_step"]
+
+
+@pytest.mark.asyncio
+async def test_failed_run_carries_no_conclude_signal() -> None:
+    result = _run_result([], ok=False)
+    ctx = _ctx()
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert "next_step" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_conclude_cue_rides_the_completion_verified_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A run whose success arrives via completion verification (not the mechanical demonstrated
+    # verdict) must still tell the model to conclude, or a verified success reads as unfinished
+    # and the model re-runs it.
+    result = _run_result([_code_block("extract_count", {"error_count": 138})])
+    ctx = _ctx(result["data"]["blocks"])
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.run_execution.outcome_fully_verified", lambda _ctx: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.run_execution._record_run_blocks_result",
+        lambda *_a, **_k: RecordedRunOutcome(verdict="progress_observed"),
+    )
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert "reply to the user now" in str(result["data"].get("next_step"))
+
+
+@pytest.mark.asyncio
+async def test_conclude_cue_absent_when_nothing_verified(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _run_result([_code_block("extract_count", {})])
+    ctx = _ctx(result["data"]["blocks"])
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.run_execution.outcome_fully_verified", lambda _ctx: False)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.run_execution._record_run_blocks_result",
+        lambda *_a, **_k: RecordedRunOutcome(verdict="not_demonstrated"),
+    )
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert result["data"].get("next_step") is None
