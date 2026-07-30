@@ -7,10 +7,11 @@ in any ``copilot/`` business logic — derivation lives in
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ResponseKind(StrEnum):
@@ -19,6 +20,26 @@ class ResponseKind(StrEnum):
     DIAGNOSE = "diagnose"
     REFUSE = "refuse"
     RECOVER = "recover"
+
+
+_UNSAFE_IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_\- ]")
+
+
+class UnresolvedRuntimeFailure(BaseModel):
+    """A failure a successful turn could not clear, recorded so the outcome is gradeable after the
+    fact; the reply text derives independently, and nothing keys success or verification on this."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    workflow_run_id: str
+    block_label: str
+
+    @field_validator("workflow_run_id", "block_label")
+    @classmethod
+    def _bare_identifier(cls, value: str) -> str:
+        # Both fields are model-authored and reach the chat reply and the history API, so they are
+        # reduced to bounded identifiers here rather than at each surface that renders them.
+        return _UNSAFE_IDENTIFIER_RE.sub("", value)[:80].strip()
 
 
 class TurnOutcome(BaseModel):
@@ -39,3 +60,4 @@ class TurnOutcome(BaseModel):
     copilot_last_code_build_failed: bool = False
     copilot_pending_capability: str | None = None
     copilot_turn_id: str | None = None
+    unresolved_runtime_failure: UnresolvedRuntimeFailure | None = None

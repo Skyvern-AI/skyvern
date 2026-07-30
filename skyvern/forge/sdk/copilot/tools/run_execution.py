@@ -2642,7 +2642,11 @@ def _record_run_blocks_result(
     copilot_ctx.last_artifact_health_blocker_labels = []
     copilot_ctx.last_artifact_health_failure_classes = []
     if completion_verification is not None and completion_verification.status == "evaluated":
-        copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
+        # Every unverified-outcome reason asserts a run that completed, so a run that
+        # raised has no outcome-gate reason and must report its own failure instead.
+        copilot_ctx.last_outcome_gate_reason = (
+            _outcome_unverified_reason(copilot_ctx, completion_verification) if run_ok else None
+        )
         copilot_ctx.last_outcome_gate_workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
     copilot_ctx.last_test_suspicious_success = False
     if prior_committed_outcome is None:
