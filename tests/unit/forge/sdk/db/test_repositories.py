@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
+
 
 def test_credential_repository_instantiation():
     from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
@@ -382,3 +385,40 @@ def test_agent_db_defines_no_delegator_methods():
         "Add data-access methods to the domain repository and call it via the typed attribute "
         "(e.g. db.tasks.get_task) instead of adding delegators to AgentDB."
     )
+
+
+async def _create_task_with_status(monkeypatch: pytest.MonkeyPatch, status: str):
+    from skyvern.forge.sdk.db.repositories import tasks as tasks_module
+
+    session = make_mock_session(MagicMock())
+    monkeypatch.setattr(tasks_module, "convert_to_task", lambda model, *args, **kwargs: model)
+    repo = tasks_module.TasksRepository(
+        session_factory=lambda: MockAsyncSessionCtx(session),
+        debug_enabled=False,
+    )
+
+    return await repo.create_task(
+        url="https://example.test/",
+        title=None,
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_running_is_not_created_after_it_started(monkeypatch: pytest.MonkeyPatch):
+    """queued_seconds is started_at - created_at, so a task created already-running must not
+    stamp started_at ahead of the flush-time created_at default."""
+    task = await _create_task_with_status(monkeypatch, TaskStatus.running.value)
+
+    assert task.started_at is not None
+    assert task.created_at == task.started_at
+
+
+@pytest.mark.asyncio
+async def test_create_task_leaves_started_at_unset_for_other_statuses(monkeypatch: pytest.MonkeyPatch):
+    task = await _create_task_with_status(monkeypatch, TaskStatus.created.value)
+
+    assert task.started_at is None
