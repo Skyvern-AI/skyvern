@@ -31,7 +31,10 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
-import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
+import {
+  PANE_HEADER_ICON_BUTTON_CLASS,
+  PANE_HEADER_ICON_BUTTON_DESTRUCTIVE_CLASS,
+} from "./constants";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { useBrowserPaneView } from "./useBrowserPaneView";
@@ -253,7 +256,7 @@ export function BrowserPaneActions() {
               disabled={
                 !workflowPermanentId || !browserSessionId || debugHidden
               }
-              className={PANE_HEADER_ICON_BUTTON_CLASS}
+              className={PANE_HEADER_ICON_BUTTON_DESTRUCTIVE_CLASS}
             >
               <PowerIcon className="h-3.5 w-3.5" />
             </button>
