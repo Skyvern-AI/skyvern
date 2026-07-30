@@ -23681,6 +23681,7 @@
           "authenticator",
           "email",
           "text",
+          "passkey",
           "none"
         ],
         "title": "TotpType",
