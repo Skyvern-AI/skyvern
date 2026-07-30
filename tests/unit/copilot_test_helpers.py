@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -208,4 +209,64 @@ def make_completion_criterion(
         mint_degrade=mint_degrade,  # type: ignore[arg-type]
         requested_output_floor_rekeyed=requested_output_floor_rekeyed,
         floor_rekeyed_from_path=floor_rekeyed_from_path,
+    )
+
+
+def two_page_login_yaml(*, submit_selector: str = "Login") -> str:
+    """The shape copilot emits in code-block mode: branch bodies are code inside one always-executed
+    block, so a passing run can traverse it without reaching the guarded call."""
+    return f"""
+    title: Sign in and read the metric
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: sign_in_and_read
+        code: |
+          await page.fill("#user", "demo")
+          await page.click("#submit")
+          if await page.locator("#token").count():
+              await page.get_by_role("button", name="{submit_selector}", exact=True).click()
+          return {{"visitors": "9.42K"}}
+    """
+
+
+def straight_line_login_yaml() -> str:
+    """One always-executed code block with no branching: executing it reaches every call in it."""
+    return """
+    title: Sign in and read the metric
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: sign_in_and_read
+        code: |
+          await page.fill("#user", "demo")
+          await page.get_by_role("button", name="Login", exact=True).click()
+          return {"visitors": "9.42K"}
+    """
+
+
+def failed_second_factor_run(run_id: str) -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        attempted_block_label="sign_in_and_read",
+        attempted_call_ref="role:button:Login",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+        workflow_run_id=run_id,
+        block_labels=["sign_in_and_read"],
+        structural_failure_identity="locator-timeout-identity",
+    )
+
+
+def passing_run(run_id: str, block_labels: list[str]) -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="progress_observed",
+        reason_code="run_completed_unevaluated",
+        workflow_run_id=run_id,
+        block_labels=block_labels,
+        structural_failure_identity="",
+        evidence_refs=["rows:1"],
     )

@@ -167,6 +167,28 @@ def _selector_from_text(text: str) -> tuple[str, str]:
     return "", ""
 
 
+_CSS_SELECTOR_KIND = "locator"
+
+
+def selector_identity_from_failure(text: str) -> str:
+    kind, value = _selector_from_text(text or "")
+    # "selector" and "locator" are the same CSS string under two spellings; the code side only ever
+    # spells it "locator", so a failure that named it "selector" must normalize or never match.
+    return f"{_CSS_SELECTOR_KIND if kind == 'selector' else kind}:{value}" if kind else ""
+
+
+def selector_identities_in_text(text: str) -> set[str]:
+    """Every locator identity in ``text``, normalized to match ``selector_identity_from_failure``."""
+    identities: set[str] = set()
+    for match in _LOCATOR_RE.finditer(text or ""):
+        identities.add(f"{_CSS_SELECTOR_KIND}:{_normalize_signature_text(match.group('selector'))}")
+    for match in _ROLE_RE.finditer(text or ""):
+        role = _normalize_signature_text(match.group("role"))
+        name = _normalize_signature_text(match.group("name") or "")
+        identities.add(f"role:{role}:{name}" if name else f"role:{role}")
+    return identities
+
+
 def _error_class_from_text(text: str) -> str:
     code_block_imposition = _code_block_imposition_error_class(text)
     if code_block_imposition:
