@@ -6,14 +6,14 @@ Create Date: 2026-07-30T09:57:46.639367+00:00
 
 """
 
+import random
+import time
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+from sqlalchemy.exc import DBAPIError
 
 from alembic import op
-import random
-import time
-from sqlalchemy.exc import DBAPIError
 
 # revision identifiers, used by Alembic.
 revision: str = "58c683692601"
@@ -31,12 +31,16 @@ _ADDS = (
     ("credentials", "run_sequentially", "BOOLEAN NOT NULL DEFAULT false"),
     ("workflow_runs", "sequential_credential_id", "VARCHAR"),
 )
+
+
 def _is_lock_not_available(exc: DBAPIError) -> bool:
     orig = getattr(exc, "orig", None)
     return (
         getattr(orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE_SQLSTATE
         or getattr(orig, "pgcode", None) == _LOCK_NOT_AVAILABLE_SQLSTATE
     )
+
+
 def _column_exists(table: str, column: str) -> bool:
     result = op.get_bind().execute(
         sa.text(
@@ -51,6 +55,8 @@ def _column_exists(table: str, column: str) -> bool:
         {"table_name": table, "column_name": column},
     )
     return result.first() is not None
+
+
 def _execute_transactional_schema_change(table: str, statement: str) -> None:
     try:
         op.execute("BEGIN")
@@ -67,6 +73,8 @@ def _execute_transactional_schema_change(table: str, statement: str) -> None:
                 f"rollback failed after schema change error; aborting migration: {rollback_exc}"
             ) from exc
         raise
+
+
 def _execute_with_retry(table: str, statement: str, deadline: float) -> None:
     while True:
         try:
