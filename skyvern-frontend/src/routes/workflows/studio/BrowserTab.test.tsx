@@ -490,6 +490,23 @@ describe("BrowserTab pills and selection sync", () => {
     }
   });
 
+  it("styles only Turn off browser as destructive, not its siblings", () => {
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(STUDIO_PATH);
+
+    expect(screen.getByLabelText("Turn off browser").className).toContain(
+      "badge-destructive",
+    );
+    for (const name of [
+      "Reconnect browser stream",
+      "Open browser in new tab",
+    ]) {
+      expect(screen.getByLabelText(name).className).not.toContain(
+        "badge-destructive",
+      );
+    }
+  });
+
   it("marks the resolved view's pill as pressed", () => {
     seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
