@@ -81,6 +81,25 @@ GMAIL_OTP_MAX_RESULTS = 5
 GMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
+
+# Injected by kubelet and the ECS agent respectively.
+_PACKAGED_DEPLOYMENT_ENV_MARKERS = (
+    "KUBERNETES_SERVICE_HOST",
+    "ECS_CONTAINER_METADATA_URI_V4",
+    "ECS_CONTAINER_METADATA_URI",
+)
+# Docker writes the first, Podman the second. Neither is created by containerd or nerdctl, so this
+# is a best-effort courtesy check and never an isolation boundary -- ENV is the boundary.
+_PACKAGED_DEPLOYMENT_MARKER_FILES = ("/.dockerenv", "/run/.containerenv")
+
+
+def running_in_packaged_deployment() -> bool:
+    """Whether this process looks like a packaged deployment rather than a developer checkout."""
+    if any(os.environ.get(marker) for marker in _PACKAGED_DEPLOYMENT_ENV_MARKERS):
+        return True
+    return any(os.path.exists(path) for path in _PACKAGED_DEPLOYMENT_MARKER_FILES)
+
+
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
@@ -964,12 +983,21 @@ class AgentFunction:
         organization_id: str,
         workflow_permanent_id: str,
     ) -> bool:
-        """Base no-op (copilot runs its block test inline); overridden per deployment."""
+        """Base no-op; callers fail closed when worker dispatch is unavailable."""
         return False
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
+
+    def allow_copilot_inline_code_execution(self) -> bool:
+        """Whether a copilot block test run may execute in the API process when sandbox dispatch is
+        unavailable. Developer checkouts only."""
+        # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
+        # ENV=local, so a packaged deployment would look identical to a laptop.
+        if settings.is_cloud_environment() or running_in_packaged_deployment():
+            return False
+        return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
@@ -1521,7 +1549,7 @@ class AgentFunction:
         if "@" not in totp_identifier:
             return None
 
-        from skyvern.services.otp_service import parse_otp_login
+        from skyvern.services.otp_service import InsufficientCreditsForOTPParse, parse_otp_login
 
         lookup_context = context or GmailOTPVerificationContext()
         now = datetime.now(timezone.utc)
@@ -1589,6 +1617,11 @@ class AgentFunction:
                         continue
                     try:
                         otp_value = await parse_otp_login(candidate.content, organization_id)
+                    except InsufficientCreditsForOTPParse:
+                        # Credit eligibility is organization-wide, so stop this scan.
+                        # Remember the candidate so later polls do not retry the same material.
+                        lookup_context.remember_message_id(candidate.message_id)
+                        return None
                     except Exception:
                         LOG.warning(
                             "Failed to parse Gmail OTP candidate",

@@ -1057,6 +1057,7 @@ class RealBrowserManager(BrowserManager):
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 script_id=script_id,
+                organization_id=organization_id,
             )
 
         if script_id:

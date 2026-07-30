@@ -225,6 +225,10 @@ class Settings(BaseSettings):
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
+    # Local-development escape hatch: run a copilot block test run in the API process when sandbox
+    # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
+    # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
+    COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.

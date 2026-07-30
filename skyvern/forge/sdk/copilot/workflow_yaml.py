@@ -539,13 +539,14 @@ def apply_block_edit(
         occurrences = current.count(expected_code)
         if occurrences == 0:
             raise BlockEditError(
-                f"expected_code was not found in block {label!r}. It has changed since you read it — "
-                "re-read the block and rewrite the edit against its current code."
+                f"expected_code was not found in block {label!r}. It has changed since you read it. "
+                f"Its code is now:\n{current}\n"
+                "Rewrite the edit against exactly that text."
             )
         if occurrences > 1:
             raise BlockEditError(
                 f"expected_code appears {occurrences} times in block {label!r}; include enough "
-                "surrounding lines to identify one occurrence."
+                f"surrounding lines to identify one occurrence. Its code is now:\n{current}"
             )
         block["code"] = current.replace(expected_code, replacement_code, 1)
 
