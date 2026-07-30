@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from unittest.mock import AsyncMock, MagicMock
 
 from skyvern.forge import set_force_app_instance
@@ -41,6 +42,13 @@ def create_forge_stub_app() -> ForgeApp:
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
+    # Credential write-lock gating — _LazyNamespace would auto-mock these as truthy AsyncMocks,
+    # forcing the update/delete credential routes down the lock path and handing `async with` a
+    # coroutine instead of a context manager. Match the real OSS base no-ops (unlocked path).
+    fake_app_module.AGENT_FUNCTION.should_lock_credential_write = AsyncMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.credential_write_lock = MagicMock(return_value=nullcontext())
+    fake_app_module.AGENT_FUNCTION.validate_credential_write = AsyncMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.prepare_credential_update = AsyncMock(side_effect=lambda **kwargs: kwargs["data"])
     # Grid-collection seam — _LazyNamespace would auto-mock this as a truthy AsyncMock whose
     # awaited value is a non-None MagicMock, poisoning the extract-information prompt/cache key.
     # Match the real OSS base no-op (None → no grid rows injected).

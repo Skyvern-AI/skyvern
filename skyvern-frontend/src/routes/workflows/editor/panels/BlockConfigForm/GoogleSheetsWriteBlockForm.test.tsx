@@ -17,6 +17,7 @@ const mockNodes = new Map<
   { id: string; type: string; data?: Record<string, unknown> } | undefined
 >();
 const updateNodeData = vi.fn();
+const capture = vi.fn();
 
 vi.mock("@xyflow/react", async () => {
   const actual =
@@ -102,6 +103,8 @@ vi.mock("@/routes/workflows/components/SpreadsheetCombobox", () => ({
     displayName: string | null;
     placeholder?: string;
     allowCreate: boolean;
+    templateMode: boolean;
+    onTemplateModeChange: (enabled: boolean) => void;
     onChange: (value: string) => void;
     onSelect: (selection: {
       url: string;
@@ -115,6 +118,7 @@ vi.mock("@/routes/workflows/components/SpreadsheetCombobox", () => ({
       data-display-name={props.displayName ?? ""}
       data-has-selected-account={String(props.hasSelectedAccount)}
       data-allow-create={String(props.allowCreate)}
+      data-template-mode={String(props.templateMode)}
     >
       <input
         data-testid="spreadsheet-input"
@@ -131,6 +135,10 @@ vi.mock("@/routes/workflows/components/SpreadsheetCombobox", () => ({
           })
         }
       />
+      <button
+        data-testid="spreadsheet-template-mode-on"
+        onClick={() => props.onTemplateModeChange(true)}
+      />
     </div>
   ),
 }));
@@ -144,10 +152,16 @@ vi.mock("@/routes/workflows/components/SheetTabCombobox", () => ({
     value: string;
     placeholder?: string;
     allowCreate: boolean;
+    templateMode: boolean;
+    onTemplateModeChange: (enabled: boolean) => void;
     onChange: (value: string) => void;
     onSelect: (tabName: string) => void;
   }) => (
-    <div data-testid="sheet-tab-combobox" data-value={props.value}>
+    <div
+      data-testid="sheet-tab-combobox"
+      data-value={props.value}
+      data-template-mode={String(props.templateMode)}
+    >
       <input
         data-testid="sheet-tab-input"
         value={props.value}
@@ -156,6 +170,10 @@ vi.mock("@/routes/workflows/components/SheetTabCombobox", () => ({
       <button
         data-testid="sheet-tab-select"
         onClick={() => props.onSelect("Tab2")}
+      />
+      <button
+        data-testid="sheet-template-mode-on"
+        onClick={() => props.onTemplateModeChange(true)}
       />
     </div>
   ),
@@ -203,6 +221,14 @@ vi.mock("@/hooks/useGoogleSheetDimensions", () => ({
   useGoogleSheetDimensions: () => ({ data: null, isLoading: false }),
 }));
 
+vi.mock("@/hooks/useCurrentOrgId", () => ({
+  useCurrentOrgId: () => "org_test",
+}));
+
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture }),
+}));
+
 vi.mock("@/components/ui/checkbox", () => ({
   Checkbox: (props: {
     checked: boolean;
@@ -241,6 +267,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   mockNodes.clear();
   updateNodeData.mockReset();
+  capture.mockReset();
   usePendingCommitsStore.setState({ commits: {} });
   useSidebarSaveStateStore.getState().reset();
 });
@@ -353,6 +380,169 @@ describe("GoogleSheetsWriteBlockForm (SKY-9361)", () => {
       spreadsheetUrl: "https://docs.google.com/spreadsheets/d/xyz456/edit",
       sheetName: "",
     });
+  });
+
+  test("switching blocks clears the selected spreadsheet display name", () => {
+    setGoogleSheetsWriteNode("g1");
+    setGoogleSheetsWriteNode("g2", {
+      spreadsheetUrl: "https://docs.google.com/spreadsheets/d/xyz456/edit",
+    });
+    const { rerender } = render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    fireEvent.click(screen.getByTestId("spreadsheet-select"));
+    expect(screen.getByTestId("spreadsheet-combobox").dataset.displayName).toBe(
+      "My Sheet",
+    );
+
+    rerender(<GoogleSheetsWriteBlockForm blockId="g2" />);
+
+    expect(screen.getByTestId("spreadsheet-combobox").dataset.displayName).toBe(
+      "",
+    );
+    expect(screen.getByTestId("spreadsheet-combobox").dataset.value).toBe(
+      "https://docs.google.com/spreadsheets/d/xyz456/edit",
+    );
+  });
+
+  test("toggles the spreadsheet field and captures telemetry", () => {
+    setGoogleSheetsWriteNode("g1");
+    render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Enter a custom value" })[0]!,
+    );
+
+    expect(
+      screen
+        .getByRole("button", { name: "Pick from your spreadsheets" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("spreadsheet-combobox").dataset.templateMode,
+    ).toBe("true");
+    expect(capture).toHaveBeenCalledWith(
+      "sheets.spreadsheet.picker.template_mode_toggled",
+      {
+        org_id: "org_test",
+        block_type: "google_sheets_write",
+        enabled: true,
+      },
+    );
+  });
+
+  test("clears a template spreadsheet value when returning to the picker", () => {
+    setGoogleSheetsWriteNode("g1", {
+      spreadsheetUrl: "{{ target_spreadsheet_url }}",
+    });
+    render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Pick from your spreadsheets" }),
+    );
+
+    expect(updateNodeData).toHaveBeenCalledWith("g1", {
+      spreadsheetUrl: "",
+    });
+    expect(capture).toHaveBeenCalledWith(
+      "sheets.spreadsheet.picker.template_mode_toggled",
+      {
+        org_id: "org_test",
+        block_type: "google_sheets_write",
+        enabled: false,
+      },
+    );
+  });
+
+  test("repeated true requests keep spreadsheet template mode on", () => {
+    setGoogleSheetsWriteNode("g1", {
+      spreadsheetUrl: "{{ target_spreadsheet_url }}",
+    });
+    render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    const requestTemplateMode = screen.getByTestId(
+      "spreadsheet-template-mode-on",
+    );
+    fireEvent.click(requestTemplateMode);
+    fireEvent.click(requestTemplateMode);
+
+    expect(
+      screen
+        .getByRole("button", { name: "Pick from your spreadsheets" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(updateNodeData).not.toHaveBeenCalled();
+    expect(capture).toHaveBeenLastCalledWith(
+      "sheets.spreadsheet.picker.template_mode_toggled",
+      {
+        org_id: "org_test",
+        block_type: "google_sheets_write",
+        enabled: true,
+      },
+    );
+  });
+
+  test("repeated true requests keep sheet template mode on", () => {
+    setGoogleSheetsWriteNode("g1", {
+      sheetName: "{{ target_sheet_name }}",
+    });
+    render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    const requestTemplateMode = screen.getByTestId("sheet-template-mode-on");
+    fireEvent.click(requestTemplateMode);
+    fireEvent.click(requestTemplateMode);
+
+    expect(
+      screen
+        .getByRole("button", { name: "Pick from your sheet tabs" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(updateNodeData).not.toHaveBeenCalled();
+    expect(capture).toHaveBeenLastCalledWith(
+      "sheets.tab.template_mode_toggled",
+      {
+        org_id: "org_test",
+        block_type: "google_sheets_write",
+        enabled: true,
+      },
+    );
+  });
+
+  test("switching blocks resets both local template modes", () => {
+    setGoogleSheetsWriteNode("g1");
+    setGoogleSheetsWriteNode("g2");
+    const { rerender } = render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Enter a custom value" })[0]!,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enter a custom value" }),
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Pick from your spreadsheets" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Pick from your sheet tabs" }),
+    ).toBeTruthy();
+
+    rerender(<GoogleSheetsWriteBlockForm blockId="g2" />);
+
+    expect(
+      screen.queryByRole("button", { name: "Pick from your spreadsheets" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Pick from your sheet tabs" }),
+    ).toBeNull();
+    expect(
+      screen.getAllByRole("button", { name: "Enter a custom value" }),
+    ).toHaveLength(2);
+    expect(
+      screen.getByTestId("spreadsheet-combobox").dataset.templateMode,
+    ).toBe("false");
+    expect(screen.getByTestId("sheet-tab-combobox").dataset.templateMode).toBe(
+      "false",
+    );
   });
 
   test("selecting a sheet propagates sheetName", () => {

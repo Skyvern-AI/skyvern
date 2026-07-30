@@ -51,10 +51,14 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         def __init__(self) -> None:
             self.credentials = FakeCredentialRepo()
 
+    process_item = AsyncMock(side_effect=lambda **kwargs: kwargs["credential_item"])
     fake_app = SimpleNamespace(
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
-        AGENT_FUNCTION=SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
+        AGENT_FUNCTION=SimpleNamespace(
+            parse_enterprise_totp_secret=AsyncMock(return_value=None),
+            process_registered_credential_item=process_item,
+        ),
     )
     monkeypatch.setattr(cm, "app", fake_app)
 
@@ -75,7 +79,10 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
     assert context.get_resolved_credential_parameter_id("credential_param") == "cred-1"
 
 
-async def _register_with_credential(monkeypatch: pytest.MonkeyPatch, credential: object) -> WorkflowRunContext:
+async def _register_with_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    credential: object,
+) -> WorkflowRunContext:
     db_credential = SimpleNamespace(
         credential_id="cred-1",
         organization_id="org-1",
@@ -100,10 +107,14 @@ async def _register_with_credential(monkeypatch: pytest.MonkeyPatch, credential:
         def __init__(self) -> None:
             self.credentials = FakeCredentialRepo()
 
+    process_item = AsyncMock(side_effect=lambda **kwargs: kwargs["credential_item"])
     fake_app = SimpleNamespace(
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
-        AGENT_FUNCTION=SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
+        AGENT_FUNCTION=SimpleNamespace(
+            parse_enterprise_totp_secret=AsyncMock(return_value=None),
+            process_registered_credential_item=process_item,
+        ),
     )
     monkeypatch.setattr(cm, "app", fake_app)
 
@@ -195,6 +206,19 @@ async def test_register_credit_card_flattens_billing_fields(
     assert context.secrets[values["billing_address_state_code"]] == "CA"
     assert context.secrets[values["billing_address_country_code"]] == "US"
     assert context.secrets[values["billing_email"]] == "billing@example.com"
+    assert context.secrets[values["metadata_customer_id"]] == "cus_123"
+
+
+@pytest.mark.asyncio
+async def test_register_password_flattens_metadata_like_credit_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = PasswordCredential(
+        username="user@example.com",
+        password="secret",
+        metadata={"customer_id": "cus_123"},
+    )
+    context = await _register_with_credential(monkeypatch, credential)
+
+    values = context.values["credential_param"]
     assert context.secrets[values["metadata_customer_id"]] == "cus_123"
 
 

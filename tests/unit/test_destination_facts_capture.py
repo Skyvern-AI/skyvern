@@ -278,7 +278,7 @@ class TestScrapeAssemblyCarriesTheSidecar:
             [[element("e1", destination=ANCHOR_FACTS)], [element("e1", destination=ANCHOR_FACTS)]]
         )
 
-        async def fake_create_instance(_frame: object) -> SkyvernFrame:
+        async def fake_create_instance(_frame: object, engine_selection: object = None) -> SkyvernFrame:
             return main_frame
 
         monkeypatch.setattr(SkyvernFrame, "create_instance", fake_create_instance)

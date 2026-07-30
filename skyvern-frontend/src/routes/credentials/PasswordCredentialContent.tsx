@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { cn } from "@/util/utils";
 import {
   CheckIcon,
@@ -32,6 +33,8 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import {
+  type CredentialAdditionalTwoFactorMethod,
+  type CredentialAdditionalTwoFactorState,
   type CredentialAuthenticatorQrCodeType,
   useCredentialAuthenticatorSupport,
 } from "./CredentialAuthenticatorSupportContext";
@@ -39,23 +42,18 @@ import { AuthenticatorAppLogo } from "./AuthenticatorAppLogo";
 import { decodeQrCodeImage } from "./decodeQrCodeImage";
 import { type AuthenticatorSaveError } from "./authenticatorSaveError";
 
+type PasswordCredentialContentValues = {
+  name: string;
+  username: string;
+  password: string;
+  totp: string;
+  totp_type: string;
+  totp_identifier: string;
+};
+
 type Props = {
-  values: {
-    name: string;
-    username: string;
-    password: string;
-    totp: string;
-    totp_type: "authenticator" | "email" | "text" | "none";
-    totp_identifier: string;
-  };
-  onChange: (values: {
-    name: string;
-    username: string;
-    password: string;
-    totp: string;
-    totp_type: "authenticator" | "email" | "text" | "none";
-    totp_identifier: string;
-  }) => void;
+  values: PasswordCredentialContentValues;
+  onChange: (values: PasswordCredentialContentValues) => void;
   /** Login page URL value — when onUrlChange is provided, a URL field is rendered after Name */
   url?: string;
   onUrlChange?: (url: string) => void;
@@ -68,6 +66,16 @@ type Props = {
   /** Slot rendered right before the separator between Name/URL and Username/Password */
   beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
+  configuredAdditionalTwoFactorMethod?: string;
+  additionalTwoFactorStates?: Record<
+    string,
+    CredentialAdditionalTwoFactorState
+  >;
+  onAdditionalTwoFactorStateChange?: (
+    methodValue: string,
+    next: CredentialAdditionalTwoFactorState,
+  ) => void;
+  additionalTwoFactorError?: string | null;
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
   onEnableEditValues?: () => void;
@@ -105,6 +113,97 @@ function isStandardAuthenticatorValue(value: string): boolean {
   return compact.length >= 16 && /^[A-Z2-7]+=*$/i.test(compact);
 }
 
+function useAdditionalTwoFactorMethodEnabled(
+  method: CredentialAdditionalTwoFactorMethod,
+): boolean {
+  const flagEnabled = useFeatureFlag(method.flagName ?? "");
+  return method.flagName ? flagEnabled === true : true;
+}
+
+function AdditionalTwoFactorMethodCard({
+  method,
+  selected,
+  onSelect,
+}: {
+  method: CredentialAdditionalTwoFactorMethod;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const enabled = useAdditionalTwoFactorMethodEnabled(method);
+  if (!enabled) {
+    return null;
+  }
+
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      className={cn(
+        "relative flex h-36 cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
+        selected &&
+          "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60",
+      )}
+      onClick={onSelect}
+    >
+      {selected && (
+        <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
+          <CheckIcon className="size-3" />
+        </span>
+      )}
+      {method.icon}
+      <Label className="cursor-pointer text-center">{method.label}</Label>
+    </button>
+  );
+}
+
+function AdditionalTwoFactorMethodFields({
+  method,
+  state,
+  setState,
+  disabled,
+  isEditMode,
+  configured,
+  error,
+}: {
+  method: CredentialAdditionalTwoFactorMethod;
+  state: CredentialAdditionalTwoFactorState;
+  setState: (next: CredentialAdditionalTwoFactorState) => void;
+  disabled: boolean;
+  isEditMode: boolean;
+  configured: boolean;
+  error?: string | null;
+}) {
+  const enabled = useAdditionalTwoFactorMethodEnabled(method);
+  const validationErrorId = useId();
+  if (!enabled) {
+    return configured ? (
+      <div className="flex items-center gap-3 rounded-md border border-input bg-background px-3 py-2">
+        {method.icon}
+        <span className="text-sm font-medium">{method.label}</span>
+        <span className="text-xs text-muted-foreground">Configured</span>
+      </div>
+    ) : null;
+  }
+
+  return (
+    <div className="space-y-4">
+      {method.renderFields({
+        state,
+        setState,
+        disabled,
+        isEditMode,
+        configured,
+        validationErrorId: error ? validationErrorId : undefined,
+      })}
+      {error && (
+        <p id={validationErrorId} className="text-xs text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function PasswordCredentialContent({
   values,
   onChange,
@@ -115,13 +214,18 @@ function PasswordCredentialContent({
   afterUrl,
   beforeCredentialFields,
   editMode,
+  configuredAdditionalTwoFactorMethod,
+  additionalTwoFactorStates = {},
+  onAdditionalTwoFactorStateChange,
+  additionalTwoFactorError,
   editingGroups,
   onEnableEditName,
   onEnableEditValues,
   totpError,
   authenticatorSaveError,
 }: Props) {
-  const { enterpriseApps } = useCredentialAuthenticatorSupport();
+  const { enterpriseApps, additionalTwoFactorMethods = [] } =
+    useCredentialAuthenticatorSupport();
   const { name, username, password, totp, totp_type, totp_identifier } = values;
 
   const enterpriseUpgradeError =
@@ -145,10 +249,8 @@ function PasswordCredentialContent({
   const nameReadOnly = editMode && !editingGroups?.name;
   const valuesReadOnly = editMode && !editingGroups?.values;
 
-  const [totpMethod, setTotpMethod] = useState<
-    "authenticator" | "email" | "text"
-  >(
-    totp_type === "email" || totp_type === "text" ? totp_type : "authenticator",
+  const [totpMethod, setTotpMethod] = useState<string>(
+    totp_type === "none" ? "authenticator" : totp_type,
   );
   const [totpAccordionValue, setTotpAccordionValue] = useState<string>("");
   const [showPassword, setShowPassword] = useState(false);
@@ -253,10 +355,12 @@ function PasswordCredentialContent({
   // Sync totpMethod and auto-expand accordion when totp_type prop changes
   // (e.g. edit data arriving after mount)
   useEffect(() => {
-    setTotpMethod(
-      totp_type === "email" || totp_type === "text"
-        ? totp_type
-        : "authenticator",
+    setTotpMethod((current) =>
+      totp_type === "none"
+        ? current === "none"
+          ? "none"
+          : "authenticator"
+        : totp_type,
     );
     if (totp_type && totp_type !== "none") {
       setTotpAccordionValue("two-factor-authentication");
@@ -359,9 +463,7 @@ function PasswordCredentialContent({
   // User explicitly switched the 2FA method. Apply method-specific identifier
   // defaults here (rather than in a useEffect) so data-hydration setTotpMethod
   // calls don't accidentally trigger them.
-  const handleTotpMethodChange = (
-    method: "authenticator" | "email" | "text",
-  ) => {
+  const handleTotpMethodChange = (method: string) => {
     onEnableEditValues?.();
     const prevMethod = totpMethod;
     setTotpMethod(method);
@@ -386,17 +488,32 @@ function PasswordCredentialContent({
       updates.totp_identifier = "";
     }
 
+    if (
+      method === "none" ||
+      additionalTwoFactorMethods.some(({ value }) => value === method)
+    ) {
+      updates.totp_identifier = "";
+    }
+
     updateValues(updates);
   };
 
   const handleTotpAccordionValueChange = (value: string) => {
     setTotpAccordionValue(value);
-    if (
-      value === "two-factor-authentication" &&
-      totp_type === "none" &&
-      !valuesReadOnly
-    ) {
-      handleTotpMethodChange(totpMethod);
+    if (valuesReadOnly) {
+      return;
+    }
+    if (value === "two-factor-authentication") {
+      // Opening the section activates a concrete method (there is no "None"
+      // tile); default to the authenticator app when nothing is selected yet.
+      if (totp_type === "none") {
+        handleTotpMethodChange(
+          totpMethod === "none" ? "authenticator" : totpMethod,
+        );
+      }
+    } else if (totp_type !== "none") {
+      // Collapsing the section is how the user turns two-factor off.
+      handleTotpMethodChange("none");
     }
   };
 
@@ -659,13 +776,15 @@ function PasswordCredentialContent({
           <AccordionContent>
             <div className="space-y-4">
               <p className="text-sm text-slate-400">
-                Set up Skyvern to automatically retrieve two-factor
-                authentication codes.
+                Set up Skyvern to automatically complete two-factor
+                authentication.
               </p>
-              <div className="grid h-36 grid-cols-3 gap-4">
-                <div
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <button
+                  type="button"
+                  aria-pressed={totpMethod === "authenticator"}
                   className={cn(
-                    "relative flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
+                    "relative flex h-36 cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
                     {
                       "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60":
                         totpMethod === "authenticator",
@@ -682,10 +801,12 @@ function PasswordCredentialContent({
                   <Label className="cursor-pointer text-center">
                     Authenticator App
                   </Label>
-                </div>
-                <div
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={totpMethod === "email"}
                   className={cn(
-                    "relative flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
+                    "relative flex h-36 cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
                     {
                       "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60":
                         totpMethod === "email",
@@ -700,10 +821,12 @@ function PasswordCredentialContent({
                   )}
                   <EnvelopeClosedIcon className="h-6 w-6" />
                   <Label className="cursor-pointer text-center">Email</Label>
-                </div>
-                <div
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={totpMethod === "text"}
                   className={cn(
-                    "relative flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
+                    "relative flex h-36 cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
                     {
                       "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60":
                         totpMethod === "text",
@@ -720,8 +843,39 @@ function PasswordCredentialContent({
                   <Label className="cursor-pointer text-center">
                     Text Message
                   </Label>
-                </div>
+                </button>
+                {additionalTwoFactorMethods.map((method) => (
+                  <AdditionalTwoFactorMethodCard
+                    key={method.value}
+                    method={method}
+                    selected={totpMethod === method.value}
+                    onSelect={() => handleTotpMethodChange(method.value)}
+                  />
+                ))}
               </div>
+              {additionalTwoFactorMethods.map((method) =>
+                totpMethod === method.value ? (
+                  <AdditionalTwoFactorMethodFields
+                    key={method.value}
+                    method={method}
+                    state={
+                      additionalTwoFactorStates[method.value] ??
+                      method.initialState ??
+                      {}
+                    }
+                    setState={(next) => {
+                      onEnableEditValues?.();
+                      onAdditionalTwoFactorStateChange?.(method.value, next);
+                    }}
+                    disabled={Boolean(valuesReadOnly)}
+                    isEditMode={Boolean(editMode)}
+                    configured={
+                      configuredAdditionalTwoFactorMethod === method.value
+                    }
+                    error={additionalTwoFactorError}
+                  />
+                ) : null,
+              )}
               {(totpMethod === "text" || totpMethod === "email") && (
                 <>
                   <div className="space-y-2">
@@ -937,4 +1091,4 @@ function PasswordCredentialContent({
   );
 }
 
-export { PasswordCredentialContent };
+export { PasswordCredentialContent, type PasswordCredentialContentValues };

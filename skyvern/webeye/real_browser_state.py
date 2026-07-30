@@ -329,7 +329,7 @@ class RealBrowserState(BrowserState):
     async def validate_browser_context(self, page: Page) -> bool:
         # validate the content
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+            skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=self.engine_selection)
             html = await skyvern_frame.get_content()
         except Exception:
             LOG.error(
@@ -764,6 +764,7 @@ class RealBrowserState(BrowserState):
             page=page,
             file_path=file_path,
             mode=ScreenshotMode.LITE,
+            engine_selection=self.engine_selection,
         )
 
     @traced(name="skyvern.browser.post_action_screenshot")
@@ -778,4 +779,5 @@ class RealBrowserState(BrowserState):
             file_path=file_path,
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
+            engine_selection=self.engine_selection,
         )
