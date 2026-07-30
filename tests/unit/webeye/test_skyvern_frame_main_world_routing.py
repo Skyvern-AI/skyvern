@@ -56,6 +56,56 @@ class TestSkyvernFrameEvaluateRouting:
         page.context.new_cdp_session.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
+    async def test_force_cdp_routes_through_runtime_evaluate_without_prefix(self) -> None:
+        """force_cdp=True must take the CDP main-world path even with no prefix
+        configured. force_cdp callers depend on this seam to keep their forced
+        main-world semantics while still receiving centralized timeout and
+        navigation recovery from SkyvernFrame."""
+        page, ctx = _make_page_mock(prefix=None)
+
+        result = await SkyvernFrame.evaluate(page, "() => 42", force_cdp=True)
+
+        assert result == "runtime-evaluate-result"
+        page.evaluate.assert_not_awaited()
+        page.context.new_cdp_session.assert_awaited_once_with(page)  # type: ignore[attr-defined]
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]  # type: ignore[attr-defined]
+        assert params["expression"] == "\n(() => 42)()"
+
+    @pytest.mark.asyncio
+    async def test_force_cdp_inlines_json_arg_via_runtime_evaluate(self) -> None:
+        page, ctx = _make_page_mock(prefix=None)
+
+        await SkyvernFrame.evaluate(page, "(opts) => opts.maxRows", {"maxRows": 10}, force_cdp=True)
+
+        page.evaluate.assert_not_awaited()
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]  # type: ignore[attr-defined]
+        assert params["expression"] == '\n((opts) => opts.maxRows)({"maxRows": 10})'
+
+    @pytest.mark.asyncio
+    async def test_force_cdp_with_frame_target_raises_clear_contract_error(self) -> None:
+        """force_cdp is a Page-only contract: the CDP main-world path dereferences
+        page-only APIs (``page.context``), so a Frame must fail with a deterministic
+        TypeError at the seam rather than an incidental AttributeError deep in the
+        hook. Iframe grids are out of scope; the sole production caller passes a Page."""
+        frame = _make_frame_mock()
+
+        with pytest.raises(TypeError, match="Page"):
+            await SkyvernFrame.evaluate(frame, "() => 1", force_cdp=True)
+
+        frame.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_frame_target_without_force_cdp_still_delegates_to_frame_evaluate(self) -> None:
+        """The force_cdp guard must not disturb the default (force_cdp=False) Frame
+        path: an iframe Frame keeps its own per-frame evaluate."""
+        frame = _make_frame_mock()
+
+        result = await SkyvernFrame.evaluate(frame, "() => 1")
+
+        assert result == "frame-evaluate-result"
+        frame.evaluate.assert_awaited_once_with(expression="() => 1", arg=None)
+
+    @pytest.mark.asyncio
     async def test_page_with_prefix_and_no_arg_routes_through_runtime_evaluate(self) -> None:
         page, ctx = _make_page_mock(prefix="// MARK")
         try:

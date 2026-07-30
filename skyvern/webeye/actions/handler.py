@@ -5709,6 +5709,7 @@ async def handle_extract_action(
             scraped_page=scraped_page,
             task=task,
             step=step,
+            page=page,
         )
         extracted_data = scrape_action_result.scraped_data
         return [ActionSuccess(data=extracted_data)]
@@ -9494,6 +9495,8 @@ async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
     scraped_page: ScrapedPage,
+    *,
+    page: Page,
 ) -> ScrapeResult:
     """
     Scrapes a webpage and returns the scraped response, including:
@@ -9512,6 +9515,15 @@ async def extract_information_for_navigation_goal(
     context.scrape_trigger = "extraction"
     context.scrape_screenshots_consumed = True
     scraped_page_refreshed = await scraped_page.refresh()
+    # Complete-row harvest for a server-windowed virtualized data grid, injected into
+    # the prompt below. Behind an AgentFunction seam (framework-specific collectors are
+    # deployment overrides) and a fail-open boundary so collection never blocks extraction.
+    virtualized_grid_rows: str | None = None
+    try:
+        virtualized_grid_rows = await app.AGENT_FUNCTION.collect_virtualized_grid_rows(task=task, page=page)
+    except Exception:
+        virtualized_grid_rows = None
+        LOG.warning("virtualized_grid_collection_failed")
 
     # task.workflow_permanent_id is None on most fetch paths (tasks table has
     # no such column); fall back to context. SKY-8992.
@@ -9557,7 +9569,11 @@ async def extract_information_for_navigation_goal(
         extracted_text=extracted_text_for_prompt,
         error_code_mapping_str=error_code_mapping_str,
         local_datetime=local_datetime_str,
+        virtualized_grid_rows=virtualized_grid_rows,
     )
+    post_ceiling_grid_rows = post_ceiling_kwargs.get("virtualized_grid_rows")
+    if virtualized_grid_rows is not None and post_ceiling_grid_rows is None:
+        LOG.warning("virtualized_grid_rows_dropped_from_prompt")
 
     # Self-heal guard: on the second retry onward (``retry_index > 1``) the
     # previous attempts' cached result is suspect — the first retry already
@@ -9606,6 +9622,7 @@ async def extract_information_for_navigation_goal(
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
             workflow_system_prompt=task.workflow_system_prompt,
+            virtualized_grid_rows=post_ceiling_grid_rows,
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
