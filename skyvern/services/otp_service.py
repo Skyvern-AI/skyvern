@@ -22,7 +22,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.services.credentials import generate_totp_code
+from skyvern.forge.sdk.services.credentials import generate_totp_code, is_unresolved_totp_placeholder
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 
 LOG = structlog.get_logger()
@@ -182,7 +182,10 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
             if not isinstance(value, str):
                 continue
             candidate_value = value.strip()
-            if candidate_value:
+            # Payloads only carry the placeholder form of an unresolved credential TOTP
+            # (raw vault markers like BW_TOTP live behind secret resolution), so match the
+            # exact placeholder rather than the broader is_unresolved_totp_value predicate.
+            if candidate_value and not is_unresolved_totp_placeholder(candidate_value):
                 traversal_stack.append(candidate_value)
 
     return None
