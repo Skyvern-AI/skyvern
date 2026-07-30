@@ -33,6 +33,7 @@ exact threat the vault architecture is designed to prevent.
 import asyncio
 import json
 import time
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Annotated, Any, NoReturn
 
@@ -186,6 +187,7 @@ _SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
     "Saved authenticator key is invalid. Edit the credential and paste the raw setup key "
     "or full otpauth:// URI from the website's 2FA setup screen."
 )
+CREDENTIAL_WRITE_CONFLICT_DETAIL = "Credential was modified by another request. Please retry."
 _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
 
 
@@ -695,6 +697,13 @@ async def create_credential(
             organization_id=current_org.organization_id,
         )
 
+    await app.AGENT_FUNCTION.validate_credential_write(
+        organization_id=current_org.organization_id,
+        credential_type=data.credential_type,
+        credential=data.credential,
+        existing_credential=None,
+    )
+
     # Validate the profile link BEFORE provisioning, so an invalid/managed/cross-org/owned profile
     # rejects with a 400 without leaving an orphan credential (and vault secret) behind.
     if data.browser_profile_id is not None:
@@ -891,7 +900,18 @@ async def rename_credential(
         proxy_session_id=data.proxy_session_id,
         rotate_proxy_session_id=data.rotate_proxy_session_id,
     )
-    updated = await _update_credential_or_profile_conflict(**update_kwargs)
+    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=None,
+        existing_credential=credential,
+    )
+    write_guard: AbstractAsyncContextManager[None] = nullcontext()
+    if requires_write_lock:
+        write_guard = app.AGENT_FUNCTION.credential_write_lock(
+            organization_id=current_org.organization_id,
+            credential_id=credential_id,
+        )
+    async with write_guard:
+        updated = await _update_credential_or_profile_conflict(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
@@ -1746,6 +1766,90 @@ async def _create_browser_profile_after_workflow(
                 )
 
 
+async def _delete_replaced_credential_item(
+    *,
+    credential_service: CredentialVaultService,
+    organization_id: str,
+    item_id: str,
+    vault_type: CredentialVaultType,
+) -> None:
+    try:
+        deleted = await credential_service.post_delete_credential_item(item_id, organization_id)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to delete replaced credential vault item",
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+            error_type=type(exc).__name__,
+        )
+    else:
+        if deleted:
+            return
+        LOG.warning(
+            "Credential vault provider rejected replaced item cleanup",
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+        )
+
+    try:
+        await app.AGENT_FUNCTION.on_credential_item_orphaned(
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+        )
+    except Exception as exc:
+        LOG.error(
+            "Failed to schedule replaced credential vault item cleanup",
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+            error_type=type(exc).__name__,
+        )
+
+
+async def _write_lock_decision_is_stale(*, sampled_credential: Credential, latest_credential: Credential) -> bool:
+    # Vault backends that update secrets in place keep item_id stable, so the lock decision
+    # itself has to be re-evaluated against the refreshed row rather than inferred from item_id.
+    requires_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=None,
+        existing_credential=latest_credential,
+    )
+    return latest_credential.item_id != sampled_credential.item_id or requires_lock
+
+
+async def _raise_if_superseded_by_concurrent_write(
+    *,
+    credential_service: CredentialVaultService,
+    credential_id: str,
+    organization_id: str,
+    written_item_id: str,
+    replaced_item_id: str,
+    vault_type: CredentialVaultType,
+) -> None:
+    latest_credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id, organization_id=organization_id
+    )
+    if latest_credential is not None and latest_credential.item_id == written_item_id:
+        return
+
+    LOG.warning(
+        "Credential update was superseded by a concurrent write",
+        credential_id=credential_id,
+        organization_id=organization_id,
+        written_item_id=written_item_id,
+    )
+    if written_item_id != replaced_item_id:
+        await _delete_replaced_credential_item(
+            credential_service=credential_service,
+            organization_id=organization_id,
+            item_id=written_item_id,
+            vault_type=vault_type,
+        )
+    raise HTTPException(status_code=409, detail=CREDENTIAL_WRITE_CONFLICT_DETAIL)
+
+
 @legacy_base_router.put("/credentials/{credential_id}")
 @legacy_base_router.put("/credentials/{credential_id}/", include_in_schema=False)
 @base_router.post(
@@ -1799,10 +1903,15 @@ async def update_credential(
     if not existing_credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    if isinstance(data.credential, NonEmptyPasswordCredential):
-        await _normalize_authenticator_totp_for_organization_or_raise(
-            data.credential,
+    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=data.credential,
+        existing_credential=existing_credential,
+    )
+    write_guard: AbstractAsyncContextManager[None] = nullcontext()
+    if requires_write_lock:
+        write_guard = app.AGENT_FUNCTION.credential_write_lock(
             organization_id=current_org.organization_id,
+            credential_id=credential_id,
         )
 
     if data.browser_profile_id is not None:
@@ -1810,36 +1919,86 @@ async def update_credential(
             data.browser_profile_id, current_org.organization_id, current_credential_id=credential_id
         )
 
-    vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
-    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
-    if not credential_service:
-        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+    async with write_guard:
+        if requires_write_lock:
+            existing_credential = await app.DATABASE.credentials.get_credential(
+                credential_id=credential_id, organization_id=current_org.organization_id
+            )
+            if not existing_credential:
+                raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    old_item_id = existing_credential.item_id
+        if isinstance(data.credential, NonEmptyPasswordCredential):
+            await _normalize_authenticator_totp_for_organization_or_raise(
+                data.credential,
+                organization_id=current_org.organization_id,
+            )
 
-    try:
-        updated_credential = await credential_service.update_credential(
-            credential=existing_credential,
+        await app.AGENT_FUNCTION.validate_credential_write(
+            organization_id=current_org.organization_id,
+            credential_type=data.credential_type,
+            credential=data.credential,
+            existing_credential=existing_credential,
+        )
+
+        vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
+        credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+        if not credential_service:
+            raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+        old_item_id = existing_credential.item_id
+
+        if not requires_write_lock:
+            latest_credential = await app.DATABASE.credentials.get_credential(
+                credential_id=credential_id, organization_id=current_org.organization_id
+            )
+            if latest_credential is None or (
+                await _write_lock_decision_is_stale(
+                    sampled_credential=existing_credential,
+                    latest_credential=latest_credential,
+                )
+            ):
+                raise HTTPException(status_code=409, detail=CREDENTIAL_WRITE_CONFLICT_DETAIL)
+
+        write_request = await app.AGENT_FUNCTION.prepare_credential_update(
+            credential_service=credential_service,
+            existing_credential=existing_credential,
             data=data,
         )
-    except SkyvernHttpException as e:
-        detail = (
-            f"Custom credential service returned {e.error_message}"
-            if e.error_message
-            else f"Custom credential service returned HTTP {e.status_code}"
-        )
-        raise HTTPException(status_code=502, detail=detail)
 
-    # Schedule background cleanup of old vault item if the item_id changed
-    if old_item_id != updated_credential.item_id:
-        background_tasks.add_task(
-            credential_service.post_delete_credential_item,
-            old_item_id,
-            existing_credential.organization_id,
-        )
+        try:
+            updated_credential = await credential_service.update_credential(
+                credential=existing_credential,
+                data=write_request,
+            )
+        except SkyvernHttpException as e:
+            detail = (
+                f"Custom credential service returned {e.error_message}"
+                if e.error_message
+                else f"Custom credential service returned HTTP {e.status_code}"
+            )
+            raise HTTPException(status_code=502, detail=detail)
 
-    if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
-        background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
+        if not requires_write_lock:
+            await _raise_if_superseded_by_concurrent_write(
+                credential_service=credential_service,
+                credential_id=credential_id,
+                organization_id=current_org.organization_id,
+                written_item_id=updated_credential.item_id,
+                replaced_item_id=old_item_id,
+                vault_type=vault_type,
+            )
+
+        if old_item_id != updated_credential.item_id:
+            background_tasks.add_task(
+                _delete_replaced_credential_item,
+                credential_service=credential_service,
+                organization_id=existing_credential.organization_id,
+                item_id=old_item_id,
+                vault_type=vault_type,
+            )
+
+        if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
+            background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
 
     _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
 
@@ -1903,28 +2062,55 @@ async def delete_credential(
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
-    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
-    if not credential_service:
-        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
-
-    try:
-        await credential_service.delete_credential(credential)
-    except SkyvernHttpException as e:
-        detail = (
-            f"Custom credential service returned {e.error_message}"
-            if e.error_message
-            else f"Custom credential service returned HTTP {e.status_code}"
+    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=None,
+        existing_credential=credential,
+    )
+    write_guard: AbstractAsyncContextManager[None] = nullcontext()
+    if requires_write_lock:
+        write_guard = app.AGENT_FUNCTION.credential_write_lock(
+            organization_id=current_org.organization_id,
+            credential_id=credential_id,
         )
-        raise HTTPException(status_code=502, detail=detail)
 
-    # Schedule background cleanup if the service implements it
-    if vault_type != CredentialVaultType.CUSTOM:
-        background_tasks.add_task(
-            credential_service.post_delete_credential_item,
-            credential.item_id,
-            credential.organization_id,
+    async with write_guard:
+        latest_credential = await app.DATABASE.credentials.get_credential(
+            credential_id=credential_id, organization_id=current_org.organization_id
         )
+        if not latest_credential:
+            raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+        if not requires_write_lock and (
+            await _write_lock_decision_is_stale(
+                sampled_credential=credential,
+                latest_credential=latest_credential,
+            )
+        ):
+            raise HTTPException(status_code=409, detail=CREDENTIAL_WRITE_CONFLICT_DETAIL)
+        credential = latest_credential
+
+        vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+        credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+        if not credential_service:
+            raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+        try:
+            await credential_service.delete_credential(credential)
+        except SkyvernHttpException as e:
+            detail = (
+                f"Custom credential service returned {e.error_message}"
+                if e.error_message
+                else f"Custom credential service returned HTTP {e.status_code}"
+            )
+            raise HTTPException(status_code=502, detail=detail)
+
+        if vault_type != CredentialVaultType.CUSTOM:
+            background_tasks.add_task(
+                _delete_replaced_credential_item,
+                credential_service=credential_service,
+                organization_id=credential.organization_id,
+                item_id=credential.item_id,
+                vault_type=vault_type,
+            )
 
     # Reap the credential's living browser profile so deleting a credential doesn't silently orphan
     # its cookie-bearing archive (unbounded S3 growth). Kept if a live owner still references it. The

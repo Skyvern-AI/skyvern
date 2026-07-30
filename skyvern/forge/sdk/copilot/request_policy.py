@@ -6,9 +6,9 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
-from urllib.parse import parse_qsl, urlencode, urlparse
 
 import structlog
 
@@ -23,6 +23,13 @@ from skyvern.forge.sdk.copilot.context import (
     prior_signin_email_from_context,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.credential_resolution import deduplicate_credentials as _deduplicate_credentials
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials as _load_credentials
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    loggable_origin,
+    resolve_by_url,
+)
+from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
@@ -48,7 +55,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -571,6 +578,9 @@ class RequestPolicy:
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
+    # credential_id -> the login page URL that granted it, so each later fill can confirm the
+    # browser has not left that site and a redirect cannot inherit the grant.
+    live_page_admitted_urls: dict[str, str] = field(default_factory=dict)
     # Approves persisting a bound credential, not running it: run authority stays
     # scoped to resolved_credentials (ADR 0002).
     discovered_credentials: list[Credential] = field(default_factory=list)
@@ -746,7 +756,7 @@ class RequestPolicy:
         if self.resolved_credentials:
             lines += [
                 "resolved_credentials:",
-                *[f"- {_safe_label(credential)}" for credential in self.resolved_credentials],
+                *[f"- {credential_candidate_label(credential)}" for credential in self.resolved_credentials],
             ]
         if self.invalid_credential_ids:
             lines.append("invalid_credential_ids: " + ", ".join(f"`{cid}`" for cid in self.invalid_credential_ids))
@@ -4292,17 +4302,6 @@ async def _classify_request(
     return policy
 
 
-async def _load_credentials(organization_id: str) -> list[Credential]:
-    page = 1
-    credentials: list[Credential] = []
-    while True:
-        items = await app.DATABASE.credentials.get_credentials(organization_id=organization_id, page=page, page_size=50)
-        credentials.extend(items)
-        if len(items) < 50:
-            return sorted(credentials, key=lambda c: getattr(c, "created_at", None) or "", reverse=True)
-        page += 1
-
-
 def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
     return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
 
@@ -4312,7 +4311,9 @@ def _credential_reference_is_negated(user_message: str, reference_start: int) ->
     context = user_message[clause_start + 1 : reference_start]
     context = re.sub(r",\s*(?=credential\b)", " ", context, flags=re.I)
     if context.rstrip().endswith(",") and re.match(
-        r"\s*(?:credential\b|cred_|[`'\"])",
+        # Any wrapper the name arrives in — quotes, markdown emphasis, brackets — reads the same:
+        # "do not use the credential, **prod**" is one clause, not an appositive.
+        r"\s*(?:credential\b|cred_|[`'\"“”‘’*_([{<])",
         user_message[reference_start:],
         re.I,
     ):
@@ -4392,6 +4393,8 @@ def _credential_name_candidates(user_message: str) -> list[str]:
 
 
 _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH = 4
+# Labels that mean the classifier read this turn as referring to a stored credential at all.
+_CREDENTIAL_REFERENCE_INPUT_KINDS = frozenset({"credential_id", "credential_name", "website_stored_credential"})
 
 
 def _explicit_login_action_asserted(user_message: str) -> bool:
@@ -4405,25 +4408,54 @@ def _explicit_login_action_asserted(user_message: str) -> bool:
     )
 
 
+def _wrapper_start(text: str, index: int) -> int:
+    """Step back over quotes, brackets or markdown emphasis wrapping a reference."""
+    while index > 0 and text[index - 1] in "`'\"“”‘’*_([{<":
+        index -= 1
+    return index
+
+
+def _name_stated_affirmatively(text: str, name: str) -> bool:
+    name = (name or "").strip()
+    if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+        return False
+    pattern = rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])"
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        # Negation reads the clause before the reference, and any wrapper around the name belongs to
+        # it: from inside the quotes, "credential, `prod`" no longer reads as an appositive.
+        start = _wrapper_start(text, match.start())
+        if not _credential_reference_is_negated(text, start) and not _credential_reference_is_unrelated_replacement(
+            text, start
+        ):
+            return True
+    return False
+
+
 def _saved_credential_names_mentioned(user_message: str, credentials: list[Credential]) -> list[str]:
     """Saved names a message states outright, e.g. "use skyvern-datadog to login".
 
     The saved names are known, so match on them rather than on the prose around them.
     """
     text = _credential_authority_text(user_message or "")
-    mentioned: list[str] = []
-    for credential in credentials:
-        name = (credential.name or "").strip()
-        if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
-            continue
-        for match in re.finditer(rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])", text, re.IGNORECASE):
-            if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
-                text, match.start()
-            ):
-                continue
-            mentioned.append(name)
-            break
-    return _clean_list(mentioned)
+    return _clean_list(
+        [
+            (credential.name or "").strip()
+            for credential in credentials
+            if _name_stated_affirmatively(text, credential.name or "")
+        ]
+    )
+
+
+def _classifier_ref_stated_in_message(policy: RequestPolicy, user_message: str) -> bool:
+    """Whether a credential-labelled turn's extracted name appears affirmatively in this message.
+
+    Which credential label the classifier chose must not decide whether a name the user wrote is
+    looked up by name (SKY-12917), but a turn it never called a credential request may not scan.
+    """
+    if policy.classifier_status == "fallback" or policy.credential_input_kind not in _CREDENTIAL_REFERENCE_INPUT_KINDS:
+        return False
+    text = _credential_authority_text(user_message or "")
+    return any(isinstance(ref, str) and _name_stated_affirmatively(text, ref) for ref in policy.credential_refs)
 
 
 def _explicit_credential_ids(user_message: str) -> list[str]:
@@ -4462,14 +4494,7 @@ def _explicit_credential_ids(user_message: str) -> list[str]:
     return _clean_list(explicit)
 
 
-def _deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
-    by_id: dict[str, Credential] = {}
-    for credential in credentials:
-        by_id.setdefault(credential.credential_id, credential)
-    return list(by_id.values())
-
-
-def _safe_label(credential: Credential) -> str:
+def credential_candidate_label(credential: Credential) -> str:
     parts = [f"`{credential.credential_id}`", credential.name]
     parts += [f"Login Page URL: {credential.tested_url}"] if credential.tested_url else []
     return " - ".join(parts)
@@ -4488,48 +4513,17 @@ def _block(
     if reason is not None:
         policy.clarification_reason = reason
     if candidates:
-        question += "\n\nSafe matches:\n" + "\n".join(f"- {_safe_label(candidate)}" for candidate in candidates)
+        question += "\n\nSafe matches:\n" + "\n".join(
+            f"- {credential_candidate_label(candidate)}" for candidate in candidates
+        )
     policy.clarification_question = question
-
-
-def _url_parts(url: str) -> tuple[str, str] | None:
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    if not parsed.netloc:
-        return None
-    host = parsed.netloc.lower()
-    path = parsed.path.rstrip("/")
-    # Login pages can differ only by query (?tenant=a vs ?tenant=b), so the
-    # exact tier keys on the full URL with a param-order-insensitive query.
-    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
-    exact = f"{parsed.scheme.lower()}://{host}{path}"
-    if query:
-        exact = f"{exact}?{query}"
-    return exact, f"{parsed.scheme.lower()}://{host}"
-
-
-def _match_by_url(
-    credentials: list[Credential], urls: list[str], *, allow_host_fallback: bool = True
-) -> list[Credential]:
-    indexed = [
-        (credential, parts)
-        for credential in credentials
-        if credential.tested_url and (parts := _url_parts(credential.tested_url))
-    ]
-    requested = [parts for url in urls if (parts := _url_parts(url))]
-    for index in range(2 if allow_host_fallback else 1):
-        matches = [
-            credential for credential, parts in indexed if any(parts[index] == target[index] for target in requested)
-        ]
-        if matches:
-            return matches
-    return []
 
 
 def _login_url_candidates(policy: RequestPolicy, user_message: str) -> list[str]:
     if policy.login_page_urls:
         return _clean_list(policy.login_page_urls)
     candidates = _clean_list([candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)])
-    candidate_hosts = {parts[1] for candidate in candidates if (parts := _url_parts(candidate))}
+    candidate_hosts = {parts[2] for candidate in candidates if (parts := _url_parts(candidate))}
     if len(candidate_hosts) > 1:
         return []
     return candidates
@@ -4646,7 +4640,7 @@ def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, work
 
 
 def _signin_target_hosts(policy: RequestPolicy, user_message: str) -> list[str]:
-    return [parts[1] for url in _login_url_candidates(policy, user_message) if (parts := _url_parts(url))]
+    return [parts[2] for url in _login_url_candidates(policy, user_message) if (parts := _url_parts(url))]
 
 
 def _is_passwordless_email_signin(policy: RequestPolicy) -> bool:
@@ -4858,7 +4852,11 @@ async def _resolve_credentials(
     # it, so a message asking for a login in its own words must still count. A classifier that failed
     # outright is a different case: a degraded turn never enumerates the org's saved credentials.
     login_phrase_asserted = _explicit_login_action_asserted(user_message)
-    may_scan_saved_names = policy.login_intent or (policy.classifier_status != "fallback" and login_phrase_asserted)
+    may_scan_saved_names = (
+        policy.login_intent
+        or (policy.classifier_status != "fallback" and login_phrase_asserted)
+        or _classifier_ref_stated_in_message(policy, user_message)
+    )
     name_candidates = _credential_name_candidates(user_message)
     credentials: list[Credential] | None = None
     # Only a request that already asserts a login or credential intent may be matched against the
@@ -4947,54 +4945,29 @@ async def _resolve_credentials(
     if url_candidates:
         if credentials is None:
             credentials = await _load_credentials(organization_id)
-        url_credentials = credentials
-        if current_turn_login_authorized:
-            # Card/secret credentials can carry a tested_url too; a
-            # login turn must only ever auto-bind a password credential.
-            url_credentials = [
-                credential for credential in credentials if credential.credential_type == CredentialType.PASSWORD
-            ]
-        matches = _match_by_url(
-            url_credentials,
+        resolution = resolve_by_url(
+            credentials,
             url_candidates,
             # A URL merely mentioned in prose is a weaker signal than a
             # classifier-extracted login page; require an exact tested-URL hit.
-            allow_host_fallback=allow_host_fallback,
+            tiers=("url_exact", "url_host") if allow_host_fallback else ("url_exact",),
+            password_only=current_turn_login_authorized,
+            allow_urlless_sole=current_turn_login_authorized,
         )
-        matches = _deduplicate_credentials(matches)
-        if len(matches) == 1:
-            policy.resolved_credentials = matches
+        if resolution.verdict == "resolved":
+            policy.resolved_credentials = list(resolution.candidates)
             return
-        if matches:
+        if resolution.verdict == "ambiguous":
             # Found-but-unbound keeps the unresolved-login override from
             # relabeling this disambiguation ask as a missing-credential turn.
-            policy.discovered_credentials = matches
+            policy.discovered_credentials = list(resolution.candidates)
             _block(
                 policy,
                 _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
-                matches,
+                list(resolution.candidates),
                 reason="credential_name_unresolved",
             )
             return
-        if current_turn_login_authorized:
-            # URL-matched password credentials rank first. If neither URL
-            # tier matches, credentials saved without a tested URL remain
-            # valid login candidates.
-            urlless = _deduplicate_credentials(
-                [credential for credential in url_credentials if not credential.tested_url]
-            )
-            if len(urlless) == 1:
-                policy.resolved_credentials = urlless
-                return
-            if urlless:
-                policy.discovered_credentials = urlless
-                _block(
-                    policy,
-                    _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
-                    urlless,
-                    reason="credential_name_unresolved",
-                )
-                return
 
     if policy.credential_input_kind == "credential_name":
         if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
@@ -5025,6 +4998,91 @@ async def _resolve_credentials(
             "I could not find a stored credential for that login page. Please select a saved credential by exact name or a credential ID beginning with cred_, or create one in the Credentials UI.",
             reason="credential_name_unresolved",
         )
+
+
+@dataclass(frozen=True)
+class LiveCredentialAdmission:
+    admitted: bool
+    steer: str | None = None
+    page_url: str | None = None
+
+
+async def admit_credential_for_live_page(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    credential_id: str,
+    page_url: str,
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]] | None = None,
+) -> LiveCredentialAdmission:
+    """Grant run authority for the credential whose saved login URL matches the page the scout reached.
+
+    The discriminator is that server-computed match, never the model's claim: a credential the page
+    does not vouch for is refused, and so is one saved without a login URL, which is evidence about
+    no page at all.
+    """
+    if policy.raw_secret_detected or not policy.allow_run_blocks or not credential_id or not page_url:
+        return LiveCredentialAdmission(False)
+    if _is_passwordless_email_signin(policy):
+        # Turn-start resolution excludes this shape from every URL tier because a site that signs in
+        # by emailed link has no password question to put to the user, so admitting one here would
+        # fill a password the user said the account does not have.
+        LOG.info(
+            "copilot credential live-page admission",
+            outcome="passwordless_declined",
+            organization_id=organization_id,
+            credential_id=credential_id,
+            page_url=loggable_origin(page_url),
+        )
+        return LiveCredentialAdmission(False)
+
+    resolution = resolve_by_url(
+        await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
+        [page_url],
+        # The scout reached this page, so its own path is the evidence; a bare host match would let
+        # any other page on that host — a profile, an upload, a user-content route — claim the login.
+        tiers=("url_exact", "url_path"),
+        password_only=True,
+    )
+    # Being *one of* several page matches is not authority; only a sole match the page
+    # vouches for is, so an ambiguous set still asks even when it contains the requested id.
+    admitted = resolution.verdict == "resolved" and resolution.contains(credential_id)
+    LOG.info(
+        "copilot credential live-page admission",
+        outcome="admitted"
+        if admitted
+        else ("wrong_credential" if resolution.verdict == "resolved" else resolution.verdict),
+        organization_id=organization_id,
+        credential_id=credential_id,
+        page_url=loggable_origin(page_url),
+        tier=resolution.tier,
+        candidate_credential_ids=[candidate.credential_id for candidate in resolution.candidates],
+    )
+    if admitted:
+        policy.resolved_credentials = _deduplicate_credentials(
+            list(policy.resolved_credentials) + list(resolution.candidates)
+        )
+        for candidate in resolution.candidates:
+            policy.live_page_admitted_urls[candidate.credential_id] = page_url
+        return LiveCredentialAdmission(True, page_url=page_url)
+
+    if resolution.verdict == "ambiguous":
+        policy.discovered_credentials = _deduplicate_credentials(
+            list(policy.discovered_credentials) + list(resolution.candidates)
+        )
+        return LiveCredentialAdmission(
+            False,
+            steer=f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Ask the user which one to use, then fill it.",
+        )
+    if resolution.verdict == "resolved":
+        return LiveCredentialAdmission(
+            False,
+            steer=(
+                f"`{credential_id}` is not the saved credential for this login page. Ask the user which "
+                "saved credential to use here."
+            ),
+        )
+    return LiveCredentialAdmission(False)
 
 
 def _is_login_credential_param(param: dict[str, Any]) -> bool:

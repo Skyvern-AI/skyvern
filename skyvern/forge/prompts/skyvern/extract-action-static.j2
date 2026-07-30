@@ -64,6 +64,7 @@ Reply in JSON format with the following keys:
     "should_enter_verification_code": bool, // Whether the user should proceed to enter the verification code.
     "should_verify_by_magic_link": bool // Whether the page instructs the user to check their email for a magic link to verify the login.{% endif %}
 }
-
+{% if extra_action_guidance %}{{ extra_action_guidance }}
+{% endif %}
 Consider the action history from the last step{% if llm_screenshots_enabled %} and the screenshot{% endif %} together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
 Action history from previous steps: (note: even if the action history suggests goal is achieved, check{% if llm_screenshots_enabled %} the screenshot and{% endif %} the DOM elements to make sure the goal is achieved)
