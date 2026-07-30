@@ -1914,7 +1914,16 @@ def _tool_visible_result_after_completion_verification(
         return result
 
     copied_data = dict(data) if isinstance(data, dict) else {}
-    copied_data["failure_reason"] = outcome_unverified_reason
+    # Every outcome-unverified reason asserts a run that completed, so substituting it for a raised
+    # block's own reason told the agent a failed run had completed and sent repair at the extraction
+    # instead of at the failing call. Append it as subordinate context instead.
+    run_failure_reason = next(iter_failure_reasons(result), "")
+    agent_facing_reason = (
+        f"{run_failure_reason.rstrip('. ')}. Completion verification also reported: {outcome_unverified_reason}"
+        if run_failure_reason
+        else outcome_unverified_reason
+    )
+    copied_data["failure_reason"] = agent_facing_reason
     copied_data["completion_verification"] = (
         completion_verification.to_trace_data() if completion_verification is not None else None
     )
@@ -1932,7 +1941,7 @@ def _tool_visible_result_after_completion_verification(
     return {
         **result,
         "ok": False,
-        "error": outcome_unverified_reason,
+        "error": agent_facing_reason,
         "data": copied_data,
     }
 

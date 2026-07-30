@@ -2,6 +2,7 @@ import asyncio
 import copy
 import dataclasses
 import json
+import re
 import time
 import warnings
 from asyncio import CancelledError
@@ -11,7 +12,6 @@ import litellm
 import structlog
 from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
-from jinja2 import Template
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
@@ -70,6 +70,12 @@ from skyvern.utils.url_validators import validate_fetch_url
 configure_litellm_transport()
 
 LOG = structlog.get_logger()
+_HASHED_HREF_PLACEHOLDER = re.compile(r"\{\{\s*(_[0-9a-f]{64})\s*\}\}")
+
+
+def _render_hashed_href_map(llm_content: str, hashed_href_map: dict[str, str]) -> str:
+    return _HASHED_HREF_PLACEHOLDER.sub(lambda match: hashed_href_map.get(match.group(1), ""), llm_content)
+
 
 # Transient upstream faults litellm maps to these subclass openai.APIError, NOT
 # litellm.exceptions.APIError, so a bare `except litellm.exceptions.APIError` misses them.
@@ -1856,7 +1862,7 @@ class LLMAPIHandlerFactory:
                 rendered_response_json = None
                 if context and len(context.hashed_href_map) > 0:
                     llm_content = json.dumps(parsed_response)
-                    rendered_content = Template(llm_content).render(context.hashed_href_map)
+                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
                     parsed_response = loads_with_repair(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
@@ -2414,7 +2420,7 @@ class LLMAPIHandlerFactory:
                 rendered_response_json = None
                 if context and len(context.hashed_href_map) > 0:
                     llm_content = json.dumps(parsed_response)
-                    rendered_content = Template(llm_content).render(context.hashed_href_map)
+                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
                     parsed_response = loads_with_repair(rendered_content)
                     rendered_response_json = json.dumps(parsed_response, indent=2)
                     if should_persist_llm_artifacts:
@@ -3017,7 +3023,7 @@ class LLMCaller:
             rendered_response_json = None
             if context and len(context.hashed_href_map) > 0:
                 llm_content = json.dumps(parsed_response)
-                rendered_content = Template(llm_content).render(context.hashed_href_map)
+                rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
                 parsed_response = loads_with_repair(rendered_content)
                 rendered_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:

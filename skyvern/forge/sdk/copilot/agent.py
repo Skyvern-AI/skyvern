@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedOutcomeBindingConstraint,
     RecordedOutcomeGroundingRequirement,
     observed_value_extraction_scaffold_lines,
+    unresolved_runtime_block_failure,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -220,7 +221,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_copilot_code_mode_diagnostics,
 )
 from skyvern.forge.sdk.copilot.turn_ownership import blocker_signal_render_allowed
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -1838,6 +1839,16 @@ def _assemble_terminal_envelope_safe(
     return payload
 
 
+def _with_unresolved_runtime_failure_note(user_response: str, failure: UnresolvedRuntimeFailure) -> str:
+    label = failure.block_label or "an earlier step"
+    note = (
+        f"One thing to flag: an earlier test run ({failure.workflow_run_id}) failed at "
+        f'"{label}", the failing call is still in the draft, and no later run '
+        "verifiably re-exercised it — so that step is still unproven."
+    )
+    return f"{user_response.rstrip()}\n\n{note}" if user_response.strip() else note
+
+
 def _make_agent_result(
     ctx: CopilotContext | None,
     *,
@@ -1898,6 +1909,26 @@ def _make_agent_result(
                 payload_updates["outcomeAdjudication"] = adjudication
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
+    if ctx is not None and turn_outcome is not None and turn_outcome.response_kind == ResponseKind.BUILD:
+        unresolved_failure = unresolved_runtime_block_failure(ctx)
+        if unresolved_failure is not None:
+            turn_outcome = turn_outcome.model_copy(update={"unresolved_runtime_failure": unresolved_failure})
+            kwargs["user_response"] = _with_unresolved_runtime_failure_note(
+                str(kwargs.get("user_response") or ""), unresolved_failure
+            )
+            # A reloaded chat renders the narrative card, and hydration prefers narrativeSummary over
+            # terminalMessage, so the qualification has to ride every surface or it survives the
+            # turn and disappears on refresh.
+            narrative = kwargs.get("narrative_payload")
+            if isinstance(narrative, dict):
+                kwargs["narrative_payload"] = {
+                    **narrative,
+                    **{
+                        key: _with_unresolved_runtime_failure_note(narrative[key], unresolved_failure)
+                        for key in ("terminalMessage", "narrativeSummary")
+                        if isinstance(narrative.get(key), str) and narrative[key].strip()
+                    },
+                }
     terminal_envelope: dict[str, Any] | None = None
     if ctx is not None:
         blocker_reason, halt_kind = _terminal_halt_fields(ctx)

@@ -154,6 +154,9 @@ from .guardrails import (
     _request_policy_allows_update_and_skip_run,
 )
 from .guardrails import _turn_intent_tool_error as _turn_intent_tool_error
+from .integrations import (
+    _list_integrations,
+)
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
 from .mcp_hooks import _click_pre_hook as _click_pre_hook
@@ -512,6 +515,42 @@ async def list_credentials_tool(
     result = await _list_credentials(arguments, copilot_ctx)
     record_tool_step_result_for_ctx(copilot_ctx, "list_credentials", arguments, result)
     sanitized = sanitize_tool_result_for_llm("list_credentials", result)
+    return json.dumps(sanitized)
+
+
+@function_tool(name_override="list_integrations")
+async def list_integrations_tool(ctx: RunContextWrapper) -> str:
+    """List the organization's connected Google and Microsoft accounts (metadata only —
+    never tokens). Each entry has `connection_id`, `provider`, `name`, `state`, and
+    `scopes_granted`.
+
+    These are OAuth connections made on the Integrations page, NOT the stored
+    login credentials returned by `list_credentials` — the two lists are disjoint,
+    so check this one before concluding the user has no Google or Microsoft access.
+    Blocks such as `google_sheets_write` take a `connection_id` from here directly
+    as their credential field. Not paginated; one call returns every connection.
+
+    Match on `scopes_granted`, not on `provider` alone: connections are granted per
+    product, so a Sheets connection cannot read Gmail and binding it to a mail block
+    fails at run time. Only a connection whose `state` is `active` can be used — an
+    expired grant stays listed so you can ask the user to reconnect that account
+    rather than tell them nothing is connected.
+    """
+    copilot_ctx = ctx.context
+    arguments: dict[str, Any] = {}
+    loop_error = _tool_loop_error(copilot_ctx, "list_integrations", arguments)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    authority_error = _authority_tool_error(copilot_ctx, "list_integrations")
+    if authority_error:
+        result = {"ok": False, "error": authority_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "list_integrations", arguments, result)
+        return json.dumps(result)
+
+    result = await _list_integrations(arguments, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "list_integrations", arguments, result)
+    sanitized = sanitize_tool_result_for_llm("list_integrations", result)
     return json.dumps(sanitized)
 
 
@@ -1014,6 +1053,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     synthesize_demonstrated_block_tool,
     list_credentials_tool,
+    list_integrations_tool,
     run_blocks_tool,
     get_run_results_tool,
     update_and_run_blocks_tool,
