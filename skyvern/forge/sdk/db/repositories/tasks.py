@@ -86,10 +86,15 @@ class TasksRepository(BaseRepository):
         terminate_criterion = _sanitize(terminate_criterion)
         workflow_system_prompt = _sanitize(workflow_system_prompt)
 
+        # created_at is passed so an already-running task cannot start before it was created; None
+        # falls through to the column default.
+        started_at = naive_utc_now() if str(status) == TaskStatus.running.value else None
+
         async with self.Session() as session:
             new_task = TaskModel(
                 status=status,
-                started_at=naive_utc_now() if str(status) == TaskStatus.running.value else None,
+                started_at=started_at,
+                created_at=started_at,
                 task_type=task_type,
                 url=url,
                 title=title,
