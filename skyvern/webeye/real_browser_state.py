@@ -139,6 +139,24 @@ class RealBrowserState(BrowserState):
                 except Exception:
                     LOG.exception("Error while closing the page", url=page.url)
 
+    def open_pages(self) -> list[Page]:
+        return list(self.browser_context.pages) if self.browser_context else []
+
+    async def close_pages_opened_after(self, baseline_pages: set[Page]) -> None:
+        # Close only pages opened after baseline_pages was captured; preserve the baseline set
+        # (e.g. a pre-loop deliverable tab) and the current working page.
+        if not self.browser_context:
+            return
+        working_page = await self.get_working_page()
+        for page in list(self.browser_context.pages):
+            if page in baseline_pages or page is working_page:
+                continue
+            try:
+                async with asyncio.timeout(BROWSER_PAGE_CLOSE_TIMEOUT):
+                    await page.close()
+            except Exception:
+                LOG.warning("Error while closing loop-iteration page", url=page.url)
+
     async def _discard_video_artifact(self, page: Page) -> None:
         # This page never became the working page — its video must not be registered.
         video = page.video

@@ -625,7 +625,7 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
-                Must be between 5 and 1440. Defaults to 60.
+                Must be at least 5; values above 240 are capped at 240. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
             extensions: Browser extensions to install in the session.
@@ -667,7 +667,7 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
-                Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+                Must be at least 5; values above 240 are capped at 240. Defaults to 60. Only used when creating a new session.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud. Only used when creating a new session.
 
