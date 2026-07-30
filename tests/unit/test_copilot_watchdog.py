@@ -429,6 +429,13 @@ def test_any_quiet_block_requested_file_download() -> None:
     assert _any_quiet_block_requested(ctx, ["download_file"]) is True
 
 
+def test_any_quiet_block_requested_code() -> None:
+    """A code block writes its row on entry and exit and nothing between, so a login or a long
+    wait inside one reads as no progress at all and the watchdog cancels a healthy run."""
+    ctx = SimpleNamespace(last_workflow=_workflow_with_block_types(("code", "login_and_extract")))
+    assert _any_quiet_block_requested(ctx, ["login_and_extract"]) is True
+
+
 def test_any_quiet_block_requested_mixed_requested_labels_match_quiet_one() -> None:
     """When multiple blocks are requested, having any one quiet type is
     enough to disable stagnation for the whole invocation."""

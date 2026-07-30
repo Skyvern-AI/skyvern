@@ -2,15 +2,36 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastmcp import Client
 
+from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.browser import _wrap_async_iife
+from skyvern.config import settings
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from tests.unit._mcp_browser_fakes import make_probe_locator
+
+RUN_ID = "wr_mcp_upload_test"
+
+
+@pytest.fixture()
+def run_upload_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    downloads_dir = tmp_path / "downloads"
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(downloads_dir))
+    upload_dir = downloads_dir / RUN_ID
+    upload_dir.mkdir(parents=True)
+    return upload_dir
+
 
 # -- Helpers --
 
@@ -32,6 +53,16 @@ def _patch_get_page(monkeypatch: pytest.MonkeyPatch, page=None, ctx=None):
 
     monkeypatch.setattr("skyvern.cli.mcp_tools.browser.get_page", fake_get_page)
     return page, ctx
+
+
+def _patch_file_input(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
+    raw = MagicMock()
+    locator = MagicMock()
+    locator.first = locator
+    locator.set_input_files = AsyncMock()
+    raw.locator = MagicMock(return_value=locator)
+    _patch_get_page(monkeypatch, page=_fake_page(raw))
+    return raw, locator
 
 
 # -- _wrap_async_iife --
@@ -208,42 +239,218 @@ class TestDrag:
 
 class TestFileUpload:
     @pytest.mark.asyncio
-    async def test_local_path_uses_set_input_files(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        raw = MagicMock()
-        mock_locator = MagicMock()
-        mock_locator.first = mock_locator
-        mock_locator.set_input_files = AsyncMock()
-        raw.locator = MagicMock(return_value=mock_locator)
-        page = _fake_page(raw)
-        _patch_get_page(monkeypatch, page=page)
+    async def test_standalone_stdio_upload_uses_local_download_scope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        standalone_upload_dir = run_upload_dir.parent / str(None)
+        standalone_upload_dir.mkdir()
+        upload_file = standalone_upload_dir / "test.txt"
+        upload_file.write_bytes(b"safe upload")
+        _, mock_locator = _patch_file_input(monkeypatch)
+        monkeypatch.setattr(session_manager, "_stdio_local_file_access_enabled", True)
 
-        result = await mcp_browser.skyvern_file_upload(
-            file_paths=["/tmp/test.txt"],
-            selector="input[type=file]",
+        with skyvern_context.scoped(SkyvernContext()):
+            async with Client(mcp) as client:
+                tool_result = await client.call_tool(
+                    "skyvern_file_upload",
+                    {"file_paths": [str(upload_file)], "selector": "input[type=file]"},
+                )
+
+        result = tool_result.structured_content
+        assert result is not None
+        assert result["ok"] is True
+        mock_locator.set_input_files.assert_awaited_once_with(
+            [{"name": "test.txt", "mimeType": "text/plain", "buffer": b"safe upload"}],
+            timeout=5000,
         )
+
+    @pytest.mark.asyncio
+    async def test_local_path_uses_captured_file_payload(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_file = run_upload_dir / "test.txt"
+        upload_file.write_bytes(b"safe upload")
+        raw, mock_locator = _patch_file_input(monkeypatch)
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_file)],
+                selector="input[type=file]",
+            )
+
         assert result["ok"] is True
         assert result["data"]["files_count"] == 1
         raw.locator.assert_called_once_with("input[type=file]")
-        # set_input_files receives a list with the single file
-        mock_locator.set_input_files.assert_awaited_once_with(["/tmp/test.txt"], timeout=5000)
+        mock_locator.set_input_files.assert_awaited_once_with(
+            [{"name": "test.txt", "mimeType": "text/plain", "buffer": b"safe upload"}],
+            timeout=5000,
+        )
 
     @pytest.mark.asyncio
-    async def test_intent_only_local_file_uses_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Intent-only + local file should use page.upload_file (AI resolution), not crash."""
+    async def test_rejects_path_traversal_outside_run_upload_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        outside_file = run_upload_dir.parent / "service-secret.txt"
+        outside_file.write_bytes(b"must not leave host")
+        raw, mock_locator = _patch_file_input(monkeypatch)
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(run_upload_dir / ".." / outside_file.name)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        raw.locator.assert_not_called()
+        mock_locator.set_input_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_symlink_escape_from_run_upload_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        outside_file = run_upload_dir.parent / "service-secret.txt"
+        outside_file.write_bytes(b"must not leave host")
+        symlink = run_upload_dir / "upload.txt"
+        symlink.symlink_to(outside_file)
+        raw, mock_locator = _patch_file_input(monkeypatch)
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(symlink)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        raw.locator.assert_not_called()
+        mock_locator.set_input_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_symlink_swap_after_path_resolution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_file = run_upload_dir / "upload.txt"
+        upload_file.write_bytes(b"safe upload")
+        outside_file = run_upload_dir.parent / "service-secret.txt"
+        outside_file.write_bytes(b"must not leave host")
+        raw, mock_locator = _patch_file_input(monkeypatch)
+        real_open = os.open
+        swapped = False
+
+        def swap_before_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal swapped
+            if not swapped:
+                upload_file.unlink()
+                upload_file.symlink_to(outside_file)
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(mcp_browser.os, "open", swap_before_open)
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_file)],
+                selector="input[type=file]",
+            )
+
+        assert swapped is True
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        raw.locator.assert_not_called()
+        mock_locator.set_input_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fifo_open_is_nonblocking(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_fifo = run_upload_dir / "upload.pipe"
+        os.mkfifo(upload_fifo)
+        _, mock_locator = _patch_file_input(monkeypatch)
+        real_open = os.open
+
+        def assert_nonblocking_open(
+            path: Any,
+            flags: int,
+            *args: Any,
+            **kwargs: Any,
+        ) -> int:
+            if path == upload_fifo.name:
+                assert flags & os.O_NONBLOCK
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_browser.os, "open", assert_nonblocking_open)
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_fifo)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        mock_locator.set_input_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_local_file_without_run_context(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_file = run_upload_dir / "test.txt"
+        upload_file.write_bytes(b"safe upload")
+        raw = MagicMock()
+        raw.locator = MagicMock()
+        _patch_get_page(monkeypatch, page=_fake_page(raw))
+
+        with skyvern_context.scoped(SkyvernContext()):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_file)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        raw.locator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_intent_only_local_file_requires_selector(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_file = run_upload_dir / "resume.pdf"
+        upload_file.write_bytes(b"safe upload")
         page, _ = _patch_get_page(monkeypatch)
         page.upload_file = AsyncMock(return_value="ok")
-        result = await mcp_browser.skyvern_file_upload(
-            file_paths=["/tmp/resume.pdf"],
-            intent="the upload button",
-        )
-        assert result["ok"] is True
-        page.upload_file.assert_awaited_once_with(
-            selector=None,
-            files="/tmp/resume.pdf",
-            prompt="the upload button",
-            ai="proactive",
-            timeout=30000,
-        )
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_file)],
+                intent="the upload button",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        page.upload_file.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_url_uses_sdk_upload_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,24 +468,52 @@ class TestFileUpload:
         )
 
     @pytest.mark.asyncio
-    async def test_multiple_local_files_set_together(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Multiple local files should be passed to set_input_files as a single list, not one at a time."""
-        raw = MagicMock()
-        mock_locator = MagicMock()
-        mock_locator.first = mock_locator
-        mock_locator.set_input_files = AsyncMock()
-        raw.locator = MagicMock(return_value=mock_locator)
-        page = _fake_page(raw)
-        _patch_get_page(monkeypatch, page=page)
+    async def test_rejects_local_files_above_aggregate_size(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_a = run_upload_dir / "a.txt"
+        upload_b = run_upload_dir / "b.txt"
+        upload_a.write_bytes(b"abc")
+        upload_b.write_bytes(b"def")
+        raw, mock_locator = _patch_file_input(monkeypatch)
+        monkeypatch.setattr(mcp_browser, "_LOCAL_UPLOAD_MAX_BYTES", 5)
 
-        result = await mcp_browser.skyvern_file_upload(
-            file_paths=["/tmp/a.txt", "/tmp/b.txt"],
-            selector="input[type=file]",
-        )
-        assert result["ok"] is True
-        assert result["data"]["files_count"] == 2
-        # Single call with both files, not two separate calls
-        mock_locator.set_input_files.assert_awaited_once_with(["/tmp/a.txt", "/tmp/b.txt"], timeout=5000)
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_a), str(upload_b)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        raw.locator.assert_not_called()
+        mock_locator.set_input_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_too_many_local_files(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_a = run_upload_dir / "a.txt"
+        upload_b = run_upload_dir / "b.txt"
+        upload_a.write_bytes(b"a")
+        upload_b.write_bytes(b"b")
+        raw, mock_locator = _patch_file_input(monkeypatch)
+        monkeypatch.setattr(mcp_browser, "_LOCAL_UPLOAD_MAX_FILES", 1)
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_a), str(upload_b)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "INVALID_INPUT"
+        raw.locator.assert_not_called()
+        mock_locator.set_input_files.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_multi_url_returns_error(self) -> None:
