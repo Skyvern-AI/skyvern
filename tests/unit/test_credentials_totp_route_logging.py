@@ -9,7 +9,8 @@ from fastapi import FastAPI, HTTPException
 
 from skyvern.forge.sdk.routes import credentials
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.schemas.totp_codes import RawTOTPCode, TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCodeCreate
+from skyvern.services.otp_service import OTPValue
 
 
 def _raw_row(totp_code_id: str = "otp_raw") -> RawTOTPCode:
@@ -69,6 +70,63 @@ async def test_send_totp_code_save_log_redacts_identifier_but_stores_raw_values(
     assert storage_kwargs["totp_identifier"] == raw_identifier
     assert storage_kwargs["content"] == raw_content
     assert storage_kwargs["code"] == raw_content
+
+
+@pytest.mark.asyncio
+async def test_send_totp_code_auto_detects_long_content_despite_submitted_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_content = "Follow https://example.test/verify?token=example to finish signing in."
+    magic_link = "https://example.test/verify?token=example"
+    create_otp_code = AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_1"))
+
+    async def detect_otp(
+        _content: str,
+        _organization_id: str,
+        enforced_otp_type: OTPType | None = None,
+    ) -> OTPValue | None:
+        if enforced_otp_type is not None:
+            return None
+        return OTPValue(value=magic_link, type=OTPType.MAGIC_LINK)
+
+    monkeypatch.setattr(credentials.app, "DATABASE", _database_with_otp_create(create_otp_code))
+    monkeypatch.setattr(credentials, "parse_otp_login", detect_otp)
+
+    result = await credentials.send_totp_code(
+        TOTPCodeCreate(
+            totp_identifier="qa-email-otp@example.test",
+            content=raw_content,
+            type=OTPType.TOTP,
+        ),
+        curr_org=SimpleNamespace(organization_id="o_test"),
+    )
+
+    assert result.totp_code_id == "otp_1"
+    storage_kwargs = create_otp_code.await_args.kwargs
+    assert storage_kwargs["code"] == magic_link
+    assert storage_kwargs["otp_type"] == OTPType.MAGIC_LINK
+
+
+@pytest.mark.asyncio
+async def test_send_totp_code_infers_short_content_type_despite_submitted_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_otp_code = AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_1"))
+    monkeypatch.setattr(credentials.app, "DATABASE", _database_with_otp_create(create_otp_code))
+
+    result = await credentials.send_totp_code(
+        TOTPCodeCreate(
+            totp_identifier="qa-email-otp@example.test",
+            content="135790",
+            type=OTPType.MAGIC_LINK,
+        ),
+        curr_org=SimpleNamespace(organization_id="o_test"),
+    )
+
+    assert result.totp_code_id == "otp_1"
+    storage_kwargs = create_otp_code.await_args.kwargs
+    assert storage_kwargs["code"] == "135790"
+    assert storage_kwargs["otp_type"] == OTPType.TOTP
 
 
 @pytest.mark.asyncio
