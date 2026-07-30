@@ -20420,25 +20420,6 @@
         ],
         "title": "ProxyLocation"
       },
-      "RawTOTPCodeAccepted": {
-        "properties": {
-          "totp_code_id": {
-            "type": "string",
-            "title": "Totp Code Id"
-          },
-          "status": {
-            "type": "string",
-            "const": "raw_pending",
-            "title": "Status",
-            "default": "raw_pending"
-          }
-        },
-        "type": "object",
-        "required": [
-          "totp_code_id"
-        ],
-        "title": "RawTOTPCodeAccepted"
-      },
       "RetryRunWebhookRequest": {
         "properties": {
           "webhook_url": {
