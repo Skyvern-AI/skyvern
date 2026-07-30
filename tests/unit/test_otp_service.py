@@ -23,6 +23,7 @@ from skyvern.services.otp_service import (
     extract_totp_from_navigation_inputs,
     parse_otp_login,
     poll_otp_value,
+    resolve_otp_value,
     try_generate_totp_from_credential,
 )
 
@@ -87,6 +88,25 @@ class TestExtractTotpFromNavigationInputs:
         assert result.value == "123456"
         assert result.get_otp_type() == OTPType.TOTP
 
+    def test_ignores_unresolved_totp_placeholder(self) -> None:
+        payload = {"credentials": {"totp": "placeholder_Xz8q_totp"}}
+        result = extract_totp_from_navigation_inputs(payload)
+        assert result is None
+
+    def test_extracts_inline_otp_from_totp_key(self) -> None:
+        payload = {"totp": "123456"}
+        result = extract_totp_from_navigation_inputs(payload)
+        assert result is not None
+        assert result.value == "123456"
+        assert result.get_otp_type() == OTPType.TOTP
+
+    def test_continues_past_placeholder_to_legitimate_inline_code(self) -> None:
+        """A skipped placeholder must not abort traversal when a real code is also present."""
+        payload = {"totp": "placeholder_Xz8q_totp", "otp_code": "246810"}
+        result = extract_totp_from_navigation_inputs(payload)
+        assert result is not None
+        assert result.value == "246810"
+
     def test_extracts_magic_link_from_payload(self) -> None:
         payload = {"verification_code": "https://example.com/login/magic?token=abc123"}
         result = extract_totp_from_navigation_inputs(payload)
@@ -126,6 +146,36 @@ class TestExtractTotpFromNavigationInputs:
         }
         result = extract_totp_from_navigation_inputs(payload)
         assert result is None
+
+
+class TestResolveOtpValuePlaceholderFallthrough:
+    """resolve_otp_value must not let an unresolved payload placeholder short-circuit resolution."""
+
+    @pytest.mark.asyncio
+    async def test_unresolved_placeholder_payload_falls_through_to_credential(self) -> None:
+        """End-to-end with the real extractor: a placeholder-only payload resolves through
+        credential-backed TOTP instead of being returned as an inline verification code."""
+        task = SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            totp_verification_url="https://example.com/webhook",
+            totp_identifier=None,
+            navigation_payload={"credentials": {"totp": "placeholder_Xz8q_totp"}},
+        )
+        credential_value = OTPValue(value="424242", type=OTPType.TOTP)
+        with (
+            patch(
+                "skyvern.services.otp_service.try_generate_totp_from_credential",
+                return_value=credential_value,
+            ) as credential,
+            patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock()) as poll,
+        ):
+            result = await resolve_otp_value(task)
+
+        assert result is credential_value
+        credential.assert_called_once_with("wr_test")
+        poll.assert_not_called()
 
 
 def _mock_org_token() -> MagicMock:
