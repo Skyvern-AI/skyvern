@@ -209,6 +209,61 @@ class TestRedactSensitiveFields:
         result = redact_sensitive_fields(data)
         assert result == data
 
+    def test_redacts_sensitive_fields_inside_serialized_json(self) -> None:
+        private_value = "serialized-private-value"
+        data = {
+            "payload": json.dumps(
+                {
+                    "private_key": private_value,
+                    "items": [{"status": "ok"}, {"api_key": "nested-key"}],
+                }
+            )
+        }
+
+        result = redact_sensitive_fields(data)
+        decoded = json.loads(result["payload"])
+
+        assert private_value not in result["payload"]
+        assert decoded == {
+            "private_key": _REDACTED,
+            "items": [{"status": "ok"}, {"api_key": _REDACTED}],
+        }
+
+    def test_metadata_preserved_by_default_and_redacted_only_when_requested(self) -> None:
+        payload = {"metadata": {"region": "north", "note": "opaque"}}
+
+        assert redact_sensitive_fields(payload) == payload
+        assert redact_sensitive_fields(payload, redact_metadata=True) == {"metadata": _REDACTED}
+
+    def test_is_sensitive_key_gates_metadata_behind_flag(self) -> None:
+        assert _is_sensitive_key("metadata") is False
+        assert _is_sensitive_key("Metadata", redact_metadata=True) is True
+        assert _is_sensitive_key("password") is True
+
+    def test_redact_metadata_flag_threads_into_nested_and_serialized_values(self) -> None:
+        nested = {"outer": {"metadata": {"k": "v"}, "keep": "me"}}
+        assert redact_sensitive_fields(nested, redact_metadata=True) == {
+            "outer": {"metadata": _REDACTED, "keep": "me"},
+        }
+
+        serialized = {"payload": json.dumps({"metadata": {"k": "v"}, "ok": 1})}
+        result = redact_sensitive_fields(serialized, redact_metadata=True)
+        assert json.loads(result["payload"]) == {"metadata": _REDACTED, "ok": 1}
+
+    def test_preserves_serialized_json_byte_for_byte_when_nothing_redacted(self) -> None:
+        # A non-secret JSON payload must round-trip unchanged: re-serializing would escape non-ASCII and
+        # re-space separators, corrupting downstream consumers that compare bytes.
+        original = '{"note":"Grüße","items":[1,2,3]}'
+        result = redact_sensitive_fields({"payload": original})
+        assert result["payload"] == original
+
+    @pytest.mark.parametrize("value", ["ordinary text", "123", "true", '"json string"'])
+    def test_preserves_non_object_strings(self, value: str) -> None:
+        assert redact_sensitive_fields({"message": value, "status": "ok"}) == {
+            "message": value,
+            "status": "ok",
+        }
+
     def test_handles_non_dict_non_list(self) -> None:
         assert redact_sensitive_fields("hello") == "hello"
         assert redact_sensitive_fields(42) == 42
@@ -357,6 +412,11 @@ class TestSanitizeResponseBody:
         result = _sanitize_response_body(request, '{"data": "value"}', "application/json")
         assert result == _REDACTED
 
+    def test_malformed_json_credential_mutation_response_is_redacted(self) -> None:
+        request = _make_request("PUT", "/api/v1/credentials/cred_123/rotate")
+        result = _sanitize_response_body(request, '{"private_key":"secret"', "application/json")
+        assert result == _REDACTED
+
     @pytest.mark.parametrize(
         ("method", "path"),
         [
@@ -409,6 +469,28 @@ class TestSanitizeBody:
         request = _make_request("GET", "/v1/tasks")
         result = _sanitize_body(request, b'{"user": "alice"}', "application/json")
         assert result == '{"user": "alice"}'
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/v1/credentials/cred_123/rotate"),
+            ("PUT", "/api/v1/credentials/cred_123"),
+        ],
+    )
+    def test_malformed_json_credential_mutation_request_is_redacted(self, method: str, path: str) -> None:
+        request = _make_request(method, path)
+        result = _sanitize_body(request, b'{"private_key":"secret"', "application/json")
+        assert result == _REDACTED
+
+    def test_malformed_json_unrelated_request_keeps_current_behavior(self) -> None:
+        request = _make_request("POST", "/v1/tasks")
+        result = _sanitize_body(request, b'{"private_key":"secret"', "application/json")
+        assert result == '{"private_key":"secret"'
+
+    def test_get_credential_path_is_logged_normally(self) -> None:
+        request = _make_request("GET", "/api/v1/credentials/cred_123")
+        result = _sanitize_body(request, b'{"status":"ok"}', "application/json")
+        assert result == '{"status":"ok"}'
 
     @pytest.mark.parametrize(
         ("method", "path"),

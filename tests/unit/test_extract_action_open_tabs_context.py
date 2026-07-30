@@ -134,6 +134,31 @@ class TestCacheVariant:
         assert "vc" in result
         assert "cp" in result
 
+    def test_guidance_text_has_a_stable_collision_resistant_tag(self) -> None:
+        first = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+            extra_action_guidance="Use verification method A.",
+        )
+        repeated = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+            extra_action_guidance="Use verification method A.",
+        )
+        second = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+            extra_action_guidance="Use verification method B.",
+        )
+
+        assert first == repeated
+        assert first.startswith("g")
+        assert len(first) == 9
+        assert first != second
+
 
 class TestNewTabSwitchTabGate:
     @pytest.mark.parametrize("template", ["extract-action", "extract-action-static"])

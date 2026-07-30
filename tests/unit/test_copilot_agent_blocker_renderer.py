@@ -1008,3 +1008,18 @@ def test_reconcile_turn_end_keeps_cancelled_result_and_expires_grant() -> None:
     assert result is original
     assert ctx.turn_halt is None
     assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+
+
+def test_unapproved_credential_reference_asks_without_naming_the_credential_inventory() -> None:
+    """`discovered_credentials` holds everything `list_credentials` returned, not page matches,
+    so the reply must not present it as a match set."""
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        discovered_credentials=[SimpleNamespace(credential_id="cred_unrelated", name="hr portal", tested_url=None)]
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "confirm which saved credential" in result.user_response
+    assert "cred_unrelated" not in result.user_response
+    assert "hr portal" not in result.user_response
