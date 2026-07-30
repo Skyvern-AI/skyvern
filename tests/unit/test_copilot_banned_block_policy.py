@@ -19,6 +19,7 @@ cross-layer sync-guard test at the end asserts neither symbol is ripped out.
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -255,6 +256,7 @@ def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> No
     # One wait on the two states together, then a no-wait branch — waiting on the login form alone
     # spends the whole timeout proving it is absent on an already-authenticated session.
     assert ".or_(" in prompt
+    assert re.search(r"\.or_\([^)]*\)\.first\.wait_for\([^)]*timeout=90000(?!\d)", prompt)
     assert "is_visible()" in prompt
     assert "await solve_captcha(page)" in prompt
     assert "platform-managed verification challenge" in prompt
@@ -771,3 +773,13 @@ def test_schema_guidance_teaches_a_no_wait_branch_between_two_page_states() -> N
 
     assert ".or_(" in guidance
     assert "is_visible()" in guidance or "count()" in guidance
+
+    entry_ceiling = re.search(r"entry wait[^.]*?timeout=(\d+)(?!\d)", guidance)
+    later_ceiling = re.search(r"later wait[^.]*?timeout=(\d+)(?!\d)", guidance)
+    assert entry_ceiling and later_ceiling
+    assert int(entry_ceiling.group(1)) > int(later_ceiling.group(1))
+
+    example_ceiling = re.search(
+        r"\.or_\([^)]*\)\.first\.wait_for\([^)]*timeout=(\d+)(?!\d)", _code_only_browser_authoring_prompt()
+    )
+    assert example_ceiling and example_ceiling.group(1) == entry_ceiling.group(1)

@@ -1029,8 +1029,16 @@ def test_elapsed_run_seconds_subtracts_pause_time() -> None:
 
 @pytest.mark.asyncio
 async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: a slow pause would consume the (tiny) real timeout budget."""
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.15)
+    """Fails on old code: a slow pause would consume the real timeout budget.
+
+    Four values must stay ordered: non-pause work < TOTAL_TIMEOUT_SECONDS < pause <
+    credential_pause_timeout_seconds. Non-pause work was measured at ~2s on a cold CI shard
+    (whichever test imports the agent SDK first pays for it), so a sub-second budget only
+    ever passed on a warm runner. The pause must still exceed the budget or the assertion
+    proves nothing, and must stay under the pause timeout or it resolves as a timeout
+    instead of a response.
+    """
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 4.0)
 
     ctx = make_copilot_context()
     ctx.organization_id = "org-1"
@@ -1042,10 +1050,10 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
 
     cache = _FakeCache()
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.2)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.5)
 
     async def _populate_after_first_poll() -> None:
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(4.5)
         cache.store[credential_response_cache_key("org-1", "chat-1", "turn-credit")] = encode_credential_response(
             "skip", None
         )
@@ -1064,7 +1072,7 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", fake_stream_to_sse)
 
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=30)
 
     populate_task = asyncio.ensure_future(_populate_after_first_poll())
     try:
