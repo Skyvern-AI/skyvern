@@ -1360,6 +1360,13 @@ class AgentFunction:
         """Cross-run (wpid-scoped) extraction-cache write. OSS no-op."""
         return None
 
+    async def collect_virtualized_grid_rows(self, *, task: Task, page: Page) -> str | None:
+        """Harvest the complete row set of a server-windowed virtualized data grid and
+        serialize it for prompt injection, or None when no such grid is present or
+        collection is disabled. OSS no-op; a deployment may override with a
+        framework-specific collector."""
+        return None
+
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
         """Return the backend-specific schedule id used by the execution engine.
 

@@ -57,6 +57,7 @@ PROMPT_HARD_CEILING_TOKENS = 180_000
 
 CEILING_FALLBACK_KEYS_BY_TEMPLATE: dict[str, list[str]] = {
     "extract-information": [
+        "virtualized_grid_rows",
         "previous_extracted_information",
         "extracted_information_schema",
         "extracted_text",
