@@ -15,6 +15,7 @@ const icons: Partial<Record<ActionType, React.ReactNode>> = {
   click: <CursorArrowIcon className="h-4 w-4" />,
   hover: <HandIcon className="h-4 w-4" />,
   input_text: <InputIcon className="h-4 w-4" />,
+  paste_text: <InputIcon className="h-4 w-4" />,
   download_file: <DownloadIcon className="h-4 w-4" />,
 };
 

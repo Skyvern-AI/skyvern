@@ -32,14 +32,14 @@ function buildAction(overrides: Partial<Action> = {}): Action {
   };
 }
 
-function renderList() {
+function renderList(action = buildAction()) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
       <ScrollableActionList
-        data={[buildAction()]}
+        data={[action]}
         activeIndex={0}
         onActiveIndexChange={() => {}}
         showStreamOption={false}
@@ -59,5 +59,11 @@ describe("ScrollableActionList", () => {
 
     // getByText throws if not found, so reaching this line means it rendered
     screen.getByText("Click the submit button");
+  });
+
+  it("renders a paste text action label", () => {
+    renderList(buildAction({ type: ActionTypes.PasteText }));
+
+    screen.getByText("Paste Text");
   });
 });
