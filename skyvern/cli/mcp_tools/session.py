@@ -18,6 +18,7 @@ from skyvern.cli.core.session_ops import (
 )
 from skyvern.cli.core.trajectory_store import delete_session_trajectories
 from skyvern.client.types.extensions import Extensions
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.runs import proxy_location_to_request
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
@@ -65,7 +66,9 @@ def _session_create_data(
 
 
 async def skyvern_browser_session_create(
-    timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
+    timeout: Annotated[
+        int | None, Field(description=f"Session timeout in minutes (min {MIN_TIMEOUT}, capped at {MAX_TIMEOUT})")
+    ] = DEFAULT_TIMEOUT,
     proxy_location: Annotated[
         str | dict[str, Any] | None,
         Field(

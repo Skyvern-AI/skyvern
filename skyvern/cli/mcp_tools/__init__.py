@@ -55,8 +55,10 @@ from .browser import (
     skyvern_clipboard_write,
     skyvern_drag,
     skyvern_evaluate,
+    skyvern_evaluate_and_screenshot,
     skyvern_execute,
     skyvern_extract,
+    skyvern_extract_and_screenshot,
     skyvern_file_upload,
     skyvern_find,
     skyvern_frame_list,
@@ -65,6 +67,8 @@ from .browser import (
     skyvern_hover,
     skyvern_login,
     skyvern_navigate,
+    skyvern_navigate_and_screenshot,
+    skyvern_navigate_extract_and_screenshot,
     skyvern_observe,
     skyvern_press_key,
     skyvern_run_task,
@@ -82,6 +86,7 @@ from .browser_profiles import (
     skyvern_browser_profile_list,
     skyvern_browser_profile_update,
 )
+from .cdp_input import skyvern_write_grid
 from .code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from .credential import (
     skyvern_credential_delete,
@@ -147,6 +152,7 @@ from .storage import (
     skyvern_set_session_storage,
 )
 from .tabs import (
+    skyvern_open_tabs,
     skyvern_tab_close,
     skyvern_tab_list,
     skyvern_tab_new,
@@ -399,6 +405,9 @@ mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(
 # non-destructive, but still open-world because the target site is unbounded.
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
+mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data + Screenshot (AI)"))(
+    size_capped(skyvern_extract_and_screenshot)
+)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
 mcp.tool(
     description=_RUN_TASK_TOOL_DESCRIPTION,
@@ -407,8 +416,17 @@ mcp.tool(
 )(skyvern_run_task)
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL + Screenshot"))(
+    size_capped(skyvern_navigate_and_screenshot)
+)
+mcp.tool(tags={"ai_powered"}, annotations=_web_mut("Navigate + Extract Data + Screenshot (AI)"))(
+    size_capped(skyvern_navigate_extract_and_screenshot)
+)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript"))(skyvern_evaluate)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript + Screenshot"))(
+    size_capped(skyvern_evaluate_and_screenshot)
+)
 
 # -- Clipboard --
 mcp.tool(tags={"browser_primitive"}, annotations=_ro("Read Clipboard"))(skyvern_clipboard_read)
@@ -417,6 +435,7 @@ mcp.tool(tags={"browser_primitive"}, annotations=_mut("Write Clipboard"))(skyver
 # -- Batch tools (observe + execute for multi-step optimization) --
 mcp.tool(tags={"browser_primitive", "batch"}, annotations=_web_ro("Observe Page Structure"))(skyvern_observe)
 mcp.tool(tags={"browser_primitive", "batch"}, annotations=_web_dest("Execute Batch Actions"))(skyvern_execute)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Write Grid"))(size_capped(skyvern_write_grid))
 
 # -- Precision tools (selector/intent-based browser primitives) --
 # Input/action primitives can submit, overwrite, or delete arbitrary website state.
@@ -435,6 +454,9 @@ mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Find Element"))(skyver
 # -- Tab management (multi-tab) --
 mcp.tool(tags={"tab_management"}, annotations=_web_ro("List Tabs"))(skyvern_tab_list)
 mcp.tool(tags={"tab_management"}, annotations=_web_mut("Open New Tab"))(skyvern_tab_new)
+mcp.tool(tags={"tab_management", "browser_primitive"}, annotations=_web_mut("Open Tabs"))(
+    size_capped(skyvern_open_tabs)
+)
 mcp.tool(tags={"tab_management"}, annotations=_mut("Switch Tab"))(skyvern_tab_switch)
 mcp.tool(tags={"tab_management"}, annotations=_dest("Close Tab"))(skyvern_tab_close)
 mcp.tool(tags={"tab_management"}, annotations=_web_ro("Wait for New Tab"))(skyvern_tab_wait_for_new)
@@ -546,12 +568,16 @@ __all__ = [
     # Primary (AI-powered)
     "skyvern_act",
     "skyvern_extract",
+    "skyvern_extract_and_screenshot",
     "skyvern_validate",
     "skyvern_run_task",
     "skyvern_login",
     "skyvern_navigate",
+    "skyvern_navigate_and_screenshot",
+    "skyvern_navigate_extract_and_screenshot",
     "skyvern_screenshot",
     "skyvern_evaluate",
+    "skyvern_evaluate_and_screenshot",
     # Clipboard
     "skyvern_clipboard_read",
     "skyvern_clipboard_write",

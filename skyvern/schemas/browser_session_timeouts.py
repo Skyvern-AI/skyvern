@@ -8,7 +8,7 @@ share these rules without pulling the heavier ``browser_sessions`` schema module
 from __future__ import annotations
 
 MIN_TIMEOUT = 5
-MAX_TIMEOUT = 60 * 24  # 24 hours
+MAX_TIMEOUT = 60 * 4  # 4 hours
 MAX_LIFETIME_SECONDS = MAX_TIMEOUT * 60
 DEFAULT_TIMEOUT = 60
 

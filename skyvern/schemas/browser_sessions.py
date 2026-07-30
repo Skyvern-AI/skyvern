@@ -13,10 +13,16 @@ from skyvern.services.browser_recording.types import RecordingDraftStep
 class CreateBrowserSessionRequest(BaseModel):
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
-        description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
+        description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least {MIN_TIMEOUT}; values above {MAX_TIMEOUT} are capped at {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
         ge=MIN_TIMEOUT,
-        le=MAX_TIMEOUT,
     )
+
+    @field_validator("timeout")
+    @classmethod
+    def clamp_timeout_to_max(cls, timeout: int | None) -> int | None:
+        # Clamped rather than rejected so callers still sending the old 24h ceiling keep working.
+        return None if timeout is None else min(timeout, MAX_TIMEOUT)
+
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "

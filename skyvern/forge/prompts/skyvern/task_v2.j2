@@ -17,6 +17,14 @@ You have access to the following task types to take actions:
 **Loop preference:** Do NOT decompose repeated same-shape work into many sequential one-off navigate/extract tasks. Iterating N items as N separate planned tasks exhausts the planning-iteration and step budget and usually runs out before finishing; a single loop task does the same work in one planning step. Reach for a loop as soon as you can enumerate (or will discover on the page) a list of similar targets, even before you know the exact count.
 
 When a tool or page caps how many items can be added in a single operation (for example a maximum number of destinations, stops, rows, or selections per request), do NOT keep retrying past that cap. Decompose the work into multiple segments that each stay within the cap, complete each segment in turn, and combine or carry forward the results toward the overall goal. A loop task is often a good fit for iterating through these segments.
+{%- if planner_mini_goal_improvements|default(false) %}
+
+**How to write each mini goal (the `plan`):** Each navigate, extract, or loop mini goal is handed to an inner agent that runs at most {{ step_budget|default(10) }} steps (one step ≈ one click, type, select, or navigation). The inner agent sees ONLY the `plan` you write, not this conversation, so make it specific enough to succeed without guessing:
+- **Copy the concrete parameters from the user goal into the plan** — exact search terms, filter values, dates, names, quantities — and state the specific on-page actions to take (which field to fill with which value, which control to use). Prefer the most direct action: e.g. "type `2026-12-02` into the check-in date field and `2026-12-05` into the check-out field" rather than "select the check-in and check-out dates", which can waste steps operating a calendar widget.
+- **Make each mini goal one substantial, self-contained objective** — a full page's worth of progress (e.g. "fill the search form with X, Y, Z and submit"), never a single click and never a multi-page journey. Do NOT split one page's work across several tiny mini goals; that re-loads and re-reads the page each time and burns the overall budget.
+- **End the `plan` with the success condition** — what will be true when it is done (e.g. "done when the results list for X is visible") — so the agent stops instead of wandering.
+- **Keep it within {{ step_budget|default(10) }} steps.** If one coherent objective genuinely cannot fit, narrow its scope (fewer target items, one section of the page) but keep it a complete unit; do not shave it into a trivial fragment.
+{% endif %}
 
 You may also determine that the user goal is IMPOSSIBLE to achieve. Use termination ONLY when there is CLEAR, EXPLICIT, and UNAMBIGUOUS evidence that the goal cannot ever be accomplished. Be very conservative - when in doubt, continue trying.
 
@@ -79,7 +87,10 @@ Reply in JSON format with the following keys:
   "user_goal_achieved": bool, // True ONLY if EVERY entry in required_subgoals is satisfied. If task_history_information OR any entry in required_subgoals indicates a required part is missing, unmet, or not yet found, this MUST be false. Never set this true while simultaneously acknowledging in thoughts or task_history_information that a required part is missing. If the user wants to extract information and it has not been done, the user goal is not achieved.
   "should_terminate": bool, // True ONLY if the user goal is definitively IMPOSSIBLE to achieve. Must have explicit evidence from the page. See termination guidelines above. False if there's any chance the goal can still be achieved.
   "termination_reason": str, // If should_terminate is true, quote the EXACT error message or text from the page that proves impossibility. Be specific. Null if should_terminate is false.
-  "plan": str, // The mini goal to achieve to move towards the user goal. DO NOT come up or hallucinate any data that's not provided in the user goal. Be accurate and precise. Return null if the user goal has been achieved or if should_terminate is true.
+  "plan": str, // The mini goal to achieve to move towards the user goal. DO NOT come up or hallucinate any data that's not provided in the user goal. Be accurate and precise.{% if planner_mini_goal_improvements|default(false) %} Write it as a specific, self-contained instruction: include the exact parameters from the user goal (search terms, filters, dates, names) and the concrete on-page actions, and end with the success condition that means this mini goal is done.{% endif %} Return null if the user goal has been achieved or if should_terminate is true.
+{%- if planner_mini_goal_improvements|default(false) %}
+  "complete_criterion": str, // For a navigate mini goal: a short, checkable statement of what is true on the page once this mini goal is done (e.g. "the confirmation number is displayed", "the results table for X is visible"). The inner agent stops as soon as this holds instead of running to its step limit. Null when task_type is not navigate, or when plan is null.
+{% endif %}
   "task_type": str, // One of the available task types: navigate, extract, loop{% if compute_enabled|default(false) %}, compute{% endif %}. Null if user_goal_achieved is true or should_terminate is true.
   "loop_values": list[str], // a list of string values to iterate through for loop task. null if it's not a loop task
   "is_loop_value_link": bool, // true if the loop_values is a list of urls to go to before for each planning session inside the loop
@@ -103,12 +114,31 @@ Clickable elements from the page:
 {{ elements | untrusted }}
 Task history (the earliest task is the first in the list and the latest is the last in the list):
 {{ task_history | untrusted }}
+{% if prior_required_subgoals %}
+Required subgoals carried forward from the previous planning step:
+{{ prior_required_subgoals | untrusted }}
+{% endif -%}
 ```
 END_UNTRUSTED_WEB_PAGE_DATA
 
 Task history explanation:
 - completed status means the mini goal has been completed
 - terminated and failed mean the mini goal was not fully achieved or couldn't be achieved so you might want to try something else. The reason is given to explain why.
+{%- if planner_mini_goal_improvements|default(false) %}
+- When a mini goal's reason says it reached the maximum steps, it did NOT fail because it was impossible — it was either too broad or the agent spent steps operating the page inefficiently. Do not re-issue it unchanged. Re-plan a MORE SPECIFIC variant: name the exact action and the exact value to enter, and switch to a more direct interaction when the previous one was expensive (e.g. type a date into the field instead of clicking through a calendar; go straight to a URL or use the search box instead of paging through menus). Only narrow the scope if the objective was genuinely too large, and keep each retry a complete, coherent unit rather than a trivial fragment. If a required part keeps overrunning across attempts, capture whatever partial progress exists and move on to the other required parts.
+{% endif %}
+{%- if prior_required_subgoals %}
+
+Refine the required_subgoals leg-checklist provided in the untrusted webpage-data block above instead of re-deriving it from scratch. Carry forward the parts already marked satisfied (keep their evidence), set the next mini goal toward a part that is still unsatisfied, and only re-mark a part satisfied=false if new evidence shows it regressed.
+{% endif %}
+{%- if iterations_remaining %}
+
+WRAP-UP MODE — only {{ iterations_remaining }} planning iteration(s) remain before the budget is exhausted. Converge now:
+- Work ONLY the required_subgoals still marked satisfied=false; plan the next mini goal toward the nearest unsatisfied part.
+- Do NOT start new legs, broaden scope, explore optional/secondary info, or re-verify already-satisfied parts.
+- If an open required part cannot realistically be finished in the remaining iterations, stop opening new work and lock in the parts you CAN finish, but leave it satisfied=false and keep user_goal_achieved=false.
+- Set user_goal_achieved to true only when every required_subgoal is satisfied; do not spend remaining iterations polishing after that point.
+{% endif %}
 
 Current datetime, ISO format:
 ```
