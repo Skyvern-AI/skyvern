@@ -554,3 +554,182 @@ class TestStatelessModeGuards:
         result = await mcp_tabs.skyvern_tab_wait_for_new()
         assert result["ok"] is False
         assert result["error"]["code"] == "ACTION_FAILED"
+
+
+# ═══════════════════════════════════════════════════
+# skyvern_open_tabs
+# ═══════════════════════════════════════════════════
+
+
+def _patch_open_tabs(monkeypatch: pytest.MonkeyPatch) -> tuple[SessionState, MagicMock]:
+    existing_page = _make_mock_page("https://old.com", "Old")
+    opened_pages = [_make_mock_page("https://a.com", "A"), _make_mock_page("https://b.com", "B")]
+    browser = _make_mock_browser(existing_page, *opened_pages)
+    browser._browser_context.new_page = AsyncMock(side_effect=list(opened_pages))
+
+    ctx = BrowserContext(mode="local")
+    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)))
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+    clear = MagicMock()
+    monkeypatch.setattr(mcp_tabs, "clear_session_ref_map", clear)
+    return state, clear
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_rejects_invalid_wait_until_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page must not run"))
+    monkeypatch.setattr(mcp_tabs, "get_page", get_page)
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://example.com"], wait_until="networkidle0")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_INPUT"
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_rejects_more_than_batch_limit_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page must not run"))
+    monkeypatch.setattr(mcp_tabs, "get_page", get_page)
+    urls = [f"https://example.com/{index}" for index in range(41)]
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=urls, screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_INPUT"
+    assert "40" in result["error"]["message"]
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_rejects_localhost_before_creating_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing_page = _make_mock_page("https://old.example", "Old")
+    browser = _make_mock_browser(existing_page)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
+    monkeypatch.setattr(
+        mcp_tabs,
+        "get_page",
+        AsyncMock(return_value=(SimpleNamespace(page=existing_page), context)),
+    )
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["http://localhost:8080/private"], screenshot=False)
+
+    assert result["ok"] is True
+    assert result["data"]["opened"] == 0
+    assert result["data"]["failed"] == 1
+    assert "localhost" in result["data"]["tabs"][0]["error"].lower()
+    browser._browser_context.new_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_keeps_success_when_page_leaves_context_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing_page = _make_mock_page("https://old.example", "Old")
+    self_closing_page = _make_mock_page("https://done.example", "Done")
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(return_value=self_closing_page)
+    context = BrowserContext(mode="local")
+    monkeypatch.setattr(
+        mcp_tabs,
+        "get_page",
+        AsyncMock(return_value=(SimpleNamespace(page=existing_page), context)),
+    )
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://done.example"], screenshot=False)
+
+    assert result["ok"] is True
+    assert result["data"]["opened"] == 1
+    assert result["data"]["failed"] == 0
+    assert result["data"]["tabs"][0]["index"] == 0
+    self_closing_page.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_keeping_the_active_tab_preserves_the_ref_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The observed page is unchanged, so refs from a prior observe are still resolvable — clearing
+    # them here would cost a re-observe for nothing.
+    state, clear = _patch_open_tabs(monkeypatch)
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://a.com", "https://b.com"], screenshot=False)
+
+    assert result["ok"] is True, result
+    assert result["data"]["opened"] == 2
+    clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_clears_the_ref_map_when_it_moves_the_active_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Parity with tab_new / tab_switch / tab_close: refs captured on the previous tab must not
+    # resolve against the newly active one.
+    state, clear = _patch_open_tabs(monkeypatch)
+
+    result = await mcp_tabs.skyvern_open_tabs(
+        urls=["https://a.com", "https://b.com"], screenshot=False, set_active_last=True
+    )
+
+    assert result["ok"] is True, result
+    assert state._active_page is not None
+    assert state._active_page.url == "https://b.com"
+    clear.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_closes_page_when_navigation_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing_page = _make_mock_page("https://old.com", "Old")
+    failed_page = _make_mock_page("https://failed.example", "Failed")
+    failed_page.goto.side_effect = RuntimeError("navigation failed")
+    browser = _make_mock_browser(existing_page, failed_page)
+    browser._browser_context.new_page = AsyncMock(return_value=failed_page)
+    ctx = BrowserContext(mode="local")
+    monkeypatch.setattr(
+        mcp_tabs,
+        "get_page",
+        AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)),
+    )
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://failed.example"], screenshot=False)
+
+    assert result["ok"] is True
+    assert result["data"]["opened"] == 0
+    assert result["data"]["failed"] == 1
+    failed_page.close.assert_awaited_once()
+    assert state._active_page is existing_page
+
+
+@pytest.mark.asyncio
+async def test_open_tabs_does_not_screenshot_preexisting_tab_when_every_navigation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing_page = _make_mock_page("https://old.example", "Old")
+    failed_page = _make_mock_page("https://failed.example", "Failed")
+    failed_page.goto.side_effect = RuntimeError("navigation failed")
+    browser = _make_mock_browser(existing_page, failed_page)
+    browser._browser_context.new_page = AsyncMock(return_value=failed_page)
+    ctx = BrowserContext(mode="local")
+    monkeypatch.setattr(
+        mcp_tabs,
+        "get_page",
+        AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)),
+    )
+    state = _make_session_state(browser)
+    state._active_page = existing_page
+    _patch_session(monkeypatch, state)
+    screenshot = AsyncMock()
+    monkeypatch.setattr(mcp_tabs, "do_screenshot", screenshot)
+
+    result = await mcp_tabs.skyvern_open_tabs(urls=["https://failed.example"], screenshot=True)
+
+    assert result["ok"] is True
+    assert result["data"]["path"] is None
+    assert result["artifacts"] == []
+    screenshot.assert_not_awaited()

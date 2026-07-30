@@ -10,6 +10,7 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.services import task_v2_service
 from skyvern.services.task_v2_service import _persist_completion_tab_screenshots
 
@@ -72,7 +73,9 @@ async def test_enumerates_without_closing_tabs(artifact_manager: AsyncMock) -> N
 
 @pytest.mark.asyncio
 async def test_respects_max_cap(artifact_manager: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(task_v2_service.settings, "MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2", 2)
+    # Patch the live SettingsManager instance the capture helper reads — not task_v2_service.settings,
+    # which diverges once any test imports cloud (set_settings swaps in a separate cloud_settings).
+    monkeypatch.setattr(SettingsManager.get_settings(), "MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2", 2)
     pages = [_fake_page() for _ in range(5)]
     browser_state = _fake_browser_state(AsyncMock(return_value=pages))
 
@@ -147,7 +150,7 @@ async def test_persist_failure_does_not_propagate(artifact_manager: AsyncMock) -
 async def test_slow_tab_times_out_and_does_not_block_others(
     artifact_manager: AsyncMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(task_v2_service.settings, "BROWSER_SCREENSHOT_TIMEOUT_MS", 50)
+    monkeypatch.setattr(SettingsManager.get_settings(), "BROWSER_SCREENSHOT_TIMEOUT_MS", 50)
     slow_page, fast_page = _fake_page("https://slow"), _fake_page("https://fast")
     pinned_selection = object()
     seen_selections = []
