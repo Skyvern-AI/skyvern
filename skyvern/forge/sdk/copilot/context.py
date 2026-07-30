@@ -727,6 +727,7 @@ class InFlightStreamToolCall:
     call_id: str
     tool_name: str
     iteration: int
+    display_label: str | None = None
 
 
 @dataclass

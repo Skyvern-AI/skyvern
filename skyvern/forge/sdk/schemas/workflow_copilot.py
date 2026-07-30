@@ -320,6 +320,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )
     tool_name: str = Field(..., description="Name of the tool that was called")
+    display_label: str | None = Field(
+        None,
+        description="Product-safe label for rendering the tool result in user-visible activity surfaces",
+    )
     success: bool = Field(..., description="Whether the tool call succeeded")
     summary: str = Field(..., description="Brief human-readable summary of the result")
     iteration: int = Field(..., description="Agent loop iteration number")
