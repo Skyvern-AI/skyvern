@@ -134,6 +134,26 @@ class TestCacheVariant:
         assert "vc" in result
         assert "cp" in result
 
+    def test_complete_criterion_variant_keys_on_presence_only(self) -> None:
+        first = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion="The first outcome is visible",
+        )
+        second = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion="A different outcome is visible",
+        )
+        absent = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+        )
+
+        assert first == second
+        assert first != absent
+
     def test_guidance_text_has_a_stable_collision_resistant_tag(self) -> None:
         first = ForgeAgent._build_extract_action_cache_variant(
             verification_code_check=False,
