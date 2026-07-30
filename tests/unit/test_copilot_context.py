@@ -734,7 +734,11 @@ class TestCopilotContext:
 
 def _policy_ctx(resolved: list[SimpleNamespace], credential_input_kind: str = "credential_name") -> SimpleNamespace:
     return SimpleNamespace(
-        request_policy=SimpleNamespace(resolved_credentials=resolved, credential_input_kind=credential_input_kind)
+        request_policy=SimpleNamespace(
+            resolved_credentials=resolved,
+            credential_input_kind=credential_input_kind,
+            live_page_admitted_urls={},
+        )
     )
 
 

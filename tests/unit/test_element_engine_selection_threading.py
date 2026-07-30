@@ -60,39 +60,53 @@ def _element_double() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_svg_eligibility_threads_live_task_engine_selection(monkeypatch: pytest.MonkeyPatch) -> None:
-    selection = _selection()
+@pytest.mark.parametrize("selection", [_selection(), None])
+async def test_svg_eligibility_reuses_frame_selection_after_browser_state_removal(
+    selection: BrowserEngineSelection | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     task = _task()
     locator = MagicMock(count=AsyncMock(return_value=1), is_visible=AsyncMock(return_value=True))
     frame = MagicMock(locator=MagicMock(return_value=locator))
     skyvern_frame = MagicMock(
+        engine_selection=selection,
         get_frame=MagicMock(return_value=frame),
         get_blocking_element_id=AsyncMock(return_value=(None, False)),
     )
     constructor = MagicMock(return_value=_element_double())
-    manager = MagicMock(get_for_task=MagicMock(return_value=SimpleNamespace(engine_selection=selection)))
+    manager = MagicMock(get_for_task=MagicMock(return_value=None))
+    resolver = MagicMock(return_value=None)
     monkeypatch.setattr(agent_functions, "SkyvernElement", constructor)
     monkeypatch.setattr(agent_functions.app, "BROWSER_MANAGER", manager)
+    monkeypatch.setattr(agent_functions, "_resolve_engine_selection", resolver)
 
     assert await agent_functions._check_svg_eligibility(skyvern_frame, {"id": "svg-1", "tagName": "svg"}, task)
 
     assert constructor.call_args.kwargs["engine_selection"] is selection
-    manager.get_for_task.assert_called_once_with(task.task_id, workflow_run_id=task.workflow_run_id)
+    resolver.assert_not_called()
+    manager.get_for_task.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_css_shape_conversion_threads_live_task_engine_selection(monkeypatch: pytest.MonkeyPatch) -> None:
-    selection = _selection()
+@pytest.mark.parametrize("selection", [_selection(), None])
+async def test_css_shape_conversion_reuses_frame_selection_after_browser_state_replacement(
+    selection: BrowserEngineSelection | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacement = _selection()
     task = _task()
     locator = MagicMock(count=AsyncMock(return_value=1))
     frame = MagicMock(locator=MagicMock(return_value=locator))
     skyvern_frame = MagicMock(
+        engine_selection=selection,
         get_frame=MagicMock(return_value=frame),
         get_blocking_element_id=AsyncMock(return_value=(None, True)),
     )
     constructor = MagicMock(return_value=_element_double())
-    manager = MagicMock(get_for_task=MagicMock(return_value=SimpleNamespace(engine_selection=selection)))
+    manager = MagicMock(get_for_task=MagicMock(return_value=SimpleNamespace(engine_selection=replacement)))
+    resolver = MagicMock(return_value=replacement)
     monkeypatch.setattr(agent_functions, "SkyvernElement", constructor)
+    monkeypatch.setattr(agent_functions, "_resolve_engine_selection", resolver)
     monkeypatch.setattr(
         agent_functions,
         "app",
@@ -112,7 +126,8 @@ async def test_css_shape_conversion_threads_live_task_engine_selection(monkeypat
     )
 
     assert constructor.call_args.kwargs["engine_selection"] is selection
-    manager.get_for_task.assert_called_once_with(task.task_id, workflow_run_id=task.workflow_run_id)
+    resolver.assert_not_called()
+    manager.get_for_task.assert_not_called()
 
 
 @pytest.mark.asyncio

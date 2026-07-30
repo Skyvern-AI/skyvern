@@ -1061,6 +1061,7 @@ async def test_real_browser_manager_adoption_resolves_context_run_id() -> None:
         patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
         patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=ctx),
     ):
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         result = await manager.get_or_create_for_workflow_run(workflow_run, browser_session_id="bs")
 

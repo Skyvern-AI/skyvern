@@ -166,7 +166,12 @@ async def _summarize_max_steps_failure_reason(
         if page is None:
             return "Failed to get the current browser page", None
 
-        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=str(task_v2.url), draw_boxes=False)
+        screenshots = await SkyvernFrame.take_split_screenshots(
+            page=page,
+            url=str(task_v2.url),
+            draw_boxes=False,
+            engine_selection=browser_state.engine_selection,
+        )
 
         run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
             workflow_run_id=task_v2.workflow_run_id,
@@ -895,7 +900,9 @@ async def run_task_v2_helper(
             try:
                 scraped_page = await browser_state.scrape_website(
                     url=url,
-                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                        engine_selection=browser_state.engine_selection
+                    ),
                     scrape_exclude=app.scrape_exclude,
                 )
                 if page is None:
@@ -1208,7 +1215,9 @@ async def run_task_v2_helper(
                 )
                 completion_scraped_page = await browser_state.scrape_website(
                     url=url,
-                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                        engine_selection=browser_state.engine_selection
+                    ),
                     scrape_exclude=app.scrape_exclude,
                 )
                 completion_screenshots = completion_scraped_page.screenshots
@@ -2389,7 +2398,11 @@ async def _persist_completion_tab_screenshots(browser_state: BrowserState, thoug
                             await page.bring_to_front()
                         except Exception:
                             LOG.debug("Failed to bring tab to front before completion screenshot", exc_info=True)
-                        screenshots = await SkyvernFrame.take_split_screenshots(page=page, scroll=False)
+                        screenshots = await SkyvernFrame.take_split_screenshots(
+                            page=page,
+                            scroll=False,
+                            engine_selection=browser_state.engine_selection,
+                        )
                 except Exception:
                     LOG.warning("Failed to capture completion screenshot for an open tab", exc_info=True)
                     continue
