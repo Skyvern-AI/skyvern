@@ -90,6 +90,7 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "discover_workflow_entrypoint",
     "get_browser_screenshot",
     "list_credentials",
+    "list_integrations",
 )
 
 
