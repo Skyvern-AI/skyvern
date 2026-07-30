@@ -476,21 +476,29 @@ async def scrape_web_unsafe(
             frame_count=len(meaningful_frames),
         )
 
-    skyvern_frame = await SkyvernFrame.create_instance(page)
+    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
     await _wait_for_scrape_ready(skyvern_frame)
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-    elements, element_tree, destinations = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
+    elements, element_tree, destinations = await get_interactable_element_tree(
+        page,
+        scrape_exclude,
+        must_included_tags,
+        engine_selection=browser_state.engine_selection,
+    )
     empty_page_retry = False
     if not elements and not support_empty_page:
         LOG.warning("No elements found on the page, wait and retry")
         await empty_page_retry_wait()
         empty_page_retry = True
         elements, element_tree, destinations = await get_interactable_element_tree(
-            page, scrape_exclude, must_included_tags
+            page,
+            scrape_exclude,
+            must_included_tags,
+            engine_selection=browser_state.engine_selection,
         )
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
@@ -563,6 +571,7 @@ async def scrape_web_unsafe(
                 draw_boxes=draw_boxes,
                 max_number=max_screenshot_number,
                 scroll=effective_scroll,
+                engine_selection=browser_state.engine_selection,
             )
             _ss_span.set_attribute("screenshot_count", len(screenshots))
             _ss_span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
@@ -585,7 +594,7 @@ async def scrape_web_unsafe(
     html = ""
     window_dimension = None
     try:
-        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+        skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=browser_state.engine_selection)
         html = await skyvern_frame.get_content()
         if page.viewport_size:
             window_dimension = Resolution(width=page.viewport_size["width"], height=page.viewport_size["height"])
@@ -690,6 +699,7 @@ async def add_frame_interactable_elements(
     element_tree: list[dict],
     destinations: dict[str, dict],
     must_included_tags: list[str] | None = None,
+    engine_selection: "BrowserEngineSelection | None" = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Add the interactable element of the frame to the elements and element_tree.
@@ -716,7 +726,7 @@ async def add_frame_interactable_elements(
         return elements, element_tree
 
     try:
-        skyvern_frame = await SkyvernFrame.create_instance(frame)
+        skyvern_frame = await SkyvernFrame.create_instance(frame, engine_selection=engine_selection)
         await _wait_for_scrape_ready(skyvern_frame)
 
         frame_elements, frame_element_tree, frame_destinations = await skyvern_frame.build_tree_from_body(
@@ -740,6 +750,7 @@ async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     must_included_tags: list[str] | None = None,
+    engine_selection: "BrowserEngineSelection | None" = None,
 ) -> tuple[list[dict], list[dict], dict[str, dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
@@ -748,7 +759,7 @@ async def get_interactable_element_tree(
         destination-facts sidecar stripped out of them at the SkyvernFrame boundary.
     """
     # main page index is 0
-    skyvern_page = await SkyvernFrame.create_instance(page)
+    skyvern_page = await SkyvernFrame.create_instance(page, engine_selection=engine_selection)
     elements, element_tree, destinations = await skyvern_page.build_tree_from_body(
         frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
     )
@@ -775,6 +786,7 @@ async def get_interactable_element_tree(
             element_tree,
             destinations,
             must_included_tags,
+            engine_selection,
         )
 
     # Placeholder nodes stand in for frames the filter skipped but wants the LLM to

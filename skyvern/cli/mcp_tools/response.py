@@ -45,6 +45,7 @@ _MAX_PRESERVED_IDENTIFIER_VALUE_CHARS = 256
 # the envelope honors its "under max_chars" contract.
 _MAX_PRESERVED_ERROR_CHARS = 2_000
 _MAX_PRESERVED_ERROR_PREVIEW_CHARS = 500
+_MAX_PRESERVED_SCREENSHOT_PATH_CHARS = 1_024
 
 _TRUNCATION_HINT = (
     "Response exceeded the ~150k-char Claude tool-result limit. "
@@ -91,6 +92,42 @@ def _bound_error_value(error: Any) -> Any:
     }
 
 
+def _contains_inline_image(value: Any, seen: set[int] | None = None) -> bool:
+    if seen is None:
+        seen = set()
+    if isinstance(value, dict):
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        if (
+            value.get("inline") is True
+            and str(value.get("mime", "")).startswith("image/")
+            and isinstance(value.get("data"), str)
+        ):
+            return True
+        return any(_contains_inline_image(item, seen) for item in value.values())
+    if isinstance(value, list):
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        return any(_contains_inline_image(item, seen) for item in value)
+    return False
+
+
+def _preserved_screenshot_artifact(value: Any) -> dict[str, Any] | None:
+    artifacts = value.get("artifacts") if isinstance(value, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("kind") != "screenshot":
+            continue
+        path = artifact.get("path")
+        if not isinstance(path, str) or len(path) > _MAX_PRESERVED_SCREENSHOT_PATH_CHARS:
+            continue
+        return {"kind": "screenshot", "path": path, "mime": "image/png"}
+    return None
+
+
 def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> Any:
     """Return `data` unchanged if under `max_chars`; otherwise wrap in a truncation envelope.
 
@@ -134,6 +171,9 @@ def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> 
             envelope["ok"] = data["ok"]
         if "error" in data:
             envelope["error"] = _bound_error_value(data["error"])
+        screenshot_artifact = _preserved_screenshot_artifact(data)
+        if screenshot_artifact:
+            envelope["artifacts"] = [screenshot_artifact]
         preserved = 0
         for key, value in data.items():
             if preserved >= _MAX_PRESERVED_IDENTIFIER_FIELDS:
@@ -149,6 +189,13 @@ def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> 
             if isinstance(value, str) and len(value) <= _MAX_PRESERVED_IDENTIFIER_VALUE_CHARS:
                 envelope[key] = value
                 preserved += 1
+        if data.get("ok") is True and _contains_inline_image(data):
+            envelope["ok"] = False
+            envelope["error"] = {
+                "code": "RESPONSE_TOO_LARGE",
+                "message": "The inline screenshot exceeded the MCP response size limit and was not returned.",
+                "hint": "Use the saved screenshot artifact path, or retry with inline=false.",
+            }
 
     # Final safety net: if the preserved fields combined still blow past the
     # cap (extremely unlikely given the per-field caps above, but possible if

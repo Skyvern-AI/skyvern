@@ -315,6 +315,7 @@ def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, crede
     untested draft instead of being forced back through update_and_run_blocks.
     """
     ctx.test_after_update_done = False
+    ctx.credential_pause_connected_credential_id = credential.credential_id
     policy.resolved_credentials.append(credential)
     policy.allow_run_blocks = True
     policy.clarification_reason = "none"

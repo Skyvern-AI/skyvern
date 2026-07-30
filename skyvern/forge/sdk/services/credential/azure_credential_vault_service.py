@@ -28,6 +28,7 @@ class AzureCredentialVaultService(CredentialVaultService):
         password: str
         username: str
         totp: str | None = None
+        metadata: dict[str, str] | None = None
 
     class _CreditCardCredentialDataImage(BaseModel):
         type: Literal["credit_card"]
@@ -73,7 +74,12 @@ class AzureCredentialVaultService(CredentialVaultService):
 
     async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
         credential_data = data.credential
-        if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+        if data.credential_type == CredentialType.PASSWORD and isinstance(credential_data, PasswordCredential):
+            credential_data = await self._preserve_omitted_password_metadata(
+                credential=credential,
+                updated_credential=credential_data,
+            )
+        elif data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
             credential_data = await self._preserve_omitted_credit_card_fields(
                 credential=credential,
                 updated_credential=credential_data,
@@ -119,7 +125,7 @@ class AzureCredentialVaultService(CredentialVaultService):
             secret_value="",
         )
 
-    async def post_delete_credential_item(self, item_id: str, _organization_id: str | None = None) -> None:
+    async def post_delete_credential_item(self, item_id: str, _organization_id: str | None = None) -> bool:
         """
         Background task to delete the credential item from Azure Key Vault.
         This allows the API to respond quickly while the deletion happens asynchronously.
@@ -136,13 +142,15 @@ class AzureCredentialVaultService(CredentialVaultService):
                 item_id=item_id,
                 vault_name=self._vault_name,
             )
-        except Exception as e:
-            LOG.exception(
+            return True
+        except Exception as exc:
+            LOG.warning(
                 "Failed to delete credential item from Azure Key Vault in background",
                 item_id=item_id,
                 vault_name=self._vault_name,
-                error=str(e),
+                error_type=type(exc).__name__,
             )
+            return False
 
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_name=db_credential.item_id, vault_name=self._vault_name)
@@ -158,6 +166,7 @@ class AzureCredentialVaultService(CredentialVaultService):
                     password=data.password,
                     totp=data.totp,
                     totp_type=db_credential.totp_type,
+                    metadata=data.metadata,
                 ),
                 name=db_credential.name,
                 credential_type=CredentialType.PASSWORD,
@@ -201,6 +210,7 @@ class AzureCredentialVaultService(CredentialVaultService):
                 username=credential.username,
                 password=credential.password,
                 totp=credential.totp,
+                metadata=credential.metadata,
             )
         elif isinstance(credential, CreditCardCredential):
             data = AzureCredentialVaultService._CreditCardCredentialDataImage(
@@ -245,6 +255,7 @@ class AzureCredentialVaultService(CredentialVaultService):
                 username=credential.username,
                 password=credential.password,
                 totp=credential.totp,
+                metadata=credential.metadata,
             )
         elif isinstance(credential, CreditCardCredential):
             data = AzureCredentialVaultService._CreditCardCredentialDataImage(

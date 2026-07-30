@@ -106,6 +106,7 @@ class SkyvernContext:
     copilot_inline_execution: bool = False
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
+    complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None

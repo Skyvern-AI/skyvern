@@ -7321,6 +7321,26 @@ class WorkflowService:
                 steps_updated=steps_updated,
             )
 
+    def _schedule_workflow_run_terminal_hooks(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        hook_coroutines = (
+            app.AGENT_FUNCTION.on_workflow_run_completed(
+                organization_id=organization_id,
+                workflow_id=workflow_id,
+                status=status,
+            ),
+        )
+        for hook_coroutine in hook_coroutines:
+            task = asyncio.create_task(hook_coroutine)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
     async def _update_workflow_run_status(
         self,
         workflow_run_id: str,
@@ -7409,15 +7429,12 @@ class WorkflowService:
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
             await self._apply_completion_run_tags_best_effort(workflow_run)
-            run_completed_task = asyncio.create_task(
-                app.AGENT_FUNCTION.on_workflow_run_completed(
-                    organization_id=workflow_run.organization_id,
-                    workflow_id=workflow_run.workflow_id,
-                    status=status,
-                ),
+            self._schedule_workflow_run_terminal_hooks(
+                workflow_run_id=workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                workflow_id=workflow_run.workflow_id,
+                status=status,
             )
-            self._background_tasks.add(run_completed_task)
-            run_completed_task.add_done_callback(self._background_tasks.discard)
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
         bg = asyncio.create_task(
@@ -7803,6 +7820,13 @@ class WorkflowService:
             workflow_schedule_id=updated.workflow_schedule_id,
         )
         await self._apply_completion_run_tags_best_effort(updated)
+
+        self._schedule_workflow_run_terminal_hooks(
+            workflow_run_id=workflow_run_id,
+            organization_id=updated.organization_id,
+            workflow_id=updated.workflow_id,
+            status=WorkflowRunStatus.canceled,
+        )
 
         bg = asyncio.create_task(
             self._sync_task_run_from_workflow_run(updated, workflow_run_id, WorkflowRunStatus.canceled),
@@ -8873,6 +8897,12 @@ class WorkflowService:
         schedule_credential_fallback_retry: bool = True,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        # Tear down passkey material in the worker, after the finally block, while the context is still alive.
+        await app.AGENT_FUNCTION.on_workflow_run_terminal(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            status=workflow_run.status,
+        )
         if browser_cleanup_result is None:
             browser_cleanup_result = await self._clean_up_workflow_browser(
                 workflow_run=workflow_run,

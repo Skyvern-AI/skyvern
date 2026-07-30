@@ -91,6 +91,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     NewTabAction,
     NullAction,
+    PasteTextAction,
     ReloadPageAction,
     ScrollAction,
     SelectOptionAction,
@@ -226,6 +227,7 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
 ACTION_TYPE_TO_CLASS = {
     ActionType.CLICK: ClickAction,
     ActionType.INPUT_TEXT: InputTextAction,
+    ActionType.PASTE_TEXT: PasteTextAction,
     ActionType.UPLOAD_FILE: UploadFileAction,
     ActionType.DOWNLOAD_FILE: DownloadFileAction,
     ActionType.NULL_ACTION: NullAction,

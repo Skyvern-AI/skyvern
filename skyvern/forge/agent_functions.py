@@ -6,10 +6,10 @@ import hashlib
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
 
 import aiohttp
 import httpx
@@ -39,6 +39,16 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_poli
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.credentials import (
+    CreateCredentialRequest,
+    Credential,
+    CredentialItem,
+    CredentialType,
+    CredentialVaultType,
+    NonEmptyCreditCardCredential,
+    NonEmptyPasswordCredential,
+    SecretCredential,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import (
@@ -56,7 +66,7 @@ from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDe
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.browser_engine import BrowserEngineSelection, resolve_engine_selection_for_task
+from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -66,6 +76,7 @@ if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -479,7 +490,7 @@ async def _check_svg_eligibility(
             locator=locater,
             frame=skyvern_frame.get_frame(),
             static_element=element,
-            engine_selection=_resolve_engine_selection(task),
+            engine_selection=skyvern_frame.engine_selection,
         )
 
         _, blocked = await skyvern_frame.get_blocking_element_id(
@@ -497,20 +508,55 @@ async def _check_svg_eligibility(
     return True
 
 
+def _svg_cache_inputs(element: dict) -> tuple[str, str]:
+    svg_html = json_to_html(_remove_skyvern_attributes(element))
+    svg_hash = hashlib.sha256(svg_html.encode("utf-8")).hexdigest()
+    return svg_html, _get_svg_cache_key(svg_hash)
+
+
+def _svg_cache_key_for_element(element: dict) -> str:
+    return _svg_cache_inputs(element)[1]
+
+
+def _partition_svgs_by_cache_key(
+    elements: list[dict],
+    key_fn: Callable[[dict], str] = _svg_cache_key_for_element,
+) -> tuple[list[dict], list[dict]]:
+    """Split SVG elements into one representative per unique cache key plus the duplicates.
+
+    Converting the representatives first warms the cache, so the duplicates resolve from cache
+    instead of each firing its own identical svg-convert LLM call (the thundering-herd flood).
+    """
+    seen: set[str] = set()
+    representatives: list[dict] = []
+    duplicates: list[dict] = []
+    for element in elements:
+        try:
+            key = key_fn(element)
+        except Exception:
+            representatives.append(element)
+            continue
+        if key in seen:
+            duplicates.append(element)
+        else:
+            seen.add(key)
+            representatives.append(element)
+    return representatives, duplicates
+
+
 async def _convert_svg_to_string(
     element: dict,
     task: Task | None = None,
     step: Step | None = None,
+    *,
+    svg_html: str | None = None,
+    svg_key: str | None = None,
 ) -> None:
     """Convert an SVG element to a string description. Assumes element has already passed eligibility checks."""
     element_id = element.get("id", "")
 
-    svg_element = _remove_skyvern_attributes(element)
-    svg_html = json_to_html(svg_element)
-    hash_object = hashlib.sha256()
-    hash_object.update(svg_html.encode("utf-8"))
-    svg_hash = hash_object.hexdigest()
-    svg_key = _get_svg_cache_key(svg_hash)
+    if svg_html is None or svg_key is None:
+        svg_html, svg_key = _svg_cache_inputs(element)
 
     svg_shape: str | None = None
     refresh_svg_cache = False
@@ -665,7 +711,7 @@ async def _convert_css_shape_to_string(
                 locator=locater,
                 frame=skyvern_frame.get_frame(),
                 static_element=element,
-                engine_selection=_resolve_engine_selection(task),
+                engine_selection=skyvern_frame.engine_selection,
             )
 
             _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
@@ -692,7 +738,11 @@ async def _convert_css_shape_to_string(
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
             # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below,
             # which drops the element from future scrape passes and aborts the conversion.
-            screenshot = await take_element_screenshot(locater, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            screenshot = await take_element_screenshot(
+                locater,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                engine_selection=skyvern_frame.engine_selection,
+            )
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today
@@ -1161,6 +1211,13 @@ class AgentFunction:
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
+    async def on_browser_context_acquired(
+        self,
+        browser_context: Any,
+        workflow_run_id: str | None,
+    ) -> None:
+        return
+
     async def validate_step_execution(
         self,
         task: Task,
@@ -1214,6 +1271,62 @@ class AgentFunction:
         totp_secret: str,
         organization_id: str | None = None,
     ) -> str | None:
+        return None
+
+    async def validate_credential_write(
+        self,
+        *,
+        organization_id: str,
+        credential_type: CredentialType,
+        credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential | SecretCredential,
+        existing_credential: Credential | None = None,
+    ) -> None:
+        return
+
+    async def prepare_credential_update(
+        self,
+        *,
+        credential_service: CredentialVaultService,
+        existing_credential: Credential,
+        data: CreateCredentialRequest,
+    ) -> CreateCredentialRequest:
+        return data
+
+    async def should_lock_credential_write(
+        self,
+        *,
+        credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential | SecretCredential | None,
+        existing_credential: Credential,
+    ) -> bool:
+        return False
+
+    def credential_write_lock(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+    ) -> AbstractAsyncContextManager[None]:
+        return nullcontext()
+
+    async def on_credential_item_orphaned(
+        self,
+        *,
+        organization_id: str,
+        item_id: str,
+        vault_type: CredentialVaultType,
+    ) -> None:
+        return
+
+    async def process_registered_credential_item(
+        self,
+        *,
+        workflow_run_id: str | None,
+        db_credential: Credential,
+        credential_item: CredentialItem,
+    ) -> CredentialItem:
+        return credential_item
+
+    async def get_extra_extract_action_guidance(self, task: Task) -> str | None:
         return None
 
     async def parse_enterprise_totp_secret_result(
@@ -1789,8 +1902,11 @@ class AgentFunction:
         self,
         task: Task | None = None,
         step: Step | None = None,
+        engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
+        if engine_selection is UNSET_SELECTION:
+            engine_selection = _resolve_engine_selection(task)
 
         @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
@@ -1804,7 +1920,7 @@ class AgentFunction:
             """
             context = skyvern_context.ensure_context()
             # page won't be in the context.frame_index_map, so the index is going to be 0
-            skyvern_frame = await SkyvernFrame.create_instance(frame=frame)
+            skyvern_frame = await SkyvernFrame.create_instance(frame=frame, engine_selection=engine_selection)
             current_frame_index = context.frame_index_map.get(frame, 0)
 
             queue = []
@@ -1829,7 +1945,10 @@ class AgentFunction:
                     new_frame = next(
                         (k for k, v in context.frame_index_map.items() if v == queue_ele.get("frame_index")), frame
                     )
-                    skyvern_frame = await SkyvernFrame.create_instance(frame=new_frame)
+                    skyvern_frame = await SkyvernFrame.create_instance(
+                        frame=new_frame,
+                        engine_selection=engine_selection,
+                    )
                     current_frame_index = queue_ele.get("frame_index", 0)
 
                 _remove_rect(queue_ele)
@@ -1856,14 +1975,31 @@ class AgentFunction:
                 )
 
             if eligible_svgs:
-                await asyncio.gather(*[_convert_svg_to_string(element, task, step) for element, frame in eligible_svgs])
+                svg_cache_inputs: dict[int, tuple[str, str]] = {}
+
+                def cache_key(element: dict) -> str:
+                    inputs = _svg_cache_inputs(element)
+                    svg_cache_inputs[id(element)] = inputs
+                    return inputs[1]
+
+                async def convert_svg(element: dict) -> None:
+                    svg_html, svg_key = svg_cache_inputs.get(id(element), (None, None))
+                    await _convert_svg_to_string(element, task, step, svg_html=svg_html, svg_key=svg_key)
+
+                svg_representatives, svg_duplicates = _partition_svgs_by_cache_key(
+                    [element for element, _frame in eligible_svgs],
+                    key_fn=cache_key,
+                )
+                await asyncio.gather(*[convert_svg(element) for element in svg_representatives])
+                if svg_duplicates:
+                    await asyncio.gather(*[convert_svg(element) for element in svg_duplicates])
 
             return element_tree
 
         return cleanup_element_tree_func
 
     async def has_code_block_access(self, organization_id: str | None = None) -> bool:
-        return settings.ENABLE_CODE_BLOCK
+        return settings.ENABLE_CODE_BLOCK and not settings.DISABLE_CODE_BLOCK_EXECUTION
 
     async def validate_code_block(self, organization_id: str | None = None) -> None:
         if not await self.has_code_block_access(organization_id):
@@ -2244,6 +2380,16 @@ class AgentFunction:
         organization_id: str,
         workflow_id: str,
         status: WorkflowRunStatus | None = None,
+    ) -> None:
+        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        return None
+
+    async def on_workflow_run_terminal(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
     ) -> None:
         """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
         return None

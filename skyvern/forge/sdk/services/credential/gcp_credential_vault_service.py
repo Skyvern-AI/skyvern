@@ -30,6 +30,7 @@ class GcpCredentialVaultService(CredentialVaultService):
         password: str
         username: str
         totp: str | None = None
+        metadata: dict[str, str] | None = None
 
     class _CreditCardCredentialDataImage(BaseModel):
         type: Literal["credit_card"]
@@ -83,7 +84,12 @@ class GcpCredentialVaultService(CredentialVaultService):
 
     async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
         credential_data = data.credential
-        if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+        if data.credential_type == CredentialType.PASSWORD and isinstance(credential_data, PasswordCredential):
+            credential_data = await self._preserve_omitted_password_metadata(
+                credential=credential,
+                updated_credential=credential_data,
+            )
+        elif data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
             credential_data = await self._preserve_omitted_credit_card_fields(
                 credential=credential,
                 updated_credential=credential_data,
@@ -128,6 +134,21 @@ class GcpCredentialVaultService(CredentialVaultService):
         await self._client.delete_secret(secret_id=credential.item_id, project_id=self._project_id)
         await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
 
+    async def post_delete_credential_item(self, item_id: str, _organization_id: str | None = None) -> bool:
+        # The reaper drops the pending record only when this returns True, so inheriting the base default
+        # (return True without deleting) would orphan the Secret Manager secret; delete_secret swallows NotFound.
+        try:
+            await self._client.delete_secret(secret_id=item_id, project_id=self._project_id)
+            return True
+        except Exception:
+            LOG.warning(
+                "Failed to delete GCP Secret Manager credential item in background cleanup",
+                item_id=item_id,
+                project_id=self._project_id,
+                exc_info=True,
+            )
+            return False
+
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_id=db_credential.item_id, project_id=self._project_id)
         if secret_json_str is None:
@@ -142,6 +163,7 @@ class GcpCredentialVaultService(CredentialVaultService):
                     password=data.password,
                     totp=data.totp,
                     totp_type=db_credential.totp_type,
+                    metadata=data.metadata,
                 ),
                 name=db_credential.name,
                 credential_type=CredentialType.PASSWORD,
@@ -181,6 +203,7 @@ class GcpCredentialVaultService(CredentialVaultService):
                 username=credential.username,
                 password=credential.password,
                 totp=credential.totp,
+                metadata=credential.metadata,
             )
         elif isinstance(credential, CreditCardCredential):
             return GcpCredentialVaultService._CreditCardCredentialDataImage(
