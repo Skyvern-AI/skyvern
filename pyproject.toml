@@ -33,7 +33,7 @@ local = [
     "aiohttp>=3.13.4,<4",
     "python-multipart>=0.0.30,<1",
     "toml>=0.10.2,<0.11",
-    "jinja2>=3.1.2,<4",
+    "jinja2>=3.1.6,<4",
     "litellm>=1.84.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
@@ -104,7 +104,7 @@ server = [
     "aiohttp>=3.13.4,<4",
     "python-multipart>=0.0.30,<1",
     "toml>=0.10.2,<0.11",
-    "jinja2>=3.1.2,<4",
+    "jinja2>=3.1.6,<4",
     "uvicorn[standard]>=0.44.0",
     "litellm>=1.84.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
@@ -235,6 +235,12 @@ dev = [
     "pyinstrument>=5.1.2",
     "pip-audit>=2.10.0",
     "import-linter>=2.1,<3",
+]
+# Non-default group: rustwright never enters the default/server/local/cloud/dev
+# install sets. `uv export --no-default-groups --group rustwright` is an isolation probe;
+# the shared worker image resolves it via `uv export --extra server --group cloud --group rustwright --no-dev`.
+rustwright = [
+    "rustwright==0.1.1",
 ]
 
 [tool.hatch.build]
