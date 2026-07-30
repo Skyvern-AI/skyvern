@@ -28,7 +28,7 @@ import structlog
 from jinja2 import Environment, FileSystemLoader
 
 from skyvern.constants import SKYVERN_DIR
-from skyvern.utils.strings import escape_code_fences
+from skyvern.utils.strings import escape_code_fences, neutralize_untrusted_web_page_data_sentinels
 
 LOG = structlog.get_logger()
 
@@ -38,7 +38,8 @@ def _untrusted_filter(value: Any, escape_quotes: bool = False) -> str:
     # Markup subclasses do not carry safe-html semantics into prompts.
     if value is None:
         return ""
-    return escape_code_fences(str(value), escape_quotes=escape_quotes)
+    filtered = escape_code_fences(str(value), escape_quotes=escape_quotes)
+    return neutralize_untrusted_web_page_data_sentinels(filtered)
 
 
 class PromptEngine:

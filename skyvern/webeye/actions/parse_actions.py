@@ -51,6 +51,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     NewTabAction,
     NullAction,
+    PasteTextAction,
     ReloadPageAction,
     ScrollAction,
     SelectOption,
@@ -155,6 +156,12 @@ def parse_action(
             text=action["text"],
             input_or_select_context=input_or_select_context,
             totp_code_required=totp_code_required,
+        )
+
+    if action_type == ActionType.PASTE_TEXT:
+        return PasteTextAction(
+            **base_action_dict,
+            text=action["text"],
         )
 
     if action_type == ActionType.UPLOAD_FILE:

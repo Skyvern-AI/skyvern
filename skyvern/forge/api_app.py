@@ -17,6 +17,8 @@ from skyvern.exceptions import require_server_extra_modules
 require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
 
 from fastapi import FastAPI, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -123,6 +125,17 @@ def format_validation_errors(exc: ValidationError) -> str:
         if error_messages
         else "A validation error occurred. Please check your input and try again."
     )
+
+
+def sanitize_request_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    return [
+        {
+            "loc": error["loc"],
+            "msg": error["msg"],
+            "type": error["type"],
+        }
+        for error in exc.errors()
+    ]
 
 
 class ExecutionDatePlugin(Plugin):
@@ -448,6 +461,20 @@ def create_api_app() -> FastAPI:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": detail},
+        )
+
+    @fastapi_app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
+        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
+        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
+        path = request.url.path.rstrip("/")
+        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+            return await request_validation_exception_handler(request, exc)
+
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": sanitize_request_validation_errors(exc)},
         )
 
     @fastapi_app.exception_handler(ClientDisconnect)

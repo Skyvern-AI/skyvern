@@ -84,6 +84,58 @@ async def build_open_tabs_context(
     return "\n".join(lines)
 
 
+async def capture_open_tab_screenshots(
+    browser_state: BrowserState,
+    *,
+    persist: Callable[[bytes], Awaitable[None]],
+    skip_single_tab: bool = False,
+) -> int:
+    """Screenshot every open tab and persist each frame via ``persist``; returns the count.
+
+    Shared end-state per-tab capture. The caller's ``persist`` owns the artifact sink and type.
+    ``skip_single_tab`` returns 0 when only one tab is open, for callers that already capture the
+    active page separately. Best-effort: runs post-success, never raises.
+    """
+    config = SettingsManager.get_settings()
+    captured = 0
+    try:
+        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
+        # close the very tabs we are trying to capture.
+        pages = await browser_state.list_valid_pages(max_pages=0)
+        if not pages or (skip_single_tab and len(pages) <= 1):
+            return 0
+        per_tab_timeout = config.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
+        # Overall budget so a few still-loading tabs can't stall the post-success path.
+        async with asyncio.timeout(config.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
+            # The cap setting is task_v2-named but governs every caller here.
+            for page in pages[: config.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
+                frames: list[bytes] = []
+                try:
+                    async with asyncio.timeout(per_tab_timeout):
+                        try:
+                            # Front each tab so Chromium paints lazily-rendered background content.
+                            await page.bring_to_front()
+                        except Exception:
+                            LOG.debug("Failed to bring tab to front before screenshot", exc_info=True)
+                        frames = await SkyvernFrame.take_split_screenshots(
+                            page=page,
+                            scroll=False,
+                            engine_selection=browser_state.engine_selection,
+                        )
+                except Exception:
+                    LOG.warning("Failed to capture screenshot for an open tab", exc_info=True)
+                    continue
+                for frame in frames:
+                    try:
+                        await persist(frame)
+                        captured += 1
+                    except Exception:
+                        LOG.warning("Failed to persist open-tab screenshot", exc_info=True)
+    except Exception:
+        LOG.warning("Aborted capturing open-tab screenshots", captured=captured, exc_info=True)
+    return captured
+
+
 _JS_TOP_LEVEL_DECL_RE = re.compile(
     r"^(?:async\s+function|function|class|let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
     re.MULTILINE,

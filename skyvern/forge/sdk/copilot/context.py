@@ -618,7 +618,8 @@ _MAX_APPROVED_CREDENTIALS = 20
 def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
     """Persist resolved credentials as durable cross-turn approval. Records only from
     resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
-    holds by construction.
+    holds by construction. A credential a live login page vouched for is left out: its
+    evidence is that page, which a later turn has not seen, so it must be re-earned there.
     """
     policy = ctx.request_policy
     if policy is None or not policy.resolved_credentials:
@@ -626,7 +627,7 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     sc = StructuredContext.from_json_str(raw_context)
     existing_ids = {record.credential_id for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
-        if credential.credential_id in existing_ids:
+        if credential.credential_id in existing_ids or credential.credential_id in policy.live_page_admitted_urls:
             continue
         sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
         existing_ids.add(credential.credential_id)
@@ -787,6 +788,7 @@ class CopilotContext(AgentContext):
     credential_pause_used: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
+    credential_pause_connected_credential_id: str | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)

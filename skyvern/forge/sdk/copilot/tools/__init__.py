@@ -97,7 +97,8 @@ from .composition_capture import (
 )
 from .composition_capture import _normalized_inspect_url as _normalized_inspect_url
 from .composition_capture import _same_inspect_target as _same_inspect_target
-from .credential_fill import _credential_fill_policy_error as _credential_fill_policy_error
+from .credential_fill import _credential_fill_authority_error as _credential_fill_authority_error
+from .credential_fill import _credential_fill_prerequisite_error as _credential_fill_prerequisite_error
 from .credential_fill import (
     _fill_credential_field_impl,
 )

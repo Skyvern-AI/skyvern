@@ -199,6 +199,7 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
@@ -1106,6 +1107,7 @@ class BaseTaskBlock(Block):
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
+    complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
@@ -1558,6 +1560,8 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
+                previous_complete_criterion_is_untrusted = current_context.complete_criterion_is_untrusted
+                current_context.complete_criterion_is_untrusted = self.complete_criterion_is_untrusted
                 close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
                 await app.agent.execute_step(
                     organization=organization,
@@ -1581,6 +1585,7 @@ class BaseTaskBlock(Block):
                 raise e
             finally:
                 current_context.task_id = None
+                current_context.complete_criterion_is_untrusted = previous_complete_criterion_is_untrusted
 
             # Check task status
             updated_task = await app.DATABASE.tasks.get_task(
@@ -2444,6 +2449,61 @@ class ForLoopBlock(Block):
                 exc_info=True,
             )
 
+    async def _get_loop_browser_state(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> BrowserState | None:
+        if browser_session_id:
+            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+        return app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+    async def _snapshot_loop_baseline_pages(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> set[Page] | None:
+        """Pre-loop tabs to preserve, or None when they could not be determined.
+
+        None and an empty set must stay distinct: closing everything opened after an empty
+        baseline closes every tab, so a failed snapshot has to suppress the reset entirely.
+        """
+        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS:
+            return None
+        try:
+            browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
+            if isinstance(browser_state, RealBrowserState):
+                return set(browser_state.open_pages())
+        except Exception:
+            LOG.warning(
+                "Failed to snapshot baseline browser tabs for loop",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+        return None
+
+    async def _reset_browser_tabs_for_iteration(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        baseline_pages: set[Page] | None,
+    ) -> None:
+        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS or baseline_pages is None:
+            return
+        try:
+            browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
+            if isinstance(browser_state, RealBrowserState):
+                await browser_state.close_pages_opened_after(baseline_pages)
+        except Exception:
+            LOG.warning(
+                "Failed to reset browser tabs between loop iterations",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+
     async def execute_loop_helper(
         self,
         workflow_run_id: str,
@@ -2459,6 +2519,10 @@ class ForLoopBlock(Block):
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+
+        loop_baseline_pages = await self._snapshot_loop_baseline_pages(
+            workflow_run_id, organization_id, browser_session_id
+        )
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
@@ -2491,6 +2555,11 @@ class ForLoopBlock(Block):
                     + f"...[truncated, original size: {len(loop_over_value_repr)}]"
                 )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value_repr)
+
+            if loop_idx > 0:
+                await self._reset_browser_tabs_for_iteration(
+                    workflow_run_id, organization_id, browser_session_id, loop_baseline_pages
+                )
 
             # Capture baseline downloaded files for per-iteration scoping (SKY-7005).
             # Download-producing child blocks re-capture their own per-block baseline

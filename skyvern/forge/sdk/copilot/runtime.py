@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.turn_origin import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.webeye.browser_state import BrowserState
 
@@ -509,6 +510,8 @@ class AgentContext:
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
+    org_credentials_for_turn: list[Credential] | None = None
     # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None

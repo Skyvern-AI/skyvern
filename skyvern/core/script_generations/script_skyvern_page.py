@@ -178,7 +178,9 @@ class ScriptSkyvernPage(SkyvernPage):
         browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id, url=url)
         return await browser_state.scrape_website(
             url="",
-            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                engine_selection=browser_state.engine_selection
+            ),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
             # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
@@ -695,7 +697,10 @@ class ScriptSkyvernPage(SkyvernPage):
             if not working_page:
                 return
 
-            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=working_page,
+                engine_selection=browser_state.engine_selection,
+            )
             html = await skyvern_frame.get_content()
 
             if html:
@@ -790,7 +795,10 @@ class ScriptSkyvernPage(SkyvernPage):
             if not self.page:
                 return
 
-            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=self.page,
+                engine_selection=self.engine_selection,
+            )
             await skyvern_frame.wait_for_page_ready(
                 network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
                 loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
@@ -821,7 +829,10 @@ class ScriptSkyvernPage(SkyvernPage):
 
             # Inject domUtils.js and build the element tree to set unique_id attrs.
             # Use a short timeout since this is best-effort; we don't want to hang for 60s.
-            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=self.page,
+                engine_selection=self.engine_selection,
+            )
             await skyvern_frame.build_tree_from_body(
                 frame_name="main.frame",
                 frame_index=0,

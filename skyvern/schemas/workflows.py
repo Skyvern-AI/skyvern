@@ -1042,6 +1042,7 @@ class NavigationBlockYAML(BlockYAML):
     totp_identifier: str | None = None
     disable_cache: bool = False
     complete_criterion: str | None = None
+    complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
     complete_verification: bool = True
     include_action_history_in_verification: bool = False

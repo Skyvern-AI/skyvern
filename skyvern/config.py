@@ -4,7 +4,7 @@ import platform
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
+    WORKER_STALL_DUMP_SECONDS: int = 0
     # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
     # an exact approval, so an enforcing value must be unrepresentable rather than merely unused.
     BROWSER_ACTION_POLICY_MODE: Literal["disabled", "observe"] = "disabled"
@@ -134,6 +135,21 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Eval-fleet levers below: each one changes task_v2 planner behavior, so they default off and
+    # the benchmark values file turns them on. Do not flip a default to True without an org gate.
+    TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE: bool = False
+    # Carry the planner's required_subgoals leg-checklist forward into the next planner
+    # prompt so it refines rather than re-derives it each iteration.
+    TASK_V2_CARRY_SUBGOALS: bool = False
+    # Final N% of planner iterations: inject a wrap-up directive telling the planner to converge on
+    # open required_subgoals instead of starting new legs (prevents budget exhaustion). 0 disables.
+    TASK_V2_CONVERGE_PCT: int = 0
+    # litellm num_retries for direct (non-router) LLM calls; 0 keeps current behavior.
+    # Raise for low-QPM keys (e.g. local Vertex smoke) so 429s back off and retry instead of failing the run.
+    LLM_DIRECT_NUM_RETRIES: int = 0
+    # Umbrella for specific self-contained mini goals, per-block complete_criterion, and inline loop_values.
+    # Default-off; the eval fleet forces it on and prod opts in per-org via the experimentation flag.
+    PLANNER_MINI_GOAL_IMPROVEMENTS: bool = False
     # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
     # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
     MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
@@ -331,6 +347,11 @@ class Settings(BaseSettings):
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
+    # When set, a ForLoopBlock snapshots the open tabs before the loop and, between iterations,
+    # closes only tabs opened during an iteration — preserving the pre-loop baseline (e.g. a
+    # deliverable tab) and the working page. Bounds tab growth in long loops so per-iteration
+    # research tabs don't bloat the open-tabs planner context. Default-off; on for the eval fleet.
+    RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS: bool = False
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
     # Add extension folders name here to load extension in your browser
@@ -647,6 +668,8 @@ class Settings(BaseSettings):
     ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    # Deployment-level fail-closed override; takes precedence over all CodeBlock entitlements.
+    DISABLE_CODE_BLOCK_EXECUTION: bool = False
     ENABLE_CODE_BLOCK: bool = True
 
     TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
@@ -807,6 +830,15 @@ class Settings(BaseSettings):
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
+
+    @field_validator("WORKER_STALL_DUMP_SECONDS", mode="before")
+    @classmethod
+    def _worker_stall_dump_seconds_or_default(cls, value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            LOG.warning("Invalid WORKER_STALL_DUMP_SECONDS=%r; using default 0", value)
+            return 0
 
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
