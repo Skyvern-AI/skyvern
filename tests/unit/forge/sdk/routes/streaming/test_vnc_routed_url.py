@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.exceptions import MissingRoutedVncAddressError
+from skyvern.forge.sdk.routes.streaming.channels import vnc as vnc_channel_module
 from skyvern.forge.sdk.routes.streaming.channels.vnc import (
     _build_vnc_url_from_browser_address,
     loop_stream_vnc,
@@ -88,7 +89,7 @@ async def test_a_session_with_no_routable_address_fails_instead_of_streaming(
         dialed.append(url)
         raise AssertionError("live view must not dial when no routed address exists")
 
-    monkeypatch.setattr("skyvern.forge.sdk.routes.streaming.channels.vnc.websockets.connect", _record_connect)
+    monkeypatch.setattr(vnc_channel_module.websockets, "connect", _record_connect)
 
     with pytest.raises(MissingRoutedVncAddressError):
         await loop_stream_vnc(_channel(POD_ADDRESS))  # type: ignore[arg-type]
