@@ -53,6 +53,7 @@ from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics as _
 from skyvern.webeye.cdp_connection import (
     merge_cdp_connect_headers,
     parse_default_cdp_connect_headers,
+    redact_cdp_url,
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
@@ -997,7 +998,7 @@ async def _connect_to_cdp_browser(
     # RealBrowserManager attaches the CDP frame publisher.
     browser_artifacts.needs_cdp_frame_publisher = True
 
-    LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    LOG.info("Connecting browser CDP connection", remote_browser_url=redact_cdp_url(remote_browser_url))
     cdp_headers = merge_cdp_connect_headers(
         default_headers=parse_default_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS),
         per_row_headers=cdp_connect_headers,
@@ -1060,7 +1061,7 @@ async def _connect_to_cdp_browser(
 
     LOG.info(
         "Launched browser CDP connection",
-        remote_browser_url=remote_browser_url,
+        remote_browser_url=redact_cdp_url(remote_browser_url),
     )
     return browser_context, browser_artifacts, None
 

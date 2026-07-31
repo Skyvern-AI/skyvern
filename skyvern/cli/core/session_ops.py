@@ -181,7 +181,10 @@ async def do_session_list(skyvern: Any) -> list[SessionInfo]:
             started_at=s.started_at.isoformat() if s.started_at else None,
             timeout=s.timeout,
             runnable_id=s.runnable_id,
-            available=s.runnable_id is None and s.browser_address is not None,
+            # started_at is the client-visible half of the readiness signal: the session worker
+            # sets it in the same write that makes the browser reachable, while an address alone
+            # can be minted before one exists.
+            available=s.runnable_id is None and s.started_at is not None and s.browser_address is not None,
         )
         for s in sessions
     ]

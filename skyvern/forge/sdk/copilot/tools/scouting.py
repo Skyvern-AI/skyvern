@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     bind_post_run_page_path_failure,
@@ -66,10 +67,14 @@ from skyvern.forge.sdk.copilot.enforcement import (
     reset_no_progress_interaction_count,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
+    DOWNLOAD_KIND_OBSERVED,
     ReachedDownloadTarget,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    derive_from_observed_download,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.result_evidence import (
@@ -1889,6 +1894,79 @@ def _with_trajectory_anchor(ctx: AgentContext, target: ReachedDownloadTarget) ->
     return replace(target, trajectory_anchor=anchor)
 
 
+async def _scout_session_download_names(ctx: AgentContext) -> frozenset[str] | None:
+    """Filenames currently registered in the scout's browser session, or empty when unavailable.
+
+    Read-only and failure-tolerant: this only sharpens download detection, so a storage hiccup must
+    never break a scout click."""
+    browser_session_id = ctx.browser_session_id
+    organization_id = ctx.organization_id
+    if not browser_session_id or not organization_id:
+        return None
+    try:
+        files = await app.STORAGE.list_downloaded_files_in_browser_session(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+    except Exception:
+        LOG.warning("copilot_scout_download_snapshot_failed", exc_info=True)
+        return None
+    return frozenset(str(name) for name in files or ())
+
+
+async def _maybe_attach_observed_download_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    selector: str,
+    url: str,
+) -> None:
+    """S3: pin the clicked affordance when the scout's own click produced a new download.
+
+    href shape cannot see a command-style download URL, so without this the model authors the
+    download step freehand instead of receiving the synthesizer's uncaught terminal."""
+    data = result.get("data")
+    if not isinstance(data, dict) or not selector:
+        return
+    before = ctx.pending_scout_download_snapshot
+    ctx.pending_scout_download_snapshot = None
+    if before is None:
+        return
+    try:
+        after = await _scout_session_download_names(ctx)
+        if after is None or not (after - before):
+            return
+        target = derive_from_observed_download(selector=selector, affordance_text=_scout_click_text(result))
+        if target is None:
+            return
+        data["reached_download_target"] = target.to_dict()
+        data["reached_download_guidance"] = _reached_download_guidance_for(target)
+        ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
+        if ctx.synthesized_block_offered and not ctx.update_workflow_called:
+            ctx.synthesized_block_offered = False
+            ctx.synthesized_block_offered_goal_complete = False
+        _register_reached_download_scout_interaction(ctx, target, url=url)
+        LOG.info(
+            "copilot_reached_download_target_steer",
+            url=url,
+            download_kind=target.download_kind,
+            already_registered=target.already_registered,
+        )
+    except Exception:
+        LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
+
+
+def _scout_click_text(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return ""
+    text = data.get("text") or data.get("accessible_name") or ""
+    return text if isinstance(text, str) else ""
+
+
+def _is_observed_download_target(target: object) -> bool:
+    return getattr(target, "download_kind", None) == DOWNLOAD_KIND_OBSERVED
+
+
 async def _maybe_attach_reached_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1915,6 +1993,11 @@ async def _maybe_attach_reached_download_target(
             return
         target = _derive_reached_download_from_nav_targets(parsed.get("navigation_targets"))
         if target is None:
+            return
+        if _is_observed_download_target(ctx.reached_download_target):
+            # A download that actually fired outranks a prediction from link shape; without this the
+            # later writer would repoint the target at an affordance nothing has exercised.
+            LOG.info("copilot_reached_download_target_prediction_yielded_to_observed", url=url)
             return
         data["reached_download_target"] = target.to_dict()
         data["reached_download_guidance"] = _reached_download_guidance_for(target)
