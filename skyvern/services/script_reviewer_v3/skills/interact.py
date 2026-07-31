@@ -26,6 +26,7 @@ from typing import Any
 
 import structlog
 
+from skyvern.services.script_reviewer_v3.redaction import REDACTED_SECRET_PLACEHOLDER, redact_sensitive_value
 from skyvern.services.script_reviewer_v3.skills.base import Skill, SkillError, SkillResult
 
 LOG = structlog.get_logger()
@@ -101,13 +102,20 @@ async def _handler_live_get_dom(args: dict[str, Any], context: Any) -> SkillResu
         return SkillResult.not_available(f"selector {selector!r} matched no element")
     if not isinstance(html, str):
         html = str(html)
+    html_chars = len(html)
+    sensitive_value = getattr(context, "value", None) if getattr(context, "value_is_sensitive", False) else None
+    html = redact_sensitive_value(html, sensitive_value)
     truncated = len(html) > max_chars
+    preview = html[:max_chars]
+    placeholder_start = html.rfind("[", 0, max_chars)
+    if html.startswith(REDACTED_SECRET_PLACEHOLDER, placeholder_start):
+        preview = html[: max_chars - len(REDACTED_SECRET_PLACEHOLDER)] + REDACTED_SECRET_PLACEHOLDER
     return SkillResult.ok(
         data={
             "selector": selector,
             "url": await _safe_url(page),
-            "html_chars": len(html),
-            "html": (html[:max_chars] + f"\n<!-- truncated {len(html) - max_chars} chars -->") if truncated else html,
+            "html_chars": html_chars,
+            "html": (preview + f"\n<!-- truncated {len(html) - len(preview)} chars -->") if truncated else html,
             "truncated": truncated,
         }
     )
@@ -231,14 +239,18 @@ async def _handler_live_try_click(args: dict[str, Any], context: Any) -> SkillRe
 
 
 async def _handler_live_try_fill(args: dict[str, Any], context: Any) -> SkillResult:
-    """Attempt page.fill(selector, value). Successful fill is the commit."""
+    """Fill an ordinary value. Successful fill is the commit."""
     page = _get_page(context)
     selector = args.get("selector")
-    value = args.get("value")
     if not selector or not isinstance(selector, str):
         raise SkillError("selector is required")
+    if getattr(context, "value_is_sensitive", False):
+        return SkillResult.not_available("live_try_fill is unavailable for sensitive values")
+    value = args.get("value")
+    if value is None:
+        value = getattr(context, "value", None)
     if value is None or not isinstance(value, str):
-        raise SkillError("value is required (string)")
+        raise SkillError("FailureContext.value is unavailable")
 
     pre_url = await _safe_url(page)
     pre_hash = await _dom_hash(page)
@@ -377,16 +389,17 @@ def all_interact_skills() -> list[Skill]:
             schema={
                 "name": "live_try_fill",
                 "description": (
-                    "Fill an input by CSS selector. A successful fill IS the commit. Returns "
-                    "pre/post URL and DOM hashes."
+                    "Fill an input by CSS selector. Resolved credentials are refused. For ordinary "
+                    "fills, omit value to reuse the failed value or supply a corrected format. "
+                    "A successful fill IS the commit. Returns pre/post URL and DOM hashes."
                 ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "selector": {"type": "string"},
-                        "value": {"type": "string"},
+                        "value": {"type": "string", "description": "Optional corrected ordinary value."},
                     },
-                    "required": ["selector", "value"],
+                    "required": ["selector"],
                 },
             },
         ),

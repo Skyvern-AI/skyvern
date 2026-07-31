@@ -1167,6 +1167,9 @@ class AgentFunction:
         """
         return None
 
+    def get_mcp_request_organization_id(self) -> str | None:
+        return None
+
     async def get_mcp_oauth_jwt_key(self) -> Any | None:
         """Return the current signing key/JWK for MCP OAuth token validation.
 

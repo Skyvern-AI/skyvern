@@ -47,6 +47,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     GoogleOAuthClientConfigSafe,
     GoogleOAuthCredentialBase,
 )
+from skyvern.forge.sdk.services import oauth_consent
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
@@ -520,6 +521,7 @@ async def start_authorization(
     scope_profile: str | None = None,
     app_origin: str | None = None,
     credential_id: str | None = None,
+    initiator_id: str | None = None,
 ) -> GoogleAuthorizationStart:
     """Start the consent flow, build the authorize URL, and persist the PKCE verifier.
 
@@ -536,7 +538,8 @@ async def start_authorization(
     if app_origin is not None:
         _validate_app_origin(app_origin, resolved_config.config)
 
-    nonce = secrets.token_urlsafe(32)
+    state = oauth_consent.generate_consent_state()
+    nonce = oauth_consent.consent_nonce(state, initiator_id)
     # Pre-generate the PKCE verifier so the pending row lands with the verifier
     # populated in a single DB write — a crash mid-flow can no longer leave a
     # pending row that the callback would see as missing the verifier.
@@ -589,22 +592,24 @@ async def start_authorization(
 
     authorize_url, _ = build_authorize_url(
         redirect_uri=redirect_uri,
-        state=nonce,
+        state=state,
         scopes=requested_scopes,
         code_verifier=code_verifier,
         client_config=resolved_config.config,
     )
 
-    return GoogleAuthorizationStart(authorize_url=authorize_url, state=nonce)
+    return GoogleAuthorizationStart(authorize_url=authorize_url, state=state)
 
 
 async def promote_pending_credential(
     organization_id: str,
-    nonce: str,
+    state: str,
+    initiator_id: str | None,
     refresh_token: str,
     scopes_granted: str | list[str] | tuple[str, ...] | None,
 ) -> GoogleOAuthCredentialBase:
     """Encrypt the refresh token and promote the matching pending row to active."""
+    nonce = oauth_consent.consent_nonce(state, initiator_id)
     _require_encryption()
     encrypted_token = await encryptor.encrypt(refresh_token, EncryptMethod.AES)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
@@ -670,11 +675,15 @@ async def mark_credential_expired(
         )
 
 
-async def load_pending_consent_context(organization_id: str, nonce: str) -> PendingConsentContext | None:
+async def load_pending_consent_context(
+    organization_id: str,
+    state: str,
+    initiator_id: str | None,
+) -> PendingConsentContext | None:
     """Fetch the redirect_uri + PKCE verifier the callback needs to replay to Google."""
     return await app.DATABASE.google_oauth.load_pending_by_nonce(
         organization_id=organization_id,
-        nonce=nonce,
+        nonce=oauth_consent.consent_nonce(state, initiator_id),
     )
 
 

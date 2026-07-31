@@ -29,7 +29,7 @@ from skyvern.webeye.browser_engine import (
     resolve_browser_engine,
 )
 from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
-from skyvern.webeye.browser_manager import BrowserManager
+from skyvern.webeye.browser_manager import BrowserCleanupResult, BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_frame_publisher import (
     CDPFramePublisher,
@@ -38,7 +38,7 @@ from skyvern.webeye.cdp_frame_publisher import (
 )
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
-from skyvern.webeye.video_utils import finalize_webm
+from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
 
@@ -774,20 +774,21 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                # Only the local Playwright-launched recording path produces WebM
-                # that needs the remux fix-up. Other producers (e.g. fully formed
-                # MP4 downloaded from a remote source) are already container-valid
-                # and would be corrupted by ``finalize_webm`` — read those raw.
                 is_webm = path.lower().endswith(".webm")
                 if finalize and is_webm:
-                    # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
-                    # even when browser_context.close() was killed mid-finalization.
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
+                    async with prepare_recording_for_upload(path) as prepared:
+                        with open(prepared.path, "rb") as f:
+                            browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                        browser_state.browser_artifacts.video_artifacts[
+                            i
+                        ].video_file_extension = prepared.file_extension
                 else:
-                    # Per-step snapshot while recording is still open — skip ffmpeg: the file is
-                    # partial, so remux would either fail or be thrown away by the final pass.
+                    # Non-WebM sources are already container-valid; per-step WebM snapshots are still incomplete.
                     with open(path, "rb") as f:
                         browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                    browser_state.browser_artifacts.video_artifacts[i].video_file_extension = (
+                        os.path.splitext(path)[1].lstrip(".").lower() or "webm"
+                    )
             else:
                 LOG.debug(
                     "Video path not found",
@@ -914,9 +915,12 @@ class RealBrowserManager(BrowserManager):
         browser_session_id: str | None = None,
         organization_id: str | None = None,
         child_workflow_run_ids: list[str] | None = None,
-    ) -> BrowserState | None:
+    ) -> BrowserCleanupResult:
         LOG.info("Cleaning up for workflow run", sampling=True)
         browser_state_to_close = self.pages.get(workflow_run_id)
+        recording_finalized = False
+        finalization_attempted = False
+        cleanup_page_ids = {workflow_run_id, *task_ids, *(child_workflow_run_ids or [])}
 
         # Drop the run's pinned engine — the run is ending, so no further browser resource will be
         # created for it. Covers the run, its inherited children, and its tasks.
@@ -944,7 +948,10 @@ class RealBrowserManager(BrowserManager):
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
             # skip closing the browser so the parent can continue using it.
-            shared = any(bs is browser_state_to_close for bs in self.pages.values())
+            shared = any(
+                page_id != workflow_run_id and browser_state is browser_state_to_close
+                for page_id, browser_state in self.pages.items()
+            )
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(
@@ -972,11 +979,24 @@ class RealBrowserManager(BrowserManager):
                     browser_state_to_close.browser_context,
                     browser_state_to_close.browser_artifacts.browser_session_dir,
                 )
+                shared_after_cleanup = any(
+                    page_id not in cleanup_page_ids and browser_state is browser_state_to_close
+                    for page_id, browser_state in self.pages.items()
+                )
+                deferred_close = close_browser_on_completion and not shared_after_cleanup
+                streams_active = set_deferred_close_params(
+                    workflow_run_id,
+                    deferred_close,
+                    release_driver=False if (shared_after_cleanup or browser_session_id) else None,
+                )
+                if not streams_active:
+                    effective_close = deferred_close
+                    shared = shared_after_cleanup
+            if streams_active:
                 LOG.info(
                     "Deferring browser close — active CDP streams",
                     workflow_run_id=workflow_run_id,
                 )
-                set_deferred_close_params(workflow_run_id, close_browser_on_completion)
                 # Keep the publisher running while streams are attached. The
                 # eventual ``close(True)`` fires the on-close callback that
                 # stops it; ``close(False)`` is covered by the publisher's
@@ -985,16 +1005,20 @@ class RealBrowserManager(BrowserManager):
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
                 await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
-                await browser_state_to_close.close(
+                close_succeeded = await browser_state_to_close.close(
                     close_browser_on_completion=effective_close,
                     release_driver=False if (shared or browser_session_id) else None,
                 )
+                finalization_attempted = effective_close
+                recording_finalized = effective_close and bool(close_succeeded)
 
         if not streams_active:
             self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None or streams_active:
+                continue
+            if task_browser_state is browser_state_to_close and finalization_attempted:
                 continue
             # Same shared-state check for task-level entries
             shared = any(bs is task_browser_state for bs in self.pages.values())
@@ -1007,10 +1031,14 @@ class RealBrowserManager(BrowserManager):
                     workflow_run_id=workflow_run_id,
                 )
             try:
-                await task_browser_state.close(
+                if task_browser_state is browser_state_to_close:
+                    finalization_attempted = effective_close
+                close_succeeded = await task_browser_state.close(
                     close_browser_on_completion=effective_close,
                     release_driver=False if (shared or browser_session_id) else None,
                 )
+                if task_browser_state is browser_state_to_close and effective_close:
+                    recording_finalized = bool(close_succeeded)
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",
@@ -1031,7 +1059,10 @@ class RealBrowserManager(BrowserManager):
                     "Organization ID not specified, cannot release browser session", workflow_run_id=workflow_run_id
                 )
 
-        return browser_state_to_close
+        return BrowserCleanupResult(
+            browser_state=browser_state_to_close,
+            recording_finalized=recording_finalized,
+        )
 
     async def get_or_create_for_script(
         self,

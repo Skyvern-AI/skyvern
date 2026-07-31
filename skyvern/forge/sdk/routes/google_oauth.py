@@ -129,6 +129,7 @@ def _require_scopes_from_token(token_data: dict) -> list[str]:
 async def google_oauth_authorize(
     request: CreateGoogleOAuthAuthorizeRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> GoogleOAuthAuthorizeResponse:
     """Kick off the Google OAuth 2.0 authorization flow."""
     try:
@@ -139,6 +140,7 @@ async def google_oauth_authorize(
             scope_profile=request.scope_profile,
             app_origin=request.app_origin,
             credential_id=request.credential_id,
+            initiator_id=current_user_id,
         )
     except google_oauth_service.CredentialNotReauthorizableError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -162,14 +164,19 @@ async def google_oauth_authorize(
 async def google_oauth_callback(
     request: CreateGoogleOAuthCallbackRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> GoogleOAuthCredentialResponse:
     """Handle the Google OAuth 2.0 authorization callback."""
     context = await google_oauth_service.load_pending_consent_context(
         organization_id=current_org.organization_id,
-        nonce=request.state,
+        state=request.state,
+        initiator_id=current_user_id,
     )
     if context is None or not context.consent_redirect_uri:
-        raise HTTPException(status_code=400, detail="Unknown or consumed OAuth consent nonce")
+        raise HTTPException(
+            status_code=400,
+            detail="This OAuth consent request is unknown, expired, or was not started by you. Restart the connection.",
+        )
     if not context.consent_code_verifier:
         raise HTTPException(
             status_code=400,
@@ -224,7 +231,8 @@ async def google_oauth_callback(
     try:
         credential = await google_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
-            nonce=request.state,
+            state=request.state,
+            initiator_id=current_user_id,
             refresh_token=refresh_token,
             scopes_granted=scopes_granted,
         )
