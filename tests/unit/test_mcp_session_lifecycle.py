@@ -31,8 +31,12 @@ def _reset_singletons() -> None:
     client_mod._api_key_clients.clear()
 
     session_manager._current_session.set(None)
+    session_manager._current_organization_id.set(None)
     session_manager._global_session = None
+    session_manager._organization_sessions.clear()
     session_manager._copilot_sessions.clear()
+    session_manager._session_ref_maps.clear()
+    session_manager._session_ref_generations.clear()
     session_manager.set_stateless_http_mode(False)
 
 
@@ -375,24 +379,34 @@ async def test_resolve_browser_classifies_explicit_cloud_session_localhost_reach
 
 
 @pytest.mark.asyncio
-async def test_resolve_browser_does_not_reuse_registered_copilot_session_for_different_api_key_override(
+@pytest.mark.parametrize(
+    ("organization_id", "api_key"),
+    [(None, "sk_copilot_org"), ("org_copilot", "sk_other_org")],
+)
+async def test_resolve_browser_requires_matching_organization_and_credential_for_registered_copilot_session(
     monkeypatch: pytest.MonkeyPatch,
+    organization_id: str | None,
+    api_key: str,
 ) -> None:
     registered_state = session_manager.SessionState(
         browser=MagicMock(),
         context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
         api_key_hash=session_manager._api_key_hash("sk_copilot_org"),
     )
-    session_manager.register_copilot_session("pbs_copilot", registered_state)
+    session_manager.register_copilot_session("pbs_copilot", registered_state, organization_id="org_copilot")
 
     fallback_browser = MagicMock()
     fake_skyvern = MagicMock()
     fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=fallback_browser)
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
 
-    token = client_mod.set_api_key_override("sk_other_org")
+    token = client_mod.set_api_key_override(api_key)
     try:
-        browser, ctx = await session_manager.resolve_browser(session_id="pbs_copilot")
+        if organization_id:
+            with session_manager.request_session_scope(organization_id):
+                browser, ctx = await session_manager.resolve_browser(session_id="pbs_copilot")
+        else:
+            browser, ctx = await session_manager.resolve_browser(session_id="pbs_copilot")
     finally:
         client_mod.reset_api_key_override(token)
 
@@ -826,6 +840,78 @@ async def test_close_current_session_still_closes_browser_when_api_fails(monkeyp
     # _browser_session_id should NOT be cleared (API close failed, let browser.close() try)
     assert browser._browser_session_id == "pbs_fail"
     assert session_manager.get_current_session().browser is None
+
+
+@pytest.mark.asyncio
+async def test_close_all_sessions_closes_each_organization_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    first_browser = MagicMock()
+    first_browser.close = AsyncMock()
+    second_error = RuntimeError("second organization cleanup failed")
+    second_browser = MagicMock()
+    second_browser.close = AsyncMock(side_effect=second_error)
+    third_error = RuntimeError("third organization cleanup failed")
+    third_browser = MagicMock()
+    third_browser.close = AsyncMock(side_effect=third_error)
+
+    with session_manager.request_session_scope("org_first"):
+        session_manager.set_current_session(
+            session_manager.SessionState(
+                browser=first_browser,
+                context=BrowserContext(mode="local"),
+            )
+        )
+    with session_manager.request_session_scope("org_second"):
+        session_manager.set_current_session(
+            session_manager.SessionState(
+                browser=second_browser,
+                context=BrowserContext(mode="local"),
+            )
+        )
+    with session_manager.request_session_scope("org_third"):
+        session_manager.set_current_session(
+            session_manager.SessionState(browser=third_browser, context=BrowserContext(mode="local"))
+        )
+
+    warning = MagicMock()
+    monkeypatch.setattr(session_manager.LOG, "warning", warning)
+    with pytest.raises(RuntimeError, match=str(second_error)):
+        await session_manager.close_all_sessions()
+
+    first_browser.close.assert_awaited_once()
+    second_browser.close.assert_awaited_once()
+    third_browser.close.assert_awaited_once()
+    assert warning.call_args.kwargs["organization_id"] == "org_third"
+    assert warning.call_args.kwargs["exc_info"][1] is third_error
+    assert session_manager._organization_sessions == {}
+    assert session_manager._current_session.get() is None
+    assert session_manager._current_organization_id.get() is None
+
+
+def test_session_ref_lookup_is_scoped_to_authenticated_organization() -> None:
+    session_id = "pbs_shared_identifier"
+    page_key = (1, None, "https://example.com", None)
+    element = {"tag": "button"}
+
+    with session_manager.request_session_scope("org_first"):
+        session_manager.set_current_session(
+            session_manager.SessionState(
+                context=BrowserContext(mode="cloud_session", session_id=session_id),
+            )
+        )
+        assert session_manager.replace_session_ref_map(
+            {"e0": element},
+            session_id=session_id,
+            page_key=page_key,
+        )
+        assert session_manager.get_session_ref("e0", session_id=session_id, page_key=page_key) == element
+
+    with session_manager.request_session_scope("org_second"):
+        session_manager.set_current_session(
+            session_manager.SessionState(
+                context=BrowserContext(mode="cloud_session", session_id=session_id),
+            )
+        )
+        assert session_manager.get_session_ref("e0", session_id=session_id, page_key=page_key) is None
 
 
 # ---------------------------------------------------------------------------

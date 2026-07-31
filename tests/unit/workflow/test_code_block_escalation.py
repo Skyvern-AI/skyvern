@@ -1274,6 +1274,7 @@ async def test_escalation_task_verifies_with_action_history(
     ("error_code", "healable", "skip_reason"),
     [
         ("unsupported_page_operation", True, None),
+        ("browser_operation_failed", True, None),
         ("timeout", False, HealSkipReason.timeout_class),
         ("insecure_code_detected", False, HealSkipReason.insecure_code),
         ("browser_disconnected", False, HealSkipReason.unclassifiable),

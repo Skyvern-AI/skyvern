@@ -112,7 +112,10 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
         async with mcp_browser_context(ctx):
             raise RuntimeError("boom")
 
-    unregister_mock.assert_called_once_with(make_self_heal_session_id("wr_777"))
+    unregister_mock.assert_called_once_with(
+        make_self_heal_session_id("wr_777"),
+        organization_id=ctx.organization_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -155,8 +158,9 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
     with capture_logs() as logs:
         async with mcp_browser_context(ctx):
             assert register_mock.call_args.args[0] == expected_session_id
+            assert register_mock.call_args.kwargs == {"organization_id": ctx.organization_id}
 
-    unregister_mock.assert_called_once_with(expected_session_id)
+    unregister_mock.assert_called_once_with(expected_session_id, organization_id=ctx.organization_id)
     manager.get_browser_state.assert_not_awaited()
     registered = [entry for entry in logs if entry["event"] == "registered self-heal browser session"]
     unregistered = [entry for entry in logs if entry["event"] == "unregistered self-heal browser session"]

@@ -35,6 +35,8 @@ from skyvern.forge.sdk.copilot.agent import _build_exit_result
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
+    USER_CANCELLED_TERMINAL_REASON,
+    _assistant_row_exists_for_turn,
     _copilot_cancel_key,
     _persist_cancel_turn,
     _persist_proposed_workflow_state,
@@ -45,6 +47,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCancelRequest,
     WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
 )
 from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
@@ -260,9 +263,10 @@ async def _drive_cancel_route(
     handler = captured["handler"]
     assert callable(handler)
     await handler(stream)
-    # Cancel turn always emits exactly two chat rows: the user prompt and the
-    # AI cancellation reply. Guard against a future regression that double-inserts.
-    assert workflow_params.create_workflow_copilot_chat_message.await_count == 2
+    # The user prompt is written ahead of the agent by start_copilot_turn; the
+    # cancel path adds only the AI reply. Guard against a double-insert of either.
+    assert workflow_params.start_copilot_turn.await_count == 1
+    assert workflow_params.create_workflow_copilot_chat_message.await_count == 1
     return restore_mock, workflow_params, sent_payloads
 
 
@@ -291,13 +295,13 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
 
     restore_mock.assert_awaited_once()
 
-    # Two chat-message inserts: user msg + Cancelled by user. AI msg.
     insert_calls = workflow_params.create_workflow_copilot_chat_message.await_args_list
     senders = [c.kwargs.get("sender") for c in insert_calls]
     contents = [c.kwargs.get("content") for c in insert_calls]
-    assert senders.count("user") == 1
+    assert senders.count("user") == 0
     assert senders.count("ai") == 1
-    assert "please update" in contents
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "please update"
+
     assert "Cancelled by user." in contents
 
     # No proposed_workflow update when the cancelled result has no WIP.
@@ -391,7 +395,7 @@ async def test_route_cancel_wip_persists_proposal_and_response_frame(
 
     insert_calls = workflow_params.create_workflow_copilot_chat_message.await_args_list
     contents = [c.kwargs.get("content") for c in insert_calls]
-    assert "please update" in contents
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "please update"
     assert user_response in contents
 
     response_frames = [
@@ -942,6 +946,8 @@ async def test_operational_cancel_does_not_persist_cancelled_message(
         title="Original",
         description=None,
         workflow_definition=None,
+        modified_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
+        model_dump=MagicMock(return_value={"workflow_id": "wf-canonical"}),
     )
     # Agent raises CancelledError synchronously (simulates operational cancel
     # propagating into the await before user_cancel_observed gets set).
@@ -970,6 +976,10 @@ async def test_operational_cancel_does_not_persist_cancelled_message(
         create_workflow_copilot_chat_message=AsyncMock(
             return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
         ),
+        start_copilot_turn=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+        clear_pending_copilot_turn=AsyncMock(),
     )
     app.DATABASE.workflow_params = workflow_params
     app.DATABASE.workflows = SimpleNamespace(
@@ -1004,3 +1014,56 @@ async def test_operational_cancel_does_not_persist_cancelled_message(
     contents = [c.kwargs.get("content") for c in insert_calls]
     # No "Cancelled by user." row was written.
     assert "Cancelled by user." not in contents
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -> None:
+    """Without a turn-stamped outcome, reconcile would append an interrupted row beside the cancel."""
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    persisted: list[SimpleNamespace] = []
+
+    async def capture_message(**kwargs: Any) -> SimpleNamespace:
+        row = SimpleNamespace(
+            sender=kwargs["sender"],
+            content=kwargs["content"],
+            turn_outcome=kwargs.get("turn_outcome"),
+            created_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
+        )
+        persisted.append(row)
+        return row
+
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=capture_message,
+        clear_pending_copilot_turn=AsyncMock(),
+        get_workflow_copilot_chat_messages=AsyncMock(return_value=persisted),
+    )
+    app.DATABASE.workflow_params = workflow_params
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="keep going",
+        agent_result=None,
+        turn_id="turn-a",
+        user_row_already_persisted=True,
+    )
+
+    assistant_rows = [row for row in persisted if row.sender == WorkflowCopilotChatSender.AI]
+    assert len(assistant_rows) == 1
+    outcome = assistant_rows[0].turn_outcome
+    assert outcome is not None
+    assert outcome.copilot_turn_id == "turn-a"
+    assert outcome.terminal_reason == USER_CANCELLED_TERMINAL_REASON
+    assert outcome.terminal_reason != "interrupted"
+    assert await _assistant_row_exists_for_turn(chat, "turn-a") is True
