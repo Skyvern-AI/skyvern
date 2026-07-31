@@ -3493,3 +3493,68 @@ async def test_reconcile_does_not_roll_back_a_later_turns_canonical_write(
     assert recovered == ["turn-a", "turn-b"]
     assert chat.pending_turns == {}
     assert response.proposed_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    timeout_copy = "I ran out of time processing your request. Here's what I have so far."
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=False,
+        workflow_applied=False,
+        proposal_disposition="auto_applicable",
+        run_outcomes=[],
+        blocker_reason=None,
+        halt_kind=None,
+        attempted=None,
+        workflow_mutated=False,
+        turn_outcome_response_kind=None,
+        terminal_cause="deadline_expired",
+    )
+    assert envelope is not None
+    agent_result = AgentResult(
+        user_response=timeout_copy,
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=envelope.model_dump(mode="json"),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["terminal_cause"] == "deadline_expired"
+    assert response_frame.message == timeout_copy
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload["terminalEnvelope"]["terminal_cause"] == "deadline_expired"
+    assert persisted_payload["terminalMessage"] == timeout_copy
+    assert persisted_payload["narrativeSummary"] == timeout_copy

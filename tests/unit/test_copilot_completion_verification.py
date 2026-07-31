@@ -88,11 +88,13 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    TOTAL_TIMEOUT_SECONDS,
     built_unverified_repair_inert_context,
     outcome_fully_verified,
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
+from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.request_policy import (
     AntecedentFamily,
     CompletionCriterion,
@@ -13665,3 +13667,45 @@ def test_minted_value_present_criterion_corroborated_reaches_verified_success() 
     )
 
     assert result.is_fully_satisfied() is True
+
+
+def test_tool_visible_result_stamps_remaining_turn_budget_mid_turn() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.copilot_run_start_monotonic = time.monotonic() - 120.0
+
+    visible = _tool_visible_result_after_completion_verification(ctx, _clean_success_result(), None)
+
+    remaining = visible["turn_seconds_remaining"]
+    assert isinstance(remaining, float)
+    assert remaining == pytest.approx(TOTAL_TIMEOUT_SECONDS - 120.0, abs=2.0)
+
+
+def test_tool_visible_result_stamps_remaining_budget_on_the_unverified_shape_too() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.copilot_run_start_monotonic = time.monotonic() - 30.0
+
+    visible = _tool_visible_result_after_completion_verification(
+        ctx, _clean_success_result(), _evaluated(("c0", False))
+    )
+
+    assert visible["ok"] is False
+    assert visible["turn_seconds_remaining"] == pytest.approx(TOTAL_TIMEOUT_SECONDS - 30.0, abs=2.0)
+
+
+def test_tool_visible_result_remaining_budget_is_none_before_the_loop_starts() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.copilot_run_start_monotonic = None
+
+    visible = _tool_visible_result_after_completion_verification(ctx, _clean_success_result(), None)
+
+    assert visible["turn_seconds_remaining"] is None
+
+
+def test_remaining_turn_budget_survives_the_llm_sanitizer() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    ctx.copilot_run_start_monotonic = time.monotonic() - 60.0
+
+    visible = _tool_visible_result_after_completion_verification(ctx, _clean_success_result(), None)
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", visible)
+
+    assert sanitized["turn_seconds_remaining"] == pytest.approx(TOTAL_TIMEOUT_SECONDS - 60.0, abs=2.0)

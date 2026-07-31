@@ -589,3 +589,121 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         assert result.proposal_disposition == "review_tested"
         assert result.cancelled is False
         assert result.user_response == _TIMEOUT_REPLY_TESTED
+
+
+class TestTimeoutExitNamesTimeAndDraftState:
+    def test_untested_draft_names_time_and_that_it_is_unverified(self) -> None:
+        ctx = _ctx(last_workflow=MagicMock(name="wf"), last_workflow_yaml="version: '1.0'", last_test_ok=None)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.proposal_disposition == "review_untested"
+        assert "ran out of time" in result.user_response
+        assert "hasn't been verified end-to-end" in result.user_response
+
+    def test_tested_draft_names_time_and_that_it_is_tested(self) -> None:
+        ctx = _ctx(last_workflow=MagicMock(name="wf"), last_workflow_yaml="version: '1.0'", last_test_ok=True)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.proposal_disposition == "review_tested"
+        assert "ran out of time" in result.user_response
+        assert "tested draft" in result.user_response
+
+    def test_no_draft_still_names_time(self) -> None:
+        ctx = _ctx(last_workflow=None, last_workflow_yaml=None, last_test_ok=None)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.proposal_disposition == "auto_applicable"
+        assert "ran out of time" in result.user_response
+
+    def test_untested_draft_with_recorded_failure_still_names_time(self) -> None:
+        # The common shape: the failed test run is what spent the budget, so a
+        # recorded failure is present on almost every real deadline expiry.
+        ctx = _ctx(last_workflow=MagicMock(name="wf"), last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_update_block_count = 1
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "could not convert string to float", run_status="failed"
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert "ran out of time" in result.user_response
+        assert "could not convert string to float" in result.user_response
+        assert not result.user_response.startswith("I built")
+
+    def test_no_draft_with_recorded_failure_still_names_time(self) -> None:
+        ctx = _ctx(last_workflow=None, last_workflow_yaml=None, last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "could not convert string to float", run_status="failed"
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert "ran out of time" in result.user_response
+        assert "could not convert string to float" in result.user_response
+
+    def test_max_turns_exit_keeps_the_recorded_failure_reply(self) -> None:
+        # The deadline precedence must not leak into sibling capacity exits.
+        ctx = _ctx(last_workflow=MagicMock(name="wf"), last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.last_update_block_count = 1
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "could not convert string to float", run_status="failed"
+        )
+
+        result = _build_max_turns_exit_result(ctx, global_llm_context=None)
+
+        assert "ran out of time" not in result.user_response
+        assert result.user_response.startswith("I built")
+
+    def test_held_draft_shape_names_time_draft_state_and_keeps_evidence(self) -> None:
+        # The shape both live deadline runs produced: review_untested / proposal_pending.
+        ctx = _ctx(last_workflow=MagicMock(name="wf"), last_workflow_yaml="version: '1.0'", last_test_ok=None)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_update_block_count = 1
+        ctx.latest_diagnosis_repair_contract = _blocker_contract("Run completed", run_status="completed")
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.proposal_disposition == "review_untested"
+        assert "ran out of time" in result.user_response
+        assert "hasn't been verified end-to-end" in result.user_response
+        assert "Run completed" in result.user_response
+
+    def test_interrupted_run_is_not_reported_as_a_failed_verification(self) -> None:
+        # A budget-paced halt was interrupted, not disproven. The deadline copy already says the
+        # work is unverified, so appending "the last test did not verify" would mis-attribute twice.
+        ctx = _ctx(last_workflow=MagicMock(name="wf"), last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_update_block_count = 3
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+            "Do NOT retry block-running tools. Use only existing run evidence and quick browser inspection.",
+            run_status="canceled",
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert "ran out of time" in result.user_response
+        assert "did not verify" not in result.user_response
+        assert "Do NOT" not in result.user_response
+
+    def test_last_good_branch_also_drops_the_trailing_verdict_when_interrupted(self) -> None:
+        # wip_last_good_workflow composes its own trailing sentence; the interrupted-run
+        # exemption has to reach that branch too, not just the two above it.
+        ctx = _overwrite_ctx(last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_update_block_count = 2
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+            "Do NOT retry block-running tools.",
+            run_status="canceled",
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert "ran out of time" in result.user_response
+        assert "did not verify" not in result.user_response
